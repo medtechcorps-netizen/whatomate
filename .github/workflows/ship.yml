@@ -1,0 +1,698 @@
+name: Release
+
+run-name: Release ${{ inputs.mode }} ${{ inputs.target_release }}
+
+# One-click promote-by-digest (Stage 1). plan -> images -> attest ->
+# production -> record. Only the production job sees the deploy token, and
+# only after the owner approves the production environment in the GitHub UI.
+# docs/release.md is the runbook; docs/emergency-rollback.md is the
+# owner-run console fallback.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: dry-run (no PUT), promote, or rollback
+        required: true
+        type: choice
+        default: dry-run
+        options:
+          - dry-run
+          - promote
+          - rollback
+      target_release:
+        description: Rollback only, a record tag such as prod-20261004T101500Z-0123abcd or prod-0000
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+# Serializes every Release run. The old launcher also treats any workflow
+# with a top-level concurrency block it does not recognise as lock-relevant.
+concurrency:
+  group: ship-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SHIP_REPOSITORY: medtechcorps-netizen/whatomate
+  SHIP_WORKFLOW_PATH: .github/workflows/ship.yml
+  PINNED_GH_VERSION: "2.98.0"
+  PINNED_GH_URL: https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz
+  PINNED_GH_SHA256: 3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de
+  PINNED_TRIVY_VERSION: "0.70.0"
+  PINNED_TRIVY_URL: https://github.com/aquasecurity/trivy/releases/download/v0.70.0/trivy_0.70.0_Linux-64bit.tar.gz
+  PINNED_TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+  PINNED_SYFT_VERSION: "1.51.0"
+  PINNED_SYFT_URL: https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz
+  PINNED_SYFT_SHA256: 2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f
+  PINNED_BUILDX_VERSION: v0.36.1
+  PINNED_BUILDX_URL: https://github.com/docker/buildx/releases/download/v0.36.1/buildx-v0.36.1.linux-amd64
+  PINNED_BUILDX_SHA256: 48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778
+  PINNED_BUILDKIT_IMAGE: docker.io/moby/buildkit:buildx-stable-1@sha256:040d34121c27906c4ff9ac152a30d52bf2c5d328d3bb748916bb3d2743c02528
+
+jobs:
+  plan:
+    name: Release plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      latest_release: ${{ steps.plan.outputs.latest_release }}
+      latest_manifest_sha256: ${{ steps.plan.outputs.latest_manifest_sha256 }}
+      latest_sha: ${{ steps.plan.outputs.latest_sha }}
+      target_release: ${{ steps.plan.outputs.target_release }}
+      target_manifest_sha256: ${{ steps.plan.outputs.target_manifest_sha256 }}
+    steps:
+      - name: Refuse re-runs
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT_NAME: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT_NAME" == "github-hosted" ]]
+
+      - name: Check out the dispatched commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ship-tools"
+          install -d -m 0755 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          printf '%s  %s\n' "$PINNED_GH_SHA256" "$RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          read -r gh_name gh_word gh_version _ < <("$tools_dir/gh" --version)
+          [[ "$gh_name $gh_word $gh_version" == "gh version $PINNED_GH_VERSION" ]]
+          printf 'SHIP_GH_BIN=%s\n' "$tools_dir/gh" >> "$GITHUB_ENV"
+
+      - name: Plan the release
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHIP_MODE: ${{ inputs.mode }}
+          SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py plan
+
+  images:
+    name: Release image (${{ matrix.component }})
+    needs: plan
+    if: ${{ inputs.mode != 'rollback' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        component:
+          - web
+          - meta-relay
+          - gmail-relay
+    steps:
+      - name: Refuse re-runs
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT_NAME: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT_NAME" == "github-hosted" ]]
+
+      - name: Check out the dispatched commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require reviewed Dockerfile pins
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py image --stage pins --component "$COMPONENT"
+
+      - name: Install pinned Trivy and Syft
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ship-tools"
+          install -d -m 0755 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_TRIVY_URL" -o "$RUNNER_TEMP/trivy.tar.gz"
+          printf '%s  %s\n' "$PINNED_TRIVY_SHA256" "$RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$tools_dir" trivy
+          [[ "$("$tools_dir/trivy" --version | awk '/^Version:/ {print $2; exit}')" == "$PINNED_TRIVY_VERSION" ]]
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_SYFT_URL" -o "$RUNNER_TEMP/syft.tar.gz"
+          printf '%s  %s\n' "$PINNED_SYFT_SHA256" "$RUNNER_TEMP/syft.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/syft.tar.gz" -C "$tools_dir" syft
+          "$tools_dir/syft" version | grep -Eq "^[[:space:]]*Version:[[:space:]]+$PINNED_SYFT_VERSION$"
+          printf '%s\n' "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Install pinned Docker Buildx and start pinned BuildKit
+        run: |
+          set -euo pipefail
+          plugin_dir="$HOME/.docker/cli-plugins"
+          mkdir -p "$plugin_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_BUILDX_URL" -o "$plugin_dir/docker-buildx"
+          printf '%s  %s\n' "$PINNED_BUILDX_SHA256" "$plugin_dir/docker-buildx" | sha256sum --check --strict
+          chmod 0755 "$plugin_dir/docker-buildx"
+          [[ "$(docker buildx version | awk '{print $2}')" == "$PINNED_BUILDX_VERSION" ]]
+          docker buildx create \
+            --name rereply-ship \
+            --driver docker-container \
+            --driver-opt "image=$PINNED_BUILDKIT_IMAGE" \
+            --use
+          docker buildx inspect --bootstrap rereply-ship
+
+      - name: Create a unique non-authority tag
+        id: identity
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          [[ "$COMPONENT" =~ ^(web|meta-relay|gmail-relay)$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          image="ghcr.io/medtechcorps-netizen/rereply-release-$COMPONENT"
+          tag="ship-${GITHUB_SHA:0:12}-r${GITHUB_RUN_ID}"
+          [[ "$tag" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'image=%s\n' "$image"
+            printf 'image_ref=%s:%s\n' "$image" "$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build the exact AMD64 image without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          file: ./docker/release/${{ matrix.component }}.Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          pull: true
+          no-cache: true
+          provenance: false
+          sbom: false
+          builder: rereply-ship
+          # The build reads the verified local checkout; never hand the
+          # workflow token to BuildKit as a Git authentication secret.
+          github-token: ""
+          tags: ${{ steps.identity.outputs.image_ref }}
+          # UBUNTU_SNAPSHOT is deliberately not passed: the Dockerfile ARG
+          # default is the exact value production was built with.
+          build-args: |
+            TARGETOS=linux
+            TARGETARCH=amd64
+          labels: |
+            org.opencontainers.image.source=https://github.com/medtechcorps-netizen/whatomate
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=ship-${{ github.sha }}
+            org.opencontainers.image.title=rereply-release-${{ matrix.component }}
+            io.rereply.release.workflow=ship
+
+      - name: Publish the unique non-authority tag
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+          IMAGE_REF: ${{ steps.identity.outputs.image_ref }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_REF" == "$IMAGE:"* ]]
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE_REF" 2>&1 | tee "$RUNNER_TEMP/docker-push.txt"
+          mapfile -t pushed_digests < <(
+            sed -nE 's/^.*digest:[[:space:]]*(sha256:[0-9a-f]{64})([[:space:]].*)?$/\1/p' "$RUNNER_TEMP/docker-push.txt"
+          )
+          [[ "${#pushed_digests[@]}" -eq 1 ]]
+          digest="${pushed_digests[0]}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$digest" --raw > "$RUNNER_TEMP/published-manifest.json"
+          [[ -s "$RUNNER_TEMP/published-manifest.json" && ! -L "$RUNNER_TEMP/published-manifest.json" ]]
+          manifest_sha256="$(sha256sum "$RUNNER_TEMP/published-manifest.json" | awk '{print $1}')"
+          [[ "sha256:$manifest_sha256" == "$digest" ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the runtime contract
+        env:
+          COMPONENT: ${{ matrix.component }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+        run: |
+          set -euo pipefail
+          image_ref="$IMAGE@$DIGEST"
+          install -d -m 0700 "$RUNNER_TEMP/ship-scan"
+          docker pull --platform linux/amd64 "$image_ref"
+          docker image inspect "$image_ref" > "$RUNNER_TEMP/ship-scan/inspect.json"
+          /usr/bin/python3 -I -S -B release/deployment/ship.py image --stage contract --component "$COMPONENT"
+          case "$COMPONENT" in
+            web)
+              docker run --rm --platform linux/amd64 --entrypoint /bin/sh "$image_ref" \
+                -ceu '
+                  uid="$(id -u)"
+                  test "$uid" -gt 0
+                  test "$(id -un)" = rereply
+                  model=/opt/piper/models/en_US-lessac-medium.onnx
+                  config=/opt/piper/models/en_US-lessac-medium.onnx.json
+                  test -s "$model" && test -r "$model" && test "$(stat -c %a "$model")" = 644
+                  test -s "$config" && test -r "$config" && test "$(stat -c %a "$config")" = 644
+                  test -s /etc/ssl/certs/ca-certificates.crt
+                  test -r /etc/ssl/certs/ca-certificates.crt
+                  test -x /usr/local/bin/piper
+                  test -d /usr/share/espeak-ng-data
+                  test -d /app/audio && test -w /app/audio
+                  printf "%s\n" "release image smoke test" |
+                    piper --model "$model" --output_file /app/audio/release-smoke.wav
+                  test -s /app/audio/release-smoke.wav
+                  opusenc --quiet /app/audio/release-smoke.wav /app/audio/release-smoke.ogg
+                  test -s /app/audio/release-smoke.ogg
+                  ffmpeg -nostdin -v error -i /app/audio/release-smoke.ogg -f null -
+                  test "$(stat -c %u /app/audio/release-smoke.wav)" = "$uid"
+                  test "$(stat -c %u /app/audio/release-smoke.ogg)" = "$uid"
+                '
+              docker run --rm --platform linux/amd64 "$image_ref" version
+              ;;
+            meta-relay|gmail-relay)
+              binary="/app/$COMPONENT"
+              container_id="$(docker create --platform linux/amd64 "$image_ref")"
+              trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+              docker export "$container_id" > "$RUNNER_TEMP/relay-rootfs.tar"
+              tar -xOf "$RUNNER_TEMP/relay-rootfs.tar" etc/passwd | grep -Fx 'relay:x:65532:65532:ReReply relay:/app:/sbin/nologin'
+              tar -xOf "$RUNNER_TEMP/relay-rootfs.tar" etc/group | grep -Fx 'relay:x:65532:'
+              tar -xOf "$RUNNER_TEMP/relay-rootfs.tar" etc/ssl/certs/ca-certificates.crt > "$RUNNER_TEMP/relay-ca-certificates.crt"
+              [[ -s "$RUNNER_TEMP/relay-ca-certificates.crt" ]]
+              tar -tvf "$RUNNER_TEMP/relay-rootfs.tar" | grep -E -- "^-rwx[^[:space:]]*[[:space:]].*[[:space:]]${binary#/}$"
+              docker rm "$container_id" > /dev/null
+              trap - EXIT
+              ;;
+            *)
+              echo "::error::Unsupported runtime smoke contract."
+              exit 1
+              ;;
+          esac
+
+      - name: Check reviewed vulnerability exceptions
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py trivy-policy
+
+      - name: Download a fresh Trivy database
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          export TRIVY_CACHE_DIR="$RUNNER_TEMP/trivy-cache"
+          trivy image \
+            --cache-dir "$TRIVY_CACHE_DIR" \
+            --download-db-only \
+            --skip-version-check
+          /usr/bin/python3 -I -S -B release/deployment/ship.py image --stage trivy-db --component "$COMPONENT"
+
+      - name: Fail on embedded secrets
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+        run: |
+          set -euo pipefail
+          trivy image \
+            --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --skip-db-update \
+            --skip-version-check \
+            --scanners secret \
+            --image-config-scanners secret \
+            --exit-code 1 \
+            --format json \
+            --output "$RUNNER_TEMP/ship-scan/secret-report.json" \
+            --timeout 30m \
+            "$IMAGE@$DIGEST"
+
+      - name: Fail on HIGH or CRITICAL vulnerabilities
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+        run: |
+          set -euo pipefail
+          trivy image \
+            --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --skip-db-update \
+            --skip-version-check \
+            --scanners vuln \
+            --pkg-types os,library \
+            --severity HIGH,CRITICAL \
+            --ignorefile release/deployment/ship.trivyignore \
+            --exit-code 1 \
+            --format json \
+            --output "$RUNNER_TEMP/ship-scan/vulnerability-report.json" \
+            --timeout 30m \
+            "$IMAGE@$DIGEST"
+
+      - name: Generate the SPDX SBOM
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+          SYFT_CHECK_FOR_APP_UPDATE: "false"
+        run: |
+          set -euo pipefail
+          syft scan "docker:$IMAGE@$DIGEST" --output "spdx-json=$RUNNER_TEMP/ship-scan/sbom.spdx.json"
+
+      - name: Record the image
+        env:
+          COMPONENT: ${{ matrix.component }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py image --stage record --component "$COMPONENT"
+
+      - name: Upload the image record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ship-image-${{ matrix.component }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/ship-image/
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: Release attestations
+    needs:
+      - plan
+      - images
+    if: ${{ inputs.mode != 'rollback' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      candidate_b64: ${{ steps.candidate.outputs.candidate_b64 }}
+      candidate_sha256: ${{ steps.candidate.outputs.candidate_sha256 }}
+    steps:
+      - name: Refuse re-runs
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT_NAME: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT_NAME" == "github-hosted" ]]
+
+      - name: Check out the dispatched commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ship-tools"
+          install -d -m 0755 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          printf '%s  %s\n' "$PINNED_GH_SHA256" "$RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          read -r gh_name gh_word gh_version _ < <("$tools_dir/gh" --version)
+          [[ "$gh_name $gh_word $gh_version" == "gh version $PINNED_GH_VERSION" ]]
+          printf 'SHIP_GH_BIN=%s\n' "$tools_dir/gh" >> "$GITHUB_ENV"
+
+      - name: Download the three image records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ship-image-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/ship-images
+          merge-multiple: false
+
+      - name: Read the three image records
+        id: images
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py candidate --stage read
+
+      - name: Attest web provenance
+        id: prov-web
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/medtechcorps-netizen/rereply-release-web
+          subject-digest: ${{ steps.images.outputs.web }}
+          push-to-registry: false
+
+      - name: Attest web SBOM
+        id: sbom-web
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/medtechcorps-netizen/rereply-release-web
+          subject-digest: ${{ steps.images.outputs.web }}
+          sbom-path: ${{ runner.temp }}/ship-images/ship-image-web-${{ github.run_id }}/sbom.spdx.json
+          push-to-registry: false
+
+      - name: Attest meta-relay provenance
+        id: prov-meta-relay
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/medtechcorps-netizen/rereply-release-meta-relay
+          subject-digest: ${{ steps.images.outputs.meta_relay }}
+          push-to-registry: false
+
+      - name: Attest meta-relay SBOM
+        id: sbom-meta-relay
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/medtechcorps-netizen/rereply-release-meta-relay
+          subject-digest: ${{ steps.images.outputs.meta_relay }}
+          sbom-path: ${{ runner.temp }}/ship-images/ship-image-meta-relay-${{ github.run_id }}/sbom.spdx.json
+          push-to-registry: false
+
+      - name: Attest gmail-relay provenance
+        id: prov-gmail-relay
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay
+          subject-digest: ${{ steps.images.outputs.gmail_relay }}
+          push-to-registry: false
+
+      - name: Attest gmail-relay SBOM
+        id: sbom-gmail-relay
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/medtechcorps-netizen/rereply-release-gmail-relay
+          subject-digest: ${{ steps.images.outputs.gmail_relay }}
+          sbom-path: ${{ runner.temp }}/ship-images/ship-image-gmail-relay-${{ github.run_id }}/sbom.spdx.json
+          push-to-registry: false
+
+      - name: Verify every attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHIP_PROV_BUNDLE_WEB: ${{ steps.prov-web.outputs.bundle-path }}
+          SHIP_SBOM_BUNDLE_WEB: ${{ steps.sbom-web.outputs.bundle-path }}
+          SHIP_PROV_BUNDLE_META_RELAY: ${{ steps.prov-meta-relay.outputs.bundle-path }}
+          SHIP_SBOM_BUNDLE_META_RELAY: ${{ steps.sbom-meta-relay.outputs.bundle-path }}
+          SHIP_PROV_BUNDLE_GMAIL_RELAY: ${{ steps.prov-gmail-relay.outputs.bundle-path }}
+          SHIP_SBOM_BUNDLE_GMAIL_RELAY: ${{ steps.sbom-gmail-relay.outputs.bundle-path }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py candidate --stage verify
+
+      - name: Require anonymous pullability
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker-config
+          WEB_DIGEST: ${{ steps.images.outputs.web }}
+          META_RELAY_DIGEST: ${{ steps.images.outputs.meta_relay }}
+          GMAIL_RELAY_DIGEST: ${{ steps.images.outputs.gmail_relay }}
+        run: |
+          set -euo pipefail
+          unset GH_TOKEN GITHUB_TOKEN CR_PAT REGISTRY_TOKEN DOCKER_AUTH_CONFIG
+          [[ ! -e "$DOCKER_CONFIG" ]]
+          install -d -m 0700 "$DOCKER_CONFIG"
+          [[ -z "$(find "$DOCKER_CONFIG" -mindepth 1 -print -quit)" ]]
+          pulled=0
+          for pair in "web=$WEB_DIGEST" "meta-relay=$META_RELAY_DIGEST" "gmail-relay=$GMAIL_RELAY_DIGEST"; do
+            component="${pair%%=*}"
+            digest="${pair#*=}"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            subject="ghcr.io/medtechcorps-netizen/rereply-release-$component@$digest"
+            docker pull --platform linux/amd64 "$subject" > /dev/null
+            [[ "$(docker image inspect --format '{{json .RepoDigests}}' "$subject")" == *"\"$subject\""* ]]
+            pulled=$((pulled + 1))
+          done
+          [[ "$pulled" -eq 3 ]]
+          [[ ! -e "$DOCKER_CONFIG/config.json" ]]
+
+      - name: Assemble the candidate
+        id: candidate
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py candidate --stage assemble
+
+  production:
+    name: Release production (${{ inputs.mode }})
+    needs:
+      - plan
+      - attest
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.plan.result == 'success' && ((inputs.mode == 'rollback' && needs.attest.result == 'skipped') || (inputs.mode != 'rollback' && needs.attest.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: production
+    concurrency:
+      group: ship-production
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      release: ${{ steps.ship.outputs.release }}
+      kind: ${{ steps.ship.outputs.kind }}
+      sha: ${{ steps.ship.outputs.sha }}
+      web_digest: ${{ steps.ship.outputs.web_digest }}
+      meta_relay_digest: ${{ steps.ship.outputs.meta_relay_digest }}
+      gmail_relay_digest: ${{ steps.ship.outputs.gmail_relay_digest }}
+      previous: ${{ steps.ship.outputs.previous }}
+      rolled_back_from: ${{ steps.ship.outputs.rolled_back_from }}
+      deployed_at: ${{ steps.ship.outputs.deployed_at }}
+      built_at: ${{ steps.ship.outputs.built_at }}
+      reconciled: ${{ steps.ship.outputs.reconciled }}
+      environment_values_sha256: ${{ steps.ship.outputs.environment_values_sha256 }}
+      non_source_projection_sha256: ${{ steps.ship.outputs.non_source_projection_sha256 }}
+    # No `uses:` in this job: only bash, git, the pinned gh tarball and the
+    # standard-library ship.py run next to the deploy token.
+    steps:
+      - name: Refuse re-runs
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT_NAME: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT_NAME" == "github-hosted" ]]
+          [[ "${RUNNER_DEBUG:-}" != "1" ]]
+
+      - name: Fetch the dispatched commit without credentials
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none --no-checkout --single-branch --branch main --no-tags \
+            "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_WORKSPACE/src"
+          git -C "$GITHUB_WORKSPACE/src" checkout --quiet --detach "$GITHUB_SHA"
+          [[ "$(git -C "$GITHUB_WORKSPACE/src" rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -z "$(git -C "$GITHUB_WORKSPACE/src" status --porcelain)" ]]
+
+      - name: Install pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ship-tools"
+          install -d -m 0755 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          printf '%s  %s\n' "$PINNED_GH_SHA256" "$RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          read -r gh_name gh_word gh_version _ < <("$tools_dir/gh" --version)
+          [[ "$gh_name $gh_word $gh_version" == "gh version $PINNED_GH_VERSION" ]]
+          printf 'SHIP_GH_BIN=%s\n' "$tools_dir/gh" >> "$GITHUB_ENV"
+
+      - name: Verify, guard, deploy, smoke and roll back
+        id: ship
+        working-directory: src
+        env:
+          SHIP_DO_TOKEN: ${{ secrets.DO_PRODUCTION_DEPLOY_TOKEN }}
+          SHIP_TARGET_JSON: ${{ secrets.PRODUCTION_TARGET_JSON }}
+          GH_TOKEN: ${{ github.token }}
+          SHIP_MODE: ${{ inputs.mode }}
+          SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
+          PLAN_LATEST_RELEASE: ${{ needs.plan.outputs.latest_release }}
+          PLAN_LATEST_MANIFEST_SHA256: ${{ needs.plan.outputs.latest_manifest_sha256 }}
+          PLAN_TARGET_RELEASE: ${{ needs.plan.outputs.target_release }}
+          PLAN_TARGET_MANIFEST_SHA256: ${{ needs.plan.outputs.target_manifest_sha256 }}
+          CANDIDATE_B64: ${{ needs.attest.outputs.candidate_b64 }}
+          CANDIDATE_SHA256: ${{ needs.attest.outputs.candidate_sha256 }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py production
+
+  record:
+    name: Release record
+    needs:
+      - production
+    if: ${{ !cancelled() && needs.production.result == 'success' && inputs.mode != 'dry-run' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    # No attempt guard: "Re-run failed jobs" reuses the successful production
+    # job's outputs, and every stage is idempotent.
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ship-tools"
+          install -d -m 0755 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          printf '%s  %s\n' "$PINNED_GH_SHA256" "$RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          read -r gh_name gh_word gh_version _ < <("$tools_dir/gh" --version)
+          [[ "$gh_name $gh_word $gh_version" == "gh version $PINNED_GH_VERSION" ]]
+          printf 'SHIP_GH_BIN=%s\n' "$tools_dir/gh" >> "$GITHUB_ENV"
+
+      - name: Build the release manifest
+        id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REC_RELEASE: ${{ needs.production.outputs.release }}
+          REC_KIND: ${{ needs.production.outputs.kind }}
+          REC_SHA: ${{ needs.production.outputs.sha }}
+          REC_WEB_DIGEST: ${{ needs.production.outputs.web_digest }}
+          REC_META_RELAY_DIGEST: ${{ needs.production.outputs.meta_relay_digest }}
+          REC_GMAIL_RELAY_DIGEST: ${{ needs.production.outputs.gmail_relay_digest }}
+          REC_PREVIOUS: ${{ needs.production.outputs.previous }}
+          REC_ROLLED_BACK_FROM: ${{ needs.production.outputs.rolled_back_from }}
+          REC_DEPLOYED_AT: ${{ needs.production.outputs.deployed_at }}
+          REC_BUILT_AT: ${{ needs.production.outputs.built_at }}
+          REC_RECONCILED: ${{ needs.production.outputs.reconciled }}
+          REC_ENVIRONMENT_VALUES_SHA256: ${{ needs.production.outputs.environment_values_sha256 }}
+          REC_NON_SOURCE_PROJECTION_SHA256: ${{ needs.production.outputs.non_source_projection_sha256 }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py record --stage manifest
+
+      - name: Attest the release manifest
+        if: ${{ steps.manifest.outputs.state != 'published' }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ steps.manifest.outputs.path }}
+          push-to-registry: false
+
+      - name: Publish the release record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py record --stage publish
+
+      - name: Verify the published record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -I -S -B release/deployment/ship.py record --stage verify
