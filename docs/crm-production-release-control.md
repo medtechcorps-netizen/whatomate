@@ -63,19 +63,22 @@ complete 68-record diff inventory is pinned in
 `test_verify_rollout_evidence.py`. Baseline, bridge and backend keep their
 2026-10-01 sources.
 
-Release gate for the backend fixes: the owner-run, read-only, counts-only
-empty-phone audit (kept with the release notes, not in this repository)
-must report `SAFE_TO_DEPLOY` before this control merges, and again right
-before the owner approves the apply environment review (audit #2b). The
-audit at launch is an early warning only, because until the apply the live
-ui source can still create rows that the new code refuses. On
-`REPAIR_FIRST`, repair every flagged organization and re-audit; never
-approve the apply without a fresh `SAFE_TO_DEPLOY`. Sections 2 to 4 of the
-source's `docs/runbooks/empty-phone-contacts-repair.md` are the repair
-procedure. That runbook's own gate (repair rows with two or more senders)
-is not enough on its own: the new code also refuses legacy rows with
-merged aliases or with inbound messages whose continuation job does not
-name the sender, and then answers 503 for the whole webhook delivery.
+Backend release gate, waived for this release by the owner on 2026-10-02:
+the production CRM holds only test numbers, so the counts-only empty-phone
+audit was not run. Instead, after the apply, watch the production logs for
+`Legacy empty-phone contact needs manual repair` and for `/api/webhook` 503
+responses, and delete or rename any affected test contact at once, because
+sustained 503s could make Meta throttle webhook delivery for every tenant.
+Once the CRM holds real customer data the gate applies in full: the
+owner-run, read-only, counts-only audit (kept with the release notes, not in
+this repository) must report `SAFE_TO_DEPLOY` before the control merges and
+again just before the apply, and every `REPAIR_FIRST` organization is
+repaired first with sections 2 to 4 of the source's
+`docs/runbooks/empty-phone-contacts-repair.md`. That runbook's own gate
+(repair rows with two or more senders) is not enough on its own: the new
+code also refuses legacy rows with merged aliases or with inbound messages
+whose continuation job does not name the sender, and then answers 503 for
+the whole webhook delivery.
 
 The release contains Klinik-only WhatsApp reply hardening and the existing
 authorized-client realtime, unread-marker, and late-layout autoscroll fixes.
