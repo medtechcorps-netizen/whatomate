@@ -63,7 +63,7 @@ func VerifyPlatformComplianceIdentityReviewFutureForTest(
 	return verifyPlatformComplianceGuardsWithIdentityReviewRequirement(db, runtimeRole, true)
 }
 
-// ExecuteCoexistenceActivationForTest exercises the same bounded executor used
+// ExecuteCoexistenceActivationForTest exercises the same atomic executor used
 // by both production migration entry points without exposing it to runtime
 // packages.
 func ExecuteCoexistenceActivationForTest(db *gorm.DB, statement string) error {
@@ -269,8 +269,6 @@ func TestWhatsAppCoexistenceIntegrityStatements(t *testing.T) {
 		strings.LastIndex(allIndexes, "owner_trigger_installed boolean"),
 		"the live-inbox foreign key must be validated before atomic trigger activation",
 	)
-	assert.Equal(t, "1s", coexistenceActivationStatementTimeout,
-		"the final hot-table cutover must have a hard bounded statement lifetime")
 	assert.Contains(t, activation, "tgenabled = 'O'")
 	assert.Contains(t, activation, "trigger_function.proname = 'rereply_guard_message_identity_review_wamid_owner'")
 	assert.Contains(t, activation, "tgargs = ''::bytea")
@@ -567,6 +565,55 @@ func TestRLSMigrationPhasePolicyIsCompileTimeAndFailClosed(t *testing.T) {
 		"every immutable source must carry one valid literal compile-time phase authority")
 }
 
+func TestRLSMigrationPrepareClaimCanonicalKAT(t *testing.T) {
+	t.Parallel()
+
+	plan := rlsMigrationPreparePlan{
+		Protocol:         "prepare:v1",
+		Phase:            "baseline",
+		Database:         "rereply_claim_fixture",
+		RuntimeRole:      "rereply_runtime_fixture",
+		RuntimeRoleOID:   424242,
+		ModelDescriptors: []string{"First=example.invalid/models.First", "Second=example.invalid/models.Second"},
+		PreparerLabels:   []string{"PrepareFirst", "PrepareSecond"},
+		IndexStatements:  []string{"LOCK TABLE public.first IN EXCLUSIVE MODE NOWAIT", "CREATE INDEX first_id ON first(id)"},
+	}
+	claim, err := rlsMigrationPrepareClaimFromPlan(plan)
+	require.NoError(t, err)
+	assert.Equal(t, "prepare:v1:e7668b2594da1b42f733a59e16f4b91329896a3bf2bfbf0a52ee50ffeb24618b", claim)
+
+	mutations := map[string]func(*rlsMigrationPreparePlan){
+		"phase":        func(candidate *rlsMigrationPreparePlan) { candidate.Phase = "bridge" },
+		"database":     func(candidate *rlsMigrationPreparePlan) { candidate.Database += "_other" },
+		"runtime role": func(candidate *rlsMigrationPreparePlan) { candidate.RuntimeRole += "_other" },
+		"runtime OID":  func(candidate *rlsMigrationPreparePlan) { candidate.RuntimeRoleOID++ },
+		"model order": func(candidate *rlsMigrationPreparePlan) {
+			candidate.ModelDescriptors[0], candidate.ModelDescriptors[1] = candidate.ModelDescriptors[1], candidate.ModelDescriptors[0]
+		},
+		"preparer order": func(candidate *rlsMigrationPreparePlan) {
+			candidate.PreparerLabels[0], candidate.PreparerLabels[1] = candidate.PreparerLabels[1], candidate.PreparerLabels[0]
+		},
+		"index order": func(candidate *rlsMigrationPreparePlan) {
+			candidate.IndexStatements[0], candidate.IndexStatements[1] = candidate.IndexStatements[1], candidate.IndexStatements[0]
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			candidate := plan
+			candidate.ModelDescriptors = append([]string(nil), plan.ModelDescriptors...)
+			candidate.PreparerLabels = append([]string(nil), plan.PreparerLabels...)
+			candidate.IndexStatements = append([]string(nil), plan.IndexStatements...)
+			mutate(&candidate)
+			mutatedClaim, err := rlsMigrationPrepareClaimFromPlan(candidate)
+			require.NoError(t, err)
+			assert.NotEqual(t, claim, mutatedClaim)
+		})
+	}
+
+	_, err = rlsMigrationPrepareClaimFromPlan(rlsMigrationPreparePlan{})
+	require.ErrorContains(t, err, "incomplete")
+}
+
 func TestRLSMigrationLostAcknowledgementClassificationIsReadOnlyAndFailClosed(t *testing.T) {
 	t.Parallel()
 
@@ -632,8 +679,9 @@ func TestRLSMigrationLostAcknowledgementClassificationIsReadOnlyAndFailClosed(t 
 func TestMigrationActivationIsSeparatedFromPreparation(t *testing.T) {
 	t.Parallel()
 
-	preparation, activation, err := splitMigrationIndexes(getIndexes())
+	readiness, preparation, activation, err := splitRLSMigrationPlan(getIndexes())
 	require.NoError(t, err)
+	require.Contains(t, readiness, "IN EXCLUSIVE MODE NOWAIT")
 	require.NotEmpty(t, preparation)
 	require.NotEmpty(t, activation)
 	assert.Contains(t, activation, "owner_trigger_installed boolean")
@@ -641,10 +689,126 @@ func TestMigrationActivationIsSeparatedFromPreparation(t *testing.T) {
 	assert.NotContains(t, strings.Join(preparation, "\n"),
 		"CREATE TRIGGER rereply_identity_review_contact_selector_fence",
 		"the old-core publication must occur only after schema, seeds, backfills, and RLS")
+	assert.NotContains(t, strings.Join(preparation, "\n"), "IN EXCLUSIVE MODE NOWAIT",
+		"the pre-mutation readiness boundary must not be replayed after mutation begins")
+	_, _, _, err = splitRLSMigrationPlan(append([]string{"SELECT 1"}, getIndexes()[1:]...))
+	require.ErrorContains(t, err, "NOWAIT readiness boundary is missing")
 	_, _, err = splitMigrationIndexes(nil)
 	require.ErrorContains(t, err, "inventory is empty")
 	_, _, err = splitMigrationIndexes([]string{"SELECT 1"})
 	require.ErrorContains(t, err, "activation boundary is missing")
+}
+
+func TestConcurrentMigrationRetryIndexContractsArePinned(t *testing.T) {
+	t.Parallel()
+
+	contracts, err := concurrentMigrationIndexContracts(getIndexes())
+	require.NoError(t, err)
+	names := make([]string, 0, len(contracts))
+	var highwater concurrentMigrationIndexContract
+	for _, contract := range contracts {
+		names = append(names, contract.Name)
+		require.NotEmpty(t, contract.Table)
+		require.NotEmpty(t, contract.Columns)
+		require.NotEmpty(t, contract.DependencyColumns)
+		_, _, err := canonicalConcurrentMigrationIndexKeys(contract.Columns)
+		require.NoError(t, err)
+		if contract.Name == "idx_messages_org_inbox_ingested_highwater" {
+			highwater = contract
+		}
+	}
+	assert.Equal(t, []string{
+		"idx_messages_org_inbox_ingested",
+		"idx_messages_org_inbox_ingested_highwater",
+		"idx_messages_org_contact_ingested",
+		"idx_messages_org_contact_account_ingested",
+		"idx_messages_org_inbox_incoming_ingested",
+		"uq_whatsapp_accounts_id_org",
+		"uq_messages_live_wamid",
+		"uq_contacts_id_org",
+		"uq_inbound_events_identity_review_wamid",
+		"idx_inbound_events_protocol",
+		"idx_inbound_events_review_hold_id",
+	}, names)
+	require.NotEmpty(t, highwater.Name)
+	highwaterKeys, highwaterOptions, err := canonicalConcurrentMigrationIndexKeys(highwater.Columns)
+	require.NoError(t, err)
+	require.Equal(t, "0,0,3", highwaterOptions,
+		"DESC must bind both PostgreSQL descending and default NULLS FIRST bits")
+	explicitDefaultKeys, explicitDefaultOptions, err := canonicalConcurrentMigrationIndexKeys(
+		"organization_id, inbox_conversation_id, ingested_at DESC NULLS FIRST",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, highwaterKeys, explicitDefaultKeys)
+	assert.Equal(t, highwaterOptions, explicitDefaultOptions)
+	_, changedNullOrder, err := canonicalConcurrentMigrationIndexKeys(
+		"organization_id, inbox_conversation_id, ingested_at DESC NULLS LAST",
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "0,0,1", changedNullOrder)
+	assert.NotEqual(t, highwaterOptions, changedNullOrder)
+
+	tampered := append([]string(nil), getIndexes()...)
+	for index, statement := range tampered {
+		if strings.Contains(statement, "idx_messages_org_inbox_ingested ON messages") {
+			tampered[index] = strings.Replace(
+				statement,
+				"idx_messages_org_inbox_ingested ON messages",
+				"unmanifested_retry_index ON messages",
+				1,
+			)
+			break
+		}
+	}
+	_, err = concurrentMigrationIndexContracts(tampered)
+	require.ErrorContains(t, err, "no dependency manifest")
+}
+
+func TestConcurrentMigrationRetryLifecycleIsFailClosed(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []struct {
+		name               string
+		valid, ready, live bool
+		want               bool
+	}{
+		{name: "published", valid: true, ready: true, live: true, want: true},
+		{name: "failed before ready", valid: false, ready: false, live: true, want: true},
+		{name: "failed after ready", valid: false, ready: true, live: true, want: true},
+		{name: "interrupted concurrent drop after dead", valid: false, ready: false, live: false, want: true},
+		{name: "valid but unready", valid: true, ready: false, live: true},
+		{name: "valid but dead", valid: true, ready: false, live: false},
+		{name: "valid ready but dead", valid: true, ready: true, live: false},
+		{name: "impossible ready dead", valid: false, ready: true, live: false},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			assert.Equal(t, state.want, retryableConcurrentIndexLifecycle(
+				state.valid,
+				state.ready,
+				state.live,
+			))
+		})
+	}
+
+	for _, state := range []struct {
+		name            string
+		valid           bool
+		constraintCount int64
+		want            bool
+	}{
+		{name: "published referenced unique index", valid: true, constraintCount: 16, want: true},
+		{name: "published unreferenced index", valid: true, constraintCount: 0, want: true},
+		{name: "invalid unreferenced retry artifact", constraintCount: 0, want: true},
+		{name: "invalid referenced index", constraintCount: 1},
+		{name: "impossible negative count", valid: true, constraintCount: -1},
+	} {
+		t.Run(state.name, func(t *testing.T) {
+			assert.Equal(t, state.want, retryableConcurrentIndexConstraintBinding(
+				state.valid,
+				state.constraintCount,
+			))
+		})
+	}
 }
 
 func TestWhatsAppIdentityReviewTablesUseAnExactAdditiveRollbackProfile(t *testing.T) {

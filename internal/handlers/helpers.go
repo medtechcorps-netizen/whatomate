@@ -10,6 +10,7 @@ import (
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
 
+	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/audit"
 	"github.com/shridarpatil/whatomate/internal/models"
 )
@@ -95,6 +96,116 @@ func findByIDAndOrg[T any](db *gorm.DB, r *fastglue.Request, id, orgID uuid.UUID
 		return nil, errEnvelopeSent
 	}
 	return &model, nil
+}
+
+// orgMemberUserCondition restricts a users query to accounts that belong to an
+// organization, either through the legacy home column (users.organization_id)
+// or through a live user_organizations row. It takes the organization ID twice.
+// EXISTS is used instead of a JOIN so a user never appears twice.
+const orgMemberUserCondition = `(users.organization_id = ? OR EXISTS (
+	SELECT 1 FROM user_organizations uo
+	WHERE uo.user_id = users.id AND uo.organization_id = ? AND uo.deleted_at IS NULL))`
+
+// loadOrgMembershipRows returns every user_organizations row for orgID and
+// the given users, soft-deleted rows included, grouped by user and ordered by
+// id. Soft-deleted rows matter: they tell a removed member apart from a legacy
+// account that never had a membership row.
+func loadOrgMembershipRows(db *gorm.DB, userIDs []uuid.UUID, orgID uuid.UUID) (map[uuid.UUID][]models.UserOrganization, error) {
+	byUser := make(map[uuid.UUID][]models.UserOrganization, len(userIDs))
+	if len(userIDs) == 0 {
+		return byUser, nil
+	}
+	var rows []models.UserOrganization
+	if err := db.Unscoped().
+		Where("organization_id = ? AND user_id IN ?", orgID, userIDs).
+		Order("id").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		byUser[row.UserID] = append(byUser[row.UserID], row)
+	}
+	return byUser, nil
+}
+
+// orgMembershipRowsValid decides membership from a user's user_organizations
+// rows for orgID (as loaded by loadOrgMembershipRows). It mirrors the auth
+// layer (middleware setAuthenticatedContext): a live row must exist and, when
+// reseller-derived, its reseller assignment must still be active. Only a user
+// with no row at all, live or soft-deleted, falls back to the legacy home
+// organization (users.organization_id), as findByIDAndOrg did before. A user
+// whose membership was removed (row soft-deleted) is rejected even when
+// orgID is their home organization. Super admins get no bypass.
+func orgMembershipRowsValid(db *gorm.DB, user *models.User, orgID uuid.UUID, rows []models.UserOrganization) bool {
+	if user == nil || orgID == uuid.Nil {
+		return false
+	}
+	if len(rows) == 0 {
+		return user.OrganizationID == orgID
+	}
+	for i := range rows {
+		if rows[i].DeletedAt.Valid {
+			continue
+		}
+		// The live row is unique (idx_user_org_unique ... WHERE deleted_at IS NULL).
+		return access.ResellerDerivedMembershipActive(db, &rows[i])
+	}
+	return false
+}
+
+// orgMemberMembershipValid reports whether user is a valid member of orgID
+// under orgMembershipRowsValid. It fails closed: a nil database or a failed
+// membership query rejects the user.
+func orgMemberMembershipValid(db *gorm.DB, user *models.User, orgID uuid.UUID) bool {
+	if db == nil || user == nil || user.ID == uuid.Nil || orgID == uuid.Nil {
+		return false
+	}
+	byUser, err := loadOrgMembershipRows(db, []uuid.UUID{user.ID}, orgID)
+	if err != nil {
+		return false
+	}
+	return orgMembershipRowsValid(db, user, orgID, byUser[user.ID])
+}
+
+// orgMemberUserQuery scopes a users query to one user who belongs to orgID.
+// GORM adds users.deleted_at IS NULL for models.User automatically.
+func orgMemberUserQuery(db *gorm.DB, userID, orgID uuid.UUID, activeOnly bool) *gorm.DB {
+	query := db.Where("users.id = ?", userID).Where(orgMemberUserCondition, orgID, orgID)
+	if activeOnly {
+		query = query.Where("users.is_active = ?", true)
+	}
+	return query
+}
+
+// lookupOrgMemberUser returns a non-deleted user who is a valid member of
+// orgID (home organization or user_organizations membership). With
+// activeOnly, deactivated users are rejected as well. It writes no response.
+func lookupOrgMemberUser(db *gorm.DB, userID, orgID uuid.UUID, activeOnly bool) (*models.User, bool) {
+	if db == nil || userID == uuid.Nil || orgID == uuid.Nil {
+		return nil, false
+	}
+	var user models.User
+	if err := orgMemberUserQuery(db, userID, orgID, activeOnly).First(&user).Error; err != nil {
+		return nil, false
+	}
+	if !orgMemberMembershipValid(db, &user, orgID) {
+		return nil, false
+	}
+	return &user, true
+}
+
+// findOrgMemberUser is the membership-aware counterpart of
+// findByIDAndOrg[models.User]. users.organization_id is only a user's home
+// organization; members working in another organization are recorded in
+// user_organizations, so a home-column lookup wrongly 404s them. On failure it
+// sends the same 404 "<label> not found" envelope and returns errEnvelopeSent.
+func findOrgMemberUser(db *gorm.DB, r *fastglue.Request, userID, orgID uuid.UUID, label string, activeOnly bool) (*models.User, error) {
+	user, ok := lookupOrgMemberUser(db, userID, orgID, activeOnly)
+	if !ok {
+		_ = r.SendErrorEnvelope(fasthttp.StatusNotFound, label+" not found", nil, "")
+		return nil, errEnvelopeSent
+	}
+	return user, nil
 }
 
 // logAudit records an audit-log entry for a resource mutation, resolving the

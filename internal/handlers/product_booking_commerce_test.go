@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +18,781 @@ import (
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
 )
+
+func TestBookingLifecyclePermissionMatrixAndFieldPreservation(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	for mask := 0; mask < 8; mask++ {
+		keys := []string{}
+		for bit, action := range []string{models.ActionRead, models.ActionWrite, models.ActionDelete} {
+			if mask&(1<<bit) != 0 {
+				keys = append(keys, models.ResourceBookingSettings+":"+action)
+			}
+		}
+		for _, service := range []bool{true, false} {
+			for _, operation := range []string{"edit", "activate", "deactivate", "delete"} {
+				t.Run(fmt.Sprintf("%03b/service_%t/%s", mask, service, operation), func(t *testing.T) {
+					app := &App{DB: db, Log: testutil.NopLogger()}
+					org := testutil.CreateTestOrganization(t, db)
+					role := createBookingCommerceTestRoleWithKeys(t, db, org.ID, "lifecycle", keys)
+					user := testutil.CreateTestUser(t, db, org.ID, testutil.WithRoleID(&role.ID))
+					enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+					s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+					if operation == "deactivate" {
+						require.NoError(t, db.Model(&s).UpdateColumn("is_active", true).Error)
+						require.NoError(t, db.Model(&resource).UpdateColumn("is_active", true).Error)
+					}
+					id := resource.ID
+					if service {
+						id = s.ID
+					}
+					before := bookingCommerceRowsSnapshot(t, db, org.ID, "booking_services", "booking_resources", "audit_logs")
+					var req *fastglue.Request
+					var err error
+					if operation == "delete" {
+						req = newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+						if service {
+							err = app.DeleteBookingService(req)
+						} else {
+							err = app.DeleteBookingResource(req)
+						}
+					} else {
+						var active *bool
+						if operation == "activate" || operation == "deactivate" {
+							value := operation == "activate"
+							active = &value
+						}
+						if service {
+							payload := bookingLifecycleServicePayload(s)
+							payload.IsActive = active
+							req = testutil.NewJSONRequest(t, payload)
+							testutil.SetAuthContext(req, org.ID, user.ID)
+							testutil.SetPathParam(req, "id", id.String())
+							err = app.UpdateBookingService(req)
+						} else {
+							payload := bookingLifecycleResourcePayload(resource)
+							payload.IsActive = active
+							req = testutil.NewJSONRequest(t, payload)
+							testutil.SetAuthContext(req, org.ID, user.ID)
+							testutil.SetPathParam(req, "id", id.String())
+							err = app.UpdateBookingResource(req)
+						}
+					}
+					require.NoError(t, err)
+					allowed := mask&2 != 0
+					if operation == "delete" {
+						allowed = mask&4 != 0
+					}
+					if !allowed {
+						testutil.AssertErrorResponse(t, req, fasthttp.StatusForbidden, "Insufficient permissions")
+						require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, "booking_services", "booking_resources", "audit_logs"))
+						return
+					}
+					require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(req.RequestCtx.Response.Body()))
+					if operation == "delete" {
+						assertBookingLifecycleDeleted(t, db, org.ID, id, service, 2)
+						var response DeleteBookingDefinitionResponse
+						testutil.ParseEnvelopeResponse(t, req, &response)
+						require.Equal(t, (DeleteBookingDefinitionResponse{ID: id, Version: 2, Deleted: true}), response)
+						return
+					}
+					if service {
+						var stored models.BookingService
+						require.NoError(t, db.First(&stored, "id = ?", id).Error)
+						require.Equal(t, operation == "activate", stored.IsActive)
+						require.Equal(t, s.BufferBeforeMins, stored.BufferBeforeMins)
+						require.Equal(t, s.BufferAfterMins, stored.BufferAfterMins)
+						require.Equal(t, s.ReminderPolicy, stored.ReminderPolicy)
+						require.Equal(t, s.Metadata, stored.Metadata)
+						require.Equal(t, s.PriceMinor, stored.PriceMinor)
+						var response BookingServiceResponse
+						testutil.ParseEnvelopeResponse(t, req, &response)
+						require.Empty(t, response.ResourceIDs, "empty associations must stay empty")
+					} else {
+						var stored models.BookingResource
+						require.NoError(t, db.First(&stored, "id = ?", id).Error)
+						require.Equal(t, operation == "activate", stored.IsActive)
+						require.Equal(t, resource.Timezone, stored.Timezone)
+						require.Equal(t, resource.Location, stored.Location)
+						require.Equal(t, resource.Metadata, stored.Metadata)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestBookingLifecycleDeleteRejectsTenantLicenseVersionAndConfirmation(t *testing.T) {
+	for _, service := range []bool{true, false} {
+		for _, scenario := range []string{"tenant", "license", "stale", "active", "missing", "deleted", "unconfirmed", "zero_version", "malformed_id"} {
+			t.Run(fmt.Sprintf("service_%t/%s", service, scenario), func(t *testing.T) {
+				db := testutil.SetupTestDB(t)
+				app := &App{DB: db, Log: testutil.NopLogger()}
+				org := testutil.CreateTestOrganization(t, db)
+				actorOrg := org
+				if scenario == "tenant" {
+					actorOrg = testutil.CreateTestOrganization(t, db)
+				}
+				role := createBookingCommerceTestRoleWithKeys(t, db, actorOrg.ID, "deleter", []string{"booking.settings:delete"})
+				user := testutil.CreateTestUser(t, db, actorOrg.ID, testutil.WithRoleID(&role.ID))
+				if scenario != "license" {
+					enableBookingCommerceTestEntitlement(t, db, actorOrg.ID, user.ID, "bookings.enabled")
+				}
+				s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+				id, model := resource.ID, any(&resource)
+				if service {
+					id, model = s.ID, &s
+				}
+				input := DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true}
+				status, message := fasthttp.StatusConflict, "was modified"
+				switch scenario {
+				case "tenant", "missing", "deleted":
+					status, message = fasthttp.StatusNotFound, "not found"
+					if scenario == "missing" {
+						id = uuid.New()
+					}
+					if scenario == "deleted" {
+						require.NoError(t, db.Delete(model).Error)
+					}
+				case "license":
+					status, message = fasthttp.StatusPaymentRequired, "Feature is not included"
+				case "stale":
+					input.Version++
+				case "active":
+					require.NoError(t, db.Model(model).UpdateColumn("is_active", true).Error)
+					message = "Deactivate"
+				case "unconfirmed":
+					input.ConfirmDelete = false
+					status, message = fasthttp.StatusBadRequest, "confirm_delete"
+				case "zero_version":
+					input.Version = 0
+					status, message = fasthttp.StatusBadRequest, "version"
+				case "malformed_id":
+					status, message = fasthttp.StatusBadRequest, "Invalid"
+				}
+				before := bookingCommerceRowsSnapshot(t, db, org.ID, "booking_services", "booking_resources", "audit_logs")
+				req := newBookingLifecycleDelete(t, actorOrg.ID, user.ID, id, input)
+				if scenario == "malformed_id" {
+					testutil.SetPathParam(req, "id", "not-a-uuid")
+				}
+				if service {
+					require.NoError(t, app.DeleteBookingService(req))
+				} else {
+					require.NoError(t, app.DeleteBookingResource(req))
+				}
+				testutil.AssertErrorResponse(t, req, status, message)
+				require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, "booking_services", "booking_resources", "audit_logs"))
+			})
+		}
+	}
+}
+
+func TestBookingLifecycleDeleteProtectsCurrentAndSoftDeletedDependencies(t *testing.T) {
+	for _, service := range []bool{true, false} {
+		kinds := []string{"event", "link"}
+		if service {
+			kinds = append(kinds, "entitlement")
+		} else {
+			kinds = append(kinds, "availability", "time_off")
+		}
+		for _, kind := range kinds {
+			for _, historical := range []bool{false, true} {
+				t.Run(fmt.Sprintf("service_%t/%s/deleted_%t", service, kind, historical), func(t *testing.T) {
+					db := testutil.SetupTestDB(t)
+					app := &App{DB: db, Log: testutil.NopLogger()}
+					org := testutil.CreateTestOrganization(t, db)
+					user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+					enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+					s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+					var dependency any
+					switch kind {
+					case "event":
+						start := time.Now().UTC().Add(-time.Hour)
+						dependency = &models.BookingEvent{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+							ServiceID: s.ID, ResourceID: resource.ID, StartsAt: start, EndsAt: start.Add(30 * time.Minute),
+							Capacity: 1, Status: models.BookingEventStatusCancelled, Version: 1}
+					case "link":
+						dependency = &models.BookingServiceResource{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+							ServiceID: s.ID, ResourceID: resource.ID, Version: 1}
+					case "entitlement":
+						pkg := createBookingCommercePackageFixture(t, db, org.ID)
+						dependency = &models.PackageEntitlement{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+							PackageDefinitionID: pkg.ID, BookingServiceID: s.ID, Credits: 1, Version: 1}
+					case "availability":
+						dependency = &models.AvailabilityRule{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+							ResourceID: resource.ID, Weekday: 1, StartLocalTime: "09:00", EndLocalTime: "17:00", Version: 1}
+					case "time_off":
+						start := time.Now().UTC().Add(-time.Hour)
+						dependency = &models.ResourceTimeOff{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+							ResourceID: resource.ID, StartsAt: start, EndsAt: start.Add(30 * time.Minute), Reason: "Retained", Version: 1}
+					}
+					require.NoError(t, db.Create(dependency).Error)
+					if historical {
+						require.NoError(t, db.Delete(dependency).Error)
+					}
+					id := resource.ID
+					if service {
+						id = s.ID
+					}
+					tables := []string{"booking_services", "booking_resources", "booking_events", "booking_service_resources",
+						"availability_rules", "resource_time_off", "package_definitions", "package_entitlements", "audit_logs"}
+					before := bookingCommerceRowsSnapshot(t, db, org.ID, tables...)
+					req := newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+					if service {
+						require.NoError(t, app.DeleteBookingService(req))
+					} else {
+						require.NoError(t, app.DeleteBookingResource(req))
+					}
+					testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "history or remaining dependencies")
+					require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, tables...), "never cascade or rewrite history")
+				})
+			}
+		}
+	}
+}
+
+func TestBookingLifecycleDeletePreservesFormerScheduleAndPurchaseHistory(t *testing.T) {
+	for _, kind := range []string{"service_event", "resource_event", "purchase", "invoice", "malformed_event", "malformed_package"} {
+		t.Run(kind, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			app := &App{DB: db, Log: testutil.NopLogger()}
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+			enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+			s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+			service := kind != "resource_event"
+			id, field := s.ID, "service_id"
+			if !service {
+				id, field = resource.ID, "resource_id"
+			}
+			log := models.AuditLog{ID: uuid.New(), OrganizationID: org.ID, UserID: user.ID, UserName: "Synthetic operator",
+				ResourceType: bookingEventAuditResource, ResourceID: uuid.New(), Action: models.AuditActionUpdated,
+				Changes: models.JSONBArray{map[string]any{"field": field, "old_value": id.String(), "new_value": uuid.NewString()}}}
+			if kind == "malformed_event" {
+				log.Changes = models.JSONBArray{map[string]any{"field": field, "old_value": 12}}
+			}
+			if kind == "purchase" || kind == "invoice" || kind == "malformed_package" {
+				pkg := createBookingCommercePackageFixture(t, db, org.ID)
+				log.ResourceType, log.ResourceID = packageAuditResource, pkg.ID
+				log.Changes = models.JSONBArray{map[string]any{"field": "entitlements", "new_value": []any{map[string]any{"booking_service_id": id.String()}}}}
+				contact := testutil.CreateTestContact(t, db, org.ID)
+				if kind == "purchase" {
+					purchase := models.ContactPackage{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+						ContactID: contact.ID, PackageDefinitionID: pkg.ID, Status: models.ContactPackageStatusActive,
+						Currency: "MYR", IdempotencyKey: uuid.NewString(), Version: 1}
+					require.NoError(t, db.Create(&purchase).Error)
+					require.NoError(t, db.Delete(&purchase).Error)
+				} else if kind == "invoice" {
+					invoice := models.CommerceInvoice{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+						ContactID: contact.ID, InvoiceNumber: uuid.NewString(), IdempotencyKey: uuid.NewString(),
+						Status: models.CommerceInvoiceStatusDraft, Currency: "MYR", Version: 1}
+					require.NoError(t, db.Create(&invoice).Error)
+					line := models.InvoiceLine{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+						InvoiceID: invoice.ID, PackageDefinitionID: &pkg.ID, Description: "Historical service", Quantity: 1, Version: 1}
+					require.NoError(t, db.Create(&line).Error)
+					require.NoError(t, db.Delete(&line).Error)
+				} else {
+					log.Changes = models.JSONBArray{map[string]any{"field": "entitlements", "new_value": "unknown"}}
+				}
+			}
+			require.NoError(t, db.Create(&log).Error)
+			tables := []string{"booking_services", "booking_resources", "package_definitions", "contact_packages", "invoice_lines", "audit_logs"}
+			before := bookingCommerceRowsSnapshot(t, db, org.ID, tables...)
+			req := newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+			if service {
+				require.NoError(t, app.DeleteBookingService(req))
+			} else {
+				require.NoError(t, app.DeleteBookingResource(req))
+			}
+			testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "history")
+			require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, tables...))
+		})
+	}
+}
+
+func TestBookingLifecycleDeleteAllowsRemovedSetupOnlyLinks(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+	s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		if err := replaceBookingServiceResources(tx, org.ID, s.ID, []uuid.UUID{resource.ID}); err != nil {
+			return err
+		}
+		return replaceBookingServiceResources(tx, org.ID, s.ID, nil)
+	}))
+	// Historical package configuration alone is not a purchase: no customer,
+	// invoice, credit or schedule ever used this former setup association.
+	pkg := createBookingCommercePackageFixture(t, db, org.ID)
+	log := models.AuditLog{ID: uuid.New(), OrganizationID: org.ID, UserID: user.ID, UserName: "Synthetic operator",
+		ResourceType: packageAuditResource, ResourceID: pkg.ID, Action: models.AuditActionUpdated,
+		Changes: models.JSONBArray{map[string]any{"field": "entitlements", "new_value": []any{map[string]any{"booking_service_id": s.ID.String()}}}}}
+	require.NoError(t, db.Create(&log).Error)
+	for _, service := range []bool{true, false} {
+		id := resource.ID
+		if service {
+			id = s.ID
+		}
+		req := newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+		if service {
+			require.NoError(t, app.DeleteBookingService(req))
+		} else {
+			require.NoError(t, app.DeleteBookingResource(req))
+		}
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+		assertBookingLifecycleDeleted(t, db, org.ID, id, service, 2)
+	}
+}
+
+func TestBookingLifecycleDeleteAuditFailureRollsBackTombstone(t *testing.T) {
+	for _, service := range []bool{true, false} {
+		t.Run(fmt.Sprintf("service_%t", service), func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			app := &App{DB: db, Log: testutil.NopLogger()}
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+			enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+			s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+			id := resource.ID
+			if service {
+				id = s.ID
+			}
+			before := bookingCommerceRowsSnapshot(t, db, org.ID, "booking_services", "booking_resources", "audit_logs")
+			callback := "test:lifecycle_audit_failure:" + uuid.NewString()
+			reached := false
+			require.NoError(t, db.Callback().Create().After("gorm:create").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "audit_logs" {
+					reached = true
+					tx.AddError(assert.AnError)
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, db.Callback().Create().Remove(callback)) })
+			req := newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+			if service {
+				require.NoError(t, app.DeleteBookingService(req))
+			} else {
+				require.NoError(t, app.DeleteBookingResource(req))
+			}
+			require.True(t, reached)
+			require.Equal(t, fasthttp.StatusInternalServerError, testutil.GetResponseStatusCode(req))
+			require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, "booking_services", "booking_resources", "audit_logs"))
+		})
+	}
+}
+
+func TestBookingLifecycleReferenceWritersFenceDeletion(t *testing.T) {
+	for _, kind := range []string{"resource_link", "service_entitlement", "service_event", "resource_event", "resource_availability"} {
+		t.Run(kind, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+			enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+			s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+			service := strings.HasPrefix(kind, "service_")
+			id := resource.ID
+			if service {
+				id = s.ID
+			}
+			holder := db.Begin()
+			require.NoError(t, holder.Error)
+			t.Cleanup(func() { _ = holder.Rollback().Error })
+			var holderPID int
+			require.NoError(t, holder.Raw("SELECT pg_backend_pid()").Scan(&holderPID).Error)
+			switch kind {
+			case "resource_link":
+				require.NoError(t, validateBookingResourceIDs(holder, org.ID, []uuid.UUID{resource.ID}))
+				require.NoError(t, replaceBookingServiceResources(holder, org.ID, s.ID, []uuid.UUID{resource.ID}))
+			case "service_entitlement":
+				require.NoError(t, holder.Model(&s).UpdateColumn("is_active", true).Error)
+				input := []PackageEntitlementInput{{BookingServiceID: s.ID, Credits: 1}}
+				require.NoError(t, validatePackageEntitlementReferences(holder, org.ID, input))
+				pkg := models.PackageDefinition{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+					Name: uuid.NewString(), Currency: "MYR", ValidityDays: 30, Version: 1}
+				require.NoError(t, holder.Create(&pkg).Error)
+				links := packageEntitlementsFromInput(org.ID, pkg.ID, input)
+				require.NoError(t, holder.Create(&links).Error)
+				require.NoError(t, holder.Model(&s).UpdateColumn("is_active", false).Error)
+			case "service_event", "resource_event":
+				require.NoError(t, holder.Model(&s).UpdateColumn("is_active", true).Error)
+				require.NoError(t, holder.Model(&resource).UpdateColumn("is_active", true).Error)
+				_, _, err := validateBookingEventReferences(holder, org.ID, s.ID, resource.ID)
+				require.NoError(t, err)
+				start := time.Now().UTC().Add(time.Hour)
+				event := models.BookingEvent{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+					ServiceID: s.ID, ResourceID: resource.ID, StartsAt: start, EndsAt: start.Add(time.Hour),
+					Capacity: 1, Status: models.BookingEventStatusScheduled, Version: 1}
+				require.NoError(t, holder.Create(&event).Error)
+				require.NoError(t, holder.Model(&s).UpdateColumn("is_active", false).Error)
+				require.NoError(t, holder.Model(&resource).UpdateColumn("is_active", false).Error)
+			case "resource_availability":
+				require.NoError(t, ensureBookingResourceTenant(holder, org.ID, resource.ID, true))
+				rule := models.AvailabilityRule{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+					ResourceID: resource.ID, Weekday: 1, StartLocalTime: "09:00", EndLocalTime: "17:00", Version: 1}
+				require.NoError(t, holder.Create(&rule).Error)
+			}
+			req := newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+			pid := make(chan int, 1)
+			done := make(chan error, 1)
+			go func() {
+				done <- db.Connection(func(conn *gorm.DB) error {
+					// Keep the pinned connection while isolating each query's statement.
+					conn = conn.Session(&gorm.Session{NewDB: true})
+					var workerPID int
+					if err := conn.Raw("SELECT pg_backend_pid()").Scan(&workerPID).Error; err != nil {
+						return err
+					}
+					pid <- workerPID
+					app := &App{DB: conn, Log: testutil.NopLogger()}
+					if service {
+						return app.DeleteBookingService(req)
+					}
+					return app.DeleteBookingResource(req)
+				})
+			}()
+			workerPID := awaitBookingLifecyclePID(t, pid)
+			require.Eventually(t, func() bool {
+				var blocked bool
+				return db.Raw("SELECT ? = ANY(pg_blocking_pids(?))", holderPID, workerPID).Scan(&blocked).Error == nil && blocked
+			}, 5*time.Second, 10*time.Millisecond, "delete must wait on the reference writer, not inspect an uncommitted empty inventory")
+			require.NoError(t, holder.Commit().Error)
+			require.NoError(t, awaitBookingLifecycleResult(t, done))
+			testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "history or remaining dependencies")
+		})
+	}
+
+	// Prove the service SHARE read itself holds the fence. Definitions are
+	// already active before BEGIN, and no reference INSERT or service UPDATE
+	// occurs in the holder until the concurrent deactivation is visibly blocked.
+	for _, kind := range []string{"service_entitlement", "service_event"} {
+		t.Run(kind+"_share_read_blocks_deactivation", func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+			enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+			s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+			require.NoError(t, db.Model(&s).UpdateColumn("is_active", true).Error)
+			require.NoError(t, db.Model(&resource).UpdateColumn("is_active", true).Error)
+
+			holder := db.Begin()
+			require.NoError(t, holder.Error)
+			t.Cleanup(func() { _ = holder.Rollback().Error })
+			var holderPID int
+			require.NoError(t, holder.Raw("SELECT pg_backend_pid()").Scan(&holderPID).Error)
+			input := []PackageEntitlementInput{{BookingServiceID: s.ID, Credits: 1}}
+			if kind == "service_entitlement" {
+				require.NoError(t, validatePackageEntitlementReferences(holder, org.ID, input))
+			} else {
+				_, _, err := validateBookingEventReferences(holder, org.ID, s.ID, resource.ID)
+				require.NoError(t, err)
+			}
+
+			inactive := false
+			payload := bookingLifecycleServicePayload(s)
+			payload.IsActive = &inactive
+			edit := testutil.NewJSONRequest(t, payload)
+			testutil.SetAuthContext(edit, org.ID, user.ID)
+			testutil.SetPathParam(edit, "id", s.ID.String())
+			pid, done := make(chan int, 1), make(chan error, 1)
+			go func() {
+				done <- db.Connection(func(conn *gorm.DB) error {
+					// Keep the pinned connection while isolating each query's statement.
+					conn = conn.Session(&gorm.Session{NewDB: true})
+					var workerPID int
+					if err := conn.Raw("SELECT pg_backend_pid()").Scan(&workerPID).Error; err != nil {
+						return err
+					}
+					pid <- workerPID
+					app := &App{DB: conn, Log: testutil.NopLogger()}
+					return app.UpdateBookingService(edit)
+				})
+			}()
+			workerPID := awaitBookingLifecyclePID(t, pid)
+			require.Eventually(t, func() bool {
+				var blocked bool
+				return db.Raw("SELECT ? = ANY(pg_blocking_pids(?))", holderPID, workerPID).Scan(&blocked).Error == nil && blocked
+			}, 5*time.Second, 10*time.Millisecond, "the helper's SHARE lock alone must fence service deactivation")
+
+			if kind == "service_entitlement" {
+				pkg := models.PackageDefinition{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+					Name: uuid.NewString(), Currency: "MYR", ValidityDays: 30, Version: 1}
+				require.NoError(t, holder.Create(&pkg).Error)
+				links := packageEntitlementsFromInput(org.ID, pkg.ID, input)
+				require.NoError(t, holder.Create(&links).Error)
+			} else {
+				start := time.Now().UTC().Add(time.Hour)
+				event := models.BookingEvent{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+					ServiceID: s.ID, ResourceID: resource.ID, StartsAt: start, EndsAt: start.Add(time.Hour),
+					Capacity: 1, Status: models.BookingEventStatusScheduled, Version: 1}
+				require.NoError(t, holder.Create(&event).Error)
+			}
+			require.NoError(t, holder.Commit().Error)
+			require.NoError(t, awaitBookingLifecycleResult(t, done))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(edit))
+
+			var stored models.BookingService
+			require.NoError(t, db.First(&stored, "organization_id = ? AND id = ?", org.ID, s.ID).Error)
+			require.False(t, stored.IsActive)
+			require.EqualValues(t, 2, stored.Version)
+			deletion := newBookingLifecycleDelete(t, org.ID, user.ID, s.ID, DeleteBookingDefinitionRequest{Version: 2, ConfirmDelete: true})
+			app := &App{DB: db, Log: testutil.NopLogger()}
+			require.NoError(t, app.DeleteBookingService(deletion))
+			testutil.AssertErrorResponse(t, deletion, fasthttp.StatusConflict, "history or remaining dependencies")
+		})
+	}
+
+}
+
+func TestBookingLifecycleCommittedDeleteRejectsWaitingReferenceWriters(t *testing.T) {
+	for _, kind := range []string{"resource_link", "service_entitlement", "service_event", "resource_event", "resource_availability"} {
+		t.Run(kind, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+			enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+			s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+			service := strings.HasPrefix(kind, "service_")
+			id, table := resource.ID, "booking_resources"
+			if service {
+				id, table = s.ID, "booking_services"
+			}
+			// The other event definition is active so the candidate reaches the
+			// exact deleted-definition read rather than failing for another ID.
+			if kind == "resource_event" {
+				require.NoError(t, db.Model(&s).UpdateColumn("is_active", true).Error)
+			}
+			if kind == "service_event" {
+				require.NoError(t, db.Model(&resource).UpdateColumn("is_active", true).Error)
+			}
+			tombstoneWritten := make(chan int, 1)
+			release := make(chan struct{})
+			var once sync.Once
+			t.Cleanup(func() { once.Do(func() { close(release) }) })
+			callback := "test:lifecycle_delete_fence:" + uuid.NewString()
+			require.NoError(t, db.Callback().Update().After("gorm:update").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table != table {
+					return
+				}
+				values, ok := tx.Statement.Dest.(map[string]any)
+				if !ok || values["deleted_at"] == nil {
+					return
+				}
+				var holderPID int
+				if err := tx.Session(&gorm.Session{NewDB: true}).Raw("SELECT pg_backend_pid()").Scan(&holderPID).Error; err != nil {
+					tx.AddError(err)
+					return
+				}
+				tombstoneWritten <- holderPID
+				select {
+				case <-release:
+				case <-time.After(10 * time.Second):
+					tx.AddError(fmt.Errorf("test fence was not released"))
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove(callback)) })
+			req := newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+			deleted := make(chan error, 1)
+			go func() {
+				app := &App{DB: db, Log: testutil.NopLogger()}
+				if service {
+					deleted <- app.DeleteBookingService(req)
+				} else {
+					deleted <- app.DeleteBookingResource(req)
+				}
+			}()
+			holderPID := awaitBookingLifecyclePID(t, tombstoneWritten)
+			pid := make(chan int, 1)
+			written := make(chan error, 1)
+			go func() {
+				written <- db.Connection(func(conn *gorm.DB) error {
+					// Keep the pinned connection while isolating each query's statement.
+					conn = conn.Session(&gorm.Session{NewDB: true})
+					var workerPID int
+					if err := conn.Raw("SELECT pg_backend_pid()").Scan(&workerPID).Error; err != nil {
+						return err
+					}
+					pid <- workerPID
+					return conn.Transaction(func(tx *gorm.DB) error {
+						switch kind {
+						case "resource_link":
+							return validateBookingResourceIDs(tx, org.ID, []uuid.UUID{resource.ID})
+						case "service_entitlement":
+							return validatePackageEntitlementReferences(tx, org.ID, []PackageEntitlementInput{{BookingServiceID: s.ID, Credits: 1}})
+						case "service_event", "resource_event":
+							_, _, err := validateBookingEventReferences(tx, org.ID, s.ID, resource.ID)
+							return err
+						default:
+							return ensureBookingResourceTenant(tx, org.ID, resource.ID, true)
+						}
+					})
+				})
+			}()
+			workerPID := awaitBookingLifecyclePID(t, pid)
+			// Active-only writers may reject the inactive predecessor immediately.
+			// Link/availability writers accept inactive definitions and must wait.
+			if kind == "resource_link" || kind == "resource_availability" {
+				require.Eventually(t, func() bool {
+					var blocked bool
+					return db.Raw("SELECT ? = ANY(pg_blocking_pids(?))", holderPID, workerPID).Scan(&blocked).Error == nil && blocked
+				}, 5*time.Second, 10*time.Millisecond)
+			}
+			once.Do(func() { close(release) })
+			require.NoError(t, awaitBookingLifecycleResult(t, deleted))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+			require.Error(t, awaitBookingLifecycleResult(t, written), "a waiting writer cannot validate a tombstone")
+			assertBookingLifecycleDeleted(t, db, org.ID, id, service, 2)
+		})
+	}
+}
+
+func TestBookingLifecycleConcurrentActivationAndDeleteCommitOnce(t *testing.T) {
+	for _, service := range []bool{true, false} {
+		t.Run(fmt.Sprintf("service_%t", service), func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			app := &App{DB: db, Log: testutil.NopLogger()}
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+			enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+			s, resource := createBookingLifecycleDefinitions(t, db, org.ID)
+			id := resource.ID
+			active := true
+			var edit *fastglue.Request
+			if service {
+				id = s.ID
+				payload := bookingLifecycleServicePayload(s)
+				payload.IsActive = &active
+				edit = testutil.NewJSONRequest(t, payload)
+			} else {
+				payload := bookingLifecycleResourcePayload(resource)
+				payload.IsActive = &active
+				edit = testutil.NewJSONRequest(t, payload)
+			}
+			testutil.SetAuthContext(edit, org.ID, user.ID)
+			testutil.SetPathParam(edit, "id", id.String())
+			deletion := newBookingLifecycleDelete(t, org.ID, user.ID, id, DeleteBookingDefinitionRequest{Version: 1, ConfirmDelete: true})
+			start, results := make(chan struct{}), make(chan error, 2)
+			go func() {
+				<-start
+				if service {
+					results <- app.UpdateBookingService(edit)
+				} else {
+					results <- app.UpdateBookingResource(edit)
+				}
+			}()
+			go func() {
+				<-start
+				if service {
+					results <- app.DeleteBookingService(deletion)
+				} else {
+					results <- app.DeleteBookingResource(deletion)
+				}
+			}()
+			close(start)
+			require.NoError(t, awaitBookingLifecycleResult(t, results))
+			require.NoError(t, awaitBookingLifecycleResult(t, results))
+			statuses := []int{testutil.GetResponseStatusCode(edit), testutil.GetResponseStatusCode(deletion)}
+			successes := 0
+			for _, status := range statuses {
+				if status == fasthttp.StatusOK {
+					successes++
+				} else {
+					require.Contains(t, []int{fasthttp.StatusNotFound, fasthttp.StatusConflict}, status)
+				}
+			}
+			require.Equal(t, 1, successes)
+			var count int64
+			require.NoError(t, db.Model(&models.AuditLog{}).Where("organization_id = ? AND resource_id = ?", org.ID, id).Count(&count).Error)
+			require.EqualValues(t, 1, count)
+		})
+	}
+}
+
+func awaitBookingLifecyclePID(t *testing.T, result <-chan int) int {
+	t.Helper()
+	select {
+	case pid := <-result:
+		return pid
+	case <-time.After(8 * time.Second):
+		t.Fatal("timed out awaiting isolated PostgreSQL session")
+		return 0
+	}
+}
+
+func awaitBookingLifecycleResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(12 * time.Second):
+		t.Fatal("timed out awaiting fenced lifecycle operation")
+		return nil
+	}
+}
+
+func createBookingLifecycleDefinitions(t *testing.T, db *gorm.DB, orgID uuid.UUID) (models.BookingService, models.BookingResource) {
+	t.Helper()
+	service := models.BookingService{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		Name: "Lifecycle service " + uuid.NewString(), Description: "Preserved description",
+		Kind: models.BookingServiceKindAppointment, DurationMinutes: 45, BufferBeforeMins: 5, BufferAfterMins: 10,
+		DefaultCapacity: 2, PriceMinor: 2500, Currency: "MYR", ReminderPolicy: models.JSONB{"email": true},
+		Metadata: models.JSONB{"synthetic": "service"}, Version: 1}
+	resource := models.BookingResource{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		Name: "Lifecycle resource " + uuid.NewString(), Kind: models.BookingResourceKindRoom,
+		Timezone: "Asia/Kuala_Lumpur", Location: "Synthetic room", Metadata: models.JSONB{"synthetic": "resource"}, Version: 1}
+	require.NoError(t, db.Create(&service).Error)
+	require.NoError(t, db.Create(&resource).Error)
+	require.NoError(t, db.Model(&service).UpdateColumn("is_active", false).Error)
+	require.NoError(t, db.Model(&resource).UpdateColumn("is_active", false).Error)
+	service.IsActive, resource.IsActive = false, false
+	return service, resource
+}
+
+func bookingLifecycleServicePayload(service models.BookingService) BookingServiceRequest {
+	return BookingServiceRequest{Name: service.Name, Description: service.Description, Kind: service.Kind,
+		DurationMinutes: service.DurationMinutes, BufferBeforeMinutes: service.BufferBeforeMins, BufferAfterMinutes: service.BufferAfterMins,
+		DefaultCapacity: service.DefaultCapacity, PriceMinor: service.PriceMinor, Currency: service.Currency,
+		ReminderPolicy: service.ReminderPolicy, Metadata: service.Metadata, Version: service.Version, ResourceIDs: []uuid.UUID{}}
+}
+
+func bookingLifecycleResourcePayload(resource models.BookingResource) BookingResourceRequest {
+	return BookingResourceRequest{UserID: resource.UserID, Name: resource.Name, Kind: resource.Kind, Timezone: resource.Timezone,
+		Location: resource.Location, Metadata: resource.Metadata, Version: resource.Version}
+}
+
+func newBookingLifecycleDelete(t *testing.T, orgID, userID, id uuid.UUID, payload DeleteBookingDefinitionRequest) *fastglue.Request {
+	t.Helper()
+	req := testutil.NewJSONRequest(t, payload)
+	testutil.SetAuthContext(req, orgID, userID)
+	testutil.SetPathParam(req, "id", id.String())
+	return req
+}
+
+func assertBookingLifecycleDeleted(t *testing.T, db *gorm.DB, orgID, id uuid.UUID, service bool, version int64) {
+	t.Helper()
+	var scoped any = &models.BookingResource{}
+	var stored any = &models.BookingResource{}
+	kind := bookingResourceAuditResource
+	if service {
+		scoped, stored, kind = &models.BookingService{}, &models.BookingService{}, bookingServiceAuditResource
+	}
+	require.ErrorIs(t, db.First(scoped, "organization_id = ? AND id = ?", orgID, id).Error, gorm.ErrRecordNotFound)
+	require.NoError(t, db.Unscoped().First(stored, "organization_id = ? AND id = ?", orgID, id).Error)
+	if service {
+		row := stored.(*models.BookingService)
+		require.True(t, row.DeletedAt.Valid)
+		require.False(t, row.IsActive)
+		require.Equal(t, version, row.Version)
+	} else {
+		row := stored.(*models.BookingResource)
+		require.True(t, row.DeletedAt.Valid)
+		require.False(t, row.IsActive)
+		require.Equal(t, version, row.Version)
+	}
+	var logs []models.AuditLog
+	require.NoError(t, db.Where("organization_id = ? AND resource_type = ? AND resource_id = ? AND action = ?",
+		orgID, kind, id, models.AuditActionDeleted).Find(&logs).Error)
+	require.Len(t, logs, 1)
+}
 
 func TestBookingCommerceValidation(t *testing.T) {
 	t.Parallel()
@@ -832,6 +1610,491 @@ func TestSellContactPackageTransactionRollsBackBothRecordsOnFailure(t *testing.T
 		Count(&contactPackageCount).Error)
 	assert.Zero(t, invoiceCount)
 	assert.Zero(t, contactPackageCount)
+}
+
+func TestBookingCommerceCreateActiveStatePersistsAndAudits(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+	event := createCapacityRaceBookingEvent(t, db, org.ID, user.ID, 1)
+	active, inactive := true, false
+	for _, tc := range []struct {
+		name  string
+		input *bool
+		want  bool
+	}{
+		{"omitted", nil, true}, {"true", &active, true}, {"false", &inactive, false},
+	} {
+		t.Run("service_"+tc.name, func(t *testing.T) {
+			req := testutil.NewJSONRequest(t, BookingServiceRequest{
+				Name: "Create state service " + uuid.NewString(), Kind: models.BookingServiceKindAppointment,
+				DurationMinutes: 30, DefaultCapacity: 1, Currency: "MYR",
+				IsActive: tc.input, ResourceIDs: []uuid.UUID{event.ResourceID},
+			})
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			require.NoError(t, app.CreateBookingService(req))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+			var response BookingServiceResponse
+			testutil.ParseEnvelopeResponse(t, req, &response)
+			var stored models.BookingService
+			require.NoError(t, db.First(&stored, "id = ? AND organization_id = ?", response.ID, org.ID).Error)
+			require.Equal(t, tc.want, stored.IsActive)
+			require.Equal(t, stored.IsActive, response.IsActive)
+			require.EqualValues(t, 1, stored.Version)
+			var links []models.BookingServiceResource
+			require.NoError(t, db.Where("organization_id = ? AND service_id = ?", org.ID, stored.ID).Find(&links).Error)
+			require.Len(t, links, 1)
+			require.Equal(t, event.ResourceID, links[0].ResourceID)
+			require.Equal(t, []uuid.UUID{event.ResourceID}, response.ResourceIDs)
+			assertBookingCommerceAuditActive(t, db, org.ID, stored.ID, models.AuditActionCreated, nil, tc.want)
+		})
+		t.Run("resource_"+tc.name, func(t *testing.T) {
+			req := testutil.NewJSONRequest(t, BookingResourceRequest{
+				Name: "Create state room " + uuid.NewString(), Kind: models.BookingResourceKindRoom,
+				Timezone: "Asia/Kuala_Lumpur", IsActive: tc.input,
+			})
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			require.NoError(t, app.CreateBookingResource(req))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+			var response models.BookingResource
+			testutil.ParseEnvelopeResponse(t, req, &response)
+			var stored models.BookingResource
+			require.NoError(t, db.First(&stored, "id = ? AND organization_id = ?", response.ID, org.ID).Error)
+			require.Equal(t, tc.want, stored.IsActive)
+			require.Equal(t, stored.IsActive, response.IsActive)
+			require.EqualValues(t, 1, stored.Version)
+			assertBookingCommerceAuditActive(t, db, org.ID, stored.ID, models.AuditActionCreated, nil, tc.want)
+		})
+	}
+}
+
+func TestBookingCommerceCreateInactiveFailureRollsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name, table     string
+		service, update bool
+	}{
+		{"service_active_update", "booking_services", true, true},
+		{"service_links", "booking_service_resources", true, false},
+		{"service_audit", "audit_logs", true, false},
+		{"resource_active_update", "booking_resources", false, true},
+		{"resource_audit", "audit_logs", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			app := &App{DB: db, Log: testutil.NopLogger()}
+			org := testutil.CreateTestOrganization(t, db)
+			user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+			enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "bookings.enabled")
+			event := createCapacityRaceBookingEvent(t, db, org.ID, user.ID, 1)
+			tables := []string{"booking_services", "booking_resources", "booking_service_resources", "audit_logs"}
+			before := bookingCommerceRowsSnapshot(t, db, org.ID, tables...)
+			callbackName := "test:booking_create_failure:" + uuid.NewString()
+			reached := false
+			callback := func(tx *gorm.DB) {
+				if tx.Statement.Table == tc.table {
+					reached = true
+					tx.AddError(assert.AnError)
+				}
+			}
+			if tc.update {
+				require.NoError(t, db.Callback().Update().After("gorm:update").Register(callbackName, callback))
+				t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove(callbackName)) })
+			} else {
+				require.NoError(t, db.Callback().Create().After("gorm:create").Register(callbackName, callback))
+				t.Cleanup(func() { require.NoError(t, db.Callback().Create().Remove(callbackName)) })
+			}
+			inactive := false
+			var req *fastglue.Request
+			if tc.service {
+				req = testutil.NewJSONRequest(t, BookingServiceRequest{
+					Name: "Rollback service " + uuid.NewString(), Kind: models.BookingServiceKindAppointment,
+					DurationMinutes: 30, DefaultCapacity: 1, Currency: "MYR",
+					IsActive: &inactive, ResourceIDs: []uuid.UUID{event.ResourceID},
+				})
+				testutil.SetAuthContext(req, org.ID, user.ID)
+				require.NoError(t, app.CreateBookingService(req))
+			} else {
+				req = testutil.NewJSONRequest(t, BookingResourceRequest{
+					Name: "Rollback room " + uuid.NewString(), Kind: models.BookingResourceKindRoom,
+					Timezone: "Asia/Kuala_Lumpur", IsActive: &inactive,
+				})
+				testutil.SetAuthContext(req, org.ID, user.ID)
+				require.NoError(t, app.CreateBookingResource(req))
+			}
+			require.True(t, reached, "the intended transactional failure point must be reached")
+			require.Equal(t, fasthttp.StatusInternalServerError, testutil.GetResponseStatusCode(req))
+			require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, tables...))
+		})
+	}
+}
+
+func TestUpdatePackagePermissionMatrix(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	for mask := 0; mask < 8; mask++ {
+		keys := []string{}
+		for bit, action := range []string{models.ActionRead, models.ActionWrite, models.ActionDelete} {
+			if mask&(1<<bit) != 0 {
+				keys = append(keys, models.ResourcePackages+":"+action)
+			}
+		}
+		for _, operation := range []string{"edit_omitted", "edit_true", "retire"} {
+			t.Run(fmt.Sprintf("permissions_%03b/%s", mask, operation), func(t *testing.T) {
+				app := &App{DB: db, Log: testutil.NopLogger()}
+				org := testutil.CreateTestOrganization(t, db)
+				role := createBookingCommerceTestRoleWithKeys(t, db, org.ID, "package-permissions", keys)
+				user := testutil.CreateTestUser(t, db, org.ID, testutil.WithRoleID(&role.ID))
+				enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "commerce.enabled")
+				pkg := createBookingCommercePackageFixture(t, db, org.ID)
+				payload := bookingCommercePackageEditPayload(pkg)
+				payload.Description = "Edited through the versioned endpoint"
+				active := operation != "retire"
+				if operation != "edit_omitted" {
+					payload.IsActive = &active
+				}
+				before := bookingCommerceRowsSnapshot(t, db, org.ID, "package_definitions", "package_entitlements", "audit_logs")
+				req := newBookingCommercePackageUpdate(t, org.ID, user.ID, pkg.ID, payload)
+				require.NoError(t, app.UpdatePackage(req))
+				allowed := mask&2 != 0 && (operation != "retire" || mask&4 != 0)
+				if !allowed {
+					testutil.AssertErrorResponse(t, req, fasthttp.StatusForbidden, "Insufficient permissions")
+					require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, "package_definitions", "package_entitlements", "audit_logs"))
+					return
+				}
+				require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+				var stored models.PackageDefinition
+				require.NoError(t, db.First(&stored, "id = ?", pkg.ID).Error)
+				require.EqualValues(t, 2, stored.Version)
+				require.Equal(t, active, stored.IsActive)
+				require.Equal(t, payload.Description, stored.Description)
+				if operation == "retire" {
+					assertBookingCommerceAuditActive(t, db, org.ID, pkg.ID, models.AuditActionUpdated, true, false)
+				}
+			})
+		}
+	}
+}
+
+func TestUpdatePackageRejectsTenantLicenseVersionAndPreservesPurchasedEntitlements(t *testing.T) {
+	for _, scenario := range []string{"tenant", "license", "version", "purchased_entitlements", "agent"} {
+		t.Run(scenario, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			app := &App{DB: db, Log: testutil.NopLogger()}
+			org := testutil.CreateTestOrganization(t, db)
+			actorOrg := org
+			if scenario == "tenant" {
+				actorOrg = testutil.CreateTestOrganization(t, db)
+			}
+			keys := []string{"packages:read", "packages:write", "packages:delete"}
+			if scenario == "agent" {
+				keys = models.SystemRolePermissions()["agent"]
+			}
+			role := createBookingCommerceTestRoleWithKeys(t, db, actorOrg.ID, "package-rejection", keys)
+			user := testutil.CreateTestUser(t, db, actorOrg.ID, testutil.WithRoleID(&role.ID))
+			if scenario != "license" {
+				enableBookingCommerceTestEntitlement(t, db, actorOrg.ID, user.ID, "commerce.enabled")
+			}
+			pkg := createBookingCommercePackageFixture(t, db, org.ID)
+			payload := bookingCommercePackageEditPayload(pkg)
+			inactive := false
+			payload.IsActive = &inactive
+			expectedStatus, expectedMessage := fasthttp.StatusConflict, "Package was modified"
+			switch scenario {
+			case "tenant":
+				expectedStatus, expectedMessage = fasthttp.StatusNotFound, "Package not found"
+			case "license":
+				expectedStatus, expectedMessage = fasthttp.StatusPaymentRequired, "Feature is not included"
+			case "agent":
+				expectedStatus, expectedMessage = fasthttp.StatusForbidden, "Insufficient permissions"
+			case "version":
+				payload.Version++
+			case "purchased_entitlements":
+				contact := testutil.CreateTestContact(t, db, org.ID)
+				purchase := models.ContactPackage{
+					BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+					ContactID: contact.ID, PackageDefinitionID: pkg.ID,
+					Status: models.ContactPackageStatusActive, Currency: "MYR",
+					IdempotencyKey: "purchased-" + uuid.NewString(), Version: 1,
+				}
+				require.NoError(t, db.Create(&purchase).Error)
+				payload.Entitlements = []PackageEntitlementInput{{BookingServiceID: uuid.New(), Credits: 5}}
+				expectedMessage = "Package entitlements cannot change"
+			}
+			tables := []string{"package_definitions", "package_entitlements", "contact_packages", "audit_logs"}
+			before := bookingCommerceRowsSnapshot(t, db, org.ID, tables...)
+			req := newBookingCommercePackageUpdate(t, actorOrg.ID, user.ID, pkg.ID, payload)
+			require.NoError(t, app.UpdatePackage(req))
+			testutil.AssertErrorResponse(t, req, expectedStatus, expectedMessage)
+			require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, tables...))
+		})
+	}
+}
+
+func TestUpdatePackageConcurrentEditAndRetirementCommitOnce(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "commerce.enabled")
+	pkg := createBookingCommercePackageFixture(t, db, org.ID)
+	edit, retire := bookingCommercePackageEditPayload(pkg), bookingCommercePackageEditPayload(pkg)
+	edit.Description = "Concurrent edit"
+	inactive := false
+	retire.IsActive = &inactive
+	requests := []*fastglue.Request{
+		newBookingCommercePackageUpdate(t, org.ID, user.ID, pkg.ID, edit),
+		newBookingCommercePackageUpdate(t, org.ID, user.ID, pkg.ID, retire),
+	}
+	start := make(chan struct{})
+	errs := make([]error, len(requests))
+	var wg sync.WaitGroup
+	for i := range requests {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			errs[index] = app.UpdatePackage(requests[index])
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	require.ElementsMatch(t, []int{fasthttp.StatusOK, fasthttp.StatusConflict}, []int{
+		testutil.GetResponseStatusCode(requests[0]), testutil.GetResponseStatusCode(requests[1]),
+	})
+	var stored models.PackageDefinition
+	require.NoError(t, db.First(&stored, "id = ?", pkg.ID).Error)
+	require.EqualValues(t, 2, stored.Version)
+	if testutil.GetResponseStatusCode(requests[0]) == fasthttp.StatusOK {
+		require.True(t, stored.IsActive)
+		require.Equal(t, edit.Description, stored.Description)
+	} else {
+		require.False(t, stored.IsActive)
+		require.Equal(t, pkg.Description, stored.Description)
+	}
+	var auditCount int64
+	require.NoError(t, db.Model(&models.AuditLog{}).
+		Where("organization_id = ? AND resource_id = ?", org.ID, pkg.ID).Count(&auditCount).Error)
+	require.EqualValues(t, 1, auditCount)
+}
+
+func TestPackageRetirementPreservesHistoryCreditsAndCompletedReplay(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+	org := testutil.CreateTestOrganization(t, db)
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithSuperAdmin())
+	contact := testutil.CreateTestContact(t, db, org.ID)
+	enableBookingCommerceTestEntitlement(t, db, org.ID, user.ID, "commerce.enabled")
+	require.NoError(t, db.Model(&models.Subscription{}).Where("organization_id = ?", org.ID).
+		Update("entitlements_snapshot", models.JSONB{"commerce.enabled": true, "bookings.enabled": true}).Error)
+	event := createCapacityRaceBookingEvent(t, db, org.ID, user.ID, 3)
+	pkg := createBookingCommercePackageFixture(t, db, org.ID)
+	entitlement := models.PackageEntitlement{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		PackageDefinitionID: pkg.ID, BookingServiceID: event.ServiceID, Credits: 3, Version: 1,
+	}
+	require.NoError(t, db.Create(&entitlement).Error)
+	grantPayload := CreateContactPackageRequest{
+		ContactID: contact.ID, PackageDefinitionID: pkg.ID, IdempotencyKey: "grant-" + uuid.NewString(),
+	}
+	grantRequest := testutil.NewJSONRequest(t, grantPayload)
+	testutil.SetAuthContext(grantRequest, org.ID, user.ID)
+	require.NoError(t, app.CreateContactPackage(grantRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(grantRequest))
+	var grant models.ContactPackage
+	testutil.ParseEnvelopeResponse(t, grantRequest, &grant)
+	salePayload := SellContactPackageRequest{
+		ContactID: contact.ID, PackageDefinitionID: pkg.ID, IdempotencyKey: "sale-" + uuid.NewString(),
+	}
+	saleRequest := testutil.NewJSONRequest(t, salePayload)
+	testutil.SetAuthContext(saleRequest, org.ID, user.ID)
+	require.NoError(t, app.SellContactPackage(saleRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(saleRequest))
+	var sale SellContactPackageResponse
+	testutil.ParseEnvelopeResponse(t, saleRequest, &sale)
+	bookingPayload := CreateBookingRequest{
+		EventID: event.ID, ContactID: contact.ID, ContactPackageID: &grant.ID,
+		Status: models.BookingStatusReserved, Quantity: 1, Source: models.BookingSourceAgent,
+		IdempotencyKey: "booking-before-retire-" + uuid.NewString(),
+	}
+	bookingRequest := testutil.NewJSONRequest(t, bookingPayload)
+	testutil.SetAuthContext(bookingRequest, org.ID, user.ID)
+	testutil.SetPathParam(bookingRequest, "id", event.ID.String())
+	require.NoError(t, app.CreateBooking(bookingRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(bookingRequest))
+	tables := []string{"package_entitlements", "contact_packages", "credit_balances", "credit_ledger_entries",
+		"commerce_invoices", "invoice_lines", "bookings", "booking_events", "subscriptions", "customer_activity_events"}
+	before := bookingCommerceRowsSnapshot(t, db, org.ID, tables...)
+	var historicalAudit []models.AuditLog
+	require.NoError(t, db.Where("organization_id = ?", org.ID).Find(&historicalAudit).Error)
+	require.NotEmpty(t, historicalAudit)
+	retirePayload := bookingCommercePackageEditPayload(pkg)
+	inactive := false
+	retirePayload.IsActive = &inactive
+	retireRequest := newBookingCommercePackageUpdate(t, org.ID, user.ID, pkg.ID, retirePayload)
+	require.NoError(t, app.UpdatePackage(retireRequest))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(retireRequest))
+	require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, tables...))
+	for _, previous := range historicalAudit {
+		var current models.AuditLog
+		require.NoError(t, db.First(&current, "id = ?", previous.ID).Error)
+		require.Equal(t, previous, current)
+	}
+	assertBookingCommerceAuditActive(t, db, org.ID, pkg.ID, models.AuditActionUpdated, true, false)
+	var retired models.PackageDefinition
+	require.NoError(t, db.First(&retired, "id = ?", pkg.ID).Error)
+	require.False(t, retired.IsActive)
+	require.EqualValues(t, 2, retired.Version)
+
+	// Repeating the versioned update is a stale conflict, never a second mutation.
+	frozen := bookingCommerceRowsSnapshot(t, db, org.ID, append(tables, "package_definitions", "audit_logs")...)
+	stale := newBookingCommercePackageUpdate(t, org.ID, user.ID, pkg.ID, retirePayload)
+	require.NoError(t, app.UpdatePackage(stale))
+	testutil.AssertErrorResponse(t, stale, fasthttp.StatusConflict, "Package was modified")
+	require.Equal(t, frozen, bookingCommerceRowsSnapshot(t, db, org.ID, append(tables, "package_definitions", "audit_logs")...))
+
+	// Completed sale and grant requests replay after retirement; new keys fail.
+	for _, replay := range []bool{true, false} {
+		saleInput, grantInput := salePayload, grantPayload
+		if !replay {
+			saleInput.IdempotencyKey = "new-sale-" + uuid.NewString()
+			grantInput.IdempotencyKey = "new-grant-" + uuid.NewString()
+		}
+		saleReq := testutil.NewJSONRequest(t, saleInput)
+		testutil.SetAuthContext(saleReq, org.ID, user.ID)
+		require.NoError(t, app.SellContactPackage(saleReq))
+		grantReq := testutil.NewJSONRequest(t, grantInput)
+		testutil.SetAuthContext(grantReq, org.ID, user.ID)
+		require.NoError(t, app.CreateContactPackage(grantReq))
+		if replay {
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(saleReq))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(grantReq))
+			var saleReplay SellContactPackageResponse
+			var grantReplay models.ContactPackage
+			testutil.ParseEnvelopeResponse(t, saleReq, &saleReplay)
+			testutil.ParseEnvelopeResponse(t, grantReq, &grantReplay)
+			require.Equal(t, sale.Invoice.ID, saleReplay.Invoice.ID)
+			require.Equal(t, sale.ContactPackage.ID, saleReplay.ContactPackage.ID)
+			require.Equal(t, grant.ID, grantReplay.ID)
+		} else {
+			testutil.AssertErrorResponse(t, saleReq, fasthttp.StatusBadRequest, "active package")
+			testutil.AssertErrorResponse(t, grantReq, fasthttp.StatusBadRequest, "active package")
+		}
+		require.Equal(t, frozen, bookingCommerceRowsSnapshot(t, db, org.ID, append(tables, "package_definitions", "audit_logs")...))
+	}
+	invoiceReq := testutil.NewJSONRequest(t, CreateCommerceInvoiceRequest{
+		ContactID: contact.ID, Currency: "MYR", IdempotencyKey: "retired-invoice-" + uuid.NewString(),
+		Lines: []CommerceInvoiceLineInput{{PackageDefinitionID: &pkg.ID, Quantity: 1}},
+	})
+	testutil.SetAuthContext(invoiceReq, org.ID, user.ID)
+	require.NoError(t, app.CreateCommerceInvoice(invoiceReq))
+	testutil.AssertErrorResponse(t, invoiceReq, fasthttp.StatusBadRequest, "active tenant package")
+	require.Equal(t, frozen, bookingCommerceRowsSnapshot(t, db, org.ID, append(tables, "package_definitions", "audit_logs")...))
+
+	// Write-only commercial edits leave a retired definition retired.
+	role := createBookingCommerceTestRoleWithKeys(t, db, org.ID, "package-editor", []string{"packages:write"})
+	editor := testutil.CreateTestUser(t, db, org.ID, testutil.WithRoleID(&role.ID))
+	editPayload := bookingCommercePackageEditPayload(retired)
+	editPayload.Description = "Retired historical plan terms"
+	edit := newBookingCommercePackageUpdate(t, org.ID, editor.ID, pkg.ID, editPayload)
+	require.NoError(t, app.UpdatePackage(edit))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(edit))
+	require.NoError(t, db.First(&retired, "id = ?", pkg.ID).Error)
+	require.False(t, retired.IsActive)
+	require.EqualValues(t, 3, retired.Version)
+	require.Equal(t, before, bookingCommerceRowsSnapshot(t, db, org.ID, tables...))
+
+	// Retirement does not invalidate credits already granted to the contact.
+	bookingPayload.IdempotencyKey = "booking-after-retire-" + uuid.NewString()
+	afterBooking := testutil.NewJSONRequest(t, bookingPayload)
+	testutil.SetAuthContext(afterBooking, org.ID, user.ID)
+	testutil.SetPathParam(afterBooking, "id", event.ID.String())
+	require.NoError(t, app.CreateBooking(afterBooking))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(afterBooking))
+	var balance models.CreditBalance
+	require.NoError(t, db.First(&balance, "organization_id = ? AND contact_package_id = ?", org.ID, grant.ID).Error)
+	require.Equal(t, 3, balance.Granted)
+	require.Equal(t, 2, balance.Reserved)
+	require.Equal(t, 1, balance.Available)
+	require.Zero(t, balance.Consumed)
+}
+
+func createBookingCommerceTestRoleWithKeys(t *testing.T, db *gorm.DB, orgID uuid.UUID, name string, keys []string) *models.CustomRole {
+	t.Helper()
+	// Other focused tests may have populated only part of the global catalog.
+	// Resolve every requested key instead of treating any catalog row as a
+	// complete seed; the role itself is new and tenant-scoped.
+	permissions := make([]models.Permission, 0, len(keys))
+	for _, key := range keys {
+		resource, action, ok := strings.Cut(key, ":")
+		require.True(t, ok)
+		permission := models.Permission{Resource: resource, Action: action}
+		require.NoError(t, db.Where("resource = ? AND action = ?", resource, action).
+			FirstOrCreate(&permission).Error)
+		permissions = append(permissions, permission)
+	}
+	role := testutil.CreateTestRole(t, db, orgID, name, permissions)
+	require.Len(t, role.Permissions, len(keys))
+	return role
+}
+
+func createBookingCommercePackageFixture(t *testing.T, db *gorm.DB, orgID uuid.UUID) models.PackageDefinition {
+	t.Helper()
+	pkg := models.PackageDefinition{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		Name: "Reviewed package " + uuid.NewString(), PriceMinor: 15000,
+		Currency: "MYR", ValidityDays: 30, IsActive: true, Metadata: models.JSONB{}, Version: 1,
+	}
+	require.NoError(t, db.Create(&pkg).Error)
+	return pkg
+}
+
+func bookingCommercePackageEditPayload(pkg models.PackageDefinition) PackageRequest {
+	return PackageRequest{
+		Name: pkg.Name, Description: pkg.Description, PriceMinor: pkg.PriceMinor,
+		Currency: pkg.Currency, ValidityDays: pkg.ValidityDays, Metadata: pkg.Metadata, Version: pkg.Version,
+	}
+}
+
+func newBookingCommercePackageUpdate(t *testing.T, orgID, userID, packageID uuid.UUID, payload PackageRequest) *fastglue.Request {
+	t.Helper()
+	req := testutil.NewJSONRequest(t, payload)
+	testutil.SetAuthContext(req, orgID, userID)
+	testutil.SetPathParam(req, "id", packageID.String())
+	return req
+}
+
+func bookingCommerceRowsSnapshot(t *testing.T, db *gorm.DB, orgID uuid.UUID, tables ...string) map[string]string {
+	t.Helper()
+	result := make(map[string]string, len(tables))
+	for _, table := range tables {
+		var rows []map[string]any
+		require.NoError(t, db.Table(table).Where("organization_id = ?", orgID).Order("id").Find(&rows).Error)
+		encoded, err := json.Marshal(rows)
+		require.NoError(t, err)
+		result[table] = string(encoded)
+	}
+	return result
+}
+
+func assertBookingCommerceAuditActive(t *testing.T, db *gorm.DB, orgID, resourceID uuid.UUID, action models.AuditAction, old any, active bool) {
+	t.Helper()
+	var rows []models.AuditLog
+	require.NoError(t, db.Where("organization_id = ? AND resource_id = ? AND action = ?", orgID, resourceID, action).Find(&rows).Error)
+	require.Len(t, rows, 1)
+	for _, raw := range rows[0].Changes {
+		change, ok := raw.(map[string]any)
+		require.True(t, ok, "audit changes must be JSON objects")
+		if change["field"] == "is_active" {
+			require.Equal(t, old, change["old_value"])
+			require.Equal(t, active, change["new_value"])
+			return
+		}
+	}
+	t.Fatal("audit must include the persisted is_active value")
 }
 
 func int64Pointer(value int64) *int64 {

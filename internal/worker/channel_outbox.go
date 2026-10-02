@@ -1613,7 +1613,11 @@ func (w *Worker) recheckChannelAIOutboxDispatchWithAccountAndFence(
 			"organization_id",
 			"channel_account_id",
 			"contact_id",
+			"contact_identity_id",
+			"external_conversation_id",
+			"channel",
 			"config",
+			"metadata",
 			"service_window_ends_at",
 		).Where(
 			"id = ? AND organization_id = ? AND channel_account_id = ?",
@@ -1749,7 +1753,7 @@ func (w *Worker) recheckChannelAIOutboxDispatchWithAccountAndFence(
 			return fmt.Errorf("%w: inbound binding is invalid", errChannelOutboxAIPolicy)
 		}
 		var inbound models.Message
-		if err := tx.Select("id", "created_at").
+		if err := tx.Select("id", "created_at", "ingested_at", "organization_id", "contact_id", "inbox_conversation_id", "metadata").
 			Where(
 				"id = ? AND organization_id = ? AND inbox_conversation_id = ? AND direction = ?",
 				inboundID,
@@ -1759,6 +1763,16 @@ func (w *Worker) recheckChannelAIOutboxDispatchWithAccountAndFence(
 			).
 			First(&inbound).Error; err != nil {
 			return fmt.Errorf("%w: inbound binding is unavailable", errChannelOutboxAIPolicy)
+		}
+		var bookingContact models.Contact
+		if err := tx.Where("id = ? AND organization_id = ?", conversation.ContactID, orgID).First(&bookingContact).Error; err != nil {
+			return err
+		}
+		if suppressed, err := channelAIBookingInboundSuppressed(tx, &bookingContact, &conversation, &inbound); err != nil || suppressed {
+			return fmt.Errorf("%w: originating inbound is durably suppressed", errChannelOutboxAIPolicy)
+		}
+		if err := verifyChannelAIBookingDispatchTx(tx, &account, &conversation, &inbound, &job, outbound); err != nil {
+			return fmt.Errorf("%w: %v", errChannelOutboxAIPolicy, err)
 		}
 		var newerHumanReplyCount int64
 		if err := tx.Model(&models.Message{}).

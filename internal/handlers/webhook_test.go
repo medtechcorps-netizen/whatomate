@@ -4413,3 +4413,82 @@ func webhookTestSignature(body []byte) string {
 	mac.Write(body)
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
+
+// A regular (non-Coexistence) account receives messages from two WhatsApp
+// username users identified only by BSUID, plus one message that names no
+// sender. /api/webhook still answers 200; each BSUID gets its own placeholder
+// contact and the sender-less message is skipped rather than retried.
+func TestWebhookHandler_NonSMBBSUIDOnlySendersGetOwnContacts(t *testing.T) {
+	app := webhookTestApp(t)
+	uid := uuid.NewString()[:8]
+	org := models.Organization{
+		BaseModel: models.BaseModel{ID: uuid.New()},
+		Name:      "bsuid-classic-org-" + uid,
+		Slug:      "bsuid-classic-org-" + uid,
+	}
+	require.NoError(t, app.DB.Create(&org).Error)
+	account := models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "bsuid-classic-acct-" + uid,
+		PhoneID:        "bsuid-classic-phone-" + uid,
+		BusinessID:     "bsuid-classic-waba-" + uid,
+		AccessToken:    "token",
+		Status:         "active",
+		IsSMB:          false,
+	}
+	require.NoError(t, app.DB.Create(&account).Error)
+	firstUserID := "US.classic-first-" + uid
+	secondUserID := "US.classic-second-" + uid
+	body := []byte(`{
+		"object":"whatsapp_business_account",
+		"entry":[{"id":"` + account.BusinessID + `","changes":[
+			{"field":"messages","value":{
+				"messaging_product":"whatsapp",
+				"metadata":{"display_phone_number":"15550783881","phone_number_id":"` + account.PhoneID + `"},
+				"contacts":[
+					{"profile":{"name":"First Username User","username":"first_user"},"user_id":"` + firstUserID + `"},
+					{"profile":{"name":"Second Username User","username":"second_user"},"user_id":"` + secondUserID + `"}
+				],
+				"messages":[
+					{"from_user_id":"` + firstUserID + `","id":"wamid.classic.first-` + uid + `",
+						"timestamp":"1739230980","type":"text","text":{"body":"Hai"}},
+					{"from_user_id":"` + secondUserID + `","id":"wamid.classic.second-` + uid + `",
+						"timestamp":"1739230981","type":"text","text":{"body":"Hello"}},
+					{"id":"wamid.classic.anonymous-` + uid + `",
+						"timestamp":"1739230982","type":"text","text":{"body":"nobody"}}
+				]
+			}}
+		]}]
+	}`)
+
+	sendSignedWebhook(t, app, body)
+
+	var first, second models.Contact
+	require.NoError(t, app.DB.Where("organization_id = ? AND bs_uid = ?", org.ID, firstUserID).First(&first).Error)
+	require.NoError(t, app.DB.Where("organization_id = ? AND bs_uid = ?", org.ID, secondUserID).First(&second).Error)
+	assert.NotEqual(t, first.ID, second.ID)
+	assert.True(t, strings.HasPrefix(first.PhoneNumber, "bsuid:"))
+	assert.True(t, strings.HasPrefix(second.PhoneNumber, "bsuid:"))
+	assert.Equal(t, "first_user", first.Metadata["coexistence_username"])
+	assert.Equal(t, "second_user", second.Metadata["coexistence_username"])
+	assert.Equal(t, "First Username User", first.ProfileName)
+	assert.Equal(t, "Second Username User", second.ProfileName)
+
+	var emptyPhoneCount int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number IN ?", org.ID, []string{"", "+"}).
+		Count(&emptyPhoneCount).Error)
+	assert.Zero(t, emptyPhoneCount)
+
+	var messages []models.Message
+	require.NoError(t, app.DB.Where("organization_id = ?", org.ID).
+		Order("whats_app_message_id ASC").Find(&messages).Error)
+	require.Len(t, messages, 2, "the sender-less message is skipped")
+	byWAMID := map[string]uuid.UUID{}
+	for _, message := range messages {
+		byWAMID[message.WhatsAppMessageID] = message.ContactID
+	}
+	assert.Equal(t, first.ID, byWAMID["wamid.classic.first-"+uid])
+	assert.Equal(t, second.ID, byWAMID["wamid.classic.second-"+uid])
+}

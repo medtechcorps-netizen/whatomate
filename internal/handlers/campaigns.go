@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/storage"
@@ -1066,6 +1067,20 @@ func (a *App) ImportRecipients(r *fastglue.Request) error {
 	}
 	if err := a.decodeRequest(r, &req); err != nil {
 		return nil
+	}
+
+	// The struct's validate tag is not enforced by decodeRequest. A blank
+	// phone ("" or "+") would later make the campaign worker resolve every
+	// such row to one shared empty-phone contact.
+	for i, rec := range req.Recipients {
+		if contactutil.IsEmptyPhone(rec.PhoneNumber) {
+			return r.SendErrorEnvelope(
+				fasthttp.StatusBadRequest,
+				fmt.Sprintf("phone_number is required for recipient %d", i+1),
+				nil,
+				"",
+			)
+		}
 	}
 
 	recipients := make([]models.BulkMessageRecipient, len(req.Recipients))

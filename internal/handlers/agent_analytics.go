@@ -161,8 +161,10 @@ func (a *App) GetAgentDetails(r *fastglue.Request) error {
 		periodEnd = now
 	}
 
-	// Verify agent exists
-	_, err = findByIDAndOrg[models.User](a.DB, r, agentID, orgID, "Agent")
+	// Verify the agent is a member of this organization (home org or
+	// user_organizations membership). Deactivated agents keep their history,
+	// so they are not filtered out here.
+	_, err = findOrgMemberUser(a.DB, r, agentID, orgID, "Agent", false)
 	if err != nil {
 		return nil
 	}
@@ -369,20 +371,46 @@ func (a *App) calculateAgentStats(orgID, agentID uuid.UUID, start, end time.Time
 }
 
 func (a *App) calculateAllAgentStats(orgID uuid.UUID, start, end time.Time) []AgentPerformanceStats {
-	// Get all agents in the organization through team membership
+	// Get every user who is, or was, an agent of one of this organization's
+	// teams. The team must belong to this organization (another org's teams
+	// do not count). Soft-deleted teams and team memberships are deliberately
+	// kept, as the old JOIN did, so an agent removed from a team or whose team
+	// was deleted keeps their stats for past periods. Membership is resolved
+	// through the home org or user_organizations, so cross-org members are
+	// included.
 	var agents []models.User
 	if err := a.DB.
-		Joins("JOIN team_members ON team_members.user_id = users.id").
-		Joins("JOIN teams ON teams.id = team_members.team_id").
-		Where("users.organization_id = ? AND team_members.role = ?", orgID, models.TeamRoleAgent).
-		Distinct().
+		Where(`users.id IN (
+			SELECT team_members.user_id FROM team_members
+			JOIN teams ON teams.id = team_members.team_id
+			WHERE teams.organization_id = ? AND team_members.role = ?)`,
+			orgID, models.TeamRoleAgent).
+		Where(orgMemberUserCondition, orgID, orgID).
+		Order("users.id").
 		Find(&agents).Error; err != nil {
 		a.Log.Error("Failed to fetch agents for analytics", "error", err, "org_id", orgID)
 		return []AgentPerformanceStats{}
 	}
 
+	// Same membership rule as the auth layer: a removed membership or a
+	// suspended reseller-derived membership no longer counts. The rows are
+	// loaded in one query for all candidates.
+	agentIDs := make([]uuid.UUID, len(agents))
+	for i := range agents {
+		agentIDs[i] = agents[i].ID
+	}
+	memberships, err := loadOrgMembershipRows(a.DB, agentIDs, orgID)
+	if err != nil {
+		a.Log.Error("Failed to fetch agent memberships for analytics", "error", err, "org_id", orgID)
+		return []AgentPerformanceStats{}
+	}
+
 	stats := make([]AgentPerformanceStats, 0, len(agents))
-	for _, agent := range agents {
+	for i := range agents {
+		agent := &agents[i]
+		if !orgMembershipRowsValid(a.DB, agent, orgID, memberships[agent.ID]) {
+			continue
+		}
 		agentStats := a.calculateAgentStats(orgID, agent.ID, start, end)
 		stats = append(stats, agentStats)
 	}

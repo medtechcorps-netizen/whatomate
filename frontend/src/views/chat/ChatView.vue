@@ -101,9 +101,15 @@ import {
   Code,
   RotateCw,
   Filter,
-  StickyNote
+  StickyNote,
+  Plus,
+  CalendarClock,
+  CalendarPlus,
+  Copy
 } from 'lucide-vue-next'
 import { getInitials, getAvatarGradient } from '@/lib/utils'
+import { contactAddressDisplay, contactDisplayName, isPlaceholderPhone } from '@/lib/contactAddress'
+import type { WorkspaceRequestedAction } from '@/lib/crmFlow'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
@@ -177,6 +183,44 @@ function toggleRevenueWorkspace() {
   isInfoPanelOpen.value = willOpen
   if (willOpen) isNotesPanelOpen.value = false
 }
+
+// Opens (never closes) the customer workspace, closing notes the same way
+// toggleRevenueWorkspace does. The rail vs Sheet split still follows
+// isRevenueRail; this only flips isInfoPanelOpen.
+function openRevenueWorkspace() {
+  if (!isInfoPanelOpen.value) isInfoPanelOpen.value = true
+  isNotesPanelOpen.value = false
+}
+
+// "Next step" menu -> workspace hand-off. The workspace runs the request once
+// it has loaded and reports it back through action-consumed.
+const workspaceRequest = ref<WorkspaceRequestedAction | null>(null)
+let workspaceRequestNonce = 0
+
+function requestWorkspaceAction(kind: WorkspaceRequestedAction['kind']) {
+  if (!contactsStore.currentContact) return
+  workspaceRequestNonce += 1
+  workspaceRequest.value = { kind, nonce: workspaceRequestNonce }
+  openRevenueWorkspace()
+}
+
+function handleWorkspaceActionConsumed(nonce?: number) {
+  if (nonce === undefined || workspaceRequest.value?.nonce === nonce) {
+    workspaceRequest.value = null
+  }
+}
+
+// Drop an unconsumed request when the customer changes or the workspace is
+// closed, so reopening the workspace later never replays an old action.
+watch(
+  () => contactsStore.currentContact?.id,
+  () => {
+    workspaceRequest.value = null
+  },
+)
+watch(isInfoPanelOpen, (open) => {
+  if (!open) workspaceRequest.value = null
+})
 
 function toggleNotesPanel() {
   const willOpen = !isNotesPanelOpen.value
@@ -436,6 +480,71 @@ const canAssignContacts = computed(() => {
   }
   return role === 'admin' || role === 'manager'
 })
+
+// "Next step" menu gates. These mirror the gates CustomerRevenueWorkspace
+// applies to its own buttons, plus the product entitlement for each module.
+const isCRMEnabled = computed(() => authStore.hasProductEntitlement('crm.enabled'))
+const canAddLeadFromChat = computed(() =>
+  isCRMEnabled.value
+  && authStore.hasPermission('crm.leads', 'write')
+  && authStore.hasPermission('crm.pipelines', 'read'),
+)
+const canScheduleFollowUpFromChat = computed(() =>
+  isCRMEnabled.value && authStore.hasPermission('tasks', 'write'),
+)
+const canBookFromChat = computed(() =>
+  authStore.hasProductEntitlement('bookings.enabled') && authStore.hasPermission('bookings', 'write'),
+)
+const hasNextStepActions = computed(() =>
+  canAddLeadFromChat.value || canScheduleFollowUpFromChat.value || canBookFromChat.value,
+)
+const canOpenContactRecord = computed(() => authStore.hasPermission('contacts', 'read'))
+
+// Native chat is always WhatsApp. Coexistence contacts can carry a username
+// placeholder instead of a real number, which must never be dialled or copied.
+const currentContactAddress = computed(() =>
+  contactAddressDisplay(contactsStore.currentContact, { channel: 'whatsapp' }),
+)
+const currentContactDialablePhone = computed(() =>
+  currentContactAddress.value.kind === 'phone' ? currentContactAddress.value.text : '',
+)
+// The contact list and header keep their original `name || phone_number`
+// output for every contact that has a name or a usable number (the list rows
+// are exercised by the production canary). Only where that output would be
+// blank or a raw placeholder such as "bsuid:..." does the staff-facing
+// fallback (profile name, then "WhatsApp user") take over.
+function contactListName(contact: Contact | null | undefined): string {
+  if (!contact) return ''
+  const legacy = contact.name || contact.phone_number || ''
+  if (legacy.trim() && !isPlaceholderPhone(legacy)) return legacy
+  return contactDisplayName(contact, { channel: 'whatsapp' })
+}
+function contactListAddress(contact: Contact): string {
+  const phone = contact.phone_number || ''
+  if (phone.trim() && !isPlaceholderPhone(phone)) return phone
+  return contactAddressDisplay(contact, { channel: 'whatsapp' }).text
+}
+const currentContactDisplayName = computed(() => contactListName(contactsStore.currentContact))
+const moreOptionsLabel = computed(() =>
+  hasNextStepActions.value ? 'Next step and more' : 'More options',
+)
+
+function openContactRecord() {
+  const id = contactsStore.currentContact?.id
+  if (!id) return
+  router.push(`/settings/contacts/${id}`)
+}
+
+async function copyCurrentContactPhone() {
+  const phone = currentContactDialablePhone.value
+  if (!phone) return
+  try {
+    await navigator.clipboard.writeText(phone)
+    toast.success('Phone number copied')
+  } catch {
+    toast.error('Could not copy the phone number')
+  }
+}
 
 // WhatsApp pauses chatbot processing through active agent transfers. Creation
 // needs transfers:write; resuming is deliberately narrower unless the user has
@@ -1626,23 +1735,48 @@ async function assignContactToUser(userId: string | null) {
   }
 }
 
+// The backend checks a self-assigned pause against the user's home organization
+// and availability. Members working in another clinic organization, or marked
+// away, get one of these rejections before anything is written, so the pause is
+// retried once without agent_id; the user still owns it through transferred_by.
+function isSelfAssignmentRejected(error: any): boolean {
+  const status = error?.response?.status
+  const message = error?.response?.data?.message
+  return (status === 404 && message === 'Agent not found')
+    || (status === 400 && message === 'Agent is currently away')
+}
+
 async function transferToAgent() {
   const contact = contactsStore.currentContact
   if (!contact || !canCreateManualTransfer.value) return
 
   isTransferring.value = true
   try {
-    const response = await chatbotService.createTransfer({
+    const request = {
       contact_id: contact.id,
       whatsapp_account: selectedAccount.value || (contact as any).whatsapp_account || '',
-      ...(authStore.user?.id ? { agent_id: authStore.user.id } : {}),
       source: 'manual',
-    })
+    }
+    const selfID = authStore.user?.id
+    let response
+    try {
+      response = await chatbotService.createTransfer({
+        ...request,
+        ...(selfID ? { agent_id: selfID } : {}),
+      })
+    } catch (error) {
+      if (!selfID || !isSelfAssignmentRejected(error)) throw error
+      response = await chatbotService.createTransfer(request)
+    }
     const createdTransfer = response.data.data?.transfer || response.data.transfer
     if (createdTransfer) transfersStore.upsertTransfer(createdTransfer)
-    toast.success('AI replies paused', {
-      description: 'This conversation is now handed over to a human.'
-    })
+    let description = 'This conversation is now handed over to a human.'
+    if (createdTransfer && !createdTransfer.agent_id) {
+      description = 'This conversation is now in the team handover queue.'
+    } else if (createdTransfer?.agent_id && selfID && createdTransfer.agent_id !== selfID) {
+      description = "This conversation was handed to the customer's assigned team member."
+    }
+    toast.success('AI replies paused', { description })
     await transfersStore.fetchActiveTransferForContact(contact.id)
   } catch (error: any) {
     toast.error('AI replies were not paused', {
@@ -2221,17 +2355,17 @@ async function sendMediaMessage() {
           >
             <Avatar class="h-9 w-9 ring-2 ring-white/[0.1] light:ring-gray-200">
               <AvatarImage :src="contact.avatar_url" />
-              <AvatarFallback :class="'text-xs bg-gradient-to-br text-white ' + getAvatarGradient(contact.name || contact.phone_number)">
-                {{ getInitials(contact.name || contact.phone_number) }}
+              <AvatarFallback :class="'text-xs bg-gradient-to-br text-white ' + getAvatarGradient(contactListName(contact))">
+                {{ getInitials(contactListName(contact)) }}
               </AvatarFallback>
             </Avatar>
             <div class="flex-1 min-w-0">
               <div class="flex items-center justify-between gap-2">
                 <p
                   class="flex-1 min-w-0 text-sm font-medium truncate text-white light:text-gray-900"
-                  :title="contact.name || contact.phone_number"
+                  :title="contactListName(contact)"
                 >
-                  {{ contact.name || contact.phone_number }}
+                  {{ contactListName(contact) }}
                 </p>
                 <span class="flex-shrink-0 text-[11px] text-white/40 light:text-gray-500">
                   {{ formatContactTime(contact.last_message_at) }}
@@ -2239,7 +2373,7 @@ async function sendMediaMessage() {
               </div>
               <div class="flex items-center justify-between gap-2">
                 <p class="flex-1 min-w-0 text-xs text-white/50 light:text-gray-500 truncate">
-                  {{ contact.phone_number }}
+                  {{ contactListAddress(contact) }}
                 </p>
                 <Badge v-if="contact.unread_count > 0" class="flex-shrink-0 h-5 text-[10px] bg-emerald-500/20 text-emerald-400 light:bg-emerald-100 light:text-emerald-700">
                   {{ contact.unread_count }}
@@ -2291,14 +2425,14 @@ async function sendMediaMessage() {
           <div class="flex items-center gap-2">
             <Avatar class="h-8 w-8 ring-2 ring-white/[0.1] light:ring-gray-200">
               <AvatarImage :src="contactsStore.currentContact.avatar_url" />
-              <AvatarFallback :class="'text-xs bg-gradient-to-br text-white ' + getAvatarGradient(contactsStore.currentContact.name || contactsStore.currentContact.phone_number)">
-                {{ getInitials(contactsStore.currentContact.name || contactsStore.currentContact.phone_number) }}
+              <AvatarFallback :class="'text-xs bg-gradient-to-br text-white ' + getAvatarGradient(currentContactDisplayName)">
+                {{ getInitials(currentContactDisplayName) }}
               </AvatarFallback>
             </Avatar>
             <div>
               <div class="flex items-center gap-1.5">
-                <p class="text-sm font-medium text-white light:text-gray-900">
-                  {{ contactsStore.currentContact.name || contactsStore.currentContact.phone_number }}
+                <p class="text-sm font-medium text-white light:text-gray-900" data-testid="chat-header-name">
+                  {{ currentContactDisplayName }}
                 </p>
                 <Badge v-if="activeTransferId" class="text-[10px] h-5 bg-orange-500/20 text-orange-400 light:bg-orange-100 light:text-orange-700">
                   AI paused
@@ -2319,8 +2453,17 @@ async function sendMediaMessage() {
                   {{ $t('chat.marketingOptOut', 'Marketing Opt-out') }}
                 </Badge>
               </div>
-              <p class="text-[11px] text-white/50 light:text-gray-500">
-                {{ contactsStore.currentContact.phone_number }}
+              <p
+                class="text-[11px] text-white/50 light:text-gray-500"
+                data-testid="chat-header-address"
+                :title="currentContactAddress.hint || undefined"
+              >
+                {{ currentContactDialablePhone ? contactsStore.currentContact.phone_number : currentContactAddress.text }}
+                <span
+                  v-if="!currentContactDialablePhone && currentContactAddress.hint"
+                  class="sr-only"
+                  data-testid="chat-header-address-hint"
+                >{{ currentContactAddress.hint }}</span>
               </p>
             </div>
           </div>
@@ -2348,10 +2491,10 @@ async function sendMediaMessage() {
               <TooltipContent>{{ conversationAIControlLabel }}</TooltipContent>
             </Tooltip>
             <CallButton
-              v-if="contactsStore.currentContact?.phone_number && selectedAccount"
+              v-if="currentContactDialablePhone && selectedAccount"
               :contact-id="contactsStore.currentContact.id"
               :contact-phone="contactsStore.currentContact.phone_number"
-              :contact-name="contactsStore.currentContact.name || contactsStore.currentContact.phone_number"
+              :contact-name="currentContactDisplayName"
               :whatsapp-account="selectedAccount"
             />
             <Tooltip v-if="canAssignContacts">
@@ -2419,21 +2562,77 @@ async function sendMediaMessage() {
               <TooltipContent>Customer revenue workspace</TooltipContent>
             </Tooltip>
             <DropdownMenu>
+              <!-- A native title instead of a Tooltip: nesting TooltipTrigger
+                   around DropdownMenuTrigger breaks the menu's popper anchor and
+                   leaves the open menu positioned off-screen. -->
               <DropdownMenuTrigger as-child>
-                <Button variant="ghost" size="icon" class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100" :aria-label="$t('chat.contactOptions')">
-                  <MoreVertical class="h-4 w-4" />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="h-9 w-9 text-white/50 hover:text-white hover:bg-white/[0.08] light:text-gray-500 light:hover:text-gray-900 light:hover:bg-gray-100"
+                  data-testid="chat-more-options"
+                  :aria-label="moreOptionsLabel"
+                  :title="moreOptionsLabel"
+                >
+                  <MoreVertical class="h-4 w-4" aria-hidden="true" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuLabel>{{ $t('chat.contactOptions') }}</DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem v-if="canAssignContacts" @click="isAssignDialogOpen = true">
-                  <UserPlus class="mr-2 h-4 w-4" />
-                  <span>{{ $t('chat.assignToAgent') }}</span>
+              <DropdownMenuContent align="end" class="w-56" data-testid="chat-next-step-menu">
+                <template v-if="hasNextStepActions">
+                  <DropdownMenuLabel>Next step</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    v-if="canAddLeadFromChat"
+                    data-testid="chat-next-step-lead"
+                    @select="requestWorkspaceAction('lead')"
+                  >
+                    <Plus class="mr-2 h-4 w-4" aria-hidden="true" />
+                    <span>Add to pipeline</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    v-if="canScheduleFollowUpFromChat"
+                    data-testid="chat-next-step-follow-up"
+                    @select="requestWorkspaceAction('follow-up')"
+                  >
+                    <CalendarClock class="mr-2 h-4 w-4" aria-hidden="true" />
+                    <span>Schedule follow-up</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    v-if="canBookFromChat"
+                    data-testid="chat-next-step-booking"
+                    @select="requestWorkspaceAction('booking')"
+                  >
+                    <CalendarPlus class="mr-2 h-4 w-4" aria-hidden="true" />
+                    <span>Book appointment</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </template>
+                <DropdownMenuItem data-testid="chat-menu-workspace" @select="toggleRevenueWorkspace">
+                  <Info class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>{{ isInfoPanelOpen ? 'Hide customer workspace' : 'Show customer workspace' }}</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem @click="toggleRevenueWorkspace">
-                  <Info class="mr-2 h-4 w-4" />
-                  <span>{{ isInfoPanelOpen ? $t('chat.hideContactDetails') : $t('chat.viewContactDetails') }}</span>
+                <DropdownMenuItem
+                  v-if="canOpenContactRecord"
+                  data-testid="chat-menu-contact-record"
+                  @select="openContactRecord"
+                >
+                  <User class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>Open contact record</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-if="currentContactDialablePhone"
+                  data-testid="chat-menu-copy-phone"
+                  @select="copyCurrentContactPhone"
+                >
+                  <Copy class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>Copy phone number</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-if="canAssignContacts"
+                  data-testid="chat-menu-assign"
+                  @select="isAssignDialogOpen = true"
+                >
+                  <UserPlus class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>{{ $t('chat.assignToAgent') }}</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -2988,6 +3187,9 @@ async function sendMediaMessage() {
         :contact="contactsStore.currentContact"
         :session-data="contactSessionData"
         surface="chat"
+        :channel="'whatsapp'"
+        :requested-action="workspaceRequest"
+        @action-consumed="handleWorkspaceActionConsumed"
         @close="isInfoPanelOpen = false"
         @tags-updated="(tags) => contactsStore.updateContactTags(contactsStore.currentContact!.id, tags)"
       />
@@ -3002,7 +3204,7 @@ async function sendMediaMessage() {
       <SheetContent side="right" class="!w-full !max-w-[440px] !p-0 [&>button:last-child]:hidden">
         <SheetTitle class="sr-only">Customer revenue workspace</SheetTitle>
         <SheetDescription class="sr-only">
-          Customer journeys, tasks, bookings, packages, revenue and activity.
+          Customer leads, follow-ups, bookings, packages, invoices and activity.
         </SheetDescription>
         <CustomerRevenueWorkspace
           v-if="isInfoPanelOpen"
@@ -3010,6 +3212,9 @@ async function sendMediaMessage() {
           :contact="contactsStore.currentContact"
           :session-data="contactSessionData"
           surface="chat"
+          :channel="'whatsapp'"
+          :requested-action="workspaceRequest"
+          @action-consumed="handleWorkspaceActionConsumed"
           @close="isInfoPanelOpen = false"
           @tags-updated="(tags) => contactsStore.updateContactTags(contactsStore.currentContact!.id, tags)"
         />

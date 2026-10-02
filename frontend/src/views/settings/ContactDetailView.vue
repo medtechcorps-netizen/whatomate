@@ -10,6 +10,7 @@ import type { Contact } from '@/stores/contacts'
 import { toast } from 'vue-sonner'
 import { getErrorMessage } from '@/lib/api-utils'
 import { getTagColorClass } from '@/lib/constants'
+import { contactAddressDisplay, contactDisplayName } from '@/lib/contactAddress'
 import { useUnsavedChangesGuard } from '@/composables/useUnsavedChangesGuard'
 import DetailPageLayout from '@/components/shared/DetailPageLayout.vue'
 import MetadataPanel from '@/components/shared/MetadataPanel.vue'
@@ -95,10 +96,17 @@ const form = ref({
   assigned_user_id: '' as string,
 })
 
+// WhatsApp username senders arrive without a phone number; explain the gap
+// instead of showing a blank (the number cannot be edited here).
+const address = computed(() => contactAddressDisplay(contact.value))
+const phoneHidden = computed(() => Boolean(contact.value) && address.value.kind !== 'phone')
+
+const displayName = computed(() => (contact.value ? contactDisplayName(contact.value) : ''))
+
 const breadcrumbs = computed(() => [
   { label: t('nav.settings'), href: '/settings' },
   { label: t('contacts.title'), href: '/settings/contacts' },
-  { label: contact.value?.profile_name || contact.value?.name || contact.value?.phone_number || '' },
+  { label: displayName.value },
 ])
 
 const assignedUserName = computed(() => {
@@ -230,7 +238,7 @@ onMounted(async () => {
 <template>
   <div class="h-full">
     <DetailPageLayout
-      :title="contact?.profile_name || contact?.name || contact?.phone_number || ''"
+      :title="displayName"
       :icon="Users"
       icon-gradient="bg-gradient-to-br from-blue-500 to-cyan-600 shadow-blue-500/20"
       back-link="/settings/contacts"
@@ -273,8 +281,8 @@ onMounted(async () => {
               <Phone class="h-5 w-5 text-primary" />
             </div>
             <div class="min-w-0">
-              <p class="font-medium truncate">{{ contact?.profile_name || contact?.name || contact?.phone_number }}</p>
-              <p class="text-sm text-muted-foreground truncate">{{ contact?.phone_number }}</p>
+              <p class="font-medium truncate">{{ displayName }}</p>
+              <p class="text-sm text-muted-foreground truncate">{{ phoneHidden ? address.text : contact?.phone_number }}</p>
             </div>
           </div>
 
@@ -285,7 +293,20 @@ onMounted(async () => {
 
           <div class="space-y-1.5">
             <Label class="text-xs">{{ $t('contacts.phoneNumber') }}</Label>
-            <Input v-model="form.phone_number" disabled />
+            <Input
+              :model-value="phoneHidden ? '' : form.phone_number"
+              disabled
+              :placeholder="phoneHidden ? address.text : undefined"
+              :aria-describedby="phoneHidden && address.hint ? 'contact-phone-hint' : undefined"
+            />
+            <p
+              v-if="phoneHidden && address.hint"
+              id="contact-phone-hint"
+              data-testid="contact-phone-hint"
+              class="text-xs text-muted-foreground"
+            >
+              {{ address.hint }}
+            </p>
           </div>
 
           <div class="space-y-1.5">

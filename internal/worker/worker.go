@@ -24,7 +24,8 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const campaignCanonicalContactAttempts = 3
+const campaignCanonicalContactAttempts = 6
+const campaignCanonicalContactInitialRetryDelay = 25 * time.Millisecond
 const campaignDurableSettlementTimeout = 10 * time.Second
 
 const campaignMarketingOptOutMessage = "Contact opted out of marketing messages"
@@ -59,6 +60,9 @@ type Worker struct {
 	// the complete outbox authorization/send/settlement path in package tests.
 	// Production workers leave it nil and use the built-in provider adapters.
 	channelAdapterFactory func(*models.ChannelAccount) (channelapi.Adapter, error)
+	// getOrCreateCampaignContact is a package-test seam. Production workers
+	// leave it nil and use contactutil.GetOrCreateContact.
+	getOrCreateCampaignContact func(*gorm.DB, uuid.UUID, string, string) (*models.Contact, bool, error)
 }
 
 // Ensure Worker implements JobHandler interface
@@ -148,7 +152,7 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 	var account models.WhatsAppAccount
 	var contact *models.Contact
 	terminal := false
-	if err := w.withRecipientTenantTransaction(ctx, job.OrganizationID, func(tx *gorm.DB) error {
+	if err := w.campaignCanonicalContactTransaction(ctx, job.OrganizationID, func(tx *gorm.DB, _ *bool) error {
 		if err := tx.
 			Where("id = ? AND organization_id = ?", job.CampaignID, job.OrganizationID).
 			Preload("Template", "organization_id = ?", job.OrganizationID).
@@ -197,13 +201,16 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 			return nil
 		}
 
-		resolved, _, err := contactutil.GetOrCreateContact(
+		resolved, _, err := w.resolveCampaignContact(
 			tx,
 			job.OrganizationID,
 			job.PhoneNumber,
 			job.RecipientName,
 		)
 		if err != nil || resolved == nil {
+			if err != nil && retryableCampaignContactWrite(err) {
+				return err
+			}
 			w.Log.Error("Failed to get or create contact", "error", err, "phone", job.PhoneNumber)
 			if failErr := failCampaignRecipientBeforeClaimTx(
 				tx,
@@ -1058,8 +1065,39 @@ func (w *Worker) campaignCanonicalContactTransaction(
 		if err == nil || deliveryAttempted || !retryableCampaignContactWrite(err) {
 			return err
 		}
+		if attempt+1 < campaignCanonicalContactAttempts {
+			if waitErr := waitForCampaignContactWriteRetry(ctx, attempt); waitErr != nil {
+				return waitErr
+			}
+		}
 	}
 	return err
+}
+
+func (w *Worker) resolveCampaignContact(
+	tx *gorm.DB,
+	organizationID uuid.UUID,
+	phoneNumber, profileName string,
+) (*models.Contact, bool, error) {
+	if w.getOrCreateCampaignContact != nil {
+		return w.getOrCreateCampaignContact(tx, organizationID, phoneNumber, profileName)
+	}
+	return contactutil.GetOrCreateContact(tx, organizationID, phoneNumber, profileName)
+}
+
+func waitForCampaignContactWriteRetry(ctx context.Context, attempt int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	delay := campaignCanonicalContactInitialRetryDelay << attempt
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // withRecipientTenantTransaction always begins a top-level phase from the
@@ -1108,7 +1146,7 @@ func retryableCampaignContactWrite(err error) bool {
 		return false
 	}
 	switch sqlState.SQLState() {
-	case "40001", "40P01":
+	case "40001", "40P01", "55P03":
 		return true
 	default:
 		return false

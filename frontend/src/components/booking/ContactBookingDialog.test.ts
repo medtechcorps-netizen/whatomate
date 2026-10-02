@@ -11,12 +11,19 @@ const mocks = vi.hoisted(() => ({
   createBooking: vi.fn(),
   createLead: vi.fn(),
   createTask: vi.fn(),
+  moveLead: vi.fn(),
+  completeTask: vi.fn(),
+  createInvoice: vi.fn(),
+  sellPackage: vi.fn(),
+  allPackages: vi.fn(),
   runCopilot: vi.fn(),
   pipelines: vi.fn(),
   getWorkspace: vi.fn(),
   hasPermission: vi.fn(),
   toastError: vi.fn(),
   toastSuccess: vi.fn(),
+  toastInfo: vi.fn(),
+  toastWarning: vi.fn(),
 }))
 
 vi.mock('@/services/productSuite', () => ({
@@ -24,23 +31,36 @@ vi.mock('@/services/productSuite', () => ({
     allAvailability: mocks.allAvailability,
     createBooking: mocks.createBooking,
   },
+  commerceService: {
+    createInvoice: mocks.createInvoice,
+    sellPackage: mocks.sellPackage,
+    allPackages: mocks.allPackages,
+  },
   copilotService: { run: mocks.runCopilot },
   crmService: {
     createLead: mocks.createLead,
     createTask: mocks.createTask,
+    moveLead: mocks.moveLead,
+    completeTask: mocks.completeTask,
     pipelines: mocks.pipelines,
   },
   customerWorkspaceService: { get: mocks.getWorkspace },
 }))
 
 vi.mock('@/stores/auth', () => ({
-  useAuthStore: () => ({ hasPermission: mocks.hasPermission }),
+  useAuthStore: () => ({
+    hasPermission: mocks.hasPermission,
+    hasProductEntitlement: () => true,
+    organizationId: 'org-test',
+  }),
 }))
 
 vi.mock('@/composables/useAppToast', () => ({
   useAppToast: () => ({
     error: mocks.toastError,
     success: mocks.toastSuccess,
+    info: mocks.toastInfo,
+    warning: mocks.toastWarning,
   }),
 }))
 
@@ -530,12 +550,30 @@ describe('CustomerRevenueWorkspace booking identity', () => {
     await flushPromises()
 
     expect(mocks.toastSuccess).not.toHaveBeenCalledWith(
-      'Journey created',
+      'Lead added',
       expect.anything(),
     )
     expect(mocks.getWorkspace).toHaveBeenCalledTimes(2)
     expect(state.showJourneyDialog).toBe(false)
     expect(state.journeyDraft.title).toBe('')
+  })
+
+  it('names a WhatsApp username contact readably in the booking dialog and toast', async () => {
+    const response = workspaceResponse('canonical-contact')
+    Object.assign(response.data.data.contact, { phone_number: 'bsuid:abc123', profile_name: '' })
+    mocks.getWorkspace.mockReset().mockResolvedValue(response)
+    const wrapper = mountWorkspace()
+    await flushPromises()
+
+    const dialog = wrapper.findComponent(ContactBookingDialog)
+    expect(dialog.props('contactName')).toBe('WhatsApp user')
+
+    dialog.vm.$emit('booked')
+    await flushPromises()
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(
+      'Appointment reserved',
+      "WhatsApp user's booking is now visible in the care timeline.",
+    )
   })
 
   it('shows booking entry only with server visibility and write permission', async () => {

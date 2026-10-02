@@ -1,0 +1,50 @@
+# Temporary convergence lint policy (release graduation step 2).
+#
+# main now carries the production ui source product tree byte for byte, so
+# the default golangci-lint configuration reports the 13 findings that
+# phase-source validation already reviewed and excludes. Everything after
+# this header block is a verbatim copy of the policy written by the
+# "Write reviewed phase-source lint policy" step of
+# .github/workflows/validate-exact-release-source.yml, so the required lint
+# check enforces exactly the reviewed validation policy. Delete this file in
+# the release that fixes those findings (graduation step 9).
+
+version: "2"
+
+# Reviewed phase-source validation policy (2026-09-16).
+#
+# The pinned release-phase snapshots are immutable earlier trees, so
+# these findings are excluded here and tracked for the next phase
+# refresh rather than edited into a frozen source:
+#
+# 1. errcheck in *_test.go - test-only code that never ships; the
+#    snapshots predate the test-hygiene cleanups in later commits.
+# 2. The dead store at internal/database/postgres.go:4157, where
+#    catalogState is assigned and never read again (no behaviour).
+# 3. QF1003 tagged-switch style suggestions in *_test.go.
+# 4. Three symbols the backend and ui snapshots add one phase before
+#    their callers land - suppressUnfinishedInboundForTransfer,
+#    bookingAvailabilityEventRow and
+#    lockBookableEventForReservation - all called in the later
+#    lineage, so this is staged integration rather than dead code.
+#
+# Every other linter and every other production-code finding still
+# fails this gate.
+linters:
+  default: standard
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+      - path: internal/database/postgres\.go
+        text: ineffectual assignment to catalogState
+        linters:
+          - ineffassign
+      - path: _test\.go
+        text: QF1003
+        linters:
+          - staticcheck
+      - text: (suppressUnfinishedInboundForTransfer|bookingAvailabilityEventRow|lockBookableEventForReservation) is unused
+        linters:
+          - unused

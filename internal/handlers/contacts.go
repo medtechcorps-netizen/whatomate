@@ -2254,6 +2254,11 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 	if len(normalizedPhone) > 0 && normalizedPhone[0] == '+' {
 		normalizedPhone = normalizedPhone[1:]
 	}
+	// "+" (or whitespace) passes the raw check above but normalizes to an
+	// empty phone, which would collide with every other empty-phone row.
+	if contactutil.IsEmptyPhone(normalizedPhone) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "phone_number is required", nil, "")
+	}
 
 	// Check if contact exists (including soft-deleted)
 	var existingContact models.Contact
@@ -2306,7 +2311,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 			}
 			updates["deleted_at"] = nil
 			activityKey := "contact-restored:" + existingContact.ID.String() + ":" + uuid.NewString()
-			if err := a.DB.Transaction(func(tx *gorm.DB) error {
+			if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 				if err := tx.Unscoped().Model(&existingContact).Updates(updates).Error; err != nil {
 					return err
 				}
@@ -2361,7 +2366,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 		contact.Metadata = models.JSONB(req.Metadata)
 	}
 
-	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+	if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 		if err := tx.Create(&contact).Error; err != nil {
 			return err
 		}
@@ -2550,20 +2555,24 @@ func (a *App) DeleteContact(r *fastglue.Request) error {
 		return nil
 	}
 
-	// Get contact
-	contact, err := findByIDAndOrg[models.Contact](a.DB, r, contactID, orgID, "Contact")
+	var contact models.Contact
+	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		if loadErr := tx.Where("id = ? AND organization_id = ?", contactID, orgID).
+			First(&contact).Error; loadErr != nil {
+			return loadErr
+		}
+		return tx.Delete(&contact).Error
+	})
 	if err != nil {
-		return nil
-	}
-
-	// Soft delete the contact
-	if err := a.DB.Delete(contact).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
 		a.Log.Error("Failed to delete contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete contact", nil, "")
 	}
 
 	a.logAudit(orgID, userID,
-		"contact", contactID, models.AuditActionDeleted, contact, nil)
+		"contact", contactID, models.AuditActionDeleted, &contact, nil)
 
 	return r.SendEnvelope(map[string]any{
 		"message": "Contact deleted successfully",

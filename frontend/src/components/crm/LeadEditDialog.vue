@@ -4,7 +4,6 @@ import { AlertTriangle, Archive, Loader2, Save } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import {
   AlertDialog,
-  AlertDialogAction,
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
@@ -21,6 +20,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { getErrorMessage } from '@/lib/api-utils'
+import { useAuthStore } from '@/stores/auth'
 import { crmService, type CRMLead } from '@/services/productSuite'
 
 const props = defineProps<{
@@ -34,6 +34,8 @@ const emit = defineEmits<{
 }>()
 
 const saving = ref(false)
+const authStore = useAuthStore()
+const canWriteLeads = computed(() => authStore.hasPermission('crm.leads', 'write'))
 const transitioning = ref(false)
 const transitionOpen = ref(false)
 const transitionReason = ref('')
@@ -45,13 +47,22 @@ const draft = ref({
   currency: 'MYR',
   next_action_at: '',
   expected_close_date: '',
+  lost_reason: '',
 })
 
 const open = computed({
   get: () => props.modelValue,
-  set: (value) => emit('update:modelValue', value),
+  set: (value) => {
+    if (!saving.value && !transitioning.value) emit('update:modelValue', value)
+  },
 })
+
+function setTransitionOpen(value: boolean) {
+  if (!transitioning.value) transitionOpen.value = value
+}
 const isArchived = computed(() => props.lead?.status === 'archived')
+// The server only accepts lost_reason edits while the lead is lost.
+const isLost = computed(() => props.lead?.status === 'lost')
 
 function toLocalDateTime(value?: string) {
   if (!value) return ''
@@ -75,6 +86,7 @@ function resetDraft() {
     currency: props.lead.currency || 'MYR',
     next_action_at: toLocalDateTime(props.lead.next_action_at),
     expected_close_date: toCalendarDate(props.lead.expected_close_date),
+    lost_reason: props.lead.lost_reason ?? '',
   }
   errorMessage.value = ''
   transitionOpen.value = false
@@ -87,7 +99,15 @@ watch([() => props.modelValue, () => props.lead], ([isOpen]) => {
 })
 
 async function save() {
-  if (!props.lead || !draft.value.title.trim()) return
+  if (
+    !props.lead ||
+    isArchived.value ||
+    !canWriteLeads.value ||
+    saving.value ||
+    transitioning.value ||
+    !draft.value.title.trim()
+  )
+    return
   const valueMinor = Math.round(Number(draft.value.value) * 100)
   if (!Number.isFinite(valueMinor) || valueMinor < 0) {
     errorMessage.value = 'Lead value must be zero or greater.'
@@ -108,9 +128,10 @@ async function save() {
         ? `${draft.value.expected_close_date}T00:00:00.000Z`
         : undefined,
       clear_expected_close_date: !draft.value.expected_close_date,
+      ...(isLost.value ? { lost_reason: draft.value.lost_reason.trim() } : {}),
     })
     emit('saved', 'updated')
-    open.value = false
+    emit('update:modelValue', false)
   } catch (error) {
     errorMessage.value = getErrorMessage(error, 'Lead could not be saved')
   } finally {
@@ -119,6 +140,7 @@ async function save() {
 }
 
 function requestTransition() {
+  if (!isArchived.value || !canWriteLeads.value || saving.value || transitioning.value) return
   errorMessage.value = ''
   transitionReason.value = ''
   transitionIdempotencyKey.value = crypto.randomUUID()
@@ -126,30 +148,23 @@ function requestTransition() {
 }
 
 async function transitionLead() {
-  if (!props.lead) return
+  if (!props.lead || !isArchived.value || !canWriteLeads.value || saving.value || transitioning.value) return
+  const lead = props.lead
   transitioning.value = true
   errorMessage.value = ''
-  const action = isArchived.value ? 'reopened' : 'archived'
   const payload = {
-    version: props.lead.version,
+    version: lead.version,
     reason: transitionReason.value.trim() || undefined,
     idempotency_key: transitionIdempotencyKey.value || crypto.randomUUID(),
     metadata: { source: 'crm_pipeline' },
   }
   try {
-    if (isArchived.value) {
-      await crmService.reopenLead(props.lead.id, payload)
-    } else {
-      await crmService.archiveLead(props.lead.id, payload)
-    }
+    await crmService.reopenLead(lead.id, payload)
     transitionOpen.value = false
-    emit('saved', action)
-    open.value = false
+    emit('saved', 'reopened')
+    emit('update:modelValue', false)
   } catch (error) {
-    errorMessage.value = getErrorMessage(
-      error,
-      isArchived.value ? 'Lead could not be reopened' : 'Lead could not be archived',
-    )
+    errorMessage.value = getErrorMessage(error, 'Lead could not be reopened')
   } finally {
     transitioning.value = false
   }
@@ -182,7 +197,7 @@ async function transitionLead() {
           <span>{{ errorMessage }}</span>
         </div>
 
-        <fieldset :disabled="isArchived || saving || transitioning" class="contents">
+        <fieldset :disabled="isArchived || !canWriteLeads || saving || transitioning" class="contents">
           <label class="block sm:col-span-2">
             <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Lead title</span>
             <input
@@ -216,7 +231,7 @@ async function transitionLead() {
             </select>
           </label>
           <label class="block">
-            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Next action</span>
+            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Follow-up date</span>
             <input
               v-model="draft.next_action_at"
               type="datetime-local"
@@ -224,22 +239,29 @@ async function transitionLead() {
             />
           </label>
           <label class="block">
-            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Expected close</span>
+            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Expected decision date</span>
             <input
               v-model="draft.expected_close_date"
               type="date"
               class="h-11 w-full rounded-xl border border-white/10 bg-[#15191f] px-3 text-xs outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 light:border-slate-300 light:bg-white"
             />
           </label>
+          <label v-if="isLost" class="block sm:col-span-2">
+            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Reason lost</span>
+            <textarea
+              v-model="draft.lost_reason"
+              rows="2"
+              maxlength="2000"
+              data-testid="lead-edit-lost-reason"
+              placeholder="Why did this lead not go ahead?"
+              class="w-full resize-y rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 light:border-slate-300 light:bg-white"
+            />
+          </label>
         </fieldset>
 
         <div
-          class="rounded-xl border p-3 sm:col-span-2"
-          :class="
-            isArchived
-              ? 'border-emerald-300/20 bg-emerald-300/[0.04] light:border-emerald-300 light:bg-emerald-50'
-              : 'border-dashed border-white/[0.1] bg-white/[0.02] light:border-slate-300 light:bg-slate-50'
-          "
+          v-if="isArchived"
+          class="rounded-xl border border-emerald-300/20 bg-emerald-300/[0.04] p-3 light:border-emerald-300 light:bg-emerald-50 sm:col-span-2"
         >
           <div class="flex items-start justify-between gap-4">
             <div>
@@ -248,25 +270,21 @@ async function transitionLead() {
                 class="flex items-center gap-2 text-xs font-semibold text-white/65 light:text-slate-700"
               >
                 <Archive class="h-3.5 w-3.5" />
-                {{ isArchived ? 'Reopen lead' : 'Archive lead' }}
+                Reopen lead
               </p>
               <p class="mt-1 text-[11px] leading-5 text-white/35 light:text-slate-500">
-                {{
-                  isArchived
-                    ? 'Restore the status implied by its current stage while preserving the full lead history.'
-                    : 'Remove this lead from the active board without deleting its history or customer record.'
-                }}
+                Restore the status implied by its current stage while preserving the full lead history.
               </p>
             </div>
             <Button
               type="button"
               size="sm"
               variant="outline"
-              :disabled="saving || transitioning"
+              :disabled="saving || transitioning || !canWriteLeads"
               aria-describedby="lead-archive-status"
               @click="requestTransition"
             >
-              {{ isArchived ? 'Reopen' : 'Archive' }}
+              Reopen
             </Button>
           </div>
         </div>
@@ -277,7 +295,7 @@ async function transitionLead() {
           isArchived ? 'Close' : 'Cancel'
         }}</Button>
         <Button
-          v-if="!isArchived"
+          v-if="!isArchived && canWriteLeads"
           type="submit"
           form="lead-edit-form"
           class="gap-2 bg-cyan-400 text-black hover:bg-cyan-300"
@@ -291,16 +309,13 @@ async function transitionLead() {
     </DialogContent>
   </Dialog>
 
-  <AlertDialog v-model:open="transitionOpen">
+  <AlertDialog :open="transitionOpen" @update:open="setTransitionOpen">
     <AlertDialogContent>
       <AlertDialogHeader>
-        <AlertDialogTitle>{{ isArchived ? 'Reopen this lead?' : 'Archive this lead?' }}</AlertDialogTitle>
+        <AlertDialogTitle>Reopen this lead?</AlertDialogTitle>
         <AlertDialogDescription>
-          {{
-            isArchived
-              ? 'The lead will return to the status defined by its current stage. Its history and previous outcome dates stay intact.'
-              : 'The lead will leave the active pipeline but remain searchable, auditable, and reversible.'
-          }}
+          The lead will return to the status defined by its current stage. Its history and previous outcome dates stay
+          intact.
         </AlertDialogDescription>
       </AlertDialogHeader>
       <div
@@ -318,22 +333,20 @@ async function transitionLead() {
           rows="3"
           maxlength="2000"
           :disabled="transitioning"
-          :placeholder="isArchived ? 'Why is this lead returning?' : 'Why is this lead being archived?'"
+          placeholder="Why is this lead returning?"
           class="w-full resize-y rounded-xl border border-border bg-background px-3 py-2.5 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
         />
       </label>
       <AlertDialogFooter>
         <AlertDialogCancel :disabled="transitioning">Keep as is</AlertDialogCancel>
-        <AlertDialogAction
-          :class="
-            isArchived ? 'bg-emerald-600 text-white hover:bg-emerald-500' : 'bg-rose-600 text-white hover:bg-rose-500'
-          "
-          :disabled="transitioning"
+        <Button
+          class="bg-emerald-600 text-white hover:bg-emerald-500"
+          :disabled="transitioning || !canWriteLeads"
           @click.prevent="transitionLead"
         >
           <Loader2 v-if="transitioning" class="mr-2 h-4 w-4 animate-spin" />
-          {{ isArchived ? 'Reopen lead' : 'Archive lead' }}
-        </AlertDialogAction>
+          Reopen lead
+        </Button>
       </AlertDialogFooter>
     </AlertDialogContent>
   </AlertDialog>

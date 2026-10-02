@@ -162,6 +162,9 @@ const metaInstagramState = ref<MetaInstagramAvailabilityState>({
   status: null,
 })
 const settingsAccount = ref<ChannelAccount | null>(null)
+const bookingSettingsSaving = ref(false)
+const bookingSettingsError = ref('')
+let bookingSettingsRequest = 0
 const conversationPage = ref(1)
 const conversationTotal = ref(0)
 const messageTotal = ref(0)
@@ -172,6 +175,9 @@ const newAccount = reactive({
   relay_url: '',
 })
 const canManageAccounts = computed(() => authStore.hasPermission('channel_accounts', 'write'))
+const canManageAIBooking = computed(() => canManageAccounts.value
+  && authStore.hasPermission('chatbot.ai', 'write')
+  && authStore.hasPermission('booking.settings', 'write'))
 const canDeleteAccounts = computed(() => authStore.hasPermission('channel_accounts', 'delete'))
 const canManageIntegrations = computed(() => authStore.hasPermission('settings.integrations', 'write'))
 const canManageMetaMessenger = computed(
@@ -205,6 +211,7 @@ const accountSettingsDraft = reactive({
   relay_url: '',
   outbound_secret: '',
   ai_reply_enabled: false,
+  ai_booking_enabled: false,
 })
 const connectionState = ref<WebSocketConnectionState>(wsService.getConnectionState())
 let stopInboxActivity: (() => void) | null = null
@@ -1073,6 +1080,9 @@ function closeMobileConversation() {
 }
 
 function resetOrganizationScopedInboxState(organizationId: string | null) {
+  bookingSettingsRequest += 1
+  bookingSettingsSaving.value = false
+  bookingSettingsError.value = ''
   conversationProjectionGeneration += 1
   conversationViewSequence += 1
   stopMessagesContentResizeObserver()
@@ -1830,17 +1840,63 @@ async function reconcileMetaInstagram(account: ChannelAccount) {
 }
 
 function openAccountSettings(account: ChannelAccount) {
+  if (bookingSettingsSaving.value) return
   settingsAccount.value = account
+  bookingSettingsError.value = ''
   accountSettingsDraft.name = account.name
   accountSettingsDraft.relay_url =
     typeof account.config?.relay_url === 'string' ? account.config.relay_url : ''
   accountSettingsDraft.outbound_secret = ''
   accountSettingsDraft.ai_reply_enabled = account.config?.ai_reply_enabled === true
+  accountSettingsDraft.ai_booking_enabled = account.config?.ai_booking_enabled === true
+}
+
+function supportsAIBooking(account: ChannelAccount) {
+  return (account.channel === 'whatsapp' && account.provider === 'meta_legacy')
+    || (['instagram', 'messenger'].includes(account.channel) && account.provider === 'relay')
+}
+
+function canEnableAIBooking(account: ChannelAccount) {
+  return account.status === 'active' && (account.provider === 'meta_legacy'
+    || (account.config?.outbound_enabled === true && account.config?.ai_reply_enabled === true))
+}
+
+async function saveAIBookingSettings() {
+  const account = settingsAccount.value
+  const organizationId = activeOrganizationId.value
+  if (!account || !organizationId || !canManageAIBooking.value || bookingSettingsSaving.value
+    || !supportsAIBooking(account)
+    || (accountSettingsDraft.ai_booking_enabled && !canEnableAIBooking(account))) return
+  const generation = organizationGeneration
+  const request = ++bookingSettingsRequest
+  const isCurrent = () => request === bookingSettingsRequest
+    && generation === organizationGeneration && organizationId === activeOrganizationId.value
+    && settingsAccount.value?.id === account.id
+  bookingSettingsSaving.value = true
+  bookingSettingsError.value = ''
+  try {
+    // Native shadows accept this dedicated field only: never submit a name,
+    // raw config, profile setting, routing value or generic outbound approval.
+    await channelsService.updateAccount(account.id, {
+      ai_booking_enabled: accountSettingsDraft.ai_booking_enabled,
+    })
+    if (!isCurrent()) return
+    settingsAccount.value = null
+    toast.success('AI booking setting saved', 'Only this channel was changed. Customers must explicitly confirm an offered scheduled slot.')
+    await load()
+  } catch (error) {
+    if (!isCurrent()) return
+    bookingSettingsError.value = getErrorMessage(error)
+    toast.error('AI booking setting was not saved', bookingSettingsError.value)
+  } finally {
+    if (request === bookingSettingsRequest) bookingSettingsSaving.value = false
+  }
 }
 
 async function saveAccountSettings() {
   const account = settingsAccount.value
-  if (!account || !canManageAccounts.value || !accountSettingsDraft.name.trim()) return
+  if (!account || account.provider === 'meta_legacy' || bookingSettingsSaving.value
+    || !canManageAccounts.value || !accountSettingsDraft.name.trim()) return
   const managedMeta = isManagedMetaAccount(account)
   if (
     account.provider === 'relay' &&
@@ -1855,10 +1911,14 @@ async function saveAccountSettings() {
       name: accountSettingsDraft.name.trim(),
     }
     if (account.provider === 'relay' && !managedMeta) {
-      update.config = {
+      const config: Record<string, unknown> = {
         ...account.config,
         relay_url: accountSettingsDraft.relay_url.trim(),
       }
+      for (const key of ['ai_booking_enabled', 'ai_booking_revision', 'ai_booking_enabled_at', 'ai_booking_route_sha256']) {
+        delete config[key]
+      }
+      update.config = config
     }
     if (!managedMeta && accountSettingsDraft.outbound_secret.trim()) {
       update.outbound_secret = accountSettingsDraft.outbound_secret
@@ -2575,10 +2635,11 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             </Button>
           </RouterLink>
           <Button
-            v-else-if="(canManageAccounts || canDeleteAccounts) && account.provider !== 'meta_legacy'"
+            v-else-if="account.provider === 'meta_legacy' ? canManageAIBooking : (canManageAccounts || canDeleteAccounts)"
             variant="outline"
             size="sm"
             class="h-8"
+            :aria-label="`Manage ${account.name}`"
             @click="openAccountSettings(account)"
           >
             <Settings2 class="mr-1.5 h-3.5 w-3.5" />
@@ -2685,7 +2746,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               <Settings2 class="h-3.5 w-3.5" />
             </RouterLink>
             <button
-              v-else-if="(canManageAccounts || canDeleteAccounts) && account.provider !== 'meta_legacy'"
+              v-else-if="account.provider === 'meta_legacy' ? canManageAIBooking : (canManageAccounts || canDeleteAccounts)"
               type="button"
               class="rounded-lg p-1.5 text-white/25 transition hover:bg-white/[0.05] hover:text-sky-300 light:text-slate-500 light:hover:text-sky-700"
               :aria-label="`Manage ${account.name}`"
@@ -2915,7 +2976,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             ref="messagesViewport"
             data-testid="omnichannel-message-viewport"
             :data-conversation-id="selectedConversation.id"
-            class="flex-1 overflow-y-auto p-3 sm:p-5 md:p-7"
+            class="flex-1 overflow-y-auto p-3 [overflow-anchor:none] sm:p-5 md:p-7"
             @scroll.passive="handleMessageViewportScroll"
           >
             <div
@@ -3098,6 +3159,8 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
         <CustomerRevenueWorkspace
           :contact-id="selectedConversation.contact_id"
           :contact="selectedConversation.contact"
+          :channel="selectedConversation.channel"
+          :conversation-id="selectedConversation.id"
           surface="omnichannel"
           @close="isWorkspaceOpen = false"
         />
@@ -3112,12 +3175,14 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
       <SheetContent side="right" class="!w-full !max-w-[440px] !p-0 [&>button:last-child]:hidden">
         <SheetTitle class="sr-only">Customer revenue workspace</SheetTitle>
         <SheetDescription class="sr-only">
-          Customer journeys, tasks, bookings, packages, revenue and activity.
+          Customer leads, follow-ups, bookings, packages, invoices and activity.
         </SheetDescription>
         <CustomerRevenueWorkspace
           v-if="isWorkspaceOpen"
           :contact-id="selectedConversation.contact_id"
           :contact="selectedConversation.contact"
+          :channel="selectedConversation.channel"
+          :conversation-id="selectedConversation.id"
           surface="omnichannel"
           @close="isWorkspaceOpen = false"
         />
@@ -3223,7 +3288,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="channel-settings-title"
-      @click.self="settingsAccount = null"
+      @click.self="!bookingSettingsSaving && (settingsAccount = null)"
     >
       <form
         class="w-full max-w-lg rounded-2xl border border-white/10 bg-[#111416] p-5 shadow-2xl light:border-gray-200 light:bg-white"
@@ -3237,7 +3302,9 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             </h2>
             <p class="mt-1 text-xs text-white/40 light:text-gray-500">
               {{
-                isManagedMetaMessenger(settingsAccount)
+                settingsAccount.provider === 'meta_legacy'
+                  ? 'Native WhatsApp routing stays managed by WhatsApp setup. Only the separate AI booking setting can be changed here.'
+                  : isManagedMetaMessenger(settingsAccount)
                   ? `Facebook-managed Page ${settingsAccount.external_account_id ?? ''}. Reconnect, test, approve, or disconnect it here.`
                   : isManagedMetaInstagram(settingsAccount)
                     ? metaInstagramOnboardingReady
@@ -3247,8 +3314,52 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               }}
             </p>
           </div>
-          <Button type="button" variant="outline" size="sm" @click="settingsAccount = null">Close</Button>
+          <Button type="button" variant="outline" size="sm" :disabled="bookingSettingsSaving" @click="settingsAccount = null">Close</Button>
         </div>
+
+        <section
+          v-if="supportsAIBooking(settingsAccount)"
+          aria-labelledby="channel-ai-booking-title"
+          class="mt-5 rounded-xl border border-sky-300/20 bg-sky-300/[0.035] p-4 light:border-sky-200 light:bg-sky-50"
+          :aria-busy="bookingSettingsSaving"
+        >
+          <label class="flex min-h-11 cursor-pointer items-start gap-3">
+            <input
+              v-model="accountSettingsDraft.ai_booking_enabled"
+              type="checkbox"
+              data-testid="channel-ai-booking-enabled"
+              aria-describedby="channel-ai-booking-description"
+              class="mt-1 h-4 w-4 rounded accent-sky-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sky-300"
+              :disabled="!canManageAIBooking || bookingSettingsSaving
+                || (!accountSettingsDraft.ai_booking_enabled && !canEnableAIBooking(settingsAccount))"
+            />
+            <span>
+              <span id="channel-ai-booking-title" class="text-sm font-semibold text-white light:text-gray-900">AI booking for this channel</span>
+              <span id="channel-ai-booking-description" class="mt-1 block text-xs leading-5 text-white/60 light:text-gray-600">
+                Off by default. Connecting AI does not enable booking. When enabled, AI may offer scheduled slots;
+                a customer must explicitly confirm before a place is reserved. Other channels are unchanged.
+              </span>
+            </span>
+          </label>
+          <p v-if="!canManageAIBooking" class="mt-2 text-xs text-white/60 light:text-gray-600">
+            Channel, AI configuration and Booking settings permissions are required.
+          </p>
+          <p v-else-if="!canEnableAIBooking(settingsAccount)" class="mt-2 text-xs text-white/60 light:text-gray-600">
+            Activate this channel first. Instagram and Messenger also need approved outbound delivery and automatic AI replies.
+          </p>
+          <p v-if="bookingSettingsError" role="alert" class="mt-3 text-xs text-red-300 light:text-red-700">{{ bookingSettingsError }}</p>
+          <Button
+            v-if="canManageAIBooking"
+            type="button"
+            data-testid="channel-ai-booking-save"
+            class="mt-3 min-h-11 bg-sky-300 text-black hover:bg-sky-200"
+            :disabled="bookingSettingsSaving || (accountSettingsDraft.ai_booking_enabled && !canEnableAIBooking(settingsAccount))"
+            @click="saveAIBookingSettings"
+          >
+            <Loader2 v-if="bookingSettingsSaving" aria-hidden="true" class="mr-2 h-4 w-4 animate-spin" />
+            {{ bookingSettingsSaving ? 'Saving AI booking…' : 'Save AI booking setting' }}
+          </Button>
+        </section>
 
         <div
           v-if="
@@ -3277,7 +3388,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
 
         <div
           v-if="
-            canManageAccounts &&
+            settingsAccount.provider !== 'meta_legacy' && canManageAccounts &&
             (!isManagedMetaAccount(settingsAccount) ||
               (managedMetaLifecycleReady(settingsAccount) && canManageIntegrations))
           "
@@ -3337,7 +3448,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             </span>
           </label>
           <div class="flex flex-wrap gap-2">
-            <Button type="submit" class="bg-sky-300 text-black hover:bg-sky-200">Save changes</Button>
+            <Button type="submit" :disabled="bookingSettingsSaving" class="bg-sky-300 text-black hover:bg-sky-200">Save changes</Button>
             <Button
               v-if="
                 canReconcileMetaMessenger &&
@@ -3467,7 +3578,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
 
         <div
           v-if="
-            canDeleteAccounts &&
+            settingsAccount.provider !== 'meta_legacy' && canDeleteAccounts &&
             (!isManagedMetaAccount(settingsAccount) ||
               (managedMetaTeardownReady(settingsAccount) && canManageIntegrations))
           "

@@ -496,6 +496,237 @@ func TestFixSystemRolePermissionsAddsOnlyNewExpectedPermissions(t *testing.T) {
 	), "an older permission removed after a role update must stay removed")
 }
 
+func TestSeedSystemRolesForOrgBookingDeletionDefaultsAreFreshOnly(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	require.NoError(t, database.SeedPermissionsAndRoles(db))
+	org := testutil.CreateTestOrganization(t, db)
+	require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+
+	var deletion models.Permission
+	require.NoError(t, db.Where("resource = ? AND action = ?",
+		models.ResourceBookingSettings, models.ActionDelete).First(&deletion).Error)
+	for _, name := range []string{"admin", "manager", "agent"} {
+		var role models.CustomRole
+		require.NoError(t, db.Where("organization_id = ? AND name = ? AND is_system = ?",
+			org.ID, name, true).First(&role).Error)
+		assert.Equal(t, name != "agent", roleHasPermission(t, db, role.ID,
+			models.ResourceBookingSettings, models.ActionDelete), name)
+
+		// Repeating fresh-role setup must not override a later explicit removal.
+		require.NoError(t, db.Model(&role).Association("Permissions").Delete(&deletion))
+	}
+	require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+	require.NoError(t, database.FixSystemRolePermissions(db))
+	var roles []models.CustomRole
+	require.NoError(t, db.Where("organization_id = ?", org.ID).Find(&roles).Error)
+	require.Len(t, roles, 3)
+	for _, role := range roles {
+		assert.False(t, roleHasPermission(t, db, role.ID,
+			models.ResourceBookingSettings, models.ActionDelete), role.Name)
+	}
+}
+
+func TestFixSystemRolePermissionsPreservesBookingDeletionDecisions(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	require.NoError(t, database.SeedPermissionsAndRoles(db))
+	var deletion, read models.Permission
+	require.NoError(t, db.Where("resource = ? AND action = ?",
+		models.ResourceBookingSettings, models.ActionDelete).First(&deletion).Error)
+	require.NoError(t, db.Where("resource = ? AND action = ?",
+		models.ResourceConversations, models.ActionRead).First(&read).Error)
+	// Both look newly introduced. Only the ordinary read permission may upgrade.
+	newPermissionTime := time.Now().UTC().Add(24 * time.Hour)
+	require.NoError(t, db.Model(&models.Permission{}).Where("id IN ?", []uuid.UUID{deletion.ID, read.ID}).
+		UpdateColumn("created_at", newPermissionTime).Error)
+
+	for _, name := range []string{"admin", "manager", "agent"} {
+		for _, state := range []string{"populated_missing", "empty", "explicit", "removed"} {
+			t.Run(name+"/"+state, func(t *testing.T) {
+				org := testutil.CreateTestOrganization(t, db)
+				perms := []models.Permission{}
+				if state != "empty" {
+					var bookingRead models.Permission
+					require.NoError(t, db.Where("resource = ? AND action = ?",
+						models.ResourceBookingSettings, models.ActionRead).First(&bookingRead).Error)
+					perms = append(perms, bookingRead)
+				}
+				if state == "explicit" || state == "removed" {
+					perms = append(perms, deletion)
+				}
+				role := testutil.CreateTestRoleExact(t, db, org.ID, name, true, false, perms)
+				if state == "removed" {
+					require.NoError(t, db.Model(role).Association("Permissions").Delete(&deletion))
+				}
+				roleTime := time.Now().UTC().Add(-time.Hour)
+				require.NoError(t, db.Model(role).UpdateColumn("updated_at", roleTime).Error)
+				for attempt := 0; attempt < 2; attempt++ {
+					require.NoError(t, database.FixSystemRolePermissions(db))
+					assert.Equal(t, state == "explicit", roleHasPermission(t, db, role.ID,
+						models.ResourceBookingSettings, models.ActionDelete))
+					assert.True(t, roleHasPermission(t, db, role.ID,
+						models.ResourceConversations, models.ActionRead),
+						"ordinary permission upgrades and empty-role repairs must still work")
+				}
+			})
+		}
+	}
+	// Custom roles are never normalized, even with a system-role name.
+	for _, explicit := range []bool{false, true} {
+		org := testutil.CreateTestOrganization(t, db)
+		perms := []models.Permission{}
+		if explicit {
+			perms = append(perms, deletion)
+		}
+		role := testutil.CreateTestRoleExact(t, db, org.ID, "admin", false, false, perms)
+		before := role.UpdatedAt
+		require.NoError(t, database.FixSystemRolePermissions(db))
+		var actual []models.Permission
+		require.NoError(t, db.Model(role).Association("Permissions").Find(&actual))
+		assert.Len(t, actual, len(perms))
+		assert.Equal(t, explicit, roleHasPermission(t, db, role.ID,
+			models.ResourceBookingSettings, models.ActionDelete))
+		require.NoError(t, db.First(role, "id = ?", role.ID).Error)
+		assert.WithinDuration(t, before, role.UpdatedAt, time.Microsecond)
+	}
+}
+
+func TestSeedSystemRolesForAllOrgsDoesNotGrantBookingDeletion(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	for _, state := range []string{"new_timestamp", "old_timestamp", "soft_deleted_roles"} {
+		t.Run(state, func(t *testing.T) {
+			cleanAll(t, db)
+			require.NoError(t, database.SeedPermissionsAndRoles(db))
+			org := testutil.CreateTestOrganization(t, db)
+			var retiredIDs []uuid.UUID
+			if state == "old_timestamp" {
+				require.NoError(t, db.Model(org).UpdateColumn("created_at", time.Now().UTC().Add(-72*time.Hour)).Error)
+			}
+			if state == "soft_deleted_roles" {
+				require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+				require.NoError(t, db.Model(&models.CustomRole{}).Where("organization_id = ?", org.ID).
+					Pluck("id", &retiredIDs).Error)
+				require.Len(t, retiredIDs, 3)
+				require.NoError(t, db.Where("organization_id = ?", org.ID).Delete(&models.CustomRole{}).Error)
+				// The existing unique-name constraint rejects recreation of
+				// soft-deleted roles. Repair must not revive or bypass them.
+				for attempt := 0; attempt < 2; attempt++ {
+					require.Error(t, database.SeedSystemRolesForAllOrgs(db))
+				}
+				var retained []models.CustomRole
+				require.NoError(t, db.Unscoped().Where("organization_id = ?", org.ID).Find(&retained).Error)
+				require.Len(t, retained, 3)
+				for _, role := range retained {
+					assert.Contains(t, retiredIDs, role.ID)
+					assert.True(t, role.DeletedAt.Valid)
+				}
+				return
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				require.NoError(t, database.SeedSystemRolesForAllOrgs(db))
+			}
+			var roles []models.CustomRole
+			require.NoError(t, db.Where("organization_id = ? AND is_system = ?", org.ID, true).Find(&roles).Error)
+			require.Len(t, roles, 3)
+			for _, role := range roles {
+				assert.NotContains(t, retiredIDs, role.ID, "old roles must not be revived")
+				assert.False(t, roleHasPermission(t, db, role.ID,
+					models.ResourceBookingSettings, models.ActionDelete), role.Name)
+				assert.True(t, roleHasPermission(t, db, role.ID,
+					models.ResourceBookingSettings, models.ActionRead), role.Name)
+				assert.Equal(t, role.Name != "agent", roleHasPermission(t, db, role.ID,
+					models.ResourceBookingSettings, models.ActionWrite), role.Name)
+			}
+		})
+	}
+}
+
+func TestSeedSystemRolesForAllOrgsPreservesBookingGrantsAndAssignments(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	cleanAll(t, db)
+	require.NoError(t, database.SeedPermissionsAndRoles(db))
+	org := testutil.CreateTestOrganization(t, db)
+	require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+	var admin, manager models.CustomRole
+	require.NoError(t, db.Where("organization_id = ? AND name = ?", org.ID, "admin").First(&admin).Error)
+	require.NoError(t, db.Where("organization_id = ? AND name = ?", org.ID, "manager").First(&manager).Error)
+	require.NoError(t, db.Model(&admin).Association("Permissions").Clear())
+	user := testutil.CreateTestUser(t, db, org.ID, testutil.WithRoleID(&manager.ID))
+	var membership models.UserOrganization
+	require.NoError(t, db.Where("user_id = ? AND organization_id = ?", user.ID, org.ID).First(&membership).Error)
+	for attempt := 0; attempt < 2; attempt++ {
+		require.NoError(t, database.SeedSystemRolesForAllOrgs(db))
+	}
+	assert.False(t, roleHasPermission(t, db, admin.ID, models.ResourceBookingSettings, models.ActionDelete))
+	assert.True(t, roleHasPermission(t, db, manager.ID, models.ResourceBookingSettings, models.ActionDelete))
+	require.NoError(t, db.First(user, "id = ?", user.ID).Error)
+	require.NoError(t, db.First(&membership, "id = ?", membership.ID).Error)
+	require.NotNil(t, user.RoleID)
+	require.NotNil(t, membership.RoleID)
+	assert.Equal(t, manager.ID, *user.RoleID)
+	assert.Equal(t, manager.ID, *membership.RoleID)
+	var roleIDs []uuid.UUID
+	require.NoError(t, db.Model(&models.CustomRole{}).Where("organization_id = ?", org.ID).Pluck("id", &roleIDs).Error)
+	assert.Contains(t, roleIDs, admin.ID)
+	assert.Contains(t, roleIDs, manager.ID)
+	assert.Len(t, roleIDs, 3)
+}
+
+func TestCreateDefaultAdminRetainedBookingDeletionPolicy(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	for _, state := range []string{"missing_roles", "empty_roles", "explicit_grants", "removed_grants"} {
+		t.Run(state, func(t *testing.T) {
+			cleanAll(t, db)
+			require.NoError(t, database.SeedPermissionsAndRoles(db))
+			org := testutil.CreateTestOrganization(t, db)
+			var priorIDs []uuid.UUID
+			if state != "missing_roles" {
+				require.NoError(t, database.SeedSystemRolesForOrg(db, org.ID))
+				var roles []models.CustomRole
+				require.NoError(t, db.Where("organization_id = ?", org.ID).Find(&roles).Error)
+				var deletion models.Permission
+				require.NoError(t, db.Where("resource = ? AND action = ?",
+					models.ResourceBookingSettings, models.ActionDelete).First(&deletion).Error)
+				for _, role := range roles {
+					priorIDs = append(priorIDs, role.ID)
+					if state == "empty_roles" {
+						require.NoError(t, db.Model(&role).Association("Permissions").Clear())
+					} else if state == "removed_grants" {
+						require.NoError(t, db.Model(&role).Association("Permissions").Delete(&deletion))
+					}
+				}
+			}
+			cfg := &config.DefaultAdminConfig{
+				Email: "booking-policy@example.test", Password: "synthetic-password",
+				FullName: "Synthetic booking policy administrator",
+			}
+			require.NoError(t, database.CreateDefaultAdmin(db, cfg))
+			require.NoError(t, database.FixSystemRolePermissions(db))
+			var user models.User
+			require.NoError(t, db.Where("email = ?", cfg.Email).First(&user).Error)
+			assert.Equal(t, org.ID, user.OrganizationID)
+			require.NotNil(t, user.RoleID)
+			var roles []models.CustomRole
+			require.NoError(t, db.Where("organization_id = ?", org.ID).Find(&roles).Error)
+			require.Len(t, roles, 3)
+			for _, role := range roles {
+				if len(priorIDs) != 0 {
+					assert.Contains(t, priorIDs, role.ID, "retained roles must not be replaced")
+				}
+				assert.Equal(t, state == "explicit_grants" && role.Name != "agent",
+					roleHasPermission(t, db, role.ID, models.ResourceBookingSettings, models.ActionDelete), role.Name)
+				if role.Name == "admin" {
+					assert.Equal(t, role.ID, *user.RoleID)
+				}
+			}
+			var orgCount int64
+			require.NoError(t, db.Model(&models.Organization{}).Count(&orgCount).Error)
+			assert.Equal(t, int64(1), orgCount)
+		})
+	}
+}
+
 func roleHasPermission(
 	t *testing.T,
 	db *gorm.DB,
@@ -708,6 +939,13 @@ func TestCreateDefaultAdmin_CreatesOrgAndUser(t *testing.T) {
 
 	// Verify the user belongs to the organization
 	assert.Equal(t, org.ID, user.OrganizationID)
+	var roles []models.CustomRole
+	require.NoError(t, db.Where("organization_id = ? AND is_system = ?", org.ID, true).Find(&roles).Error)
+	require.Len(t, roles, 3)
+	for _, role := range roles {
+		assert.Equal(t, role.Name != "agent", roleHasPermission(t, db, role.ID,
+			models.ResourceBookingSettings, models.ActionDelete), "fresh organization: "+role.Name)
+	}
 }
 
 func TestCreateDefaultAdmin_Idempotent(t *testing.T) {
