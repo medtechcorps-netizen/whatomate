@@ -1,17 +1,18 @@
 <script setup lang="ts">
-import { DropdownMenuRoot } from 'reka-ui'
+import type { DropdownMenuRootEmits, DropdownMenuRootProps } from 'reka-ui'
+import { DropdownMenuRoot, useForwardPropsEmits } from 'reka-ui'
 
-const props = defineProps<{
-  open?: boolean
-}>()
+// Forward only the props a caller actually passes. Declaring `open` as a plain
+// optional boolean let Vue cast an absent prop to `false`, which pinned every
+// uncontrolled menu closed (reka-ui only self-manages when `open` is undefined).
+const props = defineProps<DropdownMenuRootProps>()
+const emits = defineEmits<DropdownMenuRootEmits>()
 
-const emit = defineEmits<{
-  'update:open': [value: boolean]
-}>()
+const forwarded = useForwardPropsEmits(props, emits)
 </script>
 
 <template>
-  <DropdownMenuRoot :open="open" @update:open="emit('update:open', $event)">
+  <DropdownMenuRoot v-bind="forwarded">
     <slot />
   </DropdownMenuRoot>
 </template>

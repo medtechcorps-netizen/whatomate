@@ -546,8 +546,9 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 		if err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid agent_id", nil, "")
 		}
-		// Verify agent exists and is available
-		agent, err := findByIDAndOrg[models.User](a.DB, r, parsedAgentID, orgID, "Agent")
+		// Verify the agent is an active member of this organization (home org
+		// or user_organizations membership) and is available.
+		agent, err := findOrgMemberUser(a.DB, r, parsedAgentID, orgID, "Agent", true)
 		if err != nil {
 			return nil
 		}
@@ -833,8 +834,9 @@ func (a *App) AssignAgentTransfer(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid agent_id", nil, "")
 		}
 
-		// Verify agent exists and is available
-		agent, err := findByIDAndOrg[models.User](a.DB, r, parsedAgentID, orgID, "Agent")
+		// Verify the agent is an active member of this organization (home org
+		// or user_organizations membership) and is available.
+		agent, err := findOrgMemberUser(a.DB, r, parsedAgentID, orgID, "Agent", true)
 		if err != nil {
 			return nil
 		}

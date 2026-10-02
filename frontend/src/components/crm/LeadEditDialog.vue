@@ -47,6 +47,7 @@ const draft = ref({
   currency: 'MYR',
   next_action_at: '',
   expected_close_date: '',
+  lost_reason: '',
 })
 
 const open = computed({
@@ -60,6 +61,8 @@ function setTransitionOpen(value: boolean) {
   if (!transitioning.value) transitionOpen.value = value
 }
 const isArchived = computed(() => props.lead?.status === 'archived')
+// The server only accepts lost_reason edits while the lead is lost.
+const isLost = computed(() => props.lead?.status === 'lost')
 
 function toLocalDateTime(value?: string) {
   if (!value) return ''
@@ -83,6 +86,7 @@ function resetDraft() {
     currency: props.lead.currency || 'MYR',
     next_action_at: toLocalDateTime(props.lead.next_action_at),
     expected_close_date: toCalendarDate(props.lead.expected_close_date),
+    lost_reason: props.lead.lost_reason ?? '',
   }
   errorMessage.value = ''
   transitionOpen.value = false
@@ -124,6 +128,7 @@ async function save() {
         ? `${draft.value.expected_close_date}T00:00:00.000Z`
         : undefined,
       clear_expected_close_date: !draft.value.expected_close_date,
+      ...(isLost.value ? { lost_reason: draft.value.lost_reason.trim() } : {}),
     })
     emit('saved', 'updated')
     emit('update:modelValue', false)
@@ -226,7 +231,7 @@ async function transitionLead() {
             </select>
           </label>
           <label class="block">
-            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Next action</span>
+            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Follow-up date</span>
             <input
               v-model="draft.next_action_at"
               type="datetime-local"
@@ -234,11 +239,22 @@ async function transitionLead() {
             />
           </label>
           <label class="block">
-            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Expected close</span>
+            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Expected decision date</span>
             <input
               v-model="draft.expected_close_date"
               type="date"
               class="h-11 w-full rounded-xl border border-white/10 bg-[#15191f] px-3 text-xs outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 light:border-slate-300 light:bg-white"
+            />
+          </label>
+          <label v-if="isLost" class="block sm:col-span-2">
+            <span class="mb-1.5 block text-xs font-medium text-white/60 light:text-slate-700">Reason lost</span>
+            <textarea
+              v-model="draft.lost_reason"
+              rows="2"
+              maxlength="2000"
+              data-testid="lead-edit-lost-reason"
+              placeholder="Why did this lead not go ahead?"
+              class="w-full resize-y rounded-xl border border-white/10 bg-black/20 px-3 py-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-cyan-300 light:border-slate-300 light:bg-white"
             />
           </label>
         </fieldset>

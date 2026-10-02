@@ -1809,3 +1809,29 @@ func TestApp_AssignContact_AssignUserFromDifferentOrg(t *testing.T) {
 	// User from a different org should not be found
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
 }
+
+// "+" passes the raw required check but normalizes to an empty phone, which
+// would collide with every other empty-phone contact.
+func TestApp_CreateContact_RejectsPhoneThatNormalizesEmpty(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+
+	for _, phone := range []string{"+", " ", " + "} {
+		req := testutil.NewJSONRequest(t, handlers.CreateContactRequest{
+			PhoneNumber: phone,
+			ProfileName: "Blank phone",
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+
+		require.NoError(t, app.CreateContact(req))
+		assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req), "phone %q", phone)
+	}
+
+	var emptyPhoneCount int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number IN ?", org.ID, []string{"", "+", " ", " + "}).
+		Count(&emptyPhoneCount).Error)
+	assert.Zero(t, emptyPhoneCount)
+}

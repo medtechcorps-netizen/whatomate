@@ -2976,7 +2976,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             ref="messagesViewport"
             data-testid="omnichannel-message-viewport"
             :data-conversation-id="selectedConversation.id"
-            class="flex-1 overflow-y-auto p-3 sm:p-5 md:p-7"
+            class="flex-1 overflow-y-auto p-3 [overflow-anchor:none] sm:p-5 md:p-7"
             @scroll.passive="handleMessageViewportScroll"
           >
             <div
@@ -3159,6 +3159,8 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
         <CustomerRevenueWorkspace
           :contact-id="selectedConversation.contact_id"
           :contact="selectedConversation.contact"
+          :channel="selectedConversation.channel"
+          :conversation-id="selectedConversation.id"
           surface="omnichannel"
           @close="isWorkspaceOpen = false"
         />
@@ -3173,12 +3175,14 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
       <SheetContent side="right" class="!w-full !max-w-[440px] !p-0 [&>button:last-child]:hidden">
         <SheetTitle class="sr-only">Customer revenue workspace</SheetTitle>
         <SheetDescription class="sr-only">
-          Customer journeys, tasks, bookings, packages, revenue and activity.
+          Customer leads, follow-ups, bookings, packages, invoices and activity.
         </SheetDescription>
         <CustomerRevenueWorkspace
           v-if="isWorkspaceOpen"
           :contact-id="selectedConversation.contact_id"
           :contact="selectedConversation.contact"
+          :channel="selectedConversation.channel"
+          :conversation-id="selectedConversation.id"
           surface="omnichannel"
           @close="isWorkspaceOpen = false"
         />

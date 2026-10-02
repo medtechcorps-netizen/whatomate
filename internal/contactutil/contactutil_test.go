@@ -155,3 +155,50 @@ func TestGetOrCreateContact_RoutesMergedAliasToCanonicalWithoutRestoring(t *test
 	require.NotNil(t, storedAlias.MergedIntoID)
 	require.Equal(t, canonical.ID, *storedAlias.MergedIntoID)
 }
+
+// TestGetOrCreateContact_RejectsEmptyPhone runs without a database: the guard
+// returns before any query, so a nil *gorm.DB proves no lookup or insert ran.
+func TestGetOrCreateContact_RejectsEmptyPhone(t *testing.T) {
+	t.Parallel()
+	for _, phone := range []string{"", "+", " ", " + ", "+ "} {
+		contact, created, err := GetOrCreateContact(nil, uuid.New(), phone, "Profile")
+		require.ErrorIs(t, err, ErrEmptyPhoneNumber, "phone %q", phone)
+		assert.Nil(t, contact)
+		assert.False(t, created)
+	}
+}
+
+func TestIsEmptyPhone(t *testing.T) {
+	t.Parallel()
+	for _, phone := range []string{"", "+", "  ", " +", "+  "} {
+		assert.True(t, IsEmptyPhone(phone), "phone %q", phone)
+	}
+	for _, phone := range []string{"1", "+60123456789", "60123456789", "bsuid:abc", "120363000000000000@g.us"} {
+		assert.False(t, IsEmptyPhone(phone), "phone %q", phone)
+	}
+}
+
+// TestGetOrCreateContact_EmptyPhoneDoesNotReuseEmptyRow is the database-backed
+// variant: an existing legacy row with an empty phone_number is never returned.
+func TestGetOrCreateContact_EmptyPhoneDoesNotReuseEmptyRow(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	uid := uuid.New().String()[:8]
+	org := models.Organization{BaseModel: models.BaseModel{ID: uuid.New()}, Name: "test-" + uid, Slug: "test-" + uid}
+	require.NoError(t, db.Create(&org).Error)
+	legacy := models.Contact{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		PhoneNumber:    "",
+		ProfileName:    "Legacy empty phone",
+	}
+	require.NoError(t, db.Create(&legacy).Error)
+
+	contact, created, err := GetOrCreateContact(db, org.ID, "", "Someone else")
+	require.ErrorIs(t, err, ErrEmptyPhoneNumber)
+	assert.Nil(t, contact)
+	assert.False(t, created)
+
+	var reloaded models.Contact
+	require.NoError(t, db.First(&reloaded, "id = ?", legacy.ID).Error)
+	assert.Equal(t, "Legacy empty phone", reloaded.ProfileName)
+}

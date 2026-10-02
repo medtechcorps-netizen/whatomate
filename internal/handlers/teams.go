@@ -401,7 +401,12 @@ func (a *App) AddTeamMember(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid user ID", nil, "")
 	}
 
-	// Verify user exists in org
+	// Verify user exists in org. This deliberately stays on the home-org
+	// lookup: the team auto-assigner (internal/assignment) does not re-check
+	// organization membership, so a cross-org or reseller-derived member who
+	// joined a team would keep receiving transfers after their membership is
+	// removed or suspended. Widen this only once the assigner filters on
+	// membership.
 	user, err := findByIDAndOrg[models.User](a.DB, r, memberUserID, orgID, "User")
 	if err != nil {
 		return nil
