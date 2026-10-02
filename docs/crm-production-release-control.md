@@ -8,10 +8,10 @@ release evidence, and changing production are three separate authorities.
 
 The final `ui` phase is bound to one immutable Git identity:
 
-- commit: `6f25ea1919ee28856dee59d5fd121671214087e3`
-- root tree: `2a2c14e83f4524d860a65a8735c16111178e7fd3`
-- `frontend` tree: `4e027a24fcb34c2b4951d2c628dd63a3c67cc87e`
-- `internal` tree: `a43572db8ee7e5a7cf2ccaf3e880a181c91ed183`
+- commit: `c482dbbc287ae29ea0f6fe11081d4cc16d8ca525`
+- root tree: `f890fecb24d34648d5f978f12141d12a46fbe9b5`
+- `frontend` tree: `4e2add53f07fd7e0d0391614b80260d4d84e3fcf`
+- `internal` tree: `b032214101b463cc42a7949893ed2804d455019f`
 
 Refreshed 2026-09-16: the previous binding `20a47384` hung the full Go race job
 for 40 minutes in
@@ -31,9 +31,11 @@ tree, and the final UI's Booking, Commerce, Coexistence, and default-OFF AI
 booking source. Do not substitute current control `main` for a phase source:
 that checkout does not contain the complete reviewed final UI product tree.
 The already-live production bootstrap keeps the historical `4f65abeb` source
-identity, while its images and live phase describe the accepted c4cdac90 ui
-deployment (see "Genesis re-entry at the accepted live phase"). The new
-children are targets, not a rewrite of observed production history.
+identity, while its images and live evidence describe the signed `02231089`
+ui deployment of source `6f25ea19` (see "Rebaseline onto the signed 02231089
+ui state"; the earlier accepted c4cdac90 and 283e7954 states are recorded in
+"Genesis re-entry at the accepted live phase"). The new children are
+targets, not a rewrite of observed production history.
 
 Refreshed 2026-10-01: twelve axios advisories published 2026-09-30 failed every
 phase source's frontend audit (axios is a production dependency, so it cannot
@@ -46,6 +48,34 @@ backend lockfile, js-yaml 4.3.1 to 4.3.2. The children are `0267981e`,
 `claude/rebaseline-<phase>-deps-20261001` branches. Their `internal` trees are
 unchanged, so every phase keeps its compile-time database role and Go source.
 The frontend audit allow-lists are now empty.
+
+Refreshed 2026-10-02: the ui phase source is the sole-parent child
+`c482dbbc` of the signed live ui source `6f25ea19`. Its tree is `6f25ea19`
+plus the complete diffs of `claude/ui-ux-20261001` @ `fd13dbae` (46 files:
+frontend, frontend e2e, docs; see `docs/ui-ux-changes-20261001.md`) and
+`claude/backend-fixes-20261001` @ `527e36a2` (22 files: `internal/handlers`,
+`internal/contactutil`, `pkg/whatsapp`, docs; see
+`docs/backend-fixes-20261001.md`). The two diffs touch disjoint paths, and
+the tree is their conflict-free `git merge-tree` result. The child
+changes no migration, SQL, `go.mod`/`go.sum`, frontend manifest, or the
+validation-harness test file, so the ui harness blobs are unchanged; its
+complete 68-record diff inventory is pinned in
+`test_verify_rollout_evidence.py`. Baseline, bridge and backend keep their
+2026-10-01 sources.
+
+Release gate for the backend fixes: the owner-run, read-only, counts-only
+empty-phone audit (kept with the release notes, not in this repository)
+must report `SAFE_TO_DEPLOY` before this control merges, and again right
+before the owner approves the apply environment review (audit #2b). The
+audit at launch is an early warning only, because until the apply the live
+ui source can still create rows that the new code refuses. On
+`REPAIR_FIRST`, repair every flagged organization and re-audit; never
+approve the apply without a fresh `SAFE_TO_DEPLOY`. Sections 2 to 4 of the
+source's `docs/runbooks/empty-phone-contacts-repair.md` are the repair
+procedure. That runbook's own gate (repair rows with two or more senders)
+is not enough on its own: the new code also refuses legacy rows with
+merged aliases or with inbound messages whose continuation job does not
+name the sender, and then answers 503 for the whole webhook delivery.
 
 The release contains Klinik-only WhatsApp reply hardening and the existing
 authorized-client realtime, unread-marker, and late-layout autoscroll fixes.
@@ -700,8 +730,8 @@ Production has run ui, so a digest bootstrap can never again re-enter at
 baseline. The policy admits exactly the linear chain plus one reviewed
 re-entry edge, `{genesis, ui, 4}`.
 
-The next train is `genesis -> ui'` at source `6f25ea19` (`UI_TARGET_SOURCE_SHA`;
-it descends from the live `1911174a`). It is one apply whose event chain
+The next train is `genesis -> ui'` at source `c482dbbc` (`UI_TARGET_SOURCE_SHA`;
+it descends from the live `6f25ea19`). It is one apply whose event chain
 restarts at 1 under the new genesis hash: plan predecessor genesis (event 0),
 transition ordinal 4, intent and receipt lineage `{event 1, ordinal 4, from
 genesis, kind genesis}`, and phase state `{event 1, ordinal 4,
@@ -819,6 +849,65 @@ conclusion success. Both of its attestations verified online with
 `283e7954`, source ref `refs/heads/main` and `--deny-self-hosted-runners`.
 Both verified subject `54a02d3e`. The c4cdac90 evidence (receipt `de742cb5`)
 stays committed beside it.
+
+### Rebaseline onto the signed 02231089 ui state (2026-10-02)
+
+The train at control `02231089` applied ui (apply run 36951366794, attempt 1,
+artifact 11204238421, digest `d02141a0`, receipt `7e5d67f9`, source
+`6f25ea19`, receipt predecessor `38a0ff29`, the previous genesis). Its canary,
+run 36951942755, passed all 13 CRM checks (report `19984c22`) and signed the
+phase state `d2839f33` (artifact 11204383551, digest `f5fca0cc`, expires
+2026-11-01T01:41Z). This PR's data-only rebaseline is the first with
+`live_evidence` kind `signed-phase-state`: workflow
+`.github/workflows/verify-production-crm-canary.yml`, predicate
+`https://rereply.app/attestations/production-phase-state/v1`, phase state
+`d2839f33`, change receipt `7e5d67f9`, receipt predecessor `38a0ff29` and
+canary `19984c22`. The bootstrap now records the receipt after-state, which
+equals the phase state's provider state: deployment `b95ce75e`, spec
+`9b6e8bd6`, environment `e4a9eb41` and non-source `d70b6908` (both unchanged),
+and the three ui images `7a4a186c`, `400d21f6` and `4a975aaf`. The new genesis
+is `bc8ac041`. The same PR moves `UI_TARGET_SOURCE_SHA` from `6f25ea19` to the
+next ui phase-source child `c482dbbc` (next subsection), and the ancestry test
+requires that child to descend strictly from the live `6f25ea19`.
+
+Eight files are added under `release/deployment/live-evidence/`, byte for
+byte, beside all earlier evidence:
+
+- `production-phase-state-36951942755-1.json`, its `.sha256` sidecar, and its
+  bundles `.predicate-phase-state-v1.sigstore.json` and
+  `.predicate-slsa-provenance-v1.sigstore.json`;
+- `production-phase-apply-receipt-36951366794-1.json`, its `.sha256` sidecar,
+  and its bundles `.predicate-receipt-v1.sigstore.json` and
+  `.predicate-slsa-provenance-v1.sigstore.json`.
+
+The phase state binds its change receipt only by hash, so the receipt is
+committed too: the tests check that the state's evidence and lineage name the
+receipt, that the receipt's after-state equals the state's provider state,
+and that the receipt's predecessor is the previous genesis. The canary report
+is not committed. It has no attestation of its own, and the signed state
+already binds its hash (`evidence.canary_sha256`).
+
+Run 36951942755 is a `workflow_dispatch` run of
+`.github/workflows/verify-production-crm-canary.yml` on `main`, attempt 1,
+conclusion success. Run 36951366794 is the same for
+`.github/workflows/apply-production-phase.yml`. All four attestations
+verified online with `gh attestation verify`, once per predicate type, with
+signer and source digest `02231089`, source ref `refs/heads/main` and
+`--deny-self-hosted-runners`. The phase state was verified with signer
+workflow `verify-production-crm-canary.yml` and subject `d2839f33`. The
+receipt was verified with signer workflow `apply-production-phase.yml` and
+subject `7e5d67f9`. The phase state does not verify under the apply workflow
+identity. The committed bundle files verified the same way with `--bundle`.
+
+### New ui release source (2026-10-02)
+
+`UI_TARGET_SOURCE_SHA` moves to `c482dbbc`, the reviewed sole-parent child of
+the signed live ui source `6f25ea19` (see "Exact final candidate"). The live
+evidence still records `6f25ea19`; the target strictly descends from it, which
+`LiveEvidenceHistoryTests` proves. The train is again `genesis -> ui'`,
+planned from the new genesis `bc8ac041` of the rebaseline above. The genesis
+does not bind the ui target, so the contract and `CONTRACT_SHA256` are those
+of the rebaseline; only `VERIFIER_SHA256` moves again with the target.
 
 ### Failure runbook for the re-entry train
 
@@ -947,7 +1036,8 @@ delete it in the console.
 
 Deadlines: plan and recovery 900 s; intent 15 min; fork 24 h; backup 36 h or
 less; canary about 24 h after the apply; signed receipt 7 days; phase state
-30 days; receipt artifact 11125905071 expires 2026-10-07T20:39Z; fixture
+30 days; receipt artifact 11125905071 expires 2026-10-07T20:39Z; the
+02231089 phase-state artifact 11204383551 expires 2026-11-01T01:41Z; fixture
 evidence 2026-12-14T17:54Z. After a successful train, unfreeze `main`,
 archive the chain-state files, and schedule the ui' rebaseline PR.
 

@@ -74,7 +74,7 @@ EXACT_IMAGE_BUILD_ACTION = (
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6"
 )
 EXACT_RELEASE_IMAGE_WORKFLOW_SHA256 = (
-    "9bab2c323f9ac956d4e85034943e979224b3a3789eb2b5e3364080a983e9aeb8"
+    "b1dc55db4af65a0160b399011aaf8e03aaa59ae5753907ecff4c4c632fb26db9"
 )
 # 2026-10-01: the release gate's frontend audit policy (empty allow-list,
 # fail-closed on an incomplete npm audit report) is pinned byte for byte.
@@ -90,7 +90,7 @@ EXACT_IMAGE_GATE_STEP_SHA256 = (
     "1b4bf101f1756d43193ccc0050cf44bb9dd22df25302e084c9a9a91ede2db4a5"
 )
 EXACT_IMAGE_AUTHORITY_MATRIX_STEP_SHA256 = (
-    "97a6bdda7ebb11b1f6322e42a57562ad6483cf190552e2dad45b924b69a4ada6"
+    "860ad092d359524937caa79844f975b20185b2a57d89988b45ae28ee70407efd"
 )
 EXACT_RELEASE_WEB_SNAPSHOT_RUN = (
     "RUN set -eu; "
