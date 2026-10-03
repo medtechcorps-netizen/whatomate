@@ -11,8 +11,12 @@ on:
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older run. Every push to main gets
+# its own group, so a main run is never cancelled or replaced by a later one:
+# the Release plan requires a completed, successful push run for the exact
+# commit it ships.
 concurrency:
-  group: test-${{ github.event.pull_request.number || github.ref }}
+  group: test-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -51,6 +55,7 @@ jobs:
   tenant-isolation:
     name: tenant-isolation
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     services:
       postgres:
@@ -82,7 +87,7 @@ jobs:
       - name: Run PostgreSQL tenant isolation tests
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_tenant_test?sslmode=disable
-        run: go test -mod=readonly -v ./internal/database -run '^TestTenantRLS_'
+        run: go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'
 
   go-race:
     name: go-race
@@ -221,9 +226,9 @@ jobs:
           # --format testname streams a PASS/FAIL line per test as it
           # completes, so a hanging test is easy to spot — the last
           # printed test is the one before the hang.
-          # -timeout 60m caps each package's test binary. The enclosing 120m job
-          # bound retains a finite ceiling while allowing for hosted PostgreSQL
-          # runner variance in the race+coverage integration suites.
+          # -timeout 150m caps each package's test binary. One slow package on a
+          # shared runner has hit the old 60m cap; the job's 360-minute limit
+          # stays the outer ceiling for the whole race+coverage suite.
           package_output="$(go list -mod=readonly ./...)"
           [[ -n "$package_output" ]]
           mapfile -t packages < <(printf '%s\n' "$package_output")
@@ -231,7 +236,7 @@ jobs:
           gotestsum \
             --format testname \
             --hide-summary=skipped \
-            -- -mod=readonly -race -p 1 -timeout 60m -coverprofile=coverage.out "${packages[@]}"
+            -- -mod=readonly -race -p 1 -timeout 150m -coverprofile=coverage.out "${packages[@]}"
           git diff --exit-code -- go.mod go.sum
 
       - name: Display coverage

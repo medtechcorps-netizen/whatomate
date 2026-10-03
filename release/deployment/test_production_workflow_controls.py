@@ -134,10 +134,11 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
         "b91069173df06f0dbdf2b0bcaade40bf6555bec45cb52a2e7acb3be114d15766"
     ),
 }
-# 2026-10-03: re-pinned (was 0eb4da20) for the dated braces exception in the
-# CI frontend audit step.
+# 2026-10-03: re-pinned (was f11d0390, before that 0eb4da20) for the CI
+# margins: per-run concurrency groups on main, the go-race 150m per-package
+# timeout and the tenant-isolation job and test timeouts.
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "f11d039002c4ada9c9a89f5148cde5ffa67e8e3fac17d1393f59a701ed8f0c83"
+    "13f4f0636b46e3b8989464a696903ec75fd6fd350793a78cd8da3fd08dfa0537"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -150,7 +151,8 @@ EXACT_CLEANUP_AUTHORITY_STEP_SHA256 = (
 )
 EXACT_GATE_B_TEST_JOB_SHA256 = {
     "release-controls": "79645bf97ed1574bcb760af561a525ffc028e2ea34e27b9ca51af177ba59590a",
-    "go-race": "863b563a974a7050c7061eaeb80b6c5bd96ca88e0a95e6666bad511da636e192",
+    # 2026-10-03: re-pinned (was 863b563a) for the 150m per-package timeout.
+    "go-race": "49f27125029cbe88e316e3f8a2afd31f3dae047105450912b8099c16049e4df7",
     "lint": "a2402a41b92ca872b93b87e2e24cdd3d4b3703bfcf3534d1e1bf410bf0fe619c",
     # 2026-10-03: re-pinned (was 8058851a) for the dated braces exception.
     "security": "4704cd65e97571ceaa8067e31a9884490cedb92733aea0e1610108223068ec2f",
@@ -452,6 +454,19 @@ def normalized_active_sha256(source: str) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def expected_ci_concurrency(prefix: str) -> tuple[str, ...]:
+    # Pull request runs supersede each other; every other run (each push to
+    # main) has its own group, so a later merge never cancels or replaces the
+    # push run that ship.py's require_ci_green needs for an earlier commit.
+    return (
+        "concurrency:",
+        "group: " + prefix + "-${{ github.event_name == 'pull_request' && "
+        "format('pr-{0}', github.event.pull_request.number) || "
+        "format('run-{0}', github.run_id) }}",
+        "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+    )
+
+
 def assert_gate_b_test_workflow(source: str) -> None:
     if hashlib.sha256(source.encode("utf-8")).hexdigest() != (
         EXACT_GATE_B_TEST_WORKFLOW_SHA256
@@ -462,6 +477,10 @@ def assert_gate_b_test_workflow(source: str) -> None:
         "contents: read",
     ):
         raise AssertionError("Test workflow permissions differ from contents:read")
+    if exact_yaml_mapping_active_lines(source, 0, "concurrency") != (
+        expected_ci_concurrency("test")
+    ):
+        raise AssertionError("Test workflow lets main push runs cancel each other")
 
     expected_jobs = (
         "release-controls",
@@ -483,6 +502,14 @@ def assert_gate_b_test_workflow(source: str) -> None:
         if actual_sha256 != expected_sha256:
             raise AssertionError(f"Gate-B job bytes differ: {job}")
 
+    tenant_isolation = job_block(source, "tenant-isolation")
+    for line in (
+        "timeout-minutes: 60",
+        "run: go test -mod=readonly -v -timeout 45m ./internal/database "
+        "-run '^TestTenantRLS_'",
+    ):
+        require_active_source_line(tenant_isolation, line)
+
     go_race = job_block(source, "go-race")
     gate_a = step_block(go_race, "Verify Gate-A recovery boundary")
     for line in (
@@ -497,7 +524,7 @@ def assert_gate_b_test_workflow(source: str) -> None:
     for line in (
         'package_output="$(go list -mod=readonly ./...)"',
         "mapfile -t packages < <(printf '%s\\n' \"$package_output\")",
-        '-- -mod=readonly -race -p 1 -timeout 60m '
+        '-- -mod=readonly -race -p 1 -timeout 150m '
         '-coverprofile=coverage.out "${packages[@]}"',
     ):
         require_active_source_line(run_tests, line)
@@ -2839,6 +2866,28 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             "release-controls-jq-unpinned": source.replace(
                 "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f", "0" * 64, 1,
             ),
+            "main-runs-share-concurrency-group": source.replace(
+                "format('run-{0}', github.run_id)", "github.ref", 1,
+            ),
+            "main-runs-cancel-in-progress": source.replace(
+                "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n",
+                "  cancel-in-progress: true\n",
+                1,
+            ),
+            "tenant-isolation-job-unbounded": source.replace(
+                "    name: tenant-isolation\n    runs-on: ubuntu-24.04\n"
+                "    timeout-minutes: 60\n",
+                "    name: tenant-isolation\n    runs-on: ubuntu-24.04\n",
+                1,
+            ),
+            "tenant-isolation-test-timeout-removed": source.replace(
+                "go test -mod=readonly -v -timeout 45m ./internal/database",
+                "go test -mod=readonly -v ./internal/database",
+                1,
+            ),
+            "go-race-package-timeout-shortened": source.replace(
+                "-race -p 1 -timeout 150m ", "-race -p 1 -timeout 60m ", 1,
+            ),
             "push-removed": source.replace(
                 "  push:\n    branches:\n      - main\n",
                 "",
@@ -3241,6 +3290,52 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             self.assertNotEqual(moved, block)
             with self.assertRaises(AssertionError):
                 assert_ci_postgres17_service(source.replace(block, moved, 1), job)
+
+    def test_ci_main_push_runs_never_cancel_each_other(self) -> None:
+        for filename, prefix in (("test.yml", "test"), ("e2e-tests.yml", "e2e")):
+            source = workflow(filename)
+            self.assertEqual(
+                exact_yaml_mapping_active_lines(source, 0, "concurrency"),
+                expected_ci_concurrency(prefix),
+            )
+            for old, new in (
+                ("format('run-{0}', github.run_id)", "github.ref"),
+                ("format('run-{0}', github.run_id)", "github.sha"),
+                ("cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                 "cancel-in-progress: true"),
+            ):
+                mutant = source.replace(old, new, 1)
+                with self.subTest(workflow=filename, mutation=new):
+                    self.assertNotEqual(mutant, source)
+                    self.assertNotEqual(
+                        exact_yaml_mapping_active_lines(mutant, 0, "concurrency"),
+                        expected_ci_concurrency(prefix),
+                    )
+
+    def test_e2e_workflow_pins_actions_and_service_images(self) -> None:
+        source = workflow("e2e-tests.yml")
+        self.assertEqual(
+            canonical_workflow_step_uses_refs(source),
+            (
+                "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+                "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff",
+                "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+                "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+                "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            ),
+        )
+        images = re.findall(r"(?m)^ +image: *(\S+)", source)
+        self.assertEqual(len(images), 2)
+        for image in images:
+            self.assertRegex(image, r"^(?:postgres|redis):[0-9]+@sha256:[0-9a-f]{64}$")
+        with self.assertRaises(AssertionError):
+            canonical_workflow_step_uses_refs(
+                source.replace(
+                    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+                    "actions/checkout@v4",
+                    1,
+                )
+            )
 
     def test_database_phase_harness_three_consumer_parity_rejects_drift(self) -> None:
         manifest = json.loads(
