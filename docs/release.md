@@ -28,8 +28,10 @@ Preconditions:
   wait for both push runs to finish: allow up to about 4 hours (50 to 241
   minutes observed). Every push to `main` runs in its own concurrency group,
   so a later merge never cancels or replaces them.
-- Re-running the failed jobs of a `Test` or `E2E Tests` run is safe: it
-  tests the same commit again. Re-running a Release run is not; dispatch a
+- Re-running the failed jobs of a `Test` or `E2E Tests` run is safe for the
+  Release plan: it tests the same commit again, and the plan reads the
+  run's latest attempt. (The old-lane driver publish still accepts only a
+  first-attempt `Test` run.) Re-running a Release run is not; dispatch a
   new one (see "Re-runs and supersede").
 - No other Release run is waiting for review or running. Cancel stale
   waiting runs first (Actions, the run, Cancel workflow).

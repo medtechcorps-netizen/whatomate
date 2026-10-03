@@ -3324,6 +3324,12 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                 "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
             ),
         )
+        checkouts = [
+            block for block in workflow_step_blocks(source)
+            if "uses: actions/checkout@" in block
+        ]
+        self.assertEqual(len(checkouts), 1)
+        require_active_source_line(checkouts[0], "persist-credentials: false")
         images = re.findall(r"(?m)^ +image: *(\S+)", source)
         self.assertEqual(len(images), 2)
         for image in images:
