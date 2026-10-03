@@ -3507,14 +3507,45 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             "not json": ("npm ERR! network", 1, 1),
             "not an object": ([], 0, 1),
         }
+        self.assertRegex(release_step, r"(?m)^          ALLOWED = set\(\)$")
+        # The CI gate carries exactly one dated, dev-only exception.
+        self.assertRegex(gate_step, (
+            r'(?m)^          ALLOWED = \{\("braces", "stack-exhaustion denial of service", '
+            r'"2026-12-31"\)\}$'))
         for label, step in (("release gate", release_step), ("ci gate", gate_step)):
-            self.assertRegex(step, r"(?m)^          ALLOWED = set\(\)$")
             self.assertIn('|| audit_rc=$?', step)
             self.assertNotIn("|| true", step)
             for name, (body, rc, expected) in cases.items():
                 with self.subTest(gate=label, case=name):
                     returned = run_frontend_audit_policy(step, body, rc, lock)
                     self.assertEqual(returned != 0, expected == 1, returned)
+
+        def braces(title: str = "braces vulnerable to stack-exhaustion denial of "
+                   "service through deeply nested patterns", severity: str = "high") -> dict:
+            return report(braces={"name": "braces", "severity": severity, "via": [{
+                "name": "braces", "title": title, "severity": severity}]},
+                micromatch={"name": "micromatch", "severity": severity, "via": ["braces"]})
+
+        def braces_lock(dev: bool) -> dict:
+            row = {"version": "3.0.3", "dev": True} if dev else {"version": "3.0.3"}
+            return {"packages": {**lock["packages"], "node_modules/braces": row}}
+
+        expired_gate_step = gate_step.replace('"2026-12-31")}', '"2000-01-01")}', 1)
+        self.assertNotEqual(expired_gate_step, gate_step)
+        exception_cases = {
+            "braces dev-only": (gate_step, braces(), braces_lock(True), 0),
+            "braces critical dev-only": (
+                gate_step, braces(severity="critical"), braces_lock(True), 0),
+            "braces reaching production": (gate_step, braces(), braces_lock(False), 1),
+            "braces other advisory": (
+                gate_step, braces(title="braces prototype pollution"), braces_lock(True), 1),
+            "braces after review date": (expired_gate_step, braces(), braces_lock(True), 1),
+            "release gate keeps no exception": (release_step, braces(), braces_lock(True), 1),
+        }
+        for name, (step, body, case_lock, expected) in exception_cases.items():
+            with self.subTest(case=name):
+                returned = run_frontend_audit_policy(step, body, 1, case_lock)
+                self.assertEqual(returned != 0, expected == 1, returned)
 
     def test_release_image_producer_requires_stable_exact_artifact_inventory(self) -> None:
         source = workflow("build-attest-exact-release-images.yml")
