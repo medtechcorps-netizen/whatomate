@@ -8,7 +8,8 @@ reason and an expiry at most 90 days ahead. Entries use Trivy's own
 entry; this checker additionally fails the run on any expired or malformed
 entry until a reviewed PR removes or renews it. Secret findings can never be
 excepted: the secret scan gets no ignore file. The file lives here, not at the
-repository root, because test.yml:403-408 forbids a root ignore file.
+repository root, because test.yml's "Reject ambient Trivy suppression
+policy" step forbids a root ignore file.
 """
 
 from __future__ import annotations

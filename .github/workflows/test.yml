@@ -330,13 +330,17 @@ jobs:
           audit_rc=0
           npm audit --audit-level=high --json > "$RUNNER_TEMP/frontend-audit.json" || audit_rc=$?
           python3 - "$RUNNER_TEMP/frontend-audit.json" "$audit_rc" <<'AUDIT'
-          import json, sys
+          import datetime, json, sys
 
-          # 2026-10-01: the lockfile refresh (axios 1.20.0, brace-expansion
-          # 5.0.12) retired the 2026-09-30 brace-expansion exceptions, so the
-          # list is empty and every high or critical advisory fails. A future
-          # exception must name the advisory here and stay dev-only.
-          ALLOWED = set()
+          # Each exception names an advisory, must stay dev-only in the lock,
+          # and lapses after its review date.
+          # 2026-10-03: GHSA-vfj7-8cjw-p6xm (braces <= 3.0.3, stack exhaustion
+          # on deeply nested patterns) has no patched release. braces is only
+          # reached through the Tailwind and ESLint build toolchains, which
+          # expand this repository's own fixed globs; it never ships in the
+          # built assets or the production images.
+          ALLOWED = {("braces", "stack-exhaustion denial of service", "2026-12-31")}
+          TODAY = datetime.date.today().isoformat()
           LOCK = json.load(open("package-lock.json", encoding="utf-8"))
 
           def dev_only(package):
@@ -370,7 +374,8 @@ jobs:
                   if not isinstance(item, dict):
                       continue
                   if any(item.get("name") == name and phrase in str(item.get("title"))
-                         for name, phrase in ALLOWED) and dev_only(package):
+                         and TODAY <= review_by
+                         for name, phrase, review_by in ALLOWED) and dev_only(package):
                       print("allowed dev-only advisory: %s <- %s" % (package, item.get("name")))
                   else:
                       blocking.append((entry.get("severity"), package, item.get("name"), item.get("title")))

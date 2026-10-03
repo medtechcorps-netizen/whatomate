@@ -134,8 +134,10 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
         "b91069173df06f0dbdf2b0bcaade40bf6555bec45cb52a2e7acb3be114d15766"
     ),
 }
+# 2026-10-03: re-pinned (was 0eb4da20) for the dated braces exception in the
+# CI frontend audit step.
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "0eb4da2054d0cdf3496028870afd120b12cdc08ba313e607c3e9e88f7eab4e81"
+    "f11d039002c4ada9c9a89f5148cde5ffa67e8e3fac17d1393f59a701ed8f0c83"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -150,7 +152,8 @@ EXACT_GATE_B_TEST_JOB_SHA256 = {
     "release-controls": "79645bf97ed1574bcb760af561a525ffc028e2ea34e27b9ca51af177ba59590a",
     "go-race": "863b563a974a7050c7061eaeb80b6c5bd96ca88e0a95e6666bad511da636e192",
     "lint": "a2402a41b92ca872b93b87e2e24cdd3d4b3703bfcf3534d1e1bf410bf0fe619c",
-    "security": "8058851a94355f512f8e850e295f56f15cfb46921c990332177bd1eb39e58073",
+    # 2026-10-03: re-pinned (was 8058851a) for the dated braces exception.
+    "security": "4704cd65e97571ceaa8067e31a9884490cedb92733aea0e1610108223068ec2f",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
     ),
@@ -3507,14 +3510,45 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
             "not json": ("npm ERR! network", 1, 1),
             "not an object": ([], 0, 1),
         }
+        self.assertRegex(release_step, r"(?m)^          ALLOWED = set\(\)$")
+        # The CI gate carries exactly one dated, dev-only exception.
+        self.assertRegex(gate_step, (
+            r'(?m)^          ALLOWED = \{\("braces", "stack-exhaustion denial of service", '
+            r'"2026-12-31"\)\}$'))
         for label, step in (("release gate", release_step), ("ci gate", gate_step)):
-            self.assertRegex(step, r"(?m)^          ALLOWED = set\(\)$")
             self.assertIn('|| audit_rc=$?', step)
             self.assertNotIn("|| true", step)
             for name, (body, rc, expected) in cases.items():
                 with self.subTest(gate=label, case=name):
                     returned = run_frontend_audit_policy(step, body, rc, lock)
                     self.assertEqual(returned != 0, expected == 1, returned)
+
+        def braces(title: str = "braces vulnerable to stack-exhaustion denial of "
+                   "service through deeply nested patterns", severity: str = "high") -> dict:
+            return report(braces={"name": "braces", "severity": severity, "via": [{
+                "name": "braces", "title": title, "severity": severity}]},
+                micromatch={"name": "micromatch", "severity": severity, "via": ["braces"]})
+
+        def braces_lock(dev: bool) -> dict:
+            row = {"version": "3.0.3", "dev": True} if dev else {"version": "3.0.3"}
+            return {"packages": {**lock["packages"], "node_modules/braces": row}}
+
+        expired_gate_step = gate_step.replace('"2026-12-31")}', '"2000-01-01")}', 1)
+        self.assertNotEqual(expired_gate_step, gate_step)
+        exception_cases = {
+            "braces dev-only": (gate_step, braces(), braces_lock(True), 0),
+            "braces critical dev-only": (
+                gate_step, braces(severity="critical"), braces_lock(True), 0),
+            "braces reaching production": (gate_step, braces(), braces_lock(False), 1),
+            "braces other advisory": (
+                gate_step, braces(title="braces prototype pollution"), braces_lock(True), 1),
+            "braces after review date": (expired_gate_step, braces(), braces_lock(True), 1),
+            "release gate keeps no exception": (release_step, braces(), braces_lock(True), 1),
+        }
+        for name, (step, body, case_lock, expected) in exception_cases.items():
+            with self.subTest(case=name):
+                returned = run_frontend_audit_policy(step, body, 1, case_lock)
+                self.assertEqual(returned != 0, expected == 1, returned)
 
     def test_release_image_producer_requires_stable_exact_artifact_inventory(self) -> None:
         source = workflow("build-attest-exact-release-images.yml")
