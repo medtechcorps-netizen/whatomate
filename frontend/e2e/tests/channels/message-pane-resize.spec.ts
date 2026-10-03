@@ -299,4 +299,29 @@ test.describe("Message pane follows the newest message across window resizes", (
     await page.waitForTimeout(400);
     await expect.poll(() => distanceFromBottom(page, scroller)).toBeLessThan(80);
   });
+
+  test("native chat keeps following when a scroll event lands before the transcript observer", async ({ page }) => {
+    // Forces the intermittent ordering deterministically: a scroll event that
+    // runs after the narrowing reflow but before the ResizeObserver callback.
+    const viewport = '[data-testid="chat-message-list"]';
+    const scroller = `[data-reka-scroll-area-viewport]:has(${viewport})`;
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto(`/chat/${contactId}`);
+    await expect(page.locator(viewport)).toBeVisible();
+    await expect.poll(() => distanceFromBottom(page, scroller)).toBeLessThan(2);
+
+    await page.evaluate((target) => {
+      window.addEventListener(
+        "resize",
+        () => {
+          const element = document.querySelector(target);
+          if (element instanceof HTMLElement) element.dispatchEvent(new Event("scroll"));
+        },
+        { once: true },
+      );
+    }, scroller);
+    await page.setViewportSize({ width: 1300, height: 900 });
+    await page.waitForTimeout(400);
+    await expect.poll(() => distanceFromBottom(page, scroller)).toBeLessThan(80);
+  });
 });

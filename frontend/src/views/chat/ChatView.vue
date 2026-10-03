@@ -353,9 +353,19 @@ const messagesScroll = useInfiniteScroll({
   }
 })
 
+// Growth of the transcript that the ResizeObserver has not handled yet. A
+// scroll event (or a rAF boundary check) can run after a reflow, such as a
+// window resize, but before the observer callback in the same frame. Measuring
+// against the already-grown content would wrongly turn bottom-following off.
+function pendingTranscriptGrowth() {
+  const content = messagesContentRef.value
+  if (!content || !messagesContentResizeObserver || messagesContentObservedHeight <= 0) return 0
+  return Math.max(0, content.getBoundingClientRect().height - messagesContentObservedHeight)
+}
+
 function updateAtBottom(el: HTMLElement) {
   const distanceFromBottom = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop)
-  isAtBottom.value = distanceFromBottom < SCROLL_BOTTOM_THRESHOLD
+  isAtBottom.value = distanceFromBottom - pendingTranscriptGrowth() < SCROLL_BOTTOM_THRESHOLD
   if (distanceFromBottom <= READ_BOUNDARY_TOLERANCE) {
     void acknowledgeVisibleChatBoundary()
   }
