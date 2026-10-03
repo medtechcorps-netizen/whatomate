@@ -1631,9 +1631,11 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/booking/services", tenant((*handlers.App).ListBookingServices))
 	g.POST("/api/booking/services", tenant((*handlers.App).CreateBookingService))
 	g.PUT("/api/booking/services/{id}", tenant((*handlers.App).UpdateBookingService))
+	g.DELETE("/api/booking/services/{id}", tenant((*handlers.App).DeleteBookingService))
 	g.GET("/api/booking/resources", tenant((*handlers.App).ListBookingResources))
 	g.POST("/api/booking/resources", tenant((*handlers.App).CreateBookingResource))
 	g.PUT("/api/booking/resources/{id}", tenant((*handlers.App).UpdateBookingResource))
+	g.DELETE("/api/booking/resources/{id}", tenant((*handlers.App).DeleteBookingResource))
 	g.GET(
 		"/api/booking/resources/{resource_id}/availability-rules",
 		tenant((*handlers.App).ListAvailabilityRules),

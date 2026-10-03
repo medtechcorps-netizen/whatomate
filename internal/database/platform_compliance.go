@@ -2648,6 +2648,7 @@ type platformComplianceIdentityReviewTriggerProfile uint8
 const (
 	platformComplianceLegacyIdentityReviewTriggerProfile platformComplianceIdentityReviewTriggerProfile = iota
 	platformComplianceFutureIdentityReviewTriggerProfile
+	platformCompliancePreCursorIdentityReviewTriggerProfile
 )
 
 var platformComplianceProductTriggers = map[string][]platformComplianceProductTrigger{
@@ -2848,12 +2849,85 @@ func detectPlatformComplianceIdentityReviewTriggerProfile(
 		return platformComplianceLegacyIdentityReviewTriggerProfile,
 			errors.New("identity-review trigger rollout profile is unavailable")
 	}
-	return classifyPlatformComplianceIdentityReviewTriggerProfile(
+	profile, err := classifyPlatformComplianceIdentityReviewTriggerProfile(
 		state.RelationCount,
 		state.ContactTriggers,
 		state.MessageTriggers,
 		state.InboundTriggers,
 	)
+	if err == nil {
+		return profile, nil
+	}
+
+	const preCursorTriggers = "rereply_platform_compliance_write_guard"
+	if state.RelationCount != 3 ||
+		state.ContactTriggers != preCursorTriggers ||
+		state.MessageTriggers != preCursorTriggers ||
+		state.InboundTriggers != preCursorTriggers {
+		return platformComplianceLegacyIdentityReviewTriggerProfile, err
+	}
+	if err := verifyPlatformCompliancePreCursorMessageContract(db); err != nil {
+		return platformComplianceLegacyIdentityReviewTriggerProfile, err
+	}
+	return platformCompliancePreCursorIdentityReviewTriggerProfile, nil
+}
+
+func verifyPlatformCompliancePreCursorMessageContract(db *gorm.DB) error {
+	var state struct {
+		CursorColumnCount        int64  `gorm:"column:cursor_column_count"`
+		CursorFunctionCount      int64  `gorm:"column:cursor_function_count"`
+		ConversationReadTriggers string `gorm:"column:conversation_read_triggers"`
+	}
+	result := db.Raw(`
+		SELECT
+			(
+				SELECT pg_catalog.count(*)
+				FROM pg_catalog.pg_attribute AS attribute
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public'
+				  AND relation.relkind = 'r'
+				  AND attribute.attnum > 0
+				  AND NOT attribute.attisdropped
+				  AND (
+					(relation.relname = 'messages' AND attribute.attname = 'ingested_at')
+					OR (
+						relation.relname = 'conversation_reads'
+						AND attribute.attname = 'last_read_ingested_at'
+					)
+				  )
+			) AS cursor_column_count,
+			(
+				SELECT pg_catalog.count(*)
+				FROM pg_catalog.pg_proc AS procedure
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+				WHERE namespace.nspname = 'public'
+				  AND procedure.proname IN (
+					'rereply_set_message_ingestion_order',
+					'rereply_set_conversation_read_ingestion_order',
+					'rereply_cleanup_deleted_message_read_cursors'
+				  )
+			) AS cursor_function_count,
+			COALESCE((
+				SELECT pg_catalog.string_agg(trigger.tgname, ',' ORDER BY trigger.tgname)
+				FROM pg_catalog.pg_trigger AS trigger
+				JOIN pg_catalog.pg_class AS relation ON relation.oid = trigger.tgrelid
+				JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = 'public'
+				  AND relation.relname = 'conversation_reads'
+				  AND relation.relkind = 'r'
+				  AND NOT trigger.tgisinternal
+			), '') AS conversation_read_triggers
+	`).Scan(&state)
+	if result.Error != nil {
+		return fmt.Errorf("inspect pre-cursor message contract: %w", result.Error)
+	}
+	if result.RowsAffected != 1 || state.CursorColumnCount != 0 ||
+		state.CursorFunctionCount != 0 ||
+		state.ConversationReadTriggers != platformComplianceWriteTrigger {
+		return errors.New("identity-review trigger rollout state is not the exact pre-cursor predecessor")
+	}
+	return nil
 }
 
 func classifyPlatformComplianceIdentityReviewTriggerProfile(
@@ -2925,10 +2999,19 @@ func verifyPlatformComplianceExactTableTriggerSet(
 	table, expectedOwner string,
 	identityReviewProfile platformComplianceIdentityReviewTriggerProfile,
 ) error {
-	expectedProducts := append(
-		[]platformComplianceProductTrigger(nil),
-		platformComplianceProductTriggers[table]...,
-	)
+	expectedProducts := make([]platformComplianceProductTrigger, 0,
+		len(platformComplianceProductTriggers[table])+len(platformComplianceFutureIdentityReviewTriggers[table]))
+	for _, expected := range platformComplianceProductTriggers[table] {
+		preCursorProduct := identityReviewProfile == platformCompliancePreCursorIdentityReviewTriggerProfile &&
+			((table == "messages" &&
+				(expected.name == "trg_messages_ingestion_order" ||
+					expected.name == "trg_messages_cleanup_read_cursors")) ||
+				(table == "conversation_reads" &&
+					expected.name == "trg_conversation_reads_ingestion_order"))
+		if !preCursorProduct {
+			expectedProducts = append(expectedProducts, expected)
+		}
+	}
 	if identityReviewProfile == platformComplianceFutureIdentityReviewTriggerProfile {
 		expectedProducts = append(
 			expectedProducts,
@@ -3446,6 +3529,10 @@ func verifyPlatformComplianceGuardsForScope(
 	identityReviewProfile, err := detectPlatformComplianceIdentityReviewTriggerProfile(db)
 	if err != nil {
 		return err
+	}
+	if identityReviewProfile == platformCompliancePreCursorIdentityReviewTriggerProfile &&
+		scope != platformComplianceVerificationCore {
+		return errors.New("the pre-cursor predecessor is valid only for baseline core verification")
 	}
 	if requireFutureIdentityReview && platformComplianceRequiresFutureIdentityReviewProfile(rules) &&
 		identityReviewProfile != platformComplianceFutureIdentityReviewTriggerProfile {

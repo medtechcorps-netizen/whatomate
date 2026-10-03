@@ -328,6 +328,15 @@
   background-color: #f5f5f5;
 }
 
+/* Native chat transcript: browser scroll anchoring shifts scrollTop while the
+   transcript reflows on resize, which turns bottom-following off before the
+   transcript ResizeObserver runs. Prepending history keeps the reader's place
+   through useInfiniteScroll.preserveScrollPosition. Mirrors the omnichannel
+   inbox viewport (ChannelsView, [overflow-anchor:none]). */
+.chat-background [data-reka-scroll-area-viewport] {
+  overflow-anchor: none;
+}
+
 /* Modern chat bubble styles */
 .chat-bubble {
   @apply relative px-4 py-2.5 text-sm;

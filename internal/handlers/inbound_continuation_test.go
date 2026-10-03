@@ -608,7 +608,7 @@ func TestInboundContinuation_HeartbeatPreventsConcurrentLeaseReplay(t *testing.T
 	started := make(chan struct{})
 	release := make(chan struct{})
 	first := NewInboundContinuationProcessor(app, time.Second)
-	first.lease = 2 * time.Second
+	first.lease = 120 * time.Millisecond
 	first.process = func(
 		_ context.Context,
 		_ *App,

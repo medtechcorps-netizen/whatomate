@@ -962,6 +962,15 @@ func (a *App) execChatAIResponseDurable(
 		return nodeOutcome{outcome: "default"}, nil
 	}
 
+	// Use actual customer input, never a rendered graph prompt, as explicit
+	// confirmation authority. A pending offer keeps this AI node alive at yield.
+	if handled, awaiting, bookingErr := a.processNativeAIBooking(ctx.account, ctx.contact, ctx.session, settings, ctx.userInput); handled {
+		ctx.consumed = true
+		return nodeOutcome{outcome: "default", yield: awaiting}, bookingErr
+	} else if bookingErr != nil {
+		return nodeOutcome{}, bookingErr
+	}
+
 	userMessage := ctx.userInput
 	if template := stringFromConfig(
 		node.Config,
@@ -1390,6 +1399,15 @@ func (a *App) requireActiveChatSession(s *models.ChatbotSession) error {
 // Variables, current node, and the __path__ trail all live in SessionData
 // + dedicated columns. Called after every yield and on the completion path.
 func (a *App) persistChatSession(s *models.ChatbotSession) error {
+	if s != nil && a.inboundContinuation != nil && a.inboundContinuation.nativeBookingCheckpoint {
+		return database.WithTenantReadCommitted(a.rootApp().DB, s.OrganizationID, func(tx *gorm.DB) error {
+			return a.scopedApp(tx, s.OrganizationID).persistChatSessionState(s)
+		})
+	}
+	return a.persistChatSessionState(s)
+}
+
+func (a *App) persistChatSessionState(s *models.ChatbotSession) error {
 	query, err := a.activeChatSessionScope(s)
 	if err != nil {
 		return err
@@ -1408,11 +1426,13 @@ func (a *App) persistChatSession(s *models.ChatbotSession) error {
 	// Never use Save: its full-row update (and insert fallback) can resurrect
 	// a cancelled session or restore stale canonical contact ownership.
 	result := query.Updates(map[string]any{
-		"status":           s.Status,
-		"current_flow_id":  s.CurrentFlowID,
-		"current_step":     s.CurrentStep,
-		"step_retries":     s.StepRetries,
-		"session_data":     s.SessionData,
+		"status":          s.Status,
+		"current_flow_id": s.CurrentFlowID,
+		"current_step":    s.CurrentStep,
+		"step_retries":    s.StepRetries,
+		// Booking proposals/receipts are independently committed business
+		// authority. Stale graph checkpoints must not overwrite or recreate them.
+		"session_data":     nativeBookingCheckpointData(s.SessionData),
 		"last_activity_at": now,
 		"completed_at":     completedAt,
 	})

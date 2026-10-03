@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -61,6 +63,7 @@ type UpdateChannelAccountRequest struct {
 	OutboundSecret    string        `json:"outbound_secret,omitempty"`
 	OutboundEnabled   *bool         `json:"outbound_enabled,omitempty"`
 	AIReplyEnabled    *bool         `json:"ai_reply_enabled,omitempty"`
+	AIBookingEnabled  *bool         `json:"ai_booking_enabled,omitempty"`
 	IsDefaultIncoming *bool         `json:"is_default_incoming,omitempty"`
 	IsDefaultOutgoing *bool         `json:"is_default_outgoing,omitempty"`
 }
@@ -307,6 +310,7 @@ func (a *App) CreateChannelAccount(r *fastglue.Request) error {
 	// Activation and outbound approval happen only after TestChannelAccount.
 	config["outbound_enabled"] = false
 	config["ai_reply_enabled"] = false
+	resetChannelAIBooking(config)
 	account := models.ChannelAccount{
 		OrganizationID:    orgID,
 		Channel:           request.Channel,
@@ -402,6 +406,17 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 	if err := a.decodeRequest(r, &request); err != nil {
 		return nil
 	}
+	var rawFields map[string]json.RawMessage
+	_ = json.Unmarshal(r.RequestCtx.PostBody(), &rawFields)
+	if _, touched := rawFields[models.ChannelConfigAIBookingEnabled]; touched || request.AIBookingEnabled != nil {
+		if request.AIBookingEnabled == nil || !bookingOnlyChannelUpdate(r.RequestCtx.PostBody()) {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "AI booking updates require exactly one boolean ai_booking_enabled field", nil, "")
+		}
+		if !a.HasPermission(userID, models.ResourceChatbotAI, models.ActionWrite, orgID) ||
+			!a.HasPermission(userID, models.ResourceBookingSettings, models.ActionWrite, orgID) {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "AI configuration and Booking settings permissions are required", nil, "")
+		}
+	}
 	if request.Config != nil && unsafeConfigKey(*request.Config) != "" {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Config contains a restricted credential or network-policy key", nil, "")
 	}
@@ -423,7 +438,7 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		if findErr != nil {
 			return findErr
 		}
-		if account.Provider == channelapi.LegacyMetaProvider {
+		if account.Provider == channelapi.LegacyMetaProvider && request.AIBookingEnabled == nil {
 			return ErrLegacyMetaAccountManaged
 		}
 		if account.Channel == models.ChannelThreads && strings.EqualFold(account.Provider, channelapi.ThreadsProvider) {
@@ -458,6 +473,13 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			account.Config = cloneJSONB(*request.Config)
 			account.Config["outbound_enabled"] = outboundEnabled
 			account.Config["ai_reply_enabled"] = aiReplyEnabled
+			for _, key := range channelAIBookingConfigKeys {
+				if value, exists := oldAccount.Config[key]; exists {
+					account.Config[key] = value
+				} else {
+					delete(account.Config, key)
+				}
+			}
 			if account.Channel == models.ChannelThreads {
 				account.Config = threadsPublicEngagementConfig(account.Config)
 			}
@@ -477,7 +499,8 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 		}
 		managedInstagramEnableRequested := managedInstagramControlPlaneIntent(account) &&
 			((request.OutboundEnabled != nil && *request.OutboundEnabled) ||
-				(request.AIReplyEnabled != nil && *request.AIReplyEnabled))
+				(request.AIReplyEnabled != nil && *request.AIReplyEnabled) ||
+				(request.AIBookingEnabled != nil && *request.AIBookingEnabled))
 		if managedInstagramEnableRequested &&
 			a.metaInstagramCurrentRuntimeBindingReason(account, orgID, time.Now().UTC()) != "" {
 			return ErrMetaRegistryAccountManaged
@@ -493,13 +516,21 @@ func (a *App) UpdateChannelAccount(r *fastglue.Request) error {
 			}
 			account.Config["outbound_enabled"] = *request.OutboundEnabled
 		}
-		if request.AIReplyEnabled != nil && *request.AIReplyEnabled &&
+		if ((request.AIReplyEnabled != nil && *request.AIReplyEnabled) ||
+			(request.AIBookingEnabled != nil && *request.AIBookingEnabled)) &&
 			managedMetaControlPlaneIntent(account) {
 			if err := requireFreshMetaRegistryHealthApproval(account, time.Now().UTC()); err != nil {
 				return err
 			}
 		}
 		if err := applyChannelAIReplyOptIn(account, request.AIReplyEnabled); err != nil {
+			return err
+		}
+		if (request.AIReplyEnabled != nil && !*request.AIReplyEnabled) ||
+			(request.OutboundEnabled != nil && !*request.OutboundEnabled) {
+			resetChannelAIBooking(account.Config)
+		}
+		if err := applyChannelAIBookingOptIn(tx, account, request.AIBookingEnabled, time.Now().UTC()); err != nil {
 			return err
 		}
 		if request.IsDefaultIncoming != nil {
@@ -662,6 +693,105 @@ func disableChannelDeliveryForRetest(account *models.ChannelAccount) {
 	// AI approval too. A successful retest and outbound approval must not
 	// silently reactivate automatic replies without a fresh opt-in.
 	account.Config["ai_reply_enabled"] = false
+	resetChannelAIBooking(account.Config)
+}
+
+var channelAIBookingConfigKeys = []string{
+	models.ChannelConfigAIBookingEnabled, models.ChannelConfigAIBookingRevision,
+	models.ChannelConfigAIBookingEnabledAt, models.ChannelConfigAIBookingRouteBinding,
+}
+
+// A separate exact-body update prevents legacy shadow settings from becoming a
+// generic write API, including unknown, duplicate, null and alternate-type keys.
+func bookingOnlyChannelUpdate(body []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') || !decoder.More() {
+		return false
+	}
+	key, err := decoder.Token()
+	if err != nil || key != models.ChannelConfigAIBookingEnabled {
+		return false
+	}
+	var value json.RawMessage
+	if err := decoder.Decode(&value); err != nil ||
+		(!bytes.Equal(value, []byte("true")) && !bytes.Equal(value, []byte("false"))) || decoder.More() {
+		return false
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') {
+		return false
+	}
+	return decoder.Decode(new(any)) == io.EOF
+}
+
+func resetChannelAIBooking(config models.JSONB) {
+	config[models.ChannelConfigAIBookingEnabled] = false
+	config[models.ChannelConfigAIBookingRevision] = uuid.NewString()
+	delete(config, models.ChannelConfigAIBookingEnabledAt)
+	delete(config, models.ChannelConfigAIBookingRouteBinding)
+}
+
+func applyChannelAIBookingOptIn(tx *gorm.DB, account *models.ChannelAccount, enabled *bool, now time.Time) error {
+	if enabled == nil {
+		return nil
+	}
+	if tx == nil || account == nil {
+		return errors.New("AI booking requires an exact channel account")
+	}
+	if account.Config == nil {
+		account.Config = models.JSONB{}
+	}
+	binding := ""
+	if account.Provider == channelapi.LegacyMetaProvider {
+		if account.Config["legacy_read_only"] != true || account.Config["outbound_enabled"] != false ||
+			account.Config["reply_route"] != "chat" {
+			return channelapi.ErrLegacyMetaBridgeConflict
+		}
+		nativeID, err := channelapi.LegacyMetaWhatsAppAccountID(account)
+		if err != nil {
+			return err
+		}
+		var count int64
+		if err := tx.Model(&models.ChannelAccount{}).Where(
+			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+			account.OrganizationID, models.ChannelWhatsApp, channelapi.LegacyMetaProvider, account.ExternalAccountID,
+		).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 1 {
+			return errors.New("AI booking requires exactly one live native shadow")
+		}
+		var native models.WhatsAppAccount
+		if err := tx.Select("id, organization_id, phone_id, business_id, status").
+			Clauses(clause.Locking{Strength: "SHARE"}).
+			Where("id = ? AND organization_id = ?", nativeID, account.OrganizationID).First(&native).Error; err != nil {
+			return err
+		}
+		binding = channelapi.LegacyMetaAIBookingRouteBinding(&native)
+		if *enabled && (native.Status != "active" || binding == "") {
+			return errors.New("AI booking requires the current active native route")
+		}
+		// Booking is delivered by the native path; generic routing remains untouched.
+	} else if (account.Channel != models.ChannelInstagram && account.Channel != models.ChannelMessenger) ||
+		account.Provider != channelapi.RelayProvider {
+		return errors.New("AI booking is supported only for native WhatsApp, Instagram and Messenger")
+	} else if *enabled && (!boolConfigValue(account.Config, "outbound_enabled") ||
+		!boolConfigValue(account.Config, "ai_reply_enabled")) {
+		return errors.New("approve outbound delivery and automatic AI replies before enabling AI booking")
+	}
+	if *enabled && (account.DeletedAt.Valid || account.Status != models.ChannelAccountStatusActive) {
+		return errors.New("AI booking requires an active channel account")
+	}
+	resetChannelAIBooking(account.Config)
+	if *enabled {
+		account.Config[models.ChannelConfigAIBookingEnabled] = true
+		account.Config[models.ChannelConfigAIBookingEnabledAt] = now.UTC().Format(time.RFC3339Nano)
+		if binding != "" {
+			account.Config[models.ChannelConfigAIBookingRouteBinding] = binding
+		}
+	}
+	return nil
 }
 
 func quarantineManagedInstagramHealthPreflightTx(
@@ -706,6 +836,7 @@ func quarantineManagedInstagramHealthPreflightTx(
 	config := cloneJSONB(account.Config)
 	config["outbound_enabled"] = false
 	config["ai_reply_enabled"] = false
+	resetChannelAIBooking(config)
 	result := tx.Model(&models.ChannelAccount{}).Where(
 		"id = ? AND organization_id = ?", account.ID, organizationID,
 	).Updates(map[string]any{
@@ -1601,6 +1732,11 @@ func unsafeNestedConfigKey(config map[string]any, prefix string) string {
 		}
 		if normalized == "allow_localhost_dev" {
 			return path
+		}
+		for _, reserved := range channelAIBookingConfigKeys {
+			if normalized == reserved {
+				return path
+			}
 		}
 		for _, fragment := range []string{"secret", "password", "token", "api_key", "authorization", "credential"} {
 			if strings.Contains(normalized, fragment) {

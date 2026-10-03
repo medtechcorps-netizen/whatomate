@@ -77,6 +77,19 @@ test('sidebar exposes one destination per page and distinguishes both flow produ
   await page.goto('/settings')
   await expect(sidebar.getByRole('menuitem', { name: 'Settings', exact: true })).toHaveCount(1)
   await expect(sidebar.getByRole('menuitem', { name: 'General', exact: true })).toHaveCount(0)
+
+  // Chatbot and WhatsApp Flows live in "More tools". It opens by itself on its
+  // own pages (/chatbot above) and anywhere in Settings, and staff can close it.
+  const moreTools = sidebar.getByRole('button', { name: 'More tools', exact: true })
+  await expect(moreTools).toHaveAttribute('aria-expanded', 'true')
+  await expect(sidebar.getByRole('menuitem', { name: 'Chatbot', exact: true })).toHaveCount(1)
+  await expect(sidebar.getByRole('menuitem', { name: 'WhatsApp Flows', exact: true })).toHaveCount(1)
+  await moreTools.click()
+  await expect(moreTools).toHaveAttribute('aria-expanded', 'false')
+  await expect(sidebar.getByRole('menuitem', { name: 'WhatsApp Flows', exact: true })).toHaveCount(0)
+  await moreTools.click()
+  await expect(moreTools).toHaveAttribute('aria-expanded', 'true')
+  await expect(sidebar.getByRole('menuitem', { name: 'WhatsApp Flows', exact: true })).toHaveCount(1)
 })
 
 test('an audit-only user falls back to Audit Logs', async ({ page }) => {

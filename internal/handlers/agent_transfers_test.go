@@ -1691,3 +1691,339 @@ func TestApp_ReturnAgentTransfersToQueue_ClearsAssignmentWhenItPointsAtAgent(t *
 	assert.Nil(t, readContactAssignedUser(t, app, contact.ID),
 		"assignment pointing at the offline agent must be cleared")
 }
+
+// --- Cross-organization membership (Pause AI root cause) ---
+//
+// users.organization_id is only a user's home organization. Members who work
+// in another organization are recorded in user_organizations, so agent lookups
+// must resolve membership there, and must still reject reseller-derived
+// memberships whose reseller assignment is no longer active.
+
+// addDirectOrgMembership gives an existing user a direct membership in a
+// second organization, as AddOrganizationMember or tenant creation does.
+func addDirectOrgMembership(t *testing.T, app *handlers.App, userID, orgID uuid.UUID, roleID *uuid.UUID) *models.UserOrganization {
+	t.Helper()
+
+	membership := &models.UserOrganization{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		UserID:         userID,
+		OrganizationID: orgID,
+		RoleID:         roleID,
+		Source:         models.MembershipSourceDirect,
+	}
+	require.NoError(t, app.DB.Create(membership).Error)
+	return membership
+}
+
+// addResellerDerivedMembership makes userID an active reseller admin and
+// materializes the reseller-derived membership in orgID, which must belong to
+// the reseller.
+func addResellerDerivedMembership(t *testing.T, app *handlers.App, userID uuid.UUID, reseller *models.Reseller, orgID uuid.UUID, roleID *uuid.UUID) *models.UserOrganization {
+	t.Helper()
+
+	member := &models.ResellerMember{
+		BaseModel:  models.BaseModel{ID: uuid.New()},
+		ResellerID: reseller.ID,
+		UserID:     userID,
+		Role:       models.ResellerRoleAdmin,
+		IsActive:   true,
+	}
+	require.NoError(t, app.DB.Create(member).Error)
+
+	membership := &models.UserOrganization{
+		BaseModel:        models.BaseModel{ID: uuid.New()},
+		UserID:           userID,
+		OrganizationID:   orgID,
+		RoleID:           roleID,
+		Source:           models.MembershipSourceReseller,
+		ResellerMemberID: &member.ID,
+	}
+	require.NoError(t, app.DB.Create(membership).Error)
+	return membership
+}
+
+func suspendTestReseller(t *testing.T, app *handlers.App, resellerID uuid.UUID) {
+	t.Helper()
+	require.NoError(t, app.DB.Model(&models.Reseller{}).
+		Where("id = ?", resellerID).
+		Update("status", models.ResellerStatusSuspended).Error)
+}
+
+func createTransferRequest(t *testing.T, orgID, userID, contactID uuid.UUID, accountName string, agentID uuid.UUID) *fastglue.Request {
+	t.Helper()
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"contact_id":       contactID.String(),
+		"whatsapp_account": accountName,
+		"agent_id":         agentID.String(),
+	})
+	testutil.SetAuthContext(req, orgID, userID)
+	return req
+}
+
+func assertNotFoundMessage(t *testing.T, req *fastglue.Request, message string) {
+	t.Helper()
+	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
+	assert.Equal(t, message, result["message"])
+}
+
+func TestApp_CreateAgentTransfer_SelfPauseAsCrossOrgMember(t *testing.T) {
+	app := newTestApp(t)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	workOrg := testutil.CreateTestOrganization(t, app.DB)
+	workAdminRole := testutil.CreateAdminRole(t, app.DB, workOrg.ID)
+
+	// Home org A; direct membership in org B where the user actually works.
+	user := testutil.CreateTestUser(t, app.DB, homeOrg.ID)
+	addDirectOrgMembership(t, app, user.ID, workOrg.ID, &workAdminRole.ID)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, workOrg.ID)
+	contact := testutil.CreateTestContact(t, app.DB, workOrg.ID)
+
+	req := createTransferRequest(t, workOrg.ID, user.ID, contact.ID, account.Name, user.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+
+	var result struct {
+		Data struct {
+			Transfer handlers.AgentTransferResponse `json:"transfer"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
+	require.NotNil(t, result.Data.Transfer.AgentID)
+	assert.Equal(t, user.ID.String(), *result.Data.Transfer.AgentID)
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.Where("organization_id = ? AND contact_id = ?", workOrg.ID, contact.ID).First(&stored).Error)
+	require.NotNil(t, stored.AgentID)
+	assert.Equal(t, user.ID, *stored.AgentID)
+	assert.Equal(t, models.TransferStatusActive, stored.Status)
+}
+
+func TestApp_CreateAgentTransfer_CrossOrgMemberStillNeedsAvailability(t *testing.T) {
+	app := newTestApp(t)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	workOrg := testutil.CreateTestOrganization(t, app.DB)
+	workAdminRole := testutil.CreateAdminRole(t, app.DB, workOrg.ID)
+
+	user := testutil.CreateTestUser(t, app.DB, homeOrg.ID)
+	addDirectOrgMembership(t, app, user.ID, workOrg.ID, &workAdminRole.ID)
+	require.NoError(t, app.DB.Model(user).Update("is_available", false).Error)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, workOrg.ID)
+	contact := testutil.CreateTestContact(t, app.DB, workOrg.ID)
+
+	// Policy: the availability check is unchanged, also for a self-pause.
+	req := createTransferRequest(t, workOrg.ID, user.ID, contact.ID, account.Name, user.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &result))
+	assert.Equal(t, "Agent is currently away", result["message"])
+}
+
+func TestApp_CreateAgentTransfer_RejectsSuspendedResellerMembership(t *testing.T) {
+	app := newTestApp(t)
+	reseller := testutil.CreateTestReseller(t, app.DB)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	clinicOrg := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
+	clinicAdminRole := testutil.CreateAdminRole(t, app.DB, clinicOrg.ID)
+	clinicAdmin := testutil.CreateTestUser(t, app.DB, clinicOrg.ID, testutil.WithRoleID(&clinicAdminRole.ID))
+
+	resellerAdmin := testutil.CreateTestUser(t, app.DB, homeOrg.ID)
+	addResellerDerivedMembership(t, app, resellerAdmin.ID, reseller, clinicOrg.ID, &clinicAdminRole.ID)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, clinicOrg.ID)
+	activeContact := testutil.CreateTestContact(t, app.DB, clinicOrg.ID)
+	suspendedContact := testutil.CreateTestContact(t, app.DB, clinicOrg.ID)
+
+	// Control: while the reseller is active the derived membership counts.
+	activeReq := createTransferRequest(t, clinicOrg.ID, clinicAdmin.ID, activeContact.ID, account.Name, resellerAdmin.ID)
+	require.NoError(t, app.CreateAgentTransfer(activeReq))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(activeReq), string(testutil.GetResponseBody(activeReq)))
+
+	suspendTestReseller(t, app, reseller.ID)
+
+	suspendedReq := createTransferRequest(t, clinicOrg.ID, clinicAdmin.ID, suspendedContact.ID, account.Name, resellerAdmin.ID)
+	require.NoError(t, app.CreateAgentTransfer(suspendedReq))
+	assertNotFoundMessage(t, suspendedReq, "Agent not found")
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND contact_id = ?", clinicOrg.ID, suspendedContact.ID).
+		Count(&count).Error)
+	assert.Zero(t, count, "a rejected agent must not create a transfer")
+}
+
+func TestApp_CreateAgentTransfer_RejectsNonMemberAgent(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	admin := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	outsider := testutil.CreateTestUser(t, app.DB, otherOrg.ID)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	req := createTransferRequest(t, org.ID, admin.ID, contact.ID, account.Name, outsider.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	assertNotFoundMessage(t, req, "Agent not found")
+}
+
+func TestApp_CreateAgentTransfer_RejectsRemovedCrossOrgMember(t *testing.T) {
+	app := newTestApp(t)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	workOrg := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, workOrg.ID)
+	admin := testutil.CreateTestUser(t, app.DB, workOrg.ID, testutil.WithRoleID(&adminRole.ID))
+
+	former := testutil.CreateTestUser(t, app.DB, homeOrg.ID)
+	membership := addDirectOrgMembership(t, app, former.ID, workOrg.ID, nil)
+	// RemoveOrganizationMember soft-deletes the membership row.
+	require.NoError(t, app.DB.Delete(membership).Error)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, workOrg.ID)
+	contact := testutil.CreateTestContact(t, app.DB, workOrg.ID)
+
+	req := createTransferRequest(t, workOrg.ID, admin.ID, contact.ID, account.Name, former.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	assertNotFoundMessage(t, req, "Agent not found")
+}
+
+func TestApp_CreateAgentTransfer_RejectsInactiveAgent(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	admin := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	inactive := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithInactive())
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	req := createTransferRequest(t, org.ID, admin.ID, contact.ID, account.Name, inactive.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	assertNotFoundMessage(t, req, "Agent not found")
+}
+
+func TestApp_CreateAgentTransfer_HomeOrgAgentWithoutMembershipRowUnchanged(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	admin := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	legacyAgent := createTestAgent(t, app, org.ID)
+	// Legacy account: home organization only, no user_organizations row.
+	require.NoError(t, app.DB.Unscoped().
+		Where("user_id = ? AND organization_id = ?", legacyAgent.ID, org.ID).
+		Delete(&models.UserOrganization{}).Error)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	req := createTransferRequest(t, org.ID, admin.ID, contact.ID, account.Name, legacyAgent.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+}
+
+func TestApp_AssignAgentTransfer_CrossOrgMember(t *testing.T) {
+	app := newTestApp(t)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	workOrg := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, workOrg.ID)
+	admin := testutil.CreateTestUser(t, app.DB, workOrg.ID, testutil.WithRoleID(&adminRole.ID))
+	agentRole := testutil.CreateAgentRole(t, app.DB, workOrg.ID)
+
+	agent := testutil.CreateTestUser(t, app.DB, homeOrg.ID, testutil.WithFullName("Cross Org Agent"))
+	addDirectOrgMembership(t, app, agent.ID, workOrg.ID, &agentRole.ID)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, workOrg.ID)
+	contact := testutil.CreateTestContact(t, app.DB, workOrg.ID)
+	transfer := createTestTransfer(t, app, workOrg.ID, contact.ID, account.Name, models.TransferStatusActive, nil)
+
+	req := testutil.NewJSONRequest(t, map[string]any{"agent_id": agent.ID.String()})
+	testutil.SetAuthContext(req, workOrg.ID, admin.ID)
+	testutil.SetPathParam(req, "id", transfer.ID.String())
+
+	require.NoError(t, app.AssignAgentTransfer(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+
+	var updated models.AgentTransfer
+	require.NoError(t, app.DB.First(&updated, transfer.ID).Error)
+	require.NotNil(t, updated.AgentID)
+	assert.Equal(t, agent.ID, *updated.AgentID)
+}
+
+func TestApp_AssignAgentTransfer_RejectsSuspendedResellerMembership(t *testing.T) {
+	app := newTestApp(t)
+	reseller := testutil.CreateTestReseller(t, app.DB)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	clinicOrg := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
+	adminRole := testutil.CreateAdminRole(t, app.DB, clinicOrg.ID)
+	admin := testutil.CreateTestUser(t, app.DB, clinicOrg.ID, testutil.WithRoleID(&adminRole.ID))
+
+	resellerAdmin := testutil.CreateTestUser(t, app.DB, homeOrg.ID)
+	addResellerDerivedMembership(t, app, resellerAdmin.ID, reseller, clinicOrg.ID, &adminRole.ID)
+	suspendTestReseller(t, app, reseller.ID)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, clinicOrg.ID)
+	contact := testutil.CreateTestContact(t, app.DB, clinicOrg.ID)
+	transfer := createTestTransfer(t, app, clinicOrg.ID, contact.ID, account.Name, models.TransferStatusActive, nil)
+
+	req := testutil.NewJSONRequest(t, map[string]any{"agent_id": resellerAdmin.ID.String()})
+	testutil.SetAuthContext(req, clinicOrg.ID, admin.ID)
+	testutil.SetPathParam(req, "id", transfer.ID.String())
+
+	require.NoError(t, app.AssignAgentTransfer(req))
+	assertNotFoundMessage(t, req, "Agent not found")
+
+	var unchanged models.AgentTransfer
+	require.NoError(t, app.DB.First(&unchanged, transfer.ID).Error)
+	assert.Nil(t, unchanged.AgentID)
+}
+
+func TestApp_CreateAgentTransfer_RejectsRemovedHomeOrgMember(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	admin := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+
+	// RemoveOrganizationMember soft-deletes the membership row but leaves
+	// users.organization_id pointing at the organization. The auth layer
+	// rejects such a user, so the agent lookup must too.
+	former := createTestAgent(t, app, org.ID)
+	require.NoError(t, app.DB.
+		Where("user_id = ? AND organization_id = ?", former.ID, org.ID).
+		Delete(&models.UserOrganization{}).Error)
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+
+	req := createTransferRequest(t, org.ID, admin.ID, contact.ID, account.Name, former.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	assertNotFoundMessage(t, req, "Agent not found")
+}
+
+// Documented policy: a super admin gets no bypass in the agent lookup. A
+// super admin working in an organization where they have no membership row
+// (and which is not their home organization) cannot self-pause with their own
+// agent_id; the frontend falls back to an unassigned pause.
+func TestApp_CreateAgentTransfer_SuperAdminSelfPauseWithoutMembershipIsNotFound(t *testing.T) {
+	app := newTestApp(t)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	clinicOrg := testutil.CreateTestOrganization(t, app.DB)
+	superAdmin := testutil.CreateTestUser(t, app.DB, homeOrg.ID, testutil.WithSuperAdmin())
+
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, clinicOrg.ID)
+	contact := testutil.CreateTestContact(t, app.DB, clinicOrg.ID)
+
+	req := createTransferRequest(t, clinicOrg.ID, superAdmin.ID, contact.ID, account.Name, superAdmin.ID)
+	require.NoError(t, app.CreateAgentTransfer(req))
+	assertNotFoundMessage(t, req, "Agent not found")
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND contact_id = ?", clinicOrg.ID, contact.ID).
+		Count(&count).Error)
+	assert.Zero(t, count, "a rejected agent must not create a transfer")
+}

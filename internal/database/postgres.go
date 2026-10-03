@@ -312,9 +312,140 @@ type legacyRLSCatalogState uint8
 const (
 	legacyRLSCatalogQuarantined legacyRLSCatalogState = iota
 	legacyRLSCatalogPreAdditive
+	legacyRLSCatalogPreparing
 	legacyRLSCatalogRepairable
 	legacyRLSCatalogComplete
 )
+
+const rlsMigrationPrepareClaimPrefix = "prepare:v1:"
+
+// rlsMigrationPreparationLabels binds the durable retry claim to every
+// non-model step that can run before tenant-policy publication. Keep this in
+// execution order: changing, inserting, or reordering a preparer deliberately
+// changes the claim digest and quarantines a claim made by another source.
+var rlsMigrationPreparationLabels = []string{
+	"PrepareProviderIntegrationManagementMode",
+	"PrepareMessageIngestionOrder",
+	"PrepareMetaInstagramDeletionJournalTenant",
+	"AutoMigrate",
+	"InstallMessageIngestionOrderTrigger",
+	"BackfillProviderIntegrationBindings",
+	"SeedPermissionsAndRoles",
+	"SeedSystemRolesForAllOrgs",
+	"MigrateUserOrganizations",
+	"CreateDefaultAdmin",
+	"EnsurePlatformReseller",
+	"EnsureReReplyProductCatalog",
+	"SeedDefaultWidgets",
+	"BackfillLastInboundAt",
+}
+
+type rlsMigrationPreparePlan struct {
+	Protocol         string   `json:"protocol"`
+	Phase            string   `json:"phase"`
+	Database         string   `json:"database"`
+	RuntimeRole      string   `json:"runtime_role"`
+	RuntimeRoleOID   int64    `json:"runtime_role_oid"`
+	ModelDescriptors []string `json:"model_descriptors"`
+	PreparerLabels   []string `json:"preparer_labels"`
+	IndexStatements  []string `json:"index_statements"`
+}
+
+func rlsMigrationPhaseLabel(phase rlsMigrationPhase) (string, error) {
+	switch phase {
+	case rlsMigrationPhaseBaseline:
+		return "baseline", nil
+	case rlsMigrationPhaseBridge:
+		return "bridge", nil
+	case rlsMigrationPhaseBackend:
+		return "backend", nil
+	case rlsMigrationPhaseUI:
+		return "ui", nil
+	default:
+		return "", errors.New("compiled RLS migration phase is invalid")
+	}
+}
+
+func orderedMigrationModelDescriptors(migrations []MigrationModel) ([]string, error) {
+	descriptors := make([]string, 0, len(migrations))
+	seenNames := make(map[string]struct{}, len(migrations))
+	for index, migration := range migrations {
+		if strings.TrimSpace(migration.Name) != migration.Name || migration.Name == "" {
+			return nil, fmt.Errorf("migration model %d has an invalid name", index)
+		}
+		if _, duplicate := seenNames[migration.Name]; duplicate {
+			return nil, fmt.Errorf("migration model name %q is duplicated", migration.Name)
+		}
+		seenNames[migration.Name] = struct{}{}
+		modelType := reflect.TypeOf(migration.Model)
+		if modelType == nil || modelType.Kind() != reflect.Ptr || modelType.Elem().Kind() != reflect.Struct {
+			return nil, fmt.Errorf("migration model %q is not a pointer to a struct", migration.Name)
+		}
+		modelType = modelType.Elem()
+		if modelType.PkgPath() == "" || modelType.Name() == "" {
+			return nil, fmt.Errorf("migration model %q has no stable Go type", migration.Name)
+		}
+		descriptors = append(
+			descriptors,
+			migration.Name+"="+modelType.PkgPath()+"."+modelType.Name(),
+		)
+	}
+	return descriptors, nil
+}
+
+func rlsMigrationPrepareClaimFromPlan(plan rlsMigrationPreparePlan) (string, error) {
+	if plan.Protocol != "prepare:v1" || plan.Phase == "" || plan.Database == "" ||
+		plan.RuntimeRole == "" || plan.RuntimeRoleOID == 0 ||
+		len(plan.ModelDescriptors) == 0 || len(plan.PreparerLabels) == 0 ||
+		len(plan.IndexStatements) == 0 {
+		return "", errors.New("RLS migration prepare plan is incomplete")
+	}
+	payload, err := json.Marshal(plan)
+	if err != nil {
+		return "", fmt.Errorf("encode RLS migration prepare plan: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("%s%x", rlsMigrationPrepareClaimPrefix, digest), nil
+}
+
+func rlsMigrationPrepareClaim(
+	db *gorm.DB,
+	runtimeRole string,
+	phase rlsMigrationPhase,
+) (string, error) {
+	if phase != rlsMigrationPhaseBaseline {
+		return "", errors.New("RLS migration prepare claims are valid only in the baseline phase")
+	}
+	phaseLabel, err := rlsMigrationPhaseLabel(phase)
+	if err != nil {
+		return "", err
+	}
+	runtimeRoleOID, err := exactDatabaseRoleOID(db, runtimeRole)
+	if err != nil {
+		return "", fmt.Errorf("bind prepare claim to runtime role: %w", err)
+	}
+	var databaseName string
+	if err := db.Raw("SELECT pg_catalog.current_database()").Scan(&databaseName).Error; err != nil {
+		return "", fmt.Errorf("bind prepare claim to database: %w", err)
+	}
+	if databaseName == "" {
+		return "", errors.New("bind prepare claim to database: current database is empty")
+	}
+	descriptors, err := orderedMigrationModelDescriptors(GetMigrationModels())
+	if err != nil {
+		return "", err
+	}
+	return rlsMigrationPrepareClaimFromPlan(rlsMigrationPreparePlan{
+		Protocol:         "prepare:v1",
+		Phase:            phaseLabel,
+		Database:         databaseName,
+		RuntimeRole:      runtimeRole,
+		RuntimeRoleOID:   runtimeRoleOID,
+		ModelDescriptors: descriptors,
+		PreparerLabels:   append([]string(nil), rlsMigrationPreparationLabels...),
+		IndexStatements:  append([]string(nil), getIndexes()...),
+	})
+}
 
 var ErrRLSMigrationCatalogQuarantined = errors.New(
 	"RLS migration catalog state is quarantined",
@@ -369,6 +500,17 @@ func decideRLSMigrationAction(
 	profile platformComplianceIdentityReviewTriggerProfile,
 ) (rlsMigrationAction, error) {
 	switch profile {
+	case platformCompliancePreCursorIdentityReviewTriggerProfile:
+		switch phase {
+		case rlsMigrationPhaseBaseline:
+			return rlsMigrationPrepareLegacy, nil
+		case rlsMigrationPhaseBridge:
+			return 0, errors.New("bridge migration requires the exact legacy message-cursor profile")
+		case rlsMigrationPhaseBackend, rlsMigrationPhaseUI:
+			return 0, errors.New("backend and UI migrations require the exact future database profile")
+		default:
+			return 0, errors.New("compiled RLS migration phase is invalid")
+		}
 	case platformComplianceLegacyIdentityReviewTriggerProfile:
 		switch phase {
 		case rlsMigrationPhaseBaseline:
@@ -393,6 +535,7 @@ func decideRLSMigrationAction(
 func classifyLegacyRLSCatalog(
 	db *gorm.DB,
 	runtimeRole string,
+	phase rlsMigrationPhase,
 ) (legacyRLSCatalogState, error) {
 	allTables := protectedTenantTableNames()
 	coreTables, additiveTables, err := tenantPolicyFingerprintProfiles(allTables)
@@ -413,6 +556,23 @@ func classifyLegacyRLSCatalog(
 	functionCount, err := publicFunctionNameCount(db, "rereply_tenant_policy_additive_fingerprint_v1")
 	if err != nil {
 		return quarantineLegacyRLSCatalog("inspect additive tenant fingerprint inventory", err)
+	}
+	functionSource := ""
+	if functionCount == 1 {
+		var found bool
+		functionSource, found, err = publicFunctionSource(
+			db,
+			tenantAdditivePolicyFingerprintSignature,
+		)
+		if err != nil {
+			return quarantineLegacyRLSCatalog("inspect additive tenant fingerprint source", err)
+		}
+		if !found {
+			return quarantineLegacyRLSCatalog(
+				"inspect additive tenant fingerprint signature",
+				errors.New("the sole named additive tenant fingerprint has the wrong signature"),
+			)
+		}
 	}
 	allAbsent := true
 	allPresent := true
@@ -440,6 +600,35 @@ func classifyLegacyRLSCatalog(
 			return quarantineLegacyRLSCatalog("verify pre-additive tenant contract", err)
 		}
 		return legacyRLSCatalogPreAdditive, nil
+	}
+	if strings.HasPrefix(strings.TrimSpace(functionSource), "SELECT '"+rlsMigrationPrepareClaimPrefix) {
+		if functionCount != 1 {
+			return quarantineLegacyRLSCatalog(
+				"verify RLS migration prepare claim inventory",
+				fmt.Errorf("got %d named function(s), expected exactly one", functionCount),
+			)
+		}
+		if phase != rlsMigrationPhaseBaseline {
+			return quarantineLegacyRLSCatalog(
+				"reject cross-phase RLS migration prepare claim",
+				errors.New("a baseline prepare claim cannot authorize another release phase"),
+			)
+		}
+		expectedClaim, err := rlsMigrationPrepareClaim(db, runtimeRole, phase)
+		if err != nil {
+			return quarantineLegacyRLSCatalog("derive exact RLS migration prepare claim", err)
+		}
+		if err := verifyLegacyRLSPreparingCatalog(
+			db,
+			coreTables,
+			additiveTables,
+			presence,
+			runtimeRole,
+			expectedClaim,
+		); err != nil {
+			return quarantineLegacyRLSCatalog("verify claimed RLS migration prefix", err)
+		}
+		return legacyRLSCatalogPreparing, nil
 	}
 	if !allPresent || functionCount != 1 {
 		return quarantineLegacyRLSCatalog(
@@ -624,6 +813,98 @@ func publicFunctionNameCount(db *gorm.DB, function string) (int64, error) {
 	return count, nil
 }
 
+func publicFunctionSource(db *gorm.DB, signature string) (string, bool, error) {
+	var source string
+	result := db.Raw(`
+		SELECT procedure.prosrc
+		FROM pg_catalog.pg_proc AS procedure
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+		WHERE procedure.oid = pg_catalog.to_regprocedure(CAST(? AS text))
+		  AND namespace.nspname = 'public'
+		  AND procedure.prokind = 'f'
+	`, signature).Scan(&source)
+	if result.Error != nil {
+		return "", false, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return "", false, nil
+	}
+	if result.RowsAffected != 1 {
+		return "", false, fmt.Errorf("function signature %q resolved to %d rows", signature, result.RowsAffected)
+	}
+	return source, true, nil
+}
+
+func verifyLegacyRLSPreparingCatalog(
+	db *gorm.DB,
+	coreTables []string,
+	additiveTables []string,
+	presence map[string]bool,
+	runtimeRole string,
+	expectedClaim string,
+) error {
+	expectedTables := append([]string(nil), coreTables...)
+	absentSeen := false
+	for _, table := range additiveTables {
+		present := presence[table]
+		if !present {
+			absentSeen = true
+			continue
+		}
+		if absentSeen {
+			return fmt.Errorf("additive relation %q is outside the ordered migration prefix", table)
+		}
+		expectedTables = append(expectedTables, table)
+	}
+	sort.Strings(expectedTables)
+	if err := requireExactExistingProtectedTenantTables(db, expectedTables); err != nil {
+		return err
+	}
+	if err := verifyPlatformComplianceCoreLegacyGuards(db, runtimeRole); err != nil {
+		return fmt.Errorf("verify preparing core platform contract: %w", err)
+	}
+	if err := verifyPlatformComplianceCoreScanAuthority(db); err != nil {
+		return fmt.Errorf("verify preparing core scan authority: %w", err)
+	}
+	_, _, owner, err := verifyExactLegacyTenantCorePolicyContract(db, coreTables, runtimeRole)
+	if err != nil {
+		return fmt.Errorf("verify preparing core tenant contract: %w", err)
+	}
+	if _, err := verifyExactLegacyTenantPrepareClaim(
+		db,
+		expectedClaim,
+		runtimeRole,
+		&owner,
+	); err != nil {
+		return err
+	}
+	runtimeRoleOID, err := exactDatabaseRoleOID(db, runtimeRole)
+	if err != nil {
+		return fmt.Errorf("inspect preparing runtime role: %w", err)
+	}
+	if err := verifyRuntimeDefaultTablePrivilegesRevoked(db, owner.OID, runtimeRoleOID); err != nil {
+		return err
+	}
+	for _, table := range additiveTables {
+		if !presence[table] {
+			continue
+		}
+		state, err := readLegacyTenantRelationPolicyState(db, table)
+		if err != nil {
+			return fmt.Errorf("inspect preparing additive relation %q: %w", table, err)
+		}
+		if state.RelationKind != "r" || state.Persistence != "p" ||
+			!state.OwnerIsCurrent || state.HasHierarchy || !state.SelectPrivilege ||
+			state.RowSecurity || state.ForceRowSecurity || state.PolicyCount != 0 {
+			return fmt.Errorf("unpublished additive relation %q is not an exact migration prefix", table)
+		}
+		if err := verifyNoRuntimeAdditiveScaffoldPrivileges(db, table, runtimeRole); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func verifyExactLegacyTenantPolicyContract(
 	db *gorm.DB,
 	coreTables []string,
@@ -636,57 +917,15 @@ func verifyExactLegacyTenantPolicyContract(
 		return 0, err
 	}
 
-	runtimeRoleOID, err := exactDatabaseRoleOID(db, runtimeRole)
-	if err != nil {
-		return 0, fmt.Errorf("inspect tenant-policy runtime role: %w", err)
-	}
 	if err := verifyExactProtectedRuntimeTablePrivileges(db, expectedTables, runtimeRole); err != nil {
 		return 0, err
 	}
-	coreRecords, err := readTenantPolicyFingerprintRecords(db, coreTables)
-	if err != nil {
-		return 0, fmt.Errorf("read legacy core tenant policies: %w", err)
-	}
-	if len(coreRecords) != len(coreTables) {
-		return 0, fmt.Errorf("legacy core tenant policy count is %d; expected %d", len(coreRecords), len(coreTables))
-	}
-	for index, table := range coreTables {
-		state, err := readLegacyTenantRelationPolicyState(db, table)
-		if err != nil {
-			return 0, fmt.Errorf("inspect core tenant policy on %s: %w", table, err)
-		}
-		if err := state.requireExactProtected(table, false); err != nil {
-			return 0, err
-		}
-		if coreRecords[index].Table != table {
-			return 0, fmt.Errorf("legacy core tenant policy %d is for %q; expected %q", index, coreRecords[index].Table, table)
-		}
-		if err := verifyCanonicalTenantPolicyRecord(db, coreRecords[index], table, runtimeRoleOID); err != nil {
-			return 0, err
-		}
-	}
-
-	coreFingerprint, err := tenantPolicyFingerprintFromRecords(coreRecords, "")
-	if err != nil {
-		return 0, fmt.Errorf("compute legacy core tenant fingerprint: %w", err)
-	}
-	owner, err := verifyExactLegacyTenantFingerprintFunction(
+	coreRecords, runtimeRoleOID, owner, err := verifyExactLegacyTenantCorePolicyContract(
 		db,
-		tenantPolicyFingerprintSignature,
-		"rereply_tenant_policy_fingerprint",
-		coreFingerprint,
+		coreTables,
 		runtimeRole,
-		nil,
-		true,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("verify legacy core tenant fingerprint: %w", err)
-	}
-	if err := verifyNoDangerousRuntimeDefaultTablePrivileges(
-		db,
-		owner.OID,
-		runtimeRoleOID,
-	); err != nil {
 		return 0, err
 	}
 
@@ -761,6 +1000,75 @@ func verifyExactLegacyTenantPolicyContract(
 		return 0, fmt.Errorf("verify additive tenant fingerprint: %w", err)
 	}
 	return missing, nil
+}
+
+func verifyExactLegacyTenantCorePolicyContract(
+	db *gorm.DB,
+	coreTables []string,
+	runtimeRole string,
+) ([]tenantPolicyFingerprintRecord, int64, databaseRoleReference, error) {
+	runtimeRoleOID, err := exactDatabaseRoleOID(db, runtimeRole)
+	if err != nil {
+		return nil, 0, databaseRoleReference{}, fmt.Errorf("inspect tenant-policy runtime role: %w", err)
+	}
+	if err := verifyExactProtectedRuntimeTablePrivileges(db, coreTables, runtimeRole); err != nil {
+		return nil, 0, databaseRoleReference{}, err
+	}
+	coreRecords, err := readTenantPolicyFingerprintRecords(db, coreTables)
+	if err != nil {
+		return nil, 0, databaseRoleReference{}, fmt.Errorf("read legacy core tenant policies: %w", err)
+	}
+	if len(coreRecords) != len(coreTables) {
+		return nil, 0, databaseRoleReference{}, fmt.Errorf(
+			"legacy core tenant policy count is %d; expected %d",
+			len(coreRecords),
+			len(coreTables),
+		)
+	}
+	for index, table := range coreTables {
+		state, err := readLegacyTenantRelationPolicyState(db, table)
+		if err != nil {
+			return nil, 0, databaseRoleReference{}, fmt.Errorf("inspect core tenant policy on %s: %w", table, err)
+		}
+		if err := state.requireExactProtected(table, false); err != nil {
+			return nil, 0, databaseRoleReference{}, err
+		}
+		if coreRecords[index].Table != table {
+			return nil, 0, databaseRoleReference{}, fmt.Errorf(
+				"legacy core tenant policy %d is for %q; expected %q",
+				index,
+				coreRecords[index].Table,
+				table,
+			)
+		}
+		if err := verifyCanonicalTenantPolicyRecord(db, coreRecords[index], table, runtimeRoleOID); err != nil {
+			return nil, 0, databaseRoleReference{}, err
+		}
+	}
+	coreFingerprint, err := tenantPolicyFingerprintFromRecords(coreRecords, "")
+	if err != nil {
+		return nil, 0, databaseRoleReference{}, fmt.Errorf("compute legacy core tenant fingerprint: %w", err)
+	}
+	owner, err := verifyExactLegacyTenantFingerprintFunction(
+		db,
+		tenantPolicyFingerprintSignature,
+		"rereply_tenant_policy_fingerprint",
+		coreFingerprint,
+		runtimeRole,
+		nil,
+		true,
+	)
+	if err != nil {
+		return nil, 0, databaseRoleReference{}, fmt.Errorf("verify legacy core tenant fingerprint: %w", err)
+	}
+	if err := verifyNoDangerousRuntimeDefaultTablePrivileges(
+		db,
+		owner.OID,
+		runtimeRoleOID,
+	); err != nil {
+		return nil, 0, databaseRoleReference{}, err
+	}
+	return coreRecords, runtimeRoleOID, owner, nil
 }
 
 func exactDatabaseRoleOID(db *gorm.DB, role string) (int64, error) {
@@ -2957,6 +3265,50 @@ func verifyExactLegacyTenantFingerprintFunction(
 	expectedOwner *databaseRoleReference,
 	requireCurrentOwner bool,
 ) (databaseRoleReference, error) {
+	return verifyExactLegacyTenantFingerprintFunctionAccess(
+		db,
+		signature,
+		functionName,
+		expectedValue,
+		runtimeRole,
+		expectedOwner,
+		requireCurrentOwner,
+		true,
+	)
+}
+
+func verifyExactLegacyTenantPrepareClaim(
+	db *gorm.DB,
+	expectedValue string,
+	runtimeRole string,
+	expectedOwner *databaseRoleReference,
+) (databaseRoleReference, error) {
+	if !strings.HasPrefix(expectedValue, rlsMigrationPrepareClaimPrefix) ||
+		!isLowerHexSHA256(strings.TrimPrefix(expectedValue, rlsMigrationPrepareClaimPrefix)) {
+		return databaseRoleReference{}, errors.New("RLS migration prepare claim value is invalid")
+	}
+	return verifyExactLegacyTenantFingerprintFunctionAccess(
+		db,
+		tenantAdditivePolicyFingerprintSignature,
+		"rereply_tenant_policy_additive_fingerprint_v1",
+		expectedValue,
+		runtimeRole,
+		expectedOwner,
+		true,
+		false,
+	)
+}
+
+func verifyExactLegacyTenantFingerprintFunctionAccess(
+	db *gorm.DB,
+	signature string,
+	functionName string,
+	expectedValue string,
+	runtimeRole string,
+	expectedOwner *databaseRoleReference,
+	requireCurrentOwner bool,
+	requireRuntimeExecute bool,
+) (databaseRoleReference, error) {
 	var state struct {
 		NameCount         int64  `gorm:"column:name_count"`
 		Source            string `gorm:"column:source"`
@@ -3030,7 +3382,7 @@ func verifyExactLegacyTenantFingerprintFunction(
 		state.Language != "sql" || state.Volatility != "i" || state.Parallel != "u" ||
 		state.SecurityDefiner || state.Leakproof || state.Strict || !state.ReturnsText ||
 		state.ReturnsSet || !state.ExactSearchPath || !state.OwnerExecute ||
-		!state.RuntimeExecute || state.PublicExecute || state.UnexpectedExecute {
+		state.RuntimeExecute != requireRuntimeExecute || state.PublicExecute || state.UnexpectedExecute {
 		return databaseRoleReference{}, fmt.Errorf("tenant fingerprint function %q is not exact", functionName)
 	}
 	owner := databaseRoleReference{OID: state.OwnerOID, Name: state.OwnerName}
@@ -3410,39 +3762,107 @@ func revokeRuntimeDefaultTablePrivilegesBeforeAdditivePreparation(
 				return fmt.Errorf("revoke additive-preparation default table privileges: %w", err)
 			}
 		}
-		var unexpectedDefaults int64
-		if err := tx.Raw(`
-			SELECT COUNT(*)
-			FROM pg_catalog.pg_default_acl AS defaults
-			CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS grant_state
-			WHERE defaults.defaclrole = CAST(? AS pg_catalog.oid)
-			  AND defaults.defaclobjtype = 'r'
-			  AND (
-				defaults.defaclnamespace = 0
-				OR defaults.defaclnamespace = 'public'::pg_catalog.regnamespace
-			  )
-			  AND CASE
-				WHEN grant_state.grantee = 0 THEN true
-				ELSE pg_catalog.pg_has_role(
-					CAST(? AS pg_catalog.oid),
-					grant_state.grantee,
-					'MEMBER'
-				)
-			  END
-		`, migrationRoleOID, runtimeRoleOID).Scan(&unexpectedDefaults).Error; err != nil {
-			return fmt.Errorf("inspect additive-preparation default table privileges: %w", err)
-		}
-		if unexpectedDefaults != 0 {
-			return fmt.Errorf(
-				"runtime role has %d effective default table privilege grant(s) before additive preparation",
-				unexpectedDefaults,
-			)
-		}
-		return nil
+		return verifyRuntimeDefaultTablePrivilegesRevoked(tx, migrationRoleOID, runtimeRoleOID)
 	}); err != nil {
 		return err
 	}
 	return nil
+}
+
+func verifyRuntimeDefaultTablePrivilegesRevoked(
+	db *gorm.DB,
+	migrationRoleOID int64,
+	runtimeRoleOID int64,
+) error {
+	if migrationRoleOID == 0 || runtimeRoleOID == 0 {
+		return errors.New("additive-preparation default privilege role binding is missing")
+	}
+	var unexpectedDefaults int64
+	if err := db.Raw(`
+		SELECT COUNT(*)
+		FROM pg_catalog.pg_default_acl AS defaults
+		CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS grant_state
+		WHERE defaults.defaclrole = CAST(? AS pg_catalog.oid)
+		  AND defaults.defaclobjtype = 'r'
+		  AND (
+			defaults.defaclnamespace = 0
+			OR defaults.defaclnamespace = 'public'::pg_catalog.regnamespace
+		  )
+		  AND CASE
+			WHEN grant_state.grantee = 0 THEN true
+			ELSE pg_catalog.pg_has_role(
+				CAST(? AS pg_catalog.oid),
+				grant_state.grantee,
+				'MEMBER'
+			)
+		  END
+	`, migrationRoleOID, runtimeRoleOID).Scan(&unexpectedDefaults).Error; err != nil {
+		return fmt.Errorf("inspect additive-preparation default table privileges: %w", err)
+	}
+	if unexpectedDefaults != 0 {
+		return fmt.Errorf(
+			"runtime role has %d effective default table privilege grant(s) before additive preparation",
+			unexpectedDefaults,
+		)
+	}
+	return nil
+}
+
+func createLegacyRLSMigrationPrepareClaim(
+	db *gorm.DB,
+	runtimeRole string,
+	claim string,
+) error {
+	if !strings.HasPrefix(claim, rlsMigrationPrepareClaimPrefix) ||
+		!isLowerHexSHA256(strings.TrimPrefix(claim, rlsMigrationPrepareClaimPrefix)) {
+		return errors.New("RLS migration prepare claim value is invalid")
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := revokeRuntimeDefaultTablePrivilegesBeforeAdditivePreparation(tx, runtimeRole); err != nil {
+			return err
+		}
+		createStatement := fmt.Sprintf(`CREATE FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1()
+			RETURNS text
+			LANGUAGE sql
+			IMMUTABLE
+			SET search_path = pg_catalog, public
+			AS $function$
+			  SELECT '%s'::text
+			$function$`, claim)
+		for _, statement := range []string{
+			createStatement,
+			"REVOKE ALL ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() FROM PUBLIC",
+			fmt.Sprintf(
+				"REVOKE ALL ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() FROM %s",
+				quoteIdentifier(runtimeRole),
+			),
+		} {
+			if err := tx.Exec(statement).Error; err != nil {
+				return fmt.Errorf("create owner-only RLS migration prepare claim: %w", err)
+			}
+		}
+		coreTables, _, err := tenantPolicyFingerprintProfiles(protectedTenantTableNames())
+		if err != nil {
+			return err
+		}
+		_, runtimeRoleOID, owner, err := verifyExactLegacyTenantCorePolicyContract(
+			tx,
+			coreTables,
+			runtimeRole,
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := verifyExactLegacyTenantPrepareClaim(
+			tx,
+			claim,
+			runtimeRole,
+			&owner,
+		); err != nil {
+			return err
+		}
+		return verifyRuntimeDefaultTablePrivilegesRevoked(tx, owner.OID, runtimeRoleOID)
+	})
 }
 
 // VerifyRLSMigrationCallbackScanAuthorityForTest exposes the final read-only
@@ -3667,7 +4087,20 @@ func runRLSMigrationCoordinatorForPhase(
 			return err
 		}
 
+		// Inspect the additive fingerprint before any future-profile early return.
+		// A transient baseline claim must never be mistaken for a published final
+		// fingerprint merely because another actor changed the trigger profile.
+		catalogState, err := classifyLegacyRLSCatalog(session, runtimeRole, phase)
+		if err != nil {
+			return err
+		}
 		if action == rlsMigrationVerifyFuture {
+			if catalogState == legacyRLSCatalogPreparing {
+				return errors.Join(
+					ErrRLSMigrationCatalogQuarantined,
+					errors.New("future migration profile retains a transient baseline prepare claim"),
+				)
+			}
 			if err := verifyFutureRLSPostcondition(session, runtimeRole); err != nil {
 				return errors.Join(
 					ErrRLSMigrationCatalogQuarantined,
@@ -3679,11 +4112,6 @@ func runRLSMigrationCoordinatorForPhase(
 			}
 			return nil
 		}
-
-		catalogState, err := classifyLegacyRLSCatalog(session, runtimeRole)
-		if err != nil {
-			return err
-		}
 		if action == rlsMigrationPrepareLegacy && catalogState == legacyRLSCatalogComplete {
 			if err := verifyCompleteLegacyRLSPostcondition(session, runtimeRole); err != nil {
 				return fmt.Errorf("verify completed baseline migration profile without mutation: %w", err)
@@ -3694,13 +4122,40 @@ func runRLSMigrationCoordinatorForPhase(
 			return nil
 		}
 
+		readiness, _, _, err := splitRLSMigrationPlan(getIndexes())
+		if err != nil {
+			return err
+		}
+		if err := executeMigrationIndexStatement(session, readiness, false); err != nil {
+			return fmt.Errorf("verify pre-mutation RLS migration readiness: %w", err)
+		}
+
 		if catalogState == legacyRLSCatalogPreAdditive {
-			if err := revokeRuntimeDefaultTablePrivilegesBeforeAdditivePreparation(session, runtimeRole); err != nil {
+			claim, err := rlsMigrationPrepareClaim(session, runtimeRole, phase)
+			if err != nil {
 				return errors.Join(
 					ErrRLSMigrationCatalogQuarantined,
-					fmt.Errorf("fence unprotected additive scaffold privileges: %w", err),
+					fmt.Errorf("derive additive preparation claim: %w", err),
 				)
 			}
+			if err := createLegacyRLSMigrationPrepareClaim(session, runtimeRole, claim); err != nil {
+				return errors.Join(
+					ErrRLSMigrationCatalogQuarantined,
+					fmt.Errorf("atomically fence and claim additive preparation: %w", err),
+				)
+			}
+			catalogState = legacyRLSCatalogPreparing
+		}
+		// Every admitted path below replays preparation. Reconcile its exact
+		// concurrent-index artifacts regardless of whether admission came from a
+		// transient claim, a repairable legacy policy profile, or a bridge from a
+		// complete legacy profile. Future and completed-baseline paths returned
+		// above without entering this mutation boundary.
+		if err := reconcileInvalidConcurrentMigrationIndexes(session, getIndexes()); err != nil {
+			return errors.Join(
+				ErrRLSMigrationCatalogQuarantined,
+				fmt.Errorf("reconcile concurrent-index retry artifacts: %w", err),
+			)
 		}
 		if err := runMigrationPreparationWithProgressOnSession(session, adminCfg); err != nil {
 			return fmt.Errorf("prepare schema under RLS migration interlock: %w", err)
@@ -4028,7 +4483,7 @@ func runMigrationPreparationWithProgressOnSession(
 	db *gorm.DB,
 	adminCfg *config.DefaultAdminConfig,
 ) error {
-	preparation, _, err := splitMigrationIndexes(getIndexes())
+	_, preparation, _, err := splitRLSMigrationPlan(getIndexes())
 	if err != nil {
 		return err
 	}
@@ -4518,29 +4973,538 @@ func splitMigrationIndexes(indexes []string) (preparation []string, activation s
 	return preparation, activation, nil
 }
 
+func splitRLSMigrationPlan(
+	indexes []string,
+) (readiness string, preparation []string, activation string, err error) {
+	preparationWithReadiness, activation, err := splitMigrationIndexes(indexes)
+	if err != nil {
+		return "", nil, "", err
+	}
+	if len(preparationWithReadiness) == 0 ||
+		!strings.Contains(preparationWithReadiness[0], "IN EXCLUSIVE MODE NOWAIT") ||
+		!strings.Contains(preparationWithReadiness[0], "public.contacts") {
+		return "", nil, "", errors.New("migration pre-mutation NOWAIT readiness boundary is missing")
+	}
+	readiness = preparationWithReadiness[0]
+	preparation = append([]string(nil), preparationWithReadiness[1:]...)
+	return readiness, preparation, activation, nil
+}
+
+type concurrentMigrationIndexContract struct {
+	Name              string
+	Table             string
+	Columns           string
+	Predicate         string
+	DependencyColumns string
+	Unique            bool
+}
+
+func retryableConcurrentIndexLifecycle(valid, ready, live bool) bool {
+	if valid {
+		return ready && live
+	}
+	// CREATE INDEX CONCURRENTLY can leave either an unready/live catalog row
+	// (failure before publication) or a ready/live invalid row (failure after
+	// the first scan). DROP INDEX CONCURRENTLY can additionally be interrupted
+	// after marking the index dead; PostgreSQL represents that as
+	// invalid/unready/not-live and explicitly permits the same DROP to resume.
+	return live || !ready
+}
+
+func retryableConcurrentIndexConstraintBinding(valid bool, constraintCount int64) bool {
+	if constraintCount < 0 {
+		return false
+	}
+	// A published unique index can legitimately be the referenced key for
+	// foreign-key constraints. It is retained here and those exact constraints
+	// are checked by the full post-preparation verifier. An invalid index is a
+	// DROP candidate, so no pg_constraint row may still depend on it.
+	return valid || constraintCount == 0
+}
+
+var concurrentMigrationIndexDependencyColumns = map[string]string{
+	"uq_whatsapp_accounts_id_org":               "id,organization_id",
+	"uq_messages_live_wamid":                    "deleted_at,inbox_conversation_id,organization_id,whats_app_message_id",
+	"uq_contacts_id_org":                        "id,organization_id",
+	"uq_inbound_events_identity_review_wamid":   "organization_id,protocol,provider_event_id",
+	"idx_inbound_events_protocol":               "protocol",
+	"idx_inbound_events_review_hold_id":         "review_hold_id",
+	"idx_messages_org_inbox_ingested":           "created_at,deleted_at,id,inbox_conversation_id,ingested_at,organization_id",
+	"idx_messages_org_inbox_ingested_highwater": "inbox_conversation_id,ingested_at,organization_id",
+	"idx_messages_org_contact_ingested":         "contact_id,created_at,deleted_at,id,ingested_at,organization_id",
+	"idx_messages_org_contact_account_ingested": "contact_id,created_at,deleted_at,id,ingested_at,organization_id,whats_app_account",
+	"idx_messages_org_inbox_incoming_ingested":  "created_at,deleted_at,direction,id,inbox_conversation_id,ingested_at,organization_id",
+}
+
+func splitConcurrentMigrationIndexDefinition(definition string) (string, string, error) {
+	if definition == "" || definition[0] != '(' {
+		return "", "", errors.New("concurrent migration index column list is missing")
+	}
+	depth := 0
+	inSingleQuote := false
+	inDoubleQuote := false
+	for index := 0; index < len(definition); index++ {
+		character := definition[index]
+		if inSingleQuote {
+			if character == '\'' {
+				if index+1 < len(definition) && definition[index+1] == '\'' {
+					index++
+					continue
+				}
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			if character == '"' {
+				if index+1 < len(definition) && definition[index+1] == '"' {
+					index++
+					continue
+				}
+				inDoubleQuote = false
+			}
+			continue
+		}
+		switch character {
+		case '\'':
+			inSingleQuote = true
+		case '"':
+			inDoubleQuote = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return "", "", errors.New("concurrent migration index column list is unbalanced")
+			}
+			if depth == 0 {
+				columns := strings.TrimSpace(definition[1:index])
+				tail := strings.TrimSpace(definition[index+1:])
+				if columns == "" {
+					return "", "", errors.New("concurrent migration index has no columns")
+				}
+				if tail == "" {
+					return columns, "", nil
+				}
+				if !strings.HasPrefix(tail, "WHERE ") {
+					return "", "", errors.New("concurrent migration index has an unsupported suffix")
+				}
+				predicate := strings.TrimSpace(strings.TrimPrefix(tail, "WHERE "))
+				if predicate == "" {
+					return "", "", errors.New("concurrent migration index predicate is empty")
+				}
+				return columns, predicate, nil
+			}
+		}
+	}
+	return "", "", errors.New("concurrent migration index column list is unterminated")
+}
+
+func splitConcurrentMigrationIndexKeys(columns string) ([]string, error) {
+	columns = strings.TrimSpace(columns)
+	if columns == "" {
+		return nil, errors.New("concurrent migration index has no keys")
+	}
+	keys := make([]string, 0)
+	start := 0
+	depth := 0
+	inSingleQuote := false
+	inDoubleQuote := false
+	for index := 0; index < len(columns); index++ {
+		character := columns[index]
+		if inSingleQuote {
+			if character == '\'' {
+				if index+1 < len(columns) && columns[index+1] == '\'' {
+					index++
+					continue
+				}
+				inSingleQuote = false
+			}
+			continue
+		}
+		if inDoubleQuote {
+			if character == '"' {
+				if index+1 < len(columns) && columns[index+1] == '"' {
+					index++
+					continue
+				}
+				inDoubleQuote = false
+			}
+			continue
+		}
+		switch character {
+		case '\'':
+			inSingleQuote = true
+		case '"':
+			inDoubleQuote = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return nil, errors.New("concurrent migration index key expression is unbalanced")
+			}
+		case ',':
+			if depth == 0 {
+				key := strings.TrimSpace(columns[start:index])
+				if key == "" {
+					return nil, errors.New("concurrent migration index has an empty key")
+				}
+				keys = append(keys, key)
+				start = index + 1
+			}
+		}
+	}
+	if inSingleQuote || inDoubleQuote || depth != 0 {
+		return nil, errors.New("concurrent migration index key expression is unterminated")
+	}
+	key := strings.TrimSpace(columns[start:])
+	if key == "" {
+		return nil, errors.New("concurrent migration index has an empty final key")
+	}
+	return append(keys, key), nil
+}
+
+func canonicalConcurrentMigrationIndexKeys(columns string) (string, string, error) {
+	keys, err := splitConcurrentMigrationIndexKeys(columns)
+	if err != nil {
+		return "", "", err
+	}
+	canonicalKeys := make([]string, 0, len(keys))
+	options := make([]string, 0, len(keys))
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		upper := strings.ToUpper(key)
+		nullsFirst := false
+		explicitNullOrder := false
+		for _, suffix := range []struct {
+			Text       string
+			NullsFirst bool
+		}{
+			{Text: " NULLS FIRST", NullsFirst: true},
+			{Text: " NULLS LAST", NullsFirst: false},
+		} {
+			if strings.HasSuffix(upper, suffix.Text) {
+				key = strings.TrimSpace(key[:len(key)-len(suffix.Text)])
+				upper = strings.ToUpper(key)
+				nullsFirst = suffix.NullsFirst
+				explicitNullOrder = true
+				break
+			}
+		}
+		descending := false
+		switch {
+		case strings.HasSuffix(upper, " DESC"):
+			key = strings.TrimSpace(key[:len(key)-len(" DESC")])
+			descending = true
+		case strings.HasSuffix(upper, " ASC"):
+			key = strings.TrimSpace(key[:len(key)-len(" ASC")])
+		}
+		if key == "" {
+			return "", "", errors.New("concurrent migration index key expression is empty")
+		}
+		if !explicitNullOrder {
+			nullsFirst = descending
+		}
+		option := 0
+		if descending {
+			option |= 1
+		}
+		if nullsFirst {
+			option |= 2
+		}
+		canonical, err := canonicalizeLegacyAdditiveIndexPredicate(key)
+		if err != nil {
+			return "", "", err
+		}
+		canonicalKeys = append(canonicalKeys, canonical)
+		options = append(options, fmt.Sprintf("%d", option))
+	}
+	return strings.Join(canonicalKeys, "\x1e"), strings.Join(options, ","), nil
+}
+
+func concurrentMigrationIndexContracts(
+	indexes []string,
+) ([]concurrentMigrationIndexContract, error) {
+	contracts := make([]concurrentMigrationIndexContract, 0)
+	seen := make(map[string]struct{})
+	for _, statement := range indexes {
+		normalized := canonicalSchemaDefinition(statement)
+		unique := false
+		var prefix string
+		switch {
+		case strings.HasPrefix(normalized, "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "):
+			prefix = "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "
+			unique = true
+		case strings.HasPrefix(normalized, "CREATE INDEX CONCURRENTLY IF NOT EXISTS "):
+			prefix = "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+		default:
+			continue
+		}
+		remainder := strings.TrimPrefix(normalized, prefix)
+		nameEnd := strings.IndexByte(remainder, ' ')
+		if nameEnd <= 0 {
+			return nil, errors.New("concurrent migration index has no pinned name")
+		}
+		name := remainder[:nameEnd]
+		remainder = strings.TrimSpace(remainder[nameEnd:])
+		if !strings.HasPrefix(remainder, "ON ") {
+			return nil, fmt.Errorf("concurrent migration index %q has no table binding", name)
+		}
+		remainder = strings.TrimSpace(strings.TrimPrefix(remainder, "ON "))
+		tableEnd := strings.IndexByte(remainder, '(')
+		if tableEnd <= 0 {
+			return nil, fmt.Errorf("concurrent migration index %q has no column boundary", name)
+		}
+		table := strings.TrimSpace(remainder[:tableEnd])
+		table = strings.TrimPrefix(table, "public.")
+		columns, predicate, err := splitConcurrentMigrationIndexDefinition(remainder[tableEnd:])
+		if err != nil {
+			return nil, fmt.Errorf("parse concurrent migration index %q: %w", name, err)
+		}
+		if err := validateIdentifier(name); err != nil {
+			return nil, fmt.Errorf("invalid concurrent migration index name %q: %w", name, err)
+		}
+		if err := validateIdentifier(table); err != nil {
+			return nil, fmt.Errorf("invalid concurrent migration index table %q: %w", table, err)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return nil, fmt.Errorf("concurrent migration index name %q is duplicated", name)
+		}
+		dependencyColumns, present := concurrentMigrationIndexDependencyColumns[name]
+		if !present {
+			return nil, fmt.Errorf("concurrent migration index %q has no dependency manifest", name)
+		}
+		seen[name] = struct{}{}
+		contracts = append(contracts, concurrentMigrationIndexContract{
+			Name: name, Table: table, Columns: columns, Predicate: predicate,
+			DependencyColumns: dependencyColumns, Unique: unique,
+		})
+	}
+	if len(contracts) == 0 {
+		return nil, errors.New("migration plan has no concurrent indexes")
+	}
+	if len(contracts) != len(concurrentMigrationIndexDependencyColumns) {
+		return nil, fmt.Errorf(
+			"concurrent migration index inventory has %d entries; expected %d",
+			len(contracts),
+			len(concurrentMigrationIndexDependencyColumns),
+		)
+	}
+	return contracts, nil
+}
+
+func reconcileInvalidConcurrentMigrationIndexes(db *gorm.DB, indexes []string) error {
+	contracts, err := concurrentMigrationIndexContracts(indexes)
+	if err != nil {
+		return err
+	}
+	for _, contract := range contracts {
+		var relation struct {
+			OID  int64  `gorm:"column:relation_oid"`
+			Kind string `gorm:"column:relation_kind"`
+		}
+		relationResult := db.Raw(`
+			SELECT
+				relation.oid::bigint AS relation_oid,
+				relation.relkind::text AS relation_kind
+			FROM pg_catalog.pg_class AS relation
+			JOIN pg_catalog.pg_namespace AS relation_namespace
+			  ON relation_namespace.oid = relation.relnamespace
+			WHERE relation_namespace.nspname = 'public'
+			  AND relation.relname = CAST(? AS text)
+		`, contract.Name).Scan(&relation)
+		if relationResult.Error != nil {
+			return fmt.Errorf("inspect retryable concurrent relation %q: %w", contract.Name, relationResult.Error)
+		}
+		if relationResult.RowsAffected == 0 {
+			continue
+		}
+		if relationResult.RowsAffected != 1 || relation.Kind != "i" {
+			return fmt.Errorf("pinned concurrent index %q is not an exact retry artifact", contract.Name)
+		}
+
+		var state struct {
+			IndexOID        int64  `gorm:"column:index_oid"`
+			TableOID        int64  `gorm:"column:table_oid"`
+			RelationKind    string `gorm:"column:relation_kind"`
+			Persistence     string `gorm:"column:persistence"`
+			OwnerIsCurrent  bool   `gorm:"column:owner_is_current"`
+			AccessMethod    string `gorm:"column:access_method"`
+			TableSchema     string `gorm:"column:table_schema"`
+			TableName       string `gorm:"column:table_name"`
+			Columns         string `gorm:"column:columns"`
+			SortOptions     string `gorm:"column:sort_options"`
+			Predicate       string `gorm:"column:predicate"`
+			Valid           bool   `gorm:"column:valid"`
+			Ready           bool   `gorm:"column:ready"`
+			Live            bool   `gorm:"column:live"`
+			Unique          bool   `gorm:"column:unique_index"`
+			MetadataExact   bool   `gorm:"column:metadata_exact"`
+			ConstraintCount int64  `gorm:"column:constraint_count"`
+		}
+		result := db.Raw(`
+			SELECT
+				index_relation.oid::bigint AS index_oid,
+				table_relation.oid::bigint AS table_oid,
+				index_relation.relkind::text AS relation_kind,
+				index_relation.relpersistence::text AS persistence,
+				index_owner.rolname = current_user AS owner_is_current,
+				access_method.amname::text AS access_method,
+				table_namespace.nspname::text AS table_schema,
+				table_relation.relname::text AS table_name,
+				COALESCE((
+					SELECT pg_catalog.string_agg(
+						pg_catalog.pg_get_indexdef(index_state.indexrelid, key.ordinality::integer, true),
+						',' ORDER BY key.ordinality
+					)
+					FROM pg_catalog.unnest(index_state.indkey::smallint[]) WITH ORDINALITY
+						AS key(attnum, ordinality)
+				), '') AS columns,
+				COALESCE(pg_catalog.array_to_string(index_state.indoption::smallint[], ','), '') AS sort_options,
+				COALESCE(pg_catalog.pg_get_expr(index_state.indpred, index_state.indrelid, false), '') AS predicate,
+				index_state.indisvalid AS valid,
+				index_state.indisready AS ready,
+				index_state.indislive AS live,
+				index_state.indisunique AS unique_index,
+				index_state.indimmediate AND NOT index_state.indisprimary AND NOT index_state.indisexclusion
+					AND NOT index_state.indisclustered AND NOT index_state.indisreplident
+					AND NOT index_state.indcheckxmin
+					AND index_state.indnkeyatts = index_state.indnatts
+					AND index_relation.reloptions IS NULL AND index_relation.relacl IS NULL
+					AND NOT COALESCE(
+						(pg_catalog.to_jsonb(index_state)->>'indnullsnotdistinct')::boolean,
+						false
+					)
+					AND NOT EXISTS (
+						SELECT 1
+						FROM pg_catalog.unnest(index_state.indclass::oid[]) AS class(oid)
+						JOIN pg_catalog.pg_opclass AS operator_class ON operator_class.oid = class.oid
+						JOIN pg_catalog.pg_namespace AS class_namespace
+						  ON class_namespace.oid = operator_class.opcnamespace
+						WHERE NOT operator_class.opcdefault OR class_namespace.nspname <> 'pg_catalog'
+					)
+					AND NOT EXISTS (
+						SELECT 1
+						FROM pg_catalog.unnest(index_state.indcollation::oid[]) AS index_collation(oid)
+						LEFT JOIN pg_catalog.pg_collation AS resolved ON resolved.oid = index_collation.oid
+						LEFT JOIN pg_catalog.pg_namespace AS resolved_namespace
+						  ON resolved_namespace.oid = resolved.collnamespace
+						WHERE index_collation.oid <> 0 AND (
+							resolved_namespace.nspname <> 'pg_catalog' OR resolved.collname <> 'default'
+						)
+					) AS metadata_exact,
+				(SELECT COUNT(*) FROM pg_catalog.pg_constraint AS constraint_state
+				 WHERE constraint_state.conindid = index_relation.oid) AS constraint_count
+			FROM pg_catalog.pg_class AS index_relation
+			JOIN pg_catalog.pg_namespace AS index_namespace
+			  ON index_namespace.oid = index_relation.relnamespace
+			JOIN pg_catalog.pg_roles AS index_owner ON index_owner.oid = index_relation.relowner
+			JOIN pg_catalog.pg_am AS access_method ON access_method.oid = index_relation.relam
+			JOIN pg_catalog.pg_index AS index_state ON index_state.indexrelid = index_relation.oid
+			JOIN pg_catalog.pg_class AS table_relation ON table_relation.oid = index_state.indrelid
+			JOIN pg_catalog.pg_namespace AS table_namespace
+			  ON table_namespace.oid = table_relation.relnamespace
+			WHERE index_namespace.nspname = 'public'
+			  AND index_relation.relname = CAST(? AS text)
+			  AND index_relation.oid::bigint = ?
+		`, contract.Name, relation.OID).Scan(&state)
+		if result.Error != nil {
+			return fmt.Errorf("inspect retryable concurrent index %q: %w", contract.Name, result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("pinned concurrent index %q is not an exact retry artifact", contract.Name)
+		}
+		actualColumns, _, err := canonicalConcurrentMigrationIndexKeys(state.Columns)
+		if err != nil {
+			return fmt.Errorf("parse concurrent migration index %q columns: %w", contract.Name, err)
+		}
+		expectedColumns, expectedSortOptions, err := canonicalConcurrentMigrationIndexKeys(contract.Columns)
+		if err != nil {
+			return fmt.Errorf("parse expected concurrent migration index %q columns: %w", contract.Name, err)
+		}
+		actualPredicate, err := canonicalizeLegacyAdditiveIndexPredicate(state.Predicate)
+		if err != nil {
+			return fmt.Errorf("parse concurrent migration index %q predicate: %w", contract.Name, err)
+		}
+		expectedPredicate, err := canonicalizeLegacyAdditiveIndexPredicate(contract.Predicate)
+		if err != nil {
+			return fmt.Errorf("parse expected concurrent migration index %q predicate: %w", contract.Name, err)
+		}
+		if state.RelationKind != "i" || state.Persistence != "p" ||
+			!state.OwnerIsCurrent || state.AccessMethod != "btree" || state.TableSchema != "public" ||
+			state.TableName != contract.Table || state.Unique != contract.Unique ||
+			!state.MetadataExact ||
+			!retryableConcurrentIndexConstraintBinding(state.Valid, state.ConstraintCount) ||
+			!retryableConcurrentIndexLifecycle(state.Valid, state.Ready, state.Live) ||
+			actualColumns != expectedColumns || expectedSortOptions != state.SortOptions ||
+			actualPredicate != expectedPredicate {
+			return fmt.Errorf(
+				"pinned concurrent index %q is not an exact retry artifact "+
+					"(kind=%q persistence=%q owner_current=%t access_method=%q table=%q.%q "+
+					"unique=%t metadata_exact=%t constraints=%d lifecycle=%t/%t/%t "+
+					"columns=%q expected_columns=%q sort_options=%q expected_sort_options=%q "+
+					"predicate=%q expected_predicate=%q)",
+				contract.Name,
+				state.RelationKind,
+				state.Persistence,
+				state.OwnerIsCurrent,
+				state.AccessMethod,
+				state.TableSchema,
+				state.TableName,
+				state.Unique,
+				state.MetadataExact,
+				state.ConstraintCount,
+				state.Valid,
+				state.Ready,
+				state.Live,
+				state.Columns,
+				contract.Columns,
+				state.SortOptions,
+				expectedSortOptions,
+				state.Predicate,
+				contract.Predicate,
+			)
+		}
+		if err := verifyLegacyIndexDependencies(
+			db,
+			state.IndexOID,
+			state.TableOID,
+			contract.DependencyColumns,
+			0,
+		); err != nil {
+			return fmt.Errorf(
+				"concurrent migration index %q dependency binding is not exact: %w",
+				contract.Name,
+				err,
+			)
+		}
+		if state.Valid {
+			continue
+		}
+		if err := db.Exec(
+			"DROP INDEX CONCURRENTLY public." + quoteIdentifier(contract.Name),
+		).Error; err != nil {
+			return fmt.Errorf("drop invalid concurrent index %q for exact retry: %w", contract.Name, err)
+		}
+	}
+	return nil
+}
+
 // CreateIndexes creates additional indexes not handled by GORM tags
 func CreateIndexes(db *gorm.DB) error {
 	return withMigrationSession(db, createIndexesOnSession)
 }
-
-const coexistenceActivationStatementTimeout = "1s"
 
 func executeMigrationIndexStatement(db *gorm.DB, statement string, coexistenceActivation bool) error {
 	if !coexistenceActivation {
 		return db.Exec(statement).Error
 	}
 
-	// Bound the complete old-core cutover, including its EXCLUSIVE locks,
-	// historical verification, catch-up write, function replacement, and four
-	// trigger publications. PostgreSQL rolls the whole statement back if this
-	// deadline expires, leaving either the exact legacy or exact future profile.
+	// Keep the complete old-core cutover atomic. Its NOWAIT locks bound
+	// contention without imposing a wall-clock deadline on the historical
+	// verification and catch-up work, which legitimately grows with the data.
 	return db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(
-			"SELECT pg_catalog.set_config('statement_timeout', ?, true)",
-			coexistenceActivationStatementTimeout,
-		).Error; err != nil {
-			return fmt.Errorf("bound coexistence trigger activation: %w", err)
-		}
 		return tx.Exec(statement).Error
 	})
 }
@@ -4571,6 +5535,7 @@ func CreateDefaultAdmin(db *gorm.DB, cfg *config.DefaultAdminConfig) error {
 	// Find an ordinary organization, or create ReReply when the installation
 	// contains only atomic platform-compliance control-plane organizations.
 	var org models.Organization
+	createdOrganization := false
 	err := db.Scopes(ExcludePlatformComplianceOrganizations).First(&org).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// No organizations exist, create default one
@@ -4582,6 +5547,7 @@ func CreateDefaultAdmin(db *gorm.DB, cfg *config.DefaultAdminConfig) error {
 		if err := db.Create(&org).Error; err != nil {
 			return fmt.Errorf("failed to create default organization: %w", err)
 		}
+		createdOrganization = true
 	} else if err != nil {
 		return fmt.Errorf("failed to find an ordinary organization: %w", err)
 	}
@@ -4598,7 +5564,7 @@ func CreateDefaultAdmin(db *gorm.DB, cfg *config.DefaultAdminConfig) error {
 	}
 
 	// Seed system roles for this organization if not exist
-	if err := SeedSystemRolesForOrg(db, org.ID); err != nil {
+	if err := seedSystemRolesForOrg(db, org.ID, createdOrganization); err != nil {
 		return fmt.Errorf("failed to seed system roles: %w", err)
 	}
 
@@ -4779,7 +5745,7 @@ func SeedSystemRolesForAllOrgs(db *gorm.DB) error {
 	}
 
 	for _, org := range orgs {
-		if err := SeedSystemRolesForOrg(db, org.ID); err != nil {
+		if err := seedSystemRolesForOrg(db, org.ID, false); err != nil {
 			return fmt.Errorf("failed to seed roles for org %s: %w", org.ID, err)
 		}
 	}
@@ -4811,10 +5777,11 @@ func SeedSystemRolesForAllOrgs(db *gorm.DB) error {
 
 // FixSystemRolePermissions links permissions to existing system roles.
 //
-// Empty roles receive their complete system definition. Existing roles receive
-// only expected permissions that were introduced after the role was last
-// updated. This upgrades older organizations without restoring permissions a
-// platform owner deliberately removed from a system role later.
+// Empty roles receive their system definition except fresh-organization-only
+// destructive grants. Populated roles receive only expected permissions that
+// were introduced after the role was last updated, with the same exclusion.
+// Explicit grants are retained; booking-settings deletion is never inferred
+// from permission or role timestamps, including after deliberate removal.
 func FixSystemRolePermissions(db *gorm.DB) error {
 	// Get all permissions from database
 	var permissions []models.Permission
@@ -4858,10 +5825,13 @@ func FixSystemRolePermissions(db *gorm.DB) error {
 			currentPermissionIDs[permission.ID] = struct{}{}
 		}
 
-		// An empty role is repaired in full. A populated role receives only
-		// permissions created at or after its last explicit update.
+		// A retained role must receive booking-settings deletion only through an
+		// explicit grant, never normalization (even when the role is empty).
 		var permsToAdd []models.Permission
 		for _, key := range permKeys {
+			if key == bookingSettingsDeletePermissionKey {
+				continue
+			}
 			permission, exists := permMap[key]
 			if !exists {
 				continue
@@ -4966,8 +5936,16 @@ func MigrateExistingUserRoles(db *gorm.DB) error {
 	return nil
 }
 
-// SeedSystemRolesForOrg creates system roles for an organization
+const bookingSettingsDeletePermissionKey = models.ResourceBookingSettings + ":" + models.ActionDelete
+
+// SeedSystemRolesForOrg creates defaults for an explicitly newly created
+// organization. Existing-organization repair uses the private helper without
+// fresh-only destructive defaults; retained roles are never replaced.
 func SeedSystemRolesForOrg(db *gorm.DB, orgID uuid.UUID) error {
+	return seedSystemRolesForOrg(db, orgID, true)
+}
+
+func seedSystemRolesForOrg(db *gorm.DB, orgID uuid.UUID, freshOrganization bool) error {
 	// Check if system roles exist for this org
 	var roleCount int64
 	if err := db.Model(&models.CustomRole{}).Where("organization_id = ? AND is_system = ?", orgID, true).Count(&roleCount).Error; err != nil {
@@ -5017,6 +5995,9 @@ func SeedSystemRolesForOrg(db *gorm.DB, orgID uuid.UUID) error {
 		// Add permissions
 		permKeys := rolePermissions[sr.Name]
 		for _, key := range permKeys {
+			if !freshOrganization && key == bookingSettingsDeletePermissionKey {
+				continue
+			}
 			if perm, ok := permMap[key]; ok {
 				role.Permissions = append(role.Permissions, perm)
 			}

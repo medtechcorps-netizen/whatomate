@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -12,6 +13,25 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm/clause"
 )
+
+type canonicalContactWriteSQLStateError string
+
+func (err canonicalContactWriteSQLStateError) Error() string    { return string(err) }
+func (err canonicalContactWriteSQLStateError) SQLState() string { return string(err) }
+
+func TestCanonicalContactWriteRetryContract(t *testing.T) {
+	assert.Equal(t, 6, canonicalContactWriteAttempts)
+	assert.Equal(t, 25*time.Millisecond, canonicalContactWriteInitialRetryDelay)
+	for _, code := range []string{"40001", "40P01", "55P03"} {
+		err := errors.Join(errors.New("wrapped contact write"), canonicalContactWriteSQLStateError(code))
+		assert.True(t, isRetryableCanonicalContactWrite(err), code)
+	}
+	assert.False(t, isRetryableCanonicalContactWrite(canonicalContactWriteSQLStateError("23505")))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, waitForCanonicalContactWriteRetry(ctx, 0), context.Canceled)
+}
 
 func TestSaveAndFinalizeTransfer_ConcurrentAliasCreatorsUseOneCanonicalTransfer(t *testing.T) {
 	app := newProcessorTestApp(t)

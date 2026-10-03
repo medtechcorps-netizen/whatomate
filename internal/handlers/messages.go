@@ -871,6 +871,9 @@ func (a *App) deliverAutomaticAIOutgoingMessage(
 		ctx,
 		organizationID,
 		func(tx *gorm.DB) error {
+			if err := a.validateNativeBookingDispatchTx(tx, msg); err != nil {
+				return err
+			}
 			account, err := whatsappaccount.LockAndLoadActiveForOutbound(
 				tx,
 				organizationID,
@@ -919,12 +922,18 @@ func (a *App) deliverAutomaticAIOutgoingMessage(
 			if stored.Status != models.MessageStatusPending {
 				return errors.New("automatic AI message is no longer pending")
 			}
+			if err := validateNativeBookingMessageIdentity(&stored, msg); err != nil {
+				return err
+			}
 			if state, _ := stored.Metadata[automaticAIDispatchStateMetadataKey].(string); strings.TrimSpace(state) != "" {
 				return errors.New(
 					"automatic AI message already has a physical attempt",
 				)
 			}
 			metadata := cloneOutgoingMessageMetadata(stored.Metadata)
+			if err := a.claimNativeBookingDispatchTx(tx, &stored); err != nil {
+				return err
+			}
 			metadata[automaticAIDispatchStateMetadataKey] =
 				automaticAIDispatchStateDispatching
 			metadata[automaticAIDispatchStartedAtKey] =
@@ -962,6 +971,9 @@ func (a *App) deliverAutomaticAIOutgoingMessage(
 		ctx,
 		organizationID,
 		func(tx *gorm.DB, providerAttempted *bool) error {
+			if err := a.validateNativeBookingDispatchTx(tx, msg); err != nil {
+				return err
+			}
 			account, err := whatsappaccount.LockAndLoadActiveForOutbound(
 				tx,
 				organizationID,

@@ -135,6 +135,36 @@ type IncomingTextMessage struct {
 			Type  string `json:"type,omitempty"`
 		} `json:"phones,omitempty"`
 	} `json:"contacts,omitempty"`
+
+	// senderWaID and senderUsername carry the sender's value.contacts[] entry
+	// (wa_id and profile.username) from the same webhook delivery. They only
+	// help resolve the contact for a message that arrives without "from"
+	// (WhatsApp username users identified by BSUID). They are unexported, so
+	// they are never serialized into the durable continuation payload, which
+	// keeps Meta's original from/from_user_id fields unchanged.
+	senderWaID     string
+	senderUsername string
+}
+
+// withWebhookSenderContact attaches the matching value.contacts[] identity to
+// an inbound message. wa_id is kept only when Meta omitted "from" (or sent a
+// "from" that is empty once normalized, such as "+").
+func (m IncomingTextMessage) withWebhookSenderContact(contact *CoexistenceWebhookContact) IncomingTextMessage {
+	if contact == nil {
+		return m
+	}
+	m.senderUsername = strings.TrimSpace(contact.Profile.Username)
+	if normalizeCoexistencePhone(m.From) == "" {
+		m.senderWaID = strings.TrimSpace(contact.WaID)
+	}
+	return m
+}
+
+// hasSenderIdentity reports whether an inbound message identifies its sender
+// by phone ("from" or contacts[].wa_id), BSUID or username.
+func (m IncomingTextMessage) hasSenderIdentity() bool {
+	identity := inboundSenderIdentity(m, "")
+	return identity.Phone != "" || identity.primaryUserID() != "" || identity.Username != ""
 }
 
 // persistedIncomingMessage is the durable hand-off between Meta's webhook ACK
@@ -613,7 +643,7 @@ func (a *App) enrichProvenWhatsAppMessageBSUID(account *models.WhatsAppAccount, 
 	}
 	userID := lookup.Identity.primaryUserID()
 	var updated bool
-	err := a.DB.Transaction(func(tx *gorm.DB) error {
+	err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 		result := tx.Model(&models.Contact{}).Where(
 			"organization_id = ? AND id = ? AND phone_number = ? AND COALESCE(bs_uid, '') = '' AND merged_into_id IS NULL",
 			canonical.OrganizationID, canonical.ID, canonical.PhoneNumber,
@@ -692,19 +722,73 @@ func (a *App) validateWhatsAppMessageContactIdentity(orgID uuid.UUID, canonical 
 	return nil
 }
 
+// contactHasDialablePhone reports whether a contact can be addressed by its
+// phone number. A contact without one ("", "+", or a bsuid:/user:/event:/id:
+// placeholder) is reachable only through its stored BSUID.
+func contactHasDialablePhone(contact *models.Contact) bool {
+	if contact == nil {
+		return false
+	}
+	phone := normalizeCoexistencePhone(contact.PhoneNumber)
+	return phone != "" && !isCoexistencePlaceholderPhone(phone) && !whatsapp.IsPlaceholderAddress(phone)
+}
+
 // updateContactBSUID persists Meta's optional business-scoped user ID without
 // allowing a metadata-write failure to poison the surrounding inbound-message
 // transaction. GORM implements nested transactions with a PostgreSQL savepoint,
 // so rolling this callback back restores the outer tenant transaction.
+//
+// Like canEnrichProvenWhatsAppMessageBSUID, an absent phone or a non-dialable
+// placeholder never authorizes learning or replacing a BSUID: such a contact
+// is addressed by bs_uid alone, so changing it would send every later reply
+// in that thread to a different customer. Those contacts keep their bs_uid
+// and are resolved by BSUID instead (getOrCreateCoexistenceContact, which
+// getOrCreateNewInboundSenderContact also uses to fill an empty bs_uid when
+// the sender's phone is a merge alias of such a contact). A
+// contact with a dialable phone that the sender has just proven keeps the
+// previous behaviour: outbound sends address it by "to" (the phone takes
+// precedence), and refusing the update would make
+// validateWhatsAppMessageContactIdentity reject the message, which
+// /api/webhook answers with 503 and Meta retries indefinitely.
 func (a *App) updateContactBSUID(contact *models.Contact, bsuid string) {
+	bsuid = strings.TrimSpace(bsuid)
 	if contact == nil || bsuid == "" || contact.BSUID == bsuid {
 		return
 	}
+	if !contactHasDialablePhone(contact) {
+		a.Log.Warn("Refusing to change the BSUID of a contact without a dialable phone",
+			"contact_id", contact.ID,
+			"has_bsuid", contact.BSUID != "",
+		)
+		return
+	}
 
-	err := a.DB.Transaction(func(tx *gorm.DB) error {
-		return tx.Model(&models.Contact{}).
-			Where("id = ?", contact.ID).
-			Update("bs_uid", bsuid).Error
+	var updated, heldElsewhere bool
+	err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+		// Never make a second live contact hold the same BSUID (for example a
+		// call from a phone contact whose BSUID already belongs to a bsuid:
+		// placeholder). Two holders make every later BSUID-only message fail
+		// validateWhatsAppMessageContactIdentity. The existing holder keeps
+		// the BSUID; the coexistence resolver reconciles the two when a
+		// message reveals the phone.
+		var holders int64
+		if countErr := tx.Model(&models.Contact{}).Where(
+			"organization_id = ? AND bs_uid = ? AND id <> ?",
+			contact.OrganizationID, bsuid, contact.ID,
+		).Count(&holders).Error; countErr != nil {
+			return countErr
+		}
+		if holders > 0 {
+			heldElsewhere = true
+			return nil
+		}
+		// The phone predicate keeps the write atomic with the dialable-phone
+		// check above: a concurrent change of the phone wins.
+		result := tx.Model(&models.Contact{}).
+			Where("id = ? AND phone_number = ?", contact.ID, contact.PhoneNumber).
+			Update("bs_uid", bsuid)
+		updated = result.RowsAffected == 1
+		return result.Error
 	})
 	if err != nil {
 		a.Log.Warn("Failed to update contact BSUID; continuing inbound message processing",
@@ -713,7 +797,15 @@ func (a *App) updateContactBSUID(contact *models.Contact, bsuid string) {
 		)
 		return
 	}
-	contact.BSUID = bsuid
+	if heldElsewhere {
+		a.Log.Warn("Not copying a BSUID that another live contact already holds",
+			"contact_id", contact.ID,
+		)
+		return
+	}
+	if updated {
+		contact.BSUID = bsuid
+	}
 }
 
 // processIncomingMessageFull processes incoming WhatsApp messages with chatbot logic
@@ -888,6 +980,13 @@ func (a *App) continuePersistedIncomingMessage(
 	// Log incoming message to session
 	a.logSessionMessage(session.ID, models.DirectionIncoming, messageText, "keyword_check")
 
+	// An exact server token is never a keyword, greeting or model instruction.
+	// Consume it once against the durable offer before any ordinary response.
+	if isNativeBookingConfirmation(messageText) {
+		_, _, bookingErr := a.processNativeAIBooking(account, contact, session, settings, messageText)
+		return bookingErr
+	}
+
 	// Check for transfer keyword BEFORE sending greeting (transfer takes priority)
 	keywordResponse, keywordMatched := a.matchKeywordRules(account.OrganizationID, account.Name, messageText)
 	if keywordMatched && keywordResponse.ResponseType == models.ResponseTypeTransfer {
@@ -962,6 +1061,14 @@ func (a *App) continuePersistedIncomingMessage(
 			return fmt.Errorf("start chatbot flow: %w", err)
 		}
 		return nil
+	}
+
+	// An opted-in native fallback uses the same constrained booking lane as a
+	// graph AI node, including the first message of a newly acquired session.
+	if handled, _, bookingErr := a.processNativeAIBooking(account, contact, session, settings, messageText); handled {
+		return bookingErr
+	} else if bookingErr != nil {
+		return bookingErr
 	}
 
 	// Send greeting message for new sessions (only if no flow was triggered)
@@ -1543,6 +1650,12 @@ func (a *App) getOrCreateSession(
 		})
 		if !isRetryableCanonicalContactWrite(err) {
 			break
+		}
+		if attempt+1 < canonicalContactWriteAttempts {
+			if waitErr := waitForCanonicalContactWriteRetry(db.Statement.Context, attempt); waitErr != nil {
+				err = waitErr
+				break
+			}
 		}
 	}
 	if err != nil {
@@ -2780,11 +2893,10 @@ func (a *App) persistIncomingMessageForAccountWithAdmission(
 				)
 			}
 		} else {
-			contact, _, err = a.getOrCreateInboundContact(
+			contact, err = a.getOrCreateNewInboundSenderContact(
 				account,
-				msg.From,
+				msg,
 				profileName,
-				msg.FromUserID,
 			)
 			if err != nil {
 				return nil, false, fmt.Errorf(
@@ -3105,6 +3217,310 @@ func (a *App) hydratePersistedIncomingMedia(
 	return nil
 }
 
+// errInboundSenderIdentityMissing rejects an inbound message that names no
+// sender at all. The webhook handler skips such messages before persistence
+// (see WebhookHandler), so this only guards direct callers.
+var errInboundSenderIdentityMissing = errors.New("incoming WhatsApp message has no sender phone, BSUID or username")
+
+// errEmptyPhoneContactNeedsRepair refuses to give a legacy empty-phone
+// contact ("" or "+") a real phone or a BSUID when its inbound history is not
+// proven to belong to this sender alone. Before the BSUID-only fix, every
+// BSUID-only sender in an organization shared one such row. Upgrading it
+// would turn several customers' mixed history into one real-phone contact and
+// hide it from the repair audit. The caller's transaction rolls back and
+// /api/webhook answers 503, exactly as before this change (two contacts then
+// shared the BSUID and failed validateWhatsAppMessageContactIdentity), until
+// the row is repaired with docs/runbooks/empty-phone-contacts-repair.md.
+var errEmptyPhoneContactNeedsRepair = errors.New("legacy empty-phone contact is not proven to belong to this sender; repair it with docs/runbooks/empty-phone-contacts-repair.md")
+
+// Metadata keys recorded when a legacy empty-phone contact is upgraded with a
+// revealed phone. The runbook audit finds upgraded rows by these keys, since
+// their phone_number is no longer empty.
+const (
+	emptyPhoneUpgradedFromKey = "empty_phone_upgraded_from"
+	emptyPhoneUpgradedAtKey   = "empty_phone_upgraded_at"
+)
+
+// inboundSenderIdentity is the contact identity Meta supplied for an inbound
+// message. contacts[].wa_id stands in for an omitted "from".
+func inboundSenderIdentity(msg IncomingTextMessage, profileName string) coexistenceContactIdentity {
+	phone := normalizeCoexistencePhone(msg.From)
+	if phone == "" {
+		phone = normalizeCoexistencePhone(msg.senderWaID)
+	}
+	return coexistenceContactIdentity{
+		Phone:        phone,
+		UserID:       strings.TrimSpace(msg.FromUserID),
+		ParentUserID: strings.TrimSpace(msg.FromParentUserID),
+		Username:     strings.TrimSpace(msg.senderUsername),
+		ProfileName:  strings.TrimSpace(profileName),
+	}
+}
+
+// isLegacyEmptyPhoneContact reports whether a contact is a pre-fix
+// empty-phone row ("" or "+") rather than a bsuid:/user:/event: placeholder.
+func isLegacyEmptyPhoneContact(contact *models.Contact) bool {
+	return contact != nil && contactutil.IsEmptyPhone(contact.PhoneNumber)
+}
+
+// contactHoldsSenderUserID reports whether a contact already holds the
+// sender's BSUID or parent BSUID.
+func contactHoldsSenderUserID(contact *models.Contact, identity coexistenceContactIdentity) bool {
+	if contact == nil || strings.TrimSpace(contact.BSUID) == "" {
+		return false
+	}
+	bsuid := strings.TrimSpace(contact.BSUID)
+	return bsuid == strings.TrimSpace(identity.UserID) || bsuid == strings.TrimSpace(identity.ParentUserID)
+}
+
+// inboundSenderMatchesUserIDs reports whether every sender BSUID recorded on
+// a contact's inbound messages belongs to this identity. An unknown sender
+// ("": a message without a continuation job, or a job without a BSUID) or an
+// empty list never matches.
+func inboundSenderMatchesUserIDs(senders []string, identity coexistenceContactIdentity) bool {
+	allowed := map[string]bool{}
+	for _, id := range []string{identity.UserID, identity.ParentUserID} {
+		if id = strings.TrimSpace(id); id != "" {
+			allowed[id] = true
+		}
+	}
+	if len(senders) == 0 || len(allowed) == 0 {
+		return false
+	}
+	for _, sender := range senders {
+		if !allowed[strings.TrimSpace(sender)] {
+			return false
+		}
+	}
+	return true
+}
+
+// legacyEmptyPhoneContactBelongsToSender reports whether a legacy empty-phone
+// contact is proven to hold only this sender's conversation: nothing was
+// merged into it, it has at least one inbound message, and every inbound
+// message's continuation payload names this sender's BSUID (the same
+// evidence as runbook section 2.2). The contact row is already locked by the
+// caller's canonical lookup.
+func (a *App) legacyEmptyPhoneContactBelongsToSender(
+	organizationID uuid.UUID,
+	contact *models.Contact,
+	identity coexistenceContactIdentity,
+) (bool, error) {
+	var mergedAliases int64
+	if err := a.DB.Unscoped().Model(&models.Contact{}).Where(
+		"organization_id = ? AND merged_into_id = ?",
+		organizationID, contact.ID,
+	).Count(&mergedAliases).Error; err != nil {
+		return false, err
+	}
+	if mergedAliases > 0 {
+		return false, nil
+	}
+	var senders []string
+	if err := a.DB.Raw(`
+		SELECT DISTINCT COALESCE(
+		         NULLIF(j.payload -> 'message' ->> 'from_user_id', ''),
+		         NULLIF(j.payload -> 'message' ->> 'from_parent_user_id', ''),
+		         '') AS sender
+		  FROM messages m
+		  LEFT JOIN scheduled_jobs j
+		    ON j.organization_id = m.organization_id
+		   AND j.kind = ?
+		   AND j.aggregate_type = 'message'
+		   AND j.aggregate_id = m.id
+		 WHERE m.organization_id = ?
+		   AND m.contact_id = ?
+		   AND m.direction = ?`,
+		inboundContinuationJobKind, organizationID, contact.ID, models.DirectionIncoming,
+	).Scan(&senders).Error; err != nil {
+		return false, err
+	}
+	return inboundSenderMatchesUserIDs(senders, identity), nil
+}
+
+// noteLegacyEmptyPhoneUpgrade records that a legacy empty-phone contact
+// received a real phone, so the runbook audit still finds it.
+func (a *App) noteLegacyEmptyPhoneUpgrade(account *models.WhatsAppAccount, contact *models.Contact, originalPhone string) error {
+	metadata := cloneMessageMetadata(contact.Metadata)
+	metadata[emptyPhoneUpgradedFromKey] = originalPhone
+	metadata[emptyPhoneUpgradedAtKey] = time.Now().UTC().Format(time.RFC3339)
+	if err := a.DB.Model(&models.Contact{}).Where(
+		"organization_id = ? AND id = ?",
+		account.OrganizationID, contact.ID,
+	).Update("metadata", metadata).Error; err != nil {
+		return err
+	}
+	contact.Metadata = metadata
+	return nil
+}
+
+// resolveSenderOfContactWithoutDialablePhone sends a sender whose BSUID, or
+// whose phone through a merge alias, leads to a contact without a dialable
+// phone through the coexistence resolver. The resolver upgrades a placeholder
+// with the revealed phone, reconciles it with an existing phone owner, fills
+// an empty bs_uid, or records a conflict; it never makes a second contact
+// share the BSUID. A legacy empty-phone contact takes that path only when its
+// history is proven to be this sender's alone (errEmptyPhoneContactNeedsRepair
+// otherwise), and an upgrade of it is recorded in metadata.
+func (a *App) resolveSenderOfContactWithoutDialablePhone(
+	account *models.WhatsAppAccount,
+	owner *models.Contact,
+	identity coexistenceContactIdentity,
+) (*models.Contact, error) {
+	legacy := isLegacyEmptyPhoneContact(owner)
+	originalPhone := ""
+	if legacy {
+		originalPhone = owner.PhoneNumber
+		proven, err := a.legacyEmptyPhoneContactBelongsToSender(account.OrganizationID, owner, identity)
+		if err != nil {
+			return nil, err
+		}
+		if !proven {
+			a.Log.Error("Legacy empty-phone contact needs manual repair before it can take this sender's phone",
+				"contact_id", owner.ID,
+				"organization_id", account.OrganizationID,
+				"runbook", "docs/runbooks/empty-phone-contacts-repair.md",
+			)
+			return nil, errEmptyPhoneContactNeedsRepair
+		}
+	}
+	contact, _, err := a.getOrCreateCoexistenceContact(account, identity)
+	if err != nil {
+		return nil, err
+	}
+	if legacy && contact.ID == owner.ID && contactHasDialablePhone(contact) {
+		if err := a.noteLegacyEmptyPhoneUpgrade(account, contact, originalPhone); err != nil {
+			return nil, err
+		}
+	}
+	return contact, nil
+}
+
+// getOrCreateNewInboundSenderContact resolves the contact for an inbound WAMID
+// that has no durable owner yet. The caller already holds the WAMID and
+// organization policy locks and the prepared account authority, so the
+// contact locks taken here keep the documented lock order.
+//
+//   - "from" present and the sender's BSUID is not held by a contact without
+//     a dialable phone: unchanged phone-first resolution
+//     (getOrCreateInboundContact). If that phone is a merge alias of a
+//     contact without a dialable phone, the coexistence resolver fills that
+//     contact's empty bs_uid (it never replaces a different one).
+//   - "from" present and the BSUID is held by a placeholder (bsuid:/user:/
+//     event:) contact, or by a legacy empty-phone contact proven to hold
+//     only this sender: the coexistence resolver upgrades that contact with
+//     the revealed phone (or reconciles it with an existing phone owner)
+//     instead of creating a second contact that shares the BSUID. An
+//     unproven legacy empty-phone contact returns
+//     errEmptyPhoneContactNeedsRepair.
+//   - "from" absent (WhatsApp username users): the coexistence resolver looks
+//     the sender up by BSUID and otherwise creates a per-sender placeholder
+//     contact ("bsuid:<hash>") with the coexistence_* metadata keys. This path
+//     never reaches contactutil.GetOrCreateContact with an empty phone.
+func (a *App) getOrCreateNewInboundSenderContact(
+	account *models.WhatsAppAccount,
+	msg IncomingTextMessage,
+	profileName string,
+) (*models.Contact, error) {
+	if account == nil {
+		return nil, errors.New("WhatsApp account is required")
+	}
+	identity := inboundSenderIdentity(msg, profileName)
+	// Branch on the normalized phone, like hasSenderIdentity: a "+"-only
+	// "from" is no phone and must not reach GetOrCreateContact.
+	if normalizeCoexistencePhone(msg.From) != "" {
+		if identity.primaryUserID() != "" {
+			owner, err := a.findCoexistenceContactByUserID(account.OrganizationID, identity)
+			switch {
+			case err == nil && !contactHasDialablePhone(owner):
+				return a.resolveSenderOfContactWithoutDialablePhone(account, owner, identity)
+			case err != nil && !errors.Is(err, gorm.ErrRecordNotFound):
+				return nil, err
+			}
+		}
+		contact, _, err := a.getOrCreateInboundContact(account, msg.From, profileName, msg.FromUserID)
+		if err != nil {
+			return nil, err
+		}
+		if identity.primaryUserID() != "" && !contactHasDialablePhone(contact) &&
+			!contactHoldsSenderUserID(contact, identity) {
+			// The phone is a merge alias of a contact without a dialable phone
+			// (for example an agent merged it into a "WhatsApp number hidden"
+			// contact), so updateContactBSUID refused the BSUID.
+			return a.resolveSenderOfContactWithoutDialablePhone(account, contact, identity)
+		}
+		return contact, nil
+	}
+
+	if identity.Phone == "" && identity.primaryUserID() == "" && identity.Username == "" {
+		return nil, errInboundSenderIdentityMissing
+	}
+	var owner *models.Contact
+	if identity.Phone != "" && identity.primaryUserID() != "" {
+		// identity.Phone came from contacts[].wa_id. Use it only when it
+		// cannot move this BSUID onto, or a new phone onto, a contact that
+		// already belongs to someone; otherwise match by BSUID alone.
+		keepWaID, byUserID, err := a.inboundWaIDAcceptsUserID(account.OrganizationID, identity)
+		if err != nil {
+			return nil, err
+		}
+		if !keepWaID {
+			identity.Phone = ""
+		}
+		owner = byUserID
+	}
+	contact, _, err := a.getOrCreateCoexistenceContact(account, identity)
+	if err != nil {
+		return nil, err
+	}
+	if owner != nil && isLegacyEmptyPhoneContact(owner) && contact.ID == owner.ID && contactHasDialablePhone(contact) {
+		if err := a.noteLegacyEmptyPhoneUpgrade(account, contact, owner.PhoneNumber); err != nil {
+			return nil, err
+		}
+	}
+	return contact, nil
+}
+
+// inboundWaIDAcceptsUserID reports whether a contacts[].wa_id phone may be
+// used for a BSUID-identified sender, and returns the sender's current BSUID
+// owner (nil when there is none).
+//
+//   - The BSUID has an owner with a dialable phone: only when that phone
+//     already equals wa_id. A different wa_id must never rewrite an
+//     established customer's phone or move the BSUID to another contact.
+//   - The BSUID has a placeholder owner: yes; the coexistence resolver
+//     handles the phone reveal.
+//   - The BSUID has a legacy empty-phone owner: only when its history is
+//     proven to be this sender's alone (legacyEmptyPhoneContactBelongsToSender).
+//   - The BSUID has no owner: only when the phone's current contact has no
+//     BSUID or the same one.
+func (a *App) inboundWaIDAcceptsUserID(
+	organizationID uuid.UUID,
+	identity coexistenceContactIdentity,
+) (bool, *models.Contact, error) {
+	byUserID, err := a.findCoexistenceContactByUserID(organizationID, identity)
+	switch {
+	case err == nil && contactHasDialablePhone(byUserID):
+		return normalizeCoexistencePhone(byUserID.PhoneNumber) == normalizeCoexistencePhone(identity.Phone), byUserID, nil
+	case err == nil && isLegacyEmptyPhoneContact(byUserID):
+		proven, provenErr := a.legacyEmptyPhoneContactBelongsToSender(organizationID, byUserID, identity)
+		return proven, byUserID, provenErr
+	case err == nil:
+		return true, byUserID, nil
+	case !errors.Is(err, gorm.ErrRecordNotFound):
+		return false, nil, err
+	}
+	owner, err := a.findCoexistenceContactByPhone(organizationID, identity.Phone)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return true, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	return owner.BSUID == "" || owner.BSUID == identity.primaryUserID() ||
+		(identity.ParentUserID != "" && owner.BSUID == identity.ParentUserID), nil, nil
+}
+
 // getOrCreateInboundContact keeps the contact row, immutable CRM activity, and
 // durable webhook outbox in one transaction. A unique-contact race aborts the
 // losing PostgreSQL transaction, so retry it from a fresh transaction.
@@ -3188,6 +3604,11 @@ func (a *App) getOrCreateInboundContact(
 		}
 		if !isUniqueViolation(err) && !isRetryableCanonicalContactWrite(err) {
 			return nil, false, err
+		}
+		if attempt+1 < canonicalContactWriteAttempts {
+			if waitErr := waitForCanonicalContactWriteRetry(a.DB.Statement.Context, attempt); waitErr != nil {
+				return nil, false, waitErr
+			}
 		}
 	}
 	return nil, false, err
@@ -3365,6 +3786,12 @@ func (a *App) persistIncomingMessageWithFlow(account *models.WhatsAppAccount, co
 		})
 		if transactionErr == nil || (!isUniqueViolation(transactionErr) && !isRetryableCanonicalContactWrite(transactionErr)) {
 			break
+		}
+		if attempt+1 < canonicalContactWriteAttempts {
+			if waitErr := waitForCanonicalContactWriteRetry(a.DB.Statement.Context, attempt); waitErr != nil {
+				transactionErr = waitErr
+				break
+			}
 		}
 	}
 	if transactionErr != nil {

@@ -12,6 +12,7 @@ import { toast } from 'vue-sonner'
 import { Plus, Users, Pencil, Trash2, MessageSquare, Download } from 'lucide-vue-next'
 import { getErrorMessage } from '@/lib/api-utils'
 import { formatDate } from '@/lib/utils'
+import { contactAddressDisplay, contactDisplayName } from '@/lib/contactAddress'
 import { useSearchPagination } from '@/composables/useSearchPagination'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
@@ -148,8 +149,14 @@ function openChat(contact: Contact) {
   router.push({ name: 'chat-conversation', params: { contactId: contact.id } })
 }
 
+function getAddress(contact: Contact) {
+  return contactAddressDisplay(contact)
+}
+
+// Contacts that message with a WhatsApp username arrive without a phone
+// number, so never fall back to a blank name (or a raw "bsuid:" placeholder).
 function getDisplayName(contact: Contact): string {
-  return contact.profile_name || contact.name || contact.phone_number
+  return contactDisplayName(contact)
 }
 </script>
 
@@ -211,7 +218,17 @@ function getDisplayName(contact: Contact): string {
                   </div>
                 </template>
                 <template #cell-phone_number="{ item: contact }">
-                  <code class="text-sm">{{ contact.phone_number }}</code>
+                  <code v-if="getAddress(contact).kind === 'phone'" class="text-sm">{{ contact.phone_number }}</code>
+                  <Badge
+                    v-else
+                    variant="outline"
+                    class="text-xs font-normal text-muted-foreground"
+                    data-testid="contact-phone-missing"
+                    :title="getAddress(contact).hint || undefined"
+                  >
+                    {{ getAddress(contact).text }}
+                    <span v-if="getAddress(contact).hint" class="sr-only" data-testid="contact-phone-missing-hint">{{ getAddress(contact).hint }}</span>
+                  </Badge>
                 </template>
                 <template #cell-tags="{ item: contact }">
                   <div class="flex flex-wrap gap-1">

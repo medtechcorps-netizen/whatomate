@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -15,6 +16,21 @@ import (
 // a merge changed the redirect chain between the initial read and the
 // deterministic row-lock acquisition.
 var ErrCanonicalContactChanged = errors.New("canonical contact changed while acquiring locks")
+
+// ErrEmptyPhoneNumber rejects a contact lookup/create whose phone number is
+// empty after normalization ("" or "+"). Contacts are unique per
+// (organization, phone_number), so an empty phone would make every such
+// caller share one contact row. Callers that only know a WhatsApp
+// business-scoped user ID must resolve the contact by that identity instead.
+var ErrEmptyPhoneNumber = errors.New("contact phone number is empty")
+
+// IsEmptyPhone reports whether phoneNumber is empty once surrounding
+// whitespace and one leading "+" are removed. GetOrCreateContact rejects such
+// values with ErrEmptyPhoneNumber; request handlers use this to reject them
+// with a validation error before any write.
+func IsEmptyPhone(phoneNumber string) bool {
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(phoneNumber), "+")) == ""
+}
 
 // ResolveCanonicalContact follows a soft-deleted merge alias to its active
 // canonical contact. A bounded traversal rejects corrupt cycles.
@@ -153,12 +169,16 @@ func contactMergePath(
 //   - Handles race conditions on create by re-fetching
 //   - Restores soft-deleted contacts if found
 //
-// Returns the contact, whether it was newly created, and any error.
+// Returns the contact, whether it was newly created, and any error. A phone
+// that is empty after normalization returns ErrEmptyPhoneNumber.
 func GetOrCreateContact(db *gorm.DB, orgID uuid.UUID, phoneNumber, profileName string) (*models.Contact, bool, error) {
 	// Normalize phone number (remove + prefix if present)
 	normalizedPhone := phoneNumber
 	if len(normalizedPhone) > 0 && normalizedPhone[0] == '+' {
 		normalizedPhone = normalizedPhone[1:]
+	}
+	if IsEmptyPhone(normalizedPhone) {
+		return nil, false, ErrEmptyPhoneNumber
 	}
 
 	// Try to find existing contact with normalized phone (including soft-deleted)
@@ -179,12 +199,17 @@ func GetOrCreateContact(db *gorm.DB, orgID uuid.UUID, phoneNumber, profileName s
 				}
 				return canonical, false, nil
 			}
-			db.Unscoped().Model(&contact).Update("deleted_at", nil)
+			if err := db.Unscoped().Model(&contact).Update("deleted_at", nil).Error; err != nil {
+				return nil, false, err
+			}
 			contact.DeletedAt.Valid = false
 		}
 		// Update profile name if changed
 		if profileName != "" && contact.ProfileName != profileName {
-			db.Model(&contact).Update("profile_name", profileName)
+			if err := db.Model(&contact).Update("profile_name", profileName).Error; err != nil {
+				return nil, false, err
+			}
+			contact.ProfileName = profileName
 		}
 		return &contact, false, nil
 	}
@@ -206,11 +231,16 @@ func GetOrCreateContact(db *gorm.DB, orgID uuid.UUID, phoneNumber, profileName s
 				}
 				return canonical, false, nil
 			}
-			db.Unscoped().Model(&contact).Update("deleted_at", nil)
+			if err := db.Unscoped().Model(&contact).Update("deleted_at", nil).Error; err != nil {
+				return nil, false, err
+			}
 			contact.DeletedAt.Valid = false
 		}
 		if profileName != "" && contact.ProfileName != profileName {
-			db.Model(&contact).Update("profile_name", profileName)
+			if err := db.Model(&contact).Update("profile_name", profileName).Error; err != nil {
+				return nil, false, err
+			}
+			contact.ProfileName = profileName
 		}
 		return &contact, false, nil
 	}
@@ -234,7 +264,9 @@ func GetOrCreateContact(db *gorm.DB, orgID uuid.UUID, phoneNumber, profileName s
 					}
 					return canonical, false, nil
 				}
-				db.Unscoped().Model(&contact).Update("deleted_at", nil)
+				if restoreErr := db.Unscoped().Model(&contact).Update("deleted_at", nil).Error; restoreErr != nil {
+					return nil, false, restoreErr
+				}
 				contact.DeletedAt.Valid = false
 			}
 			return &contact, false, nil

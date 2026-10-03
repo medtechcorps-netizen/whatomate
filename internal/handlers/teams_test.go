@@ -577,3 +577,68 @@ func TestApp_RemoveTeamMember_NotFound(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))
 }
+
+// --- Cross-organization membership ---
+
+// AddTeamMember deliberately keeps the home-org lookup: the team
+// auto-assigner does not re-check organization membership, so a cross-org
+// member in a team would keep receiving transfers after being removed.
+func TestApp_AddTeamMember_CrossOrgMemberStaysHomeOrgOnly(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	workOrg := testutil.CreateTestOrganization(t, app.DB)
+	admin := createAdminUser(t, app, workOrg.ID)
+	team := createTeam(t, app, workOrg.ID, "Cross Org Team")
+
+	// Home org A, direct membership in org B.
+	member := testutil.CreateTestUser(t, app.DB, homeOrg.ID, testutil.WithFullName("Cross Org Member"))
+	addDirectOrgMembership(t, app, member.ID, workOrg.ID, nil)
+
+	req := testutil.NewJSONRequest(t, handlers.TeamMemberRequest{
+		UserID: member.ID.String(),
+		Role:   models.TeamRoleAgent,
+	})
+	testutil.SetAuthContext(req, workOrg.ID, admin.ID)
+	testutil.SetPathParam(req, "id", team.ID.String())
+
+	require.NoError(t, app.AddTeamMember(req))
+	assertNotFoundMessage(t, req, "User not found")
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.TeamMember{}).Where("team_id = ?", team.ID).Count(&count).Error)
+	assert.Zero(t, count)
+}
+
+func TestApp_AddTeamMember_RejectsNonMemberAndSuspendedResellerMembership(t *testing.T) {
+	t.Parallel()
+
+	app := newTestApp(t)
+	reseller := testutil.CreateTestReseller(t, app.DB)
+	homeOrg := testutil.CreateTestOrganization(t, app.DB)
+	clinicOrg := testutil.CreateTestOrganizationForReseller(t, app.DB, reseller.ID)
+	admin := createAdminUser(t, app, clinicOrg.ID)
+	team := createTeam(t, app, clinicOrg.ID, "Reseller Team")
+
+	outsider := testutil.CreateTestUser(t, app.DB, homeOrg.ID)
+	resellerAdmin := testutil.CreateTestUser(t, app.DB, homeOrg.ID)
+	addResellerDerivedMembership(t, app, resellerAdmin.ID, reseller, clinicOrg.ID, nil)
+	suspendTestReseller(t, app, reseller.ID)
+
+	for _, candidate := range []uuid.UUID{outsider.ID, resellerAdmin.ID} {
+		req := testutil.NewJSONRequest(t, handlers.TeamMemberRequest{
+			UserID: candidate.String(),
+			Role:   models.TeamRoleAgent,
+		})
+		testutil.SetAuthContext(req, clinicOrg.ID, admin.ID)
+		testutil.SetPathParam(req, "id", team.ID.String())
+
+		require.NoError(t, app.AddTeamMember(req))
+		assertNotFoundMessage(t, req, "User not found")
+	}
+
+	var count int64
+	require.NoError(t, app.DB.Model(&models.TeamMember{}).Where("team_id = ?", team.ID).Count(&count).Error)
+	assert.Zero(t, count)
+}

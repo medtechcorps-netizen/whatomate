@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/booking"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
 	"github.com/shridarpatil/whatomate/internal/database"
@@ -47,6 +48,7 @@ type channelAIReplySnapshot struct {
 	APIKey              string
 	BaseURL             string
 	MaxTokens           int
+	BookingGeneration   string
 }
 
 type channelAIReplyCheck struct {
@@ -392,20 +394,30 @@ func (w *Worker) processChannelAIReplyJob(
 				baseURL = check.Snapshot.BaseURL
 			}
 			attempted = true
-			response, providerErr = qwenapi.Generate(
-				attemptCtx,
-				w.QwenHTTP,
-				qwenapi.Options{
-					APIKey:      check.Snapshot.APIKey,
-					BaseURL:     baseURL,
-					Model:       check.Snapshot.Settings.AI.Model,
-					MaxTokens:   check.Snapshot.MaxTokens,
-					Temperature: check.Snapshot.Settings.AI.Temperature,
-					Messages:    check.Snapshot.Messages,
-				},
-			)
+			// Exact server-issued confirmations and explicit staff/urgent
+			// requests are local control input, not a model authorization.
+			if local, ok := channelAIBookingLocalResponse(check.Snapshot); ok {
+				response = local
+			} else {
+				response, providerErr = qwenapi.Generate(
+					attemptCtx,
+					w.QwenHTTP,
+					qwenapi.Options{
+						APIKey:      check.Snapshot.APIKey,
+						BaseURL:     baseURL,
+						Model:       check.Snapshot.Settings.AI.Model,
+						MaxTokens:   check.Snapshot.MaxTokens,
+						Temperature: check.Snapshot.Settings.AI.Temperature,
+						Messages:    check.Snapshot.Messages,
+					},
+				)
+			}
 			if providerErr == nil {
-				response, providerErr = normalizeChannelAIReply(response)
+				if check.Snapshot.BookingGeneration != "" {
+					response = normalizeChannelAIBookingResponse(response)
+				} else {
+					response, providerErr = normalizeChannelAIReply(response)
+				}
 			}
 			attemptRecordErr = w.persistChannelAIReplyProviderAttemptResult(
 				organizationID,
@@ -856,6 +868,9 @@ func (w *Worker) authorizeChannelAIReplyGenerationWithFence(
 		now := time.Now().UTC()
 		payload := cloneChannelAIReplyPayload(job.Payload)
 		payload["provider_attempt_state"] = "started"
+		// Freeze capability even when OFF. A later enable must not reinterpret
+		// an ordinary text result as a booking command.
+		payload[channelAIBookingGenerationKey] = check.Snapshot.BookingGeneration
 		delete(payload, "provider_result")
 		delete(payload, "provider_result_sha256")
 		delete(payload, channelAIManagedGenerationDigestKey)
@@ -1304,6 +1319,17 @@ func (w *Worker) checkChannelAIReplyEligibility(
 	check.Snapshot.APIKey = apiKey
 	check.Snapshot.BaseURL = settings.AI.BaseURL
 	check.Snapshot.MaxTokens = maxTokens
+	bookingGeneration, bookingErr := channelAIBookingGeneration(check.Snapshot)
+	if bookingErr != nil {
+		return check, bookingErr
+	}
+	check.Snapshot.BookingGeneration = bookingGeneration
+	if suppressed, suppressErr := channelAIBookingInboundSuppressed(tx, &contact, &conversation, &inbound); suppressErr != nil {
+		return check, suppressErr
+	} else if suppressed {
+		check.CancelReason = "automatic_ai_inbound_suppressed"
+		return check, nil
+	}
 	if buildPrompt {
 		messages, promptErr := buildChannelAIReplyMessages(
 			tx,
@@ -1409,6 +1435,11 @@ func buildChannelAIReplyMessages(
 		"Reply directly to the customer in plain text only. Do not return JSON, Markdown, code fences, tool calls, analysis, or internal notes. Keep the reply concise.",
 		channelAISocialSafetySuffix,
 	)
+	if _, enabled := models.AIBookingAuthorityForInbound(&account, inbound.EffectiveIngestedAt()); enabled {
+		// The strict envelope only classifies preferences. Slot IDs, capacity,
+		// confirmation and clinical/handoff decisions remain server-owned.
+		systemParts[len(systemParts)-2] = booking.IntentInstructions
+	}
 
 	messages := []qwenapi.Message{{
 		Role:    "system",
@@ -1561,8 +1592,23 @@ func (w *Worker) finalizeChannelAIReply(
 		}
 
 		snapshot := check.Snapshot
+		if !channelAIBookingGenerationMatches(&job, snapshot) {
+			return settleChannelAIReplyJobTx(tx, organizationID, job.ID, workerID,
+				models.ScheduledJobStatusCancelled, "ai_booking_authority_changed")
+		}
 		idempotencyKey := models.ChannelAIReplyIdempotencyKey(snapshot.Inbound.ID)
 		messageID := channelAIReplyMessageID(idempotencyKey)
+		bookingResult, err := w.prepareChannelAIBookingTx(tx, &snapshot, messageID, response)
+		if err != nil {
+			return err
+		}
+		if bookingResult.SettleOnly {
+			// A durable human handoff or exact booking replay needs no second
+			// bot send. Never disguise it as a staff message to bypass policy.
+			return settleChannelAIReplyJobTx(tx, organizationID, job.ID, workerID,
+				models.ScheduledJobStatusCompleted, bookingResult.Reason)
+		}
+		response = bookingResult.Response
 		now := time.Now().UTC()
 		frozenServiceWindowEndsAt := snapshot.ServiceWindowEndsAt.UTC()
 		parts := []channelapi.MessagePart{{
@@ -1599,6 +1645,9 @@ func (w *Worker) finalizeChannelAIReply(
 				"scheduled_job_id":   job.ID,
 			},
 		}
+		for key, value := range bookingResult.Metadata {
+			outbound.Metadata[key] = value
+		}
 		payload, digest, err := channelAIReplyOutboxPayload(outbound)
 		if err != nil {
 			return err
@@ -1628,6 +1677,9 @@ func (w *Worker) finalizeChannelAIReply(
 				"inbound_message_id": snapshot.Inbound.ID.String(),
 				"scheduled_job_id":   job.ID.String(),
 			},
+		}
+		for key, value := range bookingResult.Metadata {
+			message.Metadata[key] = value
 		}
 		messageParts := []models.MessagePart{{
 			BaseModel: models.BaseModel{

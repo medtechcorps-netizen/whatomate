@@ -1692,6 +1692,25 @@ func TestPlatformComplianceStartupVerificationRejectsContractDrift(t *testing.T)
 	})
 }
 
+func removeMessageCursorRolloutForExactSourceParent(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.Exec(`
+		DROP TRIGGER trg_messages_ingestion_order ON public.messages;
+		DROP TRIGGER trg_messages_cleanup_read_cursors ON public.messages;
+		DROP TRIGGER trg_conversation_reads_ingestion_order ON public.conversation_reads;
+		DROP INDEX public.idx_messages_org_inbox_ingested;
+		DROP INDEX public.idx_messages_org_inbox_ingested_highwater;
+		DROP INDEX public.idx_messages_org_contact_ingested;
+		DROP INDEX public.idx_messages_org_contact_account_ingested;
+		DROP INDEX public.idx_messages_org_inbox_incoming_ingested;
+		DROP FUNCTION public.rereply_set_message_ingestion_order();
+		DROP FUNCTION public.rereply_set_conversation_read_ingestion_order();
+		DROP FUNCTION public.rereply_cleanup_deleted_message_read_cursors();
+		ALTER TABLE public.conversation_reads DROP COLUMN last_read_ingested_at;
+		ALTER TABLE public.messages DROP COLUMN ingested_at
+	`).Error)
+}
+
 func TestPlatformComplianceStartupVerificationAcceptsOnlyExactIdentityReviewRolloutProfiles(t *testing.T) {
 	db, runtimeRole := setupPlatformComplianceGuardTest(t)
 	verifyCompatibility := func(tx *gorm.DB) error {
@@ -1768,6 +1787,67 @@ func TestPlatformComplianceStartupVerificationAcceptsOnlyExactIdentityReviewRoll
 			)
 		})
 	}
+
+	t.Run("exact source-parent pre-cursor profile is baseline-only", func(t *testing.T) {
+		parentDB, _, _, parentRuntimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
+		require.NoError(t, database.ApplyTenantRLS(parentDB, parentRuntimeRole))
+		dropIdentityReviewOldCoreTriggers(t, parentDB)
+		require.NoError(t, parentDB.Exec(
+			"DROP FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1()",
+		).Error)
+		dropPreAdditiveIdentityReviewRelations(t, parentDB)
+		removeMessageCursorRolloutForExactSourceParent(t, parentDB)
+
+		bridgeBackfillCalls := 0
+		bridgeVerificationCalls := 0
+		err := database.RunRLSMigrationCoordinatorForTest(
+			parentDB,
+			&config.DefaultAdminConfig{},
+			parentRuntimeRole,
+			"bridge",
+			func(*gorm.DB) error {
+				bridgeBackfillCalls++
+				return nil
+			},
+			func() error {
+				bridgeVerificationCalls++
+				return nil
+			},
+		)
+		require.ErrorContains(t, err, "bridge migration requires the exact legacy message-cursor profile")
+		assert.Zero(t, bridgeBackfillCalls)
+		assert.Zero(t, bridgeVerificationCalls)
+		assert.False(t, parentDB.Migrator().HasColumn(&models.Message{}, "IngestedAt"),
+			"a rejected bridge must not mutate the exact source-parent catalog")
+		assert.False(t, parentDB.Migrator().HasColumn(&models.ConversationRead{}, "LastReadIngestedAt"),
+			"a rejected bridge must not mutate the exact source-parent catalog")
+
+		baselineBackfillCalls := 0
+		baselineVerificationCalls := 0
+		require.NoError(t, database.RunRLSMigrationCoordinatorForTest(
+			parentDB,
+			&config.DefaultAdminConfig{},
+			parentRuntimeRole,
+			"baseline",
+			func(*gorm.DB) error {
+				baselineBackfillCalls++
+				return nil
+			},
+			func() error {
+				baselineVerificationCalls++
+				return database.VerifyPlatformComplianceIdentityReviewCompatibilityForTest(
+					parentDB,
+					parentRuntimeRole,
+				)
+			},
+		))
+		assert.Equal(t, 1, baselineBackfillCalls)
+		assert.Equal(t, 1, baselineVerificationCalls)
+		assert.True(t, parentDB.Migrator().HasColumn(&models.Message{}, "IngestedAt"))
+		assert.True(t, parentDB.Migrator().HasColumn(&models.ConversationRead{}, "LastReadIngestedAt"))
+		require.Empty(t, identityReviewOldCoreTriggerBindings(t, parentDB),
+			"the baseline must install cursor authority without publishing future identity-review triggers")
+	})
 }
 
 func TestBaselineRLSMigrationOnFutureProfileIsReadOnlyAndRepeatable(t *testing.T) {

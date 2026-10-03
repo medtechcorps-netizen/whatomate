@@ -27,6 +27,7 @@ import {
   Inbox,
   ListTodo,
   CalendarDays,
+  CalendarCheck,
   Package,
   LockKeyhole,
   LifeBuoy,
@@ -53,7 +54,34 @@ export interface NavSection {
   items: NavItem[]
   /** Pin to bottom of sidebar */
   pinBottom?: boolean
+  /** Stable id for sections that need DOM ids or remembered UI state */
+  id?: string
+  /**
+   * Show an open/close toggle on the full desktop sidebar. Closed by default
+   * and opened automatically while one of its pages (or a page under
+   * `autoOpenPathPrefixes`) is open. The collapsed
+   * icon rail always shows every item.
+   */
+  collapsible?: boolean
+  /**
+   * A collapsible section also opens by itself on any page under these paths.
+   * "More tools" uses it for Settings, because Accounts, Canned Responses,
+   * Tags and Teams are Settings pages that staff expect to see there.
+   */
+  autoOpenPathPrefixes?: string[]
 }
+
+/** Section id of the collapsible "More tools" group. */
+export const MORE_TOOLS_SECTION_ID = 'more-tools'
+
+/** localStorage key that remembers whether "More tools" was left open. */
+export const MORE_TOOLS_STORAGE_KEY = 'rereply.nav.moreToolsOpen'
+
+/**
+ * Anyone who can see one CRM report area can open CRM Insights. "Today" uses
+ * the same gate because it summarises those same areas.
+ */
+const CRM_INSIGHTS_PERMISSIONS = ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'] as const
 
 export const navigationSections: NavSection[] = [
   {
@@ -68,19 +96,15 @@ export const navigationSections: NavSection[] = [
     ]
   },
   {
-    label: 'nav.sectionMain',
+    // Everyday clinic work: replies, leads, follow-ups, bookings and payments.
+    label: 'nav.sectionDailyWork',
     items: [
       {
-        name: 'nav.launchpad',
-        path: '/launchpad',
-        icon: Rocket,
-        permission: 'onboarding'
-      },
-      {
-        name: 'nav.dashboard',
-        path: '/',
-        icon: LayoutDashboard,
-        permission: 'analytics'
+        name: 'nav.today',
+        path: '/today',
+        icon: CalendarCheck,
+        anyPermissions: [...CRM_INSIGHTS_PERMISSIONS],
+        entitlement: 'crm.enabled'
       },
       {
         name: 'nav.omnichannel',
@@ -97,29 +121,6 @@ export const navigationSections: NavSection[] = [
         permission: 'chat'
       },
       {
-        name: 'nav.contacts',
-        path: '/settings/contacts',
-        icon: Contact,
-        permission: 'contacts'
-      },
-      {
-        name: 'nav.tags',
-        path: '/settings/tags',
-        icon: Tags,
-        permission: 'tags'
-      },
-      {
-        name: 'nav.teams',
-        path: '/settings/teams',
-        icon: Users,
-        permission: 'teams'
-      },
-    ]
-  },
-  {
-    label: 'nav.sectionGrowth',
-    items: [
-      {
         name: 'nav.pipeline',
         path: '/crm/pipeline',
         icon: Workflow,
@@ -132,20 +133,6 @@ export const navigationSections: NavSection[] = [
         path: '/crm/tasks',
         icon: ListTodo,
         permission: 'tasks',
-        entitlement: 'crm.enabled'
-      },
-      {
-        name: 'nav.crmInsights',
-        path: '/crm/insights',
-        icon: LineChart,
-        anyPermissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'],
-        entitlement: 'crm.enabled'
-      },
-      {
-        name: 'nav.automations',
-        path: '/crm/automations',
-        icon: Zap,
-        permission: 'crm.automations',
         entitlement: 'crm.enabled'
       },
       {
@@ -164,17 +151,77 @@ export const navigationSections: NavSection[] = [
         entitlement: 'commerce.enabled'
       },
       {
+        name: 'nav.contacts',
+        path: '/settings/contacts',
+        icon: Contact,
+        permission: 'contacts'
+      }
+    ]
+  },
+  {
+    label: 'nav.sectionReports',
+    items: [
+      {
+        name: 'nav.dashboard',
+        path: '/',
+        icon: LayoutDashboard,
+        permission: 'analytics'
+      },
+      {
+        name: 'nav.crmInsights',
+        path: '/crm/insights',
+        icon: LineChart,
+        anyPermissions: [...CRM_INSIGHTS_PERMISSIONS],
+        entitlement: 'crm.enabled'
+      },
+      {
+        name: 'nav.agentAnalytics',
+        path: '/analytics/agents',
+        icon: BarChart3,
+        permission: 'analytics.agents'
+      },
+      {
+        name: 'nav.metaInsights',
+        path: '/analytics/meta-insights',
+        icon: LineChart,
+        permission: 'analytics'
+      },
+      {
+        name: 'nav.searchVisibility',
+        path: '/analytics/search-visibility',
+        icon: Search,
+        permission: 'analytics'
+      }
+    ]
+  },
+  {
+    // Setup and occasional tools. Collapsed by default on the full sidebar so
+    // daily work stays short; every destination is still one click away.
+    id: MORE_TOOLS_SECTION_ID,
+    label: 'nav.sectionMoreTools',
+    collapsible: true,
+    autoOpenPathPrefixes: ['/settings'],
+    items: [
+      {
+        name: 'nav.launchpad',
+        path: '/launchpad',
+        icon: Rocket,
+        permission: 'onboarding'
+      },
+      {
+        name: 'nav.automations',
+        path: '/crm/automations',
+        icon: Zap,
+        permission: 'crm.automations',
+        entitlement: 'crm.enabled'
+      },
+      {
         name: 'nav.copilot',
         path: '/copilot',
         icon: Sparkles,
         permission: 'copilot',
         entitlement: 'copilot.enabled'
-      }
-    ]
-  },
-  {
-    label: 'nav.sectionMessaging',
-    items: [
+      },
       {
         name: 'nav.accounts',
         path: '/settings/accounts',
@@ -218,37 +265,21 @@ export const navigationSections: NavSection[] = [
         icon: Workflow,
         permission: 'flows.whatsapp'
       },
-    ]
-  },
-  {
-    label: 'nav.sectionCalling',
-    items: [
+      {
+        name: 'nav.tags',
+        path: '/settings/tags',
+        icon: Tags,
+        permission: 'tags'
+      },
+      {
+        name: 'nav.teams',
+        path: '/settings/teams',
+        icon: Users,
+        permission: 'teams'
+      },
       { name: 'nav.callLogs', path: '/calling/logs', icon: PhoneCall, permission: 'call_logs' },
       { name: 'nav.ivrFlows', path: '/calling/ivr-flows', icon: Workflow, permission: 'ivr_flows' },
-      { name: 'nav.callTransfers', path: '/calling/transfers', icon: PhoneForwarded, permission: 'call_transfers' },
-    ]
-  },
-  {
-    label: 'nav.sectionAnalytics',
-    items: [
-      {
-        name: 'nav.agentAnalytics',
-        path: '/analytics/agents',
-        icon: BarChart3,
-        permission: 'analytics.agents'
-      },
-      {
-        name: 'nav.metaInsights',
-        path: '/analytics/meta-insights',
-        icon: LineChart,
-        permission: 'analytics'
-      },
-      {
-        name: 'nav.searchVisibility',
-        path: '/analytics/search-visibility',
-        icon: Search,
-        permission: 'analytics'
-      },
+      { name: 'nav.callTransfers', path: '/calling/transfers', icon: PhoneForwarded, permission: 'call_transfers' }
     ]
   },
   {

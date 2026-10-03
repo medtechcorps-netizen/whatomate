@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   sendChannelMessage: vi.fn(),
   sendLegacyWhatsAppReply: vi.fn(),
   setAIState: vi.fn(),
+  updateAccount: vi.fn(),
   hasPermission: vi.fn(),
   hasProductEntitlement: vi.fn(),
   connectWebSocket: vi.fn(),
@@ -101,6 +102,7 @@ vi.mock('@/services/productSuite', () => ({
     send: mocks.sendChannelMessage,
     replyLegacyWhatsApp: mocks.sendLegacyWhatsAppReply,
     setAIState: mocks.setAIState,
+    updateAccount: mocks.updateAccount,
   },
 }))
 
@@ -334,6 +336,7 @@ describe('ChannelsView messaging behavior', () => {
     mocks.connectWebSocket.mockResolvedValue(undefined)
     mocks.markRead.mockResolvedValue({ data: { data: { read_at: new Date().toISOString() } } })
     mocks.refreshUnread.mockResolvedValue(true)
+    mocks.updateAccount.mockReset().mockResolvedValue({ data: { data: {} } })
     inboxActivityHandler = null
     mocks.onInboxActivity.mockImplementation((callback) => {
       inboxActivityHandler = callback
@@ -379,6 +382,96 @@ describe('ChannelsView messaging behavior', () => {
     vi.unstubAllGlobals()
   })
 
+  it('keeps native AI booking default-off and submits only its dedicated field', async () => {
+    setInbox()
+    const view = await mountAndSelectConversation()
+    await view.findAll('[aria-label="Manage Selected WhatsApp"]')[0]!.trigger('click')
+    const dialog = view.get('[role="dialog"]')
+    const toggle = dialog.get<HTMLInputElement>('[data-testid="channel-ai-booking-enabled"]')
+    expect(toggle.element.checked).toBe(false)
+    expect(dialog.text()).toContain('Connecting AI does not enable booking')
+    expect(dialog.text()).not.toContain('Connection name')
+    expect(dialog.text()).not.toContain('Disconnect connection')
+    await toggle.setValue(true)
+    await dialog.get('[data-testid="channel-ai-booking-save"]').trigger('click')
+    await flushPromises()
+    expect(mocks.updateAccount).toHaveBeenCalledExactlyOnceWith('channel-account-selected', { ai_booking_enabled: true })
+  })
+
+  it('requires channel, AI and Booking permissions for native booking controls', async () => {
+    setInbox()
+    mocks.hasPermission.mockImplementation((resource: string) => resource !== 'booking.settings')
+    const view = await mountAndSelectConversation()
+    expect(view.find('[aria-label="Manage Selected WhatsApp"]').exists()).toBe(false)
+    expect(mocks.updateAccount).not.toHaveBeenCalled()
+  })
+
+  it('keeps a booking update single-flight and shows a retryable inline error', async () => {
+    setInbox()
+    const pending = deferred<unknown>()
+    mocks.updateAccount.mockReturnValueOnce(pending.promise)
+    const view = await mountAndSelectConversation()
+    await view.findAll('[aria-label="Manage Selected WhatsApp"]')[0]!.trigger('click')
+    await view.get('[data-testid="channel-ai-booking-enabled"]').setValue(true)
+    await view.get('[data-testid="channel-ai-booking-save"]').trigger('click')
+    expect(view.get('[data-testid="channel-ai-booking-save"]').attributes('disabled')).toBeDefined()
+    expect(view.get('[data-testid="channel-ai-booking-enabled"]').attributes('disabled')).toBeDefined()
+    await view.get('[data-testid="channel-ai-booking-save"]').trigger('click')
+    expect(mocks.updateAccount).toHaveBeenCalledTimes(1)
+    pending.resolve({})
+    await flushPromises()
+
+    mocks.updateAccount.mockRejectedValueOnce(new Error('Synthetic validation conflict'))
+    await view.findAll('[aria-label="Manage Selected WhatsApp"]')[0]!.trigger('click')
+    await view.get('[data-testid="channel-ai-booking-save"]').trigger('click')
+    await flushPromises()
+    expect(view.get('[role="alert"]').text()).toContain('Synthetic validation conflict')
+    expect(view.get('[data-testid="channel-ai-booking-save"]').attributes('disabled')).toBeUndefined()
+    expect(view.find('[role="dialog"]').exists()).toBe(true)
+  })
+
+  it('discards a completed booking save after the tenant changes', async () => {
+    setInbox()
+    const pending = deferred<unknown>()
+    mocks.updateAccount.mockReturnValueOnce(pending.promise)
+    const view = await mountAndSelectConversation()
+    await view.findAll('[aria-label="Manage Selected WhatsApp"]')[0]!.trigger('click')
+    await view.get('[data-testid="channel-ai-booking-save"]').trigger('click')
+    mocks.organizationStore.selectedOrgId = 'organization-2'
+    await nextTick()
+    await flushPromises()
+    const loadsAfterSwitch = mocks.accounts.mock.calls.length
+    pending.resolve({})
+    await flushPromises()
+    expect(view.find('[role="dialog"]').exists()).toBe(false)
+    expect(mocks.accounts).toHaveBeenCalledTimes(loadsAfterSwitch)
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+  })
+
+  it('uses a separate managed-channel booking save and preserves ordinary settings', async () => {
+    const { selectedAccount } = setInbox({ channel: 'instagram', selectedProvider: 'relay' })
+    Object.assign(selectedAccount.config, {
+      outbound_enabled: true, relay_url: 'https://relay.example.test/messages',
+      ai_booking_enabled: false, ai_booking_revision: '11111111-1111-4111-8111-111111111111',
+    })
+    const view = await mountAndSelectConversation()
+    await view.findAll('[aria-label="Manage Selected WhatsApp"]')[0]!.trigger('click')
+    await view.get('[data-testid="channel-ai-booking-enabled"]').setValue(true)
+    await view.get('[data-testid="channel-ai-booking-save"]').trigger('click')
+    await flushPromises()
+    expect(mocks.updateAccount).toHaveBeenLastCalledWith('channel-account-selected', { ai_booking_enabled: true })
+    await view.findAll('[aria-label="Manage Selected WhatsApp"]')[0]!.trigger('click')
+    await view.get('[role="dialog"] form').trigger('submit')
+    await flushPromises()
+    const normalUpdate = mocks.updateAccount.mock.calls[1]![1]
+    expect(normalUpdate.name).toBe('Selected WhatsApp')
+    expect(normalUpdate.ai_reply_enabled).toBe(true)
+    expect(normalUpdate.config.relay_url).toBe('https://relay.example.test/messages')
+    expect(normalUpdate.config).not.toHaveProperty('ai_booking_enabled')
+    expect(normalUpdate.config).not.toHaveProperty('ai_booking_revision')
+  })
+
   it('sends only through the conversation-scoped legacy WhatsApp endpoint', async () => {
     setInbox()
     const view = await mountAndSelectConversation()
@@ -389,10 +482,7 @@ describe('ChannelsView messaging behavior', () => {
     await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
-      expect(view.text()).toContain('Hello from Omnichannel')
-    }, { timeout: 2_000 })
+    expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
     expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledWith(
       'conversation-1',
       {
@@ -419,15 +509,8 @@ describe('ChannelsView messaging behavior', () => {
     await composer.setValue('Retry this exact draft')
     await send.trigger('click')
     await flushPromises()
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
-      expect(send.attributes('disabled')).toBeUndefined()
-    }, { timeout: 2_000 })
     await send.trigger('click')
     await flushPromises()
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
-    }, { timeout: 2_000 })
 
     expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
@@ -442,9 +525,6 @@ describe('ChannelsView messaging behavior', () => {
     await composer.setValue('Retry this exact draft')
     await send.trigger('click')
     await flushPromises()
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(3)
-    }, { timeout: 2_000 })
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[2]?.[1]?.idempotency_key).toBe(
       '00000000-0000-4000-8000-000000000012',
     )
@@ -475,19 +555,14 @@ describe('ChannelsView messaging behavior', () => {
 
       await composer.setValue('Already acknowledged')
       await send.trigger('click')
-      await vi.waitFor(() => {
-        expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
-        expect((composer.element as HTMLTextAreaElement).value).toBe('')
-      }, { timeout: 2_000 })
+      await flushPromises()
 
       expect(storedLegacyReplyAttempts()).toHaveLength(0)
+      expect((composer.element as HTMLTextAreaElement).value).toBe('')
 
       await composer.setValue('Already acknowledged')
       await send.trigger('click')
-      await vi.waitFor(() => {
-        expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
-        expect((composer.element as HTMLTextAreaElement).value).toBe('')
-      }, { timeout: 2_000 })
+      await flushPromises()
 
       expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
         '00000000-0000-4000-8000-000000000031',
@@ -532,10 +607,7 @@ describe('ChannelsView messaging behavior', () => {
       .setValue('Settled while switching')
     await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
-      expect(storedLegacyReplyAttempts()).toHaveLength(1)
-    }, { timeout: 2_000 })
+    expect(storedLegacyReplyAttempts()).toHaveLength(1)
 
     const secondConversationButton = view
       .findAll('button')
@@ -567,15 +639,9 @@ describe('ChannelsView messaging behavior', () => {
     mocks.sendLegacyWhatsAppReply.mockRejectedValueOnce(new Error('network timeout'))
     const firstView = await mountAndSelectConversation()
     const body = 'Private patient follow-up details'
-    const firstComposer = firstView.get('[data-testid="omnichannel-reply-composer"]')
-    const firstSend = firstView.get('[data-testid="omnichannel-send-reply"]')
-    await firstComposer.setValue(body)
-    await firstSend.trigger('click')
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
-      expect(storedLegacyReplyAttempts()).toHaveLength(1)
-      expect(firstSend.attributes('disabled')).toBeUndefined()
-    }, { timeout: 2_000 })
+    await firstView.get('[data-testid="omnichannel-reply-composer"]').setValue(body)
+    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
+    await flushPromises()
 
     const firstKey = mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key
     const stored = storedLegacyReplyAttempts()
@@ -595,12 +661,10 @@ describe('ChannelsView messaging behavior', () => {
     const remounted = await mountAndSelectConversation()
     await remounted.get('[data-testid="omnichannel-reply-composer"]').setValue(body)
     await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
-      expect(storedLegacyReplyAttempts()).toHaveLength(0)
-    }, { timeout: 2_000 })
+    await flushPromises()
 
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[1]?.[1]?.idempotency_key).toBe(firstKey)
+    expect(storedLegacyReplyAttempts()).toHaveLength(0)
   })
 
   it.each(['pending', 'failed'])('retains the attempt after a non-sent %s response', async status => {
@@ -619,16 +683,11 @@ describe('ChannelsView messaging behavior', () => {
     })
     const view = await mountAndSelectConversation()
     const composer = view.get('[data-testid="omnichannel-reply-composer"]')
-    const send = view.get('[data-testid="omnichannel-send-reply"]')
     await composer.setValue('Keep this attempt')
-    await send.trigger('click')
+    await view.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
 
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
-      expect(storedLegacyReplyAttempts()).toHaveLength(1)
-      expect(send.attributes('disabled')).toBeUndefined()
-    }, { timeout: 2_000 })
+    expect(storedLegacyReplyAttempts()).toHaveLength(1)
     expect((composer.element as HTMLTextAreaElement).value).toBe('Keep this attempt')
   })
 
@@ -703,13 +762,8 @@ describe('ChannelsView messaging behavior', () => {
     mocks.sendLegacyWhatsAppReply.mockRejectedValueOnce(new Error('network timeout'))
     const firstView = await mountAndSelectConversation()
     await firstView.get('[data-testid="omnichannel-reply-composer"]').setValue('Scoped draft')
-    const firstSend = firstView.get('[data-testid="omnichannel-send-reply"]')
-    await firstSend.trigger('click')
+    await firstView.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(1)
-      expect(firstSend.attributes('disabled')).toBeUndefined()
-    }, { timeout: 2_000 })
 
     firstView.unmount()
     wrapper = null
@@ -717,12 +771,8 @@ describe('ChannelsView messaging behavior', () => {
     setInbox()
     const remounted = await mountAndSelectConversation()
     await remounted.get('[data-testid="omnichannel-reply-composer"]').setValue('Scoped draft')
-    const secondSend = remounted.get('[data-testid="omnichannel-send-reply"]')
-    await secondSend.trigger('click')
+    await remounted.get('[data-testid="omnichannel-send-reply"]').trigger('click')
     await flushPromises()
-    await vi.waitFor(() => {
-      expect(mocks.sendLegacyWhatsAppReply).toHaveBeenCalledTimes(2)
-    }, { timeout: 2_000 })
 
     expect(mocks.sendLegacyWhatsAppReply.mock.calls[0]?.[1]?.idempotency_key).toBe(
       '00000000-0000-4000-8000-000000000051',

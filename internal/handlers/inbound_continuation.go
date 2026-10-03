@@ -57,6 +57,9 @@ type inboundContinuationExecution struct {
 	actionScope    string
 	actionIndex    int
 	attemptGuarded bool
+	// Booking commits session proposals independently before provider I/O.
+	// Its graph checkpoint must therefore not reuse an older outer snapshot.
+	nativeBookingCheckpoint bool
 }
 
 type inboundContinuationPolicyStop struct {
@@ -992,49 +995,48 @@ func (a *App) withInboundContinuationPhysicalAIAttempt(
 			); err != nil {
 				return &inboundContinuationPolicyStop{Reason: err.Error()}
 			}
-			policy, err := database.EvaluateContactAutomaticReplyPolicy(
-				guardTx,
-				execution.OrganizationID,
-				execution.ContactID,
-			)
-			if err != nil {
-				return &inboundContinuationPolicyStop{Reason: err.Error()}
+			if err := a.requireInboundContinuationPolicyTx(guardTx); err != nil {
+				return err
 			}
-			if !policy.Allowed {
-				return &inboundContinuationPolicyStop{Reason: policy.Reason}
-			}
-			// The work object can predate Pause followed by Resume. Current
-			// contact policy alone cannot revive that exact inbound message: its
-			// committed suppression is the durable cutoff authority. Read without
-			// a message lock so only the organization fence spans provider I/O.
-			var inbound models.Message
-			if err := guardTx.Select("id", "organization_id", "contact_id", "direction", "whats_app_message_id", "metadata").
-				Where("id = ? AND organization_id = ?", execution.MessageID, execution.OrganizationID).
-				First(&inbound).Error; err != nil {
-				return &inboundContinuationPolicyStop{Reason: "durable inbound message is unavailable"}
-			}
-			if inbound.ContactID != execution.ContactID || inbound.Direction != models.DirectionIncoming ||
-				inbound.WhatsAppMessageID != execution.WAMID || strings.TrimSpace(execution.WAMID) == "" {
-				return &inboundContinuationPolicyStop{Reason: "durable inbound message identity changed"}
-			}
-			if raw, exists := inbound.Metadata[incomingAutomaticAISuppressedKey]; exists {
-				suppressed, valid := raw.(bool)
-				if !valid || suppressed {
-					return &inboundContinuationPolicyStop{Reason: "durable inbound message is suppressed"}
-				}
-			}
-			if raw, exists := inbound.Metadata["inbound_continuation_completed"]; exists {
-				completed, valid := raw.(bool)
-				if !valid || completed {
-					return &inboundContinuationPolicyStop{Reason: "durable inbound message is already terminal"}
-				}
-			}
-
 			execution.attemptGuarded = true
 			defer func() { execution.attemptGuarded = false }()
 			return attempt()
 		},
 	)
+}
+
+// requireInboundContinuationPolicyTx shares the current-contact and sticky
+// inbound cutoff checks with local booking preparation. It never acquires a
+// new transaction or upgrades the caller's organization fence.
+func (a *App) requireInboundContinuationPolicyTx(tx *gorm.DB) error {
+	execution := a.inboundContinuation
+	if execution == nil || execution.OrganizationID == uuid.Nil || execution.ContactID == uuid.Nil || execution.MessageID == uuid.Nil {
+		return &inboundContinuationPolicyStop{Reason: "durable inbound identity is unavailable"}
+	}
+	policy, err := database.EvaluateContactAutomaticReplyPolicy(tx, execution.OrganizationID, execution.ContactID)
+	if err != nil {
+		return &inboundContinuationPolicyStop{Reason: err.Error()}
+	}
+	if !policy.Allowed {
+		return &inboundContinuationPolicyStop{Reason: policy.Reason}
+	}
+	var inbound models.Message
+	if err := tx.Where("id = ? AND organization_id = ?", execution.MessageID, execution.OrganizationID).First(&inbound).Error; err != nil {
+		return &inboundContinuationPolicyStop{Reason: "durable inbound message is unavailable"}
+	}
+	if inbound.ContactID != execution.ContactID || inbound.Direction != models.DirectionIncoming ||
+		inbound.WhatsAppMessageID != execution.WAMID || strings.TrimSpace(execution.WAMID) == "" {
+		return &inboundContinuationPolicyStop{Reason: "durable inbound message identity changed"}
+	}
+	for _, key := range []string{incomingAutomaticAISuppressedKey, "inbound_continuation_completed"} {
+		if raw, exists := inbound.Metadata[key]; exists {
+			stopped, valid := raw.(bool)
+			if !valid || stopped {
+				return &inboundContinuationPolicyStop{Reason: "durable inbound message is suppressed or terminal"}
+			}
+		}
+	}
+	return nil
 }
 
 func (a *App) nextInboundContinuationActionKey(

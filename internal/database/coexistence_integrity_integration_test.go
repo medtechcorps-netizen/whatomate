@@ -153,6 +153,131 @@ func setupIsolatedRLSMigrationTest(t *testing.T) (*gorm.DB, string) {
 	return db, runtimeRole
 }
 
+func setupPreAdditiveRLSMigrationTest(
+	t *testing.T,
+) (*gorm.DB, *gorm.DB, string) {
+	t.Helper()
+	db, isolatedAdminDB, _, runtimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
+	require.NoError(t, databasepkg.ApplyTenantRLS(db, runtimeRole))
+	dropIdentityReviewOldCoreTriggers(t, db)
+	require.NoError(t, db.Exec(
+		"DROP FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1()",
+	).Error)
+	dropPreAdditiveIdentityReviewRelations(t, db)
+	return db, isolatedAdminDB, runtimeRole
+}
+
+type migrationIndexLifecycleTestState struct {
+	OID        int64  `gorm:"column:index_oid"`
+	Definition string `gorm:"column:definition"`
+	Valid      bool   `gorm:"column:valid"`
+	Ready      bool   `gorm:"column:ready"`
+	Live       bool   `gorm:"column:live"`
+}
+
+func readMigrationIndexLifecycleTestState(
+	t *testing.T,
+	db *gorm.DB,
+	indexName string,
+) (migrationIndexLifecycleTestState, bool) {
+	t.Helper()
+	var state migrationIndexLifecycleTestState
+	result := db.Raw(`
+		SELECT index_state.indexrelid::bigint AS index_oid,
+			pg_catalog.pg_get_indexdef(index_state.indexrelid, 0, true) AS definition,
+			index_state.indisvalid AS valid,
+			index_state.indisready AS ready,
+			index_state.indislive AS live
+		FROM pg_catalog.pg_index AS index_state
+		WHERE index_state.indexrelid = pg_catalog.to_regclass(CAST(? AS text))
+	`, "public."+indexName).Scan(&state)
+	require.NoError(t, result.Error)
+	if result.RowsAffected == 0 {
+		return migrationIndexLifecycleTestState{}, false
+	}
+	require.EqualValues(t, 1, result.RowsAffected)
+	require.Positive(t, state.OID)
+	return state, true
+}
+
+func waitForMigrationIndexLifecycleTestState(
+	t *testing.T,
+	db *gorm.DB,
+	indexName string,
+	want func(migrationIndexLifecycleTestState, bool) bool,
+) migrationIndexLifecycleTestState {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		state, exists := readMigrationIndexLifecycleTestState(t, db, indexName)
+		if want(state, exists) {
+			return state
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("index %s did not reach the expected lifecycle state (exists=%t valid=%t ready=%t live=%t)",
+				indexName, exists, state.Valid, state.Ready, state.Live)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func leaveInterruptedConcurrentIndexBuildTestState(
+	t *testing.T,
+	db *gorm.DB,
+	observer *gorm.DB,
+	indexName string,
+	createSQL string,
+) migrationIndexLifecycleTestState {
+	t.Helper()
+	blocker := observer.Begin()
+	require.NoError(t, blocker.Error)
+	defer blocker.Rollback()
+	require.NoError(t, blocker.Exec(
+		"LOCK TABLE public.messages IN ROW EXCLUSIVE MODE",
+	).Error)
+
+	createContext, cancelCreate := context.WithCancel(context.Background())
+	defer cancelCreate()
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	createConn, err := sqlDB.Conn(context.Background())
+	require.NoError(t, err)
+	defer createConn.Close()
+	var createBackendPID int
+	require.NoError(t, createConn.QueryRowContext(
+		context.Background(), "SELECT pg_catalog.pg_backend_pid()",
+	).Scan(&createBackendPID))
+	createResult := make(chan error, 1)
+	go func() {
+		_, createErr := createConn.ExecContext(createContext, createSQL)
+		createResult <- createErr
+	}()
+	waitForMigrationIndexLifecycleTestState(t, observer, indexName,
+		func(state migrationIndexLifecycleTestState, exists bool) bool {
+			return exists && !state.Valid
+		})
+	testutil.RequirePostgresBackendWaitingForLock(t, observer, createBackendPID)
+	var canceled bool
+	require.NoError(t, observer.Raw(
+		"SELECT pg_catalog.pg_cancel_backend(?)", createBackendPID,
+	).Scan(&canceled).Error)
+	require.True(t, canceled, "PostgreSQL must accept cancellation of the blocked concurrent build")
+	select {
+	case createErr := <-createResult:
+		require.Error(t, createErr)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("canceled concurrent build for %s did not return", indexName)
+	}
+	// Keep the blocker until Exec confirms PostgreSQL processed the server-side
+	// cancellation; releasing it earlier races the publication commit against
+	// cancellation and can incorrectly leave a valid 111 index.
+	require.NoError(t, blocker.Rollback().Error)
+	return waitForMigrationIndexLifecycleTestState(t, observer, indexName,
+		func(state migrationIndexLifecycleTestState, exists bool) bool {
+			return exists && !state.Valid
+		})
+}
+
 func identityReviewOldCoreTriggerBindings(t *testing.T, db *gorm.DB) []string {
 	t.Helper()
 	var bindings []string
@@ -1129,7 +1254,8 @@ func TestWhatsAppIdentityReviewWAMIDMigrationNormalizesHistoricalOwnership(t *te
 }
 
 func TestBaselineRLSMigrationPreservesLegacyProfileAndIsIdempotent(t *testing.T) {
-	db, runtimeRole := setupIsolatedRLSMigrationTest(t)
+	db, isolatedAdminDB, _, runtimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
+	require.NoError(t, databasepkg.ApplyTenantRLS(db, runtimeRole))
 	dropIdentityReviewOldCoreTriggers(t, db)
 	require.NoError(t, db.Exec(
 		"DROP POLICY rereply_tenant_isolation ON public.whatsapp_coexistence_states",
@@ -1161,6 +1287,44 @@ func TestBaselineRLSMigrationPreservesLegacyProfileAndIsIdempotent(t *testing.T)
 		)
 	}
 
+	const retryIndexName = "idx_messages_org_inbox_ingested"
+	const exactRetryIndex = `CREATE INDEX CONCURRENTLY idx_messages_org_inbox_ingested
+		ON public.messages(organization_id, inbox_conversation_id, (COALESCE(ingested_at, created_at)), id)
+		WHERE inbox_conversation_id IS NOT NULL AND deleted_at IS NULL`
+	require.NoError(t, db.Exec("DROP INDEX CONCURRENTLY public."+retryIndexName).Error)
+	require.NoError(t, db.Exec("CREATE TABLE public."+retryIndexName+" (id bigint)").Error)
+	var collisionOID int64
+	require.NoError(t, isolatedAdminDB.Raw(`
+		SELECT relation.oid::bigint
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS relation_namespace
+		  ON relation_namespace.oid = relation.relnamespace
+		WHERE relation_namespace.nspname = 'public' AND relation.relname = ?
+	`, retryIndexName).Scan(&collisionOID).Error)
+	require.Positive(t, collisionOID)
+	err := databasepkg.RunRLSMigrationCoordinatorForTest(
+		db, adminCfg, runtimeRole, "baseline", backfill, verifyRuntime,
+	)
+	require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+	require.ErrorContains(t, err, "not an exact retry artifact")
+	require.Zero(t, backfillCalls)
+	require.Zero(t, verificationCalls)
+	var preservedCollisionOID int64
+	require.NoError(t, isolatedAdminDB.Raw(`
+		SELECT relation.oid::bigint
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS relation_namespace
+		  ON relation_namespace.oid = relation.relnamespace
+		WHERE relation_namespace.nspname = 'public' AND relation.relname = ?
+	`, retryIndexName).Scan(&preservedCollisionOID).Error)
+	require.Equal(t, collisionOID, preservedCollisionOID,
+		"repairable admission must preserve a colliding non-index relation")
+	require.NoError(t, db.Exec("DROP TABLE public."+retryIndexName).Error)
+	invalidState := leaveInterruptedConcurrentIndexBuildTestState(
+		t, db, isolatedAdminDB, retryIndexName, exactRetryIndex,
+	)
+	require.False(t, invalidState.Valid)
+
 	require.NoError(t, databasepkg.RunRLSMigrationCoordinatorForTest(
 		db,
 		adminCfg,
@@ -1183,6 +1347,11 @@ func TestBaselineRLSMigrationPreservesLegacyProfileAndIsIdempotent(t *testing.T)
 		)
 	`).Scan(&tenantPolicyRestored).Error)
 	require.True(t, tenantPolicyRestored, "baseline must restore the exact missing tenant policy")
+	rebuiltState, exists := readMigrationIndexLifecycleTestState(t, isolatedAdminDB, retryIndexName)
+	require.True(t, exists)
+	require.True(t, rebuiltState.Valid && rebuiltState.Ready && rebuiltState.Live)
+	require.NotEqual(t, invalidState.OID, rebuiltState.OID,
+		"repairable admission must drop and rebuild the exact invalid retry artifact")
 
 	require.NoError(t, databasepkg.RunRLSMigrationCoordinatorForTest(
 		db,
@@ -1301,6 +1470,357 @@ func TestBaselineRLSMigrationAcceptsExactPreAdditiveLegacyPredecessor(t *testing
 	assert.Equal(t, 2, verificationCalls)
 }
 
+func TestBaselineRLSMigrationPrepareClaimSurvivesFailureAndIsStrict(t *testing.T) {
+	db, _, runtimeRole := setupPreAdditiveRLSMigrationTest(t)
+	adminCfg := &config.DefaultAdminConfig{}
+	forcedBackfillFailure := errors.New("forced baseline backfill failure")
+	backfillCalls := 0
+	verificationCalls := 0
+
+	err := databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		adminCfg,
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error {
+			backfillCalls++
+			return forcedBackfillFailure
+		},
+		func() error {
+			verificationCalls++
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, forcedBackfillFailure)
+	require.Equal(t, 1, backfillCalls)
+	require.Zero(t, verificationCalls)
+
+	var claim string
+	require.NoError(t, db.Raw(
+		"SELECT public.rereply_tenant_policy_additive_fingerprint_v1()",
+	).Scan(&claim).Error)
+	require.True(t, strings.HasPrefix(claim, "prepare:v1:"))
+	require.Len(t, strings.TrimPrefix(claim, "prepare:v1:"), sha256.Size*2)
+	var runtimeExecute bool
+	require.NoError(t, db.Raw(`
+		SELECT pg_catalog.has_function_privilege(
+			CAST(? AS text),
+			'public.rereply_tenant_policy_additive_fingerprint_v1()'::pg_catalog.regprocedure,
+			'EXECUTE'
+		)
+	`, runtimeRole).Scan(&runtimeExecute).Error)
+	require.False(t, runtimeExecute, "the transient claim must remain owner-only")
+	var contactIndexConstraintCount int64
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM pg_catalog.pg_constraint
+		WHERE conindid = 'public.uq_contacts_id_org'::pg_catalog.regclass
+	`).Scan(&contactIndexConstraintCount).Error)
+	require.Greater(t, contactIndexConstraintCount, int64(0),
+		"the exact published unique index must retain its inbound foreign-key references during retry")
+
+	for _, phase := range []string{"bridge"} {
+		err = databasepkg.RunRLSMigrationCoordinatorForTest(
+			db,
+			adminCfg,
+			runtimeRole,
+			phase,
+			func(*gorm.DB) error {
+				backfillCalls++
+				return nil
+			},
+			func() error {
+				verificationCalls++
+				return nil
+			},
+		)
+		require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+		require.ErrorContains(t, err, "cross-phase")
+	}
+	require.Equal(t, 1, backfillCalls)
+	require.Zero(t, verificationCalls)
+
+	require.NoError(t, db.Exec(
+		"GRANT EXECUTE ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() TO "+runtimeRole,
+	).Error)
+	err = databasepkg.RunRLSMigrationCoordinatorForTest(
+		db, adminCfg, runtimeRole, "baseline",
+		func(*gorm.DB) error { backfillCalls++; return nil },
+		func() error { verificationCalls++; return nil },
+	)
+	require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+	require.ErrorContains(t, err, "not exact")
+	require.Equal(t, 1, backfillCalls)
+	require.Zero(t, verificationCalls)
+	require.NoError(t, db.Exec(
+		"REVOKE ALL ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() FROM "+runtimeRole,
+	).Error)
+
+	const wrongClaim = "prepare:v1:0000000000000000000000000000000000000000000000000000000000000000"
+	require.NoError(t, db.Exec(fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1()
+		RETURNS text LANGUAGE sql IMMUTABLE
+		SET search_path = pg_catalog, public
+		AS $function$ SELECT '%s'::text $function$
+	`, wrongClaim)).Error)
+	err = databasepkg.RunRLSMigrationCoordinatorForTest(
+		db, adminCfg, runtimeRole, "baseline",
+		func(*gorm.DB) error { backfillCalls++; return nil },
+		func() error { verificationCalls++; return nil },
+	)
+	require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+	require.ErrorContains(t, err, "not exact")
+	require.Equal(t, 1, backfillCalls)
+	require.Zero(t, verificationCalls)
+
+	require.NoError(t, db.Exec(fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1()
+		RETURNS text LANGUAGE sql IMMUTABLE
+		SET search_path = pg_catalog, public
+		AS $function$ SELECT '%s'::text $function$
+	`, claim)).Error)
+	require.NoError(t, db.Exec(
+		"REVOKE ALL ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() FROM PUBLIC",
+	).Error)
+	require.NoError(t, db.Exec(
+		"REVOKE ALL ON FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1() FROM "+runtimeRole,
+	).Error)
+	// A crash can leave only an ordered prefix of the additive model loop.
+	// Materialize that catalog-equivalent state and prove the exact claim can
+	// resume it without weakening markerless-partial quarantine.
+	require.NoError(t, db.Exec(
+		"DROP TABLE public.whatsapp_identity_review_members CASCADE",
+	).Error)
+	var identityReviewMembersExists bool
+	require.NoError(t, db.Raw(`
+		SELECT pg_catalog.to_regclass('public.whatsapp_identity_review_members') IS NOT NULL
+	`).Scan(&identityReviewMembersExists).Error)
+	require.False(t, identityReviewMembersExists)
+
+	require.NoError(t, databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		adminCfg,
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error {
+			backfillCalls++
+			return nil
+		},
+		func() error {
+			verificationCalls++
+			return errors.Join(
+				databasepkg.VerifyPlatformComplianceIdentityReviewCompatibilityForTest(db, runtimeRole),
+				databasepkg.VerifyRLSMigrationCallbackScanAuthorityForTest(db, runtimeRole),
+			)
+		},
+	))
+	require.Equal(t, 2, backfillCalls)
+	require.Equal(t, 1, verificationCalls)
+	require.NoError(t, db.Raw(`
+		SELECT pg_catalog.to_regclass('public.whatsapp_identity_review_members') IS NOT NULL
+	`).Scan(&identityReviewMembersExists).Error)
+	require.True(t, identityReviewMembersExists, "claimed ordered additive prefix must be completed on retry")
+	var finalFingerprint string
+	require.NoError(t, db.Raw(
+		"SELECT public.rereply_tenant_policy_additive_fingerprint_v1()",
+	).Scan(&finalFingerprint).Error)
+	require.True(t, strings.HasPrefix(finalFingerprint, "v1:"))
+	require.False(t, strings.HasPrefix(finalFingerprint, "prepare:"))
+	require.NoError(t, db.Raw(`
+		SELECT pg_catalog.has_function_privilege(
+			CAST(? AS text),
+			'public.rereply_tenant_policy_additive_fingerprint_v1()'::pg_catalog.regprocedure,
+			'EXECUTE'
+		)
+	`, runtimeRole).Scan(&runtimeExecute).Error)
+	require.True(t, runtimeExecute, "final publication must replace the claim and authorize runtime verification")
+}
+
+func TestBaselineRLSMigrationReconcilesOnlyExactInterruptedConcurrentIndexes(t *testing.T) {
+	db, isolatedAdminDB, runtimeRole := setupPreAdditiveRLSMigrationTest(t)
+	adminCfg := &config.DefaultAdminConfig{}
+	forcedBackfillFailure := errors.New("force durable prepare claim before concurrent-index retry")
+	require.ErrorIs(t, databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		adminCfg,
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error { return forcedBackfillFailure },
+		func() error { return nil },
+	), forcedBackfillFailure)
+
+	const indexName = "idx_messages_org_inbox_ingested"
+	const exactCreate = `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_org_inbox_ingested
+		ON messages(organization_id, inbox_conversation_id, (COALESCE(ingested_at, created_at)), id)
+		WHERE inbox_conversation_id IS NOT NULL AND deleted_at IS NULL`
+	require.NoError(t, db.Exec("DROP INDEX CONCURRENTLY public."+indexName).Error)
+
+	// A table, view, sequence, or other pg_class row with a pinned index name
+	// must never be treated as absence by the pg_index-specific inspection.
+	require.NoError(t, db.Exec("CREATE TABLE public."+indexName+" (id bigint)").Error)
+	var collidingRelation struct {
+		OID  int64  `gorm:"column:relation_oid"`
+		Kind string `gorm:"column:relation_kind"`
+	}
+	require.NoError(t, isolatedAdminDB.Raw(`
+		SELECT relation.oid::bigint AS relation_oid, relation.relkind::text AS relation_kind
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS relation_namespace
+		  ON relation_namespace.oid = relation.relnamespace
+		WHERE relation_namespace.nspname = 'public' AND relation.relname = ?
+	`, indexName).Scan(&collidingRelation).Error)
+	require.Equal(t, "r", collidingRelation.Kind)
+	backfillCalls := 0
+	verificationCalls := 0
+	err := databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		adminCfg,
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error { backfillCalls++; return nil },
+		func() error { verificationCalls++; return nil },
+	)
+	require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+	require.ErrorContains(t, err, "not an exact retry artifact")
+	require.Zero(t, backfillCalls)
+	require.Zero(t, verificationCalls)
+	var preservedCollisionOID int64
+	require.NoError(t, isolatedAdminDB.Raw(`
+		SELECT relation.oid::bigint
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS relation_namespace
+		  ON relation_namespace.oid = relation.relnamespace
+		WHERE relation_namespace.nspname = 'public' AND relation.relname = ?
+	`, indexName).Scan(&preservedCollisionOID).Error)
+	require.Equal(t, collidingRelation.OID, preservedCollisionOID)
+	require.NoError(t, db.Exec("DROP TABLE public."+indexName).Error)
+
+	// Leave a real invalid catalog row with the right pinned name/table but a
+	// wrong definition. The retry classifier must preserve and quarantine it,
+	// never normalize arbitrary DDL merely because its name is familiar.
+	wrongState := leaveInterruptedConcurrentIndexBuildTestState(
+		t,
+		db,
+		isolatedAdminDB,
+		indexName,
+		"CREATE INDEX CONCURRENTLY "+indexName+" ON public.messages(id)",
+	)
+	require.Contains(t, wrongState.Definition, "USING btree (id)")
+
+	err = databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		adminCfg,
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error { backfillCalls++; return nil },
+		func() error { verificationCalls++; return nil },
+	)
+	require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+	require.ErrorContains(t, err, "not an exact retry artifact")
+	require.Zero(t, backfillCalls)
+	require.Zero(t, verificationCalls)
+	preservedWrongState, exists := readMigrationIndexLifecycleTestState(t, isolatedAdminDB, indexName)
+	require.True(t, exists)
+	require.Equal(t, wrongState.OID, preservedWrongState.OID)
+	require.Equal(t, wrongState.Definition, preservedWrongState.Definition)
+	require.False(t, preservedWrongState.Valid)
+
+	require.NoError(t, db.Exec("DROP INDEX CONCURRENTLY public."+indexName).Error)
+	require.NoError(t, db.Exec(exactCreate).Error)
+	publishedState, exists := readMigrationIndexLifecycleTestState(t, isolatedAdminDB, indexName)
+	require.True(t, exists)
+	require.True(t, publishedState.Valid && publishedState.Ready && publishedState.Live)
+	highwaterState, exists := readMigrationIndexLifecycleTestState(
+		t, isolatedAdminDB, "idx_messages_org_inbox_ingested_highwater",
+	)
+	require.True(t, exists)
+	require.True(t, highwaterState.Valid && highwaterState.Ready && highwaterState.Live)
+	require.Contains(t, highwaterState.Definition, "ingested_at DESC",
+		"valid claimed retries must accept the pinned descending high-water index")
+
+	// Materialize PostgreSQL's real 000 state: the first blocker holds the DROP
+	// after invalidation; a second locker, admitted after that wait set is taken,
+	// holds the next phase after PostgreSQL marks the index dead.
+	firstBlocker := isolatedAdminDB.Begin()
+	require.NoError(t, firstBlocker.Error)
+	defer firstBlocker.Rollback()
+	var messageCount int64
+	require.NoError(t, firstBlocker.Raw("SELECT COUNT(*) FROM public.messages").Scan(&messageCount).Error)
+	dropContext, cancelDrop := context.WithCancel(context.Background())
+	defer cancelDrop()
+	dropSQLDB, err := db.DB()
+	require.NoError(t, err)
+	dropConn, err := dropSQLDB.Conn(context.Background())
+	require.NoError(t, err)
+	defer dropConn.Close()
+	var dropBackendPID int
+	require.NoError(t, dropConn.QueryRowContext(
+		context.Background(), "SELECT pg_catalog.pg_backend_pid()",
+	).Scan(&dropBackendPID))
+	dropResult := make(chan error, 1)
+	go func() {
+		_, dropErr := dropConn.ExecContext(
+			dropContext, "DROP INDEX CONCURRENTLY public."+indexName,
+		)
+		dropResult <- dropErr
+	}()
+	waitForMigrationIndexLifecycleTestState(t, isolatedAdminDB, indexName,
+		func(state migrationIndexLifecycleTestState, exists bool) bool {
+			return exists && !state.Valid && state.Live
+		})
+	testutil.RequirePostgresBackendWaitingForLock(t, isolatedAdminDB, dropBackendPID)
+	secondBlocker := isolatedAdminDB.Begin()
+	require.NoError(t, secondBlocker.Error)
+	defer secondBlocker.Rollback()
+	require.NoError(t, secondBlocker.Raw("SELECT COUNT(*) FROM public.messages").Scan(&messageCount).Error)
+	require.NoError(t, firstBlocker.Rollback().Error)
+	deadState := waitForMigrationIndexLifecycleTestState(t, isolatedAdminDB, indexName,
+		func(state migrationIndexLifecycleTestState, exists bool) bool {
+			return exists && !state.Valid && !state.Ready && !state.Live
+		})
+	var dropCanceled bool
+	require.NoError(t, isolatedAdminDB.Raw(
+		"SELECT pg_catalog.pg_cancel_backend(?)", dropBackendPID,
+	).Scan(&dropCanceled).Error)
+	require.True(t, dropCanceled, "PostgreSQL must accept cancellation of the blocked concurrent drop")
+	select {
+	case dropErr := <-dropResult:
+		require.Error(t, dropErr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("canceled dead-index concurrent drop did not return")
+	}
+	// Do not release the second blocker until the server confirms cancellation;
+	// otherwise DROP can win the race and remove the retained 000 artifact.
+	require.NoError(t, secondBlocker.Rollback().Error)
+	deadState, exists = readMigrationIndexLifecycleTestState(t, isolatedAdminDB, indexName)
+	require.True(t, exists)
+	require.False(t, deadState.Valid)
+	require.False(t, deadState.Ready)
+	require.False(t, deadState.Live)
+
+	require.NoError(t, databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		adminCfg,
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error { backfillCalls++; return nil },
+		func() error {
+			verificationCalls++
+			return errors.Join(
+				databasepkg.VerifyPlatformComplianceIdentityReviewCompatibilityForTest(db, runtimeRole),
+				databasepkg.VerifyRLSMigrationCallbackScanAuthorityForTest(db, runtimeRole),
+			)
+		},
+	))
+	require.Equal(t, 1, backfillCalls)
+	require.Equal(t, 1, verificationCalls)
+	rebuiltState, exists := readMigrationIndexLifecycleTestState(t, isolatedAdminDB, indexName)
+	require.True(t, exists)
+	require.True(t, rebuiltState.Valid && rebuiltState.Ready && rebuiltState.Live)
+	require.NotEqual(t, deadState.OID, rebuiltState.OID)
+	require.NotEqual(t, wrongState.OID, rebuiltState.OID)
+}
+
 func TestBaselineRLSMigrationPinsPublicBeforePreAdditivePreparation(t *testing.T) {
 	db, _, ownerRole, runtimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
 	require.NoError(t, databasepkg.ApplyTenantRLS(db, runtimeRole))
@@ -1355,6 +1875,54 @@ func TestBaselineRLSMigrationPinsPublicBeforePreAdditivePreparation(t *testing.T
 			"public."+table,
 		).Scan(&inPublic).Error)
 		require.True(t, inPublic, "%s must be created in public", table)
+	}
+}
+
+func TestBaselineRLSMigrationReadinessFailsBeforePrepareClaim(t *testing.T) {
+	db, isolatedAdminDB, runtimeRole := setupPreAdditiveRLSMigrationTest(t)
+	blocker := isolatedAdminDB.Begin()
+	require.NoError(t, blocker.Error)
+	defer blocker.Rollback()
+	require.NoError(t, blocker.Exec(
+		"LOCK TABLE public.contacts IN ROW EXCLUSIVE MODE",
+	).Error)
+
+	backfillCalls := 0
+	verificationCalls := 0
+	started := time.Now()
+	err := databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		&config.DefaultAdminConfig{},
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error { backfillCalls++; return nil },
+		func() error { verificationCalls++; return nil },
+	)
+	require.Error(t, err)
+	require.Less(t, time.Since(started), 2*time.Second)
+	require.Zero(t, backfillCalls)
+	require.Zero(t, verificationCalls)
+
+	var claimCount int64
+	require.NoError(t, db.Raw(`
+		SELECT COUNT(*)
+		FROM pg_catalog.pg_proc AS function
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = function.pronamespace
+		WHERE namespace.nspname = 'public'
+		  AND function.proname = 'rereply_tenant_policy_additive_fingerprint_v1'
+	`).Scan(&claimCount).Error)
+	require.Zero(t, claimCount, "NOWAIT readiness must fail before claim creation")
+	for _, table := range []string{
+		"whatsapp_coexistence_states",
+		"whatsapp_identity_review_holds",
+		"whatsapp_identity_review_members",
+	} {
+		var exists bool
+		require.NoError(t, db.Raw(
+			"SELECT pg_catalog.to_regclass(CAST(? AS text)) IS NOT NULL",
+			"public."+table,
+		).Scan(&exists).Error)
+		require.False(t, exists, "%s must remain absent when readiness fails", table)
 	}
 }
 
@@ -2821,6 +3389,57 @@ func TestBaselineRLSMigrationQuarantinesPartialPreAdditiveCatalog(t *testing.T) 
 	assert.True(t, membersAbsent, "quarantine must occur before schema preparation")
 }
 
+func TestBaselineRLSMigrationQuarantinesMarkerlessFullUnpublishedCatalog(t *testing.T) {
+	db, runtimeRole := setupIsolatedRLSMigrationTest(t)
+	dropIdentityReviewOldCoreTriggers(t, db)
+	require.NoError(t, db.Exec(
+		"DROP FUNCTION public.rereply_tenant_policy_additive_fingerprint_v1()",
+	).Error)
+	for _, table := range []string{
+		"whatsapp_coexistence_states",
+		"whatsapp_identity_review_holds",
+		"whatsapp_identity_review_members",
+	} {
+		require.NoError(t, db.Exec(
+			"DROP POLICY rereply_tenant_isolation ON public."+table,
+		).Error)
+		require.NoError(t, db.Exec(
+			"DROP POLICY rereply_migration_access ON public."+table,
+		).Error)
+		require.NoError(t, db.Exec(
+			"ALTER TABLE public."+table+" DISABLE ROW LEVEL SECURITY",
+		).Error)
+	}
+
+	backfillCalls := 0
+	verificationCalls := 0
+	err := databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		&config.DefaultAdminConfig{},
+		runtimeRole,
+		"baseline",
+		func(*gorm.DB) error { backfillCalls++; return nil },
+		func() error { verificationCalls++; return nil },
+	)
+	require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+	require.ErrorContains(t, err, "partial additive catalog")
+	require.Zero(t, backfillCalls)
+	require.Zero(t, verificationCalls)
+	for _, table := range []string{
+		"whatsapp_coexistence_states",
+		"whatsapp_identity_review_holds",
+		"whatsapp_identity_review_members",
+	} {
+		var rowSecurity bool
+		require.NoError(t, db.Raw(`
+			SELECT relation.relrowsecurity
+			FROM pg_catalog.pg_class AS relation
+			WHERE relation.oid = pg_catalog.to_regclass(CAST(? AS text))
+		`, "public."+table).Scan(&rowSecurity).Error)
+		require.False(t, rowSecurity, "markerless quarantine must not publish policy state on %s", table)
+	}
+}
+
 func TestBaselineRLSMigrationReadFailureCannotReachCallbacks(t *testing.T) {
 	db, runtimeRole := setupIsolatedRLSMigrationTest(t)
 	dropIdentityReviewOldCoreTriggers(t, db)
@@ -2850,7 +3469,8 @@ func TestBaselineRLSMigrationReadFailureCannotReachCallbacks(t *testing.T) {
 }
 
 func TestRLSMigrationCoordinatorRejectsFutureOnlyPhasesAndRecoversAfterLateBridgeFailure(t *testing.T) {
-	db, runtimeRole := setupIsolatedRLSMigrationTest(t)
+	db, isolatedAdminDB, _, runtimeRole := testutil.OpenIsolatedTestDatabaseOwnedByRole(t)
+	require.NoError(t, databasepkg.ApplyTenantRLS(db, runtimeRole))
 	dropIdentityReviewOldCoreTriggers(t, db)
 	require.Empty(t, identityReviewOldCoreTriggerBindings(t, db))
 
@@ -2877,8 +3497,45 @@ func TestRLSMigrationCoordinatorRejectsFutureOnlyPhasesAndRecoversAfterLateBridg
 	assert.Zero(t, mutationCalls, "future-only sources must reject legacy before any callback")
 	assert.Zero(t, verifyCalls, "a rejected legacy profile is not runtime authority")
 
-	forcedLateFailure := errors.New("forced post-schema bridge backfill failure")
+	const retryIndexName = "idx_messages_org_inbox_ingested"
+	const exactRetryIndex = `CREATE INDEX CONCURRENTLY idx_messages_org_inbox_ingested
+		ON public.messages(organization_id, inbox_conversation_id, (COALESCE(ingested_at, created_at)), id)
+		WHERE inbox_conversation_id IS NOT NULL AND deleted_at IS NULL`
+	require.NoError(t, db.Exec("DROP INDEX CONCURRENTLY public."+retryIndexName).Error)
+	wrongState := leaveInterruptedConcurrentIndexBuildTestState(
+		t,
+		db,
+		isolatedAdminDB,
+		retryIndexName,
+		"CREATE INDEX CONCURRENTLY "+retryIndexName+" ON public.messages(id)",
+	)
 	err := databasepkg.RunRLSMigrationCoordinatorForTest(
+		db,
+		adminCfg,
+		runtimeRole,
+		"bridge",
+		func(*gorm.DB) error { mutationCalls++; return nil },
+		func() error { verifyCalls++; return nil },
+	)
+	require.ErrorIs(t, err, databasepkg.ErrRLSMigrationCatalogQuarantined)
+	require.ErrorContains(t, err, "not an exact retry artifact")
+	require.Zero(t, mutationCalls)
+	require.Zero(t, verifyCalls)
+	preservedWrongState, exists := readMigrationIndexLifecycleTestState(
+		t, isolatedAdminDB, retryIndexName,
+	)
+	require.True(t, exists)
+	require.Equal(t, wrongState.OID, preservedWrongState.OID)
+	require.Equal(t, wrongState.Definition, preservedWrongState.Definition)
+	require.False(t, preservedWrongState.Valid)
+	require.NoError(t, db.Exec("DROP INDEX CONCURRENTLY public."+retryIndexName).Error)
+	invalidBridgeState := leaveInterruptedConcurrentIndexBuildTestState(
+		t, db, isolatedAdminDB, retryIndexName, exactRetryIndex,
+	)
+	require.False(t, invalidBridgeState.Valid)
+
+	forcedLateFailure := errors.New("forced post-schema bridge backfill failure")
+	err = databasepkg.RunRLSMigrationCoordinatorForTest(
 		db,
 		adminCfg,
 		runtimeRole,
@@ -2910,6 +3567,13 @@ func TestRLSMigrationCoordinatorRejectsFutureOnlyPhasesAndRecoversAfterLateBridg
 	assert.Zero(t, verifyCalls)
 	require.Empty(t, identityReviewOldCoreTriggerBindings(t, db),
 		"a late pre-activation failure must preserve the exact legacy profile")
+	rebuiltBridgeState, exists := readMigrationIndexLifecycleTestState(
+		t, isolatedAdminDB, retryIndexName,
+	)
+	require.True(t, exists)
+	require.True(t, rebuiltBridgeState.Valid && rebuiltBridgeState.Ready && rebuiltBridgeState.Live)
+	require.NotEqual(t, invalidBridgeState.OID, rebuiltBridgeState.OID,
+		"bridge-from-complete must repair the exact interrupted index before backfill")
 
 	require.NoError(t, databasepkg.RunRLSMigrationCoordinatorForTest(
 		db,
@@ -3469,7 +4133,31 @@ func TestWhatsAppIdentityReviewMigrationLocksFailFastAndRetryCleanly(t *testing.
 	}
 }
 
-func TestWhatsAppIdentityReviewActivationDeadlineRollsBackTheWholeStatement(t *testing.T) {
+func TestWhatsAppIdentityReviewActivationAllowsLongHistoricalValidation(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	testutil.TruncateTables(db)
+
+	organization := testutil.CreateTestOrganization(t, db)
+	contact := testutil.CreateTestContact(t, db, organization.ID)
+	statement := fmt.Sprintf(`DO $block$ BEGIN
+		LOCK TABLE public.contacts IN EXCLUSIVE MODE NOWAIT;
+		UPDATE public.contacts SET profile_name = 'cutover-after-long-validation'
+		WHERE id = '%s'::uuid;
+		PERFORM pg_catalog.pg_sleep(1.25);
+	END $block$`, contact.ID)
+
+	started := time.Now()
+	require.NoError(t, databasepkg.ExecuteCoexistenceActivationForTest(db, statement))
+	elapsed := time.Since(started)
+	assert.GreaterOrEqual(t, elapsed, time.Second,
+		"activation must not impose the former one-second deadline")
+
+	var durable models.Contact
+	require.NoError(t, db.Unscoped().First(&durable, "id = ?", contact.ID).Error)
+	assert.Equal(t, "cutover-after-long-validation", durable.ProfileName)
+}
+
+func TestWhatsAppIdentityReviewActivationErrorRollsBackTheWholeStatement(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	testutil.TruncateTables(db)
 
@@ -3480,23 +4168,18 @@ func TestWhatsAppIdentityReviewActivationDeadlineRollsBackTheWholeStatement(t *t
 		LOCK TABLE public.contacts IN EXCLUSIVE MODE NOWAIT;
 		UPDATE public.contacts SET profile_name = 'cutover-must-roll-back'
 		WHERE id = '%s'::uuid;
-		PERFORM pg_catalog.pg_sleep(2);
+		RAISE EXCEPTION USING ERRCODE = 'P0001', MESSAGE = 'deliberate cutover failure';
 	END $block$`, contact.ID)
 
-	started := time.Now()
 	err := databasepkg.ExecuteCoexistenceActivationForTest(db, statement)
-	_ = requireIdentityReviewSQLState(t, err, "57014")
-	elapsed := time.Since(started)
-	assert.GreaterOrEqual(t, elapsed, 750*time.Millisecond)
-	assert.Less(t, elapsed, 3*time.Second,
-		"the production cutover executor must bound its complete transaction")
+	_ = requireIdentityReviewSQLState(t, err, "P0001")
 
 	var durable models.Contact
 	require.NoError(t, db.Unscoped().First(&durable, "id = ?", contact.ID).Error)
 	assert.Equal(t, originalProfileName, durable.ProfileName,
-		"statement timeout must roll back every cutover write")
+		"a cutover error must roll back every write in the activation transaction")
 	require.NoError(t, databasepkg.CreateIndexes(db),
-		"the production migration path must remain retryable after a bounded timeout")
+		"the production migration path must remain retryable after a rolled-back activation")
 }
 
 func TestWhatsAppIdentityReviewMigrationRejectsExistingRowLockWithoutRetainingPrefixLocks(t *testing.T) {

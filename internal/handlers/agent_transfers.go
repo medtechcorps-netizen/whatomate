@@ -3,13 +3,13 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/assignment"
+	"github.com/shridarpatil/whatomate/internal/contacthandoff"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -474,42 +474,12 @@ func (a *App) ListAgentTransfers(r *fastglue.Request) error {
 	})
 }
 
-func createActiveAgentTransferTx(
-	tx *gorm.DB,
-	transfer *models.AgentTransfer,
-) error {
-	if tx == nil || transfer == nil {
-		return errors.New("complete agent transfer transaction state is required")
-	}
-	if err := database.LockOrganizationPolicyScope(
-		tx,
-		transfer.OrganizationID,
-	); err != nil {
-		return fmt.Errorf("lock transfer organization policy scope: %w", err)
-	}
-	if err := database.LockContactPolicyScope(
-		tx,
-		transfer.OrganizationID,
-		transfer.ContactID,
-	); err != nil {
-		return fmt.Errorf("lock transfer policy scope: %w", err)
-	}
-
-	var existingCount int64
-	if err := tx.Model(&models.AgentTransfer{}).
-		Where(
-			"organization_id = ? AND contact_id = ? AND status = ?",
-			transfer.OrganizationID,
-			transfer.ContactID,
-			models.TransferStatusActive,
-		).
-		Count(&existingCount).Error; err != nil {
-		return err
-	}
-	if existingCount > 0 {
+func createActiveAgentTransferTx(tx *gorm.DB, transfer *models.AgentTransfer) error {
+	err := contacthandoff.CreateActiveTx(tx, transfer)
+	if errors.Is(err, contacthandoff.ErrActiveTransferExists) {
 		return errActiveAgentTransferExists
 	}
-	return tx.Create(transfer).Error
+	return err
 }
 
 // CreateAgentTransfer creates a new agent transfer
@@ -576,8 +546,9 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 		if err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid agent_id", nil, "")
 		}
-		// Verify agent exists and is available
-		agent, err := findByIDAndOrg[models.User](a.DB, r, parsedAgentID, orgID, "Agent")
+		// Verify the agent is an active member of this organization (home org
+		// or user_organizations membership) and is available.
+		agent, err := findOrgMemberUser(a.DB, r, parsedAgentID, orgID, "Agent", true)
 		if err != nil {
 			return nil
 		}
@@ -863,8 +834,9 @@ func (a *App) AssignAgentTransfer(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid agent_id", nil, "")
 		}
 
-		// Verify agent exists and is available
-		agent, err := findByIDAndOrg[models.User](a.DB, r, parsedAgentID, orgID, "Agent")
+		// Verify the agent is an active member of this organization (home org
+		// or user_organizations membership) and is available.
+		agent, err := findOrgMemberUser(a.DB, r, parsedAgentID, orgID, "Agent", true)
 		if err != nil {
 			return nil
 		}
@@ -1394,21 +1366,14 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		if err := createActiveAgentTransferTx(tx, &candidate); err != nil {
 			return err
 		}
-		if err := suppressUnfinishedInboundForTransfer(tx, baseTransfer.OrganizationID, canonical.ID); err != nil {
+		// Manual Pause and AI handoff share one durable epoch. Resume must not
+		// revive an old offer or a pre-cutoff inbound admitted after this write.
+		if err := contacthandoff.CutoffTx(tx, baseTransfer.OrganizationID, canonical.ID); err != nil {
 			return err
 		}
-		// Invalidate any timer selected before this handover in the same policy
-		// transaction. Resume must not make that old generation eligible again.
-		if err := tx.Model(&models.Contact{}).
-			Where("id = ? AND organization_id = ?", canonical.ID, baseTransfer.OrganizationID).
-			Updates(map[string]any{
-				"chatbot_last_message_at": nil,
-				"chatbot_reminder_sent":   false,
-			}).Error; err != nil {
+		if err := tx.Where("id = ? AND organization_id = ?", canonical.ID, baseTransfer.OrganizationID).First(canonical).Error; err != nil {
 			return err
 		}
-		canonical.ChatbotLastMessageAt = nil
-		canonical.ChatbotReminderSent = false
 
 		// Update contact assignment if agent assigned, but only when
 		// AssignToSameAgent is enabled and no relationship manager is already

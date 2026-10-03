@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,9 +13,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
@@ -29,6 +33,279 @@ import (
 
 type campaignStatsCaptureHook struct {
 	payloads chan []byte
+}
+
+type campaignContactSQLStateError string
+
+func (err campaignContactSQLStateError) Error() string    { return string(err) }
+func (err campaignContactSQLStateError) SQLState() string { return string(err) }
+
+type campaignContactAttempt struct {
+	xid string
+	err error
+}
+
+func campaignContactErrorSQLState(err error) string {
+	var sqlState interface {
+		SQLState() string
+	}
+	if errors.As(err, &sqlState) {
+		return sqlState.SQLState()
+	}
+	return ""
+}
+
+func campaignRecipientJob(
+	organization *models.Organization,
+	campaign *models.BulkMessageCampaign,
+	recipient *models.BulkMessageRecipient,
+) *queue.RecipientJob {
+	return &queue.RecipientJob{
+		CampaignID:     campaign.ID,
+		RecipientID:    recipient.ID,
+		OrganizationID: organization.ID,
+		PhoneNumber:    recipient.PhoneNumber,
+		RecipientName:  recipient.RecipientName,
+		TemplateParams: recipient.TemplateParams,
+		EnqueuedAt:     campaign.StartedAt.UTC(),
+	}
+}
+
+func holdCampaignContactSelectorFence(
+	t *testing.T,
+	db *gorm.DB,
+	organizationID uuid.UUID,
+) *gorm.DB {
+	t.Helper()
+	holder := db.Begin()
+	require.NoError(t, holder.Error)
+	require.NoError(t, holder.Exec(
+		"SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
+		database.WhatsAppIdentityReviewContactSelectorFenceKey(organizationID),
+	).Error)
+	return holder
+}
+
+func TestRetryableCampaignContactWriteIncludesWrappedSelectorContention(t *testing.T) {
+	assert.Equal(t, 6, campaignCanonicalContactAttempts)
+	assert.Equal(t, 25*time.Millisecond, campaignCanonicalContactInitialRetryDelay)
+	err := errors.Join(errors.New("wrapped campaign contact"), campaignContactSQLStateError("55P03"))
+	assert.True(t, retryableCampaignContactWrite(err))
+}
+
+func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testing.T) {
+	w := testWorker(t)
+	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+
+	existing := testutil.CreateTestContactWith(
+		t,
+		w.DB,
+		organization.ID,
+		testutil.WithPhoneNumber(recipient.PhoneNumber),
+	)
+	require.NoError(t, w.DB.Model(existing).Update("profile_name", "stale campaign profile").Error)
+	require.NoError(t, w.DB.Delete(existing).Error)
+
+	holder := holdCampaignContactSelectorFence(t, w.DB, organization.ID)
+	holderOpen := true
+	t.Cleanup(func() {
+		if holderOpen {
+			_ = holder.Rollback().Error
+		}
+	})
+
+	firstFailure := make(chan campaignContactAttempt, 1)
+	var firstFailureReported atomic.Bool
+	var attemptXIDs []string
+	w.getOrCreateCampaignContact = func(
+		tx *gorm.DB,
+		organizationID uuid.UUID,
+		phoneNumber, profileName string,
+	) (*models.Contact, bool, error) {
+		var xid string
+		if err := tx.Raw("SELECT pg_catalog.pg_current_xact_id()::text").Scan(&xid).Error; err != nil {
+			return nil, false, err
+		}
+		contact, created, err := contactutil.GetOrCreateContact(
+			tx,
+			organizationID,
+			phoneNumber,
+			profileName,
+		)
+		attemptXIDs = append(attemptXIDs, xid)
+		if err != nil && firstFailureReported.CompareAndSwap(false, true) {
+			firstFailure <- campaignContactAttempt{xid: xid, err: err}
+		}
+		return contact, created, err
+	}
+
+	var providerRequests atomic.Int32
+	providerVisibility := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		requestNumber := providerRequests.Add(1)
+		var visible models.Contact
+		err := w.DB.Where(
+			"organization_id = ? AND phone_number = ?",
+			organization.ID,
+			recipient.PhoneNumber,
+		).First(&visible).Error
+		if err == nil && visible.ID != existing.ID {
+			err = fmt.Errorf("provider observed contact %s; want restored contact %s", visible.ID, existing.ID)
+		}
+		if err == nil && visible.ProfileName != recipient.RecipientName {
+			err = fmt.Errorf("provider observed profile %q; want %q", visible.ProfileName, recipient.RecipientName)
+		}
+		if requestNumber == 1 {
+			providerVisibility <- err
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.selector-release"}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- w.HandleRecipientJob(ctx, campaignRecipientJob(organization, campaign, recipient))
+	}()
+
+	var collision campaignContactAttempt
+	select {
+	case collision = <-firstFailure:
+	case <-ctx.Done():
+		t.Fatalf("campaign contact write did not reach the held selector fence: %v", ctx.Err())
+	}
+	require.Equal(t, "55P03", campaignContactErrorSQLState(collision.err))
+	var collisionPGError *pgconn.PgError
+	require.ErrorAs(t, collision.err, &collisionPGError)
+	require.Equal(t, "55P03", collisionPGError.Code)
+	require.NotEmpty(t, collision.xid)
+	assert.Zero(t, providerRequests.Load(), "provider must not run before the contact transaction commits")
+	require.NoError(t, holder.Rollback().Error)
+	holderOpen = false
+
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatalf("campaign contact retry did not finish after selector fence release: %v", ctx.Err())
+	}
+
+	require.GreaterOrEqual(t, len(attemptXIDs), 2)
+	assert.Equal(t, collision.xid, attemptXIDs[0])
+	assert.NotEqual(t, attemptXIDs[0], attemptXIDs[len(attemptXIDs)-1],
+		"selector retry must start a fresh PostgreSQL transaction")
+	assert.Equal(t, int32(1), providerRequests.Load())
+	select {
+	case visibilityErr := <-providerVisibility:
+		require.NoError(t, visibilityErr,
+			"provider must observe the restored contact committed with its new profile")
+	case <-ctx.Done():
+		t.Fatalf("provider did not report committed contact visibility: %v", ctx.Err())
+	}
+
+	var canonicalCount int64
+	require.NoError(t, w.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number = ? AND merged_into_id IS NULL",
+			organization.ID, recipient.PhoneNumber).
+		Count(&canonicalCount).Error)
+	assert.EqualValues(t, 1, canonicalCount)
+
+	var restored models.Contact
+	require.NoError(t, w.DB.First(&restored, existing.ID).Error)
+	assert.Equal(t, recipient.RecipientName, restored.ProfileName)
+	assert.False(t, restored.DeletedAt.Valid)
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, storedRecipient.Status)
+	assert.Equal(t, "wamid.selector-release", storedRecipient.WhatsAppMessageID)
+}
+
+func TestHandleRecipientSelectorFenceExhaustionLeavesJobPending(t *testing.T) {
+	w := testWorker(t)
+	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
+	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
+
+	holder := holdCampaignContactSelectorFence(t, w.DB, organization.ID)
+	holderOpen := true
+	t.Cleanup(func() {
+		if holderOpen {
+			_ = holder.Rollback().Error
+		}
+	})
+
+	var attempts atomic.Int32
+	var attemptResults []campaignContactAttempt
+	w.getOrCreateCampaignContact = func(
+		tx *gorm.DB,
+		organizationID uuid.UUID,
+		phoneNumber, profileName string,
+	) (*models.Contact, bool, error) {
+		attempts.Add(1)
+		var xid string
+		if err := tx.Raw("SELECT pg_catalog.pg_current_xact_id()::text").Scan(&xid).Error; err != nil {
+			return nil, false, err
+		}
+		contact, created, err := contactutil.GetOrCreateContact(tx, organizationID, phoneNumber, profileName)
+		attemptResults = append(attemptResults, campaignContactAttempt{xid: xid, err: err})
+		return contact, created, err
+	}
+
+	var providerRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		providerRequests.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(map[string]any{
+			"messages": []map[string]any{{"id": "wamid.must-not-send"}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	w.WhatsApp = whatsapp.NewWithBaseURL(w.Log, server.URL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	handlerErr := w.HandleRecipientJob(ctx, campaignRecipientJob(organization, campaign, recipient))
+	require.Error(t, handlerErr)
+	assert.Equal(t, "55P03", campaignContactErrorSQLState(handlerErr))
+	assert.True(t, retryableCampaignContactWrite(handlerErr))
+	require.NoError(t, holder.Rollback().Error)
+	holderOpen = false
+
+	assert.Equal(t, int32(campaignCanonicalContactAttempts), attempts.Load())
+	require.Len(t, attemptResults, campaignCanonicalContactAttempts)
+	xids := make(map[string]bool, campaignCanonicalContactAttempts)
+	for _, attempt := range attemptResults {
+		var pgError *pgconn.PgError
+		require.ErrorAs(t, attempt.err, &pgError)
+		assert.Equal(t, "55P03", pgError.Code)
+		require.NotEmpty(t, attempt.xid)
+		assert.False(t, xids[attempt.xid], "each retry must use a distinct top-level transaction")
+		xids[attempt.xid] = true
+	}
+	assert.Zero(t, providerRequests.Load(), "provider must not run while contact selection is fenced")
+
+	var storedRecipient models.BulkMessageRecipient
+	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
+	assert.Equal(t, models.MessageStatusPending, storedRecipient.Status)
+	assert.Nil(t, storedRecipient.MessageID)
+	assert.Empty(t, storedRecipient.ErrorMessage)
+	assert.Nil(t, storedRecipient.SentAt)
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, w.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Zero(t, storedCampaign.FailedCount)
+	assert.Zero(t, storedCampaign.SentCount)
+
+	var contactCount int64
+	require.NoError(t, w.DB.Unscoped().Model(&models.Contact{}).
+		Where("organization_id = ? AND phone_number = ?", organization.ID, recipient.PhoneNumber).
+		Count(&contactCount).Error)
+	assert.Zero(t, contactCount, "every failed insert attempt must roll back")
 }
 
 func (h *campaignStatsCaptureHook) DialHook(next redis.DialHook) redis.DialHook {
