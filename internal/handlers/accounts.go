@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -2498,6 +2499,12 @@ type embeddedSignupAccountVersion struct {
 	isSMB      bool
 }
 
+// embeddedSignupKeptAPIVersionPattern is the Graph API version shape the
+// WhatsApp client accepts (graphAPIVersionPattern in pkg/whatsapp/client.go).
+// A stored value of any other shape is never kept: the signup stays on the
+// configured version and meets the existing exact-contract rejection.
+var embeddedSignupKeptAPIVersionPattern = regexp.MustCompile(`^v[0-9]{1,3}\.[0-9]{1,3}$`)
+
 // embeddedSignupAccountAPIVersion keeps the verified provider contract of a
 // live account that enters or refreshes Coexistence after the server's
 // configured API version has changed. It neither migrates versions nor relaxes
@@ -2527,7 +2534,9 @@ func (a *App) embeddedSignupAccountAPIVersion(
 			return err
 		}
 		storedVersion := strings.TrimSpace(account.APIVersion)
-		if storedVersion == "" || storedVersion == metaSnapshot.apiVersion {
+		if storedVersion == "" ||
+			storedVersion == metaSnapshot.apiVersion ||
+			!embeddedSignupKeptAPIVersionPattern.MatchString(storedVersion) {
 			return nil
 		}
 		matches, err := scoped.embeddedSignupActiveReconnectContractMatches(

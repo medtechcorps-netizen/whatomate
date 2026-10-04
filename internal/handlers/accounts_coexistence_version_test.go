@@ -21,6 +21,18 @@ const (
 	coexistenceConfiguredAPIVersion = "v24.0"
 )
 
+// Stored values that differ from the configured version but that the Graph
+// client refuses as an API version. Each fits the 20-character column.
+var coexistenceMalformedStoredAPIVersions = []string{
+	"V21.0",
+	"v21",
+	"v21.0/x",
+	"v21.0?x=1",
+	"../v21.0",
+	"v21.0#",
+	"v1234.0",
+}
+
 type coexistenceVersionFixture struct {
 	app     *App
 	meta    *whatsappContractMeta
@@ -448,7 +460,7 @@ func TestEmbeddedSignupAccountAPIVersionKeepsOnlyExactLiveAccount(t *testing.T) 
 		configured expectation = iota
 		kept
 	)
-	for _, tc := range []struct {
+	type helperCase struct {
 		name     string
 		mode     string
 		noRow    bool
@@ -457,8 +469,15 @@ func TestEmbeddedSignupAccountAPIVersionKeepsOnlyExactLiveAccount(t *testing.T) 
 		after    func(t *testing.T, f *coexistenceVersionFixture, account *models.WhatsAppAccount)
 		want     expectation
 		wantVer  string
-	}{
+	}
+	cases := []helperCase{
 		{name: "exact live classic account", mode: embeddedSignupModeCoexistence, want: kept, wantVer: coexistenceStoredAPIVersion},
+		{
+			name: "padded stored version is kept trimmed", mode: embeddedSignupModeCoexistence, want: kept, wantVer: coexistenceStoredAPIVersion,
+			after: func(t *testing.T, f *coexistenceVersionFixture, account *models.WhatsAppAccount) {
+				require.NoError(t, f.app.DB.Exec("UPDATE whatsapp_accounts SET api_version = ? WHERE id = ?", " "+coexistenceStoredAPIVersion+" ", account.ID).Error)
+			},
+		},
 		{
 			name: "exact live coexistence account", mode: embeddedSignupModeCoexistence, want: kept, wantVer: coexistenceStoredAPIVersion,
 			prepare: func(_ *testing.T, account *models.WhatsAppAccount) { account.IsSMB = true; account.Pin = "" },
@@ -528,7 +547,18 @@ func TestEmbeddedSignupAccountAPIVersionKeepsOnlyExactLiveAccount(t *testing.T) 
 			},
 		},
 		{name: "account belongs to another organization", mode: embeddedSignupModeCoexistence, otherOrg: true, want: configured},
-	} {
+	}
+	// A stored value the Graph client would refuse is never kept, so it can
+	// neither change the Graph path nor turn the exact-contract 409 into a
+	// provider validation error.
+	for _, malformed := range coexistenceMalformedStoredAPIVersions {
+		stored := malformed
+		cases = append(cases, helperCase{
+			name: "malformed stored version " + stored, mode: embeddedSignupModeCoexistence, want: configured,
+			prepare: func(_ *testing.T, account *models.WhatsAppAccount) { account.APIVersion = stored },
+		})
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newCoexistenceVersionFixture(t)
 			account := f.liveClassicAccount(t, coexistenceStoredAPIVersion)
@@ -599,11 +629,12 @@ func TestEmbeddedSignupUsesConfiguredAPIVersionOutsideKeptLiveAccount(t *testing
 		assert.Zero(t, f.meta.versionHits(coexistenceStoredAPIVersion))
 	})
 
-	for _, tc := range []struct {
+	type unchangedContractCase struct {
 		name    string
 		mode    string
 		prepare func(t *testing.T, f *coexistenceVersionFixture, account *models.WhatsAppAccount)
-	}{
+	}
+	unchangedContractCases := []unchangedContractCase{
 		{
 			name: "classic reconnect of a live account on another version",
 			mode: embeddedSignupModeClassic,
@@ -616,7 +647,19 @@ func TestEmbeddedSignupUsesConfiguredAPIVersionOutsideKeptLiveAccount(t *testing
 				account.APIVersion = ""
 			},
 		},
-	} {
+	}
+	for _, malformed := range coexistenceMalformedStoredAPIVersions {
+		stored := malformed
+		unchangedContractCases = append(unchangedContractCases, unchangedContractCase{
+			name: "coexistence reconnect of a live account with malformed stored version " + stored,
+			mode: embeddedSignupModeCoexistence,
+			prepare: func(t *testing.T, f *coexistenceVersionFixture, account *models.WhatsAppAccount) {
+				require.NoError(t, f.app.DB.Exec("UPDATE whatsapp_accounts SET api_version = ? WHERE id = ?", stored, account.ID).Error)
+				account.APIVersion = stored
+			},
+		})
+	}
+	for _, tc := range unchangedContractCases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newCoexistenceVersionFixture(t)
 			if tc.mode == embeddedSignupModeClassic {
@@ -640,6 +683,9 @@ func TestEmbeddedSignupUsesConfiguredAPIVersionOutsideKeptLiveAccount(t *testing
 			assert.False(t, stored.IsSMB)
 			assert.True(t, stored.UpdatedAt.Equal(before.UpdatedAt))
 			assert.Zero(t, f.meta.versionHits(coexistenceStoredAPIVersion), "the stored version is not used outside the kept Coexistence path")
+			if stored := strings.TrimSpace(before.APIVersion); stored != "" {
+				assert.Zero(t, f.meta.versionHits(stored), "no Graph path may be built from the stored value")
+			}
 			assert.Positive(t, f.meta.methodHits(http.MethodGet, "/"+coexistenceConfiguredAPIVersion+"/"+f.phoneID))
 			assert.Zero(t, f.coexistenceStates(t))
 			f.assertNoProviderMutation(t)
