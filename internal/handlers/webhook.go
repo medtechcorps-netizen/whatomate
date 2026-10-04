@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -587,31 +588,73 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 				a.startPersistedIncomingMessageContinuation(work)
 			}
 
-			// Process status updates
+			// Process status updates. Each status commits in its own transaction
+			// and only ever applies a strict forward step, so a status that was
+			// already applied is a no-op when Meta replays the change. A status
+			// that must be retried therefore no longer stops the statuses of
+			// other messages after it in this change: they are applied now and
+			// the change is still answered with 503 below. Later statuses for
+			// the same WAMID wait for that retry instead, so per-message order is
+			// kept: a higher status applied first would otherwise turn the
+			// retried lower one into a no-op (a campaign recipient's delivered_at
+			// would never be set, for example).
+			statusRetryRequired := false
+			var retryWAMIDs map[string]struct{}
 			for _, status := range change.Value.Statuses {
 				a.Log.Info("Received status update",
 					"message_id", status.ID,
 					"status", status.Status,
 				)
 
+				wamid := strings.TrimSpace(status.ID)
+				if _, waiting := retryWAMIDs[wamid]; waiting {
+					a.Log.Info("Deferred WhatsApp status behind an earlier status for the same message",
+						"phone_id", phoneNumberID,
+						"message_id", status.ID,
+						"status", status.Status,
+					)
+					continue
+				}
 				if err := a.processStatusUpdate(phoneNumberID, status); err != nil {
+					statusRetryRequired = true
+					if retryWAMIDs == nil {
+						retryWAMIDs = make(map[string]struct{})
+					}
+					retryWAMIDs[wamid] = struct{}{}
+					if errors.Is(err, errWhatsAppStatusOwnerPending) {
+						// processStatusUpdate already logged this wait at Info, or
+						// at Warn when it needs attention; it is not a
+						// persistence failure.
+						continue
+					}
 					a.Log.Error(
 						"Failed to durably process status update before acknowledgement",
 						"error", err,
 						"phone_id", phoneNumberID,
 						"message_id", status.ID,
 					)
-					// A non-2xx response asks Meta to retry. Returning 200 before
-					// the committed receipt mutation would lose an early receipt if
-					// this process exits or the matching outgoing WAMID has not yet
-					// committed.
-					return r.SendErrorEnvelope(
-						fasthttp.StatusServiceUnavailable,
-						"Status update persistence failed",
-						nil,
-						"",
-					)
 				}
+			}
+			if statusRetryRequired {
+				// A non-2xx response asks Meta to retry. Returning 200 before
+				// the committed receipt mutation would lose an early receipt if
+				// this process exits or the matching outgoing WAMID has not yet
+				// committed. processStatusUpdate also returns nil without a
+				// mutation in other cases, among them a durable tombstone, a
+				// duplicate or non-forward status, an unknown status value and,
+				// on a classic account only, a WAMID proven absent once its
+				// status is older than whatsAppOrphanStatusGrace (see that
+				// constant for the bound). As before, the 503 ends the POST
+				// here: later changes and entries, including an
+				// smb_message_echoes change that would store a pending status's
+				// owner, wait for Meta's retry, which replays them in the same
+				// order.
+				return r.SendErrorEnvelope(
+					fasthttp.StatusServiceUnavailable,
+					"Status update persistence failed",
+					nil,
+					"",
+				)
 			}
 		}
 	}
@@ -749,6 +792,11 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 	// transaction, including in non-RLS development/test configurations: this
 	// preserves the WAMID -> account -> contact -> message lock order and keeps
 	// the message, recipient, and campaign counter atomically consistent.
+	orphanAcknowledged := false
+	orphanAge := time.Duration(0)
+	orphanTimestampUsable := false
+	orphanSettled := false
+	orphanCoexistenceAccount := false
 	err = a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
 		if err := database.LockWhatsAppWAMIDScopes(scoped.DB, organizationID, messageID); err != nil {
 			return err
@@ -775,17 +823,183 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 		if errors.Is(err, errWhatsAppMessageOwnerDeleted) {
 			return nil // durable tombstones reserve the WAMID but accept no replay mutation.
 		}
+		if errors.Is(err, errWhatsAppMessageOwnerNotStored) {
+			// No Message is a candidate owner of this WAMID yet, but one that
+			// has not committed may still claim it: an early receipt for a
+			// ReReply send inside the grace window, or, on a Coexistence
+			// account, a status that overtook its smb_message_echoes echo,
+			// whose ingestion has no bound short of Meta's own retry horizon.
+			// Keep the error so Meta retries. Only a classic account past the
+			// grace window may acknowledge, and only a proven absent owner;
+			// any row carrying the WAMID keeps failing closed exactly as
+			// before. A stored owner whose dependent lookup misses (for
+			// example a soft-deleted contact) is not this case: its bare
+			// gorm.ErrRecordNotFound is returned below as a real rejection.
+			orphanAge, orphanTimestampUsable, orphanSettled = whatsAppOrphanStatusAge(status.Timestamp, time.Now())
+			orphanCoexistenceAccount = account.IsSMB
+			if account.IsSMB || !orphanSettled {
+				return fmt.Errorf("%w: %w", errWhatsAppStatusOwnerPending, err)
+			}
+			absent, probeErr := scoped.whatsAppStatusOwnerAbsent(&account, messageID)
+			if probeErr != nil {
+				return fmt.Errorf("prove WhatsApp status owner absence: %w", probeErr)
+			}
+			if !absent {
+				return err
+			}
+			orphanAcknowledged = true
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		return scoped.updateResolvedMessageStatus(&resolved.Message, status.Status, status.Errors)
 	})
 	if err != nil {
+		if errors.Is(err, errWhatsAppStatusOwnerPending) {
+			fields := []any{
+				"error", err,
+				"phone_id", phoneNumberID,
+				"status_id", messageID,
+				"status", status.Status,
+				"age_seconds", int64(orphanAge / time.Second),
+				"coexistence_account", orphanCoexistenceAccount,
+			}
+			switch {
+			case !orphanTimestampUsable:
+				// Meta stamps every status, so a missing, malformed or
+				// far-future timestamp is an anomaly rather than an expected
+				// wait: such a status can never settle and is retried for
+				// Meta's whole retry window.
+				a.Log.Warn("Retrying WhatsApp status without a usable timestamp",
+					append(fields, "timestamp", status.Timestamp)...)
+			case orphanSettled:
+				// Only a Coexistence account defers a settled status; past
+				// the grace window it points at a lagging echo ingestion.
+				a.Log.Warn("Deferred WhatsApp status until its message is stored", fields...)
+			default:
+				// An expected wait, not a persistence failure.
+				a.Log.Info("Deferred WhatsApp status until its message is stored", fields...)
+			}
+			return err
+		}
 		a.Log.Warn("Rejected WhatsApp status update", "error", err, "phone_id", phoneNumberID, "status_id", messageID)
 		return err
 	}
+	if orphanAcknowledged {
+		a.Log.Warn("Acknowledged WhatsApp status for a message ReReply never stored",
+			"phone_id", phoneNumberID,
+			"status_id", messageID,
+			"status", status.Status,
+			"age_seconds", int64(orphanAge/time.Second),
+			"coexistence_account", orphanCoexistenceAccount,
+		)
+		return nil
+	}
 	a.Log.Info("Processed status update", "message_id", messageID, "status", status.Status, "phone_number_id", phoneNumberID)
 	return nil
+}
+
+// errWhatsAppStatusOwnerPending marks a status whose WAMID no candidate
+// Message carries yet but which a Message may still claim, so Meta must retry
+// it. It wraps the resolver's errWhatsAppMessageOwnerNotStored (and so
+// gorm.ErrRecordNotFound) and is an expected wait, not a persistence failure.
+// A stored owner whose dependent lookup misses never gets this label.
+var errWhatsAppStatusOwnerPending = errors.New("WhatsApp status owner is not stored yet")
+
+// whatsAppOrphanStatusGrace bounds how long, on a classic (non-Coexistence)
+// account, a status for a WAMID that no tenant Message carries may still be an
+// early receipt. It applies to classic accounts only: on a Coexistence account
+// the WhatsApp Business app echo that creates the Message has no such bound
+// (it depends on Meta's retries and on our own admission and availability),
+// so there an absent WAMID is never acknowledged.
+//
+// On a classic account only a ReReply send can create the owner. Every
+// ReReply WhatsApp send that produces a Message commits it as pending (with
+// an empty WAMID) before calling Graph and commits the returned WAMID right
+// after: in the same provider transaction, or in a recovery or settlement
+// bounded by outgoingDeliveryRecoveryTimeout and
+// campaignDurableSettlementTimeout (10s), behind a Graph call bounded by
+// whatsapp.DefaultTimeout (30s) or, for automatic AI replies,
+// defaultInboundAIAttemptTimeout (2m). Meta stamps a status with the time of
+// its event, which is never earlier than Meta accepting the send. Once a
+// status is older than this window and its WAMID is still absent, no ReReply
+// send can claim it any more: it belongs to a message ReReply never stored (a
+// WhatsApp Business app reply on a classic account, a reaction or call
+// permission request, which produce no Message, or a send by another app on
+// the number), so a retry can never succeed.
+//
+// Assumptions: Meta's retries resend the original status timestamp (were a
+// retry ever re-stamped, its status would stay inside the window and keep the
+// previous retry behaviour), and the server clock is NTP-synchronised to
+// within a few minutes. A clock running fast by more than the window would
+// acknowledge genuine early receipts; a slow clock only delays acknowledgement.
+const whatsAppOrphanStatusGrace = 15 * time.Minute
+
+// whatsAppStatusClockSkew is how far in the future a status timestamp may lie
+// and still count as a fresh event rather than an unusable one. It only
+// chooses the log level: a future timestamp is never settled.
+const whatsAppStatusClockSkew = time.Minute
+
+// whatsAppOrphanStatusAge reports the age of a status event, whether its
+// timestamp is usable, and whether it is past whatsAppOrphanStatusGrace. A
+// missing, malformed, zero or future timestamp is never settled, so such a
+// status keeps the retry contract; one that is missing, malformed, zero or
+// more than whatsAppStatusClockSkew in the future (for example milliseconds
+// read as seconds) is also reported as unusable.
+func whatsAppOrphanStatusAge(rawTimestamp string, now time.Time) (age time.Duration, usable, settled bool) {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(rawTimestamp), 10, 64)
+	if err != nil || seconds <= 0 {
+		return 0, false, false
+	}
+	age = now.Sub(time.Unix(seconds, 0))
+	if age < -whatsAppStatusClockSkew {
+		return age, false, false
+	}
+	return age, true, age >= whatsAppOrphanStatusGrace
+}
+
+// whatsAppStatusOwnerAbsent proves, inside the status transaction, that no
+// Message in the tenant (live or soft-deleted, linked or unlinked) carries
+// this WAMID or its deterministic Coexistence identity. The resolver's
+// gorm.ErrRecordNotFound alone is not that proof: a row that is not a resolver
+// candidate (a linked row of another provider, live or soft-deleted, whose
+// WAMID may even be untrimmed because chk_messages_whatsapp_message_id_trimmed
+// exempts it) can still carry the WAMID, and such a status must keep failing
+// closed. The deterministic-id clause is defensive only: the resolver's
+// candidate query already returns any row with that id, and the WAMID advisory
+// lock held by the caller stops one from appearing in between.
+//
+// The proof requires READ COMMITTED. The caller takes the WAMID advisory lock
+// first, and only a fresh per-statement snapshot sees an owner that committed
+// while this transaction waited for that lock; a REPEATABLE READ snapshot could
+// predate it, so any other isolation level fails closed.
+func (a *App) whatsAppStatusOwnerAbsent(account *models.WhatsAppAccount, wamid string) (bool, error) {
+	wamid = strings.TrimSpace(wamid)
+	if a == nil || a.DB == nil || account == nil || account.ID == uuid.Nil ||
+		account.OrganizationID == uuid.Nil || wamid == "" {
+		return false, errors.New("WhatsApp status owner absence proof is incomplete")
+	}
+	var isolation string
+	if err := a.DB.Raw("SHOW transaction_isolation").Scan(&isolation).Error; err != nil {
+		return false, fmt.Errorf("read status transaction isolation: %w", err)
+	}
+	if isolation != "read committed" {
+		return false, fmt.Errorf(
+			"WhatsApp status owner absence proof requires read committed isolation, got %q",
+			isolation,
+		)
+	}
+	var owners int64
+	if err := a.DB.Unscoped().Model(&models.Message{}).Where(
+		"organization_id = ? AND (id = ? OR BTRIM(whats_app_message_id) = ?)",
+		account.OrganizationID,
+		uuid.NewSHA1(account.ID, []byte("coexistence-message:"+wamid)),
+		wamid,
+	).Count(&owners).Error; err != nil {
+		return false, err
+	}
+	return owners == 0, nil
 }
 
 // statusPriority returns the priority of a status (higher = more progressed)

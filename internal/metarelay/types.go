@@ -140,6 +140,12 @@ type Config struct {
 	RegistryEdgeSecret          string
 	RegistryCacheTTL            time.Duration
 	RegistryTimeout             time.Duration
+	// Environment is production unless META_RELAY_ENVIRONMENT names staging,
+	// local, or test. Only those may set the Graph base URLs, which point the
+	// relay at a Graph stub; empty values keep Meta's own hosts.
+	Environment           string
+	FacebookGraphBaseURL  string
+	InstagramGraphBaseURL string
 
 	// allowInsecureTestEndpoints can only be set by package tests/options. It
 	// is deliberately not sourced from an environment variable.
