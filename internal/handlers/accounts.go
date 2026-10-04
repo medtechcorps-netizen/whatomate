@@ -1649,7 +1649,14 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 	)
 	discoveryCancel()
 	if errors.Is(err, errEmbeddedSignupAccountInspection) {
-		a.Log.Error("Failed to inspect existing WhatsApp account API version", "organization_id", orgID)
+		inspectionStage := "unknown"
+		var inspectionErr *embeddedSignupAccountInspectionError
+		if errors.As(err, &inspectionErr) {
+			inspectionStage = inspectionErr.stage
+		}
+		a.Log.Error("Failed to inspect existing WhatsApp account API version",
+			"organization_id", orgID,
+			"stage", inspectionStage)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to inspect the existing WhatsApp account", nil, "")
 	}
 	if err != nil {
@@ -2505,6 +2512,30 @@ type embeddedSignupAccountVersion struct {
 // configured version and meets the existing exact-contract rejection.
 var embeddedSignupKeptAPIVersionPattern = regexp.MustCompile(`^v[0-9]{1,3}\.[0-9]{1,3}$`)
 
+// Local steps of the pre-validation account inspection. Each is a fixed,
+// non-secret label that may be logged in place of the underlying error, which
+// can carry database or credential details.
+const (
+	embeddedSignupInspectionStageAccountLookup = "account_lookup"
+	embeddedSignupInspectionStageAppCredential = "legacy_app_credentials"
+	embeddedSignupInspectionStageTenantScope   = "tenant_transaction"
+)
+
+// embeddedSignupAccountInspectionError reports which local step failed while
+// inspecting the existing account before Graph validation. It deliberately
+// drops the underlying error and matches errEmbeddedSignupAccountInspection.
+type embeddedSignupAccountInspectionError struct {
+	stage string
+}
+
+func (e *embeddedSignupAccountInspectionError) Error() string {
+	return errEmbeddedSignupAccountInspection.Error() + ": " + e.stage
+}
+
+func (e *embeddedSignupAccountInspectionError) Unwrap() error {
+	return errEmbeddedSignupAccountInspection
+}
+
 // embeddedSignupAccountAPIVersion keeps the verified provider contract of a
 // live account that enters or refreshes Coexistence after the server's
 // configured API version has changed. It neither migrates versions nor relaxes
@@ -2531,7 +2562,7 @@ func (a *App) embeddedSignupAccountAPIVersion(
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil
 			}
-			return err
+			return &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageAccountLookup}
 		}
 		storedVersion := strings.TrimSpace(account.APIVersion)
 		if storedVersion == "" ||
@@ -2546,8 +2577,13 @@ func (a *App) embeddedSignupAccountAPIVersion(
 			storedVersion,
 			metaSnapshot,
 		)
-		if err != nil || !matches {
-			return err
+		if err != nil {
+			// Only a pinned legacy app secret that cannot be decrypted (or a
+			// missing encryption key) makes the contract check fail.
+			return &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageAppCredential}
+		}
+		if !matches {
+			return nil
 		}
 		version = embeddedSignupAccountVersion{
 			apiVersion: storedVersion,
@@ -2558,7 +2594,11 @@ func (a *App) embeddedSignupAccountAPIVersion(
 		return nil
 	})
 	if err != nil {
-		return embeddedSignupAccountVersion{}, err
+		var inspectionErr *embeddedSignupAccountInspectionError
+		if !errors.As(err, &inspectionErr) {
+			inspectionErr = &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageTenantScope}
+		}
+		return embeddedSignupAccountVersion{}, inspectionErr
 	}
 	return version, nil
 }
@@ -2654,7 +2694,9 @@ func (a *App) discoverWABAAndPhone(
 
 	accountVersion, err := a.embeddedSignupAccountAPIVersion(orgID, signupMode, phoneID, wabaID, metaSnapshot)
 	if err != nil {
-		return "", "", "", nil, nil, embeddedSignupAccountVersion{}, errEmbeddedSignupAccountInspection
+		// Always an *embeddedSignupAccountInspectionError, which matches
+		// errEmbeddedSignupAccountInspection and carries no underlying detail.
+		return "", "", "", nil, nil, embeddedSignupAccountVersion{}, err
 	}
 
 	// Even when the browser supplied both IDs, verify the token can read each

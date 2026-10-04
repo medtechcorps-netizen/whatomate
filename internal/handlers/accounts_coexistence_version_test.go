@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -13,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"github.com/zerodha/logf"
 )
 
 // The server default has advanced past the version stored on a live account.
@@ -705,5 +708,115 @@ func TestEmbeddedSignupUsesConfiguredAPIVersionOutsideKeptLiveAccount(t *testing
 		assert.Equal(t, 1, f.meta.methodHits(http.MethodGet, "/"+coexistenceConfiguredAPIVersion+"/"+f.wabaID+"/subscribed_apps"))
 		assert.Equal(t, 2, f.meta.hit("/"+coexistenceConfiguredAPIVersion+"/"+f.phoneID+"/smb_app_data"))
 		assert.Zero(t, f.meta.versionHits(coexistenceStoredAPIVersion))
+	})
+}
+
+// coexistenceLogBuffer collects one App's log output for assertions.
+type coexistenceLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *coexistenceLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *coexistenceLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// A local failure while inspecting the existing account is a 500 that changes
+// nothing. The log names only a fixed stage label, never the underlying error.
+func TestEmbeddedSignupAccountInspectionFailureNamesOnlyItsStage(t *testing.T) {
+	undecryptableLegacySecret := func(t *testing.T, account *models.WhatsAppAccount) {
+		t.Helper()
+		var err error
+		account.AppID = contractMetaAppID
+		account.AppSecret, err = appcrypto.Encrypt(contractMetaAppSecret, "another-synthetic-encryption-key-long-enough")
+		require.NoError(t, err)
+	}
+	snapshot := embeddedSignupMetaSnapshot{
+		appID:      contractMetaAppID,
+		appSecret:  contractMetaAppSecret,
+		apiVersion: coexistenceConfiguredAPIVersion,
+	}
+
+	t.Run("helper names the failed stage", func(t *testing.T) {
+		f := newCoexistenceVersionFixture(t)
+		account := f.liveClassicAccount(t, coexistenceStoredAPIVersion)
+		undecryptableLegacySecret(t, &account)
+		require.NoError(t, f.app.DB.Create(&account).Error)
+
+		for _, tc := range []struct {
+			name      string
+			orgID     uuid.UUID
+			wantStage string
+		}{
+			{name: "undecryptable legacy app secret", orgID: f.org.ID, wantStage: embeddedSignupInspectionStageAppCredential},
+			{name: "unknown organization", orgID: uuid.New(), wantStage: embeddedSignupInspectionStageTenantScope},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				version, err := f.app.embeddedSignupAccountAPIVersion(tc.orgID, embeddedSignupModeCoexistence, f.phoneID, f.wabaID, snapshot)
+				require.ErrorIs(t, err, errEmbeddedSignupAccountInspection)
+				var inspectionErr *embeddedSignupAccountInspectionError
+				require.ErrorAs(t, err, &inspectionErr)
+				assert.Equal(t, tc.wantStage, inspectionErr.stage)
+				assert.Equal(t, embeddedSignupAccountVersion{}, version)
+				assert.NotContains(t, err.Error(), "decrypt")
+				assert.NotContains(t, err.Error(), "record not found")
+			})
+		}
+	})
+
+	t.Run("a stored version that is not kept never reaches the legacy secret", func(t *testing.T) {
+		for _, stored := range []string{coexistenceConfiguredAPIVersion, "V21.0"} {
+			f := newCoexistenceVersionFixture(t)
+			account := f.liveClassicAccount(t, stored)
+			undecryptableLegacySecret(t, &account)
+			require.NoError(t, f.app.DB.Create(&account).Error)
+
+			version, err := f.app.embeddedSignupAccountAPIVersion(f.org.ID, embeddedSignupModeCoexistence, f.phoneID, f.wabaID, snapshot)
+			require.NoError(t, err, stored)
+			assert.Equal(t, embeddedSignupAccountVersion{apiVersion: coexistenceConfiguredAPIVersion}, version, stored)
+		}
+	})
+
+	t.Run("signup returns 500 and changes nothing", func(t *testing.T) {
+		f := newCoexistenceVersionFixture(t)
+		logs := &coexistenceLogBuffer{}
+		f.app.Log = logf.New(logf.Opts{Writer: logs, Level: logf.InfoLevel})
+		account := f.liveClassicAccount(t, coexistenceStoredAPIVersion)
+		undecryptableLegacySecret(t, &account)
+		require.NoError(t, f.app.DB.Create(&account).Error)
+		before := f.reload(t, account.ID)
+
+		req := f.exchange(t, f.org.ID, f.user.ID, f.signupBody("synthetic-inspection-failure-code", embeddedSignupModeCoexistence))
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusInternalServerError, "Failed to inspect the existing WhatsApp account")
+
+		stored := f.reload(t, account.ID)
+		assert.Equal(t, before.AccessToken, stored.AccessToken)
+		assert.Equal(t, before.Pin, stored.Pin)
+		assert.Equal(t, before.AppSecret, stored.AppSecret)
+		assert.Equal(t, coexistenceStoredAPIVersion, stored.APIVersion)
+		assert.Equal(t, "active", stored.Status)
+		assert.False(t, stored.IsSMB)
+		assert.True(t, stored.UpdatedAt.Equal(before.UpdatedAt))
+		assert.EqualValues(t, 1, f.phoneRows(t))
+		assert.Zero(t, f.coexistenceStates(t))
+		// The failure lands before any account-scoped Graph call.
+		assert.Zero(t, f.meta.versionHits(coexistenceStoredAPIVersion))
+		assert.Equal(t, 1, f.meta.versionHits(coexistenceConfiguredAPIVersion), "only the code exchange ran")
+		f.assertNoProviderMutation(t)
+
+		output := logs.String()
+		assert.Contains(t, output, "Failed to inspect existing WhatsApp account API version")
+		assert.Contains(t, output, "stage="+embeddedSignupInspectionStageAppCredential)
+		assert.NotContains(t, output, "decrypt")
+		assert.NotContains(t, output, before.AppSecret)
+		assert.NotContains(t, output, contractMetaAppSecret)
 	})
 }
