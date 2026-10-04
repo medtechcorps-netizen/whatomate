@@ -453,6 +453,7 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH
           scanners: vuln
+          trivyignores: release/deployment/ci-canary-driver.trivyignore
 
   recovery-boundary-images:
     name: recovery-boundary-images (${{ matrix.role }})

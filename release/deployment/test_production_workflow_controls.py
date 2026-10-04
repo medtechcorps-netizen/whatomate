@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import re
@@ -10,7 +11,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from release.deployment import verify_rollout_evidence
+from release.deployment import trivy_policy, verify_rollout_evidence
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -136,9 +137,10 @@ EXACT_AGGREGATE_ARTIFACT_BOUNDARY_SHA256 = {
 }
 # 2026-10-03: re-pinned (was f11d0390, before that 0eb4da20) for the CI
 # margins: per-run concurrency groups on main, the go-race 150m per-package
-# timeout and the tenant-isolation job and test timeouts.
+# timeout and the tenant-isolation job and test timeouts. 2026-10-04:
+# re-pinned (was 13f4f063) for the canary driver scan's expiring exceptions.
 EXACT_GATE_B_TEST_WORKFLOW_SHA256 = (
-    "13f4f0636b46e3b8989464a696903ec75fd6fd350793a78cd8da3fd08dfa0537"
+    "426e529337c8cee26fae564aab6f092aa9d44c04e9f4e8d4cbbae479aca45c46"
 )
 EXACT_CLEANUP_WORKFLOW_SHA256 = (
     "7031482c0c388b1d69ccc140f54ac8ec6f75ac34ec6d79624d2a6ae129c06421"
@@ -154,8 +156,9 @@ EXACT_GATE_B_TEST_JOB_SHA256 = {
     # 2026-10-03: re-pinned (was 863b563a) for the 150m per-package timeout.
     "go-race": "49f27125029cbe88e316e3f8a2afd31f3dae047105450912b8099c16049e4df7",
     "lint": "a2402a41b92ca872b93b87e2e24cdd3d4b3703bfcf3534d1e1bf410bf0fe619c",
-    # 2026-10-03: re-pinned (was 8058851a) for the dated braces exception.
-    "security": "4704cd65e97571ceaa8067e31a9884490cedb92733aea0e1610108223068ec2f",
+    # 2026-10-03: re-pinned (was 8058851a) for the dated braces exception;
+    # 2026-10-04: re-pinned (was 4704cd65) for the driver scan's exceptions.
+    "security": "0849ce34e4d18b318d2475203a0bbeac61402896732a70b9b57b80376a74dff6",
     "recovery-boundary-images": (
         "90daa97f1350ea5ec53dfc0b86416138fc4737928e6a7d089c33276aa36eaea2"
     ),
@@ -612,8 +615,20 @@ def assert_gate_b_test_workflow(source: str) -> None:
         "vuln-type: os,library",
         "severity: CRITICAL,HIGH",
         "scanners: vuln",
+        "trivyignores: release/deployment/ci-canary-driver.trivyignore",
     ):
         raise AssertionError("CRM canary driver scan differs")
+    # The driver scan alone reads a reviewed, expiring exception file: same
+    # format and checker as ship.trivyignore, braces advisories only.
+    driver_ignore = ROOT / "release/deployment/ci-canary-driver.trivyignore"
+    trivy_policy.check(driver_ignore, datetime.date.today())
+    driver_ids = {
+        line.split(" ", 1)[0]
+        for line in driver_ignore.read_text(encoding="ascii").splitlines()
+        if line and not line.startswith("#")
+    }
+    if driver_ids != {"CVE-2026-93687", "GHSA-vfj7-8cjw-p6xm"}:
+        raise AssertionError("CRM canary driver scan exceptions differ")
     production_scan = step_block(security, "Scan production container")
     if not (
         security.index(frontend_audit)
@@ -3085,8 +3100,15 @@ class WorkflowAuthorityPolicyTests(unittest.TestCase):
                 1,
             ),
             "crm-driver-vulnerability-scanner-replaced": source.replace(
-                "          scanners: vuln\n\n  recovery-boundary-images:",
-                "          scanners: secret\n\n  recovery-boundary-images:",
+                "          scanners: vuln\n"
+                "          trivyignores: release/deployment/ci-canary-driver.trivyignore\n",
+                "          scanners: secret\n"
+                "          trivyignores: release/deployment/ci-canary-driver.trivyignore\n",
+                1,
+            ),
+            "crm-driver-scan-exception-file-swapped": source.replace(
+                "          trivyignores: release/deployment/ci-canary-driver.trivyignore\n",
+                "          trivyignores: release/deployment/ship.trivyignore\n",
                 1,
             ),
             "crm-driver-scan-ambient-suppression": source.replace(
