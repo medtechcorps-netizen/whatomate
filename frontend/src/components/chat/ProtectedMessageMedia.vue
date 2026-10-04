@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { AlertCircle, FileText, Loader2, RotateCw } from 'lucide-vue-next'
 import { messagesService } from '@/services/api'
+import { displaySafeMediaBlob, INLINE_IMAGE_TYPES, type ChatMediaKind } from '@/lib/chatMedia'
 import type { Message } from '@/stores/contacts'
 
 // Renders chat media from the authenticated API client instead of a native
@@ -10,7 +11,7 @@ import type { Message } from '@/stores/contacts'
 // X-Organization-ID header, so in any workspace other than the login default
 // the server looked the message up in the wrong tenant and answered 404.
 
-type MediaKind = 'image' | 'sticker' | 'video' | 'audio' | 'document'
+type MediaKind = ChatMediaKind
 
 const props = defineProps<{
   // Workspace the transcript was loaded from; every request is pinned to it.
@@ -46,13 +47,8 @@ const imageAlt = computed(() => {
   return props.message.content?.body || t('chat.image')
 })
 
-// Only raster images open in a new tab. The object URL shares this app's
-// origin, so a scriptable type (SVG, HTML) must never become a document.
-const previewable = computed(() =>
-  status.value === 'ready'
-  && loadedType.value.startsWith('image/')
-  && !loadedType.value.startsWith('image/svg'),
-)
+// Only raster images open in a new tab (see displaySafeMediaBlob).
+const previewable = computed(() => status.value === 'ready' && INLINE_IMAGE_TYPES.has(loadedType.value))
 
 function releaseMedia() {
   generation++
@@ -84,8 +80,9 @@ async function loadMedia(): Promise<string> {
     if (requestGeneration !== generation) return ''
     const blob = response.data
     if (!(blob instanceof Blob) || blob.size === 0) throw new Error('Empty media response')
-    mediaURL.value = URL.createObjectURL(blob)
-    loadedType.value = blob.type
+    const displayBlob = displaySafeMediaBlob(blob, kind.value)
+    mediaURL.value = URL.createObjectURL(displayBlob)
+    loadedType.value = displayBlob.type
     status.value = 'ready'
     return mediaURL.value
   } catch {

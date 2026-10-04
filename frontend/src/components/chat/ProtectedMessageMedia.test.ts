@@ -71,21 +71,44 @@ describe('ProtectedMessageMedia', () => {
     const view = mountMedia()
     await flushPromises()
 
+    expect((createURL.mock.calls[0][0] as Blob).type).toBe('image/jpeg')
     await view.get('button').trigger('click')
     expect(open).toHaveBeenCalledWith('blob:protected-photo', '_blank')
   })
 
-  it('never opens a scriptable image type as a same-origin document', async () => {
-    mocks.getMedia.mockResolvedValueOnce(mediaResponse('image/svg+xml'))
+  it('never gives a scriptable image a renderable type or a new-tab preview', async () => {
+    mocks.getMedia.mockResolvedValueOnce({
+      data: new Blob(['<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'], { type: 'image/svg+xml' }),
+    })
     const open = vi.fn()
     vi.stubGlobal('open', open)
     const view = mountMedia()
     await flushPromises()
 
-    expect(view.get('img').attributes('src')).toBe('blob:protected-photo')
+    // "Open image in new tab" on this object URL must download, not render.
+    expect((createURL.mock.calls[0][0] as Blob).type).toBe('application/octet-stream')
     expect(view.find('button').exists()).toBe(false)
     await view.get('img').trigger('click')
     expect(open).not.toHaveBeenCalled()
+  })
+
+  it('downloads a customer HTML document as opaque bytes instead of a same-origin page', async () => {
+    const html = '<script>localStorage.setItem("compromised", "1")</script>'
+    mocks.getMedia.mockResolvedValueOnce({ data: new Blob([html], { type: 'text/html' }) })
+    const clicked = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const view = mountMedia({
+      message: { ...imageMessage, message_type: 'document', media_mime_type: 'text/html', media_filename: 'visit-summary.html' },
+    })
+
+    await view.get('button').trigger('click')
+    await flushPromises()
+
+    const blob = createURL.mock.calls[0][0] as Blob
+    expect(blob.type).toBe('application/octet-stream')
+    expect(await blob.text()).toBe(html)
+    expect(view.get('a[download]').attributes('download')).toBe('visit-summary.html')
+    expect(clicked).toHaveBeenCalledTimes(1)
+    clicked.mockRestore()
   })
 
   it('fails closed instead of falling back to the login workspace when no workspace is known', async () => {

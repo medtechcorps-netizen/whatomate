@@ -12,6 +12,13 @@ const loginWorkspaceId = "f1111111-1111-4111-8111-111111111111";
 const selectedWorkspaceId = "f2222222-2222-4222-8222-222222222222";
 const contactId = "f3333333-3333-4333-8333-333333333333";
 const imageMessageId = "f4444444-4444-4444-8444-444444444444";
+const documentMessageId = "f8888888-8888-4888-8888-888888888888";
+
+// A customer document that would run script if it rendered in the CRM origin.
+const customerHtml =
+  "<!doctype html><title>Visit summary</title>" +
+  "<script>localStorage.setItem('chat-media-script', 'inline')</script>" +
+  "<img src=\"missing.png\" onerror=\"localStorage.setItem('chat-media-script', 'handler')\">";
 
 const user = {
   id: "f5555555-5555-4555-8555-555555555555",
@@ -75,7 +82,12 @@ const at = (index: number) => new Date(baseTime + index * 60_000).toISOString();
 
 type MediaRequest = { messageId: string; organizationId: string | null };
 
-async function mockApi(page: Page) {
+type MockOptions = {
+  // An HTML document from the customer as the newest message.
+  htmlDocument?: boolean;
+};
+
+async function mockApi(page: Page, options: MockOptions = {}) {
   const mediaRequests: MediaRequest[] = [];
   let releaseMedia!: () => void;
   const mediaGate = new Promise<void>((resolve) => {
@@ -140,6 +152,23 @@ async function mockApi(page: Page) {
       created_at: at(textCount),
       updated_at: at(textCount),
     },
+    ...(options.htmlDocument
+      ? [
+          {
+            id: documentMessageId,
+            contact_id: contactId,
+            direction: "incoming",
+            message_type: "document",
+            content: { body: "" },
+            media_url: `organizations/${selectedWorkspaceId}/messages/documents/visit-summary.html`,
+            media_mime_type: "text/html",
+            media_filename: "visit-summary.html",
+            status: "received",
+            created_at: at(textCount + 1),
+            updated_at: at(textCount + 1),
+          },
+        ]
+      : []),
   ];
 
   await page.route(/\/api\/contacts(?:\?.*)?$/, (route) =>
@@ -156,10 +185,15 @@ async function mockApi(page: Page) {
     const messageId = new URL(request.url()).pathname.split("/").pop() ?? "";
     const organizationId = await request.headerValue("x-organization-id");
     mediaRequests.push({ messageId, organizationId });
-    if (messageId !== imageMessageId || organizationId !== selectedWorkspaceId) {
+    const known = messageId === imageMessageId || (options.htmlDocument && messageId === documentMessageId);
+    if (!known || organizationId !== selectedWorkspaceId) {
       // Without the header the server resolves the login workspace, where
       // this message does not exist.
       await route.fulfill({ status: 404, json: { status: "error", message: "Message not found" } });
+      return;
+    }
+    if (messageId === documentMessageId) {
+      await route.fulfill({ status: 200, contentType: "text/html", body: customerHtml });
       return;
     }
     await mediaGate;
@@ -179,10 +213,14 @@ async function distanceFromBottom(page: Page) {
   }, scroller);
 }
 
-function imageMedia(page: Page) {
+function messageMedia(page: Page, messageId: string) {
   return page.locator(
-    `[data-testid="chat-message"][data-message-id="${imageMessageId}"] [data-testid="chat-message-media"]`,
+    `[data-testid="chat-message"][data-message-id="${messageId}"] [data-testid="chat-message-media"]`,
   );
+}
+
+function imageMedia(page: Page) {
+  return messageMedia(page, imageMessageId);
 }
 
 async function naturalWidth(page: Page) {
@@ -230,6 +268,39 @@ test.describe("Chat media in a non-default workspace", () => {
       )
       .toBe(imageWidth);
     await popup.close();
+  });
+
+  test("downloads a customer HTML document instead of running it in the CRM origin", async ({ page }) => {
+    const { mediaRequests } = await mockApi(page, { htmlDocument: true });
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto(`/chat/${contactId}`);
+
+    const documentMedia = messageMedia(page, documentMessageId);
+    await expect(documentMedia).toHaveAttribute("data-media-status", "idle");
+    const downloadPromise = page.waitForEvent("download");
+    await documentMedia.getByRole("button", { name: "visit-summary.html" }).click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe("visit-summary.html");
+    expect(mediaRequests.filter((request) => request.messageId === documentMessageId)).toEqual([
+      { messageId: documentMessageId, organizationId: selectedWorkspaceId },
+    ]);
+
+    // "Open link in new tab" on the attachment: the object URL shares this
+    // origin, so the browser must download the bytes, not render the page.
+    const href = await documentMedia.locator("a[download]").getAttribute("href");
+    expect(href).toMatch(/^blob:/);
+    const newTab = await page.context().newPage();
+    const newTabDownload = newTab.waitForEvent("download");
+    // Playwright reports a navigation that turns into a download as an error.
+    const opened = await newTab.goto(href ?? "").then(
+      () => "rendered as a page",
+      (error: Error) => error.message,
+    );
+    expect(opened).toContain("Download is starting");
+    await newTabDownload;
+    await page.waitForTimeout(300);
+    expect(await page.evaluate(() => localStorage.getItem("chat-media-script"))).toBeNull();
+    await newTab.close();
   });
 
   test("does not pull a reader who scrolled up when an image finishes loading", async ({ page }) => {

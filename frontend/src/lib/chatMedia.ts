@@ -1,0 +1,66 @@
+export type ChatMediaKind = 'image' | 'sticker' | 'video' | 'audio' | 'document'
+
+// Chat media is shown from object URLs. An object URL has this app's origin
+// but none of the CSP or nosniff headers the server sends with /api/media, and
+// the browser renders it by the blob's type when an agent uses "Open image in
+// new tab" or "Open link in new tab". A customer's HTML, SVG or XML file would
+// then run script in the CRM's origin. So only types that render inertly keep
+// their type; anything else, and every document, becomes an opaque download.
+// "+xml" types are excluded on purpose: browsers render them as XML documents.
+export const INLINE_IMAGE_TYPES: ReadonlySet<string> = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'image/avif',
+  'image/bmp',
+])
+
+const INLINE_VIDEO_TYPES: ReadonlySet<string> = new Set([
+  'video/mp4',
+  'video/3gpp',
+  'video/3gpp2',
+  'video/webm',
+  'video/ogg',
+  'video/quicktime',
+  'video/mpeg',
+  'video/x-m4v',
+])
+
+const INLINE_AUDIO_TYPES: ReadonlySet<string> = new Set([
+  'audio/aac',
+  'audio/mp4',
+  'audio/mpeg',
+  'audio/mp3',
+  'audio/amr',
+  'audio/ogg',
+  'audio/opus',
+  'audio/wav',
+  'audio/x-wav',
+  'audio/wave',
+  'audio/webm',
+  'audio/x-m4a',
+  'audio/3gpp',
+  'audio/flac',
+])
+
+export const OPAQUE_MEDIA_TYPE = 'application/octet-stream'
+
+export function displaySafeMediaType(type: string, kind: ChatMediaKind): string {
+  // Parameters are dropped too, so nothing after the essence can change how
+  // the type is parsed when the object URL is opened.
+  const essence = type.split(';', 1)[0].trim().toLowerCase()
+  const inlineTypes =
+    kind === 'image' || kind === 'sticker'
+      ? INLINE_IMAGE_TYPES
+      : kind === 'video'
+        ? INLINE_VIDEO_TYPES
+        : kind === 'audio'
+          ? INLINE_AUDIO_TYPES
+          : null
+  return inlineTypes?.has(essence) ? essence : OPAQUE_MEDIA_TYPE
+}
+
+export function displaySafeMediaBlob(blob: Blob, kind: ChatMediaKind): Blob {
+  return new Blob([blob], { type: displaySafeMediaType(blob.type, kind) })
+}
