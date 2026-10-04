@@ -1,14 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +30,7 @@ import (
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/zerodha/logf"
 	"gorm.io/gorm"
 )
 
@@ -768,6 +772,13 @@ func TestProcessStatusUpdateRejectsUnprovenSameTenantOwner(t *testing.T) {
 	require.NoError(t, app.DB.Create(&unproven).Error)
 
 	require.Error(t, app.processStatusUpdate(account.PhoneID, WebhookStatus{ID: wamid, Status: "delivered"}))
+	// An existing but unproven owner is not absence: it keeps failing closed
+	// even long after the orphan grace window.
+	require.Error(t, app.processStatusUpdate(account.PhoneID, WebhookStatus{
+		ID:        wamid,
+		Status:    "delivered",
+		Timestamp: strconv.FormatInt(time.Now().Add(-6*time.Hour).Unix(), 10),
+	}))
 
 	var storedUnproven models.Message
 	require.NoError(t, app.DB.First(&storedUnproven, unproven.ID).Error)
@@ -800,6 +811,685 @@ func TestProcessStatusUpdateRejectsCrossTenantPhoneCollision(t *testing.T) {
 	require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
 	assert.Equal(t, models.MessageStatusDelivered, storedOwner.Status)
 	assert.Equal(t, models.MessageStatusDelivered, storedRecipient.Status)
+}
+
+func TestWhatsAppOrphanStatusAge(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_800_000_000, 0)
+	unix := func(at time.Time) string { return strconv.FormatInt(at.Unix(), 10) }
+
+	for name, tc := range map[string]struct {
+		raw     string
+		usable  bool
+		settled bool
+	}{
+		"missing":            {raw: "", usable: false, settled: false},
+		"malformed":          {raw: "not-a-time", usable: false, settled: false},
+		"zero":               {raw: "0", usable: false, settled: false},
+		"negative":           {raw: "-60", usable: false, settled: false},
+		"milliseconds":       {raw: strconv.FormatInt(now.Add(-time.Hour).UnixMilli(), 10), usable: false, settled: false},
+		"future":             {raw: unix(now.Add(whatsAppStatusClockSkew + time.Second)), usable: false, settled: false},
+		"within clock skew":  {raw: unix(now.Add(whatsAppStatusClockSkew)), usable: true, settled: false},
+		"fresh":              {raw: unix(now), usable: true, settled: false},
+		"just inside":        {raw: unix(now.Add(-whatsAppOrphanStatusGrace + time.Second)), usable: true, settled: false},
+		"at grace":           {raw: unix(now.Add(-whatsAppOrphanStatusGrace)), usable: true, settled: true},
+		"well past grace":    {raw: unix(now.Add(-6 * time.Hour)), usable: true, settled: true},
+		"padded old value":   {raw: " " + unix(now.Add(-time.Hour)) + " ", usable: true, settled: true},
+		"padded fresh value": {raw: " " + unix(now) + " ", usable: true, settled: false},
+	} {
+		_, usable, settled := whatsAppOrphanStatusAge(tc.raw, now)
+		assert.Equal(t, tc.usable, usable, name)
+		assert.Equal(t, tc.settled, settled, name)
+	}
+	age, usable, settled := whatsAppOrphanStatusAge(unix(now.Add(-time.Hour)), now)
+	assert.True(t, usable)
+	assert.True(t, settled)
+	assert.Equal(t, time.Hour, age)
+}
+
+func orphanStatusTestAccount(t *testing.T, app *App, isSMB bool) models.WhatsAppAccount {
+	t.Helper()
+	uid := uuid.NewString()[:8]
+	org := models.Organization{
+		BaseModel: models.BaseModel{ID: uuid.New()},
+		Name:      "orphan-status-org-" + uid,
+		Slug:      "orphan-status-org-" + uid,
+	}
+	require.NoError(t, app.DB.Create(&org).Error)
+	account := models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "orphan-status-account-" + uid,
+		PhoneID:        "orphan-status-phone-" + uid,
+		BusinessID:     "orphan-status-waba-" + uid,
+		AccessToken:    "token",
+		Status:         "active",
+		IsSMB:          isSMB,
+	}
+	require.NoError(t, app.DB.Create(&account).Error)
+	return account
+}
+
+func orphanStatusAt(wamid, value string, at time.Time) map[string]any {
+	return map[string]any{
+		"id":           wamid,
+		"status":       value,
+		"timestamp":    strconv.FormatInt(at.Unix(), 10),
+		"recipient_id": "15550000002",
+	}
+}
+
+func orphanStatusBody(t *testing.T, account models.WhatsAppAccount, statuses ...map[string]any) []byte {
+	t.Helper()
+	items := make([]any, 0, len(statuses))
+	for _, status := range statuses {
+		items = append(items, status)
+	}
+	body, err := json.Marshal(map[string]any{
+		"object": "whatsapp_business_account",
+		"entry": []any{map[string]any{
+			"id": account.BusinessID,
+			"changes": []any{map[string]any{
+				"field": "messages",
+				"value": map[string]any{
+					"messaging_product": "whatsapp",
+					"metadata":          map[string]any{"phone_number_id": account.PhoneID},
+					"statuses":          items,
+				},
+			}},
+		}},
+	})
+	require.NoError(t, err)
+	return body
+}
+
+func orphanEchoBody(account models.WhatsAppAccount, wamid string) []byte {
+	return []byte(`{
+		"object":"whatsapp_business_account",
+		"entry":[{"id":"` + account.BusinessID + `","changes":[
+			{"field":"smb_message_echoes","value":{
+				"messaging_product":"whatsapp",
+				"metadata":{"phone_number_id":"` + account.PhoneID + `"},
+				"message_echoes":[{"from":"15550000001","to":"15550000002",
+					"id":"` + wamid + `","timestamp":"` + strconv.FormatInt(time.Now().Unix(), 10) + `",
+					"type":"text","text":{"body":"synthetic phone-app reply"}}]
+			}}
+		]}]
+	}`)
+}
+
+func signedWebhookStatusCode(t *testing.T, app *App, body []byte) int {
+	t.Helper()
+	req := testutil.NewRequest(t)
+	req.RequestCtx.Request.Header.SetMethod("POST")
+	req.RequestCtx.Request.Header.SetContentType("application/json")
+	req.RequestCtx.Request.Header.Set("X-Hub-Signature-256", webhookTestSignature(body))
+	req.RequestCtx.Request.SetBody(body)
+	require.NoError(t, app.WebhookHandler(req))
+	return req.RequestCtx.Response.StatusCode()
+}
+
+// The production gap: a classic account ignores the WhatsApp Business app
+// echo, so the echo's later statuses can never resolve. A fresh one (or one
+// without a usable timestamp) is still retried; once it is older than the
+// grace window it is acknowledged without any write.
+func TestWebhookStatusForIgnoredClassicEchoIsAcknowledgedAfterGrace(t *testing.T) {
+	app := webhookTestApp(t)
+	account := orphanStatusTestAccount(t, app, false)
+	wamid := "wamid.synthetic-classic-echo-" + uuid.NewString()
+
+	sendSignedWebhook(t, app, orphanEchoBody(account, wamid))
+
+	fresh := orphanStatusBody(t, account, orphanStatusAt(wamid, "delivered", time.Now()))
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, fresh))
+	untimed := orphanStatusBody(t, account, map[string]any{"id": wamid, "status": "delivered"})
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, untimed))
+	malformed := orphanStatusBody(t, account, map[string]any{"id": wamid, "status": "delivered", "timestamp": "yesterday"})
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, malformed))
+
+	settled := orphanStatusBody(t, account, orphanStatusAt(wamid, "read", time.Now().Add(-whatsAppOrphanStatusGrace-time.Minute)))
+	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, settled))
+	// Meta duplicates and retries stay idempotent.
+	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, settled))
+
+	var messages, contacts int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Message{}).Where("organization_id = ?", account.OrganizationID).Count(&messages).Error)
+	require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).Where("organization_id = ?", account.OrganizationID).Count(&contacts).Error)
+	assert.Zero(t, messages)
+	assert.Zero(t, contacts)
+}
+
+// A settled orphan no longer blocks the known receipt delivered beside it in
+// the same webhook POST; on main the whole POST was rejected and retried.
+func TestWebhookStatusBatchSettlesKnownReceiptBesideOrphan(t *testing.T) {
+	app := webhookTestApp(t)
+	_, known, campaign, recipient := webhookTestData(t, app, models.MessageStatusSent)
+	var account models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ?", known.OrganizationID).First(&account).Error)
+	orphan := "wamid.synthetic-batch-orphan-" + uuid.NewString()
+
+	body := orphanStatusBody(t, account,
+		orphanStatusAt(orphan, "read", time.Now().Add(-time.Hour)),
+		orphanStatusAt(known.WhatsAppMessageID, "delivered", time.Now()),
+	)
+	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+
+	var stored models.Message
+	var storedRecipient models.BulkMessageRecipient
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, app.DB.First(&stored, known.ID).Error)
+	require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
+	require.NoError(t, app.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, models.MessageStatusDelivered, stored.Status)
+	assert.Equal(t, models.MessageStatusDelivered, storedRecipient.Status)
+	assert.Equal(t, 1, storedCampaign.DeliveredCount)
+}
+
+// A fresh orphan still asks Meta to retry the POST, but it no longer holds
+// back the known receipt behind it in the same change: that receipt is applied
+// in the same attempt, and replaying the whole change stays idempotent.
+func TestWebhookStatusBatchAppliesKnownReceiptBehindPendingOrphan(t *testing.T) {
+	app := webhookTestApp(t)
+	_, known, campaign, recipient := webhookTestData(t, app, models.MessageStatusSent)
+	var account models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ?", known.OrganizationID).First(&account).Error)
+	pending := "wamid.synthetic-batch-pending-" + uuid.NewString()
+	now := time.Now()
+
+	body := orphanStatusBody(t, account,
+		orphanStatusAt(pending, "read", now),
+		orphanStatusAt(known.WhatsAppMessageID, "delivered", now),
+	)
+	for attempt := 1; attempt <= 2; attempt++ {
+		assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body), "attempt %d", attempt)
+
+		var stored models.Message
+		var storedRecipient models.BulkMessageRecipient
+		var storedCampaign models.BulkMessageCampaign
+		require.NoError(t, app.DB.First(&stored, known.ID).Error)
+		require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
+		require.NoError(t, app.DB.First(&storedCampaign, campaign.ID).Error)
+		assert.Equal(t, models.MessageStatusDelivered, stored.Status, "attempt %d", attempt)
+		assert.Equal(t, models.MessageStatusDelivered, storedRecipient.Status, "attempt %d", attempt)
+		assert.Equal(t, 1, storedCampaign.DeliveredCount, "attempt %d: a replay must not count twice", attempt)
+	}
+
+	err := app.processStatusUpdate(account.PhoneID, WebhookStatus{
+		ID: pending, Status: "read", Timestamp: strconv.FormatInt(now.Unix(), 10),
+	})
+	require.ErrorIs(t, err, errWhatsAppStatusOwnerPending)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+// createLinkedForeignWAMIDRow stores a provider-neutral Messenger row linked to
+// an inbox conversation that carries wamid. The resolver never selects such a
+// row, and chk_messages_whatsapp_message_id_trimmed lets its WAMID be padded.
+func createLinkedForeignWAMIDRow(
+	t *testing.T,
+	db *gorm.DB,
+	account models.WhatsAppAccount,
+	wamid string,
+) models.Message {
+	t.Helper()
+	contact := testutil.CreateTestContact(t, db, account.OrganizationID)
+	channel := models.ChannelAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: account.OrganizationID,
+		Channel: models.ChannelMessenger, Provider: "meta_graph", Name: "orphan-status-foreign-row",
+		ExternalAccountID: "orphan-status-foreign-row-" + uuid.NewString(),
+		Status:            models.ChannelAccountStatusActive, Capabilities: models.JSONB{}, Config: models.JSONB{}, Metadata: models.JSONB{},
+	}
+	require.NoError(t, db.Create(&channel).Error)
+	conversation := models.InboxConversation{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: account.OrganizationID,
+		ChannelAccountID: channel.ID, ContactID: contact.ID, Channel: models.ChannelMessenger,
+		ExternalConversationID: "orphan-status-foreign-row-" + uuid.NewString(),
+		Status:                 models.InboxConversationStatusOpen, OpenedAt: time.Now().UTC(),
+		Config: models.JSONB{}, Metadata: models.JSONB{},
+	}
+	require.NoError(t, db.Create(&conversation).Error)
+	foreign := models.Message{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: account.OrganizationID,
+		ContactID: contact.ID, WhatsAppAccount: account.Name, InboxConversationID: &conversation.ID,
+		WhatsAppMessageID: wamid, Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+		Content: "synthetic provider-neutral row", Status: models.MessageStatusSent, Metadata: models.JSONB{},
+	}
+	require.NoError(t, db.Create(&foreign).Error)
+	return foreign
+}
+
+// A row that carries the WAMID but is not a resolver candidate (here a
+// linked provider-neutral Messenger row, live or soft-deleted) is not proof of
+// absence. The status keeps failing closed after the grace window, as a real
+// rejection rather than an expected wait, and the row is untouched.
+func TestWebhookStatusForeignRowCarryingWAMIDStillRetriedAfterGrace(t *testing.T) {
+	app := webhookTestApp(t)
+	for _, softDeleted := range []bool{false, true} {
+		name := "live"
+		if softDeleted {
+			name = "soft-deleted"
+		}
+		t.Run(name, func(t *testing.T) {
+			account := orphanStatusTestAccount(t, app, false)
+			wamid := "wamid.synthetic-foreign-row-" + uuid.NewString()
+			foreign := createLinkedForeignWAMIDRow(t, app.DB, account, wamid)
+			if softDeleted {
+				require.NoError(t, app.DB.Delete(&foreign).Error)
+			}
+
+			old := time.Now().Add(-6 * time.Hour)
+			err := app.processStatusUpdate(account.PhoneID, WebhookStatus{
+				ID: wamid, Status: "delivered", Timestamp: strconv.FormatInt(old.Unix(), 10),
+			})
+			require.ErrorIs(t, err, gorm.ErrRecordNotFound, "the resolver must not select a provider-neutral row")
+			assert.NotErrorIs(t, err, errWhatsAppStatusOwnerPending)
+			assert.Equal(t, http.StatusServiceUnavailable,
+				signedWebhookStatusCode(t, app, orphanStatusBody(t, account, orphanStatusAt(wamid, "delivered", old))))
+
+			var stored models.Message
+			require.NoError(t, app.DB.Unscoped().First(&stored, foreign.ID).Error)
+			assert.Equal(t, models.MessageStatusSent, stored.Status)
+			assert.Equal(t, softDeleted, stored.DeletedAt.Valid)
+		})
+	}
+}
+
+// Another tenant's row carrying the same WAMID is no owner for this account:
+// it must not block the acknowledgement, and it is never touched.
+func TestWebhookStatusOtherTenantWAMIDDoesNotBlockAcknowledgement(t *testing.T) {
+	app := webhookTestApp(t)
+	account := orphanStatusTestAccount(t, app, false)
+	other := orphanStatusTestAccount(t, app, false)
+	otherContact := testutil.CreateTestContact(t, app.DB, other.OrganizationID)
+	wamid := "wamid.synthetic-other-tenant-" + uuid.NewString()
+	otherRow := models.Message{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: other.OrganizationID,
+		ContactID: otherContact.ID, WhatsAppAccount: other.Name, WhatsAppMessageID: wamid,
+		Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+		Content: "synthetic other-tenant row", Status: models.MessageStatusSent, Metadata: models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&otherRow).Error)
+
+	settled := orphanStatusBody(t, account, orphanStatusAt(wamid, "read", time.Now().Add(-time.Hour)))
+	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, settled))
+
+	var stored models.Message
+	require.NoError(t, app.DB.First(&stored, otherRow.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, stored.Status)
+	var ownRows int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Message{}).
+		Where("organization_id = ?", account.OrganizationID).Count(&ownRows).Error)
+	assert.Zero(t, ownRows)
+}
+
+// The absence proof itself: an empty tenant is absent; a row with the
+// deterministic Coexistence id (defensive clause) or an untrimmed linked row
+// carrying the WAMID is not; and any isolation other than READ COMMITTED
+// fails closed.
+func TestWhatsAppStatusOwnerAbsentProof(t *testing.T) {
+	app := webhookTestApp(t)
+	account := orphanStatusTestAccount(t, app, false)
+	contact := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
+	probe := func(wamid string) (bool, error) {
+		var absent bool
+		err := app.WithCommittedTenantApp(account.OrganizationID, func(scoped *App) error {
+			var probeErr error
+			absent, probeErr = scoped.whatsAppStatusOwnerAbsent(&account, wamid)
+			return probeErr
+		})
+		return absent, err
+	}
+
+	absentWAMID := "wamid.synthetic-probe-absent-" + uuid.NewString()
+	absent, err := probe(absentWAMID)
+	require.NoError(t, err)
+	assert.True(t, absent)
+
+	deterministicWAMID := "wamid.synthetic-probe-deterministic-" + uuid.NewString()
+	require.NoError(t, app.DB.Create(&models.Message{
+		BaseModel:      models.BaseModel{ID: uuid.NewSHA1(account.ID, []byte("coexistence-message:"+deterministicWAMID))},
+		OrganizationID: account.OrganizationID, ContactID: contact.ID, WhatsAppAccount: account.Name,
+		WhatsAppMessageID: "wamid.synthetic-probe-other-" + uuid.NewString(),
+		Direction:         models.DirectionOutgoing, MessageType: models.MessageTypeText,
+		Content: "synthetic deterministic-id row", Status: models.MessageStatusSent, Metadata: models.JSONB{},
+	}).Error)
+	absent, err = probe(deterministicWAMID)
+	require.NoError(t, err)
+	assert.False(t, absent, "a row holding the deterministic Coexistence id is an owner")
+
+	paddedWAMID := "wamid.synthetic-probe-padded-" + uuid.NewString()
+	createLinkedForeignWAMIDRow(t, app.DB, account, " "+paddedWAMID+" ")
+	absent, err = probe(paddedWAMID)
+	require.NoError(t, err)
+	assert.False(t, absent, "an untrimmed linked row still carries the WAMID")
+
+	repeatable := app.DB.Begin(&sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	require.NoError(t, repeatable.Error)
+	defer repeatable.Rollback()
+	absent, err = app.scopedApp(repeatable, account.OrganizationID).whatsAppStatusOwnerAbsent(&account, absentWAMID)
+	require.ErrorContains(t, err, "read committed")
+	assert.False(t, absent)
+}
+
+// On a Coexistence account the Message is created by the smb_message_echoes
+// echo, whose ingestion has no bound short of Meta's retries, so a status
+// that overtakes its echo is retried at any age and applies once the echo is
+// stored. The classic-only grace therefore cannot drop a Coexistence tick,
+// before or after a mode switch.
+func TestWebhookStatusOvertakingCoexistenceEchoAppliesAfterEcho(t *testing.T) {
+	app := webhookTestApp(t)
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+	}{
+		{name: "fresh", age: 0},
+		{name: "just past the classic grace", age: whatsAppOrphanStatusGrace + time.Minute},
+		{name: "six hours", age: 6 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := orphanStatusTestAccount(t, app, true)
+			wamid := "wamid.synthetic-smb-echo-" + uuid.NewString()
+			at := time.Now().Add(-tc.age)
+
+			err := app.processStatusUpdate(account.PhoneID, WebhookStatus{
+				ID: wamid, Status: "read", Timestamp: strconv.FormatInt(at.Unix(), 10),
+			})
+			require.ErrorIs(t, err, errWhatsAppStatusOwnerPending)
+			status := orphanStatusBody(t, account, orphanStatusAt(wamid, "read", at))
+			assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, status))
+
+			sendSignedWebhook(t, app, orphanEchoBody(account, wamid))
+			assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, status))
+
+			var stored models.Message
+			require.NoError(t, app.DB.Where(
+				"organization_id = ? AND whats_app_message_id = ?", account.OrganizationID, wamid,
+			).First(&stored).Error)
+			assert.Equal(t, models.DirectionOutgoing, stored.Direction)
+			assert.Equal(t, models.MessageStatusRead, stored.Status)
+		})
+	}
+}
+
+// statusTestLogs captures the log lines written by processStatusUpdate and the
+// webhook handler so tests can assert their level and message.
+type statusTestLogs struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *statusTestLogs) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *statusTestLogs) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf.Reset()
+}
+
+// lines returns the captured lines that carry message at level.
+func (l *statusTestLogs) lines(level, message string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var matched []string
+	for _, line := range strings.Split(l.buf.String(), "\n") {
+		if strings.Contains(line, "level="+level+" message="+strconv.Quote(message)) {
+			matched = append(matched, line)
+		}
+	}
+	return matched
+}
+
+func captureStatusTestLogs(app *App) *statusTestLogs {
+	logs := &statusTestLogs{}
+	app.Log = logf.New(logf.Opts{Writer: logs, Level: logf.DebugLevel})
+	return logs
+}
+
+const (
+	statusTestDeferredLog = "Deferred WhatsApp status until its message is stored"
+	statusTestUnusableLog = "Retrying WhatsApp status without a usable timestamp"
+	statusTestRejectedLog = "Rejected WhatsApp status update"
+	statusTestFailedLog   = "Failed to durably process status update before acknowledgement"
+)
+
+// Only a WAMID that no candidate Message carries is an expected wait. A stored
+// owner whose dependent lookup misses (here its contact was soft-deleted,
+// which leaves the contact's messages live) can never resolve, so on both
+// account kinds and at any age it stays a real rejection: a Warn plus the
+// handler's Error and a 503, exactly as on main.
+func TestWebhookStatusStoredOwnerLookupMissIsNotPending(t *testing.T) {
+	for _, coexistence := range []bool{false, true} {
+		name := "classic"
+		if coexistence {
+			name = "coexistence"
+		}
+		t.Run(name, func(t *testing.T) {
+			app := webhookTestApp(t)
+			_, known, _, _ := webhookTestData(t, app, models.MessageStatusSent)
+			var account models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("organization_id = ?", known.OrganizationID).First(&account).Error)
+			if coexistence {
+				require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+					Where("id = ?", account.ID).Update("is_smb", true).Error)
+				app.InvalidateWhatsAppAccountCache(account.PhoneID)
+				account.IsSMB = true
+			}
+			require.NoError(t, app.DB.Delete(&models.Contact{}, "id = ?", known.ContactID).Error)
+			logs := captureStatusTestLogs(app)
+
+			for _, age := range []time.Duration{0, 6 * time.Hour} {
+				at := time.Now().Add(-age)
+				logs.reset()
+				err := app.processStatusUpdate(account.PhoneID, WebhookStatus{
+					ID: known.WhatsAppMessageID, Status: "delivered", Timestamp: strconv.FormatInt(at.Unix(), 10),
+				})
+				require.ErrorIs(t, err, gorm.ErrRecordNotFound, "age %s", age)
+				assert.NotErrorIs(t, err, errWhatsAppMessageOwnerNotStored, "age %s", age)
+				assert.NotErrorIs(t, err, errWhatsAppStatusOwnerPending, "age %s", age)
+				assert.Len(t, logs.lines("warn", statusTestRejectedLog), 1, "age %s", age)
+				assert.Empty(t, logs.lines("info", statusTestDeferredLog), "age %s", age)
+				assert.Empty(t, logs.lines("warn", statusTestDeferredLog), "age %s", age)
+
+				logs.reset()
+				assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app,
+					orphanStatusBody(t, account, orphanStatusAt(known.WhatsAppMessageID, "delivered", at))), "age %s", age)
+				assert.Len(t, logs.lines("error", statusTestFailedLog), 1, "age %s", age)
+			}
+
+			var stored models.Message
+			require.NoError(t, app.DB.First(&stored, known.ID).Error)
+			assert.Equal(t, models.MessageStatusSent, stored.Status)
+		})
+	}
+}
+
+// A status still waiting for its owner logs an expected wait at Info, with
+// the error. A Coexistence status past the grace window raises it to Warn. A
+// missing, malformed or far-future timestamp (for example milliseconds) can
+// never settle, so it logs its own Warn instead. None of them is reported by
+// the handler as a persistence failure, and each still gets a 503.
+func TestWebhookStatusPendingOrphanLogLevels(t *testing.T) {
+	app := webhookTestApp(t)
+	logs := captureStatusTestLogs(app)
+	classic := orphanStatusTestAccount(t, app, false)
+	coexistence := orphanStatusTestAccount(t, app, true)
+	ago := func(age time.Duration) string { return strconv.FormatInt(time.Now().Add(-age).Unix(), 10) }
+
+	for _, tc := range []struct {
+		name      string
+		account   models.WhatsAppAccount
+		timestamp string
+		level     string
+		message   string
+	}{
+		{name: "classic fresh", account: classic, timestamp: ago(0), level: "info", message: statusTestDeferredLog},
+		{name: "classic within clock skew", account: classic, timestamp: ago(-30 * time.Second), level: "info", message: statusTestDeferredLog},
+		{name: "classic missing", account: classic, timestamp: "", level: "warn", message: statusTestUnusableLog},
+		{name: "classic malformed", account: classic, timestamp: "yesterday", level: "warn", message: statusTestUnusableLog},
+		{name: "classic milliseconds", account: classic,
+			timestamp: strconv.FormatInt(time.Now().Add(-time.Hour).UnixMilli(), 10), level: "warn", message: statusTestUnusableLog},
+		{name: "coexistence fresh", account: coexistence, timestamp: ago(0), level: "info", message: statusTestDeferredLog},
+		{name: "coexistence settled", account: coexistence, timestamp: ago(6 * time.Hour), level: "warn", message: statusTestDeferredLog},
+		{name: "coexistence missing", account: coexistence, timestamp: "", level: "warn", message: statusTestUnusableLog},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status := map[string]any{"id": "wamid.synthetic-pending-log-" + uuid.NewString(), "status": "read"}
+			if tc.timestamp != "" {
+				status["timestamp"] = tc.timestamp
+			}
+			logs.reset()
+			assert.Equal(t, http.StatusServiceUnavailable,
+				signedWebhookStatusCode(t, app, orphanStatusBody(t, tc.account, status)))
+
+			matched := logs.lines(tc.level, tc.message)
+			require.Len(t, matched, 1)
+			assert.Contains(t, matched[0], `error="WhatsApp status owner is not stored yet: `)
+			deferred := len(logs.lines("info", statusTestDeferredLog)) + len(logs.lines("warn", statusTestDeferredLog))
+			unusable := len(logs.lines("warn", statusTestUnusableLog))
+			assert.Equal(t, 1, deferred+unusable, "exactly one pending line")
+			assert.Empty(t, logs.lines("warn", statusTestRejectedLog))
+			assert.Empty(t, logs.lines("error", statusTestFailedLog))
+		})
+	}
+}
+
+// The Coexistence gate reads IsSMB from the account row locked inside the
+// status transaction, not from the unlocked read taken before that lock. A
+// settled orphan that waits on a concurrent switch to Coexistence is
+// therefore kept for retry once the switch commits, instead of being
+// acknowledged from a stale classic read.
+func TestWebhookStatusOrphanGateSeesConcurrentCoexistenceSwitch(t *testing.T) {
+	app := webhookTestApp(t)
+	account := orphanStatusTestAccount(t, app, false)
+	wamid := "wamid.synthetic-concurrent-switch-" + uuid.NewString()
+
+	switchTx := app.DB.Begin()
+	require.NoError(t, switchTx.Error)
+	t.Cleanup(func() { switchTx.Rollback() })
+	var switchPID int
+	require.NoError(t, switchTx.Raw("SELECT pg_backend_pid()").Scan(&switchPID).Error)
+	require.NoError(t, switchTx.Exec(
+		"UPDATE whatsapp_accounts SET is_smb = true WHERE id = ? AND organization_id = ?",
+		account.ID, account.OrganizationID,
+	).Error)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- app.processStatusUpdate(account.PhoneID, WebhookStatus{
+			ID: wamid, Status: "read", Timestamp: strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10),
+		})
+	}()
+	require.Eventually(t, func() bool {
+		var waiters int64
+		err := app.DB.Raw(`
+			SELECT COUNT(*)
+			  FROM pg_catalog.pg_stat_activity AS activity
+			 WHERE ? = ANY(pg_catalog.pg_blocking_pids(activity.pid))
+		`, switchPID).Scan(&waiters).Error
+		return err == nil && waiters > 0
+	}, 10*time.Second, 10*time.Millisecond, "the status never waited on the account row lock")
+	require.NoError(t, switchTx.Commit().Error)
+
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, errWhatsAppStatusOwnerPending,
+			"after the switch commits, the gate must see the Coexistence account and keep the 503")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the status did not finish after the switch committed")
+	}
+	var rows int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Message{}).
+		Where("organization_id = ?", account.OrganizationID).Count(&rows).Error)
+	assert.Zero(t, rows)
+}
+
+// When a status fails for a passing reason, the later statuses for the same
+// WAMID in that change wait for Meta's retry, which applies them in order. A
+// read applied first would otherwise turn the retried delivered into a no-op
+// and leave the campaign recipient's delivered_at unset. Statuses for other
+// messages in the change are still applied straight away.
+func TestWebhookStatusBatchKeepsPerMessageOrderAfterFailure(t *testing.T) {
+	app := webhookTestApp(t)
+	_, known, campaign, recipient := webhookTestData(t, app, models.MessageStatusSent)
+	var account models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ?", known.OrganizationID).First(&account).Error)
+	otherWAMID := "wamid.synthetic-order-other-" + uuid.NewString()
+	other := models.Message{
+		BaseModel:      models.BaseModel{ID: uuid.NewSHA1(account.ID, []byte("coexistence-message:"+otherWAMID))},
+		OrganizationID: known.OrganizationID, WhatsAppAccount: account.Name, ContactID: known.ContactID,
+		WhatsAppMessageID: otherWAMID, Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+		Content: "synthetic second message", Status: models.MessageStatusSent,
+		Metadata: models.JSONB{database.WhatsAppWAMIDOwnerMetadataKey: true},
+	}
+	require.NoError(t, app.DB.Create(&other).Error)
+
+	// A passing failure (a deadlock victim or a dropped connection in
+	// production) for this message's delivered step only.
+	suffix := uuid.NewString()[:8]
+	functionName := "fail_status_delivered_" + suffix
+	triggerName := "fail_status_delivered_trigger_" + suffix
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.id = '%s'::uuid AND NEW.status = 'delivered' THEN
+				RAISE EXCEPTION 'synthetic passing status failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$`, functionName, known.ID)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE TRIGGER %s
+		BEFORE UPDATE OF status ON messages
+		FOR EACH ROW EXECUTE FUNCTION %s()`, triggerName, functionName)).Error)
+	removeTrigger := func() {
+		app.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON messages", triggerName))
+		app.DB.Exec(fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
+	}
+	t.Cleanup(removeTrigger)
+
+	now := time.Now()
+	body := orphanStatusBody(t, account,
+		orphanStatusAt(known.WhatsAppMessageID, "delivered", now),
+		orphanStatusAt(known.WhatsAppMessageID, "read", now),
+		orphanStatusAt(otherWAMID, "delivered", now),
+	)
+	logs := captureStatusTestLogs(app)
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+	assert.Len(t, logs.lines("error", statusTestFailedLog), 1)
+	assert.Len(t, logs.lines("info", "Deferred WhatsApp status behind an earlier status for the same message"), 1)
+
+	var stored, storedOther models.Message
+	var storedRecipient models.BulkMessageRecipient
+	var storedCampaign models.BulkMessageCampaign
+	require.NoError(t, app.DB.First(&stored, known.ID).Error)
+	require.NoError(t, app.DB.First(&storedOther, other.ID).Error)
+	require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
+	require.NoError(t, app.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, models.MessageStatusSent, stored.Status, "read must wait for the failed delivered")
+	assert.Equal(t, models.MessageStatusSent, storedRecipient.Status)
+	assert.Nil(t, storedRecipient.DeliveredAt)
+	assert.Nil(t, storedRecipient.ReadAt)
+	assert.Zero(t, storedCampaign.DeliveredCount)
+	assert.Equal(t, models.MessageStatusDelivered, storedOther.Status, "another message is applied straight away")
+
+	removeTrigger()
+	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+	require.NoError(t, app.DB.First(&stored, known.ID).Error)
+	require.NoError(t, app.DB.First(&storedOther, other.ID).Error)
+	require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
+	require.NoError(t, app.DB.First(&storedCampaign, campaign.ID).Error)
+	assert.Equal(t, models.MessageStatusRead, stored.Status)
+	assert.Equal(t, models.MessageStatusRead, storedRecipient.Status)
+	assert.NotNil(t, storedRecipient.DeliveredAt, "the retried delivered step is applied, not skipped")
+	assert.NotNil(t, storedRecipient.ReadAt)
+	assert.Equal(t, 1, storedCampaign.DeliveredCount)
+	assert.Equal(t, 1, storedCampaign.ReadCount)
+	assert.Equal(t, models.MessageStatusDelivered, storedOther.Status)
 }
 
 func TestUpdateMessageStatus_FailedBroadcastsErrorMessageViaWebSocket(t *testing.T) {

@@ -228,6 +228,15 @@ type whatsAppMessageResolution struct {
 
 var errWhatsAppMessageOwnerDeleted = errors.New("WhatsApp message owner is soft-deleted")
 
+// errWhatsAppMessageOwnerNotStored is the resolver's no-candidate result: no
+// Message in the tenant is a candidate owner of the WAMID and no provenance
+// references one. It wraps gorm.ErrRecordNotFound, so errors.Is callers keep
+// their behaviour, while a caller can tell it apart from a stored owner whose
+// dependent lookup misses (a soft-deleted contact, or a missing conversation,
+// shadow channel, identity or locked row), which returns a bare
+// gorm.ErrRecordNotFound.
+var errWhatsAppMessageOwnerNotStored = fmt.Errorf("no WhatsApp message owner candidate: %w", gorm.ErrRecordNotFound)
+
 type whatsAppMessageAuthorityKey struct{}
 type whatsAppMessageAuthority struct {
 	pool                  gorm.ConnPool
@@ -356,7 +365,7 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		if len(activities) != 0 || len(jobs) != 0 || lookup.MessageID != uuid.Nil {
 			return nil, errors.New("WhatsApp message provenance references a missing winner")
 		}
-		return nil, gorm.ErrRecordNotFound
+		return nil, errWhatsAppMessageOwnerNotStored
 	}
 	// More than one org/WAMID row is ambiguity, not permission to select the
 	// first linked/unlinked representation or manufacture a new execution ID.

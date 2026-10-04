@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -314,83 +315,130 @@ func TestOutgoingDeliveryCreatesImmediateReceiptAndReactionAuthority(t *testing.
 	assert.NotEmpty(t, stored.Metadata["reactions"])
 }
 
+// outgoingReceiptFixture returns a sender-ready account in either mode: a
+// Coexistence account, or the classic account production runs today.
+func outgoingReceiptFixture(t *testing.T, coexistence bool) (*App, *models.WhatsAppAccount, *models.Contact) {
+	t.Helper()
+	if coexistence {
+		return whatsappIdentityFixture(t)
+	}
+	app := newProcessorTestApp(t)
+	_, account := createProcessorTestOrg(t, app)
+	account.BusinessID = testutil.NewTestGraphObjectID()
+	require.NoError(t, app.DB.Save(account).Error)
+	contact := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
+	contact.PhoneNumber = "60" + testutil.NewTestGraphObjectID()
+	contact.WhatsAppAccount = account.Name
+	require.NoError(t, app.DB.Save(contact).Error)
+	return app, account, contact
+}
+
+// A receipt that Meta delivers while the ReReply send is still inside its
+// provider call must be retried until the WAMID commits, then applied. Meta
+// stamps every real status with its event time, so the orphan grace window
+// must never acknowledge such a receipt: it is always younger than the
+// window while its send can still commit.
 func TestOutgoingStatusReceiptRetriesUntilProviderWAMIDCommits(t *testing.T) {
-	app, account, contact := whatsappIdentityFixture(t)
-	app.Config = &config.Config{
-		WhatsApp: config.WhatsAppConfig{AppSecret: webhookTestAppSecret},
-	}
-	account.AppSecret = webhookTestAppSecret
-	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where(
-		"id = ? AND organization_id = ?",
-		account.ID,
-		account.OrganizationID,
-	).Update("app_secret", account.AppSecret).Error)
-	app.InvalidateWhatsAppAccountCache(account.PhoneID)
-
-	wamid := "wamid.receipt-before-sender-commit-" + uuid.NewString()
-	body, err := json.Marshal(map[string]any{
-		"object": "whatsapp_business_account",
-		"entry": []any{map[string]any{
-			"id": account.BusinessID,
-			"changes": []any{map[string]any{
-				"field": "messages",
-				"value": map[string]any{
-					"messaging_product": "whatsapp",
-					"metadata": map[string]any{
-						"phone_number_id": account.PhoneID,
-					},
-					"statuses": []any{map[string]any{
-						"id":     wamid,
-						"status": "delivered",
-					}},
-				},
-			}},
+	for _, tc := range []struct {
+		name        string
+		coexistence bool
+		timestamp   func() string
+	}{
+		{name: "coexistence without timestamp", coexistence: true, timestamp: func() string { return "" }},
+		{name: "coexistence with Meta event time", coexistence: true, timestamp: func() string {
+			return strconv.FormatInt(time.Now().Unix(), 10)
 		}},
-	})
-	require.NoError(t, err)
-	sendReceipt := func() (int, error) {
-		req := testutil.NewRequest(t)
-		req.RequestCtx.Request.Header.SetMethod(http.MethodPost)
-		req.RequestCtx.Request.Header.SetContentType("application/json")
-		req.RequestCtx.Request.Header.Set(
-			"X-Hub-Signature-256",
-			webhookTestSignature(body),
-		)
-		req.RequestCtx.Request.SetBody(body)
-		err := app.WebhookHandler(req)
-		return req.RequestCtx.Response.StatusCode(), err
+		{name: "classic with Meta event time", coexistence: false, timestamp: func() string {
+			return strconv.FormatInt(time.Now().Unix(), 10)
+		}},
+		{name: "classic just inside orphan grace", coexistence: false, timestamp: func() string {
+			return strconv.FormatInt(time.Now().Add(-whatsAppOrphanStatusGrace+time.Minute).Unix(), 10)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, account, contact := outgoingReceiptFixture(t, tc.coexistence)
+			app.Config = &config.Config{
+				WhatsApp: config.WhatsAppConfig{AppSecret: webhookTestAppSecret},
+			}
+			account.AppSecret = webhookTestAppSecret
+			require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where(
+				"id = ? AND organization_id = ?",
+				account.ID,
+				account.OrganizationID,
+			).Update("app_secret", account.AppSecret).Error)
+			app.InvalidateWhatsAppAccountCache(account.PhoneID)
+
+			wamid := "wamid.receipt-before-sender-commit-" + uuid.NewString()
+			receipt := map[string]any{
+				"id":     wamid,
+				"status": "delivered",
+			}
+			if timestamp := tc.timestamp(); timestamp != "" {
+				receipt["timestamp"] = timestamp
+			}
+			body, err := json.Marshal(map[string]any{
+				"object": "whatsapp_business_account",
+				"entry": []any{map[string]any{
+					"id": account.BusinessID,
+					"changes": []any{map[string]any{
+						"field": "messages",
+						"value": map[string]any{
+							"messaging_product": "whatsapp",
+							"metadata": map[string]any{
+								"phone_number_id": account.PhoneID,
+							},
+							"statuses": []any{receipt},
+						},
+					}},
+				}},
+			})
+			require.NoError(t, err)
+			sendReceipt := func() (int, error) {
+				req := testutil.NewRequest(t)
+				req.RequestCtx.Request.Header.SetMethod(http.MethodPost)
+				req.RequestCtx.Request.Header.SetContentType("application/json")
+				req.RequestCtx.Request.Header.Set(
+					"X-Hub-Signature-256",
+					webhookTestSignature(body),
+				)
+				req.RequestCtx.Request.SetBody(body)
+				err := app.WebhookHandler(req)
+				return req.RequestCtx.Response.StatusCode(), err
+			}
+
+			options := DefaultSendOptions()
+			options.Async = false
+			options.BroadcastWebSocket = false
+			options.DispatchWebhook = false
+			options.TrackSLA = false
+			firstReceiptStatus := 0
+			var firstReceiptErr error
+			message, err := app.SendOutgoingMessage(context.Background(), OutgoingMessageRequest{
+				Account: account,
+				Contact: contact,
+				Type:    models.MessageTypeText,
+				Content: "receipt can arrive before sender commit",
+				deliveryOverride: func(context.Context, *models.Contact) (string, error) {
+					firstReceiptStatus, firstReceiptErr = sendReceipt()
+					return wamid, nil
+				},
+			}, options)
+			require.NoError(t, err)
+			require.NotNil(t, message)
+			require.NoError(t, firstReceiptErr)
+			assert.Equal(t, http.StatusServiceUnavailable, firstReceiptStatus,
+				"a receipt that cannot yet resolve its WAMID must not be acknowledged")
+
+			// Meta retries the identical body, including its original timestamp.
+			replayedStatus, replayedErr := sendReceipt()
+			require.NoError(t, replayedErr)
+			assert.Equal(t, http.StatusOK, replayedStatus)
+			var stored models.Message
+			require.NoError(t, app.DB.First(&stored, "id = ?", message.ID).Error)
+			assert.Equal(t, models.MessageStatusDelivered, stored.Status)
+			assert.Equal(t, wamid, stored.WhatsAppMessageID)
+		})
 	}
-
-	options := DefaultSendOptions()
-	options.Async = false
-	options.BroadcastWebSocket = false
-	options.DispatchWebhook = false
-	options.TrackSLA = false
-	firstReceiptStatus := 0
-	var firstReceiptErr error
-	message, err := app.SendOutgoingMessage(context.Background(), OutgoingMessageRequest{
-		Account: account,
-		Contact: contact,
-		Type:    models.MessageTypeText,
-		Content: "receipt can arrive before sender commit",
-		deliveryOverride: func(context.Context, *models.Contact) (string, error) {
-			firstReceiptStatus, firstReceiptErr = sendReceipt()
-			return wamid, nil
-		},
-	}, options)
-	require.NoError(t, err)
-	require.NotNil(t, message)
-	require.NoError(t, firstReceiptErr)
-	assert.Equal(t, http.StatusServiceUnavailable, firstReceiptStatus,
-		"a receipt that cannot yet resolve its WAMID must not be acknowledged")
-
-	replayedStatus, replayedErr := sendReceipt()
-	require.NoError(t, replayedErr)
-	assert.Equal(t, http.StatusOK, replayedStatus)
-	var stored models.Message
-	require.NoError(t, app.DB.First(&stored, "id = ?", message.ID).Error)
-	assert.Equal(t, models.MessageStatusDelivered, stored.Status)
-	assert.Equal(t, wamid, stored.WhatsAppMessageID)
 }
 
 func TestAutomaticAIProviderAttemptHoldsAccountLifecycleLock(t *testing.T) {
