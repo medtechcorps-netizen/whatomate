@@ -1,0 +1,5 @@
+*
+!go.mod
+!go.sum
+!release/staging/graphstub/
+release/staging/graphstub/**/*_test.go
