@@ -289,9 +289,54 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 	webhookBodyDigest := sha256.Sum256(body)
 	webhookBodySHA256 := hex.EncodeToString(webhookBodyDigest[:])
 
+	// statusRetryCarried is set once a status in this POST must be retried
+	// (see the status loop below). That no longer ends the POST after the
+	// status's own change. The remaining changes and entries are still walked,
+	// but only smb_message_echoes changes are processed. Every other change is
+	// skipped and waits for Meta's replay, exactly as when the 503 ended the
+	// POST there. The POST is answered with a single 503 at its end.
+	//
+	// Echoes are the only exception. They are the event that the early 503
+	// lost: on a Coexistence account Meta can batch a status ahead of the echo
+	// that stores the very message the status belongs to. Meta replays a POST
+	// in the same order, so the status could never resolve, and the echo was
+	// lost once Meta stopped retrying. Echoes are also safe to run on the first
+	// attempt and again on every replay. An echo change commits in one
+	// transaction before the acknowledgement, and an echo is idempotent per
+	// WAMID: its Message has a deterministic id, the first durable admission
+	// winner owns the WAMID, a replay only merges details and moves the status
+	// forward, and the new-message broadcast and outgoing webhook fire only on
+	// the first insert. A revoke echo is final and a no-op once applied. An
+	// edit echo is held back with the skipped changes, because its replay
+	// guard remembers only the latest edit: replayed after a newer edit of the
+	// same message, it would restore the older text. An echo that quotes an
+	// inbound message skipped earlier in the POST is stored without its reply
+	// link, which a replay of the echo does not add.
+	//
+	// The skipped changes have no such guard, or depend on their order. Calls,
+	// template status updates, call-permission replies and reactions have no
+	// replay guard: run on the first attempt and again on each replay, they
+	// could overwrite newer state with older state or repeat call events.
+	// Inbound messages must not be admitted, and their automatic replies
+	// started, ahead of Meta's in-order replay, and later statuses keep
+	// per-message order by waiting too.
+	//
+	// A persistence failure of a processed echo, like that of any change
+	// before the status, still answers 503 at that point, and nothing after it
+	// is processed in that attempt.
+	statusRetryCarried := false
+
 	// Process each entry
 	for _, entry := range payload.Entry {
 		for _, change := range entry.Changes {
+			if statusRetryCarried && change.Field != "smb_message_echoes" {
+				a.Log.Info("Deferred webhook change behind a WhatsApp status retry",
+					"waba_id", entry.ID,
+					"field", change.Field,
+				)
+				continue
+			}
+
 			// Coexistence lifecycle events are WABA-scoped and normally do not
 			// include phone-number metadata. Persist them before acknowledging so
 			// disconnected accounts cannot continue sending from a stale cache.
@@ -420,9 +465,16 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 						"phone_number_id", phoneNumberID,
 					)
 				}
+				echoes := change.Value.MessageEchoes
+				if statusRetryCarried {
+					echoes = a.messageEchoesAheadOfStatusRetry(phoneNumberID, echoes)
+					if len(echoes) == 0 {
+						continue
+					}
+				}
 				if err := a.persistMessageEchoesBeforeAck(
 					phoneNumberID,
-					change.Value.MessageEchoes,
+					echoes,
 					change.Value.Contacts,
 				); err != nil {
 					a.Log.Error("Failed to durably process message echoes",
@@ -590,15 +642,16 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 
 			// Process status updates. Each status commits in its own transaction
 			// and only ever applies a strict forward step, so a status that was
-			// already applied is a no-op when Meta replays the change. A status
-			// that must be retried therefore no longer stops the statuses of
-			// other messages after it in this change: they are applied now and
-			// the change is still answered with 503 below. Later statuses for
-			// the same WAMID wait for that retry instead, so per-message order is
-			// kept: a higher status applied first would otherwise turn the
-			// retried lower one into a no-op (a campaign recipient's delivered_at
-			// would never be set, for example).
-			statusRetryRequired := false
+			// already applied is a no-op when Meta replays the POST. A status
+			// that must be retried therefore does not stop the statuses of other
+			// messages after it in this change: they are applied now, and the
+			// POST is answered with 503 at its end (statusRetryCarried above
+			// covers the changes after this one). Later statuses for the same
+			// WAMID in this change wait for that retry instead, so per-message
+			// order is kept: a higher status applied first would otherwise turn
+			// the retried lower one into a no-op (a campaign recipient's
+			// delivered_at would never be set, for example). Statuses in later
+			// changes all wait for the retry, so retryWAMIDs is kept per change.
 			var retryWAMIDs map[string]struct{}
 			for _, status := range change.Value.Statuses {
 				a.Log.Info("Received status update",
@@ -616,7 +669,7 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					continue
 				}
 				if err := a.processStatusUpdate(phoneNumberID, status); err != nil {
-					statusRetryRequired = true
+					statusRetryCarried = true
 					if retryWAMIDs == nil {
 						retryWAMIDs = make(map[string]struct{})
 					}
@@ -635,32 +688,55 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					)
 				}
 			}
-			if statusRetryRequired {
-				// A non-2xx response asks Meta to retry. Returning 200 before
-				// the committed receipt mutation would lose an early receipt if
-				// this process exits or the matching outgoing WAMID has not yet
-				// committed. processStatusUpdate also returns nil without a
-				// mutation in other cases, among them a durable tombstone, a
-				// duplicate or non-forward status, an unknown status value and,
-				// on a classic account only, a WAMID proven absent once its
-				// status is older than whatsAppOrphanStatusGrace (see that
-				// constant for the bound). As before, the 503 ends the POST
-				// here: later changes and entries, including an
-				// smb_message_echoes change that would store a pending status's
-				// owner, wait for Meta's retry, which replays them in the same
-				// order.
-				return r.SendErrorEnvelope(
-					fasthttp.StatusServiceUnavailable,
-					"Status update persistence failed",
-					nil,
-					"",
-				)
-			}
 		}
+	}
+
+	if statusRetryCarried {
+		// A non-2xx response asks Meta to retry. Returning 200 before the
+		// committed receipt mutation would lose an early receipt if this
+		// process exits or the matching outgoing WAMID has not yet committed.
+		// processStatusUpdate also returns nil without a mutation in other
+		// cases, among them a durable tombstone, a duplicate or non-forward
+		// status, an unknown status value and, on a classic account only, a
+		// WAMID proven absent once its status is older than
+		// whatsAppOrphanStatusGrace (see that constant for the bound). The 503
+		// is sent only now, so that an smb_message_echoes change after the
+		// status that stores its message is committed in this attempt and
+		// Meta's replay can apply the status. Every other change after the
+		// status was skipped and is processed by that replay (see
+		// statusRetryCarried above).
+		return r.SendErrorEnvelope(
+			fasthttp.StatusServiceUnavailable,
+			"Status update persistence failed",
+			nil,
+			"",
+		)
 	}
 
 	// Always respond with 200 to acknowledge receipt
 	return r.SendEnvelope(map[string]string{"status": "ok"})
+}
+
+// messageEchoesAheadOfStatusRetry returns the echoes of an smb_message_echoes
+// change that are stored while an earlier status of the same POST waits for
+// Meta's replay: every echo except an edit. An edit waits for that replay,
+// like the changes WebhookHandler skips (see statusRetryCarried there).
+func (a *App) messageEchoesAheadOfStatusRetry(
+	phoneNumberID string,
+	echoes []CoexistenceMessage,
+) []CoexistenceMessage {
+	kept := make([]CoexistenceMessage, 0, len(echoes))
+	for _, echo := range echoes {
+		if strings.EqualFold(strings.TrimSpace(echo.Type), "edit") {
+			a.Log.Info("Deferred message echo edit behind a WhatsApp status retry",
+				"phone_number_id", phoneNumberID,
+				"message_id", echo.ID,
+			)
+			continue
+		}
+		kept = append(kept, echo)
+	}
+	return kept
 }
 
 func (a *App) processIncomingMessage(phoneNumberID string, msg IncomingTextMessage, profileName string) {

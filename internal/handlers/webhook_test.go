@@ -1492,6 +1492,681 @@ func TestWebhookStatusBatchKeepsPerMessageOrderAfterFailure(t *testing.T) {
 	assert.Equal(t, models.MessageStatusDelivered, storedOther.Status)
 }
 
+// retryPOSTStatusChange is a "messages" change carrying only statuses.
+func retryPOSTStatusChange(account models.WhatsAppAccount, statuses ...map[string]any) map[string]any {
+	return map[string]any{
+		"field": "messages",
+		"value": map[string]any{
+			"messaging_product": "whatsapp",
+			"metadata":          map[string]any{"phone_number_id": account.PhoneID},
+			"statuses":          statuses,
+		},
+	}
+}
+
+// retryPOSTEcho is one synthetic WhatsApp Business app reply, shaped like
+// orphanEchoBody's.
+func retryPOSTEcho(wamid string, at time.Time) map[string]any {
+	return map[string]any{
+		"from": "15550000001", "to": "15550000002", "id": wamid,
+		"timestamp": strconv.FormatInt(at.Unix(), 10),
+		"type":      "text", "text": map[string]any{"body": "synthetic phone-app reply"},
+	}
+}
+
+// retryPOSTEchoEdit is a synthetic WhatsApp Business app edit of the reply
+// originalWAMID to body.
+func retryPOSTEchoEdit(eventWAMID, originalWAMID, body string, at time.Time) map[string]any {
+	return map[string]any{
+		"from": "15550000001", "to": "15550000002", "id": eventWAMID,
+		"timestamp": strconv.FormatInt(at.Unix(), 10),
+		"type":      "edit",
+		"edit": map[string]any{
+			"original_message_id": originalWAMID,
+			"message":             map[string]any{"type": "text", "text": map[string]any{"body": body}},
+		},
+	}
+}
+
+// retryPOSTEchoChange is an smb_message_echoes change carrying the given
+// echoes in order.
+func retryPOSTEchoChange(account models.WhatsAppAccount, echoes ...map[string]any) map[string]any {
+	return map[string]any{
+		"field": "smb_message_echoes",
+		"value": map[string]any{
+			"messaging_product": "whatsapp",
+			"metadata":          map[string]any{"phone_number_id": account.PhoneID},
+			"message_echoes":    echoes,
+		},
+	}
+}
+
+// retryPOSTInboundChange is a "messages" change carrying one synthetic
+// inbound text message from sender, plus any statuses.
+func retryPOSTInboundChange(
+	account models.WhatsAppAccount,
+	sender models.Contact,
+	wamid string,
+	at time.Time,
+	statuses ...map[string]any,
+) map[string]any {
+	value := map[string]any{
+		"messaging_product": "whatsapp",
+		"metadata":          map[string]any{"phone_number_id": account.PhoneID},
+		"contacts": []any{map[string]any{
+			"profile": map[string]any{"name": sender.ProfileName},
+			"wa_id":   sender.PhoneNumber, "user_id": sender.BSUID,
+		}},
+		"messages": []any{map[string]any{
+			"from": sender.PhoneNumber, "from_user_id": sender.BSUID, "id": wamid,
+			"timestamp": strconv.FormatInt(at.Unix(), 10),
+			"type":      "text", "text": map[string]any{"body": "synthetic inbound message"},
+		}},
+	}
+	if len(statuses) > 0 {
+		value["statuses"] = statuses
+	}
+	return map[string]any{"field": "messages", "value": value}
+}
+
+// retryPOSTTemplateStatusChange is a message_template_status_update change
+// for template.
+func retryPOSTTemplateStatusChange(template models.Template, event string) map[string]any {
+	return map[string]any{
+		"field": "message_template_status_update",
+		"value": map[string]any{
+			"event":                     event,
+			"message_template_name":     template.Name,
+			"message_template_language": template.Language,
+			"reason":                    "NONE",
+		},
+	}
+}
+
+// retryPOSTCallTerminateChange is a "calls" change that ends the
+// business-initiated call callID.
+func retryPOSTCallTerminateChange(account models.WhatsAppAccount, callID string, at time.Time) map[string]any {
+	return map[string]any{
+		"field": "calls",
+		"value": map[string]any{
+			"messaging_product": "whatsapp",
+			"metadata":          map[string]any{"phone_number_id": account.PhoneID},
+			"calls": []any{map[string]any{
+				"id": callID, "event": "terminate", "direction": "BUSINESS_INITIATED",
+				"timestamp": strconv.FormatInt(at.Unix(), 10), "duration": 42,
+			}},
+		},
+	}
+}
+
+// retryPOSTBody builds one webhook POST body with one entry per
+// argument, each carrying the given changes in order. The body is built once
+// so that a test can replay exactly the same bytes, as Meta does.
+func retryPOSTBody(t *testing.T, account models.WhatsAppAccount, entries ...[]map[string]any) []byte {
+	t.Helper()
+	items := make([]any, 0, len(entries))
+	for _, changes := range entries {
+		items = append(items, map[string]any{"id": account.BusinessID, "changes": changes})
+	}
+	body, err := json.Marshal(map[string]any{"object": "whatsapp_business_account", "entry": items})
+	require.NoError(t, err)
+	return body
+}
+
+// retryPOSTLayouts places the given changes in one entry, or each in its own
+// entry, so a test covers both later changes and later entries of a POST.
+var retryPOSTLayouts = []struct {
+	name   string
+	layout func(changes ...map[string]any) [][]map[string]any
+}{
+	{name: "same entry", layout: func(changes ...map[string]any) [][]map[string]any {
+		return [][]map[string]any{changes}
+	}},
+	{name: "separate entries", layout: func(changes ...map[string]any) [][]map[string]any {
+		entries := make([][]map[string]any, 0, len(changes))
+		for _, change := range changes {
+			entries = append(entries, []map[string]any{change})
+		}
+		return entries
+	}},
+}
+
+// connectCoexistenceForInboundTest gives a Coexistence account the connected
+// onboarding state that inbound admission requires.
+func connectCoexistenceForInboundTest(t *testing.T, app *App, account models.WhatsAppAccount) {
+	t.Helper()
+	require.NoError(t, app.DB.Create(&models.WhatsAppCoexistenceState{
+		ID:                uuid.New(),
+		OrganizationID:    account.OrganizationID,
+		WhatsAppAccountID: account.ID,
+		OnboardingStatus:  models.CoexistenceOnboardingStatusConnected,
+		OnboardingCycle:   1,
+		LifecycleStatus:   models.CoexistenceLifecycleStatusConnected,
+		LifecycleMetadata: models.JSONB{},
+		Version:           1,
+	}).Error)
+}
+
+// coexistenceInboundSenderForTest stores a synthetic customer that owns a
+// BSUID, so Coexistence inbound admission routes its messages straight to it
+// as Messages instead of staging them for identity review.
+func coexistenceInboundSenderForTest(t *testing.T, app *App, account models.WhatsAppAccount) models.Contact {
+	t.Helper()
+	sender := models.Contact{
+		BaseModel:       models.BaseModel{ID: uuid.New()},
+		OrganizationID:  account.OrganizationID,
+		PhoneNumber:     "60" + testutil.NewTestGraphObjectID(),
+		ProfileName:     "Synthetic Customer",
+		WhatsAppAccount: account.Name,
+		BSUID:           "US.synthetic-retry-" + uuid.NewString(),
+		Metadata:        models.JSONB{},
+	}
+	require.NoError(t, app.DB.Create(&sender).Error)
+	return sender
+}
+
+func countWAMIDMessages(t *testing.T, app *App, account models.WhatsAppAccount, wamid string) int64 {
+	t.Helper()
+	var count int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Message{}).Where(
+		"organization_id = ? AND whats_app_message_id = ?", account.OrganizationID, wamid,
+	).Count(&count).Error)
+	return count
+}
+
+func requireSingleWAMIDMessage(t *testing.T, app *App, account models.WhatsAppAccount, wamid string) models.Message {
+	t.Helper()
+	require.EqualValues(t, 1, countWAMIDMessages(t, app, account, wamid), "exactly one message carries the WAMID")
+	var stored models.Message
+	require.NoError(t, app.DB.Where(
+		"organization_id = ? AND whats_app_message_id = ?", account.OrganizationID, wamid,
+	).First(&stored).Error)
+	return stored
+}
+
+// failSyntheticMessageWrites makes every messages write of the given trigger
+// event (for example "INSERT" or "UPDATE OF status") that matches condition
+// fail like a passing database error, until the returned func (also run at
+// cleanup) removes it. condition is a plpgsql expression over NEW built from
+// synthetic test values only.
+func failSyntheticMessageWrites(t *testing.T, app *App, event, condition string) func() {
+	t.Helper()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	functionName := "fail_synthetic_message_write_" + suffix
+	triggerName := functionName + "_trigger"
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF %s THEN
+				RAISE EXCEPTION 'synthetic passing message write failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$`, functionName, condition)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE TRIGGER %s
+		BEFORE %s ON messages
+		FOR EACH ROW EXECUTE FUNCTION %s()`, triggerName, event, functionName)).Error)
+	var once sync.Once
+	remove := func() {
+		once.Do(func() {
+			app.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON messages", triggerName))
+			app.DB.Exec(fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName))
+		})
+	}
+	t.Cleanup(remove)
+	return remove
+}
+
+const (
+	retryTestChangeDeferredLog   = "Deferred webhook change behind a WhatsApp status retry"
+	retryTestEchoEditDeferredLog = "Deferred message echo edit behind a WhatsApp status retry"
+	retryTestEchoFailedLog       = "Failed to durably process message echoes"
+	retryTestTemplateLog         = "Received template status update"
+	retryTestTemplateUpdatedLog  = "Updated template status from webhook"
+	retryTestCallLog             = "Received call event"
+	retryTestCallEndedLog        = "Handled orphaned outgoing call terminate"
+	retryTestInboundLog          = "Received message"
+)
+
+// On a Coexistence account Meta can batch a status ahead of the
+// smb_message_echoes echo that stores its message, in a later change or a
+// later entry of the same POST. The status must be retried, but that no
+// longer stops the echo: it is stored on the first attempt, which is still
+// answered with 503, and Meta's replay applies the status. Further replays
+// change nothing. When the 503 ended the POST at the status, the echo was
+// never stored, every replay failed the same way, and the echo was lost once
+// Meta stopped retrying.
+func TestWebhookStatusBeforeCoexistenceEchoInSamePOSTStoresEcho(t *testing.T) {
+	app := webhookTestApp(t)
+	for _, layout := range retryPOSTLayouts {
+		t.Run(layout.name, func(t *testing.T) {
+			account := orphanStatusTestAccount(t, app, true)
+			wamid := "wamid.synthetic-status-before-echo-" + uuid.NewString()
+			now := time.Now()
+			body := retryPOSTBody(t, account, layout.layout(
+				retryPOSTStatusChange(account, orphanStatusAt(wamid, "read", now)),
+				retryPOSTEchoChange(account, retryPOSTEcho(wamid, now)),
+			)...)
+
+			assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+			stored := requireSingleWAMIDMessage(t, app, account, wamid)
+			assert.Equal(t, models.DirectionOutgoing, stored.Direction)
+			assert.Equal(t, "synthetic phone-app reply", stored.Content)
+			assert.Equal(t, models.MessageStatusSent, stored.Status, "the status waits for Meta's replay")
+
+			for attempt := 2; attempt <= 3; attempt++ {
+				assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body), "attempt %d", attempt)
+				stored = requireSingleWAMIDMessage(t, app, account, wamid)
+				assert.Equal(t, models.MessageStatusRead, stored.Status,
+					"attempt %d: the replayed echo must not move the status back", attempt)
+			}
+		})
+	}
+}
+
+// Changes after a status that must be retried, other than echoes, are not
+// processed in that attempt: they wait for Meta's in-order replay, exactly as
+// when the 503 ended the POST at the status. Calls and template status
+// updates have no replay guard, so running them on the first attempt and
+// again on every replay could repeat call events or overwrite a newer
+// template status with this older one. Here they run exactly once, on the
+// replay that is acknowledged, while the echo after them is still stored on
+// the first attempt.
+func TestWebhookStatusRetrySkipsUnguardedLaterChanges(t *testing.T) {
+	app := webhookTestApp(t)
+	for _, layout := range retryPOSTLayouts {
+		t.Run(layout.name, func(t *testing.T) {
+			account := orphanStatusTestAccount(t, app, true)
+			template := models.Template{
+				BaseModel:       models.BaseModel{ID: uuid.New()},
+				OrganizationID:  account.OrganizationID,
+				WhatsAppAccount: account.Name,
+				Name:            "synthetic_retry_template_" + strings.ReplaceAll(uuid.NewString()[:8], "-", ""),
+				Language:        "en",
+				BodyContent:     "Synthetic {{1}}",
+				Status:          "PENDING",
+			}
+			require.NoError(t, app.DB.Create(&template).Error)
+			callContact := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
+			callLog := createOutgoingCallWebhookTestLog(t, app.DB, account.OrganizationID, callContact, "synthetic-retry-call")
+
+			wamid := "wamid.synthetic-skip-unguarded-" + uuid.NewString()
+			now := time.Now()
+			body := retryPOSTBody(t, account, layout.layout(
+				retryPOSTStatusChange(account, orphanStatusAt(wamid, "read", now)),
+				retryPOSTTemplateStatusChange(template, "APPROVED"),
+				retryPOSTCallTerminateChange(account, callLog.WhatsAppCallID, now),
+				retryPOSTEchoChange(account, retryPOSTEcho(wamid, now)),
+			)...)
+			logs := captureStatusTestLogs(app)
+
+			assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+			assert.Len(t, logs.lines("info", retryTestChangeDeferredLog), 2)
+			assert.Empty(t, logs.lines("info", retryTestTemplateLog), "the template status update waits for the replay")
+			assert.Empty(t, logs.lines("info", retryTestCallLog), "the call event waits for the replay")
+			var storedCall models.CallLog
+			require.NoError(t, app.DB.First(&storedCall, callLog.ID).Error)
+			assert.Equal(t, models.CallStatusInitiating, storedCall.Status)
+			assert.Nil(t, storedCall.EndedAt)
+			assert.Equal(t, models.MessageStatusSent, requireSingleWAMIDMessage(t, app, account, wamid).Status,
+				"the echo after the skipped changes is stored on the first attempt")
+
+			assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+			assert.Len(t, logs.lines("info", retryTestChangeDeferredLog), 2, "nothing is deferred on the replay")
+			assert.Len(t, logs.lines("info", retryTestTemplateLog), 1, "the template status update runs once")
+			assert.Len(t, logs.lines("info", retryTestCallLog), 1, "the call event runs once")
+			assert.Len(t, logs.lines("info", retryTestCallEndedLog), 1)
+			require.NoError(t, app.DB.First(&storedCall, callLog.ID).Error)
+			assert.Equal(t, models.CallStatusMissed, storedCall.Status)
+			assert.NotNil(t, storedCall.EndedAt)
+			assert.Equal(t, 42, storedCall.Duration)
+			require.Eventually(t, func() bool {
+				var stored models.Template
+				return app.DB.First(&stored, template.ID).Error == nil && stored.Status == "APPROVED"
+			}, 10*time.Second, 20*time.Millisecond, "the replay applies the template status update")
+			require.Eventually(t, func() bool {
+				return len(logs.lines("info", retryTestTemplateUpdatedLog)) == 1
+			}, 10*time.Second, 20*time.Millisecond)
+			assert.Equal(t, models.MessageStatusRead, requireSingleWAMIDMessage(t, app, account, wamid).Status)
+		})
+	}
+}
+
+// An inbound message after a status that must be retried is not admitted in
+// that attempt either (its automatic reply must not start ahead of Meta's
+// in-order replay). The replay admits it once.
+func TestWebhookStatusRetrySkipsLaterInboundMessage(t *testing.T) {
+	app := webhookTestApp(t)
+	t.Cleanup(app.wg.Wait)
+	for _, layout := range retryPOSTLayouts {
+		t.Run(layout.name, func(t *testing.T) {
+			account := orphanStatusTestAccount(t, app, true)
+			connectCoexistenceForInboundTest(t, app, account)
+			sender := coexistenceInboundSenderForTest(t, app, account)
+			uid := uuid.NewString()
+			echoWAMID := "wamid.synthetic-skip-inbound-echo-" + uid
+			inboundWAMID := "wamid.synthetic-skip-inbound-" + uid
+			now := time.Now()
+			body := retryPOSTBody(t, account, layout.layout(
+				retryPOSTStatusChange(account, orphanStatusAt(echoWAMID, "delivered", now)),
+				retryPOSTInboundChange(account, sender, inboundWAMID, now),
+				retryPOSTEchoChange(account, retryPOSTEcho(echoWAMID, now)),
+			)...)
+			logs := captureStatusTestLogs(app)
+
+			assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+			assert.Len(t, logs.lines("info", retryTestChangeDeferredLog), 1)
+			assert.Empty(t, logs.lines("info", retryTestInboundLog))
+			assert.Zero(t, countWAMIDMessages(t, app, account, inboundWAMID),
+				"the inbound message waits for the replay")
+			assert.Equal(t, models.MessageStatusSent, requireSingleWAMIDMessage(t, app, account, echoWAMID).Status)
+
+			for attempt := 2; attempt <= 3; attempt++ {
+				assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body), "attempt %d", attempt)
+				inbound := requireSingleWAMIDMessage(t, app, account, inboundWAMID)
+				assert.Equal(t, models.DirectionIncoming, inbound.Direction)
+				assert.Equal(t, sender.ID, inbound.ContactID)
+				assert.Equal(t, models.MessageStatusDelivered, requireSingleWAMIDMessage(t, app, account, echoWAMID).Status)
+			}
+			assert.Len(t, logs.lines("info", retryTestChangeDeferredLog), 1)
+		})
+	}
+}
+
+// A real persistence failure of an echo after a status that must be retried
+// still answers 503 at that point: nothing after the failed echo is processed
+// in that attempt, exactly as for any other failed change. Once the failure
+// passes, Meta's replays store every echo once and then apply the status.
+func TestWebhookEchoPersistenceFailureAfterStatusRetryEndsPOST(t *testing.T) {
+	app := webhookTestApp(t)
+	for _, layout := range retryPOSTLayouts {
+		t.Run(layout.name, func(t *testing.T) {
+			account := orphanStatusTestAccount(t, app, true)
+			uid := uuid.NewString()
+			ownerWAMID := "wamid.synthetic-echo-failure-owner-" + uid
+			failingWAMID := "wamid.synthetic-echo-failure-failing-" + uid
+			now := time.Now()
+			body := retryPOSTBody(t, account, layout.layout(
+				retryPOSTStatusChange(account, orphanStatusAt(ownerWAMID, "delivered", now)),
+				retryPOSTEchoChange(account, retryPOSTEcho(failingWAMID, now)),
+				retryPOSTEchoChange(account, retryPOSTEcho(ownerWAMID, now)),
+			)...)
+			removeFailure := failSyntheticMessageWrites(t, app, "INSERT",
+				fmt.Sprintf("NEW.whats_app_message_id = '%s'", failingWAMID))
+			logs := captureStatusTestLogs(app)
+
+			assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+			failed := logs.lines("error", retryTestEchoFailedLog)
+			require.Len(t, failed, 1)
+			assert.Contains(t, failed[0], "synthetic passing message write failure")
+			assert.Zero(t, countWAMIDMessages(t, app, account, failingWAMID))
+			assert.Zero(t, countWAMIDMessages(t, app, account, ownerWAMID),
+				"nothing after the failed echo is processed in this attempt")
+
+			// The failure passes. The replay stores both echoes; the status
+			// still waits, because its echo is stored after it in this attempt.
+			removeFailure()
+			logs.reset()
+			assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+			assert.Empty(t, logs.lines("error", retryTestEchoFailedLog))
+			requireSingleWAMIDMessage(t, app, account, failingWAMID)
+			assert.Equal(t, models.MessageStatusSent, requireSingleWAMIDMessage(t, app, account, ownerWAMID).Status)
+
+			assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+			requireSingleWAMIDMessage(t, app, account, failingWAMID)
+			assert.Equal(t, models.MessageStatusDelivered, requireSingleWAMIDMessage(t, app, account, ownerWAMID).Status)
+		})
+	}
+}
+
+// Replaying a POST whose first attempt stored an echo and was answered with
+// 503 for a status applies the echo no second time: message and contact rows,
+// the contact's summary, campaign counters and the recipient's receipt times
+// are only changed by the statuses the replay applies, and a further replay
+// changes nothing at all.
+func TestWebhookStatusRetryEchoReplayIsIdempotent(t *testing.T) {
+	app := webhookTestApp(t)
+	_, known, campaign, recipient := webhookTestData(t, app, models.MessageStatusSent)
+	var account models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ?", known.OrganizationID).First(&account).Error)
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("id = ?", account.ID).Update("is_smb", true).Error)
+	app.InvalidateWhatsAppAccountCache(account.PhoneID)
+	account.IsSMB = true
+
+	echoWAMID := "wamid.synthetic-replay-echo-" + uuid.NewString()
+	now := time.Now()
+	body := retryPOSTBody(t, account,
+		[]map[string]any{
+			retryPOSTStatusChange(account,
+				orphanStatusAt(echoWAMID, "read", now),
+				orphanStatusAt(known.WhatsAppMessageID, "delivered", now),
+			),
+			retryPOSTEchoChange(account, retryPOSTEcho(echoWAMID, now)),
+		},
+		[]map[string]any{
+			retryPOSTStatusChange(account, orphanStatusAt(known.WhatsAppMessageID, "read", now)),
+		},
+	)
+
+	type snapshot struct {
+		messages, contacts                int64
+		echoID, echoContactID             uuid.UUID
+		echoContent                       string
+		echoContactLastMessageAt          *time.Time
+		sent, delivered, read, failed     int
+		recipientStatus                   models.MessageStatus
+		recipientDelivered, recipientRead *time.Time
+		knownStatus, echoStatus           models.MessageStatus
+	}
+	take := func() snapshot {
+		t.Helper()
+		var s snapshot
+		require.NoError(t, app.DB.Unscoped().Model(&models.Message{}).
+			Where("organization_id = ?", account.OrganizationID).Count(&s.messages).Error)
+		require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+			Where("organization_id = ?", account.OrganizationID).Count(&s.contacts).Error)
+		echo := requireSingleWAMIDMessage(t, app, account, echoWAMID)
+		s.echoID, s.echoContactID, s.echoContent, s.echoStatus = echo.ID, echo.ContactID, echo.Content, echo.Status
+		var echoContact models.Contact
+		require.NoError(t, app.DB.First(&echoContact, echo.ContactID).Error)
+		s.echoContactLastMessageAt = echoContact.LastMessageAt
+		var storedCampaign models.BulkMessageCampaign
+		require.NoError(t, app.DB.First(&storedCampaign, campaign.ID).Error)
+		s.sent, s.delivered, s.read, s.failed = storedCampaign.SentCount, storedCampaign.DeliveredCount,
+			storedCampaign.ReadCount, storedCampaign.FailedCount
+		var storedRecipient models.BulkMessageRecipient
+		require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
+		s.recipientStatus, s.recipientDelivered, s.recipientRead =
+			storedRecipient.Status, storedRecipient.DeliveredAt, storedRecipient.ReadAt
+		s.knownStatus = requireSingleWAMIDMessage(t, app, account, known.WhatsAppMessageID).Status
+		return s
+	}
+
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+	first := take()
+	assert.Equal(t, models.MessageStatusSent, first.echoStatus)
+	assert.Equal(t, uuid.NewSHA1(account.ID, []byte("coexistence-message:"+echoWAMID)), first.echoID,
+		"the echo's Message id is deterministic")
+	assert.Equal(t, models.MessageStatusDelivered, first.knownStatus,
+		"another message's status in the same change is applied on the first attempt")
+	assert.Equal(t, 1, first.delivered)
+	assert.Zero(t, first.read, "the read status in a later change waits for the replay")
+	assert.NotNil(t, first.recipientDelivered)
+	assert.Nil(t, first.recipientRead)
+
+	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+	second := take()
+	assert.Equal(t, first.messages, second.messages, "no duplicate message")
+	assert.Equal(t, first.contacts, second.contacts, "no duplicate contact")
+	assert.Equal(t, first.echoID, second.echoID)
+	assert.Equal(t, first.echoContactID, second.echoContactID)
+	assert.Equal(t, first.echoContent, second.echoContent)
+	require.NotNil(t, first.echoContactLastMessageAt)
+	require.NotNil(t, second.echoContactLastMessageAt)
+	assert.True(t, first.echoContactLastMessageAt.Equal(*second.echoContactLastMessageAt), "contact summary kept")
+	assert.Equal(t, models.MessageStatusRead, second.echoStatus)
+	assert.Equal(t, models.MessageStatusRead, second.knownStatus)
+	assert.Equal(t, [4]int{first.sent, 1, 1, first.failed},
+		[4]int{second.sent, second.delivered, second.read, second.failed}, "campaign counters")
+	require.NotNil(t, second.recipientDelivered)
+	require.NotNil(t, second.recipientRead)
+	assert.True(t, first.recipientDelivered.Equal(*second.recipientDelivered), "delivered_at kept")
+
+	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+	third := take()
+	assert.Equal(t, second.messages, third.messages)
+	assert.Equal(t, second.contacts, third.contacts)
+	assert.Equal(t, second.echoID, third.echoID)
+	assert.Equal(t, second.echoContactID, third.echoContactID)
+	assert.Equal(t, second.echoContent, third.echoContent)
+	assert.Equal(t, second.echoStatus, third.echoStatus)
+	assert.Equal(t, second.knownStatus, third.knownStatus)
+	require.NotNil(t, third.echoContactLastMessageAt)
+	assert.True(t, second.echoContactLastMessageAt.Equal(*third.echoContactLastMessageAt))
+	assert.Equal(t, [4]int{second.sent, second.delivered, second.read, second.failed},
+		[4]int{third.sent, third.delivered, third.read, third.failed})
+	assert.Equal(t, second.recipientStatus, third.recipientStatus)
+	require.NotNil(t, third.recipientDelivered)
+	require.NotNil(t, third.recipientRead)
+	assert.True(t, second.recipientDelivered.Equal(*third.recipientDelivered))
+	assert.True(t, second.recipientRead.Equal(*third.recipientRead))
+}
+
+// An edit echo is not stored ahead of a status retry: its replay guard
+// remembers only the latest edit, so replayed after a newer edit of the same
+// message it would restore the older text. It waits for Meta's replay like
+// the other skipped changes, while a new echo in the same change is stored.
+func TestWebhookStatusRetryHoldsBackEchoEdit(t *testing.T) {
+	app := webhookTestApp(t)
+	account := orphanStatusTestAccount(t, app, true)
+	uid := uuid.NewString()
+	originalWAMID := "wamid.synthetic-held-edit-original-" + uid
+	newWAMID := "wamid.synthetic-held-edit-new-" + uid
+	editWAMID := "wamid.synthetic-held-edit-event-" + uid
+	now := time.Now()
+	require.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, retryPOSTBody(t, account,
+		[]map[string]any{retryPOSTEchoChange(account, retryPOSTEcho(originalWAMID, now))})))
+
+	body := retryPOSTBody(t, account, []map[string]any{
+		retryPOSTStatusChange(account, orphanStatusAt(newWAMID, "delivered", now)),
+		retryPOSTEchoChange(account,
+			retryPOSTEcho(newWAMID, now),
+			retryPOSTEchoEdit(editWAMID, originalWAMID, "synthetic edited reply", now),
+		),
+	})
+	logs := captureStatusTestLogs(app)
+
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+	assert.Len(t, logs.lines("info", retryTestEchoEditDeferredLog), 1)
+	assert.Equal(t, models.MessageStatusSent, requireSingleWAMIDMessage(t, app, account, newWAMID).Status)
+	assert.Equal(t, "synthetic phone-app reply", requireSingleWAMIDMessage(t, app, account, originalWAMID).Content,
+		"the edit waits for the replay")
+
+	for attempt := 2; attempt <= 3; attempt++ {
+		assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body), "attempt %d", attempt)
+		assert.Equal(t, "synthetic edited reply", requireSingleWAMIDMessage(t, app, account, originalWAMID).Content,
+			"attempt %d", attempt)
+		assert.Equal(t, models.MessageStatusDelivered, requireSingleWAMIDMessage(t, app, account, newWAMID).Status,
+			"attempt %d", attempt)
+		assert.Zero(t, countWAMIDMessages(t, app, account, editWAMID), "the edit event is no message of its own")
+	}
+	assert.Len(t, logs.lines("info", retryTestEchoEditDeferredLog), 1)
+}
+
+// Statuses in a change after a status that must be retried wait for Meta's
+// replay too, also those of other messages, so the per-message order set
+// only needs to cover one change. That also holds when the message is stored
+// in between, by an echo later in the same POST.
+func TestWebhookStatusRetryDefersStatusesOfLaterChanges(t *testing.T) {
+	for _, layout := range retryPOSTLayouts {
+		t.Run("passing failure, "+layout.name, func(t *testing.T) {
+			app := webhookTestApp(t)
+			_, known, campaign, recipient := webhookTestData(t, app, models.MessageStatusSent)
+			var account models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("organization_id = ?", known.OrganizationID).First(&account).Error)
+			otherWAMID := "wamid.synthetic-later-statuses-other-" + uuid.NewString()
+			other := models.Message{
+				BaseModel:      models.BaseModel{ID: uuid.NewSHA1(account.ID, []byte("coexistence-message:"+otherWAMID))},
+				OrganizationID: known.OrganizationID, WhatsAppAccount: account.Name, ContactID: known.ContactID,
+				WhatsAppMessageID: otherWAMID, Direction: models.DirectionOutgoing, MessageType: models.MessageTypeText,
+				Content: "synthetic second message", Status: models.MessageStatusSent,
+				Metadata: models.JSONB{database.WhatsAppWAMIDOwnerMetadataKey: true},
+			}
+			require.NoError(t, app.DB.Create(&other).Error)
+			removeFailure := failSyntheticMessageWrites(t, app, "UPDATE OF status",
+				fmt.Sprintf("NEW.id = '%s'::uuid AND NEW.status = 'delivered'", known.ID))
+
+			now := time.Now()
+			body := retryPOSTBody(t, account, layout.layout(
+				retryPOSTStatusChange(account, orphanStatusAt(known.WhatsAppMessageID, "delivered", now)),
+				retryPOSTStatusChange(account,
+					orphanStatusAt(known.WhatsAppMessageID, "read", now),
+					orphanStatusAt(otherWAMID, "delivered", now),
+				),
+			)...)
+			logs := captureStatusTestLogs(app)
+			assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+			assert.Len(t, logs.lines("error", statusTestFailedLog), 1)
+			assert.Len(t, logs.lines("info", retryTestChangeDeferredLog), 1)
+
+			var stored, storedOther models.Message
+			var storedRecipient models.BulkMessageRecipient
+			var storedCampaign models.BulkMessageCampaign
+			require.NoError(t, app.DB.First(&stored, known.ID).Error)
+			require.NoError(t, app.DB.First(&storedOther, other.ID).Error)
+			require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
+			require.NoError(t, app.DB.First(&storedCampaign, campaign.ID).Error)
+			assert.Equal(t, models.MessageStatusSent, stored.Status, "read in a later change waits for the failed delivered")
+			assert.Equal(t, models.MessageStatusSent, storedRecipient.Status)
+			assert.Nil(t, storedRecipient.DeliveredAt)
+			assert.Nil(t, storedRecipient.ReadAt)
+			assert.Zero(t, storedCampaign.DeliveredCount)
+			assert.Zero(t, storedCampaign.ReadCount)
+			assert.Equal(t, models.MessageStatusSent, storedOther.Status, "another message's later change waits too")
+
+			removeFailure()
+			assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+			require.NoError(t, app.DB.First(&stored, known.ID).Error)
+			require.NoError(t, app.DB.First(&storedOther, other.ID).Error)
+			require.NoError(t, app.DB.First(&storedRecipient, recipient.ID).Error)
+			require.NoError(t, app.DB.First(&storedCampaign, campaign.ID).Error)
+			assert.Equal(t, models.MessageStatusRead, stored.Status)
+			assert.Equal(t, models.MessageStatusRead, storedRecipient.Status)
+			assert.NotNil(t, storedRecipient.DeliveredAt, "the retried delivered step is applied, not skipped")
+			assert.NotNil(t, storedRecipient.ReadAt)
+			assert.Equal(t, 1, storedCampaign.DeliveredCount)
+			assert.Equal(t, 1, storedCampaign.ReadCount)
+			assert.Equal(t, models.MessageStatusDelivered, storedOther.Status)
+		})
+	}
+
+	t.Run("pending Coexistence status, echo stored in between", func(t *testing.T) {
+		app := webhookTestApp(t)
+		account := orphanStatusTestAccount(t, app, true)
+		wamid := "wamid.synthetic-later-statuses-echo-" + uuid.NewString()
+		now := time.Now()
+		body := retryPOSTBody(t, account, []map[string]any{
+			retryPOSTStatusChange(account, orphanStatusAt(wamid, "delivered", now)),
+			retryPOSTEchoChange(account, retryPOSTEcho(wamid, now)),
+			retryPOSTStatusChange(account, orphanStatusAt(wamid, "read", now)),
+		})
+		logs := captureStatusTestLogs(app)
+		assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+		assert.Len(t, logs.lines("info", retryTestChangeDeferredLog), 1)
+		assert.Equal(t, models.MessageStatusSent, requireSingleWAMIDMessage(t, app, account, wamid).Status,
+			"the read waits for the retried delivered although its message is stored now")
+
+		logs.reset()
+		assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, body))
+		assert.Empty(t, logs.lines("info", retryTestChangeDeferredLog))
+		assert.Equal(t, models.MessageStatusRead, requireSingleWAMIDMessage(t, app, account, wamid).Status)
+	})
+}
+
 func TestUpdateMessageStatus_FailedBroadcastsErrorMessageViaWebSocket(t *testing.T) {
 	// Create app with a real WebSocket hub
 	db := testutil.SetupTestDB(t)
