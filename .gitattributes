@@ -1,2 +1,0 @@
-# Committed production evidence is pinned byte for byte: never convert its line endings.
-release/deployment/live-evidence/** -text
