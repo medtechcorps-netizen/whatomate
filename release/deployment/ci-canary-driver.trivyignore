@@ -1,0 +1,10 @@
+# Reviewed, expiring Trivy vulnerability exceptions for the CI scan of the
+# CRM canary driver container only (.github/workflows/test.yml, step "Scan
+# CRM canary driver container"). Same format and rules as ship.trivyignore,
+# checked by release/deployment/trivy_policy.py. The release images and
+# their ship.yml scans never read this file.
+#
+# reason: braces <=3.0.3 stack-exhaustion DoS has no patched release; build/test tooling in the retiring driver image only
+CVE-2026-93687 exp:2026-12-31
+# reason: same braces advisory under its GHSA id; driver code is removed in Stage 2 Part A before this expires
+GHSA-vfj7-8cjw-p6xm exp:2026-12-31
