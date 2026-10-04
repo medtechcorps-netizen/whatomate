@@ -120,6 +120,26 @@ must not overlap them. A future overlapping migration requires a separate
 drain: block static intake, drain/settle old static work, remove the exact
 mapping from every replica, roll all replicas, then start managed OAuth.
 
+## Non-production Graph origins
+
+Local, CI, and staging relays can send Graph calls to a Graph stub instead of
+Meta. Production sets none of these variables.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `META_RELAY_ENVIRONMENT` | `production` | `production`, `staging`, `local`, or `test`. Any other value stops startup. |
+| `META_RELAY_FACEBOOK_GRAPH_BASE_URL` | unset (`https://graph.facebook.com`) | Graph origin for Messenger and `facebook_login` Instagram accounts. Outside production only. |
+| `META_RELAY_INSTAGRAM_GRAPH_BASE_URL` | unset (`https://graph.instagram.com`) | Graph origin for `instagram_login` accounts. Outside production only. |
+
+Each base URL must be a bare `http` or `https` origin, `scheme://host[:port]`
+with at most a trailing `/`, and no credentials, path, query, or fragment. The
+relay adds the Graph version and path itself. An unset base URL keeps Meta's
+host, so one product can use a stub while the other does not.
+
+When `META_RELAY_ENVIRONMENT` is unset or `production`, setting either base URL
+stops startup, even if it restates Meta's own host. A production relay
+therefore always calls `graph.facebook.com` and `graph.instagram.com`.
+
 ## Dynamic control plane
 
 > **Production gate:** keep the dynamic registry and Messenger lifecycle off
@@ -231,7 +251,9 @@ the channel, token, webhook payload, or environment-variable name.
 | `instagram` + `facebook_login` | Facebook Page token with `instagram_*` permissions, including `instagram_manage_messages` | `graph.facebook.com` | Messenger parent app |
 
 Messenger mappings must omit `instagram_api_mode`. A missing or unrecognized
-Instagram mode, or a mode on a Messenger mapping, stops startup.
+Instagram mode, or a mode on a Messenger mapping, stops startup. The Graph
+hosts above are fixed in production; outside production they can be replaced
+as described in [Non-production Graph origins](#non-production-graph-origins).
 
 Example:
 

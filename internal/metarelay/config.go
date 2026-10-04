@@ -34,6 +34,8 @@ const (
 	leaseSafetyMargin        = time.Second
 	maxWorkerConcurrency     = 64
 	maxStaticMessengerApps   = 16
+
+	relayEnvironmentProduction = "production"
 )
 
 var (
@@ -98,6 +100,9 @@ func loadConfig(getenv func(string) string) (*Config, error) {
 	}
 	if config.RedisPrefix == "" {
 		config.RedisPrefix = defaultRedisPrefix
+	}
+	if err := config.loadGraphBaseOverrides(getenv); err != nil {
+		return nil, err
 	}
 
 	var err error
@@ -549,6 +554,62 @@ func validateEndpoint(raw string, allowInsecure bool) error {
 		return nil
 	}
 	return errors.New("https is required")
+}
+
+// loadGraphBaseOverrides reads the relay environment and the optional Graph
+// origins. Production is the default, and production keeps Meta's hosts: an
+// override there stops startup instead of being ignored.
+func (c *Config) loadGraphBaseOverrides(getenv func(string) string) error {
+	c.Environment = strings.ToLower(strings.TrimSpace(getenv("META_RELAY_ENVIRONMENT")))
+	if c.Environment == "" {
+		c.Environment = relayEnvironmentProduction
+	}
+	c.FacebookGraphBaseURL = getenv("META_RELAY_FACEBOOK_GRAPH_BASE_URL")
+	c.InstagramGraphBaseURL = getenv("META_RELAY_INSTAGRAM_GRAPH_BASE_URL")
+	return c.validateGraphBaseOverrides()
+}
+
+// validateGraphBaseOverrides is also checked by NewServer, so a Config built
+// in code cannot point a production relay at another Graph host either. An
+// empty environment is production.
+func (c *Config) validateGraphBaseOverrides() error {
+	switch c.Environment {
+	case "", relayEnvironmentProduction:
+		if c.FacebookGraphBaseURL != "" || c.InstagramGraphBaseURL != "" {
+			return errors.New("meta Graph base URL overrides are refused in production; unset META_RELAY_FACEBOOK_GRAPH_BASE_URL and META_RELAY_INSTAGRAM_GRAPH_BASE_URL")
+		}
+		return nil
+	case "staging", "local", "test":
+	default:
+		return errors.New("environment variable META_RELAY_ENVIRONMENT must be production, staging, local, or test")
+	}
+	if err := validateGraphBaseOrigin(c.FacebookGraphBaseURL); err != nil {
+		return fmt.Errorf("environment variable META_RELAY_FACEBOOK_GRAPH_BASE_URL %w", err)
+	}
+	if err := validateGraphBaseOrigin(c.InstagramGraphBaseURL); err != nil {
+		return fmt.Errorf("environment variable META_RELAY_INSTAGRAM_GRAPH_BASE_URL %w", err)
+	}
+	return nil
+}
+
+// validateGraphBaseOrigin mirrors the WhatsApp base_url rule in
+// internal/config: an HTTP(S) origin only. It also requires the exact
+// scheme://host[:port] spelling, because the value is joined into request
+// URLs as written. Errors never echo the value.
+func validateGraphBaseOrigin(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || strings.TrimSpace(raw) != raw || parsed.Hostname() == "" || parsed.User != nil ||
+		parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawPath != "" ||
+		parsed.ForceQuery || parsed.Opaque != "" ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		(parsed.Path != "" && parsed.Path != "/") ||
+		strings.TrimSuffix(raw, "/") != parsed.Scheme+"://"+parsed.Host {
+		return errors.New("must be an HTTP(S) origin without credentials, path, query, or fragment")
+	}
+	return nil
 }
 
 func secretFromEnv(getenv func(string) string, accountKey, field, envName string) (string, error) {

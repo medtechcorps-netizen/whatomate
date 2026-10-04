@@ -79,6 +79,9 @@ func NewServer(config *Config, store ServerStore, options ...ServerOption) (*Ser
 	if store == nil {
 		return nil, errors.New("durable relay store is required")
 	}
+	if err := config.validateGraphBaseOverrides(); err != nil {
+		return nil, err
+	}
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -96,6 +99,8 @@ func NewServer(config *Config, store ServerStore, options ...ServerOption) (*Ser
 		outboundTimeout:    defaultOutboundTimeout,
 		settlementTimeout:  defaultSettlementTimeout,
 	}
+	// Validated above: both are empty in production, so Meta's hosts stay.
+	withGraphBases(config.FacebookGraphBaseURL, config.InstagramGraphBaseURL)(server)
 	for _, option := range options {
 		option(server)
 	}
