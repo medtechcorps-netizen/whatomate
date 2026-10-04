@@ -293,33 +293,50 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 	// (see the status loop below). That no longer ends the POST after the
 	// status's own change. The remaining changes and entries are still walked,
 	// but only smb_message_echoes changes are processed. Every other change is
-	// skipped and waits for Meta's replay, exactly as when the 503 ended the
-	// POST there. The POST is answered with a single 503 at its end.
+	// skipped, as when the 503 ended the POST there, and the POST is answered
+	// with a single 503 at its end.
 	//
 	// Echoes are the only exception. They are the event that the early 503
 	// lost: on a Coexistence account Meta can batch a status ahead of the echo
 	// that stores the very message the status belongs to. Meta replays a POST
 	// in the same order, so the status could never resolve, and the echo was
-	// lost once Meta stopped retrying. Echoes are also safe to run on the first
-	// attempt and again on every replay. An echo change commits in one
-	// transaction before the acknowledgement, and an echo is idempotent per
-	// WAMID: its Message has a deterministic id, the first durable admission
-	// winner owns the WAMID, a replay only merges details and moves the status
-	// forward, and the new-message broadcast and outgoing webhook fire only on
-	// the first insert. A revoke echo is final and a no-op once applied. An
-	// edit echo is held back with the skipped changes, because its replay
-	// guard remembers only the latest edit: replayed after a newer edit of the
-	// same message, it would restore the older text. An echo that quotes an
-	// inbound message skipped earlier in the POST is stored without its reply
-	// link, which a replay of the echo does not add.
+	// lost once Meta stopped retrying. Every echo is stored, not only one whose
+	// message has a pending status: a Coexistence status whose message is
+	// never stored stays pending for Meta's whole retry window, and would
+	// otherwise still lose every other echo behind it. Echoes are also safe to
+	// run on the first attempt and again on every replay. An echo change
+	// commits in one transaction before the acknowledgement, and an echo is
+	// idempotent per WAMID: its Message has a deterministic id, the first
+	// durable admission winner owns the WAMID, a replay only merges details and
+	// moves the status forward, the new-message broadcast and outgoing webhook
+	// fire only on the first insert, and the media hydration job is keyed for
+	// idempotency. A revoke echo is final and a no-op once applied. An edit
+	// echo is held back with the skipped changes, because its replay guard
+	// remembers only the latest edit: replayed after a newer edit of the same
+	// message, it would restore the older text.
 	//
 	// The skipped changes have no such guard, or depend on their order. Calls,
 	// template status updates, call-permission replies and reactions have no
 	// replay guard: run on the first attempt and again on each replay, they
 	// could overwrite newer state with older state or repeat call events.
 	// Inbound messages must not be admitted, and their automatic replies
-	// started, ahead of Meta's in-order replay, and later statuses keep
-	// per-message order by waiting too.
+	// started, ahead of Meta's replay, and later statuses keep per-message
+	// order by waiting too.
+	//
+	// As when the 503 ended the POST at the status, a skipped change is
+	// processed only by a replay that no longer has to retry a status, never
+	// by an attempt that does. It now runs after the echoes that followed it
+	// in the POST, though, because those were stored by an earlier attempt:
+	// the order seen when Meta delivers such an echo in an earlier POST. For
+	// an inbound message M and a later echo E to the same customer, both after
+	// the pending status:
+	//   - E is stored without its reply link to M, and a replay of E does not
+	//     add a missing link;
+	//   - the inbox conversation's last-message preview shows M instead of E,
+	//     and its last inbound time ends up later than its last outbound time;
+	//   - if M is the first message from a BSUID that no contact owns yet, it
+	//     is admitted to the contact that E created instead of being staged
+	//     for identity review.
 	//
 	// A persistence failure of a processed echo, like that of any change
 	// before the status, still answers 503 at that point, and nothing after it

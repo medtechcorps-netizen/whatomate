@@ -1768,13 +1768,13 @@ func TestWebhookStatusBeforeCoexistenceEchoInSamePOSTStoresEcho(t *testing.T) {
 }
 
 // Changes after a status that must be retried, other than echoes, are not
-// processed in that attempt: they wait for Meta's in-order replay, exactly as
-// when the 503 ended the POST at the status. Calls and template status
-// updates have no replay guard, so running them on the first attempt and
-// again on every replay could repeat call events or overwrite a newer
-// template status with this older one. Here they run exactly once, on the
-// replay that is acknowledged, while the echo after them is still stored on
-// the first attempt.
+// processed in that attempt: they wait for Meta's replay, as when the 503
+// ended the POST at the status. Calls and template status updates have no
+// replay guard, so running them on the first attempt and again on every
+// replay could repeat call events or overwrite a newer template status with
+// this older one. Here they run exactly once, on the replay that is
+// acknowledged, while the echo after them is still stored on the first
+// attempt.
 func TestWebhookStatusRetrySkipsUnguardedLaterChanges(t *testing.T) {
 	app := webhookTestApp(t)
 	for _, layout := range retryPOSTLayouts {
@@ -1837,7 +1837,7 @@ func TestWebhookStatusRetrySkipsUnguardedLaterChanges(t *testing.T) {
 
 // An inbound message after a status that must be retried is not admitted in
 // that attempt either (its automatic reply must not start ahead of Meta's
-// in-order replay). The replay admits it once.
+// replay). The replay admits it once.
 func TestWebhookStatusRetrySkipsLaterInboundMessage(t *testing.T) {
 	app := webhookTestApp(t)
 	t.Cleanup(app.wg.Wait)
@@ -2034,6 +2034,195 @@ func TestWebhookStatusRetryEchoReplayIsIdempotent(t *testing.T) {
 	require.NotNil(t, third.recipientRead)
 	assert.True(t, second.recipientDelivered.Equal(*third.recipientDelivered))
 	assert.True(t, second.recipientRead.Equal(*third.recipientRead))
+}
+
+// On a Coexistence account a status whose message is never stored stays
+// pending for Meta's whole retry window, so the echoes after it in the same
+// POST are stored by the first attempt and then replayed again and again.
+// The replays must leave that attempt's side effects alone: no further
+// message, contact or inbox conversation, one media hydration job, the same
+// inbox conversation link and summary, and one new-message realtime event and
+// one outgoing webhook per echo.
+func TestWebhookStatusRetryEchoReplayKeepsSideEffectsStable(t *testing.T) {
+	app := webhookTestApp(t)
+	t.Cleanup(app.wg.Wait)
+	account := orphanStatusTestAccount(t, app, true)
+
+	hub := websocket.NewHub(app.Log)
+	go hub.Run()
+	app.WSHub = hub
+	client := websocket.NewClient(hub, nil, uuid.New(), account.OrganizationID)
+	hub.Register(client)
+	require.Eventually(t, func() bool { return hub.GetClientCount() == 1 }, 2*time.Second, 5*time.Millisecond)
+	newMessageEvents := map[string]int{}
+	// drainNewMessageEvents counts the new-message events received so far. It
+	// waits up to 5s for a first event of each wanted message, then returns
+	// once no event has arrived for 300ms.
+	drainNewMessageEvents := func(want ...uuid.UUID) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			wait := 300 * time.Millisecond
+			for _, id := range want {
+				if newMessageEvents[id.String()] == 0 {
+					wait = time.Until(deadline)
+				}
+			}
+			if wait <= 0 {
+				return
+			}
+			select {
+			case data := <-client.SendChan():
+				var message websocket.WSMessage
+				require.NoError(t, json.Unmarshal(data, &message))
+				if message.Type != websocket.TypeNewMessage {
+					continue
+				}
+				payload, ok := message.Payload.(map[string]any)
+				require.True(t, ok)
+				id, _ := payload["id"].(string)
+				newMessageEvents[id]++
+			case <-time.After(wait):
+				return
+			}
+		}
+	}
+
+	var deliveriesMu sync.Mutex
+	outgoingDeliveries := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Event string `json:"event"`
+			Data  struct {
+				MessageID string `json:"message_id"`
+			} `json:"data"`
+		}
+		if json.NewDecoder(r.Body).Decode(&payload) == nil &&
+			payload.Event == string(models.WebhookEventMessageOutgoing) {
+			deliveriesMu.Lock()
+			outgoingDeliveries[payload.Data.MessageID]++
+			deliveriesMu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	app.HTTPClient = testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{
+		"https://webhook.example.com": server,
+	})
+	app.InvalidateWebhooksCache(account.OrganizationID)
+	t.Cleanup(func() { app.InvalidateWebhooksCache(account.OrganizationID) })
+	require.NoError(t, app.DB.Create(&models.Webhook{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: account.OrganizationID,
+		Name:           "synthetic-retry-webhook",
+		URL:            "https://webhook.example.com/synthetic-retry",
+		Events:         models.StringArray{string(models.WebhookEventMessageOutgoing)},
+		IsActive:       true,
+	}).Error)
+
+	uid := uuid.NewString()
+	neverStoredWAMID := "wamid.synthetic-never-stored-" + uid
+	imageWAMID := "wamid.synthetic-image-echo-" + uid
+	textWAMID := "wamid.synthetic-text-echo-" + uid
+	now := time.Now()
+	imageEcho := map[string]any{
+		"from": "15550000001", "to": "15550000002", "id": imageWAMID,
+		"timestamp": strconv.FormatInt(now.Unix(), 10), "type": "image",
+		"image": map[string]any{
+			"id": "synthetic-media-" + uid, "mime_type": "image/jpeg", "sha256": "synthetic-sha256",
+		},
+	}
+	body := retryPOSTBody(t, account, []map[string]any{
+		retryPOSTStatusChange(account, orphanStatusAt(neverStoredWAMID, "delivered", now)),
+		retryPOSTEchoChange(account, imageEcho, retryPOSTEcho(textWAMID, now)),
+	})
+
+	type snapshot struct {
+		messages, contacts, conversations, jobs, imageJobs int64
+		imageID, textID                                    uuid.UUID
+		imageConversation, textConversation                uuid.UUID
+		contactPreview                                     string
+		contactLastMessageAt                               time.Time
+		conversationPreview                                string
+		conversationUnread                                 int
+		conversationLastMessageAt                          time.Time
+		conversationLastOutboundAt                         time.Time
+	}
+	take := func() snapshot {
+		t.Helper()
+		app.WaitForBackgroundTasks()
+		var s snapshot
+		require.NoError(t, app.DB.Unscoped().Model(&models.Message{}).
+			Where("organization_id = ?", account.OrganizationID).Count(&s.messages).Error)
+		require.NoError(t, app.DB.Unscoped().Model(&models.Contact{}).
+			Where("organization_id = ?", account.OrganizationID).Count(&s.contacts).Error)
+		require.NoError(t, app.DB.Unscoped().Model(&models.InboxConversation{}).
+			Where("organization_id = ?", account.OrganizationID).Count(&s.conversations).Error)
+		image := requireSingleWAMIDMessage(t, app, account, imageWAMID)
+		text := requireSingleWAMIDMessage(t, app, account, textWAMID)
+		s.imageID, s.textID = image.ID, text.ID
+		require.NoError(t, app.DB.Model(&models.ScheduledJob{}).
+			Where("organization_id = ?", account.OrganizationID).Count(&s.jobs).Error)
+		require.NoError(t, app.DB.Model(&models.ScheduledJob{}).
+			Where("organization_id = ? AND aggregate_id = ?", account.OrganizationID, image.ID).
+			Count(&s.imageJobs).Error)
+		require.NotNil(t, image.InboxConversationID, "the image echo is linked to its inbox conversation")
+		require.NotNil(t, text.InboxConversationID, "the text echo is linked to its inbox conversation")
+		s.imageConversation, s.textConversation = *image.InboxConversationID, *text.InboxConversationID
+		var contact models.Contact
+		require.NoError(t, app.DB.First(&contact, text.ContactID).Error)
+		require.NotNil(t, contact.LastMessageAt)
+		s.contactPreview, s.contactLastMessageAt = contact.LastMessagePreview, *contact.LastMessageAt
+		var conversation models.InboxConversation
+		require.NoError(t, app.DB.First(&conversation, *text.InboxConversationID).Error)
+		require.NotNil(t, conversation.LastMessageAt)
+		require.NotNil(t, conversation.LastOutboundAt)
+		s.conversationPreview, s.conversationUnread = conversation.LastMessagePreview, conversation.UnreadCount
+		s.conversationLastMessageAt = *conversation.LastMessageAt
+		s.conversationLastOutboundAt = *conversation.LastOutboundAt
+		return s
+	}
+	eventCounts := func(s snapshot) [4]int {
+		t.Helper()
+		deliveriesMu.Lock()
+		defer deliveriesMu.Unlock()
+		return [4]int{
+			newMessageEvents[s.imageID.String()], newMessageEvents[s.textID.String()],
+			outgoingDeliveries[s.imageID.String()], outgoingDeliveries[s.textID.String()],
+		}
+	}
+
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body))
+	first := take()
+	drainNewMessageEvents(first.imageID, first.textID)
+	assert.EqualValues(t, 1, first.imageJobs, "one media hydration job for the image echo")
+	assert.Equal(t, first.imageConversation, first.textConversation)
+	assert.Equal(t, [4]int{1, 1, 1, 1}, eventCounts(first),
+		"one new-message event and one outgoing webhook per echo")
+
+	for attempt := 2; attempt <= 5; attempt++ {
+		assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, body),
+			"attempt %d: the status still waits for its message", attempt)
+		replayed := take()
+		drainNewMessageEvents()
+		assert.Equal(t, [5]int64{first.messages, first.contacts, first.conversations, first.jobs, first.imageJobs},
+			[5]int64{replayed.messages, replayed.contacts, replayed.conversations, replayed.jobs, replayed.imageJobs},
+			"attempt %d: messages, contacts, conversations and jobs", attempt)
+		assert.Equal(t, [2]uuid.UUID{first.imageID, first.textID}, [2]uuid.UUID{replayed.imageID, replayed.textID})
+		assert.Equal(t, [2]uuid.UUID{first.imageConversation, first.textConversation},
+			[2]uuid.UUID{replayed.imageConversation, replayed.textConversation},
+			"attempt %d: inbox conversation links", attempt)
+		assert.Equal(t, first.contactPreview, replayed.contactPreview)
+		assert.True(t, first.contactLastMessageAt.Equal(replayed.contactLastMessageAt),
+			"attempt %d: contact summary", attempt)
+		assert.Equal(t, first.conversationPreview, replayed.conversationPreview)
+		assert.Equal(t, first.conversationUnread, replayed.conversationUnread)
+		assert.True(t, first.conversationLastMessageAt.Equal(replayed.conversationLastMessageAt),
+			"attempt %d: inbox conversation activity", attempt)
+		assert.True(t, first.conversationLastOutboundAt.Equal(replayed.conversationLastOutboundAt))
+		assert.Equal(t, [4]int{1, 1, 1, 1}, eventCounts(replayed),
+			"attempt %d: no further new-message event or outgoing webhook", attempt)
+	}
 }
 
 // An edit echo is not stored ahead of a status retry: its replay guard
