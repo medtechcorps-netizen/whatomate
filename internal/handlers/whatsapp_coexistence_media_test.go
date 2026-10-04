@@ -531,6 +531,17 @@ func createStagedIdentityReviewMediaFixture(
 	t *testing.T,
 ) (*App, models.WhatsAppAccount, models.InboundEvent, *coexistenceMediaServer) {
 	t.Helper()
+	return createStagedIdentityReviewMediaFixtureWithMimeType(t, "image/jpeg")
+}
+
+// createStagedIdentityReviewMediaFixtureWithMimeType stages an image whose
+// webhook declares mimeType. Staged events are immutable once inserted, so the
+// type has to be chosen here.
+func createStagedIdentityReviewMediaFixtureWithMimeType(
+	t *testing.T,
+	mimeType string,
+) (*App, models.WhatsAppAccount, models.InboundEvent, *coexistenceMediaServer) {
+	t.Helper()
 	app, account, _, provider := newCoexistenceMediaFixtureWithPersistence(t, false)
 	require.NoError(t, app.DB.Create(&models.WhatsAppCoexistenceState{
 		ID:                uuid.New(),
@@ -547,6 +558,7 @@ func createStagedIdentityReviewMediaFixture(
 		"wamid.staged-media-"+uuid.NewString(),
 		"staged-media-"+uuid.NewString(),
 	)
+	message.Image.MimeType = mimeType
 	work, duplicate, err := app.persistAuthenticatedIncomingMessageBeforeAck(
 		account.PhoneID,
 		message,
