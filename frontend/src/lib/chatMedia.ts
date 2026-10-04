@@ -9,6 +9,8 @@ export type ChatMediaKind = 'image' | 'sticker' | 'video' | 'audio' | 'document'
 // then run script in the CRM's origin. So only types that render inertly keep
 // their type; anything else, and every document, becomes an opaque download.
 // "+xml" types are excluded on purpose: browsers render them as XML documents.
+// The server serves exactly these types inline (inlineChatMediaTypes in
+// internal/handlers/media.go); a Go test fails if the two lists differ.
 export const INLINE_IMAGE_TYPES: ReadonlySet<string> = new Set([
   'image/jpeg',
   'image/png',

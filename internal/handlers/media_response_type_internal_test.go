@@ -71,7 +71,8 @@ func TestMediaDownloadFilename(t *testing.T) {
 func TestInlineChatMediaTypesMatchFrontend(t *testing.T) {
 	source, err := os.ReadFile(filepath.Join("..", "..", "frontend", "src", "lib", "chatMedia.ts"))
 	require.NoError(t, err)
-	quoted := regexp.MustCompile(`'([^']+)'`)
+	// Either quote style, so reformatting the frontend file cannot break it.
+	quoted := regexp.MustCompile(`["']([^"']+)["']`)
 	var frontend []string
 	for _, name := range []string{"INLINE_IMAGE_TYPES", "INLINE_VIDEO_TYPES", "INLINE_AUDIO_TYPES"} {
 		set := regexp.MustCompile(`(?s)\b` + name + `\b[^=]*=\s*new Set\(\[(.*?)\]\)`).FindSubmatch(source)
