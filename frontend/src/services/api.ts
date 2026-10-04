@@ -474,6 +474,9 @@ export const dataService = {
   },
 };
 
+// A chat media download that receives no bytes for this long is abandoned.
+export const MEDIA_STALL_TIMEOUT_MS = 30000;
+
 export const messagesService = {
   list: (
     contactId: string,
@@ -556,6 +559,60 @@ export const messagesService = {
     api.post(`/contacts/${contactId}/messages/${messageId}/reaction`, {
       emoji,
     }),
+  // Native <img>/<video>/<audio>/<a> requests carry the auth cookie but not the
+  // X-Organization-ID header, so the server would resolve them against the
+  // login (default) workspace. Chat media is fetched through this client
+  // instead, pinned to the workspace its transcript was loaded from.
+  getMedia: (
+    messageId: string,
+    organizationId: string,
+    options: {
+      signal?: AbortSignal;
+      onProgress?: (loaded: number, total: number | undefined) => void;
+    } = {},
+  ) => {
+    const explicitOrganizationId = organizationId.trim();
+    if (!explicitOrganizationId) {
+      throw new Error("Organization is required to load chat media");
+    }
+    const { signal, onProgress } = options;
+    // WhatsApp media can be up to 16 MB, which takes minutes on a slow link,
+    // so a download fails only when it stops making progress rather than
+    // after a fixed total time.
+    const controller = new AbortController();
+    const forwardAbort = () => controller.abort(signal?.reason);
+    if (signal?.aborted) forwardAbort();
+    else signal?.addEventListener("abort", forwardAbort, { once: true });
+    let stalled = false;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const restartWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => {
+        stalled = true;
+        controller.abort();
+      }, MEDIA_STALL_TIMEOUT_MS);
+    };
+    restartWatchdog();
+    return api
+      .get<Blob>(`/media/${encodeURIComponent(messageId)}`, {
+        responseType: "blob",
+        timeout: 0,
+        headers: { "X-Organization-ID": explicitOrganizationId },
+        signal: controller.signal,
+        onDownloadProgress: (event) => {
+          restartWatchdog();
+          onProgress?.(event.loaded, event.total);
+        },
+      })
+      .catch((error: unknown) => {
+        if (stalled) throw new Error("Chat media download stalled");
+        throw error;
+      })
+      .finally(() => {
+        clearTimeout(watchdog);
+        signal?.removeEventListener("abort", forwardAbort);
+      });
+  },
 };
 
 export const templatesService = {
