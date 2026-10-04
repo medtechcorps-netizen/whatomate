@@ -127,14 +127,16 @@ Meta. Production sets none of these variables.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `META_RELAY_ENVIRONMENT` | `production` | `production`, `staging`, `local`, or `test`. Any other value stops startup. |
+| `META_RELAY_ENVIRONMENT` | `production` | `production`, `staging`, `local`, or `test`, trimmed and case-insensitive. Any other value stops startup. |
 | `META_RELAY_FACEBOOK_GRAPH_BASE_URL` | unset (`https://graph.facebook.com`) | Graph origin for Messenger and `facebook_login` Instagram accounts. Outside production only. |
 | `META_RELAY_INSTAGRAM_GRAPH_BASE_URL` | unset (`https://graph.instagram.com`) | Graph origin for `instagram_login` accounts. Outside production only. |
 
 Each base URL must be a bare `http` or `https` origin, `scheme://host[:port]`
 with at most a trailing `/`, and no credentials, path, query, or fragment. The
-relay adds the Graph version and path itself. An unset base URL keeps Meta's
-host, so one product can use a stub while the other does not.
+host must be a host name, an IPv4 address, or a bracketed IPv6 address, and a
+port must be a number from 1 to 65535. The relay adds the Graph version and
+path itself. An unset base URL keeps Meta's host, so one product can use a
+stub while the other does not.
 
 When `META_RELAY_ENVIRONMENT` is unset or `production`, setting either base URL
 stops startup, even if it restates Meta's own host. A production relay

@@ -154,6 +154,32 @@ func TestLoadConfigAcceptsBareGraphOriginsOutsideProduction(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAcceptsDialableGraphOriginHosts(t *testing.T) {
+	for _, value := range []string{
+		"http://graph_stub:18090",
+		"https://Graph-Stub.example.test",
+		"https://graph-stub.example.test:1",
+		"https://graph-stub.example.test:65535/",
+		"http://127.0.0.1:18090",
+		"http://[::1]",
+	} {
+		environment := validConfigEnvironment()
+		environment["META_RELAY_ENVIRONMENT"] = "local"
+		environment["META_RELAY_FACEBOOK_GRAPH_BASE_URL"] = value
+		config, err := loadTestEnvironment(environment)
+		if err != nil {
+			t.Fatalf("%q: expected a dialable origin to load: %v", value, err)
+		}
+		server, err := NewServer(config, newMemoryServerStore())
+		if err != nil {
+			t.Fatalf("%q: new server: %v", value, err)
+		}
+		if server.facebookGraphBase != strings.TrimSuffix(value, "/") {
+			t.Fatalf("%q: Facebook Graph base = %q", value, server.facebookGraphBase)
+		}
+	}
+}
+
 func TestLoadConfigRejectsGraphBaseThatIsNotABareOrigin(t *testing.T) {
 	const secret = "do-not-print-this-secret"
 	for _, value := range []string{
@@ -177,6 +203,18 @@ func TestLoadConfigRejectsGraphBaseThatIsNotABareOrigin(t *testing.T) {
 		"https://",
 		"http://:18090",
 		"https://graph stub.example.test",
+		// url.Parse accepts these hosts, but the relay could not dial them.
+		"https://graph-stub.example.test;x",
+		"https://graph-stub.example.test:443:443",
+		"https://graph-stub.example.test:",
+		"https://graph-stub.example.test:0",
+		"https://graph-stub.example.test:65536",
+		"https://graph-stub.example.test:99999",
+		"https://-graph-stub.example.test",
+		"https://graph-stub..example.test",
+		"http://[::1]:",
+		"http://[fe80::1%25graph-stub]:18090",
+		"https://[graph-stub.example.test]",
 	} {
 		for _, variable := range []string{
 			"META_RELAY_FACEBOOK_GRAPH_BASE_URL",
@@ -198,7 +236,8 @@ func TestLoadConfigRejectsGraphBaseThatIsNotABareOrigin(t *testing.T) {
 }
 
 func TestNewServerRefusesGraphBaseOverridesOutsideNonProductionConfig(t *testing.T) {
-	for _, environment := range []string{"", "production"} {
+	// NewServer reads the environment as loadConfig does: trimmed, any case.
+	for _, environment := range []string{"", "production", " Production "} {
 		config := newTestConfig(t)
 		config.Environment = environment
 		config.FacebookGraphBaseURL = "https://graph-stub.example.test"
@@ -214,6 +253,17 @@ func TestNewServerRefusesGraphBaseOverridesOutsideNonProductionConfig(t *testing
 	if _, err := NewServer(config, newMemoryServerStore()); err == nil ||
 		!strings.Contains(err.Error(), "META_RELAY_INSTAGRAM_GRAPH_BASE_URL") {
 		t.Fatalf("expected NewServer origin rejection, got %v", err)
+	}
+
+	config = newTestConfig(t)
+	config.Environment = " Staging "
+	config.InstagramGraphBaseURL = "https://graph-stub.example.test"
+	server, err := NewServer(config, newMemoryServerStore())
+	if err != nil {
+		t.Fatalf("expected NewServer to accept a staging override: %v", err)
+	}
+	if server.instagramGraphBase != "https://graph-stub.example.test" {
+		t.Fatalf("Instagram Graph base = %q", server.instagramGraphBase)
 	}
 
 	config = newTestConfig(t)
