@@ -237,7 +237,11 @@ onBeforeUnmount(releaseMedia)
       class="flex max-w-[280px] items-center gap-2 px-3 py-3 bg-background/50 rounded-lg text-sm"
     >
       <AlertCircle class="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-      <span class="flex-1">{{ t('chat.mediaLoadFailed') }}</span>
+      <span class="flex min-w-0 flex-1 flex-col">
+        <!-- Say which attachment failed: the error replaces its filename button. -->
+        <span v-if="kind === 'document'" class="truncate font-medium" :title="documentName">{{ documentName }}</span>
+        <span>{{ t('chat.mediaLoadFailed') }}</span>
+      </span>
       <button
         type="button"
         class="inline-flex items-center gap-1 rounded px-2 py-1 font-medium hover:bg-background/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"

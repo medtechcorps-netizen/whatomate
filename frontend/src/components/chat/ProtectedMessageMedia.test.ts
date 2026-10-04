@@ -348,6 +348,33 @@ describe('ProtectedMessageMedia', () => {
     expect(clicked).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps the document name in view when its download fails, and retries it', async () => {
+    mocks.getMedia.mockRejectedValueOnce(new Error('network')).mockResolvedValueOnce(mediaResponse('application/pdf'))
+    const clicked = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const view = mountMedia({
+      message: { ...imageMessage, message_type: 'document', media_mime_type: 'application/pdf', media_filename: 'lab-report.pdf' },
+    })
+    await view.get('button').trigger('click')
+    await flushPromises()
+
+    const alert = view.get('[role="alert"]')
+    expect(alert.text()).toContain('lab-report.pdf')
+    expect(alert.text()).toContain('chat.mediaLoadFailed')
+    expect(alert.get('[title="lab-report.pdf"]').text()).toBe('lab-report.pdf')
+
+    await alert.get('button').trigger('click')
+    await flushPromises()
+    expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+    expect(view.get('a[download]').attributes('download')).toBe('lab-report.pdf')
+    expect(clicked).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not label a failed image with a filename', async () => {
+    mocks.getMedia.mockRejectedValueOnce(new Error('404'))
+    const view = await mountLoaded({ message: { ...imageMessage, media_filename: 'IMG_0001.jpg' } })
+    expect(view.get('[role="alert"]').text()).not.toContain('IMG_0001.jpg')
+  })
+
   it('names a document without a filename with the translated fallback', async () => {
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
     const view = mountMedia({
