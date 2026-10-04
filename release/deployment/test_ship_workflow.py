@@ -23,8 +23,6 @@ import ship_common as common
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 WORKFLOW_PATH = ROOT / ".github" / "workflows" / "ship.yml"
-BUILD_ATTEST = ROOT / ".github" / "workflows" / "build-attest-exact-release-images.yml"
-CONTRACT = HERE / "production-app-contract.json"
 OLD_GROUP = "rereply" + "-production"
 OLD_GROUP_LINE = "group: " + OLD_GROUP
 FORBIDDEN_FRAGMENT = "live" + "-evidence"
@@ -35,39 +33,45 @@ ALLOWED_ACTIONS = {
     "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6",
     "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4",
 }
+# The Release workflow, its two runbooks and every file in this directory:
+# the retired release tooling is gone, so whatever lands here is held to the
+# same rules without editing a list.
 NEW_FILES = (
     ".github/workflows/ship.yml",
-    "release/deployment/ship_common.py",
-    "release/deployment/spec_images.py",
-    "release/deployment/do_app.py",
-    "release/deployment/backup_check.py",
-    "release/deployment/smoke.py",
-    "release/deployment/release_record.py",
-    "release/deployment/schema_change.py",
-    "release/deployment/trivy_policy.py",
-    "release/deployment/ship.py",
-    "release/deployment/ship-target.json",
-    "release/deployment/ship-bootstrap-record.json",
-    "release/deployment/ship.trivyignore",
-    "release/deployment/test_ship_support.py",
-    "release/deployment/test_ship_common.py",
-    "release/deployment/test_ship_spec_images.py",
-    "release/deployment/test_ship_do_app.py",
-    "release/deployment/test_ship_backup_check.py",
-    "release/deployment/test_ship_smoke.py",
-    "release/deployment/test_ship_release_record.py",
-    "release/deployment/test_ship_schema_change.py",
-    "release/deployment/test_ship_trivy_policy.py",
-    "release/deployment/test_ship_production.py",
-    "release/deployment/test_ship_plan_record.py",
-    "release/deployment/test_ship_workflow.py",
+    *sorted(f"release/deployment/{path.name}" for path in HERE.iterdir() if path.is_file()),
     "docs/release.md",
     "docs/emergency-rollback.md",
 )
-OLD_RELEASE_MODULES = {
-    path.stem for path in HERE.glob("*.py")
-    if not path.name.startswith("test_") and f"release/deployment/{path.name}" not in NEW_FILES
-} | {"verify_production_crm_canary"}
+# The release modules the four-phase machinery used, retired with it. None may
+# come back, and no Stage 1 file may import one.
+RETIRED_MODULES = frozenset({
+    "apply_production_change",
+    "authorize_production_main_lock_release",
+    "bootstrap_production_crm_canary_driver",
+    "cleanup_production_crm_canary_fixture",
+    "confirm_production_orphan_lock_release",
+    "finalize_production_orphan_lock",
+    "inverse_production_crm_canary_fixture",
+    "launch_production_prerequisites",
+    "observe_crm_fixture_prestate",
+    "observe_production_recovery",
+    "provider_native_valkey_recovery",
+    "provision_production_crm_canary_fixture",
+    "reconcile_crm_fixture_readonly",
+    "reconcile_production_main_lock_release",
+    "reconcile_production_orphan",
+    "reconcile_production_orphan_lock_release",
+    "recover_production_crm_canary_driver",
+    "repair_crm_canary_driver_logins",
+    "rollback_production_change",
+    "run_existing_crm_canary_driver_recovery",
+    "sanitized_provider_parity",
+    "verify_crm_canary_fixture_binding",
+    "verify_production_crm_canary",
+    "verify_production_plan",
+    "verify_production_release",
+    "verify_rollout_evidence",
+})
 
 
 # --------------------------------------------------------------------------
@@ -297,16 +301,17 @@ class TriggerAndTopLevelTests(unittest.TestCase):
         for name in (".trivyignore", ".trivyignore.yaml", "trivy.yaml", "trivy.yml"):
             self.assertFalse((ROOT / name).exists())
 
-    def test_pinned_tools_equal_the_reviewed_build_workflow(self) -> None:
-        if not BUILD_ATTEST.exists():
-            self.skipTest("the old build workflow is gone")
-        text = BUILD_ATTEST.read_text(encoding="utf-8")
-        header = text.split("\njobs:\n", 1)[0]
-        reviewed = dict(re.findall(r'(?m)^  (PINNED_[A-Z0-9_]+): "?([^"\n]+?)"?$', header))
-        for key, value in DOC["env"].items():
-            if key.startswith("PINNED_"):
-                with self.subTest(key=key):
-                    self.assertEqual(value, reviewed[key])
+    def test_pinned_tools_are_exact(self) -> None:
+        pinned = {key: value for key, value in DOC["env"].items() if key.startswith("PINNED_")}
+        for tool in ("GH", "TRIVY", "SYFT", "BUILDX"):
+            with self.subTest(tool=tool):
+                version = pinned[f"PINNED_{tool}_VERSION"]
+                self.assertRegex(version, r"^v?[0-9]+\.[0-9]+\.[0-9]+$")
+                self.assertTrue(pinned[f"PINNED_{tool}_URL"].startswith("https://github.com/"))
+                self.assertIn(version.removeprefix("v"), pinned[f"PINNED_{tool}_URL"])
+                self.assertRegex(pinned[f"PINNED_{tool}_SHA256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(pinned["PINNED_BUILDKIT_IMAGE"], r"@sha256:[0-9a-f]{64}$")
+        self.assertEqual(len(pinned), 13)
         self.assertNotIn("PINNED_TRIVY_DB", DOC["env"])
         self.assertNotIn("PINNED_JQ_URL", DOC["env"])
         self.assertEqual(DOC["env"]["SHIP_REPOSITORY"], common.REPOSITORY)
@@ -567,8 +572,10 @@ class RepositoryFileTests(unittest.TestCase):
                     self.assertEqual(raw, common.canonical_file_bytes(json.loads(raw)))
 
     def test_no_new_module_imports_a_pre_existing_release_module(self) -> None:
-        self.assertIn("verify_production_release", OLD_RELEASE_MODULES)
-        self.assertIn("apply_production_change", OLD_RELEASE_MODULES)
+        self.assertIn("release/deployment/ship.py", NEW_FILES)
+        for name in sorted(RETIRED_MODULES):
+            with self.subTest(retired=name):
+                self.assertFalse((HERE / f"{name}.py").exists())
         for relative in NEW_FILES:
             if not relative.endswith(".py"):
                 continue
@@ -580,7 +587,7 @@ class RepositoryFileTests(unittest.TestCase):
                 elif isinstance(node, ast.ImportFrom) and node.module:
                     imported.add(node.module.split(".")[0])
             with self.subTest(path=relative):
-                self.assertEqual(imported & OLD_RELEASE_MODULES, set())
+                self.assertEqual(imported & RETIRED_MODULES, set())
 
     def test_new_files_carry_no_provider_identifiers(self) -> None:
         for relative in NEW_FILES:
@@ -590,25 +597,6 @@ class RepositoryFileTests(unittest.TestCase):
             with self.subTest(path=relative):
                 self.assertFalse("ondigitalocean" + ".app" in text.lower(), "App Platform hostname fragment")
                 self.assertFalse(common.ANY_UUID_RE.search(text), "identifier-shaped value")
-
-    def test_ship_target_equals_the_contract(self) -> None:
-        if not CONTRACT.exists():
-            self.skipTest("the old production contract is gone")
-        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
-        target = json.loads((HERE / "ship-target.json").read_text(encoding="ascii"))
-        postgres = {item["cluster_sha256"] for item in contract["expected_topology"]["databases"] if item["engine"] == "PG"}
-        self.assertEqual(target["app_id_sha256"], contract["provider"]["app_id_sha256"])
-        self.assertEqual(target["default_ingress_sha256"], contract["provider"]["default_ingress_sha256"])
-        self.assertEqual(target["vpc_id_sha256"], contract["expected_topology"]["vpc_id_sha256"])
-        self.assertEqual({target["postgres"]["cluster_name_sha256"]}, postgres)
-        self.assertEqual(target["app_name"], contract["provider"]["app_name"])
-        self.assertEqual(target["region"], contract["expected_topology"]["region"])
-        for component in contract["components"]:
-            if component["collection"] == "services":
-                self.assertEqual(target["services"][component["app_name"]],
-                                 {"http_port": component["http_port"], "health_path": component["health_path"]})
-            else:
-                self.assertEqual(target["pre_deploy_job"], {"name": component["app_name"], "run_command": component["run_command"]})
 
     def test_release_dockerfiles_are_pinned(self) -> None:
         for component in common.COMPONENTS:

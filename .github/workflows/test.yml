@@ -20,8 +20,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  release-controls:
-    name: release-controls
+  # The only job that runs the Release workflow's tests, the schema guard's
+  # tests and the CI workflow tests (release/deployment/test_ci_workflows.py).
+  release-tests:
+    name: release-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -31,26 +33,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install exact release-rehearsal jq
-        env:
-          PINNED_JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-linux-amd64
-          PINNED_JQ_SHA256: b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            "$PINNED_JQ_URL" -o "$RUNNER_TEMP/release-rehearsal-jq"
-          printf '%s  %s\n' "$PINNED_JQ_SHA256" "$RUNNER_TEMP/release-rehearsal-jq" | sha256sum --check --strict
-          chmod 0700 "$RUNNER_TEMP/release-rehearsal-jq"
-          [[ "$("$RUNNER_TEMP/release-rehearsal-jq" --version)" == "jq-1.8.2" ]]
-          printf 'RELEASE_TEST_JQ=%s\n' "$RUNNER_TEMP/release-rehearsal-jq" >> "$GITHUB_ENV"
-
-      - name: Test exact rollout evidence controls
+      - name: Test the Release workflow, its modules and the CI workflows
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           set -euo pipefail
           python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v
-          python3 -B -m unittest discover -s release/canary -p 'test_*.py' -v
 
   tenant-isolation:
     name: tenant-isolation
@@ -129,15 +117,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify Gate-A recovery boundary
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-          PYTHONHASHSEED: "0"
-        run: |
-          set -euo pipefail
-          python3 -B -m unittest discover -s prototype/recovery-boundary/tests -p 'test_*.py' -v
-          python3 -B prototype/recovery-boundary/verify_gate_a.py
-
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -146,68 +125,6 @@ jobs:
 
       - name: Download dependencies
         run: go mod download
-
-      - name: Verify this checkout's compile-time UI database role
-        env:
-          GITHUB_WORKFLOW_REPOSITORY: ${{ github.repository }}
-          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
-          RUNNER_ENVIRONMENT: ${{ runner.environment }}
-          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_test?sslmode=disable
-        run: |
-          set -euo pipefail
-          # This proves only the one role compiled into this checkout. The
-          # release workflows separately prove each immutable phase source;
-          # this integrated checkout is never treated as evidence for all four.
-          phase_manifest="$RUNNER_TEMP/current-ui-exact-sources.json"
-          phase_evidence="$RUNNER_TEMP/current-ui-database-phase-compatibility.json"
-          source_sha="$(git rev-parse 'HEAD^{commit}')"
-          root_tree="$(git show -s --format=%T HEAD)"
-          frontend_tree="$(git rev-parse 'HEAD:frontend')"
-          internal_tree="$(git rev-parse 'HEAD:internal')"
-          SOURCE_SHA="$source_sha" ROOT_TREE="$root_tree" \
-            FRONTEND_TREE="$frontend_tree" INTERNAL_TREE="$internal_tree" \
-            python3 - "$phase_manifest" <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          manifest = json.loads(Path("release/exact-sources.json").read_text(encoding="utf-8"))
-          manifest["phases"]["ui"] = {
-              "source_sha": os.environ["SOURCE_SHA"],
-              "root_tree": os.environ["ROOT_TREE"],
-              "frontend_tree": os.environ["FRONTEND_TREE"],
-              "internal_tree": os.environ["INTERNAL_TREE"],
-          }
-          Path(sys.argv[1]).write_bytes(
-              json.dumps(manifest, ensure_ascii=True, indent=2).encode("ascii") + b"\n"
-          )
-          PY
-          bash release/validation/verify_database_phase_compatibility.sh \
-            --phase ui \
-            --source-dir . \
-            --manifest "$phase_manifest" \
-            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
-            --workflow-path .github/workflows/test.yml \
-            --workflow-repository "$GITHUB_WORKFLOW_REPOSITORY" \
-            --runner-environment "$RUNNER_ENVIRONMENT" \
-            --output "$phase_evidence"
-          python3 - "$phase_evidence" "$source_sha" "$GITHUB_WORKFLOW_SHA" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          evidence = json.loads(Path(sys.argv[1]).read_text(encoding="ascii"))
-          if (
-              evidence["phase"] != "ui"
-              or evidence["source"]["commit"] != sys.argv[2]
-              or evidence["compile_time"]["value"] != "rlsMigrationPhaseUI"
-              or evidence["workflow"]["sha"] != sys.argv[3]
-              or evidence["workflow"]["path"] != ".github/workflows/test.yml"
-              or evidence["tests"]["result"] != "passed"
-          ):
-              raise SystemExit("current UI database compatibility evidence differs")
-          PY
 
       - name: Install pinned gotestsum
         run: go install gotest.tools/gotestsum@v1.13.0
@@ -269,15 +186,13 @@ jobs:
         with:
           version: v2.11.4
 
-      - name: Lint workflows and inert recovery templates
+      - name: Lint workflows
         run: |
           set -euo pipefail
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
-          actionlint .github/workflows/test.yml
-          actionlint .github/workflows/provision-production-crm-canary-fixture.yml .github/workflows/cleanup-production-crm-canary-fixture.yml
-          actionlint .github/workflows/bootstrap-production-crm-canary-driver.yml
-          actionlint .github/workflows/recover-production-crm-canary-driver.yml
-          actionlint -ignore '"on" section should not be empty' prototype/recovery-boundary/workflows/*.tmpl
+          # With no arguments actionlint checks every workflow file under
+          # .github/workflows, so a new workflow is linted without an edit here.
+          actionlint
 
   build:
     name: build
@@ -407,9 +322,6 @@ jobs:
       - name: Build Gmail relay container
         run: docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .
 
-      - name: Build CRM canary driver container
-        run: docker build -f docker/crm-canary-driver.Dockerfile -t rereply-crm-canary-driver:ci .
-
       - name: Reject ambient Trivy suppression policy
         run: |
           set -euo pipefail
@@ -444,93 +356,42 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH
 
-      - name: Scan CRM canary driver container
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
-        with:
-          image-ref: rereply-crm-canary-driver:ci
-          format: table
-          exit-code: "1"
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-          scanners: vuln
-          trivyignores: release/deployment/ci-canary-driver.trivyignore
-
-  recovery-boundary-images:
-    name: recovery-boundary-images (${{ matrix.role }})
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - role: writer-authority
-            dockerfile: prototype/recovery-boundary/docker/writer-authority.Dockerfile
-            image: recovery-boundary-writer-authority:ci
-          - role: writer-broker
-            dockerfile: prototype/recovery-boundary/docker/writer-broker.Dockerfile
-            image: recovery-boundary-writer-broker:ci
-          - role: observer-authority
-            dockerfile: prototype/recovery-boundary/docker/observer-authority.Dockerfile
-            image: recovery-boundary-observer-authority:ci
-          - role: observer-broker
-            dockerfile: prototype/recovery-boundary/docker/observer-broker.Dockerfile
-            image: recovery-boundary-observer-broker:ci
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Build inert recovery boundary image
-        run: >-
-          docker build --pull --no-cache --platform linux/amd64
-          -f "${{ matrix.dockerfile }}"
-          -t "${{ matrix.image }}" .
-
-      - name: Scan inert recovery boundary image
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
-        with:
-          image-ref: ${{ matrix.image }}
-          format: table
-          exit-code: "1"
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-
+  # Branch protection requires this job. It runs even when a job it needs
+  # failed or was cancelled (a skipped required check would count as passing)
+  # and fails unless every job it needs succeeded. test_ci_workflows.py keeps
+  # every other job of this workflow in its needs.
   test:
     name: test
     if: ${{ always() }}
     needs:
-      - release-controls
+      - release-tests
       - tenant-isolation
       - go-race
       - lint
       - build
       - security
-      - recovery-boundary-images
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Require every Test job to succeed
         env:
-          RELEASE_CONTROLS_RESULT: ${{ needs.release-controls.result }}
-          TENANT_ISOLATION_RESULT: ${{ needs.tenant-isolation.result }}
-          GO_RACE_RESULT: ${{ needs.go-race.result }}
-          LINT_RESULT: ${{ needs.lint.result }}
-          BUILD_RESULT: ${{ needs.build.result }}
-          SECURITY_RESULT: ${{ needs.security.result }}
-          RECOVERY_BOUNDARY_IMAGES_RESULT: ${{ needs.recovery-boundary-images.result }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_CONTROLS_RESULT" == "success" ]]
-          [[ "$TENANT_ISOLATION_RESULT" == "success" ]]
-          [[ "$GO_RACE_RESULT" == "success" ]]
-          [[ "$LINT_RESULT" == "success" ]]
-          [[ "$BUILD_RESULT" == "success" ]]
-          [[ "$SECURITY_RESULT" == "success" ]]
-          [[ "$RECOVERY_BOUNDARY_IMAGES_RESULT" == "success" ]]
+          python3 - <<'NEEDS'
+          import json, os, sys
+
+          needs = json.loads(os.environ["NEEDS_JSON"])
+          if type(needs) is not dict or not needs:
+              print("no job results to check; failing closed")
+              sys.exit(1)
+          failed = []
+          for job, value in sorted(needs.items()):
+              result = value.get("result") if type(value) is dict else None
+              print("%s: %s" % (job, result))
+              if result != "success":
+                  failed.append(job)
+          if failed:
+              print("not successful: %s" % ", ".join(failed))
+              sys.exit(1)
+          NEEDS

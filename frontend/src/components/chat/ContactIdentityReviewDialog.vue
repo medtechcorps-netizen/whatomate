@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { getErrorMessage, unwrapItemResponse } from '@/lib/api-utils'
+import { displaySafeMediaBlob, mediaDownloadName } from '@/lib/chatMedia'
 import {
   contactsService,
   effectiveAIIsAllowed,
@@ -53,6 +54,7 @@ const stagedDetail = ref<StagedIdentityReviewDetail | null>(null)
 const stagedLoading = ref(false)
 const mediaLoading = ref(false)
 const mediaURL = ref('')
+const mediaFileName = ref('')
 let requestGeneration = 0
 let requestController: AbortController | null = null
 let mediaRequestController: AbortController | null = null
@@ -129,6 +131,7 @@ function closeMediaURL() {
   mediaRequestController = null
   if (mediaURL.value) URL.revokeObjectURL(mediaURL.value)
   mediaURL.value = ''
+  mediaFileName.value = ''
   mediaLoading.value = false
 }
 
@@ -401,7 +404,12 @@ async function loadStagedMedia() {
     )
     if (generation !== requestGeneration || stagedDetail.value?.id !== detail.id || controller.signal.aborted) return
     if (mediaURL.value) URL.revokeObjectURL(mediaURL.value)
-    mediaURL.value = URL.createObjectURL(response.data)
+    // Customer media: an object URL has this app's origin but not the
+    // server's nosniff and attachment headers, so "Open link in new tab"
+    // would render an SVG or other XML type as a page and run its script.
+    // Opaque bytes always download.
+    mediaURL.value = URL.createObjectURL(displaySafeMediaBlob(response.data, 'document'))
+    mediaFileName.value = mediaDownloadName(detail.media_filename, response.data.type, 'staged-media')
   } catch (requestError) {
     if (generation === requestGeneration && !controller.signal.aborted) {
       error.value = getErrorMessage(requestError, 'Protected staged media could not be loaded.')
@@ -570,7 +578,7 @@ onBeforeUnmount(() => {
               <Loader2 v-if="mediaLoading" class="mr-2 h-3.5 w-3.5 animate-spin" />
               Load protected media
             </Button>
-            <a v-if="mediaURL" :href="mediaURL" download class="ml-3 text-xs font-medium text-sky-300 underline light:text-sky-700">Download media</a>
+            <a v-if="mediaURL" :href="mediaURL" :download="mediaFileName" class="ml-3 text-xs font-medium text-sky-300 underline light:text-sky-700">Download media</a>
           </div>
         </div>
         <ScrollArea v-else class="max-h-[22rem]">

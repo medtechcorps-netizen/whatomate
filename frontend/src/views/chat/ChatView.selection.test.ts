@@ -4,6 +4,7 @@ import { flushPromises, shallowMount, type VueWrapper } from '@vue/test-utils'
 import { defineComponent, nextTick } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ChatViewComponent from './ChatView.vue'
+import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 
 const mocks = vi.hoisted(() => ({
   routeSource: { params: { contactId: 'first' as string | undefined } },
@@ -116,6 +117,7 @@ vi.mock('@/stores/contacts', async () => {
     sortedContacts: [] as Array<Record<string, unknown>>,
     currentContact: null as Record<string, any> | null,
     messages: [] as Array<Record<string, unknown>>,
+    messagesOrganizationScope: '',
     replyingTo: null,
     searchQuery: '',
     selectedTags: [] as string[],
@@ -324,6 +326,7 @@ describe('ChatView conversation selection', () => {
       sortedContacts: [first, second],
       currentContact: null,
       messages: [],
+      messagesOrganizationScope: '',
       searchQuery: '',
       isLoadingMessages: false,
     })
@@ -421,6 +424,79 @@ describe('ChatView conversation selection', () => {
     const message = transcript.get('[data-testid="chat-message"]')
     expect(message.attributes('data-message-id')).toBe('message-selector-1')
     expect(message.attributes('data-message-direction')).toBe('incoming')
+  })
+
+  describe('chat media', () => {
+    const mediaMessage = (id: string, messageType: string, mimeType: string, mediaURL = `stored/${id}`) => ({
+      id,
+      direction: 'incoming',
+      message_type: messageType,
+      content: messageType === 'template' ? { body: 'Template body' } : {},
+      media_url: mediaURL,
+      media_mime_type: mimeType,
+      media_filename: messageType === 'document' ? 'lab-report.pdf' : undefined,
+      status: 'received',
+      created_at: '2026-08-24T04:00:00Z',
+    })
+
+    async function renderMedia(messages: Array<Record<string, unknown>>) {
+      mocks.contactsStore!.messages = messages
+      mocks.contactsStore!.messagesOrganizationScope = 'workspace-transcript'
+      mocks.fetchMessages.mockResolvedValue(undefined)
+      wrapper = mountChatView()
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+      return wrapper.findAllComponents(ProtectedMessageMedia)
+    }
+
+    afterEach(() => {
+      localStorage.removeItem('selected_organization_id')
+    })
+
+    it('renders every media type through the media component pinned to the transcript workspace', async () => {
+      mocks.organizationStore.selectedOrgId = 'workspace-b'
+      const media = await renderMedia([
+        mediaMessage('media-image', 'image', 'image/jpeg'),
+        mediaMessage('media-sticker', 'sticker', 'image/webp'),
+        mediaMessage('media-video', 'video', 'video/mp4'),
+        mediaMessage('media-audio', 'audio', 'audio/ogg'),
+        mediaMessage('media-document', 'document', 'application/pdf'),
+        mediaMessage('media-template', 'template', 'image/png'),
+        mediaMessage('media-pending', 'image', 'image/jpeg', ''),
+      ])
+
+      expect(media.map(component => component.props('message').id)).toEqual([
+        'media-image',
+        'media-sticker',
+        'media-video',
+        'media-audio',
+        'media-document',
+        'media-template',
+      ])
+      for (const component of media) {
+        expect(component.props('organizationId')).toBe('workspace-transcript')
+      }
+      // Native elements can no longer request the header-less media URL.
+      expect(wrapper!.html()).not.toContain('/api/media/')
+      expect(wrapper!.text()).toContain('[Image]')
+    })
+
+    it('keeps media on the transcript workspace instead of following a later selection', async () => {
+      localStorage.setItem('selected_organization_id', 'workspace-persisted')
+      const media = await renderMedia([mediaMessage('media-image', 'image', 'image/jpeg')])
+      expect(media).toHaveLength(1)
+
+      mocks.organizationStore.selectedOrgId = 'workspace-switched'
+      localStorage.setItem('selected_organization_id', 'workspace-switched')
+      await nextTick()
+      expect(media[0].props('organizationId')).toBe('workspace-transcript')
+
+      // A new transcript load records its own workspace.
+      mocks.contactsStore!.messagesOrganizationScope = 'workspace-reloaded'
+      await nextTick()
+      expect(media[0].props('organizationId')).toBe('workspace-reloaded')
+    })
   })
 
   it('finishes account and conversation selection while AI status is still loading', async () => {
@@ -1441,6 +1517,7 @@ describe('ChatView next-step menu', () => {
       sortedContacts: [first, second],
       currentContact: null,
       messages: [],
+      messagesOrganizationScope: '',
       searchQuery: '',
       isLoadingMessages: false,
     })
