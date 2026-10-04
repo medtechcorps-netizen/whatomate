@@ -437,6 +437,8 @@
     "mediaFailedDesc": "Please try again",
     "mediaLoading": "Loading attachment",
     "mediaLoadFailed": "Could not load attachment",
+    "playVideo": "Play video",
+    "playAudio": "Play audio",
     "internalNotes": "Notes",
     "addNote": "Add Note",
     "writeNote": "Write a note",

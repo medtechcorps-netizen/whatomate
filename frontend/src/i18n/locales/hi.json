@@ -389,6 +389,8 @@
     "mediaFailedDesc": "कृपया पुनः प्रयास करें",
     "mediaLoading": "अटैचमेंट लोड हो रहा है",
     "mediaLoadFailed": "अटैचमेंट लोड नहीं हो सका",
+    "playVideo": "वीडियो चलाएँ",
+    "playAudio": "ऑडियो चलाएँ",
     "internalNotes": "नोट्स",
     "addNote": "नोट जोड़ें",
     "writeNote": "एक नोट लिखें",

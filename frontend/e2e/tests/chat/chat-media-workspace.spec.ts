@@ -13,6 +13,7 @@ const selectedWorkspaceId = "f2222222-2222-4222-8222-222222222222";
 const contactId = "f3333333-3333-4333-8333-333333333333";
 const imageMessageId = "f4444444-4444-4444-8444-444444444444";
 const documentMessageId = "f8888888-8888-4888-8888-888888888888";
+const olderImageId = (index: number) => `f7000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
 
 // A customer document that would run script if it rendered in the CRM origin.
 const customerHtml =
@@ -83,17 +84,22 @@ const at = (index: number) => new Date(baseTime + index * 60_000).toISOString();
 type MediaRequest = { messageId: string; organizationId: string | null };
 
 type MockOptions = {
+  // Image messages placed before the text history, far above the newest one.
+  olderImages?: number;
   // An HTML document from the customer as the newest message.
   htmlDocument?: boolean;
 };
 
 async function mockApi(page: Page, options: MockOptions = {}) {
   const mediaRequests: MediaRequest[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
   let releaseMedia!: () => void;
   const mediaGate = new Promise<void>((resolve) => {
     releaseMedia = resolve;
   });
   const png = solidPng(imageWidth, imageHeight);
+  const olderImages = options.olderImages ?? 0;
 
   await page.addInitScript(
     ({ mockUser, workspaceId }) => {
@@ -129,7 +135,20 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     created_at: at(0),
     updated_at: at(textCount),
   };
+  const imageMessage = (id: string, minute: number) => ({
+    id,
+    contact_id: contactId,
+    direction: "incoming",
+    message_type: "image",
+    content: { body: "" },
+    media_url: `organizations/${selectedWorkspaceId}/messages/images/${id}.png`,
+    media_mime_type: "image/png",
+    status: "received",
+    created_at: at(minute),
+    updated_at: at(minute),
+  });
   const messages = [
+    ...Array.from({ length: olderImages }, (_, index) => imageMessage(olderImageId(index), index - olderImages)),
     ...Array.from({ length: textCount }, (_, index) => ({
       id: `f6000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
       contact_id: contactId,
@@ -140,18 +159,7 @@ async function mockApi(page: Page, options: MockOptions = {}) {
       created_at: at(index),
       updated_at: at(index),
     })),
-    {
-      id: imageMessageId,
-      contact_id: contactId,
-      direction: "incoming",
-      message_type: "image",
-      content: { body: "" },
-      media_url: `organizations/${selectedWorkspaceId}/messages/images/synthetic.png`,
-      media_mime_type: "image/png",
-      status: "received",
-      created_at: at(textCount),
-      updated_at: at(textCount),
-    },
+    imageMessage(imageMessageId, textCount),
     ...(options.htmlDocument
       ? [
           {
@@ -170,6 +178,10 @@ async function mockApi(page: Page, options: MockOptions = {}) {
         ]
       : []),
   ];
+  const servedImages = new Set([
+    imageMessageId,
+    ...Array.from({ length: olderImages }, (_, index) => olderImageId(index)),
+  ]);
 
   await page.route(/\/api\/contacts(?:\?.*)?$/, (route) =>
     route.fulfill({ json: { data: { contacts: [contact], total: 1 } } }),
@@ -185,7 +197,7 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     const messageId = new URL(request.url()).pathname.split("/").pop() ?? "";
     const organizationId = await request.headerValue("x-organization-id");
     mediaRequests.push({ messageId, organizationId });
-    const known = messageId === imageMessageId || (options.htmlDocument && messageId === documentMessageId);
+    const known = servedImages.has(messageId) || (options.htmlDocument && messageId === documentMessageId);
     if (!known || organizationId !== selectedWorkspaceId) {
       // Without the header the server resolves the login workspace, where
       // this message does not exist.
@@ -196,11 +208,14 @@ async function mockApi(page: Page, options: MockOptions = {}) {
       await route.fulfill({ status: 200, contentType: "text/html", body: customerHtml });
       return;
     }
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
     await mediaGate;
     await route.fulfill({ status: 200, contentType: "image/png", body: png });
+    inFlight--;
   });
 
-  return { mediaRequests, releaseMedia };
+  return { mediaRequests, releaseMedia, maxInFlight: () => maxInFlight };
 }
 
 const scroller = '[data-reka-scroll-area-viewport]:has([data-testid="chat-message-list"])';
@@ -221,6 +236,13 @@ function messageMedia(page: Page, messageId: string) {
 
 function imageMedia(page: Page) {
   return messageMedia(page, imageMessageId);
+}
+
+async function scrollToTop(page: Page) {
+  await page.evaluate((target) => {
+    const element = document.querySelector(target);
+    if (element instanceof HTMLElement) element.scrollTop = 0;
+  }, scroller);
 }
 
 async function naturalWidth(page: Page) {
@@ -249,25 +271,53 @@ test.describe("Chat media in a non-default workspace", () => {
     await expect(media.locator("img")).toHaveAttribute("src", /^blob:/);
     await expect.poll(() => distanceFromBottom(page)).toBeLessThan(2);
 
-    expect(mediaRequests.length).toBeGreaterThan(0);
-    for (const request of mediaRequests) {
-      expect(request).toEqual({ messageId: imageMessageId, organizationId: selectedWorkspaceId });
-    }
+    // Exactly one request: a refetch on transcript refresh or a duplicate
+    // load from the same bubble would show up here.
+    expect(mediaRequests).toEqual([{ messageId: imageMessageId, organizationId: selectedWorkspaceId }]);
 
     // Clicking the image opens the already-authorized bytes in a new tab.
+    const imageSource = await media.locator("img").getAttribute("src");
     const popupPromise = page.waitForEvent("popup");
     await media.getByRole("button").click();
     const popup = await popupPromise;
-    expect(popup.url()).toMatch(/^blob:/);
-    await expect
-      .poll(() =>
-        popup.evaluate(() => {
-          const image = document.querySelector("img");
-          return image instanceof HTMLImageElement && image.complete ? image.naturalWidth : 0;
-        }),
-      )
-      .toBe(imageWidth);
+    await popup.waitForLoadState();
+    expect(popup.url()).toBe(imageSource);
+    expect(await popup.evaluate(() => document.contentType)).toBe("image/png");
     await popup.close();
+    expect(mediaRequests).toHaveLength(1);
+  });
+
+  test("loads images only as they near the view, a few at a time", async ({ page }) => {
+    const olderImages = 6;
+    const { mediaRequests, releaseMedia, maxInFlight } = await mockApi(page, { olderImages });
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto(`/chat/${contactId}`);
+
+    await expect(imageMedia(page)).toHaveAttribute("data-media-status", "loading");
+    await expect.poll(() => distanceFromBottom(page)).toBeLessThan(2);
+    await page.waitForTimeout(500);
+    // Opening the chat at the newest message does not pull the whole history.
+    expect(mediaRequests.map((request) => request.messageId)).toEqual([imageMessageId]);
+    await expect(messageMedia(page, olderImageId(0))).toHaveAttribute("data-media-status", "idle");
+
+    await scrollToTop(page);
+    await expect.poll(() => mediaRequests.length).toBe(4);
+    await page.waitForTimeout(500);
+    // While every download is held, no more than four run at once.
+    expect(mediaRequests).toHaveLength(4);
+    expect(maxInFlight()).toBe(4);
+
+    releaseMedia();
+    for (let index = 0; index < olderImages; index++) {
+      const media = messageMedia(page, olderImageId(index));
+      await media.scrollIntoViewIfNeeded();
+      await expect(media).toHaveAttribute("data-media-status", "ready");
+    }
+    const requested = mediaRequests.map((request) => request.messageId);
+    expect(new Set(requested).size).toBe(requested.length);
+    expect(requested).toHaveLength(olderImages + 1);
+    for (const request of mediaRequests) expect(request.organizationId).toBe(selectedWorkspaceId);
+    expect(maxInFlight()).toBe(4);
   });
 
   test("downloads a customer HTML document instead of running it in the CRM origin", async ({ page }) => {

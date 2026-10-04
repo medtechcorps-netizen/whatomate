@@ -1,3 +1,5 @@
+import { createLoadLimiter } from './loadLimiter'
+
 export type ChatMediaKind = 'image' | 'sticker' | 'video' | 'audio' | 'document'
 
 // Chat media is shown from object URLs. An object URL has this app's origin
@@ -64,3 +66,15 @@ export function displaySafeMediaType(type: string, kind: ChatMediaKind): string 
 export function displaySafeMediaBlob(blob: Blob, kind: ChatMediaKind): Blob {
   return new Blob([blob], { type: displaySafeMediaType(blob.type, kind) })
 }
+
+// Every chat media download shares these slots, so a long transcript cannot
+// fill the connection that other API calls need.
+export const chatMediaLoadLimiter = createLoadLimiter(4)
+
+// Images start loading when they come within this distance of the visible
+// part of the transcript...
+export const CHAT_MEDIA_NEAR_VIEWPORT_PX = 600
+// ...and have stayed there this long. A transcript is first laid out at its
+// oldest message and only then scrolled to the newest, and a fast scroll
+// passes many images; neither should start downloads nobody will see.
+export const CHAT_MEDIA_VISIBILITY_DWELL_MS = 150
