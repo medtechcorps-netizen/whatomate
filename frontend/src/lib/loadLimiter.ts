@@ -7,27 +7,59 @@ export interface LoadLimiter {
   readonly waiting: number
 }
 
+export interface LoadLimiterOptions {
+  // Serve waiting callers newest first instead of in arrival order. Slots are
+  // handed out once the current task ends, so callers that queue together
+  // (say, every item of a list rendered at once) are ordered before any of
+  // them starts. Priority callers still go first, in arrival order.
+  newestFirst?: boolean
+}
+
 function abortReason(signal: AbortSignal) {
   return signal.reason ?? new DOMException('The load was aborted.', 'AbortError')
 }
 
-export function createLoadLimiter(limit: number): LoadLimiter {
+export function createLoadLimiter(limit: number, options: LoadLimiterOptions = {}): LoadLimiter {
+  const newestFirst = options.newestFirst ?? false
   let active = 0
+  let drainScheduled = false
+  const priorityQueue: Array<() => void> = []
   const queue: Array<() => void> = []
 
+  function next() {
+    if (priorityQueue.length > 0) return priorityQueue.shift()
+    return newestFirst ? queue.pop() : queue.shift()
+  }
+
   function drain() {
-    while (active < limit && queue.length > 0) {
+    while (active < limit) {
+      const grant = next()
+      if (!grant) return
       active++
-      queue.shift()!()
+      grant()
     }
   }
 
-  function acquire(signal: AbortSignal, options: { priority?: boolean } = {}) {
+  function scheduleDrain() {
+    if (!newestFirst) {
+      drain()
+      return
+    }
+    if (drainScheduled) return
+    drainScheduled = true
+    queueMicrotask(() => {
+      drainScheduled = false
+      drain()
+    })
+  }
+
+  function acquire(signal: AbortSignal, acquireOptions: { priority?: boolean } = {}) {
     return new Promise<() => void>((resolve, reject) => {
       if (signal.aborted) {
         reject(abortReason(signal))
         return
       }
+      const waitingIn = acquireOptions.priority ? priorityQueue : queue
       let released = false
       const release = () => {
         if (released) return
@@ -40,14 +72,13 @@ export function createLoadLimiter(limit: number): LoadLimiter {
         resolve(release)
       }
       const cancel = () => {
-        const index = queue.indexOf(grant)
-        if (index !== -1) queue.splice(index, 1)
+        const index = waitingIn.indexOf(grant)
+        if (index !== -1) waitingIn.splice(index, 1)
         reject(abortReason(signal))
       }
       signal.addEventListener('abort', cancel, { once: true })
-      if (options.priority) queue.unshift(grant)
-      else queue.push(grant)
-      drain()
+      waitingIn.push(grant)
+      scheduleDrain()
     })
   }
 
@@ -57,7 +88,7 @@ export function createLoadLimiter(limit: number): LoadLimiter {
       return active
     },
     get waiting() {
-      return queue.length
+      return priorityQueue.length + queue.length
     },
   }
 }

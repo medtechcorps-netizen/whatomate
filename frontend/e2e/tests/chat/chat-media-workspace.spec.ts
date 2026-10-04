@@ -14,6 +14,9 @@ const contactId = "f3333333-3333-4333-8333-333333333333";
 const imageMessageId = "f4444444-4444-4444-8444-444444444444";
 const documentMessageId = "f8888888-8888-4888-8888-888888888888";
 const olderImageId = (index: number) => `f7000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+const textMessageId = (index: number) => `f6000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+const threadImageId = (index: number) => `f7100000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+const replyMessageId = "f9999999-9999-4999-8999-999999999999";
 
 // A customer document that would run script if it rendered in the CRM origin.
 const customerHtml =
@@ -88,6 +91,9 @@ type MockOptions = {
   olderImages?: number;
   // An HTML document from the customer as the newest message.
   htmlDocument?: boolean;
+  // Replaces the history with this many text messages, each followed by an
+  // image, and ends with a reply that quotes one of the texts.
+  thread?: { pairs: number; quotedText: number };
 };
 
 async function mockApi(page: Page, options: MockOptions = {}) {
@@ -100,6 +106,7 @@ async function mockApi(page: Page, options: MockOptions = {}) {
   });
   const png = solidPng(imageWidth, imageHeight);
   const olderImages = options.olderImages ?? 0;
+  const thread = options.thread;
 
   await page.addInitScript(
     ({ mockUser, workspaceId }) => {
@@ -135,6 +142,16 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     created_at: at(0),
     updated_at: at(textCount),
   };
+  const textMessage = (index: number, minute = index) => ({
+    id: textMessageId(index),
+    contact_id: contactId,
+    direction: index % 2 === 0 ? "incoming" : "outgoing",
+    message_type: "text",
+    content: { body: longText(index) },
+    status: "delivered",
+    created_at: at(minute),
+    updated_at: at(minute),
+  });
   const imageMessage = (id: string, minute: number) => ({
     id,
     contact_id: contactId,
@@ -147,40 +164,51 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     created_at: at(minute),
     updated_at: at(minute),
   });
-  const messages = [
-    ...Array.from({ length: olderImages }, (_, index) => imageMessage(olderImageId(index), index - olderImages)),
-    ...Array.from({ length: textCount }, (_, index) => ({
-      id: `f6000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
-      contact_id: contactId,
-      direction: index % 2 === 0 ? "incoming" : "outgoing",
+  const replyMessage = (quotedText: number, minute: number) => ({
+    ...textMessage(quotedText, minute),
+    id: replyMessageId,
+    direction: "outgoing",
+    content: { body: "Yes, those hours are right." },
+    is_reply: true,
+    reply_to_message_id: textMessageId(quotedText),
+    reply_to_message: {
+      id: textMessageId(quotedText),
+      direction: "incoming",
       message_type: "text",
-      content: { body: longText(index) },
-      status: "delivered",
-      created_at: at(index),
-      updated_at: at(index),
-    })),
-    imageMessage(imageMessageId, textCount),
-    ...(options.htmlDocument
-      ? [
-          {
-            id: documentMessageId,
-            contact_id: contactId,
-            direction: "incoming",
-            message_type: "document",
-            content: { body: "" },
-            media_url: `organizations/${selectedWorkspaceId}/messages/documents/visit-summary.html`,
-            media_mime_type: "text/html",
-            media_filename: "visit-summary.html",
-            status: "received",
-            created_at: at(textCount + 1),
-            updated_at: at(textCount + 1),
-          },
-        ]
-      : []),
-  ];
+      content: { body: longText(quotedText) },
+    },
+  });
+  const documentMessage = {
+    id: documentMessageId,
+    contact_id: contactId,
+    direction: "incoming",
+    message_type: "document",
+    content: { body: "" },
+    media_url: `organizations/${selectedWorkspaceId}/messages/documents/visit-summary.html`,
+    media_mime_type: "text/html",
+    media_filename: "visit-summary.html",
+    status: "received",
+    created_at: at(textCount + 1),
+    updated_at: at(textCount + 1),
+  };
+  const messages = thread
+    ? [
+        ...Array.from({ length: thread.pairs }, (_, index) => [
+          textMessage(index, index * 2),
+          imageMessage(threadImageId(index), index * 2 + 1),
+        ]).flat(),
+        replyMessage(thread.quotedText, thread.pairs * 2),
+      ]
+    : [
+        ...Array.from({ length: olderImages }, (_, index) => imageMessage(olderImageId(index), index - olderImages)),
+        ...Array.from({ length: textCount }, (_, index) => textMessage(index)),
+        imageMessage(imageMessageId, textCount),
+        ...(options.htmlDocument ? [documentMessage] : []),
+      ];
   const servedImages = new Set([
     imageMessageId,
     ...Array.from({ length: olderImages }, (_, index) => olderImageId(index)),
+    ...Array.from({ length: thread?.pairs ?? 0 }, (_, index) => threadImageId(index)),
   ]);
 
   await page.route(/\/api\/contacts(?:\?.*)?$/, (route) =>
@@ -245,6 +273,47 @@ async function scrollToTop(page: Page) {
   }, scroller);
 }
 
+function readyMedia(page: Page) {
+  return page.locator('[data-testid="chat-message-media"][data-media-status="ready"]');
+}
+
+async function scrollTop(page: Page) {
+  return page.evaluate((target) => {
+    const element = document.querySelector(target);
+    return element instanceof HTMLElement ? element.scrollTop : -1;
+  }, scroller);
+}
+
+// Scrolls up a step at a time, as a reader going back through the thread
+// does, and reports how far the topmost fully visible message moved while the
+// reader paused on each step.
+async function readUpward(page: Page, step: number, pauseMs: number) {
+  return page.evaluate(
+    async ({ target, step, pauseMs }) => {
+      const viewport = document.querySelector(target);
+      if (!(viewport instanceof HTMLElement)) return [];
+      const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+      const pause = () => new Promise((resolve) => setTimeout(resolve, pauseMs));
+      const drifts: number[] = [];
+      while (viewport.scrollTop > 0) {
+        viewport.scrollTop = Math.max(0, viewport.scrollTop - step);
+        await nextFrame();
+        const bounds = viewport.getBoundingClientRect();
+        const anchor = Array.from(viewport.querySelectorAll('[data-testid="chat-message"]')).find((message) => {
+          const rect = message.getBoundingClientRect();
+          return rect.top >= bounds.top && rect.bottom <= bounds.bottom;
+        });
+        if (!anchor) continue;
+        const before = anchor.getBoundingClientRect().top;
+        await pause();
+        drifts.push(Math.round(Math.abs(anchor.getBoundingClientRect().top - before)));
+      }
+      return drifts;
+    },
+    { target: scroller, step, pauseMs },
+  );
+}
+
 async function naturalWidth(page: Page) {
   return imageMedia(page)
     .locator("img")
@@ -287,37 +356,95 @@ test.describe("Chat media in a non-default workspace", () => {
     expect(mediaRequests).toHaveLength(1);
   });
 
-  test("loads images only as they near the view, a few at a time", async ({ page }) => {
+  test("loads the transcript's images newest first, a few at a time", async ({ page }) => {
     const olderImages = 6;
     const { mediaRequests, releaseMedia, maxInFlight } = await mockApi(page, { olderImages });
     await page.setViewportSize({ width: 1600, height: 900 });
     await page.goto(`/chat/${contactId}`);
 
     await expect(imageMedia(page)).toHaveAttribute("data-media-status", "loading");
-    await expect.poll(() => distanceFromBottom(page)).toBeLessThan(2);
-    await page.waitForTimeout(500);
-    // Opening the chat at the newest message does not pull the whole history.
-    expect(mediaRequests.map((request) => request.messageId)).toEqual([imageMessageId]);
-    await expect(messageMedia(page, olderImageId(0))).toHaveAttribute("data-media-status", "idle");
-
-    await scrollToTop(page);
     await expect.poll(() => mediaRequests.length).toBe(4);
     await page.waitForTimeout(500);
-    // While every download is held, no more than four run at once.
+    // While every download is held, no more than four run at once, and the
+    // newest images, the ones in view when a chat opens, go first.
     expect(mediaRequests).toHaveLength(4);
+    expect(new Set(mediaRequests.map((request) => request.messageId))).toEqual(
+      new Set([imageMessageId, olderImageId(5), olderImageId(4), olderImageId(3)]),
+    );
     expect(maxInFlight()).toBe(4);
 
     releaseMedia();
-    for (let index = 0; index < olderImages; index++) {
-      const media = messageMedia(page, olderImageId(index));
-      await media.scrollIntoViewIfNeeded();
-      await expect(media).toHaveAttribute("data-media-status", "ready");
-    }
+    await expect(readyMedia(page)).toHaveCount(olderImages + 1);
     const requested = mediaRequests.map((request) => request.messageId);
     expect(new Set(requested).size).toBe(requested.length);
     expect(requested).toHaveLength(olderImages + 1);
     for (const request of mediaRequests) expect(request.organizationId).toBe(selectedWorkspaceId);
     expect(maxInFlight()).toBe(4);
+    // Older images that load above the newest message do not move it.
+    await expect.poll(() => distanceFromBottom(page)).toBeLessThan(2);
+  });
+
+  test("keeps the text a reader is on in place while reading back through images", async ({ page }) => {
+    const pairs = 12;
+    const { releaseMedia } = await mockApi(page, { thread: { pairs, quotedText: 5 } });
+    releaseMedia();
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto(`/chat/${contactId}`);
+
+    // The whole transcript loads when the chat opens, so its height is final
+    // before the reader scrolls back.
+    await expect(readyMedia(page)).toHaveCount(pairs);
+    await expect.poll(() => distanceFromBottom(page)).toBeLessThan(2);
+
+    const drifts = await readUpward(page, 600, 400);
+    expect(drifts.length).toBeGreaterThan(4);
+    for (const drift of drifts) expect(drift).toBeLessThanOrEqual(2);
+  });
+
+  test("brings a quoted message into view from its reply preview among images", async ({ page }) => {
+    const pairs = 12;
+    const quotedText = 5;
+    const { releaseMedia } = await mockApi(page, { thread: { pairs, quotedText } });
+    releaseMedia();
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto(`/chat/${contactId}`);
+    await expect(readyMedia(page)).toHaveCount(pairs);
+    await expect.poll(() => distanceFromBottom(page)).toBeLessThan(2);
+
+    const start = await scrollTop(page);
+    await page.locator(`[data-testid="chat-message"][data-message-id="${replyMessageId}"] .reply-preview`).click();
+    await expect.poll(() => scrollTop(page)).not.toBe(start);
+    // Let the smooth scroll finish, then give late layout changes time to show.
+    let previous = -1;
+    await expect
+      .poll(
+        async () => {
+          const current = await scrollTop(page);
+          const settled = current === previous;
+          previous = current;
+          return settled;
+        },
+        { intervals: [250] },
+      )
+      .toBe(true);
+    await page.waitForTimeout(500);
+
+    const placement = await page.evaluate(
+      ({ target, messageId }) => {
+        const viewport = document.querySelector(target);
+        const message = document.querySelector(`[data-testid="chat-message"][data-message-id="${messageId}"]`);
+        if (!(viewport instanceof HTMLElement) || !(message instanceof HTMLElement)) return null;
+        const bounds = viewport.getBoundingClientRect();
+        const rect = message.getBoundingClientRect();
+        return {
+          inView: rect.top >= bounds.top && rect.bottom <= bounds.bottom,
+          offsetFromCentre: Math.round(rect.top + rect.height / 2 - (bounds.top + bounds.height / 2)),
+        };
+      },
+      { target: scroller, messageId: textMessageId(quotedText) },
+    );
+    expect(placement?.inView).toBe(true);
+    expect(Math.abs(placement?.offsetFromCentre ?? Number.POSITIVE_INFINITY)).toBeLessThanOrEqual(2);
   });
 
   test("downloads a customer HTML document instead of running it in the CRM origin", async ({ page }) => {
@@ -362,21 +489,14 @@ test.describe("Chat media in a non-default workspace", () => {
     await expect(media).toHaveAttribute("data-media-status", "loading");
     await expect.poll(() => distanceFromBottom(page)).toBeLessThan(2);
 
-    await page.evaluate((target) => {
-      const element = document.querySelector(target);
-      if (element instanceof HTMLElement) element.scrollTop = 0;
-    }, scroller);
+    await scrollToTop(page);
     await page.waitForTimeout(300);
 
     releaseMedia();
     await expect.poll(() => naturalWidth(page)).toBe(imageWidth);
     await page.waitForTimeout(300);
 
-    const scrollTop = await page.evaluate((target) => {
-      const element = document.querySelector(target);
-      return element instanceof HTMLElement ? element.scrollTop : -1;
-    }, scroller);
-    expect(scrollTop).toBeLessThan(5);
+    expect(await scrollTop(page)).toBeLessThan(5);
     expect(await distanceFromBottom(page)).toBeGreaterThan(200);
   });
 });

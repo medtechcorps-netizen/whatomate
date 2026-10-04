@@ -73,4 +73,68 @@ describe('createLoadLimiter', () => {
     expect(limiter.active).toBe(0)
     expect(limiter.waiting).toBe(0)
   })
+
+  describe('newest first', () => {
+    it('starts the newest of the callers that queued together, then the next newest', async () => {
+      const limiter = createLoadLimiter(2, { newestFirst: true })
+      const granted: string[] = []
+      const releases: Record<string, () => void> = {}
+      // Items of a list rendered at once queue oldest first.
+      for (const name of ['oldest', 'older', 'newer', 'newest']) {
+        void limiter.acquire(new AbortController().signal).then(release => {
+          granted.push(name)
+          releases[name] = release
+        })
+      }
+      expect(limiter.active).toBe(0)
+      await flush()
+      expect(granted).toEqual(['newest', 'newer'])
+      expect(limiter.waiting).toBe(2)
+
+      releases.newest()
+      await flush()
+      expect(granted).toEqual(['newest', 'newer', 'older'])
+      releases.newer()
+      releases.older()
+      await flush()
+      expect(granted).toEqual(['newest', 'newer', 'older', 'oldest'])
+      releases.oldest()
+      expect(limiter.active).toBe(0)
+    })
+
+    it('still serves priority callers first, in the order they asked', async () => {
+      const limiter = createLoadLimiter(1, { newestFirst: true })
+      const granted: string[] = []
+      const releaseFirst = await limiter.acquire(new AbortController().signal)
+      for (const [name, priority] of [['background', false], ['first request', true], ['second request', true]] as const) {
+        void limiter.acquire(new AbortController().signal, { priority }).then(release => {
+          granted.push(name)
+          release()
+        })
+      }
+
+      releaseFirst()
+      await flush()
+      expect(granted).toEqual(['first request', 'second request', 'background'])
+      expect(limiter.active).toBe(0)
+    })
+
+    it('drops a caller that aborts before slots are handed out', async () => {
+      const limiter = createLoadLimiter(1, { newestFirst: true })
+      const controller = new AbortController()
+      const granted: string[] = []
+      void limiter.acquire(new AbortController().signal).then(release => {
+        granted.push('older')
+        release()
+      })
+      const aborted = limiter.acquire(controller.signal)
+      controller.abort()
+
+      await expect(aborted).rejects.toMatchObject({ name: 'AbortError' })
+      await flush()
+      expect(granted).toEqual(['older'])
+      expect(limiter.active).toBe(0)
+      expect(limiter.waiting).toBe(0)
+    })
+  })
 })

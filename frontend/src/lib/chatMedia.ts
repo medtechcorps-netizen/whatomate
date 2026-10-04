@@ -100,13 +100,6 @@ export function mediaDownloadName(filename: string | undefined, sourceType: stri
 }
 
 // Every chat media download shares these slots, so a long transcript cannot
-// fill the connection that other API calls need.
-export const chatMediaLoadLimiter = createLoadLimiter(4)
-
-// Images start loading when they come within this distance of the visible
-// part of the transcript...
-export const CHAT_MEDIA_NEAR_VIEWPORT_PX = 600
-// ...and have stayed there this long. A transcript is first laid out at its
-// oldest message and only then scrolled to the newest, and a fast scroll
-// passes many images; neither should start downloads nobody will see.
-export const CHAT_MEDIA_VISIBILITY_DWELL_MS = 150
+// fill the connection that other API calls need. A transcript opens at its
+// newest message, so the newest media loads first.
+export const chatMediaLoadLimiter = createLoadLimiter(4, { newestFirst: true })

@@ -1,24 +1,15 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { AlertCircle, FileText, Loader2, Play, RotateCw } from 'lucide-vue-next'
 import { messagesService } from '@/services/api'
-import {
-  CHAT_MEDIA_NEAR_VIEWPORT_PX,
-  CHAT_MEDIA_VISIBILITY_DWELL_MS,
-  chatMediaLoadLimiter,
-  displaySafeMediaBlob,
-  INLINE_IMAGE_TYPES,
-  type ChatMediaKind,
-} from '@/lib/chatMedia'
+import { chatMediaLoadLimiter, displaySafeMediaBlob, INLINE_IMAGE_TYPES, type ChatMediaKind } from '@/lib/chatMedia'
 import type { Message } from '@/stores/contacts'
 
 // Renders chat media from the authenticated API client instead of a native
 // src=/api/media/{id} URL. Native element requests cannot send the
 // X-Organization-ID header, so in any workspace other than the login default
 // the server looked the message up in the wrong tenant and answered 404.
-
-const SCROLL_VIEWPORT_SELECTOR = '[data-reka-scroll-area-viewport], [data-radix-scroll-area-viewport]'
 
 const props = defineProps<{
   // Workspace the transcript was requested from; every request is pinned to it.
@@ -28,7 +19,6 @@ const props = defineProps<{
 
 const { t } = useI18n()
 
-const container = ref<HTMLElement | null>(null)
 const documentLink = ref<HTMLAnchorElement | null>(null)
 const mediaElement = ref<HTMLMediaElement | null>(null)
 const status = ref<'idle' | 'loading' | 'ready' | 'error'>('idle')
@@ -37,10 +27,6 @@ const loadedType = ref('')
 const progress = ref<number | null>(null)
 let requestController: AbortController | null = null
 let releaseSlot: (() => void) | null = null
-let waitingForSlot = false
-let visibilityObserver: IntersectionObserver | null = null
-let nearViewport = false
-let dwellTimer: ReturnType<typeof setTimeout> | null = null
 let generation = 0
 
 const kind = computed<ChatMediaKind>(() => {
@@ -54,11 +40,15 @@ const kind = computed<ChatMediaKind>(() => {
   return 'document'
 })
 
-// Images and stickers load by themselves once they near the viewport. Video
-// and audio can be up to 16 MB and documents are rarely opened, so those load
-// only when the agent asks for them.
-const loadsWhenVisible = computed(() => kind.value === 'image' || kind.value === 'sticker')
-const busy = computed(() => status.value === 'loading' || (status.value === 'idle' && loadsWhenVisible.value))
+// Images and stickers load as soon as they render, as native images did, so
+// the transcript has its full height before the agent scrolls through it or
+// jumps to a quoted message. Images that load later, while the agent reads,
+// would push the text being read out of place: the chat viewport has scroll
+// anchoring turned off so it can follow the newest message. Video and audio
+// can be up to 16 MB and documents are rarely opened, so those load only when
+// the agent asks for them.
+const loadsAutomatically = computed(() => kind.value === 'image' || kind.value === 'sticker')
+const busy = computed(() => status.value === 'loading' || (status.value === 'idle' && loadsAutomatically.value))
 const progressPercent = computed(() => (progress.value === null ? null : Math.round(progress.value * 100)))
 
 const documentName = computed(() => props.message.media_filename || t('chat.document'))
@@ -72,25 +62,12 @@ const imageAlt = computed(() => {
 // Only raster images open in a new tab (see displaySafeMediaBlob).
 const previewable = computed(() => status.value === 'ready' && INLINE_IMAGE_TYPES.has(loadedType.value))
 
-function cancelDwell() {
-  if (dwellTimer !== null) clearTimeout(dwellTimer)
-  dwellTimer = null
-}
-
-function stopObserving() {
-  cancelDwell()
-  visibilityObserver?.disconnect()
-  visibilityObserver = null
-  nearViewport = false
-}
-
 function releaseMedia() {
   generation++
   requestController?.abort()
   requestController = null
   releaseSlot?.()
   releaseSlot = null
-  waitingForSlot = false
   progress.value = null
   if (mediaURL.value) URL.revokeObjectURL(mediaURL.value)
   mediaURL.value = ''
@@ -106,7 +83,6 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
     // Fail closed: without a workspace the request would silently fall back
     // to the login workspace.
     status.value = 'error'
-    stopObserving()
     return ''
   }
 
@@ -115,11 +91,9 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
   requestController = controller
   let slot: (() => void) | null = null
   try {
-    waitingForSlot = true
-    // Loads the agent asked for go ahead of images that are only nearing view.
+    // Loads the agent asked for go ahead of images that load by themselves.
     slot = await chatMediaLoadLimiter.acquire(controller.signal, { priority: options.userInitiated })
     if (requestGeneration !== generation) return ''
-    waitingForSlot = false
     releaseSlot = slot
     const response = await messagesService.getMedia(messageId, organizationId, {
       signal: controller.signal,
@@ -143,72 +117,8 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
     slot?.()
     if (releaseSlot === slot) releaseSlot = null
     if (requestController === controller) requestController = null
-    if (requestGeneration === generation) {
-      progress.value = null
-      stopObserving()
-    }
+    if (requestGeneration === generation) progress.value = null
   }
-}
-
-function scrollViewport(element: HTMLElement) {
-  return element.closest(SCROLL_VIEWPORT_SELECTOR)
-}
-
-// A little more generous than the observer, so the two only disagree when the
-// observer has not yet reported a scroll.
-function stillNearViewport(element: HTMLElement) {
-  const slack = CHAT_MEDIA_NEAR_VIEWPORT_PX + 50
-  const bounds = scrollViewport(element)?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight }
-  const rect = element.getBoundingClientRect()
-  return rect.bottom >= bounds.top - slack && rect.top <= bounds.bottom + slack
-}
-
-function loadAfterDwell() {
-  if (dwellTimer !== null) return
-  dwellTimer = setTimeout(() => {
-    dwellTimer = null
-    if (status.value !== 'idle' || !nearViewport) return
-    const element = container.value
-    if (element && !stillNearViewport(element)) {
-      // The transcript scrolled away after the observer last reported; wait
-      // for it to catch up rather than load media that is out of sight.
-      loadAfterDwell()
-      return
-    }
-    void loadMedia()
-  }, CHAT_MEDIA_VISIBILITY_DWELL_MS)
-}
-
-function onVisibilityChange(entries: IntersectionObserverEntry[]) {
-  const entry = entries[entries.length - 1]
-  if (!entry) return
-  nearViewport = entry.isIntersecting
-  if (nearViewport) {
-    if (status.value === 'idle') loadAfterDwell()
-    return
-  }
-  cancelDwell()
-  if (status.value === 'loading' && waitingForSlot) {
-    // Scrolled away before its turn: leave the slots to media the reader sees.
-    releaseMedia()
-    status.value = 'idle'
-  }
-}
-
-function loadWhenVisible() {
-  stopObserving()
-  if (typeof IntersectionObserver === 'undefined') {
-    void loadMedia()
-    return
-  }
-  const element = container.value
-  // Before mount there is nothing to observe yet; onMounted starts it.
-  if (!element) return
-  visibilityObserver = new IntersectionObserver(onVisibilityChange, {
-    root: scrollViewport(element),
-    rootMargin: `${CHAT_MEDIA_NEAR_VIEWPORT_PX}px 0px`,
-  })
-  visibilityObserver.observe(element)
 }
 
 // Documents download from the protected bytes once they are loaded.
@@ -265,27 +175,18 @@ watch(
   () => {
     releaseMedia()
     status.value = 'idle'
-    if (loadsWhenVisible.value) loadWhenVisible()
-    else stopObserving()
+    if (loadsAutomatically.value) void loadMedia()
   },
   // Sync flush aborts the previous workspace's request before anything else
   // can observe the new props.
   { immediate: true, flush: 'sync' },
 )
 
-onMounted(() => {
-  if (loadsWhenVisible.value && status.value === 'idle' && !visibilityObserver) loadWhenVisible()
-})
-
-onBeforeUnmount(() => {
-  stopObserving()
-  releaseMedia()
-})
+onBeforeUnmount(releaseMedia)
 </script>
 
 <template>
   <div
-    ref="container"
     class="mb-2"
     data-testid="chat-message-media"
     :data-media-kind="kind"
