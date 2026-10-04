@@ -339,8 +339,7 @@ func (a *App) GetStagedContactIdentityReviewMedia(r *fastglue.Request) error {
 	contentType := safeStagedIdentityReviewContentType(storedContentType, expectedMimeType)
 	r.RequestCtx.Response.Header.Set("Content-Type", contentType)
 	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
-	r.RequestCtx.Response.Header.Set("X-Content-Type-Options", "nosniff")
-	r.RequestCtx.Response.Header.Set("Content-Disposition", "attachment")
+	setMediaDownloadHeaders(&r.RequestCtx.Response.Header, "")
 	r.RequestCtx.SetBody(data)
 	return nil
 }
@@ -435,11 +434,15 @@ func stagedWhatsAppIdentityReviewItemFromEvent(event *models.InboundEvent) stage
 	return item
 }
 
+// safeStagedIdentityReviewContentType returns the first usable type of staged
+// media. SVG and every other "+xml" type are refused although they are image
+// types: a browser runs them as documents.
 func safeStagedIdentityReviewContentType(values ...string) string {
 	for _, value := range values {
 		mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(value))
-		if err == nil && (strings.HasPrefix(mediaType, "image/") || strings.HasPrefix(mediaType, "audio/") ||
-			strings.HasPrefix(mediaType, "video/") || mediaType == "application/pdf" || mediaType == "application/octet-stream") {
+		if err == nil && !isScriptableMediaType(mediaType) &&
+			(strings.HasPrefix(mediaType, "image/") || strings.HasPrefix(mediaType, "audio/") ||
+				strings.HasPrefix(mediaType, "video/") || mediaType == "application/pdf" || mediaType == "application/octet-stream") {
 			return mediaType
 		}
 	}

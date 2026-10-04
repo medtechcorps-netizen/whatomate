@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"mime"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -458,9 +461,150 @@ func (a *App) ServeMedia(r *fastglue.Request) error {
 		contentType = getMimeTypeFromExtension(strings.ToLower(path.Ext(message.MediaURL)))
 	}
 
-	r.RequestCtx.Response.Header.Set("Content-Type", contentType)
-	r.RequestCtx.Response.Header.Set("Cache-Control", "private, max-age=3600") // Cache for 1 hour, private
+	servedType, inline := chatMediaResponseType(contentType)
+	header := &r.RequestCtx.Response.Header
+	header.Set("Content-Type", servedType)
+	header.Set("Cache-Control", "private, max-age=3600") // Cache for 1 hour, private
+	header.Set("X-Content-Type-Options", "nosniff")
+	if !inline {
+		setMediaDownloadHeaders(header, mediaDownloadFilename(message.MediaFilename, servedType))
+	}
 	r.RequestCtx.SetBody(data)
 
 	return nil
+}
+
+// Media is served from this app's origin, and a customer can send any file.
+// Only types a browser shows inertly are served inline: raster images and the
+// video and audio types the chat plays. Everything else downloads in a
+// sandbox, and types a browser could run as a page or a script are served as
+// opaque bytes. Keep this list in step with the inline lists in
+// frontend/src/lib/chatMedia.ts; a test compares them.
+var inlineChatMediaTypes = map[string]bool{
+	// Raster images only. No "+xml" type: browsers render those as documents.
+	"image/jpeg": true,
+	"image/png":  true,
+	"image/gif":  true,
+	"image/webp": true,
+	"image/avif": true,
+	"image/bmp":  true,
+
+	"video/mp4":       true,
+	"video/3gpp":      true,
+	"video/3gpp2":     true,
+	"video/webm":      true,
+	"video/ogg":       true,
+	"video/quicktime": true,
+	"video/mpeg":      true,
+	"video/x-m4v":     true,
+
+	"audio/aac":   true,
+	"audio/mp4":   true,
+	"audio/mpeg":  true,
+	"audio/mp3":   true,
+	"audio/amr":   true,
+	"audio/ogg":   true,
+	"audio/opus":  true,
+	"audio/wav":   true,
+	"audio/x-wav": true,
+	"audio/wave":  true,
+	"audio/webm":  true,
+	"audio/x-m4a": true,
+	"audio/3gpp":  true,
+	"audio/flac":  true,
+}
+
+// scriptableMediaTypes are the HTML and XML document types, the JavaScript
+// MIME types of the WHATWG MIME Sniffing standard, and multipart/x-mixed-replace,
+// whose parts can be HTML. Every "+xml" type is scriptable as well.
+var scriptableMediaTypes = map[string]bool{
+	"text/html":                 true,
+	"text/xml":                  true,
+	"application/xml":           true,
+	"text/xsl":                  true,
+	"multipart/x-mixed-replace": true,
+
+	"application/ecmascript":   true,
+	"application/javascript":   true,
+	"application/x-ecmascript": true,
+	"application/x-javascript": true,
+	"text/ecmascript":          true,
+	"text/javascript":          true,
+	"text/javascript1.0":       true,
+	"text/javascript1.1":       true,
+	"text/javascript1.2":       true,
+	"text/javascript1.3":       true,
+	"text/javascript1.4":       true,
+	"text/javascript1.5":       true,
+	"text/jscript":             true,
+	"text/livescript":          true,
+	"text/x-ecmascript":        true,
+	"text/x-javascript":        true,
+}
+
+// mediaTypeEssence returns the lowercase type/subtype of a Content-Type value
+// without its parameters, or "" when the value is not a valid media type.
+func mediaTypeEssence(contentType string) string {
+	base, _, _ := strings.Cut(contentType, ";")
+	essence, _, err := mime.ParseMediaType(base)
+	if err != nil || !strings.Contains(essence, "/") {
+		return ""
+	}
+	return essence
+}
+
+func isScriptableMediaType(essence string) bool {
+	return scriptableMediaTypes[essence] || strings.HasSuffix(essence, "+xml")
+}
+
+// chatMediaResponseType returns the Content-Type to serve stored chat media
+// with, and whether it may be shown inline. Parameters are dropped so nothing
+// after the essence can change how the type is parsed.
+func chatMediaResponseType(contentType string) (servedType string, inline bool) {
+	essence := mediaTypeEssence(contentType)
+	switch {
+	case inlineChatMediaTypes[essence]:
+		return essence, true
+	case essence == "" || isScriptableMediaType(essence):
+		return "application/octet-stream", false
+	default:
+		return essence, false
+	}
+}
+
+// setMediaDownloadHeaders makes the browser save a media response instead of
+// showing it, and keeps the response inert if it is shown anyway: the sandbox
+// policy with no sources replaces the app's policy, which allows same-origin
+// scripts.
+func setMediaDownloadHeaders(header *fasthttp.ResponseHeader, filename string) {
+	disposition := "attachment"
+	if filename != "" {
+		if formatted := mime.FormatMediaType("attachment", map[string]string{"filename": filename}); formatted != "" {
+			disposition = formatted
+		}
+	}
+	header.Set("Content-Disposition", disposition)
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Content-Security-Policy", "sandbox; default-src 'none'")
+}
+
+// mediaDownloadFilename returns the name a downloaded media file is saved as:
+// the last path element of the sender's file name, without control or
+// formatting characters such as a right-to-left override that would disguise
+// its extension. Without a usable name it is "media" with the served type's
+// extension; opaque types get none.
+func mediaDownloadFilename(name, servedType string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = name[strings.LastIndex(name, "/")+1:]
+	name = strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, name)
+	name = strings.Trim(name, " .")
+	if name == "" {
+		return "media" + getExtensionFromMimeType(servedType)
+	}
+	return name
 }
