@@ -435,6 +435,8 @@
     "mediaSent": "Media sent successfully",
     "mediaFailed": "Failed to send media",
     "mediaFailedDesc": "Please try again",
+    "mediaLoading": "Loading attachment",
+    "mediaLoadFailed": "Could not load attachment",
     "internalNotes": "Notes",
     "addNote": "Add Note",
     "writeNote": "Write a note",

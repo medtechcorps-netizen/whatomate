@@ -387,6 +387,8 @@
     "mediaSent": "मीडिया सफलतापूर्वक भेजा गया",
     "mediaFailed": "मीडिया भेजने में विफल",
     "mediaFailedDesc": "कृपया पुनः प्रयास करें",
+    "mediaLoading": "अटैचमेंट लोड हो रहा है",
+    "mediaLoadFailed": "अटैचमेंट लोड नहीं हो सका",
     "internalNotes": "नोट्स",
     "addNote": "नोट जोड़ें",
     "writeNote": "एक नोट लिखें",

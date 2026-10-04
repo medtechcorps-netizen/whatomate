@@ -110,10 +110,12 @@ import {
 import { getInitials, getAvatarGradient } from '@/lib/utils'
 import { contactAddressDisplay, contactDisplayName, isPlaceholderPhone } from '@/lib/contactAddress'
 import type { WorkspaceRequestedAction } from '@/lib/crmFlow'
+import { readSelectedOrganizationId } from '@/lib/browserIdentity'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
+import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
@@ -240,9 +242,6 @@ const filePreviewUrl = ref<string | null>(null)
 const isMediaDialogOpen = ref(false)
 const mediaCaption = ref('')
 const isUploadingMedia = ref(false)
-
-// Cache for media blob URLs (message_id -> blob URL)
-
 
 // Canned responses slash command state
 const cannedPickerOpen = ref(false)
@@ -2111,27 +2110,22 @@ function isMediaMessage(message: Message): boolean {
   return ['image', 'video', 'audio', 'document'].includes(message.message_type)
 }
 
-function getMediaUrl(message: Message): string {
-  if (!message.media_url) return ''
-  const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
-  return `${basePath}/api/media/${message.id}`
+const PROTECTED_MEDIA_MESSAGE_TYPES = new Set(['template', 'image', 'sticker', 'video', 'audio', 'document'])
+
+function hasProtectedMedia(message: Message): boolean {
+  return !!message.media_url && PROTECTED_MEDIA_MESSAGE_TYPES.has(message.message_type)
 }
 
-function openMediaPreview(message: Message) {
-  const url = getMediaUrl(message)
-  if (url) {
-    window.open(url, '_blank')
-  }
-}
-
-function handleImageError(event: Event) {
-  const img = event.target as HTMLImageElement
-  img.style.display = 'none'
-}
-
-function handleMediaError(event: Event, mediaType: string) {
-  console.error(`Failed to load ${mediaType}:`, event)
-}
+// Workspace that chat media requests are pinned to. Native src=/api/media/{id}
+// requests cannot send X-Organization-ID, so the server resolved them against
+// the login workspace and media in any other workspace failed to load. Match
+// the workspace the API client sent for the transcript: the in-memory
+// selection, else the persisted selection (a super admin's selection is
+// restored into the store only after the organization switcher mounts), else
+// the session's own workspace.
+const mediaOrganizationId = computed(() =>
+  organizationsStore.selectedOrgId || readSelectedOrganizationId() || authStore.organizationId || '',
+)
 
 // File upload functions
 function openFilePicker() {
@@ -2756,83 +2750,12 @@ async function sendMediaMessage() {
                     {{ getReplyPreviewContent(message) }}
                   </p>
                 </div>
-                <!-- Template header media (image/video/document shown above template text) -->
-                <div v-if="message.message_type === 'template' && message.media_url" class="mb-2">
-                  <img
-                    v-if="message.media_mime_type?.startsWith('image/')"
-                    :src="getMediaUrl(message)"
-                    alt="Template header"
-                    class="max-w-[280px] max-h-[300px] rounded-lg cursor-pointer object-cover"
-                    @click="openMediaPreview(message)"
-                    @error="handleImageError($event)"
-                  />
-                  <video
-                    v-else-if="message.media_mime_type?.startsWith('video/')"
-                    :src="getMediaUrl(message)"
-                    controls
-                    class="max-w-[280px] max-h-[300px] rounded-lg"
-                  />
-                  <a
-                    v-else
-                    :href="getMediaUrl(message)"
-                    :download="message.media_filename || 'document'"
-                    class="flex items-center gap-2 px-3 py-2 bg-background/50 rounded-lg hover:bg-background/80 transition-colors"
-                  >
-                    <FileText class="h-5 w-5 text-muted-foreground" />
-                    <span class="text-sm truncate max-w-[200px]">{{ message.media_filename || 'Document' }}</span>
-                  </a>
-                </div>
-                <!-- Image message -->
-                <div v-else-if="message.message_type === 'image' && message.media_url" class="mb-2">
-                  <img
-                    :src="getMediaUrl(message)"
-                    :alt="message.content?.body || 'Image'"
-                    class="max-w-[280px] max-h-[300px] rounded-lg cursor-pointer object-cover"
-                    @click="openMediaPreview(message)"
-                    @error="handleImageError($event)"
-                  />
-                </div>
-                <!-- Sticker message -->
-                <div v-else-if="message.message_type === 'sticker' && message.media_url" class="mb-2">
-                  <img
-                    :src="getMediaUrl(message)"
-                    alt="Sticker"
-                    class="max-w-[128px] max-h-[128px] cursor-pointer"
-                    @click="openMediaPreview(message)"
-                    @error="handleImageError($event)"
-                  />
-                </div>
-                <!-- Video message -->
-                <div v-else-if="message.message_type === 'video' && message.media_url" class="mb-2">
-                  <video
-                    :src="getMediaUrl(message)"
-                    controls
-                    class="max-w-[280px] max-h-[300px] rounded-lg"
-                    @error="handleMediaError($event, 'video')"
-                  />
-                </div>
-                <!-- Audio message -->
-                <div v-else-if="message.message_type === 'audio' && message.media_url" class="mb-2">
-                  <audio
-                    :src="getMediaUrl(message)"
-                    controls
-                    class="max-w-[280px]"
-                    @error="handleMediaError($event, 'audio')"
-                  />
-                </div>
-                <!-- Document message -->
-                <div v-else-if="message.message_type === 'document' && message.media_url" class="mb-2">
-                  <a
-                    :href="getMediaUrl(message)"
-                    :download="message.media_filename || 'document'"
-                    class="flex items-center gap-2 px-3 py-2 bg-background/50 rounded-lg hover:bg-background/80 transition-colors"
-                  >
-                    <FileText class="h-5 w-5 text-muted-foreground" />
-                    <span class="text-sm truncate max-w-[200px]">
-                      {{ message.media_filename || 'Document' }}
-                    </span>
-                  </a>
-                </div>
+                <!-- Template header, image, sticker, video, audio and document media -->
+                <ProtectedMessageMedia
+                  v-if="hasProtectedMedia(message)"
+                  :organization-id="mediaOrganizationId"
+                  :message="message"
+                />
                 <!-- Location message -->
                 <div v-else-if="message.message_type === 'location' && getLocationData(message)" class="mb-2">
                   <a

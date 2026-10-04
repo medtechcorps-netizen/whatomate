@@ -425,6 +425,8 @@
     "mediaSent": "تم إرسال الوسائط بنجاح",
     "mediaFailed": "فشل إرسال الوسائط",
     "mediaFailedDesc": "يرجى المحاولة مرة أخرى",
+    "mediaLoading": "جاري تحميل المرفق",
+    "mediaLoadFailed": "تعذر تحميل المرفق",
     "internalNotes": "ملاحظات",
     "addNote": "إضافة ملاحظة",
     "writeNote": "اكتب ملاحظة...",

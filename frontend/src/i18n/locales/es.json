@@ -387,6 +387,8 @@
     "mediaSent": "Medio enviado exitosamente",
     "mediaFailed": "Error al enviar medio",
     "mediaFailedDesc": "Por favor intente de nuevo",
+    "mediaLoading": "Cargando archivo adjunto",
+    "mediaLoadFailed": "No se pudo cargar el archivo adjunto",
     "internalNotes": "Notas",
     "addNote": "Agregar nota",
     "writeNote": "Escribir una nota",

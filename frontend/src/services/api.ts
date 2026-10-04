@@ -556,6 +556,24 @@ export const messagesService = {
     api.post(`/contacts/${contactId}/messages/${messageId}/reaction`, {
       emoji,
     }),
+  // Native <img>/<video>/<audio>/<a> requests carry the auth cookie but not the
+  // X-Organization-ID header, so the server would resolve them against the
+  // login (default) workspace. Chat media is fetched through this client
+  // instead, pinned to the workspace its transcript was loaded from.
+  getMedia: (messageId: string, organizationId: string, signal?: AbortSignal) => {
+    const explicitOrganizationId = organizationId.trim();
+    if (!explicitOrganizationId) {
+      throw new Error("Organization is required to load chat media");
+    }
+    return api.get<Blob>(`/media/${encodeURIComponent(messageId)}`, {
+      responseType: "blob",
+      // WhatsApp media can be up to 16 MB; the 30 s default is too short for a
+      // video on a slow connection. Unmounting aborts the request regardless.
+      timeout: 120000,
+      headers: { "X-Organization-ID": explicitOrganizationId },
+      signal,
+    });
+  },
 };
 
 export const templatesService = {
