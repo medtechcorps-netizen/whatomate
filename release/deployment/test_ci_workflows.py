@@ -20,7 +20,12 @@ negative cases that break the property and must make the checker fail:
 8. each CI aggregator runs even when a job fails, needs every other job of its
    workflow and fails unless each one succeeded;
 9. the frontend audit keeps only the dated, dev-only braces exception and
-   fails closed on everything else.
+   fails closed on everything else;
+10. every job of a CI workflow other than its aggregator runs unconditionally;
+11. lint runs the pinned golangci-lint, build builds every package, and
+    security runs govulncheck, rejects ambient Trivy suppression files right
+    before its scans, and fails on any CRITICAL or HIGH finding in each image
+    it builds, with no exception file.
 
 The workflows are read with test_ship_workflow's YAML-subset reader plus the
 folded scalars the CI workflows use; when PyYAML happens to be importable the
@@ -77,6 +82,24 @@ ACTIONLINT_INSTALL = "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7
 # Exactly the test discovery the release tests job runs. A new release test
 # directory is added here and to the job together.
 RELEASE_TEST_COMMANDS = ("python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v",)
+GOLANGCI_LINT = {"version": "v2.11.4"}
+GO_BUILD = "go build -mod=readonly -v ./..."
+GOVULNCHECK = ("go install golang.org/x/vuln/cmd/govulncheck@v1.7.0", "GOFLAGS=-mod=readonly govulncheck ./...")
+AMBIENT_TRIVY_POLICY = [
+    "set -euo pipefail",
+    "for path in .trivyignore .trivyignore.yaml trivy.yaml trivy.yml; do",
+    '[[ ! -e "$path" && ! -L "$path" ]]',
+    "done",
+]
+# Each image the security job builds and scans, with its Dockerfile, and the
+# scan settings every one of them gets. Scanning other images or applying an
+# exception file is a reviewed edit of these lines.
+SCANNED_IMAGES = {
+    "rereply:ci": "docker/Dockerfile",
+    "rereply-meta-relay:ci": "docker/meta-relay.Dockerfile",
+    "rereply-gmail-relay:ci": "docker/gmail-relay.Dockerfile",
+}
+TRIVY_SCAN = {"format": "table", "exit-code": "1", "vuln-type": "os,library", "severity": "CRITICAL,HIGH"}
 # #213: GHSA-vfj7-8cjw-p6xm, reviewed to 2026-12-31. A renewal or a new
 # exception is a reviewed edit of this line.
 BRACES_EXCEPTION = ("braces", "stack-exhaustion denial of service", "2026-12-31")
@@ -379,6 +402,55 @@ def assert_aggregators(sources: dict[str, str]) -> None:
             raise AssertionError(f"{workflow} {aggregator} does not require every other job to succeed")
 
 
+def assert_unconditional_jobs(sources: dict[str, str]) -> None:
+    docs = parse(sources)
+    for workflow, aggregator in AGGREGATORS.items():
+        for job_id, job in jobs(docs[workflow]).items():
+            # A skipped job's own check counts as passing in branch protection.
+            if job_id != aggregator and "if" in job:
+                raise AssertionError(f"{workflow} job {job_id} is conditional")
+
+
+def text_values(mapping: dict[str, Any]) -> dict[str, str]:
+    return {key: str(value) for key, value in mapping.items()}
+
+
+def assert_lint_build_and_scans(sources: dict[str, str]) -> None:
+    test_jobs = jobs(parse(sources)["test.yml"])
+    linters = [item for item in test_jobs["lint"].get("steps", [])
+               if str(item.get("uses", "")).startswith("golangci/golangci-lint-action@")]
+    if len(linters) != 1 or "if" in linters[0] or text_values(linters[0].get("with", {})) != GOLANGCI_LINT:
+        raise AssertionError("the lint job does not run the pinned golangci-lint")
+    if GO_BUILD not in [line for item in test_jobs["build"].get("steps", []) if "if" not in item
+                        for line in run_lines(item)]:
+        raise AssertionError("the build job does not build every package")
+    security = test_jobs["security"].get("steps", [])
+    lines = [line for item in security if "if" not in item for line in run_lines(item)]
+    if any(command not in lines for command in GOVULNCHECK):
+        raise AssertionError("the security job does not run govulncheck over every package")
+    built = {}
+    for line in lines:
+        match = re.fullmatch(r"docker build -f (\S+) -t (\S+) \.", line)
+        if match:
+            built[match.group(2)] = match.group(1)
+    rejections = [index for index, item in enumerate(security)
+                  if "if" not in item and run_lines(item) == AMBIENT_TRIVY_POLICY]
+    scans = [index for index, item in enumerate(security)
+             if str(item.get("uses", "")).startswith("aquasecurity/trivy-action@")]
+    # Nothing runs between the rejection and the scans that could add a policy file.
+    if len(rejections) != 1 or scans != list(range(rejections[0] + 1, rejections[0] + 1 + len(scans))):
+        raise AssertionError("the security job does not reject ambient Trivy policy right before its scans")
+    scanned = {}
+    for index in scans:
+        settings = text_values(security[index].get("with", {}))
+        image = settings.pop("image-ref", "")
+        if "if" in security[index] or settings != TRIVY_SCAN:
+            raise AssertionError(f"the scan of {image} does not fail on every CRITICAL or HIGH finding")
+        scanned[image] = built.get(image)
+    if scanned != SCANNED_IMAGES:
+        raise AssertionError(f"the security job does not scan exactly the images it builds: {sorted(scanned.items())}")
+
+
 AUDIT_LOCK = {"packages": {
     "": {"name": "fixture"},
     "node_modules/runtime-lib": {"version": "1.0.0"},
@@ -443,6 +515,8 @@ CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
     ("release-tests", assert_release_tests),
     ("aggregators", assert_aggregators),
     ("braces-audit", assert_frontend_audit_policy),
+    ("unconditional-jobs", assert_unconditional_jobs),
+    ("lint-build-and-scans", assert_lint_build_and_scans),
 )
 
 
@@ -487,6 +561,10 @@ jobs:
 """
 
 AGGREGATOR_STEP = "      - name: Require every Test job to succeed\n"
+GMAIL_SCAN = ("      - name: Scan Gmail relay container\n"
+              "        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0\n"
+              "        with:\n          image-ref: rereply-gmail-relay:ci\n          format: table\n"
+              "          exit-code: \"1\"\n          vuln-type: os,library\n          severity: CRITICAL,HIGH\n")
 RELEASE_TESTS_STEP = "      - name: Test the Release workflow, its modules and the CI workflows\n"
 
 # Each case breaks one property; the checker must fail on the named check.
@@ -620,6 +698,46 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "test.yml", '"2026-12-31")}', '"2026-12-31"), ("esbuild", "request forgery", "2026-12-31")}')),
     "tolerate a failed npm audit": ("braces-audit", lambda: replaced(
         "test.yml", "|| audit_rc=$?", "|| true")),
+    # 10. Unconditional jobs.
+    "run security only on push": ("unconditional-jobs", lambda: replaced(
+        "test.yml", "  security:\n    name: security\n",
+        "  security:\n    name: security\n    if: github.event_name == 'push'\n")),
+    "skip tenant-isolation on pull requests": ("unconditional-jobs", lambda: replaced(
+        "test.yml", "  tenant-isolation:\n    name: tenant-isolation\n",
+        "  tenant-isolation:\n    name: tenant-isolation\n    if: ${{ github.event_name != 'pull_request' }}\n")),
+    "run the e2e shards only on push": ("unconditional-jobs", lambda: replaced(
+        "e2e-tests.yml", "    name: e2e-shard-${{ matrix.shard }}\n",
+        "    name: e2e-shard-${{ matrix.shard }}\n    if: github.event_name == 'push'\n")),
+    # 11. Lint, build and the security scans.
+    "drop golangci-lint": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "      - name: Run golangci-lint\n"
+        "        uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7\n"
+        "        with:\n          version: v2.11.4\n\n", "")),
+    "change the golangci-lint version": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "          version: v2.11.4\n", "          version: latest\n")),
+    "replace go build with true": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "        run: go build -mod=readonly -v ./...\n", '        run: "true"\n')),
+    "drop govulncheck": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "          GOFLAGS=-mod=readonly govulncheck ./...\n", "")),
+    "tolerate govulncheck findings": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "govulncheck ./...\n", "govulncheck ./... || true\n")),
+    "accept ambient Trivy policy": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", '            [[ ! -e "$path" && ! -L "$path" ]]\n', "            true\n")),
+    "write a Trivy policy after the rejection": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "      - name: Scan production container\n",
+        "      - name: Write policy\n        run: touch trivy.yaml\n\n      - name: Scan production container\n")),
+    "let a scan pass on findings": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace('exit-code: "1"', 'exit-code: "0"'))),
+    "scan for CRITICAL only": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace("severity: CRITICAL,HIGH", "severity: CRITICAL"))),
+    "give a scan an exception file": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", GMAIL_SCAN, GMAIL_SCAN + "          trivyignores: release/deployment/ship.trivyignore\n")),
+    "make a scan conditional": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace("        uses: ", "        if: ${{ false }}\n        uses: "))),
+    "drop a scan": ("lint-build-and-scans", lambda: replaced("test.yml", GMAIL_SCAN, "")),
+    "scan an image built from another Dockerfile": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .",
+        "docker build -f docker/meta-relay.Dockerfile -t rereply-gmail-relay:ci .")),
 }
 
 
@@ -694,6 +812,10 @@ class CiWorkflowTests(unittest.TestCase):
         assert_environments_and_secrets(replaced(
             "ship.yml", "    environment: production\n", "    environment:\n      name: production\n"))
         check_ci_workflows(added("extra.yml", extra_workflow("[push]", "extra")))
+        check_ci_workflows(replaced(
+            "test.yml", "      - name: Build\n        run: go build -mod=readonly -v ./...\n",
+            "      - name: Build\n        run: go build -mod=readonly -v ./...\n\n"
+            "      - name: Vet\n        run: go vet -mod=readonly ./...\n"))
 
     def test_every_negative_case_fails_its_check(self) -> None:
         labels = {label for label, _ in CHECKS}
