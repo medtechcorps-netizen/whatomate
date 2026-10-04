@@ -117,6 +117,7 @@ vi.mock('@/stores/contacts', async () => {
     sortedContacts: [] as Array<Record<string, unknown>>,
     currentContact: null as Record<string, any> | null,
     messages: [] as Array<Record<string, unknown>>,
+    messagesOrganizationScope: '',
     replyingTo: null,
     searchQuery: '',
     selectedTags: [] as string[],
@@ -325,6 +326,7 @@ describe('ChatView conversation selection', () => {
       sortedContacts: [first, second],
       currentContact: null,
       messages: [],
+      messagesOrganizationScope: '',
       searchQuery: '',
       isLoadingMessages: false,
     })
@@ -439,6 +441,7 @@ describe('ChatView conversation selection', () => {
 
     async function renderMedia(messages: Array<Record<string, unknown>>) {
       mocks.contactsStore!.messages = messages
+      mocks.contactsStore!.messagesOrganizationScope = 'workspace-transcript'
       mocks.fetchMessages.mockResolvedValue(undefined)
       wrapper = mountChatView()
       await flushPromises()
@@ -451,7 +454,7 @@ describe('ChatView conversation selection', () => {
       localStorage.removeItem('selected_organization_id')
     })
 
-    it('renders every media type through the workspace-pinned media component', async () => {
+    it('renders every media type through the media component pinned to the transcript workspace', async () => {
       mocks.organizationStore.selectedOrgId = 'workspace-b'
       const media = await renderMedia([
         mediaMessage('media-image', 'image', 'image/jpeg'),
@@ -472,24 +475,27 @@ describe('ChatView conversation selection', () => {
         'media-template',
       ])
       for (const component of media) {
-        expect(component.props('organizationId')).toBe('workspace-b')
+        expect(component.props('organizationId')).toBe('workspace-transcript')
       }
       // Native elements can no longer request the header-less media URL.
       expect(wrapper!.html()).not.toContain('/api/media/')
       expect(wrapper!.text()).toContain('[Image]')
     })
 
-    it('pins media to the persisted workspace before the switcher restores it into the store', async () => {
+    it('keeps media on the transcript workspace instead of following a later selection', async () => {
       localStorage.setItem('selected_organization_id', 'workspace-persisted')
       const media = await renderMedia([mediaMessage('media-image', 'image', 'image/jpeg')])
       expect(media).toHaveLength(1)
-      expect(media[0].props('organizationId')).toBe('workspace-persisted')
-    })
 
-    it('uses the session workspace when no other workspace is selected', async () => {
-      const media = await renderMedia([mediaMessage('media-image', 'image', 'image/jpeg')])
-      expect(media).toHaveLength(1)
-      expect(media[0].props('organizationId')).toBe('organization-1')
+      mocks.organizationStore.selectedOrgId = 'workspace-switched'
+      localStorage.setItem('selected_organization_id', 'workspace-switched')
+      await nextTick()
+      expect(media[0].props('organizationId')).toBe('workspace-transcript')
+
+      // A new transcript load records its own workspace.
+      mocks.contactsStore!.messagesOrganizationScope = 'workspace-reloaded'
+      await nextTick()
+      expect(media[0].props('organizationId')).toBe('workspace-reloaded')
     })
   })
 
@@ -1511,6 +1517,7 @@ describe('ChatView next-step menu', () => {
       sortedContacts: [first, second],
       currentContact: null,
       messages: [],
+      messagesOrganizationScope: '',
       searchQuery: '',
       isLoadingMessages: false,
     })

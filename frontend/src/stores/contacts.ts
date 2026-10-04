@@ -8,6 +8,7 @@ import {
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { compareMessageIngestionOrder } from '@/lib/messageOrdering'
+import { readSelectedOrganizationId } from '@/lib/browserIdentity'
 
 // Phones are stored without leading + or whitespace (see CreateContact in
 // internal/handlers/contacts.go). Strip them from a digit-only query so a user
@@ -108,6 +109,18 @@ export const useContactsStore = defineStore('contacts', () => {
   const activeOrganizationScope = computed(
     () => organizationsStore.selectedOrgId || authStore.organizationId || '',
   )
+  // Workspace the open transcript was requested from. Chat media must be
+  // fetched from that same workspace, so it is captured when a transcript load
+  // starts instead of following the live selection: a workspace switch clears
+  // the transcript rather than refetching its media under the new workspace.
+  const messagesOrganizationScope = ref('')
+
+  function transcriptRequestOrganizationScope() {
+    // Mirrors the API client's request interceptor: a persisted selection is
+    // sent as X-Organization-ID, and without one the server uses the
+    // session's own workspace.
+    return readSelectedOrganizationId() || authStore.organizationId || ''
+  }
   let identityGeneration = 0
   let contactLoadGeneration = 0
   let contactLoadAbortController: AbortController | null = null
@@ -175,6 +188,7 @@ export const useContactsStore = defineStore('contacts', () => {
     contacts.value = []
     currentContact.value = null
     messages.value = []
+    messagesOrganizationScope.value = ''
     contactsPage.value = 1
     contactsTotal.value = 0
     isLoading.value = false
@@ -334,6 +348,7 @@ export const useContactsStore = defineStore('contacts', () => {
       isLoadingMessages.value = true
       // Selection loads intentionally clear the previous contact immediately.
       messages.value = []
+      messagesOrganizationScope.value = transcriptRequestOrganizationScope()
     }
     try {
       const response = await messagesService.list(contactId, params, controller.signal)
@@ -604,6 +619,7 @@ export const useContactsStore = defineStore('contacts', () => {
     olderMessageLoadAbortController?.abort()
     olderMessageLoadAbortController = null
     messages.value = []
+    messagesOrganizationScope.value = ''
     isLoadingMessages.value = false
     isLoadingOlderMessages.value = false
     hasMoreMessages.value = false
@@ -655,6 +671,7 @@ export const useContactsStore = defineStore('contacts', () => {
     contacts,
     currentContact,
     messages,
+    messagesOrganizationScope,
     isLoading,
     isLoadingMessages,
     isLoadingOlderMessages,

@@ -110,7 +110,6 @@ import {
 import { getInitials, getAvatarGradient } from '@/lib/utils'
 import { contactAddressDisplay, contactDisplayName, isPlaceholderPhone } from '@/lib/contactAddress'
 import type { WorkspaceRequestedAction } from '@/lib/crmFlow'
-import { readSelectedOrganizationId } from '@/lib/browserIdentity'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
@@ -2116,17 +2115,6 @@ function hasProtectedMedia(message: Message): boolean {
   return !!message.media_url && PROTECTED_MEDIA_MESSAGE_TYPES.has(message.message_type)
 }
 
-// Workspace that chat media requests are pinned to. Native src=/api/media/{id}
-// requests cannot send X-Organization-ID, so the server resolved them against
-// the login workspace and media in any other workspace failed to load. Match
-// the workspace the API client sent for the transcript: the in-memory
-// selection, else the persisted selection (a super admin's selection is
-// restored into the store only after the organization switcher mounts), else
-// the session's own workspace.
-const mediaOrganizationId = computed(() =>
-  organizationsStore.selectedOrgId || readSelectedOrganizationId() || authStore.organizationId || '',
-)
-
 // File upload functions
 function openFilePicker() {
   fileInputRef.value?.click()
@@ -2750,10 +2738,11 @@ async function sendMediaMessage() {
                     {{ getReplyPreviewContent(message) }}
                   </p>
                 </div>
-                <!-- Template header, image, sticker, video, audio and document media -->
+                <!-- Template header, image, sticker, video, audio and document media,
+                     fetched from the workspace the transcript was requested from. -->
                 <ProtectedMessageMedia
                   v-if="hasProtectedMedia(message)"
-                  :organization-id="mediaOrganizationId"
+                  :organization-id="contactsStore.messagesOrganizationScope"
                   :message="message"
                 />
                 <!-- Location message -->

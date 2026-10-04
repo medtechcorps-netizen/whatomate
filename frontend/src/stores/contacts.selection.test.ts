@@ -9,6 +9,12 @@ const mocks = vi.hoisted(() => ({
   listMessages: vi.fn(),
   sendMessage: vi.fn(),
   sendTemplate: vi.fn(),
+  readSelectedOrganizationId: vi.fn((): string | null => null),
+}))
+
+vi.mock('@/lib/browserIdentity', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/lib/browserIdentity')>()),
+  readSelectedOrganizationId: mocks.readSelectedOrganizationId,
 }))
 
 vi.mock('@/services/api', () => ({
@@ -87,6 +93,7 @@ describe('contacts store conversation selection', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
+    mocks.readSelectedOrganizationId.mockReturnValue(null)
   })
 
   it('does not select a contact merely because its deep-link lookup finishes', async () => {
@@ -257,6 +264,76 @@ describe('contacts store conversation selection', () => {
     expect(store.contacts.map(item => item.id)).toEqual(['organization-b-contact'])
     expect(store.contactsTotal).toBe(1)
     expect(store.isLoading).toBe(false)
+  })
+
+  describe('transcript workspace for chat media', () => {
+    function messagesResponse(messages: Message[]): MessageListResponse {
+      return { data: { data: { messages, has_more: false } } }
+    }
+
+    it('records the workspace the transcript request is sent to when the load starts', async () => {
+      const { useAuthStore } = await import('./auth')
+      useAuthStore().user = { organization_id: 'organization-session' } as never
+      const { useContactsStore } = await import('./contacts')
+      const store = useContactsStore()
+      const response = deferred<MessageListResponse>()
+      mocks.listMessages.mockReturnValueOnce(response.promise)
+
+      // The API client sends the persisted selection as X-Organization-ID.
+      mocks.readSelectedOrganizationId.mockReturnValue('organization-persisted')
+      store.setCurrentContact(contact('first'))
+      const load = store.fetchMessages('first')
+      expect(store.messagesOrganizationScope).toBe('organization-persisted')
+
+      response.resolve(messagesResponse([message('first-message', 'first')]))
+      await load
+      expect(store.messagesOrganizationScope).toBe('organization-persisted')
+
+      // Without a persisted selection the server uses the session workspace.
+      mocks.readSelectedOrganizationId.mockReturnValue(null)
+      mocks.listMessages.mockResolvedValueOnce(messagesResponse([]))
+      await store.fetchMessages('first')
+      expect(store.messagesOrganizationScope).toBe('organization-session')
+    })
+
+    it('keeps the transcript workspace through a realtime refresh', async () => {
+      const { useContactsStore } = await import('./contacts')
+      const store = useContactsStore()
+      mocks.readSelectedOrganizationId.mockReturnValue('organization-a')
+      mocks.listMessages.mockResolvedValue(messagesResponse([message('first-message', 'first')]))
+      store.setCurrentContact(contact('first'))
+      await store.fetchMessages('first')
+
+      // Another tab changed the persisted selection; the merged transcript
+      // still belongs to the workspace it was loaded from.
+      mocks.readSelectedOrganizationId.mockReturnValue('organization-b')
+      await store.refreshCurrentMessages()
+      expect(store.messagesOrganizationScope).toBe('organization-a')
+    })
+
+    it('drops the transcript workspace together with the transcript', async () => {
+      const { useOrganizationsStore } = await import('./organizations')
+      const organizationsStore = useOrganizationsStore()
+      organizationsStore.selectedOrgId = 'organization-a'
+      const { useContactsStore } = await import('./contacts')
+      const store = useContactsStore()
+      mocks.readSelectedOrganizationId.mockReturnValue('organization-a')
+      mocks.listMessages.mockResolvedValue(messagesResponse([message('first-message', 'first')]))
+      store.setCurrentContact(contact('first'))
+      await store.fetchMessages('first')
+      expect(store.messagesOrganizationScope).toBe('organization-a')
+
+      // A workspace switch clears the transcript rather than leaving its media
+      // to be refetched under the new workspace.
+      organizationsStore.selectedOrgId = 'organization-b'
+      await nextTick()
+      expect(store.messages).toEqual([])
+      expect(store.messagesOrganizationScope).toBe('')
+
+      await store.fetchMessages('first')
+      store.clearMessages()
+      expect(store.messagesOrganizationScope).toBe('')
+    })
   })
 
   it('polls a newly arriving hold into the selected contact without changing selection', async () => {
