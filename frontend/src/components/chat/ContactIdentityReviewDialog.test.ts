@@ -316,6 +316,61 @@ describe('ContactIdentityReviewDialog', () => {
     expect(wrapper.text()).toContain('Sanitized caption')
   })
 
+  it.each([
+    ['image/svg+xml', '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>', undefined, 'staged-media'],
+    ['image/png', 'png bytes', undefined, 'staged-media.png'],
+    ['application/pdf', 'pdf bytes', 'lab-report.pdf', 'lab-report.pdf'],
+  ])('hands staged %s media to the browser only as an opaque download', async (type, body, filename, downloadName) => {
+    const createURL = vi.fn<(value: Blob | MediaSource) => string>().mockReturnValue('blob:staged-media')
+    const revokeURL = vi.fn<(url: string) => void>()
+    vi.stubGlobal('URL', class extends URL {
+      static createObjectURL = createURL
+      static revokeObjectURL = revokeURL
+    })
+    const item = {
+      id: 'staged-1',
+      hold_id: 'hold-1',
+      protocol_version: 1,
+      revision: 'c'.repeat(64),
+      status: 'pending',
+      message_type: 'image',
+      received_at: '2026-09-06T00:00:00Z',
+    }
+    mocks.listStaged.mockResolvedValueOnce({ data: { data: { reviews: [item], total: 1 } } })
+    mocks.getStaged.mockResolvedValueOnce({
+      data: { data: { ...item, content: '', media_available: true, media_mime_type: type, media_filename: filename } },
+    })
+    mocks.getMedia.mockResolvedValueOnce({ data: new Blob([body], { type }) })
+
+    try {
+      wrapper = mountDialog()
+      await flushPromises()
+      await wrapper.findAll('button').find(button => button.text().includes('Protected staged queue'))!.trigger('click')
+      await flushPromises()
+      await wrapper.findAll('button').find(button => button.text().includes('image'))!.trigger('click')
+      await flushPromises()
+      await wrapper.findAll('button').find(button => button.text().includes('Load protected media'))!.trigger('click')
+      await flushPromises()
+
+      expect(mocks.getMedia).toHaveBeenCalledWith('staged-1', 'c'.repeat(64), expect.any(AbortSignal))
+      // The object URL shares this app's origin but none of the server's
+      // headers: "Open link in new tab" must download the bytes, never
+      // render a customer SVG as a page that runs script.
+      const blob = createURL.mock.calls[0][0] as Blob
+      expect(blob.type).toBe('application/octet-stream')
+      expect(await blob.text()).toBe(body)
+      const link = wrapper.get('a[download]')
+      expect(link.attributes('href')).toBe('blob:staged-media')
+      expect(link.attributes('download')).toBe(downloadName)
+
+      wrapper.unmount()
+      wrapper = null
+      expect(revokeURL).toHaveBeenCalledWith('blob:staged-media')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('pages through every protected staged review beyond the API limit', async () => {
     mocks.listStaged
       .mockResolvedValueOnce({

@@ -67,6 +67,38 @@ export function displaySafeMediaBlob(blob: Blob, kind: ChatMediaKind): Blob {
   return new Blob([blob], { type: displaySafeMediaType(blob.type, kind) })
 }
 
+// An opaque download carries no type the browser could name the saved file
+// by, so a file without a name of its own gets its extension here. Scriptable
+// types get none.
+const DOWNLOAD_EXTENSIONS: Readonly<Record<string, string>> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'image/avif': '.avif',
+  'image/bmp': '.bmp',
+  'video/mp4': '.mp4',
+  'video/3gpp': '.3gp',
+  'video/webm': '.webm',
+  'video/quicktime': '.mov',
+  'audio/aac': '.aac',
+  'audio/amr': '.amr',
+  'audio/mp4': '.m4a',
+  'audio/mpeg': '.mp3',
+  'audio/ogg': '.ogg',
+  'audio/opus': '.opus',
+  'audio/wav': '.wav',
+  'audio/webm': '.weba',
+  'application/pdf': '.pdf',
+}
+
+export function mediaDownloadName(filename: string | undefined, sourceType: string, fallbackBase: string): string {
+  const name = filename?.trim()
+  if (name) return name
+  const essence = sourceType.split(';', 1)[0].trim().toLowerCase()
+  return fallbackBase + (DOWNLOAD_EXTENSIONS[essence] ?? '')
+}
+
 // Every chat media download shares these slots, so a long transcript cannot
 // fill the connection that other API calls need.
 export const chatMediaLoadLimiter = createLoadLimiter(4)

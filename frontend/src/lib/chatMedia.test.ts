@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { displaySafeMediaBlob, displaySafeMediaType, OPAQUE_MEDIA_TYPE } from './chatMedia'
+import { displaySafeMediaBlob, displaySafeMediaType, mediaDownloadName, OPAQUE_MEDIA_TYPE } from './chatMedia'
 
 describe('displaySafeMediaType', () => {
   it.each([
@@ -43,5 +43,26 @@ describe('displaySafeMediaBlob', () => {
     const blob = displaySafeMediaBlob(new Blob([html], { type: 'text/html' }), 'document')
     expect(blob.type).toBe(OPAQUE_MEDIA_TYPE)
     expect(await blob.text()).toBe(html)
+  })
+})
+
+describe('mediaDownloadName', () => {
+  it('keeps the name the file arrived with', () => {
+    expect(mediaDownloadName(' lab-report.pdf ', 'application/pdf', 'media')).toBe('lab-report.pdf')
+  })
+
+  it.each([
+    ['image/jpeg', 'media.jpg'],
+    ['IMAGE/PNG; name="photo.png"', 'media.png'],
+    ['audio/ogg; codecs=opus', 'media.ogg'],
+    ['application/pdf', 'media.pdf'],
+    // Scriptable or unknown types get no extension that would open them
+    // in a browser.
+    ['image/svg+xml', 'media'],
+    ['text/html', 'media'],
+    ['', 'media'],
+  ])('names an unnamed %s file %s', (type, expected) => {
+    expect(mediaDownloadName(undefined, type, 'media')).toBe(expected)
+    expect(mediaDownloadName('  ', type, 'media')).toBe(expected)
   })
 })
