@@ -1,0 +1,784 @@
+"""Semantic tests for the CI workflows that branch protection relies on.
+
+They replace the retired suite's byte pins on test.yml. Each check states one
+property of the whole workflow set, passes on the checked-in files, and has
+negative cases that break the property and must make the checker fail:
+
+1. each required status check is reported by one job whose id and name equal
+   it, and the E2E shards stay e2e-shard-1 to e2e-shard-4;
+2. no other job in any workflow can report one of those names;
+3. CI runs on every push to and pull request for main with no path filter, no
+   workflow uses pull_request_target or workflow_run, every action is pinned
+   to a full commit, every service image to a digest (PostgreSQL to the
+   reviewed 17 image), and no checkout persists credentials;
+4. main push runs never cancel each other, and the CI timeouts hold;
+5. only ship.yml names a deployment environment or reads a secret other than
+   GITHUB_TOKEN, and each environment belongs to exactly the job mapped here;
+6. actionlint checks every workflow;
+7. the Test workflow runs the release/deployment suite (this file included)
+   in a job its aggregator needs;
+8. each CI aggregator runs even when a job fails, needs every other job of its
+   workflow and fails unless each one succeeded;
+9. the frontend audit keeps only the dated, dev-only braces exception and
+   fails closed on everything else.
+
+The workflows are read with test_ship_workflow's YAML-subset reader plus the
+folded scalars the CI workflows use; when PyYAML happens to be importable the
+parse is cross-checked.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from typing import Any, Callable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_ship_workflow import MiniYaml
+
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent
+WORKFLOWS = ROOT / ".github" / "workflows"
+
+# Branch protection's required status checks on main, each with the one job
+# (workflow file, job id) that reports it.
+REQUIRED_CONTEXTS = {
+    "test": ("test.yml", "test"),
+    "lint": ("test.yml", "lint"),
+    "build": ("test.yml", "build"),
+    "security": ("test.yml", "security"),
+    "e2e": ("e2e-tests.yml", "e2e"),
+    "tenant-isolation": ("test.yml", "tenant-isolation"),
+}
+E2E_SHARDS = [1, 2, 3, 4]
+# Each CI workflow's aggregator and its concurrency group prefix.
+AGGREGATORS = {"test.yml": "test", "e2e-tests.yml": "e2e"}
+CI_PREFIXES = {"test.yml": "test", "e2e-tests.yml": "e2e"}
+CI_TRIGGERS = {"push": {"branches": ["main"]}, "pull_request": {"branches": ["main"]}}
+FORBIDDEN_TRIGGERS = ("pull_request_target", "workflow_run")
+# Every job that names a deployment environment, and the environment it names.
+ENVIRONMENTS = {("ship.yml", "production"): "production"}
+SECRET_WORKFLOWS = {"ship.yml"}
+PG17_IMAGE = "postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
+POSTGRES_JOBS = (("test.yml", "tenant-isolation"), ("test.yml", "go-race"), ("e2e-tests.yml", "e2e-shard"))
+PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
+DIGEST_IMAGE = re.compile(r"[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}")
+TENANT_TEST = "go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'"
+RACE_TEST = '-- -mod=readonly -race -p 1 -timeout 150m -coverprofile=coverage.out "${packages[@]}"'
+ACTIONLINT_INSTALL = "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7"
+# Exactly the test discovery the release tests job runs. A new release test
+# directory is added here and to the job together.
+RELEASE_TEST_COMMANDS = ("python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v",)
+# #213: GHSA-vfj7-8cjw-p6xm, reviewed to 2026-12-31. A renewal or a new
+# exception is a reviewed edit of this line.
+BRACES_EXCEPTION = ("braces", "stack-exhaustion denial of service", "2026-12-31")
+
+
+class WorkflowYaml(MiniYaml):
+    """MiniYaml plus the folded scalars the CI workflows use for service
+    options. More-indented lines inside a folded scalar stay outside the
+    contract."""
+
+    def value(self, rest: str, indent: int) -> Any:
+        if rest in {">", ">-"}:
+            return self.folded(indent, keep_last=rest == ">")
+        return super().value(rest, indent)
+
+    def folded(self, indent: int, *, keep_last: bool) -> str:
+        text = ""
+        for line in self.literal(indent, keep_last=False).split("\n"):
+            if line[:1] in {" ", "\t"}:
+                raise ValueError("more-indented folded lines are outside the contract")
+            if not line:
+                text += "\n"
+            elif text and not text.endswith("\n"):
+                text += " " + line
+            else:
+                text += line
+        return text + "\n" if keep_last and text else text
+
+
+def read_sources() -> dict[str, str]:
+    sources: dict[str, str] = {}
+    for path in sorted(WORKFLOWS.iterdir()):
+        if path.suffix not in {".yml", ".yaml"}:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise AssertionError(f"workflow is not a regular file: {path.name}")
+        sources[path.name] = path.read_text(encoding="utf-8")
+    return sources
+
+
+SOURCES = read_sources()
+
+
+def parse(sources: dict[str, str]) -> dict[str, dict[str, Any]]:
+    return {name: WorkflowYaml(text).parse() for name, text in sources.items()}
+
+
+def jobs(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return doc["jobs"]
+
+
+def needs(job: dict[str, Any]) -> list[str]:
+    value = job.get("needs", [])
+    return [value] if type(value) is str else list(value)
+
+
+def run_lines(step: dict[str, Any]) -> list[str]:
+    return [line.strip() for line in str(step.get("run", "")).splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def step_named(job: dict[str, Any], name: str) -> dict[str, Any]:
+    matches = [item for item in job.get("steps", []) if item.get("name") == name]
+    if len(matches) != 1:
+        raise AssertionError(f"step {name!r} is missing or not unique")
+    return matches[0]
+
+
+def heredoc(run: str, marker: str) -> str:
+    opener = f"<<'{marker}'\n"
+    if run.count(opener) != 1:
+        raise AssertionError(f"expected one {marker} heredoc")
+    body, closed, _ = run.split(opener, 1)[1].partition(f"\n{marker}\n")
+    if not closed:
+        raise AssertionError(f"the {marker} heredoc is not closed")
+    return body + "\n"
+
+
+def run_python(script: str, *args: str, files: dict[str, str] | None = None,
+               env: dict[str, str] | None = None) -> int:
+    """Run a workflow's embedded Python the way its step does, in a scratch directory."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "policy.py").write_text(script, encoding="utf-8")
+        for name, text in (files or {}).items():
+            (root / name).write_text(text, encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, "-I", "-S", "policy.py", *args], cwd=root, env={**os.environ, **(env or {})},
+            capture_output=True, text=True, timeout=60,
+        ).returncode
+
+
+def name_pattern(name: str) -> re.Pattern[str]:
+    # An expression in a job name can render as any text.
+    return re.compile(".*".join(re.escape(part) for part in re.split(r"\$\{\{.*?\}\}", name)))
+
+
+def expected_concurrency(prefix: str) -> dict[str, str]:
+    # Pull request runs supersede each other; every other run (each push to
+    # main) has its own group, so a later merge never cancels or replaces the
+    # push run that ship.py's require_ci_green needs for an earlier commit.
+    return {
+        "group": prefix + "-${{ github.event_name == 'pull_request' && "
+        "format('pr-{0}', github.event.pull_request.number) || "
+        "format('run-{0}', github.run_id) }}",
+        "cancel-in-progress": "${{ github.event_name == 'pull_request' }}",
+    }
+
+
+# --------------------------------------------------------------------------
+# The checks. Each takes the workflow sources by file name and raises
+# AssertionError when its property does not hold.
+# --------------------------------------------------------------------------
+
+
+def assert_required_contexts(sources: dict[str, str]) -> None:
+    docs = parse(sources)
+    for context, (workflow, job_id) in REQUIRED_CONTEXTS.items():
+        job = jobs(docs[workflow]).get(job_id)
+        if job is None or job.get("name") != context:
+            raise AssertionError(f"required check {context} is not reported by job {job_id} of {workflow}")
+    shard = jobs(docs["e2e-tests.yml"]).get("e2e-shard")
+    if shard is None or shard.get("name") != "e2e-shard-${{ matrix.shard }}":
+        raise AssertionError("the E2E shards are not named e2e-shard-N")
+    if shard.get("strategy", {}).get("matrix") != {"shard": E2E_SHARDS}:
+        raise AssertionError("the E2E shard matrix differs")
+    split = "--shard=${{ matrix.shard }}/" + str(len(E2E_SHARDS))
+    if not any(split in line for item in shard.get("steps", []) for line in run_lines(item)):
+        raise AssertionError("the E2E shards do not split the suite by the matrix")
+
+
+def assert_context_names_unique(sources: dict[str, str]) -> None:
+    designated = set(REQUIRED_CONTEXTS.values()) | {("e2e-tests.yml", "e2e-shard")}
+    reserved = [*REQUIRED_CONTEXTS, *(f"e2e-shard-{shard}" for shard in E2E_SHARDS)]
+    for workflow, doc in parse(sources).items():
+        for job_id, job in jobs(doc).items():
+            if (workflow, job_id) in designated:
+                continue
+            pattern = name_pattern(str(job.get("name", job_id)))
+            clashes = [name for name in reserved if pattern.fullmatch(name)]
+            if clashes:
+                raise AssertionError(f"{workflow} job {job_id} can report the required check {clashes[0]}")
+
+
+def assert_triggers_and_pins(sources: dict[str, str]) -> None:
+    docs = parse(sources)
+    for workflow in CI_PREFIXES:
+        if docs[workflow].get("on") != CI_TRIGGERS:
+            raise AssertionError(f"{workflow} does not run on every push to and pull request for main")
+    for workflow, doc in docs.items():
+        on = doc.get("on")
+        events = set(on) if type(on) in (dict, list) else {on}
+        active = "\n".join(line for line in sources[workflow].splitlines() if not line.lstrip().startswith("#"))
+        for event in FORBIDDEN_TRIGGERS:
+            if event in events or re.search(rf"\b{event}\b", active):
+                raise AssertionError(f"{workflow} uses {event}")
+        uses = [job["uses"] for job in jobs(doc).values() if "uses" in job]
+        uses += [item["uses"] for job in jobs(doc).values() for item in job.get("steps", []) if "uses" in item]
+        if len(uses) != len(re.findall(r"(?m)^[ \t]*(?:-[ \t]+)?uses[ \t]*:", sources[workflow])):
+            raise AssertionError(f"{workflow} has a uses: the reader did not see")
+        for value in uses:
+            if not PINNED_USES.fullmatch(str(value)):
+                raise AssertionError(f"{workflow} uses {value} without a full commit pin")
+        for job_id, job in jobs(doc).items():
+            images = [service if type(service) is str else service.get("image")
+                      for service in job.get("services", {}).values()]
+            if "container" in job:
+                images.append(job["container"] if type(job["container"]) is str else job["container"].get("image"))
+            for image in images:
+                if not DIGEST_IMAGE.fullmatch(str(image)) or (str(image).startswith("postgres") and image != PG17_IMAGE):
+                    raise AssertionError(f"{workflow} job {job_id} runs an unpinned or unreviewed image {image}")
+            for item in job.get("steps", []):
+                if (str(item.get("uses", "")).startswith("actions/checkout@")
+                        and item.get("with", {}).get("persist-credentials") is not False):
+                    raise AssertionError(f"{workflow} job {job_id} persists checkout credentials")
+    for workflow, job_id in POSTGRES_JOBS:
+        if jobs(docs[workflow])[job_id].get("services", {}).get("postgres", {}).get("image") != PG17_IMAGE:
+            raise AssertionError(f"{workflow} job {job_id} does not test against the reviewed PostgreSQL 17")
+
+
+def assert_concurrency_and_timeouts(sources: dict[str, str]) -> None:
+    docs = parse(sources)
+    for workflow, prefix in CI_PREFIXES.items():
+        if docs[workflow].get("concurrency") != expected_concurrency(prefix):
+            raise AssertionError(f"{workflow} lets main push runs cancel each other")
+        for job_id, job in jobs(docs[workflow]).items():
+            if "concurrency" in job:
+                raise AssertionError(f"{workflow} job {job_id} has its own concurrency group")
+    test_jobs = jobs(docs["test.yml"])
+    tenant = test_jobs["tenant-isolation"]
+    if tenant.get("timeout-minutes") != 60:
+        raise AssertionError("tenant-isolation has no explicit 60-minute job timeout")
+    if [line for item in tenant.get("steps", []) for line in run_lines(item) if line.startswith("go test")] != [TENANT_TEST]:
+        raise AssertionError("tenant-isolation does not run its tests with the 45-minute timeout")
+    race = test_jobs["go-race"]
+    # The per-package cap stays below the job's ceiling (GitHub's 360 minutes).
+    if race.get("timeout-minutes") != 360 or RACE_TEST not in run_lines(step_named(race, "Run tests")):
+        raise AssertionError("go-race does not run with the 150-minute package timeout under a 360-minute job")
+
+
+def assert_environments_and_secrets(sources: dict[str, str]) -> None:
+    docs = parse(sources)
+    found: dict[tuple[str, str], Any] = {}
+    for workflow, doc in docs.items():
+        for job_id, job in jobs(doc).items():
+            if "environment" in job:
+                value = job["environment"]
+                found[(workflow, job_id)] = value.get("name") if type(value) is dict else value
+            if "secrets" in job and workflow not in SECRET_WORKFLOWS:
+                raise AssertionError(f"{workflow} job {job_id} passes secrets")
+        declared = len(re.findall(r"(?m)^[ \t]+environment[ \t]*:", sources[workflow]))
+        if declared != sum(key[0] == workflow for key in found):
+            raise AssertionError(f"{workflow} names an environment outside a job")
+    if found != ENVIRONMENTS:
+        raise AssertionError(f"the job environments differ: {sorted(found.items())}")
+    for workflow, source in sources.items():
+        if workflow in SECRET_WORKFLOWS:
+            continue
+        for expression in re.findall(r"\$\{\{(.*?)\}\}", source, flags=re.S):
+            for match in re.finditer(r"\bsecrets\b(\.[A-Za-z_][A-Za-z0-9_]*)?", expression):
+                if match.group(1) != ".GITHUB_TOKEN":
+                    raise AssertionError(f"{workflow} reads a secret other than GITHUB_TOKEN")
+
+
+def assert_workflow_lint(sources: dict[str, str]) -> None:
+    lint = jobs(parse(sources)["test.yml"])["lint"]
+    lines = [line for item in lint.get("steps", []) if "if" not in item for line in run_lines(item)]
+    # With no arguments actionlint checks every file under .github/workflows.
+    if ACTIONLINT_INSTALL not in lines or "actionlint" not in lines:
+        raise AssertionError("the lint job does not run the pinned actionlint over every workflow")
+
+
+def assert_release_tests(sources: dict[str, str]) -> None:
+    test_jobs = jobs(parse(sources)["test.yml"])
+    runners = [(job_id, item) for job_id, job in test_jobs.items() for item in job.get("steps", [])
+               if any("unittest discover" in line for line in run_lines(item))]
+    if len(runners) != 1:
+        raise AssertionError(f"expected one step running the release tests, found {len(runners)}")
+    job_id, item = runners[0]
+    if job_id not in needs(test_jobs["test"]):
+        raise AssertionError(f"the release tests job {job_id} is not in the test aggregator's needs")
+    if "if" in item or "if" in test_jobs[job_id] or "working-directory" in item:
+        raise AssertionError("the release tests are conditional or run elsewhere")
+    if run_lines(item) != ["set -euo pipefail", *RELEASE_TEST_COMMANDS]:
+        raise AssertionError("the release tests job does not run exactly the release test discovery")
+
+
+def aggregator_script_requires_every_result(run: str, variable: str) -> bool:
+    lines = run_lines({"run": run})
+    if lines[:2] != ["set -euo pipefail", "python3 - <<'NEEDS'"] or lines[-1] != "NEEDS":
+        return False
+    script = heredoc(run, "NEEDS")
+
+    def passes(value: str) -> bool:
+        return run_python(script, env={variable: value}) == 0
+
+    def results(*values: str) -> str:
+        return json.dumps({f"job-{index}": {"result": value, "outputs": {}} for index, value in enumerate(values)})
+
+    return (passes(results("success", "success"))
+            and not any(passes(results("success", value)) for value in ("failure", "cancelled", "skipped"))
+            and not passes("{}") and not passes("[]"))
+
+
+def checked_results(job: dict[str, Any]) -> set[str]:
+    """The needed jobs whose results some unconditional step of ``job`` requires to be success."""
+    checked: set[str] = set()
+    for item in job.get("steps", []):
+        run = str(item.get("run", ""))
+        if "if" in item or "||" in run:
+            continue
+        for variable, value in item.get("env", {}).items():
+            if value == "${{ toJSON(needs) }}":
+                if aggregator_script_requires_every_result(run, variable):
+                    checked.update(needs(job))
+                continue
+            match = re.fullmatch(r"\$\{\{ needs\.([A-Za-z0-9_-]+)\.result \}\}", str(value))
+            if match and re.search(r'"\$%s" ==? "success"' % re.escape(variable), run):
+                checked.add(match.group(1))
+    return checked
+
+
+def assert_aggregators(sources: dict[str, str]) -> None:
+    docs = parse(sources)
+    for workflow in CI_PREFIXES:
+        for job_id, job in jobs(docs[workflow]).items():
+            # A tolerated job or step reports success to the aggregator.
+            if "continue-on-error" in job or any("continue-on-error" in item for item in job.get("steps", [])):
+                raise AssertionError(f"{workflow} job {job_id} tolerates failure")
+    for workflow, aggregator in AGGREGATORS.items():
+        workflow_jobs = jobs(docs[workflow])
+        job = workflow_jobs[aggregator]
+        others = sorted(job_id for job_id in workflow_jobs if job_id != aggregator)
+        # Skipped because a needed job failed, a required check counts as passing.
+        if job.get("if") not in ("always()", "${{ always() }}"):
+            raise AssertionError(f"{workflow} {aggregator} does not run when a job it needs fails")
+        if sorted(needs(job)) != others:
+            raise AssertionError(f"{workflow} {aggregator} does not need exactly every other job")
+        if sorted(checked_results(job)) != others:
+            raise AssertionError(f"{workflow} {aggregator} does not require every other job to succeed")
+
+
+AUDIT_LOCK = {"packages": {
+    "": {"name": "fixture"},
+    "node_modules/runtime-lib": {"version": "1.0.0"},
+    "node_modules/build-tool": {"version": "1.0.0", "dev": True},
+}}
+
+
+def audit_report(**vulnerabilities: dict) -> dict:
+    return {"auditReportVersion": 2, "vulnerabilities": vulnerabilities, "metadata": {"vulnerabilities": {}}}
+
+
+def advisory(package: str, severity: str) -> dict:
+    return {"name": package, "severity": severity, "via": [{
+        "name": package, "title": "synthetic advisory", "severity": severity}]}
+
+
+def braces_report(title: str = "braces vulnerable to stack-exhaustion denial of service through deeply "
+                  "nested patterns", severity: str = "high") -> dict:
+    return audit_report(braces={"name": "braces", "severity": severity, "via": [{
+        "name": "braces", "title": title, "severity": severity}]},
+        micromatch={"name": "micromatch", "severity": severity, "via": ["braces"]})
+
+
+def braces_lock(dev: bool) -> dict:
+    row = {"version": "3.0.3", "dev": True} if dev else {"version": "3.0.3"}
+    return {"packages": {**AUDIT_LOCK["packages"], "node_modules/braces": row}}
+
+
+def audit_run(sources: dict[str, str]) -> str:
+    return step_named(jobs(parse(sources)["test.yml"])["security"], "Audit frontend dependencies")["run"]
+
+
+def run_audit_policy(run: str, report: object, rc: int, lock: dict) -> int:
+    """Run the step's embedded audit policy against a synthetic npm audit report."""
+    return run_python(heredoc(run, "AUDIT"), "report.json", str(rc), files={
+        "package-lock.json": json.dumps(lock),
+        "report.json": report if type(report) is str else json.dumps(report),
+    })
+
+
+def assert_frontend_audit_policy(sources: dict[str, str]) -> None:
+    run = audit_run(sources)
+    if "|| audit_rc=$?" not in run or "|| true" in run:
+        raise AssertionError("the frontend audit's exit status is not captured fail-closed")
+    if re.findall(r"(?m)^ALLOWED = (.*)$", heredoc(run, "AUDIT")) != ['{("%s", "%s", "%s")}' % BRACES_EXCEPTION]:
+        raise AssertionError("the audit exceptions differ from the reviewed braces exception")
+    if dt.date.fromisoformat(BRACES_EXCEPTION[2]) < dt.date.today():
+        raise AssertionError(f"the braces exception lapsed on {BRACES_EXCEPTION[2]}; review it")
+    if run_audit_policy(run, braces_report(), 1, braces_lock(True)) != 0:
+        raise AssertionError("the dev-only braces advisory is no longer allowed")
+    if run_audit_policy(run, braces_report(), 1, braces_lock(False)) == 0:
+        raise AssertionError("a braces advisory that reaches production is allowed")
+
+
+CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
+    ("required-contexts", assert_required_contexts),
+    ("unique-context-names", assert_context_names_unique),
+    ("triggers-and-pins", assert_triggers_and_pins),
+    ("concurrency-and-timeouts", assert_concurrency_and_timeouts),
+    ("environments-and-secrets", assert_environments_and_secrets),
+    ("workflow-lint", assert_workflow_lint),
+    ("release-tests", assert_release_tests),
+    ("aggregators", assert_aggregators),
+    ("braces-audit", assert_frontend_audit_policy),
+)
+
+
+def check_ci_workflows(sources: dict[str, str]) -> None:
+    """Every check in order; the error names the first one that fails."""
+    try:
+        parse(sources)
+    except (ValueError, KeyError, IndexError) as error:
+        raise AssertionError(f"parse: {error}") from None
+    for label, check in CHECKS:
+        try:
+            check(sources)
+        except (AssertionError, KeyError, TypeError, AttributeError) as error:
+            raise AssertionError(f"{label}: {error}") from None
+
+
+def replaced(workflow: str, old: str, new: str) -> dict[str, str]:
+    if SOURCES[workflow].count(old) != 1:
+        raise AssertionError(f"mutation anchor is not unique in {workflow}: {old!r}")
+    return {**SOURCES, workflow: SOURCES[workflow].replace(old, new, 1)}
+
+
+def added(workflow: str, text: str) -> dict[str, str]:
+    if workflow in SOURCES:
+        raise AssertionError(f"{workflow} already exists")
+    return {**SOURCES, workflow: text}
+
+
+def extra_workflow(on: str, job: str) -> str:
+    return f"""name: Extra
+
+on: {on}
+
+permissions:
+  contents: read
+
+jobs:
+  {job}:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: "true"
+"""
+
+AGGREGATOR_STEP = "      - name: Require every Test job to succeed\n"
+RELEASE_TESTS_STEP = "      - name: Test the Release workflow, its modules and the CI workflows\n"
+
+# Each case breaks one property; the checker must fail on the named check.
+NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
+    # 1. Required check names.
+    "rename a required job's name": ("required-contexts", lambda: replaced(
+        "test.yml", "  lint:\n    name: lint\n", "  lint:\n    name: golangci-lint\n")),
+    "rename a required job's id": ("required-contexts", lambda: replaced(
+        "test.yml", "  build:\n    name: build\n", "  compile:\n    name: build\n")),
+    "rename the e2e aggregator": ("required-contexts", lambda: replaced(
+        "e2e-tests.yml", "  e2e:\n    name: e2e\n", "  e2e:\n    name: e2e-all\n")),
+    "rename the e2e shards": ("required-contexts", lambda: replaced(
+        "e2e-tests.yml", "name: e2e-shard-${{ matrix.shard }}", "name: shard-${{ matrix.shard }}")),
+    "shrink the shard matrix": ("required-contexts", lambda: replaced(
+        "e2e-tests.yml", "shard: [1, 2, 3, 4]", "shard: [1, 2, 3]")),
+    # 2. No other job can report a required name.
+    "name a new job test in a new workflow": ("unique-context-names", lambda: added(
+        "extra.yml", extra_workflow("[push]", "test"))),
+    "name a new job test in the e2e workflow": ("unique-context-names", lambda: replaced(
+        "e2e-tests.yml", "  e2e:\n    name: e2e\n",
+        "  smoke:\n    name: test\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"true\"\n\n"
+        "  e2e:\n    name: e2e\n")),
+    "name a Release job lint": ("unique-context-names", lambda: replaced(
+        "ship.yml", "    name: Release plan\n", "    name: lint\n")),
+    "name a Release job by expression only": ("unique-context-names", lambda: replaced(
+        "ship.yml", "    name: Release image (${{ matrix.component }})\n", "    name: ${{ matrix.component }}\n")),
+    # 3. Triggers, pins and checkouts.
+    "add pull_request_target to Test": ("triggers-and-pins", lambda: replaced(
+        "test.yml", "  pull_request:\n    branches:\n      - main\n",
+        "  pull_request:\n    branches:\n      - main\n  pull_request_target:\n    branches:\n      - main\n")),
+    "add workflow_run to Release": ("triggers-and-pins", lambda: replaced(
+        "ship.yml", "on:\n  workflow_dispatch:\n",
+        "on:\n  workflow_run:\n    workflows: [Test]\n    types: [completed]\n  workflow_dispatch:\n")),
+    "add pull_request_target to Release": ("triggers-and-pins", lambda: replaced(
+        "ship.yml", "on:\n  workflow_dispatch:\n", "on:\n  pull_request_target:\n  workflow_dispatch:\n")),
+    "add a workflow on pull_request_target": ("triggers-and-pins", lambda: added(
+        "extra.yml", extra_workflow("[push, pull_request_target]", "extra"))),
+    "add a workflow on workflow_run": ("triggers-and-pins", lambda: added(
+        "extra.yml", extra_workflow("workflow_run", "extra"))),
+    "add a path filter to Test": ("triggers-and-pins", lambda: replaced(
+        "test.yml", "  pull_request:\n    branches:\n      - main\n",
+        "  pull_request:\n    branches:\n      - main\n    paths:\n      - internal/**\n")),
+    "add a path filter to E2E": ("triggers-and-pins", lambda: replaced(
+        "e2e-tests.yml", "  push:\n    branches: [main]\n", "  push:\n    branches: [main]\n    paths-ignore: [docs/**]\n")),
+    "unpin a uses in Test": ("triggers-and-pins", lambda: replaced(
+        "test.yml", "golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7",
+        "golangci/golangci-lint-action@v7")),
+    "unpin a uses in E2E": ("triggers-and-pins", lambda: replaced(
+        "e2e-tests.yml", "- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+        "- uses: actions/checkout@main")),
+    "unpin a uses in Release": ("triggers-and-pins", lambda: replaced(
+        "ship.yml", "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6",
+        "docker/build-push-action@v6")),
+    "unpin a service image": ("triggers-and-pins", lambda: replaced(
+        "e2e-tests.yml", "redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab", "redis:7")),
+    "test against another PostgreSQL": ("triggers-and-pins", lambda: replaced(
+        "e2e-tests.yml", PG17_IMAGE, "postgres:16@sha256:" + "0" * 64)),
+    "persist checkout credentials": ("triggers-and-pins", lambda: replaced(
+        "e2e-tests.yml", "          persist-credentials: false\n", "          persist-credentials: true\n")),
+    # 4. Concurrency and timeouts.
+    "revert the Test concurrency group": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "format('run-{0}', github.run_id)", "github.ref")),
+    "revert the E2E concurrency group": ("concurrency-and-timeouts", lambda: replaced(
+        "e2e-tests.yml", "format('run-{0}', github.run_id)", "github.ref")),
+    "cancel Test main runs in progress": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n", "  cancel-in-progress: true\n")),
+    "cancel E2E main runs in progress": ("concurrency-and-timeouts", lambda: replaced(
+        "e2e-tests.yml", "  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n",
+        "  cancel-in-progress: true\n")),
+    "add a job concurrency group": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "  build:\n    name: build\n",
+        "  build:\n    name: build\n    concurrency:\n      group: build\n      cancel-in-progress: true\n")),
+    "drop the tenant-isolation job timeout": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "    name: tenant-isolation\n    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n",
+        "    name: tenant-isolation\n    runs-on: ubuntu-24.04\n")),
+    "drop the tenant-isolation test timeout": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "go test -mod=readonly -v -timeout 45m ./internal/database", "go test -mod=readonly -v ./internal/database")),
+    "shorten the go-race package timeout": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "-race -p 1 -timeout 150m ", "-race -p 1 -timeout 60m ")),
+    # 5. Environments and secrets.
+    "add an environment outside ship.yml": ("environments-and-secrets", lambda: replaced(
+        "test.yml", "  lint:\n    name: lint\n", "  lint:\n    name: lint\n    environment: production\n")),
+    "add a secret outside ship.yml": ("environments-and-secrets", lambda: replaced(
+        "e2e-tests.yml", "          CI: true\n", "          CI: true\n          META_TOKEN: ${{ secrets.META_TOKEN }}\n")),
+    "read every secret outside ship.yml": ("environments-and-secrets", lambda: replaced(
+        "e2e-tests.yml", "          CI: true\n", "          CI: true\n          ALL: ${{ toJSON(secrets) }}\n")),
+    "inherit secrets outside ship.yml": ("environments-and-secrets", lambda: replaced(
+        "test.yml", "  lint:\n    name: lint\n", "  lint:\n    name: lint\n    secrets: inherit\n")),
+    "map the production job to the wrong environment": ("environments-and-secrets", lambda: replaced(
+        "ship.yml", "    environment: production\n", "    environment: staging\n")),
+    "map the production job to the wrong environment by object": ("environments-and-secrets", lambda: replaced(
+        "ship.yml", "    environment: production\n", "    environment:\n      name: staging\n")),
+    "give another Release job an environment": ("environments-and-secrets", lambda: replaced(
+        "ship.yml", "    name: Release record\n", "    name: Release record\n    environment: production\n")),
+    # 6. actionlint.
+    "lint only one workflow": ("workflow-lint", lambda: replaced(
+        "test.yml", "          actionlint\n", "          actionlint .github/workflows/test.yml\n")),
+    # 7. The release tests.
+    "remove the release/deployment discover command": ("release-tests", lambda: replaced(
+        "test.yml", "          python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v\n", "")),
+    "retarget the release tests": ("release-tests", lambda: replaced(
+        "test.yml", "discover -s release/deployment -p", "discover -s release/canary -p")),
+    "make the release tests conditional": ("release-tests", lambda: replaced(
+        "test.yml", RELEASE_TESTS_STEP, RELEASE_TESTS_STEP + "        if: ${{ github.event_name == 'push' }}\n")),
+    "drop the release tests from the aggregator": ("release-tests", lambda: replaced(
+        "test.yml", "      - release-tests\n", "")),
+    # 8. Aggregators.
+    "drop a job from the test aggregator": ("aggregators", lambda: replaced("test.yml", "      - go-race\n", "")),
+    "add a job the e2e aggregator does not need": ("aggregators", lambda: replaced(
+        "e2e-tests.yml", "  e2e:\n    name: e2e\n",
+        "  e2e-lint:\n    name: e2e-lint\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"true\"\n\n"
+        "  e2e:\n    name: e2e\n")),
+    "skip the test aggregator when a job fails": ("aggregators", lambda: replaced(
+        "test.yml", "    if: ${{ always() }}\n", "")),
+    "skip the e2e aggregator when a shard fails": ("aggregators", lambda: replaced(
+        "e2e-tests.yml", "  e2e:\n    name: e2e\n    if: always()\n", "  e2e:\n    name: e2e\n")),
+    "make the aggregator check conditional": ("aggregators", lambda: replaced(
+        "test.yml", AGGREGATOR_STEP, AGGREGATOR_STEP + "        if: ${{ false }}\n")),
+    "ignore cancelled and skipped jobs": ("aggregators", lambda: replaced(
+        "test.yml", '              if result != "success":\n', '              if result == "failure":\n')),
+    "pass with no job results": ("aggregators", lambda: replaced(
+        "test.yml", "          if type(needs) is not dict or not needs:\n", "          if type(needs) is not dict:\n")),
+    "tolerate a failed e2e shard": ("aggregators", lambda: replaced(
+        "e2e-tests.yml", 'run: test "$SHARD_RESULT" = "success"', 'run: test "$SHARD_RESULT" = "success" || true')),
+    "tolerate a failed job": ("aggregators", lambda: replaced(
+        "test.yml", "  build:\n    name: build\n    runs-on: ubuntu-24.04\n",
+        "  build:\n    name: build\n    runs-on: ubuntu-24.04\n    continue-on-error: true\n")),
+    # 9. The braces exception.
+    "expire the braces date": ("braces-audit", lambda: replaced("test.yml", '"2026-12-31")}', '"2000-01-01")}')),
+    "add a second audit exception": ("braces-audit", lambda: replaced(
+        "test.yml", '"2026-12-31")}', '"2026-12-31"), ("esbuild", "request forgery", "2026-12-31")}')),
+    "tolerate a failed npm audit": ("braces-audit", lambda: replaced(
+        "test.yml", "|| audit_rc=$?", "|| true")),
+}
+
+
+class ParserTests(unittest.TestCase):
+    def test_folded_scalars(self) -> None:
+        self.assertEqual(WorkflowYaml("a: >-\n  x y\n  z\n\n  w\nb: 1\n").parse(), {"a": "x y z\nw", "b": 1})
+        self.assertEqual(WorkflowYaml("a: >\n  x\n  y\n").parse(), {"a": "x y\n"})
+        with self.assertRaises(ValueError):
+            WorkflowYaml("a: >-\n  x\n    y\n").parse()
+
+    def test_every_workflow_parses(self) -> None:
+        self.assertGreaterEqual(set(SOURCES), {"ship.yml", "test.yml", "e2e-tests.yml"})
+        docs = parse(SOURCES)
+        for name, doc in docs.items():
+            with self.subTest(workflow=name):
+                self.assertTrue(jobs(doc))
+        self.assertEqual(jobs(docs["test.yml"])["go-race"]["services"]["postgres"]["options"],
+                         "--health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5")
+
+    def test_optional_pyyaml_cross_check(self) -> None:
+        try:
+            import yaml  # type: ignore[import-not-found]
+        except ImportError:
+            self.skipTest("PyYAML is not installed")
+
+        # BaseLoader keeps every scalar a string (no YAML 1.1 "on" or
+        # base-60 surprises), so compare against the reader's values as text.
+        def text(value: Any) -> Any:
+            if type(value) is dict:
+                return {key: text(child) for key, child in value.items()}
+            if type(value) is list:
+                return [text(child) for child in value]
+            if type(value) is bool:
+                return "true" if value else "false"
+            return "" if value is None else str(value)
+
+        for name, source in SOURCES.items():
+            with self.subTest(workflow=name):
+                self.assertEqual(yaml.load(source, Loader=yaml.BaseLoader), text(WorkflowYaml(source).parse()))
+
+
+class CiWorkflowTests(unittest.TestCase):
+    def test_checked_in_workflows_pass_every_check(self) -> None:
+        check_ci_workflows(SOURCES)
+
+    def test_required_contexts_and_e2e_shard_names(self) -> None:
+        docs = parse(SOURCES)
+        for context, (workflow, job_id) in REQUIRED_CONTEXTS.items():
+            with self.subTest(context=context):
+                self.assertEqual(job_id, context)
+                self.assertEqual(jobs(docs[workflow])[job_id]["name"], context)
+        shard = jobs(docs["e2e-tests.yml"])["e2e-shard"]
+        self.assertEqual([name_pattern(shard["name"]).fullmatch(f"e2e-shard-{n}") is not None for n in E2E_SHARDS],
+                         [True] * len(E2E_SHARDS))
+
+    def test_ci_main_push_runs_never_cancel_each_other(self) -> None:
+        for workflow, prefix in CI_PREFIXES.items():
+            self.assertEqual(parse(SOURCES)[workflow]["concurrency"], expected_concurrency(prefix))
+            for old, new in (
+                ("format('run-{0}', github.run_id)", "github.ref"),
+                ("format('run-{0}', github.run_id)", "github.sha"),
+                ("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", "cancel-in-progress: true"),
+            ):
+                with self.subTest(workflow=workflow, mutation=new):
+                    with self.assertRaisesRegex(AssertionError, "cancel each other"):
+                        assert_concurrency_and_timeouts(replaced(workflow, old, new))
+
+    def test_harmless_changes_pass(self) -> None:
+        # The checks do not simply fail on any edit.
+        assert_environments_and_secrets(replaced(
+            "e2e-tests.yml", "          CI: true\n", "          CI: true\n          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"))
+        assert_environments_and_secrets(replaced(
+            "ship.yml", "    environment: production\n", "    environment:\n      name: production\n"))
+        check_ci_workflows(added("extra.yml", extra_workflow("[push]", "extra")))
+
+    def test_every_negative_case_fails_its_check(self) -> None:
+        labels = {label for label, _ in CHECKS}
+        self.assertEqual({label for label, _ in NEGATIVE_CASES.values()}, labels)
+        for case, (label, mutate) in NEGATIVE_CASES.items():
+            with self.subTest(case=case):
+                mutant = mutate()
+                self.assertNotEqual(mutant, SOURCES)
+                with self.assertRaisesRegex(AssertionError, rf"^{re.escape(label)}: "):
+                    check_ci_workflows(mutant)
+
+
+class AggregatorScriptTests(unittest.TestCase):
+    def test_generic_aggregator_requires_every_result_to_be_success(self) -> None:
+        step = step_named(jobs(parse(SOURCES)["test.yml"])["test"], "Require every Test job to succeed")
+        self.assertEqual(step["env"], {"NEEDS_JSON": "${{ toJSON(needs) }}"})
+        script = heredoc(step["run"], "NEEDS")
+        cases = {
+            "all success": ({"a": {"result": "success"}, "b": {"result": "success", "outputs": {}}}, 0),
+            "one failure": ({"a": {"result": "success"}, "b": {"result": "failure"}}, 1),
+            "one cancelled": ({"a": {"result": "cancelled"}, "b": {"result": "success"}}, 1),
+            "one skipped": ({"a": {"result": "success"}, "b": {"result": "skipped"}}, 1),
+            "no result": ({"a": {"result": "success"}, "b": {}}, 1),
+            "not an object": ({"a": {"result": "success"}, "b": "success"}, 1),
+            "no jobs": ({}, 1),
+            "a list": ([], 1),
+            "not json": ("success", 1),
+        }
+        for name, (value, expected) in cases.items():
+            with self.subTest(case=name):
+                raw = value if type(value) is str else json.dumps(value)
+                self.assertEqual(run_python(script, env={"NEEDS_JSON": raw}) != 0, expected == 1)
+
+
+class FrontendAuditPolicyTests(unittest.TestCase):
+    """#213's dated braces exception, ported from the retired suite."""
+
+    def test_frontend_audit_policy_fails_closed(self) -> None:
+        gate = audit_run(SOURCES)
+        self.assertIn("|| audit_rc=$?", gate)
+        self.assertNotIn("|| true", gate)
+        cases = {
+            "clean": (audit_report(), 0, 0),
+            "moderate only": (audit_report(**{"build-tool": advisory("build-tool", "moderate")}), 0, 0),
+            "high production": (audit_report(**{"runtime-lib": advisory("runtime-lib", "high")}), 1, 1),
+            "critical production": (audit_report(**{"runtime-lib": advisory("runtime-lib", "critical")}), 1, 1),
+            "high dev-only": (audit_report(**{"build-tool": advisory("build-tool", "high")}), 1, 1),
+            "registry error": ({"error": {"code": "E503", "summary": "unavailable"}}, 1, 1),
+            "error beside an empty report": (dict(audit_report(), error={"code": "E500"}), 1, 1),
+            "error object with exit 0": ({"error": {"code": "E503", "summary": "unavailable"}}, 0, 1),
+            "error beside an empty report with exit 0": (dict(audit_report(), error={"code": "E500"}), 0, 1),
+            "missing vulnerabilities": ({"auditReportVersion": 2, "metadata": {}}, 0, 1),
+            "empty vulnerabilities without metadata": ({"auditReportVersion": 2, "vulnerabilities": {}}, 0, 1),
+            "old report version": (dict(audit_report(), auditReportVersion=1), 0, 1),
+            "npm crashed": (audit_report(), 2, 1),
+            "exit 1 without findings": (audit_report(), 1, 1),
+            "exit 0 with a high finding": (audit_report(**{"runtime-lib": advisory("runtime-lib", "high")}), 0, 1),
+            "not json": ("npm ERR! network", 1, 1),
+            "not an object": ([], 0, 1),
+        }
+        for name, (body, rc, expected) in cases.items():
+            with self.subTest(case=name):
+                returned = run_audit_policy(gate, body, rc, AUDIT_LOCK)
+                self.assertEqual(returned != 0, expected == 1, returned)
+
+    def test_braces_exception_is_exact_dated_and_dev_only(self) -> None:
+        gate = audit_run(SOURCES)
+        self.assertRegex(gate, r'(?m)^ALLOWED = \{\("braces", "stack-exhaustion denial of service", "2026-12-31"\)\}$')
+        expired = gate.replace('"2026-12-31")}', '"2000-01-01")}', 1)
+        without = re.sub(r"(?m)^ALLOWED = .*$", "ALLOWED = set()", gate, count=1)
+        self.assertNotEqual(expired, gate)
+        self.assertNotEqual(without, gate)
+        cases = {
+            "braces dev-only": (gate, braces_report(), braces_lock(True), 0),
+            "braces critical dev-only": (gate, braces_report(severity="critical"), braces_lock(True), 0),
+            "braces reaching production": (gate, braces_report(), braces_lock(False), 1),
+            "braces other advisory": (gate, braces_report(title="braces prototype pollution"), braces_lock(True), 1),
+            "braces after review date": (expired, braces_report(), braces_lock(True), 1),
+            "no exception": (without, braces_report(), braces_lock(True), 1),
+        }
+        for name, (run, body, lock, expected) in cases.items():
+            with self.subTest(case=name):
+                returned = run_audit_policy(run, body, 1, lock)
+                self.assertEqual(returned != 0, expected == 1, returned)
+
+
+if __name__ == "__main__":
+    unittest.main()
