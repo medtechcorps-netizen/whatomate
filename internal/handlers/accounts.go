@@ -35,6 +35,7 @@ var (
 	errEmbeddedSignupConfigurationChanged         = errors.New("embedded signup configuration changed")
 	errEmbeddedSignupClaimInProgress              = errors.New("embedded signup claim is already in progress")
 	errEmbeddedSignupAppSubscriptionNotProven     = errors.New("embedded signup app subscription is not proven")
+	errEmbeddedSignupAccountInspection            = errors.New("embedded signup could not inspect the existing account")
 	errRegistrationRecoveryStatus                 = errors.New("account is not pending registration")
 	errRegistrationRecoveryCredentials            = errors.New("registration recovery credentials are unavailable")
 	errRegistrationRecoverySuperseded             = errors.New("registration recovery was superseded")
@@ -1635,8 +1636,10 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 	}
 
 	discoveryCtx, discoveryCancel := context.WithTimeout(providerCtx, 60*time.Second)
-	phoneID, wabaID, name, tokenExpiresAt, phoneInfo, err := a.discoverWABAAndPhone(
+	phoneID, wabaID, name, tokenExpiresAt, phoneInfo, accountVersion, err := a.discoverWABAAndPhone(
 		discoveryCtx,
+		orgID,
+		signupMode,
 		accessToken,
 		req.PhoneID,
 		req.WABAID,
@@ -1644,8 +1647,18 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		metaSnapshot,
 	)
 	discoveryCancel()
+	if errors.Is(err, errEmbeddedSignupAccountInspection) {
+		a.Log.Error("Failed to inspect existing WhatsApp account API version", "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to inspect the existing WhatsApp account", nil, "")
+	}
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+	}
+	if accountVersion.accountID != uuid.Nil {
+		a.Log.Info("Coexistence Embedded Signup keeps the existing account API version",
+			"account_id", accountVersion.accountID,
+			"api_version", accountVersion.apiVersion,
+			"configured_api_version", metaSnapshot.apiVersion)
 	}
 	discoveredCoexistence := embeddedSignupPhoneIsSMB(phoneInfo)
 	if (signupMode == embeddedSignupModeCoexistence) != discoveredCoexistence {
@@ -1665,7 +1678,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		orgID,
 		phoneID,
 		wabaID,
-		metaSnapshot.apiVersion,
+		accountVersion.apiVersion,
 		metaSnapshot,
 	)
 	if err != nil {
@@ -1680,7 +1693,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 			wabaID,
 			metaSnapshot.appID,
 			accessToken,
-			metaSnapshot.apiVersion,
+			accountVersion.apiVersion,
 		)
 		subscriptionReadCancel()
 		if err != nil {
@@ -1715,7 +1728,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		name,
 		accessToken,
 		tokenExpiresAt,
-		metaSnapshot.apiVersion,
+		accountVersion,
 		phoneInfo,
 		registrationPIN,
 		metaSnapshot,
@@ -1812,7 +1825,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		runtimeAccount := &whatsapp.Account{
 			PhoneID:     phoneID,
 			BusinessID:  wabaID,
-			APIVersion:  metaSnapshot.apiVersion,
+			APIVersion:  accountVersion.apiVersion,
 			AccessToken: accessToken,
 		}
 		subscriptionCtx, subscriptionCancel := context.WithTimeout(providerCtx, 30*time.Second)
@@ -1850,7 +1863,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 			&whatsapp.Account{
 				PhoneID:     phoneID,
 				BusinessID:  wabaID,
-				APIVersion:  metaSnapshot.apiVersion,
+				APIVersion:  accountVersion.apiVersion,
 				AccessToken: accessToken,
 			},
 		)
@@ -2104,7 +2117,7 @@ func (a *App) claimEmbeddedSignupAccount(
 	orgID, userID uuid.UUID,
 	phoneID, wabaID, name, accessToken string,
 	tokenExpiresAt *time.Time,
-	apiVersion string,
+	accountVersion embeddedSignupAccountVersion,
 	phoneInfo *whatsapp.PhoneNumberInfo,
 	registrationPIN string,
 	metaSnapshot embeddedSignupMetaSnapshot,
@@ -2112,6 +2125,7 @@ func (a *App) claimEmbeddedSignupAccount(
 	coexistenceOnboardedAt time.Time,
 	businessPhoneNumber string,
 ) (*embeddedSignupClaim, error) {
+	apiVersion := accountVersion.apiVersion
 	phoneID = strings.TrimSpace(phoneID)
 	wabaID = strings.TrimSpace(wabaID)
 	name = strings.TrimSpace(name)
@@ -2145,6 +2159,24 @@ func (a *App) claimEmbeddedSignupAccount(
 			Where("organization_id = ? AND BTRIM(phone_id) = BTRIM(?)", orgID, phoneID).
 			Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, updated_at DESC, created_at DESC, id DESC").
 			First(&account).Error
+		if accountVersion.accountID != uuid.Nil {
+			if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+				return lookupErr
+			}
+			// A preserved API version belongs only to the exact live account row
+			// inspected before Graph validation. A concurrent edit, lifecycle
+			// change, or replacement row must abort rather than turn this
+			// conversion into a new account or a provider registration.
+			if lookupErr != nil ||
+				account.ID != accountVersion.accountID ||
+				account.DeletedAt.Valid ||
+				strings.TrimSpace(account.Status) != "active" ||
+				account.IsSMB != accountVersion.isSMB ||
+				strings.TrimSpace(account.APIVersion) != accountVersion.apiVersion ||
+				!account.UpdatedAt.Equal(accountVersion.updatedAt) {
+				return errEmbeddedSignupClaimSuperseded
+			}
+		}
 		initializeOperationalFields := false
 		switch {
 		case lookupErr == nil:
@@ -2455,11 +2487,80 @@ func (a *App) persistEmbeddedSignupStatus(
 	return &account, nil
 }
 
+// embeddedSignupAccountVersion is the Graph API version used for one Embedded
+// Signup's account-scoped provider calls. accountID is set only when a live
+// account's stored version, which differs from the configured one, was kept;
+// the locked claim then requires that exact row to be unchanged.
+type embeddedSignupAccountVersion struct {
+	apiVersion string
+	accountID  uuid.UUID
+	updatedAt  time.Time
+	isSMB      bool
+}
+
+// embeddedSignupAccountAPIVersion keeps the verified provider contract of a
+// live account that enters or refreshes Coexistence after the server's
+// configured API version has changed. It neither migrates versions nor relaxes
+// ownership: the fresh token must still prove this exact phone, WABA and app,
+// and the locked claim rechecks the account row and the server configuration.
+// New accounts, classic signups and any other row use the configured version.
+func (a *App) embeddedSignupAccountAPIVersion(
+	orgID uuid.UUID,
+	signupMode, phoneID, wabaID string,
+	metaSnapshot embeddedSignupMetaSnapshot,
+) (embeddedSignupAccountVersion, error) {
+	version := embeddedSignupAccountVersion{apiVersion: metaSnapshot.apiVersion}
+	if signupMode != embeddedSignupModeCoexistence {
+		return version, nil
+	}
+	err := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		var account models.WhatsAppAccount
+		if err := scoped.DB.Where(
+			"organization_id = ? AND BTRIM(phone_id) = BTRIM(?) AND deleted_at IS NULL AND status = ?",
+			orgID,
+			strings.TrimSpace(phoneID),
+			"active",
+		).First(&account).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		storedVersion := strings.TrimSpace(account.APIVersion)
+		if storedVersion == "" || storedVersion == metaSnapshot.apiVersion {
+			return nil
+		}
+		matches, err := scoped.embeddedSignupActiveReconnectContractMatches(
+			&account,
+			phoneID,
+			wabaID,
+			storedVersion,
+			metaSnapshot,
+		)
+		if err != nil || !matches {
+			return err
+		}
+		version = embeddedSignupAccountVersion{
+			apiVersion: storedVersion,
+			accountID:  account.ID,
+			updatedAt:  account.UpdatedAt,
+			isSMB:      account.IsSMB,
+		}
+		return nil
+	})
+	if err != nil {
+		return embeddedSignupAccountVersion{}, err
+	}
+	return version, nil
+}
+
 func (a *App) discoverWABAAndPhone(
 	ctx context.Context,
+	orgID uuid.UUID,
+	signupMode string,
 	accessToken, phoneID, wabaID, name string,
 	metaSnapshot embeddedSignupMetaSnapshot,
-) (string, string, string, *time.Time, *whatsapp.PhoneNumberInfo, error) {
+) (string, string, string, *time.Time, *whatsapp.PhoneNumberInfo, embeddedSignupAccountVersion, error) {
 	a.Log.Info("Validating embedded signup token via debug_token")
 
 	debugInfo, tokenExpiresAt, err := a.debugAndValidateMetaAccessTokenWithCredentials(
@@ -2469,7 +2570,7 @@ func (a *App) discoverWABAAndPhone(
 		metaSnapshot.appSecret,
 	)
 	if err != nil {
-		return "", "", "", nil, nil, err
+		return "", "", "", nil, nil, embeddedSignupAccountVersion{}, err
 	}
 	discoveredWABAIDs := make(map[string]struct{})
 	messagingTargetIDs := make(map[string]struct{})
@@ -2499,22 +2600,22 @@ func (a *App) discoverWABAAndPhone(
 		// not a safe discovery fallback.
 		switch len(discoveredWABAIDs) {
 		case 0:
-			return "", "", "", nil, nil, fmt.Errorf("embedded signup did not provide a WhatsApp Business Account ID; reconnect and complete the WhatsApp account selection")
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("embedded signup did not provide a WhatsApp Business Account ID; reconnect and complete the WhatsApp account selection")
 		case 1:
 			for discoveredWABAID := range discoveredWABAIDs {
 				wabaID = discoveredWABAID
 			}
 		default:
-			return "", "", "", nil, nil, fmt.Errorf("embedded signup token grants access to multiple WhatsApp Business Accounts; reconnect and select exactly one account")
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("embedded signup token grants access to multiple WhatsApp Business Accounts; reconnect and select exactly one account")
 		}
 
 		a.Log.Info("Discovered WABA ID", "waba_id", wabaID)
 	} else if _, granted := discoveredWABAIDs[wabaID]; !granted {
-		return "", "", "", nil, nil, errors.New("the selected WhatsApp Business Account is not granted by the embedded signup token")
+		return "", "", "", nil, nil, embeddedSignupAccountVersion{}, errors.New("the selected WhatsApp Business Account is not granted by the embedded signup token")
 	}
 	if len(messagingTargetIDs) > 0 {
 		if _, granted := messagingTargetIDs[wabaID]; !granted {
-			return "", "", "", nil, nil, errors.New("the selected WhatsApp Business Account is not granted for messaging by the embedded signup token")
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, errors.New("the selected WhatsApp Business Account is not granted for messaging by the embedded signup token")
 		}
 	}
 
@@ -2523,23 +2624,28 @@ func (a *App) discoverWABAAndPhone(
 		phonesResp, err := a.WhatsApp.GetWABAPhoneNumbers(ctx, wabaID, accessToken, metaSnapshot.apiVersion)
 		if err != nil {
 			a.Log.Error("Failed to fetch phone numbers from Meta", "error", err)
-			return "", "", "", nil, nil, fmt.Errorf("failed to fetch phone numbers from WABA: %w", err)
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("failed to fetch phone numbers from WABA: %w", err)
 		}
 
 		if len(phonesResp.Data) == 0 {
-			return "", "", "", nil, nil, fmt.Errorf("no phone numbers found in this WhatsApp Business Account")
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("no phone numbers found in this WhatsApp Business Account")
 		}
 
 		if len(phonesResp.Data) > 1 {
-			return "", "", "", nil, nil, fmt.Errorf("multiple phone numbers found in this WhatsApp Business Account; reconnect and select exactly one phone number")
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("multiple phone numbers found in this WhatsApp Business Account; reconnect and select exactly one phone number")
 		}
 
 		phone := phonesResp.Data[0]
 		phoneID = strings.TrimSpace(phone.ID)
 		if phoneID == "" {
-			return "", "", "", nil, nil, fmt.Errorf("meta returned a phone number without an ID")
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("meta returned a phone number without an ID")
 		}
 		a.Log.Info("Discovered Phone ID", "phone_id", phoneID)
+	}
+
+	accountVersion, err := a.embeddedSignupAccountAPIVersion(orgID, signupMode, phoneID, wabaID, metaSnapshot)
+	if err != nil {
+		return "", "", "", nil, nil, embeddedSignupAccountVersion{}, errEmbeddedSignupAccountInspection
 	}
 
 	// Even when the browser supplied both IDs, verify the token can read each
@@ -2551,10 +2657,10 @@ func (a *App) discoverWABAAndPhone(
 		phoneID,
 		wabaID,
 		accessToken,
-		metaSnapshot.apiVersion,
+		accountVersion.apiVersion,
 	)
 	if err != nil {
-		return "", "", "", nil, nil, err
+		return "", "", "", nil, nil, embeddedSignupAccountVersion{}, err
 	}
 
 	phoneInfo := &whatsapp.PhoneNumberInfo{
@@ -2564,7 +2670,7 @@ func (a *App) discoverWABAAndPhone(
 		IsOnBizApp:         validation.IsOnBizApp,
 		PlatformType:       validation.PlatformType,
 	}
-	return phoneID, wabaID, name, tokenExpiresAt, phoneInfo, nil
+	return phoneID, wabaID, name, tokenExpiresAt, phoneInfo, accountVersion, nil
 }
 
 func (a *App) debugAndValidateMetaAccessToken(
