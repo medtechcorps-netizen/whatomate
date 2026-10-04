@@ -39,6 +39,7 @@ func (s *Server) oauthAccessToken(c *call) {
 		graphError(c, http.StatusBadRequest, 1, 0, "OAuthException", "Error validating client secret.", false)
 		return
 	}
+	c.trusted = true
 	switch grant := params.Get("grant_type"); {
 	case grant == "client_credentials":
 		writeJSON(c.w, http.StatusOK, map[string]string{"access_token": s.appToken, "token_type": "bearer"})
@@ -69,6 +70,7 @@ func (s *Server) debugToken(c *call) {
 		graphError(c, http.StatusUnauthorized, 190, 0, "OAuthException", "Invalid OAuth access token - Cannot parse access token", false)
 		return
 	}
+	c.trusted = true
 	input := c.r.URL.Query().Get("input_token")
 	if input == "" {
 		invalidParameter(c, "The parameter input_token is required")

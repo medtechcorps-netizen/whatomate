@@ -2,9 +2,13 @@ package graphstub
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -57,6 +61,22 @@ func TestControlRequiresAValidMAC(t *testing.T) {
 		request.Header.Del(header)
 		cases["missing "+header] = request
 	}
+	// The MAC covers the query too. These read the journal, which honours
+	// limit, so a changed query would change what the caller gets.
+	queryChanged, _ := http.NewRequest(http.MethodGet, h.url+"/_control/journal?limit=3", nil)
+	SignControlRequest(queryChanged, testControlKey, nil, time.Now())
+	queryChanged.URL.RawQuery = "limit=2"
+	cases["query changed after signing"] = queryChanged
+	queryAdded, _ := http.NewRequest(http.MethodGet, h.url+"/_control/journal", nil)
+	SignControlRequest(queryAdded, testControlKey, nil, time.Now())
+	queryAdded.URL.RawQuery = "limit=2"
+	cases["query added after signing"] = queryAdded
+	pathOnly, _ := http.NewRequest(http.MethodGet, h.url+"/_control/journal?limit=2", nil)
+	pathStamp, pathNonce := strconv.FormatInt(time.Now().Unix(), 10), randomToken(18)
+	pathOnly.Header.Set(HeaderTimestamp, pathStamp)
+	pathOnly.Header.Set(HeaderNonce, pathNonce)
+	pathOnly.Header.Set(HeaderMAC, ControlMAC(testControlKey, http.MethodGet, "/_control/journal", pathStamp, pathNonce, nil))
+	cases["query left out of the MAC"] = pathOnly
 	uppercase := signed(noop)
 	uppercase.Header.Set(HeaderMAC, strings.ToUpper(uppercase.Header.Get(HeaderMAC)))
 	for name, request := range cases {
@@ -76,15 +96,38 @@ func TestControlRequiresAValidMAC(t *testing.T) {
 	if status, decoded := h.do(uppercase); status != http.StatusOK {
 		t.Fatalf("a valid request (upper-case hex MAC) was refused: %d %v", status, decoded)
 	}
-	reasons := map[string]bool{}
+
+	// The wire format, computed without ControlMAC or SignControlRequest:
+	// hex HMAC-SHA256 over method|path?query|timestamp|nonce|hex(sha256(body)).
+	stamp, nonce := strconv.FormatInt(time.Now().Unix(), 10), randomToken(18)
+	emptySum := sha256.Sum256(nil)
+	mac := hmac.New(sha256.New, []byte(testControlKey))
+	mac.Write([]byte("GET|/_control/journal?limit=3|" + stamp + "|" + nonce + "|" + hex.EncodeToString(emptySum[:])))
+	pinned, _ := http.NewRequest(http.MethodGet, h.url+"/_control/journal?limit=3", nil)
+	pinned.Header.Set(HeaderTimestamp, stamp)
+	pinned.Header.Set(HeaderNonce, nonce)
+	pinned.Header.Set(HeaderMAC, hex.EncodeToString(mac.Sum(nil)))
+	if status, decoded := h.do(pinned); status != http.StatusOK {
+		t.Fatalf("a request signed over path?query by hand was refused: %d %v", status, decoded)
+	} else if entries, _ := decoded["entries"].([]any); len(entries) > 3 {
+		t.Fatalf("limit=3 returned %d entries", len(entries))
+	}
+
+	// Failures land in the rejected ring, never in the journal.
 	for _, entry := range h.journal() {
+		if entry.Error != "" {
+			t.Errorf("a failed authentication reached the journal: %+v", entry)
+		}
+	}
+	reasons := map[string]bool{}
+	for _, entry := range h.rejected() {
 		if entry.Kind == KindControl {
 			reasons[entry.Error] = true
 		}
 	}
 	for _, reason := range []string{"missing_header", "malformed_header", "stale_timestamp", "bad_mac"} {
 		if !reasons[reason] {
-			t.Errorf("no control journal entry with error %q", reason)
+			t.Errorf("no rejected control entry with error %q", reason)
 		}
 	}
 }
@@ -101,8 +144,46 @@ func TestControlRefusesAReplayedNonce(t *testing.T) {
 	if status, body := h.do(replay); status != http.StatusUnauthorized {
 		t.Fatalf("replay: %d %v", status, body)
 	}
-	if entries := h.journal(); entries[len(entries)-1].Error != "replayed_nonce" {
-		t.Fatalf("last journal entry %+v", entries[len(entries)-1])
+	if entries := h.rejected(); len(entries) != 1 || entries[0].Error != "replayed_nonce" {
+		t.Fatalf("rejected entries %+v", entries)
+	}
+}
+
+// TestControlSpendsTheNonceOnlyAfterTheMAC: a caller without the key can
+// neither burn a nonce a real client is about to use nor grow the replay
+// cache, however many requests it sends.
+func TestControlSpendsTheNonceOnlyAfterTheMAC(t *testing.T) {
+	h := newHarness(t, nil)
+	send := func(key, nonce string) int {
+		request, _ := http.NewRequest(http.MethodGet, h.url+"/_control/journal", nil)
+		stamp := strconv.FormatInt(time.Now().Unix(), 10)
+		request.Header.Set(HeaderTimestamp, stamp)
+		request.Header.Set(HeaderNonce, nonce)
+		request.Header.Set(HeaderMAC, ControlMAC(key, http.MethodGet, "/_control/journal", stamp, nonce, nil))
+		status, _ := h.do(request)
+		return status
+	}
+	const wrongKey = "not-the-control-key-but-long-enough-0"
+	for index := 0; index < 20; index++ {
+		if status := send(wrongKey, randomToken(18)); status != http.StatusUnauthorized {
+			t.Fatalf("a bad MAC was answered %d", status)
+		}
+	}
+	nonce := randomToken(18)
+	if status := send(wrongKey, nonce); status != http.StatusUnauthorized {
+		t.Fatalf("a bad MAC was answered %d", status)
+	}
+	h.stub.nonces.mu.Lock()
+	spent := len(h.stub.nonces.seen)
+	h.stub.nonces.mu.Unlock()
+	if spent != 0 {
+		t.Fatalf("requests with a bad MAC put %d nonces in the replay cache", spent)
+	}
+	if status := send(testControlKey, nonce); status != http.StatusOK {
+		t.Fatalf("a bad-MAC request burnt the nonce: the signed request got %d", status)
+	}
+	if status := send(testControlKey, nonce); status != http.StatusUnauthorized {
+		t.Fatalf("the nonce was accepted twice: %d", status)
 	}
 }
 
@@ -147,6 +228,21 @@ func TestControlBodyLimit(t *testing.T) {
 	SignControlRequest(request, testControlKey, body, time.Now())
 	if status, _ := h.do(request); status != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status %d, want 413", status)
+	}
+
+	// The control media cap is reachable inside the body limit: exactly
+	// maxControlMediaBytes is stored, and one byte more is refused as media
+	// that is too large rather than as a body that is.
+	media := func(size int) (int, map[string]any) {
+		return h.control(http.MethodPost, "/_control/media", map[string]any{
+			"phone_number_id": testPhone, "mime_type": "video/mp4", "data_base64": base64.StdEncoding.EncodeToString(make([]byte, size)),
+		})
+	}
+	if status, body := media(maxControlMediaBytes); status != http.StatusOK || body["file_size"] != float64(maxControlMediaBytes) {
+		t.Fatalf("media at the cap: %d %v", status, body)
+	}
+	if status, body := media(maxControlMediaBytes + 1); status != http.StatusBadRequest || body["error"] != "media is too large" {
+		t.Fatalf("media over the cap: %d %v", status, body)
 	}
 }
 
@@ -366,6 +462,91 @@ func TestScheduledStatusesFollowTheWebhookOverride(t *testing.T) {
 	if webhook := h.product.next(t); webhook.Path != WebhookPath {
 		t.Fatalf("delivered to %q", webhook.Path)
 	}
+}
+
+// TestScheduledStatusesRetryLikeMeta: a status the product does not accept
+// with 2xx is delivered again, byte for byte, until it is accepted or
+// statusAttempts deliveries have been made, and only then does the sequence
+// move on.
+func TestScheduledStatusesRetryLikeMeta(t *testing.T) {
+	h := newHarness(t, func(config *Config) { config.StatusSequence = []string{"sent", "delivered"} })
+	h.product.failNext.Store(2)
+	_, sent := h.sendText(testToken, testPhone, "retry me")
+	wamid := dig(sent, "messages", 0, "id")
+	var first []byte
+	for attempt := 1; attempt <= 3; attempt++ {
+		webhook := h.product.next(t)
+		status := dig(webhook.decode(t), "entry", 0, "changes", 0, "value", "statuses", 0)
+		if dig(status, "id") != wamid || dig(status, "status") != "sent" {
+			t.Fatalf("delivery %d: %v", attempt, status)
+		}
+		if attempt == 1 {
+			first = webhook.Body
+		} else if !bytes.Equal(webhook.Body, first) || webhook.Signature != SignWebhook(testAppSecret, first) {
+			t.Fatalf("retry %d changed the payload or its signature", attempt)
+		}
+	}
+	if status := dig(h.product.next(t).decode(t), "entry", 0, "changes", 0, "value", "statuses", 0, "status"); status != "delivered" {
+		t.Fatalf("after the retries: %v", status)
+	}
+	h.product.none(t, 50*time.Millisecond)
+	var attempts, codes []int
+	for _, entry := range h.journal() {
+		if entry.Kind == KindWebhook {
+			attempts, codes = append(attempts, entry.Attempt), append(codes, entry.Status)
+		}
+	}
+	if fmt.Sprint(attempts) != "[1 2 3 1]" || fmt.Sprint(codes) != "[503 503 200 200]" {
+		t.Fatalf("journaled attempts %v with statuses %v", attempts, codes)
+	}
+
+	// A product that never accepts gets statusAttempts deliveries of each
+	// status, and then nothing more.
+	h.product.status.Store(http.StatusServiceUnavailable)
+	h.sendText(testToken, testPhone, "never accepted")
+	for index := 0; index < 2*statusAttempts; index++ {
+		want := "sent"
+		if index >= statusAttempts {
+			want = "delivered"
+		}
+		if status := dig(h.product.next(t).decode(t), "entry", 0, "changes", 0, "value", "statuses", 0, "status"); status != want {
+			t.Fatalf("delivery %d: %v, want %s", index+1, status, want)
+		}
+	}
+	h.product.none(t, 200*time.Millisecond)
+}
+
+// TestStatusRetriesStopOnResetAndClose: a retry waiting for its turn is
+// dropped by a reset (a new generation) and by Close, which does not wait
+// out the backoff.
+func TestStatusRetriesStopOnResetAndClose(t *testing.T) {
+	refusing := func(config *Config) {
+		config.StatusSequence = []string{"sent"}
+		config.StatusInterval = 200 * time.Millisecond
+	}
+	h := newHarness(t, refusing)
+	h.product.status.Store(http.StatusServiceUnavailable)
+	h.sendText(testToken, testPhone, "reset me")
+	h.product.next(t)
+	h.mustControl(http.MethodPost, "/_control/reset", nil)
+	// The three retries would come 200, 600 and 1400 ms after the first.
+	h.product.none(t, 1600*time.Millisecond)
+
+	closing := newHarness(t, refusing)
+	closing.product.status.Store(http.StatusServiceUnavailable)
+	closing.sendText(testToken, testPhone, "close me")
+	closing.product.next(t)
+	done := make(chan struct{})
+	go func() {
+		closing.stub.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close waited out the status retry backoff")
+	}
+	closing.product.none(t, 300*time.Millisecond)
 }
 
 func TestControlTemplateReview(t *testing.T) {

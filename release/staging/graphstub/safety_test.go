@@ -152,9 +152,16 @@ func TestHostRefusals(t *testing.T) {
 			}
 		}
 	}
-	for _, entry := range h.journal() {
+	if entries := h.journal(); len(entries) != 0 {
+		t.Fatalf("refused hosts reached the journal: %+v", entries)
+	}
+	refused := h.rejected()
+	if len(refused) != 9 {
+		t.Fatalf("%d rejected entries, want 9", len(refused))
+	}
+	for _, entry := range refused {
 		if entry.Kind != KindRefused || entry.Route != "host" {
-			t.Fatalf("journal entry %+v", entry)
+			t.Fatalf("rejected entry %+v", entry)
 		}
 	}
 	if status, _ := h.graph(http.MethodGet, v+"/"+testPhone, testToken, nil); status != http.StatusOK {
@@ -226,7 +233,7 @@ func TestJournalAndLogsCarryNoBodiesOrSecrets(t *testing.T) {
 	request, _ := http.NewRequest("PROPFIND-"+strings.ToUpper(marker), h.url+v+"/"+testPhone, nil)
 	h.do(request)
 
-	journal, _ := json.Marshal(h.journal())
+	journal, _ := json.Marshal(append(h.journal(), h.rejected()...))
 	logs := h.logs.String()
 	if !strings.Contains(logs, `"method":"OTHER"`) {
 		t.Fatalf("an unknown method was not logged as OTHER: %s", logs)
@@ -255,8 +262,58 @@ func TestJournalAndLogsCarryNoBodiesOrSecrets(t *testing.T) {
 	}
 }
 
+// TestUnauthenticatedRequestsStayOutOfTheJournal: on staging /_stub is
+// public, so anyone can send requests that fail authentication. They go to
+// the small rejected ring, and the journal a test run reads does not move.
+func TestUnauthenticatedRequestsStayOutOfTheJournal(t *testing.T) {
+	h := newHarness(t, nil)
+	h.graph(http.MethodGet, v+"/"+testPhone, testToken, nil)
+	_, before := h.stub.journal.since(0, 1)
+	flood := []func(){
+		func() {
+			// A current timestamp and a fresh nonce, but not the key.
+			request, _ := http.NewRequest(http.MethodGet, h.url+"/_control/journal", nil)
+			SignControlRequest(request, "not-the-control-key-but-long-enough-0", nil, time.Now())
+			h.do(request)
+		},
+		func() { h.graph(http.MethodGet, v+"/"+testPhone, "wrong-token-value-0000", nil) },
+		func() { h.graph(http.MethodGet, v+"/"+testPhone, "", nil) },
+		func() { h.graph(http.MethodGet, "/", "", nil) },
+		func() { h.graph(http.MethodPost, "/oauth/access_token?client_id=1&client_secret=wrong", "", nil) },
+		func() { h.graph(http.MethodGet, "/debug_token?input_token=x", "wrong-app-token", nil) },
+		func() {
+			request, _ := http.NewRequest(http.MethodGet, h.url+"/_control/journal", nil)
+			request.Host = "graph.facebook.com"
+			h.do(request)
+		},
+	}
+	rounds := RejectedCapacity/len(flood) + 2
+	for round := 0; round < rounds; round++ {
+		for _, request := range flood {
+			request()
+		}
+	}
+	if _, after := h.stub.journal.since(0, 1); after != before {
+		t.Fatalf("unauthenticated requests moved the journal from %d to %d", before, after)
+	}
+	if rejected := h.rejected(); len(rejected) != RejectedCapacity {
+		t.Fatalf("the rejected ring holds %d entries, want %d", len(rejected), RejectedCapacity)
+	}
+	page := h.mustControl(http.MethodGet, "/_control/rejected?limit=5", nil)
+	if entries, _ := page["entries"].([]any); len(entries) != 5 || page["latest"] != float64(rounds*len(flood)) {
+		t.Fatalf("rejected page %v", page)
+	}
+	if entries := h.journal(); len(entries) != 2 || entries[0].Route != routePhone || entries[1].Route != "rejected" {
+		t.Fatalf("journal %+v", entries)
+	}
+	h.mustControl(http.MethodPost, "/_control/reset", nil)
+	if rejected := h.rejected(); len(rejected) != 0 {
+		t.Fatalf("reset kept %d rejected entries", len(rejected))
+	}
+}
+
 func TestJournalIsATenThousandEntryRing(t *testing.T) {
-	journal := newJournal()
+	journal := newJournal(JournalCapacity)
 	for index := 0; index < JournalCapacity+25; index++ {
 		journal.add(Entry{Kind: KindGraph, Route: "phone", To: strings.Repeat("x", 500)})
 	}

@@ -2,8 +2,10 @@ package graphstub
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -228,16 +230,26 @@ func TestGraphEndpoints(t *testing.T) {
 		}
 	}
 
-	journal := h.journal()
 	routes := map[string]bool{}
-	for _, entry := range journal {
+	for _, entry := range h.journal() {
 		routes[entry.Route] = true
 	}
 	for _, route := range []string{routePhone, routeWABA, routePhoneNumbers, routeMessages, routeMediaUpload, routeMedia,
-		routeMediaDownload, routeTemplates, routeSubscribedApps, routeRegister, routeBusinessProfile, "unsupported", "auth"} {
+		routeMediaDownload, routeTemplates, routeSubscribedApps, routeRegister, routeBusinessProfile, "unsupported"} {
 		if !routes[route] {
 			t.Errorf("the journal has no %q entry", route)
 		}
+	}
+	// Calls without a valid token are kept out of the journal.
+	if routes["auth"] {
+		t.Error("a call without a valid token reached the journal")
+	}
+	rejected := false
+	for _, entry := range h.rejected() {
+		rejected = rejected || entry.Route == "auth"
+	}
+	if !rejected {
+		t.Error("the rejected ring has no \"auth\" entry")
 	}
 }
 
@@ -309,6 +321,47 @@ func TestMediaRoundTrip(t *testing.T) {
 	request.Header.Set("Content-Type", "text/plain")
 	if status, body := h.do(request); status != http.StatusBadRequest {
 		t.Fatalf("non-multipart upload: %d %v", status, body)
+	}
+}
+
+// TestURLsUseTheCallersOrigin: the download URL and paging.next carry the
+// scheme and host the caller used, so pkg/whatsapp's same-origin check passes
+// behind an https base too.
+func TestURLsUseTheCallersOrigin(t *testing.T) {
+	h := newHarness(t, nil)
+	_, uploaded := h.uploadMedia(testPhone, "image/png", []byte("png"))
+	mediaID, _ := uploaded["id"].(string)
+	read := func(server *httptest.Server, path, forwarded string) map[string]any {
+		request, _ := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		request.Header.Set("Authorization", "Bearer "+testToken)
+		if forwarded != "" {
+			request.Header.Set("X-Forwarded-Proto", forwarded)
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = response.Body.Close() }()
+		var decoded map[string]any
+		if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("%s: %d %v", path, response.StatusCode, err)
+		}
+		return decoded
+	}
+	host := strings.TrimPrefix(h.url, "http://")
+	for forwarded, scheme := range map[string]string{"": "http", "https": "https", "HTTPS, http": "https", "http": "http", "wss": "http"} {
+		if got := read(h.server, v+"/"+mediaID, forwarded)["url"]; got != scheme+"://"+host+"/_media/"+mediaID {
+			t.Errorf("X-Forwarded-Proto %q: url %v", forwarded, got)
+		}
+		next, _ := dig(read(h.server, v+"/"+testWABA+"/phone_numbers?limit=1", forwarded), "paging", "next").(string)
+		if !strings.HasPrefix(next, scheme+"://"+host+v+"/"+testWABA+"/phone_numbers?") {
+			t.Errorf("X-Forwarded-Proto %q: paging.next %q", forwarded, next)
+		}
+	}
+	secure := httptest.NewTLSServer(h.stub)
+	defer secure.Close()
+	if got := read(secure, v+"/"+mediaID, "")["url"]; got != secure.URL+"/_media/"+mediaID {
+		t.Fatalf("over TLS: url %v", got)
 	}
 }
 
@@ -399,13 +452,17 @@ func TestRequestedFields(t *testing.T) {
 
 func TestGraphSegments(t *testing.T) {
 	for path, want := range map[string]string{
-		"/v21.0/123/messages": "123/messages",
-		"/123/messages":       "123/messages",
-		"/v1.2":               "",
-		"/v21/123":            "v21/123",
-		"//123":               "",
-		"/123//messages":      "",
-		"/":                   "",
+		"/v21.0/123/messages":  "123/messages",
+		"/123/messages":        "123/messages",
+		"/v1.2":                "",
+		"/v21/123":             "v21/123",
+		"//123":                "123",
+		"//v21.0/123/messages": "123/messages",
+		"///debug_token":       "debug_token",
+		"/123//messages":       "",
+		"/123/messages/":       "",
+		"//":                   "",
+		"/":                    "",
 	} {
 		if got := strings.Join(graphSegments(path), "/"); got != want {
 			t.Errorf("graphSegments(%q) = %q, want %q", path, got, want)

@@ -34,9 +34,17 @@ const (
 	HeaderMAC       = "X-Stub-Mac"
 	ControlSkew     = 60 * time.Second
 
-	controlPrefix  = "/_control"
-	maxControlBody = 8 << 20
-	maxNonces      = 65_536
+	controlPrefix = "/_control"
+	maxNonces     = 65_536
+
+	// maxControlMediaBytes caps the media /_control/media stores for a
+	// synthetic inbound message, and maxControlBody fits exactly that much as
+	// base64 in the JSON body plus room for the other fields. A caller without
+	// the key but with a current timestamp can make the stub buffer up to
+	// maxControlBody before its MAC fails, so both stay small; outbound media
+	// the product uploads through the Graph API keeps maxMediaBytes.
+	maxControlMediaBytes = 2 << 20
+	maxControlBody       = (maxControlMediaBytes+2)/3*4 + 4<<10
 )
 
 var (
@@ -105,8 +113,13 @@ func controlUnauthorized(c *call, reason string) {
 }
 
 // authenticateControl checks the headers and the clock before it reads the
-// body, then the MAC, and only then spends the nonce, so unauthenticated
-// callers can neither make the stub buffer a body nor fill the replay cache.
+// body, then the MAC, and only then spends the nonce. The clock check keeps
+// stale callers from making the stub buffer a body; a caller with a current
+// timestamp but no key can still make it buffer up to maxControlBody, which is
+// why that limit is small. Spending the nonce only after the MAC verifies
+// keeps callers without the key from burning nonces or filling the replay
+// cache. Only a request that passes every check is trusted, so failures land
+// in the rejected ring, never in the journal.
 func (s *Server) authenticateControl(c *call) ([]byte, bool) {
 	timestamp := c.r.Header.Get(HeaderTimestamp)
 	nonce := c.r.Header.Get(HeaderNonce)
@@ -144,6 +157,7 @@ func (s *Server) authenticateControl(c *call) ([]byte, bool) {
 		controlUnauthorized(c, "replayed_nonce")
 		return nil, false
 	}
+	c.trusted = true
 	return body, true
 }
 
@@ -156,6 +170,7 @@ func (s *Server) serveControl(c *call) {
 	c.entry.Route = name
 	routes := map[string]map[string]func(*call, []byte){
 		"journal":     {http.MethodGet: s.controlJournal},
+		"rejected":    {http.MethodGet: s.controlRejected},
 		"accounts":    {http.MethodGet: s.controlListAccounts, http.MethodPost: s.controlAddAccount},
 		"inbound":     {http.MethodPost: s.controlInbound},
 		"status":      {http.MethodPost: s.controlStatus},
@@ -192,6 +207,17 @@ func decodeControl(c *call, body []byte, target any) bool {
 }
 
 func (s *Server) controlJournal(c *call, _ []byte) {
+	s.pageJournal(c, s.journal)
+}
+
+// controlRejected pages the ring of requests that never authenticated, so a
+// test can still see what was refused without those requests crowding out
+// the journal.
+func (s *Server) controlRejected(c *call, _ []byte) {
+	s.pageJournal(c, s.rejected)
+}
+
+func (s *Server) pageJournal(c *call, ring *journal) {
 	query := c.r.URL.Query()
 	after, limit := uint64(0), 100
 	if raw := query.Get("after"); raw != "" {
@@ -210,7 +236,7 @@ func (s *Server) controlJournal(c *call, _ []byte) {
 		}
 		limit = value
 	}
-	entries, latest := s.journal.since(after, limit)
+	entries, latest := ring.since(after, limit)
 	writeJSON(c.w, http.StatusOK, map[string]any{"entries": entries, "latest": latest})
 }
 
@@ -436,7 +462,7 @@ func (s *Server) controlMedia(c *call, body []byte) {
 	case err != nil || len(data) == 0:
 		controlBadRequest(c, "data_base64 must be non-empty standard base64")
 		return
-	case len(data) > maxMediaBytes:
+	case len(data) > maxControlMediaBytes:
 		controlBadRequest(c, "media is too large")
 		return
 	case !mimeTypePattern.MatchString(request.MimeType):
@@ -583,8 +609,9 @@ func (s *Server) controlClearFaults(c *call, _ []byte) {
 }
 
 // controlReset returns the stub to its startup state: configured accounts
-// only, no media, messages, templates, codes or faults, an empty journal, and
-// no further deliveries from status sequences already scheduled.
+// only, no media, messages, templates, codes or faults, an empty journal and
+// rejected ring, and no further deliveries (or retries) from status sequences
+// already scheduled.
 func (s *Server) controlReset(c *call, _ []byte) {
 	s.mu.Lock()
 	s.state = newState(s.cfg.Accounts)
@@ -592,5 +619,6 @@ func (s *Server) controlReset(c *call, _ []byte) {
 	s.generation++
 	s.mu.Unlock()
 	s.journal.reset()
+	s.rejected.reset()
 	writeJSON(c.w, http.StatusOK, map[string]bool{"ok": true})
 }

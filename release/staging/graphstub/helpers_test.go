@@ -67,11 +67,26 @@ func (w capturedWebhook) decode(t *testing.T) map[string]any {
 	return value
 }
 
-// fakeProduct stands in for the product's webhook endpoint.
+// fakeProduct stands in for the product's webhook endpoint. It answers
+// status, except that the next failNext webhooks are answered 503.
 type fakeProduct struct {
 	server   *httptest.Server
 	received chan capturedWebhook
 	status   atomic.Int32
+	failNext atomic.Int32
+}
+
+// takeFailure reports whether this webhook is one of the failNext to refuse.
+func (p *fakeProduct) takeFailure() bool {
+	for {
+		left := p.failNext.Load()
+		if left <= 0 {
+			return false
+		}
+		if p.failNext.CompareAndSwap(left, left-1) {
+			return true
+		}
+	}
 }
 
 func newFakeProduct(t *testing.T) *fakeProduct {
@@ -80,8 +95,12 @@ func newFakeProduct(t *testing.T) *fakeProduct {
 	product.status.Store(http.StatusOK)
 	product.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		status := int(product.status.Load())
+		if product.takeFailure() {
+			status = http.StatusServiceUnavailable
+		}
 		product.received <- capturedWebhook{Path: r.URL.RequestURI(), Body: body, Signature: r.Header.Get(SignatureHeader)}
-		w.WriteHeader(int(product.status.Load()))
+		w.WriteHeader(status)
 	}))
 	t.Cleanup(product.server.Close)
 	return product
@@ -257,6 +276,13 @@ func (h *harness) uploadMedia(phoneID, mimeType string, data []byte) (int, map[s
 func (h *harness) journal() []Entry {
 	h.t.Helper()
 	entries, _ := h.stub.journal.since(0, JournalCapacity)
+	return entries
+}
+
+// rejected returns the ring of requests that never authenticated.
+func (h *harness) rejected() []Entry {
+	h.t.Helper()
+	entries, _ := h.stub.rejected.since(0, RejectedCapacity)
 	return entries
 }
 

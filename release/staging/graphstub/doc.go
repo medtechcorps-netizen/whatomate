@@ -11,13 +11,14 @@
 //
 // # Graph endpoints
 //
-// Paths work with or without a /v{n}.{m} prefix. Every endpoint except the
+// Paths work with or without a /v{n}.{m} prefix, and extra leading slashes
+// are ignored, so whatsapp.base_url may end in "/". Every endpoint except the
 // two token endpoints needs "Authorization: Bearer <token>" with a token from
 // STUB_ACCESS_TOKENS.
 //
 //	POST   /{phone}/messages                 send (new WAMID, then scheduled status webhooks) or read receipt
 //	POST   /{phone}/media                    multipart upload, returns a media ID
-//	GET    /{media}                          media metadata with a same-origin download URL
+//	GET    /{media}                          media metadata with a download URL on the caller's origin
 //	DELETE /{media}                          delete media
 //	GET    /_media/{media}                   download (the URL GET /{media} returns)
 //	GET    /{phone}                          phone fields, including webhook_configuration
@@ -39,19 +40,30 @@
 // Errors use Meta's {"error":{...}} envelope. Anything else answers 400 with
 // Graph error 100, and the journal records the route as "unsupported".
 //
+// Download and paging.next URLs use the request's Host and its scheme: https
+// over TLS or when a proxy sends "X-Forwarded-Proto: https", otherwise http.
+//
+// A send schedules its status webhooks (STUB_STATUS_SEQUENCE, one every
+// STUB_STATUS_INTERVAL). As Meta does, a status the product does not answer
+// with 2xx is retried, up to 4 deliveries in all, waiting the interval and
+// doubling each time; the journal numbers each delivery in "attempt".
+//
 // # Control API
 //
 // /_control/* drives the stub from tests. Each request is authenticated with
 // an HMAC (see ControlMAC and SignControlRequest) over the path the stub
-// receives: a missing header, a wrong key, a timestamp more than 60 s away or
-// a reused nonce is answered 401. The staging ingress exposes it only under
-// its /_stub prefix, which the ingress strips before the stub sees a request.
+// receives, query included: a missing header, a wrong key, a timestamp more
+// than 60 s away or a reused nonce is answered 401. The staging ingress
+// exposes it only under its /_stub prefix, which the ingress strips before
+// the stub sees a request. A control body is at most about 2.7 MiB, enough for
+// 2 MiB of base64 media.
 //
 //	GET    /_control/journal?after=&limit=   journal entries after a sequence number
+//	GET    /_control/rejected?after=&limit=  the same for requests that never authenticated
 //	GET    /_control/accounts                POST registers a WABA and phone (idempotent)
 //	POST   /_control/inbound                 deliver a signed inbound customer message now
 //	POST   /_control/status                  deliver one status webhook for an accepted send
-//	POST   /_control/media                   store media for an inbound media message
+//	POST   /_control/media                   store media (2 MiB at most) for an inbound media message
 //	POST   /_control/templates               set a template's review status and notify
 //	POST   /_control/oauth/codes             issue a single-use Embedded Signup code
 //	POST   /_control/faults                  queue a fault; DELETE clears the queue
@@ -79,6 +91,10 @@
 // those hosts and refuses webhook overrides on them. Webhooks go only to
 // STUB_CALLBACK_ORIGIN: a phone's override contributes its path and query,
 // never its host, and the dialer refuses any other address. State lives in
-// memory; the journal keeps the last 10,000 requests and webhooks, and
-// neither the journal nor the logs hold a body, token or secret.
+// memory. The journal keeps the last 10,000 authenticated requests and
+// webhooks; requests that never proved a credential (failed control
+// authentication, a missing or wrong Graph token, a refused host) go to a
+// separate 256-entry rejected ring instead, so they cannot evict what a test
+// run is about to read. Neither ring nor the logs hold a body, token or
+// secret.
 package graphstub

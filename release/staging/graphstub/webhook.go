@@ -24,6 +24,15 @@ const SignatureHeader = "X-Hub-Signature-256"
 const (
 	webhookTimeout          = 10 * time.Second
 	maxWebhookResponseBytes = 64 << 10
+
+	// statusAttempts bounds the deliveries of one scheduled status. Like
+	// Meta, the stub retries a status the product did not answer with 2xx:
+	// the product answers 503 to a status whose WAMID it has not stored yet,
+	// which happens when the status overtakes the product's write of the
+	// send. Retries wait the status interval, doubling each time, and never
+	// less than minStatusRetryDelay.
+	statusAttempts      = 4
+	minStatusRetryDelay = 10 * time.Millisecond
 )
 
 var errDialRefused = errors.New("graph stub dials only STUB_CALLBACK_ORIGIN")
@@ -205,7 +214,9 @@ func sha256Sum(data []byte) []byte {
 }
 
 // scheduleStatuses delivers the configured status sequence for one accepted
-// send. A reset or Close stops the sequence before its next delivery.
+// send, retrying each status as statusAttempts describes before it moves on
+// to the next. A reset or Close stops the sequence before its next delivery
+// or retry.
 func (s *Server) scheduleStatuses(account Account, message sentMessage, generation uint64) bool {
 	sequence := s.cfg.StatusSequence
 	if len(sequence) == 0 {
@@ -228,33 +239,51 @@ func (s *Server) scheduleStatuses(account Account, message sentMessage, generati
 	go func() {
 		defer s.wg.Done()
 		defer func() { <-s.pending }()
+		retryDelay := max(s.cfg.StatusInterval, minStatusRetryDelay)
 		timer := time.NewTimer(s.cfg.StatusInterval)
 		defer timer.Stop()
 		for index, status := range sequence {
 			if index > 0 {
 				timer.Reset(s.cfg.StatusInterval)
 			}
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-timer.C:
-			}
-			s.mu.Lock()
-			current := s.generation == generation
-			s.mu.Unlock()
-			if !current {
+			if !s.waitForStatus(timer, generation) {
 				return
 			}
-			ctx, cancel := context.WithTimeout(s.ctx, webhookTimeout)
-			_, _ = s.deliver(ctx, account.PhoneNumberID, statusPayload(account, message, status, s.now()), Entry{
-				Route:             "status",
-				PhoneNumberID:     account.PhoneNumberID,
-				BusinessAccountID: account.BusinessAccountID,
-				MessageID:         message.ID,
-				DeliveryStatus:    status,
-			})
-			cancel()
+			// Every attempt sends the same payload, as Meta's retries do.
+			payload := statusPayload(account, message, status, s.now())
+			for attempt := 1; ; attempt++ {
+				ctx, cancel := context.WithTimeout(s.ctx, webhookTimeout)
+				code, err := s.deliver(ctx, account.PhoneNumberID, payload, Entry{
+					Route:             "status",
+					PhoneNumberID:     account.PhoneNumberID,
+					BusinessAccountID: account.BusinessAccountID,
+					MessageID:         message.ID,
+					DeliveryStatus:    status,
+					Attempt:           attempt,
+				})
+				cancel()
+				if (err == nil && code >= 200 && code < 300) || attempt == statusAttempts {
+					break
+				}
+				timer.Reset(retryDelay << (attempt - 1))
+				if !s.waitForStatus(timer, generation) {
+					return
+				}
+			}
 		}
 	}()
 	return true
+}
+
+// waitForStatus waits for timer and reports whether the status sequence of
+// generation should still deliver: false after Close or a reset.
+func (s *Server) waitForStatus(timer *time.Timer, generation uint64) bool {
+	select {
+	case <-s.ctx.Done():
+		return false
+	case <-timer.C:
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.generation == generation
 }

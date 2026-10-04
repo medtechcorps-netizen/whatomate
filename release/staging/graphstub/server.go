@@ -30,6 +30,7 @@ type Server struct {
 	cfg      Config
 	log      *slog.Logger
 	journal  *journal
+	rejected *journal
 	nonces   *nonceCache
 	webhooks *webhookClient
 	appToken string
@@ -66,7 +67,8 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 	return &Server{
 		cfg:      cfg,
 		log:      logger,
-		journal:  newJournal(),
+		journal:  newJournal(JournalCapacity),
+		rejected: newJournal(RejectedCapacity),
 		nonces:   newNonceCache(),
 		webhooks: webhooks,
 		appToken: cfg.AppID + "|" + hex.EncodeToString(mac.Sum(nil))[:32],
@@ -94,11 +96,16 @@ var knownMethods = map[string]bool{
 }
 
 // call is one request in flight. Handlers fill entry; ServeHTTP journals it.
+// trusted is set once the request has proved a credential (a control MAC, a
+// Graph token, the app's client secret or app token) or consumed a fault an
+// authenticated control call queued; only then does it reach the journal.
+// Everything else goes to the small rejected ring.
 type call struct {
 	w        *statusWriter
 	r        *http.Request
 	entry    *Entry
 	segments []string
+	trusted  bool
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +123,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c := &call{w: &statusWriter{ResponseWriter: w}, r: r, entry: entry}
 	defer func() {
 		entry.Status = c.w.status
-		s.journal.add(*entry)
+		if c.trusted || entry.Fault {
+			s.journal.add(*entry)
+		} else {
+			s.rejected.add(*entry)
+		}
 		// Route names are fixed strings; IDs, paths and bodies stay out of logs.
 		s.log.Info("request", "kind", entry.Kind, "method", entry.Method, "route", entry.Route,
 			"status", entry.Status, "fault", entry.Fault, "duration_ms", s.now().Sub(started).Milliseconds())
@@ -199,6 +210,21 @@ func invalidParameter(c *call, message string) {
 func unsupported(c *call) {
 	graphError(c, http.StatusBadRequest, 100, 33, "GraphMethodException",
 		"Unsupported "+strings.ToLower(c.r.Method)+" request. Object does not exist, cannot be loaded due to missing permissions, or does not support this operation.", false)
+}
+
+// requestOrigin is the origin the caller used to reach the stub, for URLs the
+// stub hands back to that caller (media downloads, paging.next). The scheme is
+// https when the connection is TLS or a TLS-terminating proxy says so in
+// X-Forwarded-Proto; the host is the request's own Host, which RefusedHost
+// has already vetted.
+func requestOrigin(r *http.Request) (scheme, host string) {
+	scheme = "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if forwarded, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ","); strings.EqualFold(strings.TrimSpace(forwarded), "https") {
+		scheme = "https"
+	}
+	return scheme, r.Host
 }
 
 // bearer returns the Authorization token for the Bearer or OAuth scheme.

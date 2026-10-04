@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -150,6 +152,62 @@ func TestProductClientAgainstStub(t *testing.T) {
 	var metaErr *whatsapp.MetaHTTPError
 	if !errors.As(err, &metaErr) || metaErr.StatusCode != http.StatusBadRequest || metaErr.MetaCode != 131047 {
 		t.Fatalf("the fault reached the client as %v", err)
+	}
+}
+
+// TestProductClientWithOtherBaseShapes covers base URLs staging could set:
+// config accepts whatsapp.base_url with a trailing "/" (internal/config
+// validateWhatsAppConfig) and pkg/whatsapp then requests "//v21.0/...", and
+// an https base needs https download URLs to pass validatedMediaDownloadURL.
+func TestProductClientWithOtherBaseShapes(t *testing.T) {
+	h := newHarness(t, nil)
+	secure := httptest.NewTLSServer(h.stub)
+	t.Cleanup(secure.Close)
+	for index, base := range []struct {
+		name   string
+		url    string
+		client *http.Client
+	}{
+		{"http with a trailing slash", h.url + "/", h.server.Client()},
+		{"https", secure.URL, secure.Client()},
+		{"https with a trailing slash", secure.URL + "/", secure.Client()},
+	} {
+		t.Run(base.name, func(t *testing.T) {
+			client := whatsapp.NewWithBaseURL(logf.New(logf.Opts{Writer: io.Discard, Level: logf.FatalLevel}), base.url)
+			client.HTTPClient = base.client
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			account := &whatsapp.Account{PhoneID: testPhone, BusinessID: testWABA, AppID: testAppID, APIVersion: "v21.0", AccessToken: testToken}
+			if validation, err := client.ValidateCredentials(ctx, testPhone, testWABA, testToken, account.APIVersion); err != nil || validation.VerifiedName != "Stub Clinic" {
+				t.Fatalf("ValidateCredentials: %+v, %v", validation, err)
+			}
+			if _, err := client.SendTextMessage(ctx, account, whatsapp.Recipient{Phone: testCustomer}, "base shape"); err != nil {
+				t.Fatalf("SendTextMessage: %v", err)
+			}
+			payload := []byte("synthetic media for " + base.name)
+			mediaID, err := client.UploadMedia(ctx, account, payload, "image/png", "sample.png")
+			if err != nil {
+				t.Fatalf("UploadMedia: %v", err)
+			}
+			mediaURL, err := client.GetMediaURL(ctx, mediaID, account)
+			if err != nil {
+				t.Fatalf("GetMediaURL: %v", err)
+			}
+			if downloaded, err := client.DownloadMedia(ctx, mediaURL, testToken); err != nil || !bytes.Equal(downloaded, payload) {
+				t.Fatalf("DownloadMedia from %q: %q, %v", mediaURL, downloaded, err)
+			}
+			code := "synthetic-base-shape-code-" + strconv.Itoa(index)
+			h.mustControl(http.MethodPost, "/_control/oauth/codes", map[string]any{"code": code, "access_token": testToken2})
+			if token, err := client.ExchangeCodeForToken(ctx, code, testAppID, testAppSecret, account.APIVersion); err != nil || token != testToken2 {
+				t.Fatalf("ExchangeCodeForToken: %v", err)
+			}
+			if debug, err := client.GetTokenDebugInfo(ctx, testToken2, testAppID+"|"+testAppSecret); err != nil || !debug.IsValid {
+				t.Fatalf("GetTokenDebugInfo: %+v, %v", debug, err)
+			}
+		})
+	}
+	for _, entry := range h.rejected() {
+		t.Errorf("a product request was rejected: %+v", entry)
 	}
 }
 

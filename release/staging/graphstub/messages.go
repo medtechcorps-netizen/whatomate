@@ -260,8 +260,9 @@ func newMedia(phoneID, mimeType string, data []byte) *media {
 }
 
 // getMedia answers GET /{media_id} with a download URL on the origin the
-// caller used, which is what pkg/whatsapp requires of a non-Meta Graph base
-// (validatedMediaDownloadURL) before it sends its bearer there.
+// caller used (scheme included, see requestOrigin), which is what pkg/whatsapp
+// requires of a non-Meta Graph base (validatedMediaDownloadURL) before it
+// sends its bearer there.
 func (s *Server) getMedia(c *call) {
 	id := c.segments[0]
 	c.entry.MediaID = id
@@ -272,7 +273,8 @@ func (s *Server) getMedia(c *call) {
 		unsupported(c)
 		return
 	}
-	download := url.URL{Scheme: "http", Host: c.r.Host, Path: "/" + mediaDownloadSegment + "/" + item.ID}
+	scheme, host := requestOrigin(c.r)
+	download := url.URL{Scheme: scheme, Host: host, Path: "/" + mediaDownloadSegment + "/" + item.ID}
 	writeJSON(c.w, http.StatusOK, map[string]any{
 		"messaging_product": "whatsapp",
 		"id":                item.ID,

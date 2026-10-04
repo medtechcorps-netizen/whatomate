@@ -9,6 +9,12 @@ import (
 // overwritten once it is full.
 const JournalCapacity = 10_000
 
+// RejectedCapacity bounds the separate ring of requests that never
+// authenticated: failed control authentications, Graph calls without a valid
+// token and refused hosts. Keeping them apart means a caller without a
+// credential cannot evict the entries a test run is about to read.
+const RejectedCapacity = 256
+
 // maxJournalField bounds every caller-supplied string kept in an entry, so a
 // full journal stays small whatever the requests contained.
 const maxJournalField = 128
@@ -39,19 +45,21 @@ type Entry struct {
 	MediaID           string    `json:"media_id,omitempty"`
 	TemplateName      string    `json:"template_name,omitempty"`
 	DeliveryStatus    string    `json:"delivery_status,omitempty"`
+	Attempt           int       `json:"attempt,omitempty"`
 	Fault             bool      `json:"fault,omitempty"`
 	Error             string    `json:"error,omitempty"`
 }
 
 type journal struct {
-	mu      sync.Mutex
-	entries []Entry
-	start   int
-	seq     uint64
+	mu       sync.Mutex
+	capacity int
+	entries  []Entry
+	start    int
+	seq      uint64
 }
 
-func newJournal() *journal {
-	return &journal{entries: make([]Entry, 0, 64)}
+func newJournal(capacity int) *journal {
+	return &journal{capacity: capacity, entries: make([]Entry, 0, min(capacity, 64))}
 }
 
 func (j *journal) add(entry Entry) uint64 {
@@ -71,11 +79,11 @@ func (j *journal) add(entry Entry) uint64 {
 	if entry.Time.IsZero() {
 		entry.Time = time.Now().UTC()
 	}
-	if len(j.entries) < JournalCapacity {
+	if len(j.entries) < j.capacity {
 		j.entries = append(j.entries, entry)
 	} else {
 		j.entries[j.start] = entry
-		j.start = (j.start + 1) % JournalCapacity
+		j.start = (j.start + 1) % j.capacity
 	}
 	return entry.Seq
 }

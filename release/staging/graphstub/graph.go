@@ -44,9 +44,12 @@ var (
 )
 
 // graphSegments splits a Graph path and drops an optional /v{n}.{m} prefix.
-// It returns nil for an empty path or an empty segment.
+// Leading slashes are all dropped: config accepts whatsapp.base_url with a
+// trailing "/" and pkg/whatsapp appends "/v21.0/..." to it as given, so the
+// product can send "//v21.0/...". It returns nil for an empty path or an empty
+// segment anywhere else.
 func graphSegments(path string) []string {
-	segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	segments := strings.Split(strings.TrimLeft(path, "/"), "/")
 	if len(segments) > 0 && versionPattern.MatchString(segments[0]) {
 		segments = segments[1:]
 	}
@@ -62,6 +65,11 @@ func graphSegments(path string) []string {
 }
 
 func (s *Server) serveGraph(c *call) {
+	// A configured access token makes the call trusted. The token endpoints
+	// also trust a call that passes their own credential check; every other
+	// endpoint needs the access token.
+	authorized := oneOf(bearer(c.r), s.cfg.AccessTokens...)
+	c.trusted = authorized
 	c.segments = graphSegments(c.r.URL.Path)
 	if c.segments == nil {
 		unsupported(c)
@@ -81,7 +89,7 @@ func (s *Server) serveGraph(c *call) {
 		}
 		return
 	}
-	if !oneOf(bearer(c.r), s.cfg.AccessTokens...) {
+	if !authorized {
 		c.entry.Route = "auth"
 		graphError(c, http.StatusUnauthorized, 190, 0, "OAuthException", "Invalid OAuth access token - Cannot parse access token", false)
 		return
@@ -254,7 +262,8 @@ func paginate(c *call, items []map[string]any) (map[string]any, bool) {
 		paging := map[string]any{"cursors": map[string]string{"before": cursor(offset), "after": cursor(end)}}
 		if end < len(items) {
 			query.Set("after", cursor(end))
-			next := url.URL{Scheme: "http", Host: c.r.Host, Path: c.r.URL.Path, RawQuery: query.Encode()}
+			scheme, host := requestOrigin(c.r)
+			next := url.URL{Scheme: scheme, Host: host, Path: c.r.URL.Path, RawQuery: query.Encode()}
 			paging["next"] = next.String()
 		}
 		result["paging"] = paging
