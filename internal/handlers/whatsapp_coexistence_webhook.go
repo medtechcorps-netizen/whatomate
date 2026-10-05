@@ -1176,6 +1176,26 @@ func (a *App) persistAuthenticatedIncomingMessageBeforeAck(
 		if admissionErr != nil {
 			return admissionErr
 		}
+		if admission.Blocked {
+			// A sender with no identity question (nobody in the tenant matches
+			// any of its selectors, or the only match is the phone this number
+			// just messaged from the Business app) is bound to one contact and
+			// re-evaluated under the same locks. Every other blocked admission
+			// keeps the review path below unchanged.
+			admitted, bindErr := scoped.admitCoexistenceSenderWithoutIdentityQuestion(
+				account,
+				&claim,
+				admission,
+				message,
+				profileName,
+			)
+			if bindErr != nil {
+				return bindErr
+			}
+			if admitted != nil {
+				admission = admitted
+			}
+		}
 		if admission.Blocked != admission.NeedsReview {
 			return errors.New("WhatsApp identity-review admission state is inconsistent")
 		}

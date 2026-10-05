@@ -248,14 +248,19 @@ func (a *App) ListStagedContactIdentityReviews(r *fastglue.Request) error {
 		return nil
 	}
 	pg := parsePagination(r)
-	query := a.stagedIdentityReviewEventsQuery(orgID)
+	// Count over the unprojected scope: GORM quotes a "table.*" projection as
+	// one identifier inside COUNT(), which PostgreSQL rejects. Each statement
+	// gets its own chain so the count cannot leak into the page query, and the
+	// order is table-qualified because the hold join also has id/created_at.
 	var total int64
-	if err := query.Count(&total).Error; err != nil {
+	if err := a.stagedIdentityReviewEventsScope(orgID).Count(&total).Error; err != nil {
 		a.Log.Error("Failed to count staged identity reviews", "error", err, "organization_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
 	}
 	var events []models.InboundEvent
-	if err := query.Order("received_at DESC, id DESC").Offset(pg.Offset).Limit(pg.Limit).Find(&events).Error; err != nil {
+	if err := a.stagedIdentityReviewEventsQuery(orgID).
+		Order("inbound_events.received_at DESC, inbound_events.id DESC").
+		Offset(pg.Offset).Limit(pg.Limit).Find(&events).Error; err != nil {
 		a.Log.Error("Failed to list staged identity reviews", "error", err, "organization_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
 	}
@@ -398,8 +403,13 @@ func (a *App) loadStagedIdentityReviewEvent(
 // authority. Inbound receipts are immutable audit records, but only receipts
 // backed by an open hold are actionable queue/detail/media surfaces.
 func (a *App) stagedIdentityReviewEventsQuery(organizationID uuid.UUID) *gorm.DB {
+	return a.stagedIdentityReviewEventsScope(organizationID).Select("inbound_events.*")
+}
+
+// stagedIdentityReviewEventsScope is the same tenant/open-hold boundary without
+// a projection, for COUNT(*).
+func (a *App) stagedIdentityReviewEventsScope(organizationID uuid.UUID) *gorm.DB {
 	return a.DB.Model(&models.InboundEvent{}).
-		Select("inbound_events.*").
 		Joins(`JOIN whatsapp_identity_review_holds AS review_holds
 			ON review_holds.organization_id = inbound_events.organization_id
 			AND review_holds.id = inbound_events.review_hold_id`).
