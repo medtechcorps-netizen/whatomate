@@ -326,7 +326,12 @@ func TestCallPermissionReplyAnswersTheRequestItNames(t *testing.T) {
 	firstStatus, secondStatus = statuses()
 	assert.Equal(t, models.CallPermissionDeclined, firstStatus)
 	assert.Equal(t, models.CallPermissionAccepted, secondStatus, "an unrecorded request falls back to the newest one")
-	assert.Len(t, wsTypes(t, client, quiet), 3)
+
+	// The other answer in the same second is applied; its replay is not.
+	reply("reject", base.Add(130*time.Second), second.MessageID)
+	reply("reject", base.Add(130*time.Second), second.MessageID)
+	assert.Equal(t, models.CallPermissionDeclined, storedCallPermission(t, app, second.ID).Status)
+	assert.Len(t, wsTypes(t, client, quiet), 4)
 }
 
 // The webhook passes the reply's context.id through.
