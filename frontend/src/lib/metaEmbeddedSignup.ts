@@ -1,4 +1,6 @@
 export const META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS = 5_000;
+// Leave time to exchange Meta's short-lived code after waiting for selection.
+export const META_COEXISTENCE_SELECTION_TIMEOUT_MS = 20_000;
 export const META_COEXISTENCE_SESSION_INFO_VERSION = "3";
 
 export type MetaEmbeddedSignupMode = "coexistence" | "classic";
@@ -38,7 +40,7 @@ export interface MetaEmbeddedSignupSession {
 interface EmbeddedSignupMessage {
   type: "WA_EMBEDDED_SIGNUP";
   event: string;
-  version?: number | string;
+  version?: unknown;
   data?: Record<string, unknown>;
 }
 
@@ -98,10 +100,7 @@ export function parseMetaEmbeddedSignupMessage(
   return {
     type: "WA_EMBEDDED_SIGNUP",
     event: payload.event,
-    version:
-      typeof payload.version === "number" || typeof payload.version === "string"
-        ? payload.version
-        : undefined,
+    version: payload.version,
     data: isRecord(payload.data) ? payload.data : undefined,
   };
 }
@@ -111,13 +110,19 @@ function isExpectedFinishMessage(
   mode: MetaEmbeddedSignupMode,
 ): boolean {
   const event = message.event.toUpperCase();
+  const standardFinish = event === "FINISH" || event === "FINISH_ONLY_WABA";
   if (mode === "coexistence") {
+    // Standard completion messages identify selected assets and may omit the
+    // session version. They do not change the requested mode: the server
+    // independently proves that mode from Meta phone data.
     return (
-      event === "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING" &&
-      String(message.version) === META_COEXISTENCE_SESSION_INFO_VERSION
+      (standardFinish || event === "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING") &&
+      (message.version === undefined ||
+        message.version === 3 ||
+        message.version === META_COEXISTENCE_SESSION_INFO_VERSION)
     );
   }
-  return event === "FINISH" || event === "FINISH_ONLY_WABA";
+  return standardFinish;
 }
 
 function loginErrorMessage(
@@ -183,8 +188,20 @@ export function createMetaEmbeddedSignupSession(
     });
   };
 
-  const scheduleCodeOnlyFallback = () => {
+  const scheduleCompletionDeadline = () => {
     if (settled || !code || fallbackTimer !== undefined) return;
+    if (options.mode === "coexistence") {
+      // Token grants may include previously connected WABAs. Never substitute
+      // those grants for the user's selected account or discard a late finish.
+      fallbackTimer = setTimeout(() => {
+        if (!ensureContextCurrent()) return;
+        abort(
+          "error",
+          "Meta did not return the selected WhatsApp account. Restart the connection and complete account selection in Meta.",
+        );
+      }, META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+      return;
+    }
     fallbackTimer = setTimeout(
       () => complete(true),
       options.codeFallbackMs ?? META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS,
@@ -203,8 +220,62 @@ export function createMetaEmbeddedSignupSession(
 
     const eventName = message.event.toUpperCase();
     if (isExpectedFinishMessage(message, options.mode)) {
-      phoneNumberId = nonEmptyString(message.data?.phone_number_id);
-      wabaId = nonEmptyString(message.data?.waba_id);
+      if (options.mode === "classic") {
+        phoneNumberId = nonEmptyString(message.data?.phone_number_id);
+        wabaId = nonEmptyString(message.data?.waba_id);
+        complete(false);
+        return;
+      }
+      const selectedWabaIds = new Set<string>();
+      const singularSelection = message.data?.waba_id;
+      const pluralSelection = message.data?.waba_ids;
+      if (
+        (singularSelection !== undefined &&
+          typeof singularSelection !== "string") ||
+        (pluralSelection !== undefined &&
+          (!Array.isArray(pluralSelection) ||
+            pluralSelection.some((value) => typeof value !== "string")))
+      ) {
+        abort(
+          "error",
+          "Meta returned an invalid WhatsApp account selection. Restart the connection and select exactly one account.",
+        );
+        return;
+      }
+      const singularWabaId = nonEmptyString(singularSelection);
+      if (singularWabaId) selectedWabaIds.add(singularWabaId);
+      if (Array.isArray(pluralSelection)) {
+        for (const value of pluralSelection) {
+          const selectedWabaId = nonEmptyString(value);
+          if (selectedWabaId) selectedWabaIds.add(selectedWabaId);
+        }
+      }
+      const selectedWabaId = [...selectedWabaIds][0];
+      if (
+        selectedWabaIds.size > 1 ||
+        (wabaId && selectedWabaId && wabaId !== selectedWabaId)
+      ) {
+        abort(
+          "error",
+          "Meta returned more than one selected WhatsApp account. Restart the connection and select exactly one account.",
+        );
+        return;
+      }
+      if (!selectedWabaId) return;
+      const selectedPhoneId = nonEmptyString(message.data?.phone_number_id);
+      if (
+        phoneNumberId &&
+        selectedPhoneId &&
+        phoneNumberId !== selectedPhoneId
+      ) {
+        abort(
+          "error",
+          "Meta returned more than one selected WhatsApp phone number. Restart the connection and select exactly one phone number.",
+        );
+        return;
+      }
+      phoneNumberId = selectedPhoneId || phoneNumberId;
+      wabaId = selectedWabaId;
       complete(false);
       return;
     }
@@ -234,7 +305,7 @@ export function createMetaEmbeddedSignupSession(
       }
 
       complete(false);
-      scheduleCodeOnlyFallback();
+      scheduleCompletionDeadline();
       return;
     }
 

@@ -115,6 +115,7 @@ async function installEmbeddedSignupMocks(
               data: {
                 type: 'WA_EMBEDDED_SIGNUP',
                 event: 'FINISH',
+                version: 2,
                 data: {
                   phone_number_id: 'wrong-mode-phone',
                   waba_id: 'wrong-mode-waba'
@@ -381,7 +382,7 @@ test("launches Coexistence with Meta's Business App onboarding contract", async 
   ]);
 });
 
-test("Coexistence ignores wrong finish signals and falls back with a mode-bound code only", async ({
+test("Coexistence rejects unsupported finish versions without exchanging a code-only request", async ({
   page,
 }) => {
   const capture = await installEmbeddedSignupMocks(page, {
@@ -389,15 +390,62 @@ test("Coexistence ignores wrong finish signals and falls back with a mode-bound 
   });
   await page.goto("/settings/accounts");
   await openConnectionMethodDialog(page);
+  await page.clock.install();
   await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
 
-  await page.waitForTimeout(250);
+  await page.clock.fastForward(5_001);
   expect(capture.exchangeRequests).toBe(0);
-  await expect.poll(() => capture.exchangeRequests, { timeout: 7_000 }).toBe(1);
+  await page.clock.fastForward(15_000);
+  await expect(
+    page.getByText(/Meta did not return the selected WhatsApp account/),
+  ).toBeVisible();
+  expect(capture.exchangeRequests).toBe(0);
+  expect(capture.exchangeBodies).toEqual([]);
+});
+
+test("Coexistence preserves the selected account from a delayed standard finish without a version", async ({
+  page,
+}) => {
+  const capture = await installEmbeddedSignupMocks(page, {
+    metaLoginMode: "pending",
+  });
+  await page.goto("/settings/accounts");
+  await openConnectionMethodDialog(page);
+  await page.clock.install();
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await page.evaluate(() => {
+    const loginCallback = (
+      window as typeof window & {
+        __embeddedSignupLoginCallback?: (response: unknown) => void;
+      }
+    ).__embeddedSignupLoginCallback;
+    loginCallback?.({ authResponse: { code: "review-safe-code" } });
+  });
+  await page.clock.fastForward(5_001);
+  expect(capture.exchangeRequests).toBe(0);
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "https://www.facebook.com",
+        data: {
+          type: "WA_EMBEDDED_SIGNUP",
+          event: "FINISH",
+          data: {
+            waba_id: "1000000000000004",
+            phone_number_id: "1000000000000003",
+          },
+        },
+      }),
+    );
+  });
+  await expect.poll(() => capture.exchangeRequests).toBe(1);
+  expect(capture.exchangeOrganizationIds).toEqual([organizationId]);
   expect(capture.exchangeBodies).toEqual([
     {
       code: "review-safe-code",
       signup_mode: "coexistence",
+      phone_id: "1000000000000003",
+      waba_id: "1000000000000004",
     },
   ]);
 });

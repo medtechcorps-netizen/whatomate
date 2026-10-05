@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createMetaEmbeddedSignupSession,
   isAllowedMetaEmbeddedSignupOrigin,
+  META_COEXISTENCE_SELECTION_TIMEOUT_MS,
   type MetaEmbeddedSignupAbortReason,
   type MetaEmbeddedSignupMode,
   type MetaEmbeddedSignupResult,
@@ -272,32 +273,289 @@ describe("createMetaEmbeddedSignupSession", () => {
     });
   });
 
-  it("ignores classic and wrong-version finish events in Coexistence mode", () => {
+  it.each([
+    ["FINISH", undefined],
+    ["FINISH", 3],
+    ["FINISH_ONLY_WABA", undefined],
+    ["FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING", undefined],
+    ["FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING", "3"],
+  ])(
+    "retains selected assets and Coexistence mode for %s version %s",
+    (event, version) => {
+      const harness = createHarness(50, undefined, "coexistence");
+      harness.session.handleMessage({
+        origin: facebookOrigin,
+        data: {
+          type: "WA_EMBEDDED_SIGNUP",
+          event,
+          version,
+          data: { waba_id: "selected-waba", phone_number_id: "selected-phone" },
+        },
+      });
+      harness.session.handleLoginResponse({
+        authResponse: { code: "code-abc" },
+      });
+
+      expect(harness.completed).toEqual([
+        {
+          code: "code-abc",
+          mode: "coexistence",
+          wabaId: "selected-waba",
+          phoneNumberId: "selected-phone",
+        },
+      ]);
+      expect(harness.aborted).toHaveLength(0);
+    },
+  );
+
+  it("retains a Coexistence selection received after the classic fallback deadline", () => {
     vi.useFakeTimers();
     const harness = createHarness(50, undefined, "coexistence");
     harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    vi.advanceTimersByTime(5_001);
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.settledCount()).toBe(0);
 
+    harness.session.handleMessage(finishMessage());
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        wabaId: "waba-456",
+        phoneNumberId: "phone-123",
+      },
+    ]);
+    expect(harness.aborted).toHaveLength(0);
+    expect(harness.settledCount()).toBe(1);
+  });
+
+  it.each([2, "2", 4, "", null, true, {}, []])(
+    "rejects explicit unsupported or malformed Coexistence version %j without code-only completion",
+    (version) => {
+      vi.useFakeTimers();
+      const harness = createHarness(50, undefined, "coexistence");
+      harness.session.handleLoginResponse({
+        authResponse: { code: "code-abc" },
+      });
+      for (const event of [
+        "FINISH",
+        "FINISH_ONLY_WABA",
+        "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+      ]) {
+        harness.session.handleMessage({
+          origin: facebookOrigin,
+          data: {
+            type: "WA_EMBEDDED_SIGNUP",
+            event,
+            version,
+            data: { waba_id: "wrong-version-waba" },
+          },
+        });
+      }
+      vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+
+      expect(harness.completed).toHaveLength(0);
+      expect(harness.aborted).toEqual([
+        {
+          reason: "error",
+          detail: expect.stringContaining(
+            "Meta did not return the selected WhatsApp account",
+          ),
+        },
+      ]);
+      expect(harness.settledCount()).toBe(1);
+    },
+  );
+
+  it.each([undefined, { phone_number_id: "phone-only" }])(
+    "requires a selected WABA before exchanging the Coexistence code",
+    (data) => {
+      vi.useFakeTimers();
+      const harness = createHarness(50, undefined, "coexistence");
+      harness.session.handleLoginResponse({
+        authResponse: { code: "code-abc", waba_id: "untrusted-auth-waba" },
+      });
+      if (data) {
+        harness.session.handleMessage({
+          origin: facebookOrigin,
+          data: { type: "WA_EMBEDDED_SIGNUP", event: "FINISH", data },
+        });
+      }
+      vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS - 1);
+      expect(harness.completed).toHaveLength(0);
+      expect(harness.aborted).toHaveLength(0);
+      vi.advanceTimersByTime(1);
+      harness.session.handleMessage(finishMessage());
+
+      expect(harness.completed).toHaveLength(0);
+      expect(harness.aborted).toHaveLength(1);
+      expect(harness.settledCount()).toBe(1);
+    },
+  );
+
+  it.each([
+    { waba_ids: [" selected-waba ", "selected-waba", ""] },
+    { waba_id: "selected-waba", waba_ids: ["selected-waba"] },
+  ])(
+    "accepts one distinct selected WABA from singular/plural fields",
+    (data) => {
+      const harness = createHarness(50, undefined, "coexistence");
+      harness.session.handleMessage({
+        origin: facebookOrigin,
+        data: { type: "WA_EMBEDDED_SIGNUP", event: "FINISH_ONLY_WABA", data },
+      });
+      harness.session.handleLoginResponse({
+        authResponse: { code: "code-abc" },
+      });
+      expect(harness.completed).toEqual([
+        {
+          code: "code-abc",
+          mode: "coexistence",
+          wabaId: "selected-waba",
+          phoneNumberId: undefined,
+        },
+      ]);
+    },
+  );
+
+  it.each([
+    { waba_ids: ["waba-a", "waba-b"] },
+    { waba_id: "waba-a", waba_ids: ["waba-b"] },
+  ])("rejects ambiguous or conflicting selected WABAs", (data) => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: { type: "WA_EMBEDDED_SIGNUP", event: "FINISH", data },
+    });
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toEqual([
+      {
+        reason: "error",
+        detail: expect.stringContaining(
+          "more than one selected WhatsApp account",
+        ),
+      },
+    ]);
+  });
+
+  it("preserves a phone selection when Meta repeats a WABA-only completion", () => {
+    const harness = createHarness(50, undefined, "coexistence");
     harness.session.handleMessage(finishMessage());
     harness.session.handleMessage({
       origin: facebookOrigin,
       data: {
         type: "WA_EMBEDDED_SIGNUP",
-        event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
-        version: 2,
-        data: { waba_id: "wrong-version-waba" },
+        event: "FINISH_ONLY_WABA",
+        data: { waba_id: "waba-456" },
       },
     });
-    expect(harness.completed).toHaveLength(0);
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    expect(harness.completed[0]?.phoneNumberId).toBe("phone-123");
+  });
 
-    vi.advanceTimersByTime(50);
-    expect(harness.completed).toEqual([
+  it.each([
+    { waba_ids: ["waba-a", 123] },
+    { waba_id: "waba-a", waba_ids: "waba-b" },
+    { waba_id: null, waba_ids: ["waba-a"] },
+  ])("rejects malformed explicit WABA selections", (data) => {
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: { type: "WA_EMBEDDED_SIGNUP", event: "FINISH", data },
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toEqual([
       {
-        code: "code-abc",
-        mode: "coexistence",
-        phoneNumberId: undefined,
-        wabaId: undefined,
+        reason: "error",
+        detail: expect.stringContaining("invalid WhatsApp account selection"),
       },
     ]);
+  });
+
+  it("rejects conflicting WABAs across completion messages before the login code", () => {
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleMessage(finishMessage());
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH",
+        data: { waba_id: "another-waba" },
+      },
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toHaveLength(1);
+  });
+
+  it("rejects conflicting phone selections within the same WABA before the login code", () => {
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleMessage(finishMessage());
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH",
+        data: { waba_id: "waba-456", phone_number_id: "another-phone" },
+      },
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toEqual([
+      {
+        reason: "error",
+        detail: expect.stringContaining(
+          "more than one selected WhatsApp phone number",
+        ),
+      },
+    ]);
+  });
+
+  it("does not accept a forged Coexistence selection before its deadline", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.handleMessage(
+      finishMessage("https://www.facebook.com.example.org"),
+    );
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toHaveLength(1);
+  });
+
+  it("cleans up the Coexistence deadline if the workspace changes", () => {
+    vi.useFakeTimers();
+    let isCurrent = true;
+    const harness = createHarness(
+      50,
+      { isCurrent: () => isCurrent },
+      "coexistence",
+    );
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    isCurrent = false;
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toHaveLength(0);
+    expect(harness.contextChangedCount()).toBe(1);
+    expect(harness.settledCount()).toBe(1);
+  });
+
+  it("cleans up the Coexistence deadline after cancellation", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.cancel();
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+    harness.session.handleMessage(finishMessage());
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toHaveLength(0);
+    expect(harness.settledCount()).toBe(1);
   });
 
   it("ignores a Coexistence finish event in classic mode", () => {
