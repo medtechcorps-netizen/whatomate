@@ -1754,58 +1754,81 @@ func (a *App) SendReaction(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
-	// Parse existing reactions from Metadata
-	var metadata map[string]any
-	if message.Metadata != nil {
-		metadata = message.Metadata
-	} else {
-		metadata = make(map[string]any)
-	}
-
-	// Get or initialize reactions array
 	type Reaction struct {
 		Emoji     string `json:"emoji"`
 		FromPhone string `json:"from_phone,omitempty"`
 		FromUser  string `json:"from_user,omitempty"`
 	}
-	var reactions []Reaction
-	if reactionsRaw, ok := metadata["reactions"]; ok {
-		if reactionsArray, ok := reactionsRaw.([]any); ok {
-			for _, r := range reactionsArray {
-				if rMap, ok := r.(map[string]any); ok {
-					emoji, _ := rMap["emoji"].(string)
-					fromPhone, _ := rMap["from_phone"].(string)
-					fromUser, _ := rMap["from_user"].(string)
-					reactions = append(reactions, Reaction{
-						Emoji:     emoji,
-						FromPhone: fromPhone,
-						FromUser:  fromUser,
-					})
+	var newReactions []Reaction
+	// The reactions are read and written back under the message's row lock,
+	// in a transaction (a savepoint inside a request's tenant transaction).
+	// The metadata also holds what other writers keep there under the same
+	// lock: a customer's reactions and their replay record
+	// (incomingReactionEventsMetadataKey) and the WAMIDs of earlier reactions
+	// sent from here (sentReactionWAMIDsMetadataKey). Rewriting a copy read
+	// before such a write committed would drop it.
+	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+		var locked models.Message
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND contact_id = ?", messageID, contactID).
+			First(&locked).Error; err != nil {
+			return err
+		}
+
+		// Parse existing reactions from Metadata
+		var metadata map[string]any
+		if locked.Metadata != nil {
+			metadata = locked.Metadata
+		} else {
+			metadata = make(map[string]any)
+		}
+
+		// Get or initialize reactions array
+		var reactions []Reaction
+		if reactionsRaw, ok := metadata["reactions"]; ok {
+			if reactionsArray, ok := reactionsRaw.([]any); ok {
+				for _, r := range reactionsArray {
+					if rMap, ok := r.(map[string]any); ok {
+						emoji, _ := rMap["emoji"].(string)
+						fromPhone, _ := rMap["from_phone"].(string)
+						fromUser, _ := rMap["from_user"].(string)
+						reactions = append(reactions, Reaction{
+							Emoji:     emoji,
+							FromPhone: fromPhone,
+							FromUser:  fromUser,
+						})
+					}
 				}
 			}
 		}
-	}
 
-	// Remove existing reaction from this user (each user can only have one reaction)
-	userIDStr := userID.String()
-	var newReactions []Reaction
-	for _, r := range reactions {
-		if r.FromUser != userIDStr {
-			newReactions = append(newReactions, r)
+		// Remove existing reaction from this user (each user can only have one reaction)
+		userIDStr := userID.String()
+		for _, r := range reactions {
+			if r.FromUser != userIDStr {
+				newReactions = append(newReactions, r)
+			}
 		}
-	}
 
-	// Add new reaction if emoji is not empty
-	if req.Emoji != "" {
-		newReactions = append(newReactions, Reaction{
-			Emoji:    req.Emoji,
-			FromUser: userIDStr,
-		})
-	}
+		// Add new reaction if emoji is not empty
+		if req.Emoji != "" {
+			newReactions = append(newReactions, Reaction{
+				Emoji:    req.Emoji,
+				FromUser: userIDStr,
+			})
+		}
 
-	// Update metadata
-	metadata["reactions"] = newReactions
-	if err := a.DB.Model(&message).Update("metadata", metadata).Error; err != nil {
+		// Update metadata
+		metadata["reactions"] = newReactions
+		if err := tx.Model(&locked).Update("metadata", metadata).Error; err != nil {
+			return err
+		}
+		message = locked
+		return nil
+	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Message not found", nil, "")
+		}
 		a.Log.Error("Failed to update message reactions", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update reaction", nil, "")
 	}
@@ -1879,7 +1902,8 @@ func (a *App) sendWhatsAppReactionGuarded(account *models.WhatsAppAccount, conta
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return a.withLockedWhatsAppAccountForOutbound(ctx, account.OrganizationID, account.ID, func(locked *models.WhatsAppAccount) error {
+	var reactionWAMID string
+	err = a.withLockedWhatsAppAccountForOutbound(ctx, account.OrganizationID, account.ID, func(locked *models.WhatsAppAccount) error {
 		url := fmt.Sprintf("%s/%s/%s/messages", a.Config.WhatsApp.BaseURL, locked.APIVersion, locked.PhoneID)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonPayload))
 		if err != nil {
@@ -1897,9 +1921,68 @@ func (a *App) sendWhatsAppReactionGuarded(account *models.WhatsAppAccount, conta
 			body, _ := io.ReadAll(resp.Body)
 			return fmt.Errorf("WhatsApp API reaction status %d: %s", resp.StatusCode, truncateString(string(body), 512))
 		}
+		var sent struct {
+			Messages []struct {
+				ID string `json:"id"`
+			} `json:"messages"`
+		}
+		if body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10)); readErr == nil && json.Unmarshal(body, &sent) == nil && len(sent.Messages) > 0 {
+			reactionWAMID = strings.TrimSpace(sent.Messages[0].ID)
+		}
 
 		a.Log.Info("Reaction sent successfully", "message_id", message.WhatsAppMessageID, "emoji", emoji)
 		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if reactionWAMID == "" {
+		a.Log.Warn("Reaction sent without a WAMID in the Graph response; its statuses fall back to the grace windows",
+			"message_id", message.ID)
+		return nil
+	}
+	if recordErr := a.recordSentWhatsAppReactionWAMID(account.OrganizationID, message.ID, reactionWAMID); recordErr != nil {
+		// The reaction was sent; only the early acknowledgement of its
+		// statuses is lost, and they fall back to the grace windows.
+		a.Log.Warn("Failed to record sent reaction WAMID", "error", recordErr, "message_id", message.ID)
+	}
+	return nil
+}
+
+// recordSentWhatsAppReactionWAMID appends wamid to sentReactionWAMIDsMetadataKey
+// in the metadata of the message that was reacted to, keeping the most recent
+// sentReactionWAMIDsLimit, so that whatsAppStatusNonMessageSend can acknowledge
+// the reaction's statuses. Only that message row is locked, and no other lock
+// is taken after it.
+func (a *App) recordSentWhatsAppReactionWAMID(organizationID, messageID uuid.UUID, wamid string) error {
+	wamid = strings.TrimSpace(wamid)
+	if organizationID == uuid.Nil || messageID == uuid.Nil || wamid == "" {
+		return errors.New("sent reaction WAMID record is incomplete")
+	}
+	return a.rootApp().WithCommittedTenantApp(organizationID, func(scoped *App) error {
+		var target models.Message
+		if err := scoped.DB.Unscoped().Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", messageID, organizationID).
+			First(&target).Error; err != nil {
+			return err
+		}
+		recorded := make([]any, 0, sentReactionWAMIDsLimit)
+		if existing, ok := target.Metadata[sentReactionWAMIDsMetadataKey].([]any); ok {
+			for _, value := range existing {
+				if text, ok := value.(string); ok && text != "" && text != wamid {
+					recorded = append(recorded, text)
+				}
+			}
+		}
+		recorded = append(recorded, wamid)
+		if len(recorded) > sentReactionWAMIDsLimit {
+			recorded = recorded[len(recorded)-sentReactionWAMIDsLimit:]
+		}
+		metadata := cloneMessageMetadata(target.Metadata)
+		metadata[sentReactionWAMIDsMetadataKey] = recorded
+		return scoped.DB.Unscoped().Model(&models.Message{}).
+			Where("id = ? AND organization_id = ?", messageID, organizationID).
+			UpdateColumn("metadata", metadata).Error
 	})
 }
 

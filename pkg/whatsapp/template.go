@@ -3,6 +3,7 @@ package whatsapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -403,6 +404,29 @@ func (c *Client) FetchTemplates(ctx context.Context, account *Account) ([]MetaTe
 
 	c.Log.Info("Fetched templates from Meta", "count", len(result.Data))
 	return result.Data, nil
+}
+
+// FetchTemplate fetches one template's current name, language and status from
+// Meta's API by its template ID (GET /{template-id}).
+func (c *Client) FetchTemplate(ctx context.Context, account *Account, templateID string) (*MetaTemplate, error) {
+	if account == nil {
+		return nil, errors.New("WhatsApp account is required")
+	}
+	id, err := normalizeGraphObjectID(templateID, "template_id")
+	if err != nil {
+		return nil, err
+	}
+	apiVersion, err := normalizeGraphAPIVersion(account.APIVersion)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("%s/%s/%s?fields=id,name,language,status", c.getBaseURL(), apiVersion, id)
+	result, err := doJSON[MetaTemplate](ctx, c, http.MethodGet, url, nil, account.AccessToken)
+	if err != nil {
+		c.Log.Error("Failed to fetch template", "error", err, "template_id", id)
+		return nil, err
+	}
+	return &result, nil
 }
 
 // DeleteTemplate deletes a template from Meta's API

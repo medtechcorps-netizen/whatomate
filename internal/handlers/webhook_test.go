@@ -827,6 +827,9 @@ func TestWhatsAppOrphanStatusAge(t *testing.T) {
 		"malformed":          {raw: "not-a-time", usable: false, settled: false},
 		"zero":               {raw: "0", usable: false, settled: false},
 		"negative":           {raw: "-60", usable: false, settled: false},
+		"tiny":               {raw: "5", usable: false, settled: false},
+		"below the floor":    {raw: strconv.FormatInt(whatsAppEventUnixFloor-1, 10), usable: false, settled: false},
+		"at the floor":       {raw: strconv.FormatInt(whatsAppEventUnixFloor, 10), usable: true, settled: true},
 		"milliseconds":       {raw: strconv.FormatInt(now.Add(-time.Hour).UnixMilli(), 10), usable: false, settled: false},
 		"future":             {raw: unix(now.Add(whatsAppStatusClockSkew + time.Second)), usable: false, settled: false},
 		"within clock skew":  {raw: unix(now.Add(whatsAppStatusClockSkew)), usable: true, settled: false},
@@ -1172,9 +1175,10 @@ func TestWhatsAppStatusOwnerAbsentProof(t *testing.T) {
 
 // On a Coexistence account the Message is created by the smb_message_echoes
 // echo, whose ingestion has no bound short of Meta's retries, so a status
-// that overtakes its echo is retried at any age and applies once the echo is
-// stored. The classic-only grace therefore cannot drop a Coexistence tick,
-// before or after a mode switch.
+// that overtakes its echo is retried for the whole Coexistence backstop
+// (whatsAppCoexistenceOrphanStatusGrace) and applies once the echo is
+// stored. The classic grace therefore cannot drop a Coexistence tick, before
+// or after a mode switch.
 func TestWebhookStatusOvertakingCoexistenceEchoAppliesAfterEcho(t *testing.T) {
 	app := webhookTestApp(t)
 	for _, tc := range []struct {
@@ -1184,6 +1188,7 @@ func TestWebhookStatusOvertakingCoexistenceEchoAppliesAfterEcho(t *testing.T) {
 		{name: "fresh", age: 0},
 		{name: "just past the classic grace", age: whatsAppOrphanStatusGrace + time.Minute},
 		{name: "six hours", age: 6 * time.Hour},
+		{name: "just inside the coexistence backstop", age: whatsAppCoexistenceOrphanStatusGrace - time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			account := orphanStatusTestAccount(t, app, true)

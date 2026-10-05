@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -835,7 +837,7 @@ func (a *App) processIncomingMessageFull(phoneNumberID string, msg IncomingTextM
 
 	// Handle reaction messages specially - they update existing messages, not create new ones
 	if msg.Type == "reaction" && msg.Reaction != nil {
-		a.handleIncomingReaction(account, msg.From, msg.Reaction.MessageID, msg.Reaction.Emoji, profileName)
+		a.handleIncomingReactionEvent(account, msg.From, msg.Reaction.MessageID, msg.Reaction.Emoji, profileName, msg.ID, msg.Timestamp)
 		return
 	}
 
@@ -2365,10 +2367,109 @@ type Reaction struct {
 	FromUser  string `json:"from_user,omitempty"`  // User ID if from agent
 }
 
+// incomingReactionEventsMetadataKey maps, in the metadata of a reacted-to
+// message, each reacting phone number to the last second ("timestamp", Unix
+// seconds) in which a reaction event from it was applied, and the WAMIDs
+// ("ids") of the events applied in that second. It is kept when the reaction
+// itself is removed, so a replayed older reaction cannot bring it back.
+const incomingReactionEventsMetadataKey = "whatsapp_reaction_events"
+
+// incomingReactionEventIDsLimit bounds the WAMIDs kept for one second.
+const incomingReactionEventIDsLimit = 16
+
+// incomingReactionLastEvent returns the second and the WAMIDs recorded for
+// phone by incomingReactionEventsMetadataKey.
+func incomingReactionLastEvent(metadata models.JSONB, phone string) (int64, []string) {
+	events, _ := metadata[incomingReactionEventsMetadataKey].(map[string]any)
+	last, _ := events[phone].(map[string]any)
+	if last == nil {
+		return 0, nil
+	}
+	var lastAt int64
+	switch value := last["timestamp"].(type) {
+	case float64:
+		lastAt = int64(value)
+	case int64:
+		lastAt = value
+	case json.Number:
+		lastAt, _ = value.Int64()
+	}
+	var ids []string
+	switch values := last["ids"].(type) {
+	case []any:
+		for _, value := range values {
+			if id, ok := value.(string); ok && id != "" {
+				ids = append(ids, id)
+			}
+		}
+	case []string:
+		ids = append(ids, values...)
+	}
+	return lastAt, ids
+}
+
+// incomingReactionEventIsStale reports whether a reaction event from phone
+// is a replay of, or older than, the reactions already applied to the message
+// whose metadata is given: its WAMID was applied in the last recorded second,
+// or it is stamped in an earlier second. Two different reactions in the same
+// second are both applied, in the order they arrive; a replay of either is
+// recognised by its WAMID. An event without an ID and timestamp is never
+// stale.
+func incomingReactionEventIsStale(metadata models.JSONB, phone, eventID string, eventAt int64) bool {
+	lastAt, ids := incomingReactionLastEvent(metadata, phone)
+	if eventID != "" && slices.Contains(ids, eventID) {
+		return true
+	}
+	return eventAt > 0 && lastAt > 0 && eventAt < lastAt
+}
+
+// nextIncomingReactionEvent is the incomingReactionEventsMetadataKey record
+// for phone once the event eventID at eventAt is applied: a newer second
+// replaces the recorded one and its WAMIDs; an event in the recorded second
+// (or without a timestamp) is added to them.
+func nextIncomingReactionEvent(metadata models.JSONB, phone, eventID string, eventAt int64) map[string]any {
+	lastAt, ids := incomingReactionLastEvent(metadata, phone)
+	if eventAt > lastAt {
+		lastAt, ids = eventAt, nil
+	}
+	if eventID != "" {
+		ids = append(ids, eventID)
+		if len(ids) > incomingReactionEventIDsLimit {
+			ids = ids[len(ids)-incomingReactionEventIDsLimit:]
+		}
+	}
+	if ids == nil {
+		ids = []string{}
+	}
+	return map[string]any{"timestamp": lastAt, "ids": ids}
+}
+
 // handleIncomingReaction handles incoming reaction messages from WhatsApp
+// without an event identity, so no replay guard applies.
 func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone, messageWAMID, emoji, profileName string) {
+	a.handleIncomingReactionEvent(account, fromPhone, messageWAMID, emoji, profileName, "", "")
+}
+
+// handleIncomingReactionEvent handles an incoming reaction message. eventID
+// and eventTimestamp are the reaction message's own WAMID and timestamp, which
+// Meta keeps on its retries: a reaction that is a replay of one already
+// applied from the same phone to the same message in the last recorded
+// second, or that is stamped in an earlier second, is ignored
+// (incomingReactionEventIsStale), so a replayed POST cannot restore an older
+// reaction or announce it again.
+func (a *App) handleIncomingReactionEvent(account *models.WhatsAppAccount, fromPhone, messageWAMID, emoji, profileName, eventID, eventTimestamp string) {
 	if a == nil || account == nil || account.OrganizationID == uuid.Nil || account.ID == uuid.Nil {
 		return
+	}
+	eventID = strings.TrimSpace(eventID)
+	eventAt, parseErr := strconv.ParseInt(strings.TrimSpace(eventTimestamp), 10, 64)
+	if parseErr != nil {
+		eventAt = 0
+	}
+	if eventAt != 0 && usableWhatsAppEventUnix(eventAt, time.Now()) == 0 {
+		a.Log.Warn("Reaction has an unusable timestamp; ordering it by its WAMID only",
+			"reaction_id", eventID, "timestamp", eventAt)
+		eventAt = 0
 	}
 	a.Log.Info("Handling incoming reaction",
 		"from", fromPhone,
@@ -2388,6 +2489,7 @@ func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone,
 	accountCopy := *account
 	var updatedMessageID, contactID uuid.UUID
 	var newReactions []Reaction
+	staleEvent := false
 	err := root.WithCommittedTenantApp(account.OrganizationID, func(scoped *App) error {
 		// Find the exact WhatsApp-owner candidate without trusting the mutable
 		// account display name. The resolver below proves the stable account,
@@ -2453,6 +2555,22 @@ func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone,
 		}
 
 		metadata := cloneMessageMetadata(resolved.Message.Metadata)
+		// The message row is locked, so this check and the write below are
+		// serialised with every other reaction to the same message.
+		if incomingReactionEventIsStale(metadata, fromPhone, eventID, eventAt) {
+			staleEvent = true
+			return nil
+		}
+		if eventID != "" || eventAt > 0 {
+			events := make(map[string]any)
+			if existing, ok := metadata[incomingReactionEventsMetadataKey].(map[string]any); ok {
+				for phone, value := range existing {
+					events[phone] = value
+				}
+			}
+			events[fromPhone] = nextIncomingReactionEvent(metadata, fromPhone, eventID, eventAt)
+			metadata[incomingReactionEventsMetadataKey] = events
+		}
 		var reactions []Reaction
 		if reactionsArray, ok := metadata["reactions"].([]any); ok {
 			for _, raw := range reactionsArray {
@@ -2489,6 +2607,11 @@ func (a *App) handleIncomingReaction(account *models.WhatsAppAccount, fromPhone,
 	}
 	if err != nil {
 		a.Log.Error("Failed to update message reaction", "error", err, "wamid", messageWAMID)
+		return
+	}
+	if staleEvent {
+		a.Log.Info("Ignoring replayed or older WhatsApp reaction",
+			"wamid", messageWAMID, "reaction_id", eventID, "timestamp", eventAt)
 		return
 	}
 	if updatedMessageID == uuid.Nil {

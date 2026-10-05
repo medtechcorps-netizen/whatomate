@@ -141,13 +141,45 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 
 	// Ensure a CallLog exists for this call. WhatsApp may send "connect" as the
 	// first event (skipping "ringing"), so we create the record on demand.
-	callLog := a.getOrCreateCallLog(account, contact, ce.ID, ce.From, now)
+	callLog, created := a.getOrCreateCallLog(account, contact, ce.ID, ce.From, now)
 	if callLog == nil {
 		return
 	}
 
+	// Replay guard. Meta replays a whole POST until it is acknowledged, so an
+	// event may arrive again after it, or a later event of the same call, was
+	// applied. An ended call accepts no further event: a replayed ringing or
+	// connect must not ring agents, reopen the call log or start a new WebRTC
+	// session, and a replayed end must not move ended_at or the duration. Only
+	// the idempotent session cleanup still runs for an end event, in case a
+	// session outlived the call log's end (for example an error event ended it
+	// first). The exception is the call's own end event after an error on an
+	// earlier event marked the call failed (incomingCallEndClaimsFailedLog).
+	var eventError *string
+	if ce.Error != nil {
+		eventError = &ce.Error.Message
+	}
+	if incomingCallLogEnded(callLog.Status) && !incomingCallEndClaimsFailedLog(callLog, ce.Event, eventError) {
+		if a.CallManager != nil && isIncomingCallEndEvent(ce.Event) {
+			a.CallManager.EndCall(ce.ID)
+		}
+		a.Log.Info("Ignoring call event for a call that has already ended",
+			"call_id", ce.ID, "event", ce.Event, "status", callLog.Status)
+		return
+	}
+
+	// endClaimed reports, for an end event, whether this delivery ended the
+	// call (see the error write below).
+	endClaimed := false
 	switch ce.Event {
 	case "ringing":
+		// Only the event that created the call log rings agents. A ringing
+		// event for an existing call log is a replay, or arrived after a
+		// later event of the call.
+		if !created {
+			a.Log.Info("Ignoring repeated call ringing event", "call_id", ce.ID, "status", callLog.Status)
+			break
+		}
 		// Broadcast incoming call via WebSocket (no SDP yet, WebRTC starts on "connect")
 		payload := map[string]any{
 			"call_log_id":  callLog.ID.String(),
@@ -183,11 +215,13 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 			sdpOffer = ce.Session.SDP
 		}
 
-		// Update call status to answered
-		a.DB.Model(callLog).Updates(map[string]any{
-			"status":      models.CallStatusAnswered,
-			"answered_at": now,
-		})
+		// Update call status to answered. Only the first connect (or in_call)
+		// of a call that has not ended claims the transition; a replay finds
+		// answered_at already set and changes nothing.
+		if !a.claimIncomingCallAnswered(callLog, now) {
+			a.Log.Info("Ignoring repeated call connect event", "call_id", ce.ID, "status", callLog.Status)
+			break
+		}
 
 		// Delegate to CallManager with the SDP offer. Resolve the sticky
 		// agent again here — Meta echoes biz_opaque_callback_data on every
@@ -210,11 +244,11 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 		})
 
 	case "in_call":
-		// Update call status to answered
-		a.DB.Model(callLog).Updates(map[string]any{
-			"status":      models.CallStatusAnswered,
-			"answered_at": now,
-		})
+		// Update call status to answered (once, as for connect)
+		if !a.claimIncomingCallAnswered(callLog, now) {
+			a.Log.Info("Ignoring repeated call in_call event", "call_id", ce.ID, "status", callLog.Status)
+			break
+		}
 
 		// Notify CallManager if session exists
 		if a.IsCallingEnabledForOrg(account.OrganizationID) {
@@ -257,11 +291,18 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 		if callLog.DisconnectedBy == "" {
 			updates["disconnected_by"] = models.DisconnectedByClient
 		}
-		a.DB.Model(callLog).Updates(updates)
+		ended := a.endIncomingCallLog(callLog, updates, eventError)
+		endClaimed = ended
 
 		// Notify CallManager to clean up
 		if a.CallManager != nil {
 			a.CallManager.EndCall(ce.ID)
+		}
+		if !ended {
+			// A concurrent delivery of this or another end event ended the
+			// call first and already announced it.
+			a.Log.Info("Ignoring repeated call end event", "call_id", ce.ID, "event", ce.Event)
+			break
 		}
 
 		disconnectedBy := string(callLog.DisconnectedBy)
@@ -278,11 +319,15 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 		})
 
 	case "missed", "unanswered":
-		a.DB.Model(callLog).Updates(map[string]any{
+		endClaimed = a.endIncomingCallLog(callLog, map[string]any{
 			"status":          models.CallStatusMissed,
 			"ended_at":        now,
 			"disconnected_by": models.DisconnectedByClient,
-		})
+		}, eventError)
+		if !endClaimed {
+			a.Log.Info("Ignoring repeated call end event", "call_id", ce.ID, "event", ce.Event)
+			break
+		}
 
 		a.broadcastCallEvent(account.OrganizationID, websocket.TypeCallEnded, map[string]any{
 			"call_id":    ce.ID,
@@ -295,8 +340,11 @@ func (a *App) processCallWebhook(phoneNumberID string, call any) {
 		a.Log.Warn("Unknown call event", "event", ce.Event, "call_id", ce.ID)
 	}
 
-	// Handle error in call event
-	if ce.Error != nil {
+	// Handle error in call event. An end event that did not end the call is a
+	// copy that a concurrent delivery overtook between the guard above and its
+	// own claim; like a replay stopped by the guard, it changes nothing, so it
+	// does not move ended_at either.
+	if ce.Error != nil && (endClaimed || !isIncomingCallEndEvent(ce.Event)) {
 		a.DB.Model(&models.CallLog{}).
 			Where("whatsapp_call_id = ? AND organization_id = ?", ce.ID, account.OrganizationID).
 			Updates(map[string]any{
@@ -323,15 +371,108 @@ func (a *App) resolveCallWebhookOrganizationID(phoneNumberID string) (uuid.UUID,
 	return account.OrganizationID, nil
 }
 
+// endedIncomingCallStatuses are the call log statuses after which an incoming
+// call accepts no further webhook event.
+var endedIncomingCallStatuses = []models.CallStatus{
+	models.CallStatusCompleted,
+	models.CallStatusMissed,
+	models.CallStatusRejected,
+	models.CallStatusFailed,
+}
+
+func incomingCallLogEnded(status models.CallStatus) bool {
+	for _, ended := range endedIncomingCallStatuses {
+		if status == ended {
+			return true
+		}
+	}
+	return false
+}
+
+func isIncomingCallEndEvent(event string) bool {
+	switch event {
+	case "ended", "terminate", "missed", "unanswered":
+		return true
+	default:
+		return false
+	}
+}
+
+// incomingCallEndClaimsFailedLog reports whether an end event may still end a
+// call log that an error on an earlier event of the call marked failed. Before
+// the replay guards the call's end event was then applied as usual: it
+// recorded the duration and the end, replaced the failed status with the final
+// one (the error message stays) and announced call_ended. It still is, once:
+// the final status is itself an ended status, so a replay of the end event
+// finds an ended call. An end event that carries the error the call log
+// already stores is not this case: it is a replay of the end event whose own
+// error failed the call (the error is written after the end), and it changes
+// nothing. eventError is the event's error message, nil when it has no error.
+func incomingCallEndClaimsFailedLog(callLog *models.CallLog, event string, eventError *string) bool {
+	return callLog != nil && callLog.Status == models.CallStatusFailed && isIncomingCallEndEvent(event) &&
+		(eventError == nil || *eventError != callLog.ErrorMessage)
+}
+
+// claimIncomingCallAnswered marks the call log answered at now, unless it was
+// already answered or has ended. It reports whether this event made the
+// transition; a replayed connect or in_call does not. The check and the write
+// are one statement, so two concurrent deliveries cannot both claim it. A
+// failed write is logged and treated as claimed, as before this guard, so a
+// database error never stops a call from being answered.
+func (a *App) claimIncomingCallAnswered(callLog *models.CallLog, now time.Time) bool {
+	result := a.DB.Model(&models.CallLog{}).
+		Where("id = ? AND organization_id = ? AND answered_at IS NULL AND status NOT IN ?",
+			callLog.ID, callLog.OrganizationID, endedIncomingCallStatuses).
+		Updates(map[string]any{
+			"status":      models.CallStatusAnswered,
+			"answered_at": now,
+		})
+	if result.Error != nil {
+		a.Log.Error("Failed to record answered call", "error", result.Error, "call_log_id", callLog.ID)
+		return true
+	}
+	if result.RowsAffected == 0 {
+		return false
+	}
+	callLog.Status = models.CallStatusAnswered
+	callLog.AnsweredAt = &now
+	return true
+}
+
+// endIncomingCallLog applies updates (which end the call) unless the call log
+// has already ended, and reports whether this event ended it. A call log that
+// an earlier error marked failed is still ended once by an end event that
+// does not carry the same error (incomingCallEndClaimsFailedLog); eventError
+// is the event's error message, nil when it has none. The check is part of
+// the UPDATE, so of two concurrent deliveries only one ends the call. As for
+// claimIncomingCallAnswered, a failed write is logged and treated as applied.
+func (a *App) endIncomingCallLog(callLog *models.CallLog, updates map[string]any, eventError *string) bool {
+	query := a.DB.Model(&models.CallLog{}).
+		Where("id = ? AND organization_id = ?", callLog.ID, callLog.OrganizationID)
+	if eventError == nil {
+		query = query.Where("(status NOT IN ? OR status = ?)", endedIncomingCallStatuses, models.CallStatusFailed)
+	} else {
+		query = query.Where("(status NOT IN ? OR (status = ? AND COALESCE(error_message, '') <> ?))",
+			endedIncomingCallStatuses, models.CallStatusFailed, *eventError)
+	}
+	result := query.Updates(updates)
+	if result.Error != nil {
+		a.Log.Error("Failed to record ended call", "error", result.Error, "call_log_id", callLog.ID)
+		return true
+	}
+	return result.RowsAffected > 0
+}
+
 // getOrCreateCallLog finds an existing CallLog by WhatsApp call ID, or creates one
 // if it doesn't exist. This handles cases where WhatsApp skips the "ringing" event
-// and sends "connect" as the first event.
-func (a *App) getOrCreateCallLog(account *models.WhatsAppAccount, contact *models.Contact, callID, callerPhone string, now time.Time) *models.CallLog {
+// and sends "connect" as the first event. created reports whether this call
+// created the CallLog.
+func (a *App) getOrCreateCallLog(account *models.WhatsAppAccount, contact *models.Contact, callID, callerPhone string, now time.Time) (callLogResult *models.CallLog, created bool) {
 	var callLog models.CallLog
 	err := a.DB.Where("whatsapp_call_id = ? AND organization_id = ?", callID, account.OrganizationID).
 		First(&callLog).Error
 	if err == nil {
-		return &callLog
+		return &callLog, false
 	}
 
 	// Create a new call log
@@ -353,11 +494,11 @@ func (a *App) getOrCreateCallLog(account *models.WhatsAppAccount, contact *model
 
 	if err := a.DB.Create(&callLog).Error; err != nil {
 		a.Log.Error("Failed to create call log", "error", err)
-		return nil
+		return nil, false
 	}
 
 	a.Log.Info("Created call log", "call_id", callID, "call_log_id", callLog.ID)
-	return &callLog
+	return &callLog, true
 }
 
 // handleOrphanedOutgoingCallEvent handles business-initiated call webhooks
@@ -386,9 +527,26 @@ func (a *App) handleOrphanedOutgoingCallEvent(organizationID uuid.UUID, callID, 
 			finalStatus = models.CallStatusMissed
 		}
 
+		// Replay guard: a terminate that would change nothing but ended_at
+		// was already applied (by this event's earlier delivery, or by an
+		// agent hangup that recorded the same outcome) and was announced.
+		if callLog.EndedAt != nil && callLog.Status == finalStatus &&
+			(duration <= 0 || callLog.Duration == duration) {
+			a.Log.Info("Ignoring repeated orphaned outgoing call terminate", "call_id", callID, "status", callLog.Status)
+			return
+		}
+
+		// A call that has already ended keeps its first ended_at; this
+		// terminate only corrects its status or duration (Meta's duration
+		// replaces the one an agent hangup computed).
+		endedAt := now
 		updates := map[string]any{
-			"status":   finalStatus,
-			"ended_at": now,
+			"status": finalStatus,
+		}
+		if callLog.EndedAt != nil {
+			endedAt = *callLog.EndedAt
+		} else {
+			updates["ended_at"] = now
 		}
 		if duration > 0 {
 			updates["duration"] = duration
@@ -397,16 +555,27 @@ func (a *App) handleOrphanedOutgoingCallEvent(organizationID uuid.UUID, callID, 
 		if callLog.DisconnectedBy == "" {
 			updates["disconnected_by"] = models.DisconnectedByClient
 		}
-		a.DB.Model(&models.CallLog{}).
+		// The statement repeats the replay guard, so that of two concurrent
+		// deliveries of this terminate only one applies and announces it. A
+		// failed write is logged and announced, as before this guard.
+		result := a.DB.Model(&models.CallLog{}).
 			Where("id = ? AND organization_id = ?", callLog.ID, organizationID).
+			Where("NOT (ended_at IS NOT NULL AND status = ? AND (? <= 0 OR duration = ?))",
+				finalStatus, duration, duration).
 			Updates(updates)
+		if result.Error != nil {
+			a.Log.Error("Failed to record orphaned outgoing call terminate", "error", result.Error, "call_id", callID)
+		} else if result.RowsAffected == 0 {
+			a.Log.Info("Ignoring repeated orphaned outgoing call terminate", "call_id", callID, "status", finalStatus)
+			return
+		}
 
 		a.broadcastCallEvent(callLog.OrganizationID, websocket.TypeOutgoingCallEnded, map[string]any{
 			"call_log_id": callLog.ID.String(),
 			"call_id":     callID,
 			"status":      string(finalStatus),
 			"duration":    duration,
-			"ended_at":    now.Format(time.RFC3339),
+			"ended_at":    endedAt.Format(time.RFC3339),
 		})
 
 		a.Log.Info("Handled orphaned outgoing call terminate", "call_id", callID, "duration", duration)
@@ -482,6 +651,45 @@ type CallPermissionReplyData struct {
 	IsPermanent         bool   `json:"is_permanent"`
 	ExpirationTimestamp int64  `json:"expiration_timestamp,omitempty"`
 	ResponseSource      string `json:"response_source"`
+	// RepliedAt is the reply message's own timestamp (Unix seconds), which
+	// Meta keeps on its retries; 0 when the payload carries none.
+	RepliedAt int64 `json:"-"`
+	// RequestMessageID is the WAMID of the permission request the reply
+	// answers (the reply message's context.id); "" when the payload has none.
+	RequestMessageID string `json:"-"`
+}
+
+// callPermissionReplyRequestSkew is how much earlier than a permission row's
+// requested_at a reply may be stamped and still answer that request when the
+// reply does not name its request. The row is created only after the Graph
+// send returns (bounded by whatsapp.DefaultTimeout, 30s), while Meta may
+// answer an automatic reply as soon as it accepts the request; the margin also
+// absorbs clock skew. requested_at is the server's clock and the reply's time
+// is Meta's: with the server more than this ahead of Meta, a reply that does
+// not name its request finds no request sent before it and is recorded as an
+// out-of-band reply instead (see processCallPermissionReply).
+const callPermissionReplyRequestSkew = 2 * time.Minute
+
+// callPermissionReplyNewerCondition is the SQL condition under which a
+// call_permissions row may take a reply stamped repliedAt (Unix seconds, > 0)
+// with status: the row records no response yet, or a response from an earlier
+// second, or from the same second with the other status. A replay of the
+// stored reply, or an older reply, matches neither. responded_at is the stored
+// reply's own time (or, for a row answered before replies were ordered, the
+// time it was processed). A reply that does not name its request only ever
+// reaches a request sent before it: processCallPermissionReply selects the
+// row that way, and requested_at never changes.
+//
+// The condition is part of the UPDATE rather than checked against a row read
+// earlier: each delivery runs in its own goroutine, and PostgreSQL re-checks
+// the condition against the row as a concurrent delivery left it. Of two
+// different replies processed concurrently, the newer one is therefore applied
+// whichever commits first, and two copies of one reply apply it once.
+func callPermissionReplyNewerCondition(repliedAt int64, status models.CallPermissionStatus) (string, []any) {
+	return `(responded_at IS NULL OR (
+		FLOOR(EXTRACT(EPOCH FROM responded_at)) < ?
+		OR (FLOOR(EXTRACT(EPOCH FROM responded_at)) = ? AND status <> ?)
+	))`, []any{repliedAt, repliedAt, string(status)}
 }
 
 // processCallPermissionReply handles the call_permission_reply interactive webhook.
@@ -511,49 +719,87 @@ func (a *App) processCallPermissionReply(phoneNumberID, fromPhone string, reply 
 		return
 	}
 
-	// Load the most recent permission request for this contact. If none exists
-	// (e.g. the permission prompt was sent out-of-band by Meta, or the request
-	// went out while outside business calling hours), create one from the reply
-	// so the grant/decline is captured instead of being dropped.
+	repliedAt := usableWhatsAppEventUnix(reply.RepliedAt, time.Now())
+	if reply.RepliedAt != 0 && repliedAt == 0 {
+		a.Log.Warn("Call permission reply has an unusable timestamp; applying it unordered",
+			"contact_id", contact.ID, "replied_at", reply.RepliedAt)
+	}
+
+	// The reply names the request it answers (context.id, the WAMID stored as
+	// CallPermission.message_id), so it updates exactly that row. Without a
+	// context, or for a request ReReply did not record, it falls back to the
+	// contact's most recent request; with a usable time, to the most recent
+	// one sent before the reply (allowing callPermissionReplyRequestSkew), so
+	// that a reply delivered after a newer request was sent answers an earlier
+	// request rather than the newer one, and a replay finds the request it
+	// answered the first time. If none exists (e.g. the permission prompt was
+	// sent out-of-band by Meta, the request went out while outside business
+	// calling hours, or every recorded request is newer than the reply),
+	// create one from the reply so the grant/decline is captured instead of
+	// being dropped; its requested_at is the reply's time, so that this
+	// fallback finds it again for a replay of the reply.
 	var permission models.CallPermission
 	isNewPermission := false
-	if err := a.DB.Where("organization_id = ? AND contact_id = ?", account.OrganizationID, contact.ID).
-		Order("created_at DESC").
-		First(&permission).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
+	answersRow := false
+	if requestWAMID := strings.TrimSpace(reply.RequestMessageID); requestWAMID != "" {
+		err := a.DB.Where("organization_id = ? AND contact_id = ? AND BTRIM(message_id) = ?",
+			account.OrganizationID, contact.ID, requestWAMID).
+			Order("created_at DESC").
+			First(&permission).Error
+		switch {
+		case err == nil:
+			answersRow = true
+		case !errors.Is(err, gorm.ErrRecordNotFound):
 			a.Log.Error("Failed to load call permission for reply", "error", err, "contact_id", contact.ID)
 			return
 		}
-		isNewPermission = true
-		permission = models.CallPermission{
-			BaseModel:       models.BaseModel{ID: uuid.New()},
-			OrganizationID:  account.OrganizationID,
-			ContactID:       contact.ID,
-			WhatsAppAccount: account.Name,
-			Status:          models.CallPermissionPending,
+	}
+	if !answersRow {
+		fallback := a.DB.Where("organization_id = ? AND contact_id = ?", account.OrganizationID, contact.ID)
+		if repliedAt > 0 {
+			fallback = fallback.Where("(requested_at IS NULL OR requested_at <= ?)",
+				time.Unix(repliedAt, 0).Add(callPermissionReplyRequestSkew))
 		}
-		a.Log.Info("No prior permission record for reply; creating one (out-of-band grant)", "contact_id", contact.ID)
+		if err := fallback.Order("created_at DESC").First(&permission).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				a.Log.Error("Failed to load call permission for reply", "error", err, "contact_id", contact.ID)
+				return
+			}
+			isNewPermission = true
+			permission = models.CallPermission{
+				BaseModel:       models.BaseModel{ID: uuid.New()},
+				OrganizationID:  account.OrganizationID,
+				ContactID:       contact.ID,
+				WhatsAppAccount: account.Name,
+				Status:          models.CallPermissionPending,
+			}
+			if repliedAt > 0 {
+				permission.RequestedAt = time.Unix(repliedAt, 0)
+			}
+			a.Log.Info("No prior permission record for reply; creating one (out-of-band grant)", "contact_id", contact.ID)
+		}
 	}
 
+	newStatus := models.CallPermissionDeclined
+	if reply.Response == "accept" {
+		newStatus = models.CallPermissionAccepted
+	}
+
+	// responded_at records the reply's own time when Meta stamped it, so that
+	// the next reply is ordered against it rather than against the time this
+	// one happened to be processed.
 	now := time.Now()
+	if repliedAt > 0 {
+		now = time.Unix(repliedAt, 0)
+	}
 	permission.RespondedAt = &now
+	permission.Status = newStatus
 
 	var expiresAt *time.Time
-	if reply.Response == "accept" {
-		permission.Status = models.CallPermissionAccepted
-		if reply.ExpirationTimestamp > 0 {
-			t := time.Unix(reply.ExpirationTimestamp, 0)
-			expiresAt = &t
-			permission.ExpiresAt = &t
-		}
-		a.Log.Info("Call permission accepted",
-			"contact_id", contact.ID,
-			"is_permanent", reply.IsPermanent,
-			"expiration", reply.ExpirationTimestamp,
-		)
-	} else {
-		permission.Status = models.CallPermissionDeclined
-		a.Log.Info("Call permission declined", "contact_id", contact.ID)
+	if newStatus == models.CallPermissionAccepted && reply.ExpirationTimestamp > 0 {
+		t := time.Unix(reply.ExpirationTimestamp, 0)
+		expiresAt = &t
+		permission.ExpiresAt = &t
 	}
 
 	if isNewPermission {
@@ -569,7 +815,57 @@ func (a *App) processCallPermissionReply(phoneNumberID, fromPhone string, reply 
 		if expiresAt != nil {
 			updates["expires_at"] = *expiresAt
 		}
-		a.DB.Model(&permission).Updates(updates)
+		query := a.DB.Model(&models.CallPermission{}).
+			Where("id = ? AND organization_id = ?", permission.ID, account.OrganizationID)
+		// Replay guard: Meta replays a whole POST until it is acknowledged,
+		// and this reply may also arrive after a newer one. Only a reply newer
+		// than the stored response is applied. A reply without a usable
+		// timestamp cannot be ordered and applies as before this guard.
+		if repliedAt > 0 {
+			condition, args := callPermissionReplyNewerCondition(repliedAt, newStatus)
+			query = query.Where(condition, args...)
+		}
+		result := query.Updates(updates)
+		if result.Error != nil {
+			// The reply is still announced, as before the replay guards: it
+			// runs after the POST was acknowledged, so Meta does not deliver
+			// it again, and calls are not gated on this row.
+			a.Log.Error("Failed to update call permission from reply; announcing it anyway",
+				"error", result.Error, "permission_id", permission.ID)
+		} else if result.RowsAffected == 0 {
+			a.Log.Info("Ignoring replayed or older call permission reply",
+				"contact_id", contact.ID,
+				"permission_id", permission.ID,
+				"replied_at", repliedAt,
+				"status", newStatus,
+				"answers_request", answersRow,
+			)
+			return
+		}
+	}
+
+	if newStatus == models.CallPermissionAccepted {
+		a.Log.Info("Call permission accepted",
+			"contact_id", contact.ID,
+			"permission_id", permission.ID,
+			"is_permanent", reply.IsPermanent,
+			"expiration", reply.ExpirationTimestamp,
+		)
+	} else {
+		a.Log.Info("Call permission declined", "contact_id", contact.ID, "permission_id", permission.ID)
+	}
+
+	// Agents hold one permission state per contact, so a reply is not
+	// announced over a newer reply that another request of the contact
+	// already recorded.
+	if repliedAt > 0 && a.callPermissionHasNewerReply(account.OrganizationID, contact.ID, permission.ID, repliedAt) {
+		a.Log.Info("Call permission reply recorded but not announced: the contact has a newer reply",
+			"contact_id", contact.ID,
+			"permission_id", permission.ID,
+			"replied_at", repliedAt,
+			"status", newStatus,
+		)
+		return
 	}
 
 	// Broadcast permission update to agents via WebSocket
@@ -583,6 +879,26 @@ func (a *App) processCallPermissionReply(phoneNumberID, fromPhone string, reply 
 		wsPayload["expires_at"] = expiresAt.Format(time.RFC3339)
 	}
 	a.broadcastCallEvent(account.OrganizationID, websocket.TypeCallPermissionUpdate, wsPayload)
+}
+
+// callPermissionHasNewerReply reports whether another permission row of the
+// contact records a reply stamped in a later second than repliedAt. Replies to
+// different requests are ordered per row (callPermissionReplyNewerCondition),
+// while call_permission_update is keyed by contact: an older reply applied to
+// its own request after a newer reply to another request must not replace the
+// newer answer on the agents' screens. A failed lookup reports false, so the
+// reply is announced as before.
+func (a *App) callPermissionHasNewerReply(organizationID, contactID, permissionID uuid.UUID, repliedAt int64) bool {
+	var newer int64
+	if err := a.DB.Model(&models.CallPermission{}).
+		Where(`organization_id = ? AND contact_id = ? AND id <> ? AND responded_at IS NOT NULL
+			AND FLOOR(EXTRACT(EPOCH FROM responded_at)) > ?`, organizationID, contactID, permissionID, repliedAt).
+		Count(&newer).Error; err != nil {
+		a.Log.Error("Failed to compare call permission reply with the contact's other replies",
+			"error", err, "contact_id", contactID, "permission_id", permissionID)
+		return false
+	}
+	return newer > 0
 }
 
 // validateStickyAgent runs the per-call eligibility checks (same-org,
