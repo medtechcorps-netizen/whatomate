@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -174,4 +175,36 @@ func TestSLAEscalationWarnsOnceAcrossConcurrentTicks(t *testing.T) {
 	var stored models.AgentTransfer
 	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
 	assert.Equal(t, 1, stored.SLA.EscalationLevel)
+}
+
+// A direct send from inside a tenant transaction would wait on whatever that
+// transaction holds (here the organization policy fence) until the 30 s send
+// timeout. It is refused instead; callers queue it with sendSLATextAfterCommit.
+func TestSLATextRefusesToSendInsideCallerTransaction(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	transfer := createTransfer(models.SLATracking{})
+
+	started := time.Now()
+	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+		if err := database.LockOrganizationPolicyScope(scoped.DB, organization.ID); err != nil {
+			return err
+		}
+		NewSLAProcessor(scoped, time.Minute).sendSLATextToCustomer(*transfer, "Synthetic SLA notice", "Synthetic refused notice")
+		return nil
+	}))
+	assert.Less(t, time.Since(started), 10*time.Second)
+	assert.Empty(t, deliveries())
+	assert.Zero(t, countSLATestOutgoing(t, app, transfer))
+
+	// The same notice queued for after commit is delivered once.
+	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+		if err := database.LockOrganizationPolicyScope(scoped.DB, organization.ID); err != nil {
+			return err
+		}
+		NewSLAProcessor(scoped, time.Minute).sendSLATextAfterCommit(*transfer, "Synthetic SLA notice", "Synthetic queued notice")
+		return nil
+	}))
+	require.Len(t, deliveries(), 1)
+	assert.Equal(t, "Synthetic queued notice", deliveries()[0].Body)
+	assert.EqualValues(t, 1, countSLATestOutgoing(t, app, transfer))
 }
