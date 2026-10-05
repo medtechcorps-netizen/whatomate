@@ -420,8 +420,15 @@ func (a *App) EvaluateWhatsAppIdentityReviewAdmission(
 	if !candidates.routable[*latest.DecisionTargetContactID] {
 		// The decided contact has since come to belong to another WhatsApp
 		// user. The decision cannot follow it; a fresh generation asks again,
-		// and a proven direct owner still holds the message meanwhile.
-		return unreviewed("decision_target_contradicted"), nil
+		// and a proven direct owner still holds the message meanwhile. That is
+		// drift of the reviewed set, so it is persisted with the drift reasons
+		// releases before this one already accept, keeping such a held route
+		// resolvable after a rollback.
+		ownedReason := "unique_direct_primary_drift"
+		if selectorConflict {
+			ownedReason = "phone_selector_drift"
+		}
+		return unreviewed(ownedReason), nil
 	}
 	target := *latest.DecisionTargetContactID
 	result.RouteContactID = &target
@@ -612,9 +619,11 @@ func (a *App) previewWhatsAppIdentityReviewDecision(
 		return nil, err
 	}
 
-	if !hold.Supported && hold.Disposition == models.WhatsAppIdentityReviewDispositionOpen {
+	if hold.Disposition == models.WhatsAppIdentityReviewDispositionOpen &&
+		(!hold.Supported || len(identityReviewRoutableContactIDs(candidates)) == 0) {
 		// Say so plainly instead of a "state changed" conflict that reloading
-		// can never clear.
+		// can never clear. A supported hold whose every member has since come
+		// to belong to another WhatsApp user can no longer be decided either.
 		return nil, ErrWhatsAppIdentityReviewReadOnly
 	}
 	if !hold.Supported || hold.Disposition != models.WhatsAppIdentityReviewDispositionOpen ||
@@ -1046,8 +1055,8 @@ func enumerateWhatsAppIdentityReviewCandidates(
 //     parent BSUID;
 //   - its stored Coexistence identity names another user or records an
 //     unresolved identity conflict (coexistenceIdentityMetadataNamesAnotherUser);
-//   - a reviewer already routed a different direct BSUID to it in this
-//     account's onboarding cycle.
+//   - a reviewer's decision routes a different direct BSUID to it, on any
+//     account and in any onboarding cycle of the organization.
 //
 // Routing the claim's principal to such a contact would put two WhatsApp
 // users behind one contact, as a recycled phone number does.
@@ -1085,10 +1094,10 @@ func identityReviewMembersOfOtherUsers(
 	}
 	var decidedForOthers []uuid.UUID
 	if err := db.Model(&models.WhatsAppIdentityReviewHold{}).
-		Where(`organization_id = ? AND whats_app_account_id = ? AND onboarding_cycle = ?
-			AND disposition = ? AND direct_primary_bsuid <> ? AND decision_target_contact_id IN ?`,
-			claim.OrganizationID, claim.WhatsAppAccountID, claim.OnboardingCycle,
-			models.WhatsAppIdentityReviewDispositionFutureRouting, claim.DirectPrimaryBSUID, contactIDs).
+		Where(`organization_id = ? AND disposition = ? AND direct_primary_bsuid <> ?
+			AND decision_target_contact_id IN ?`,
+			claim.OrganizationID, models.WhatsAppIdentityReviewDispositionFutureRouting,
+			claim.DirectPrimaryBSUID, contactIDs).
 		Pluck("decision_target_contact_id", &decidedForOthers).Error; err != nil {
 		return nil, fmt.Errorf("read identity-review decisions for other principals: %w", err)
 	}

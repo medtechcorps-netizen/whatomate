@@ -627,7 +627,7 @@ func (a *App) validatePersistedWhatsAppIdentityReviewRoute(
 func whatsAppIdentityReviewRouteReasonAllowed(reason string) bool {
 	switch reason {
 	case "phone_selector_conflict", "phone_selector_drift", "unique_direct_primary_drift",
-		"review_open", "another_review_open", "decision_target_contradicted", "reviewed_future_route":
+		"review_open", "another_review_open", "reviewed_future_route":
 		return true
 	default:
 		return false

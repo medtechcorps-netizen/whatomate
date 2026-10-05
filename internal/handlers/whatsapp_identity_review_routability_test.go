@@ -11,7 +11,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"gorm.io/gorm"
 )
+
+// preIdentityReviewRolloutRouteReasons is the persisted-route reason
+// allow-list of the release before #226 (0ce88ed0). A rollback past #226 runs
+// that release's validatePersistedWhatsAppIdentityReviewRoute, so every reason
+// this release persists must stay inside it.
+var preIdentityReviewRolloutRouteReasons = []string{
+	"phone_selector_conflict", "phone_selector_drift", "unique_direct_primary_drift",
+	"review_open", "another_review_open", "reviewed_future_route",
+}
+
+func TestWhatsAppIdentityReviewPersistedReasonsStayRollbackSafe(t *testing.T) {
+	t.Parallel()
+	for _, reason := range preIdentityReviewRolloutRouteReasons {
+		assert.True(t, whatsAppIdentityReviewRouteReasonAllowed(reason), reason)
+	}
+	for _, reason := range []string{"decision_target_contradicted", "direct_primary_unowned", "direct_primary_ambiguous", "decision_target_missing"} {
+		assert.False(t, whatsAppIdentityReviewRouteReasonAllowed(reason),
+			"%s must never be persisted: the previous release would reject it", reason)
+	}
+}
 
 func latestWhatsAppIdentityReviewHoldForBSUID(t *testing.T, app *App, organizationID uuid.UUID, bsuid string) models.WhatsAppIdentityReviewHold {
 	t.Helper()
@@ -128,7 +149,11 @@ func TestWhatsAppIdentityReviewContradictedDecisionKeepsOwnedPrincipalOnItsConta
 	work, _ = admitCoexistenceAdmissionMessage(t, app, account, next, "Owned")
 	require.NotNil(t, work, "the owned principal's message must stay on its direct owner")
 	assert.Equal(t, direct.ID, work.Persisted.ContactID)
-	assert.Equal(t, "decision_target_contradicted", work.Persisted.Metadata[incomingIdentityReviewReasonKey])
+	// Persisted with a reason releases before #226 already accept, so the
+	// held route stays resolvable after a rollback.
+	reason, _ := work.Persisted.Metadata[incomingIdentityReviewReasonKey].(string)
+	assert.Equal(t, "phone_selector_drift", reason)
+	assert.Contains(t, preIdentityReviewRolloutRouteReasons, reason)
 	assert.Equal(t, incomingIdentityReviewRouteHeldDirect, work.Persisted.Metadata[incomingIdentityReviewRouteModeKey])
 	assert.True(t, incomingMessageAutomaticAISuppressed(&work.Persisted))
 	assert.EqualValues(t, 2, countCoexistenceAdmissionRows(t, app.DB, &models.WhatsAppIdentityReviewHold{},
@@ -231,4 +256,72 @@ func TestWhatsAppIdentityReviewPreviewListsEveryHeldCopyOfTheOpenChain(t *testin
 	}
 	got := []string{wamidByID[page.Reviews[0].ID], wamidByID[page.Reviews[1].ID], wamidByID[page.Reviews[2].ID]}
 	assert.Equal(t, append(firstGeneration, secondGeneration), got, "oldest first, across both generations")
+}
+
+// When a competing decision makes the only member of a still-open supported
+// review another user's contact, that review can no longer be decided: the
+// dialog gets the read-only answer instead of an empty, undecidable choice.
+func TestWhatsAppIdentityReviewSupportedHoldWithoutRoutableMemberIsReadOnly(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	phone := "60" + testutil.NewTestGraphObjectID()[:10]
+	contact := syncPhoneOnlyCoexistenceContact(t, app, account, phone)
+	first := "US.first-" + uuid.NewString()
+	second := "US.second-" + uuid.NewString()
+	for _, principal := range []string{first, second} {
+		work, _ := admitCoexistenceAdmissionMessage(t, app, account,
+			coexistenceAdmissionMessage(t, "wamid.both-"+uuid.NewString(), phone, principal, "held"), "Held")
+		require.Nil(t, work)
+	}
+	firstHold := latestWhatsAppIdentityReviewHoldForBSUID(t, app, organizationID, first)
+	require.True(t, firstHold.Supported)
+
+	resolver := createWhatsAppIdentityReviewResolver(t, app.DB, organizationID)
+	secondHold := latestWhatsAppIdentityReviewHoldForBSUID(t, app, organizationID, second)
+	decideWhatsAppIdentityReviewForTest(t, app, app.DB, organizationID, resolver.ID, secondHold.ID, contact.ID)
+
+	status, body, _ := previewContactIdentityReviewOverHTTP(t, app, organizationID, resolver.ID, contact.ID)
+	assert.Equal(t, fasthttp.StatusConflict, status)
+	assert.Contains(t, body, "identity_review_read_only")
+	var preview *WhatsAppIdentityReviewPreview
+	err := app.DB.Transaction(func(tx *gorm.DB) error {
+		var previewErr error
+		preview, previewErr = app.PreviewWhatsAppIdentityReviewDecision(tx, WhatsAppIdentityReviewPreviewInput{
+			OrganizationID: organizationID, HoldID: firstHold.ID, ResolverUserID: resolver.ID,
+		})
+		return previewErr
+	})
+	assert.Nil(t, preview)
+	assert.ErrorIs(t, err, ErrWhatsAppIdentityReviewReadOnly)
+}
+
+// A decision that routes another WhatsApp ID to a contact counts across the
+// whole organization: on another Coexistence number, too.
+func TestWhatsAppIdentityReviewDecisionForAnotherPrincipalOnAnotherAccountBlocksRouting(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	phone := "60" + testutil.NewTestGraphObjectID()[:10]
+	contact := syncPhoneOnlyCoexistenceContact(t, app, account, phone)
+
+	other := testutil.CreateTestWhatsAppAccount(t, app.DB, organizationID)
+	setWhatsAppAccountCoexistenceForTest(t, app, other, true)
+	require.NoError(t, app.DB.Create(&models.WhatsAppCoexistenceState{
+		ID: uuid.New(), OrganizationID: organizationID, WhatsAppAccountID: other.ID,
+		OnboardingStatus: models.CoexistenceOnboardingStatusConnected, OnboardingCycle: 1,
+		LifecycleStatus: models.CoexistenceLifecycleStatusConnected, LifecycleMetadata: models.JSONB{}, Version: 1,
+	}).Error)
+	elsewhere := "US.elsewhere-" + uuid.NewString()
+	work, _ := admitCoexistenceAdmissionMessage(t, app, other,
+		coexistenceAdmissionMessage(t, "wamid.elsewhere-"+uuid.NewString(), phone, elsewhere, "other number"), "Elsewhere")
+	require.Nil(t, work)
+	resolver := createWhatsAppIdentityReviewResolver(t, app.DB, organizationID)
+	elsewhereHold := latestWhatsAppIdentityReviewHoldForBSUID(t, app, organizationID, elsewhere)
+	decideWhatsAppIdentityReviewForTest(t, app, app.DB, organizationID, resolver.ID, elsewhereHold.ID, contact.ID)
+
+	principal := "US.here-" + uuid.NewString()
+	work, _ = admitCoexistenceAdmissionMessage(t, app, account,
+		coexistenceAdmissionMessage(t, "wamid.here-"+uuid.NewString(), phone, principal, "this number"), "Here")
+	assert.Nil(t, work)
+	assert.False(t, latestWhatsAppIdentityReviewHoldForBSUID(t, app, organizationID, principal).Supported,
+		"a contact decided for another WhatsApp ID on another number is that user's")
 }

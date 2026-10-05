@@ -382,7 +382,10 @@ func reconnectCoexistenceAccountForTest(t *testing.T, app *App, account *models.
 // review is still open, or when the closed review was left by a different
 // BSUID on the same phone (a second WhatsApp user), the sender stays held.
 func TestCoexistenceClassicHistoryAfterReconnect(t *testing.T) {
-	for _, variant := range []string{"own_review_open", "own_review_closed_by_reconnect", "other_bsuid_review_closed_by_reconnect"} {
+	for _, variant := range []string{
+		"own_review_open", "own_review_closed_by_reconnect", "other_bsuid_review_closed_by_reconnect",
+		"own_review_from_another_phone_closed_by_reconnect",
+	} {
 		t.Run(variant, func(t *testing.T) {
 			app, account, _ := whatsappIdentityFixture(t)
 			organizationID := account.OrganizationID
@@ -393,7 +396,14 @@ func TestCoexistenceClassicHistoryAfterReconnect(t *testing.T) {
 			if variant == "other_bsuid_review_closed_by_reconnect" {
 				holdBSUID = "US.second-user-" + uuid.NewString()
 			}
-			legacyHold := insertMainShapeUnsupportedHoldForTest(t, app, account, holdBSUID, phone, classic.ContactID)
+			holdPhone, holdMember := phone, classic.ContactID
+			if variant == "own_review_from_another_phone_closed_by_reconnect" {
+				// The sender wrote from an earlier number before: evidence it
+				// changed numbers, so this number's history is not its own.
+				holdPhone = coexistenceAdmissionTestPhone()
+				holdMember = deliverClassicInboundForTest(t, app, account, holdPhone, "").ContactID
+			}
+			legacyHold := insertMainShapeUnsupportedHoldForTest(t, app, account, holdBSUID, holdPhone, holdMember)
 			if variant != "own_review_open" {
 				reconnectCoexistenceAccountForTest(t, app, account, legacyHold)
 			}

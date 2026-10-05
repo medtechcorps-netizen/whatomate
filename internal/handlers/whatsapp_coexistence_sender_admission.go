@@ -471,10 +471,11 @@ func (a *App) coexistenceSenderHasReviewEvidence(
 }
 
 // coexistenceSenderHasLiveReviewEvidence is coexistenceSenderHasReviewEvidence
-// without this sender's own holds that an onboarding-cycle change closed: such
-// a hold neither stays open nor records a decision, and it names no other
-// user. A cycle-closed hold left by any other direct BSUID on these selectors
-// still shows that a second WhatsApp user wrote from them.
+// without this sender's own holds that an onboarding-cycle change closed, from
+// the phone it writes from now and with an unchanged parent BSUID: such a hold
+// neither stays open nor records a decision, and it names no other user or
+// number. A cycle-closed hold left by any other direct BSUID on these
+// selectors still shows that a second WhatsApp user wrote from them.
 func (a *App) coexistenceSenderHasLiveReviewEvidence(
 	organizationID uuid.UUID,
 	claim WhatsAppIdentityReviewClaim,
@@ -514,8 +515,16 @@ func (a *App) coexistenceSenderReviewEvidence(
 			directBSUID, strings.TrimSpace(claim.ParentBSUID),
 		)
 	if ignoreOwnCycleClosed {
-		query = query.Where("NOT (disposition = ? AND direct_primary_bsuid = ?)",
-			models.WhatsAppIdentityReviewDispositionSupersededByCycle, directBSUID)
+		// Only the sender's own closed hold from the phone it writes from now
+		// (or from no phone) and with the same or no parent BSUID is ignored. A
+		// closed hold the sender left from another phone shows it changed
+		// numbers, so it still counts.
+		ownPhones := append([]string{""}, selectors.phones...)
+		query = query.Where(
+			"NOT (disposition = ? AND direct_primary_bsuid = ? AND phone IN ? AND parent_bsuid IN ?)",
+			models.WhatsAppIdentityReviewDispositionSupersededByCycle, directBSUID,
+			ownPhones, []string{"", strings.TrimSpace(claim.ParentBSUID)},
+		)
 	}
 	var count int64
 	if err := query.Count(&count).Error; err != nil {
