@@ -193,6 +193,17 @@ the rls-migrate and startup-contract functions in `cmd/whatomate/main.go`,
 blocks promotion (`schema-change-blocked`). Reverting the change unblocks.
 Stage 2 lifts the freeze.
 
+The `schema-guard` job of the `Test` workflow runs the same check on every
+pull request, so such a change fails the required `test` check before it can
+merge instead of leaving `main` unpromotable. It compares GitHub's merge
+commit with its merge base on `main`, so only the pull request's own changes
+count, and each push to `main` with its first parent. Split or revert a
+refused pull request. The check cannot see product code that rewrites
+existing rows: such a pull request merges only when the owner says so, with a
+data-change note in its description. It also refuses a pull request that
+reverts a guarded change already on `main`, because the revert edits the same
+paths.
+
 ## Secrets and token
 
 Environment `production` holds two secrets, read by one step only:
