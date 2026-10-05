@@ -856,6 +856,64 @@ describe("createMetaEmbeddedSignupSession", () => {
     },
   );
 
+  it.each(["classic", "coexistence"] as const)(
+    "shows a Meta-reported %s error sent as CANCEL without its session ID",
+    (mode) => {
+      const harness = createHarness(50, undefined, mode);
+      harness.session.handleMessage({
+        origin: facebookOrigin,
+        data: {
+          type: "WA_EMBEDDED_SIGNUP",
+          event: "CANCEL",
+          data: {
+            error_message: "This phone number is already registered",
+            error_code: 524126,
+            session_id: "synthetic-session-id",
+            timestamp: "1700000000",
+          },
+        },
+      });
+      harness.session.handleLoginResponse({
+        authResponse: { code: "code-abc" },
+      });
+
+      expect(harness.completed).toHaveLength(0);
+      expect(harness.aborted).toEqual([
+        {
+          reason: "error",
+          detail:
+            "This phone number is already registered (Meta error code 524126)",
+        },
+      ]);
+      expect(JSON.stringify(harness.aborted)).not.toContain(
+        "synthetic-session-id",
+      );
+      expect(harness.settledCount()).toBe(1);
+    },
+  );
+
+  it.each([
+    [
+      { error_message: "Meta rejected it", error_code: "524126" },
+      " (Meta error code 524126)",
+    ],
+    [{ error_message: "Meta rejected it", error_code: "52x" }, ""],
+    [{ error_message: "Meta rejected it", error_code: -1 }, ""],
+    [{ error_message: "Meta rejected it" }, ""],
+  ])(
+    "formats Meta's error code only when it is numeric: %j",
+    (data, suffix) => {
+      const harness = createHarness();
+      harness.session.handleMessage({
+        origin: facebookOrigin,
+        data: { type: "WA_EMBEDDED_SIGNUP", event: "ERROR", data },
+      });
+      expect(harness.aborted).toEqual([
+        { reason: "error", detail: `Meta rejected it${suffix}` },
+      ]);
+    },
+  );
+
   it("cleans up when the Facebook login callback returns an error", () => {
     vi.useFakeTimers();
     const harness = createHarness();

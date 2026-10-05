@@ -228,6 +228,27 @@ function isExpectedFinishMessage(
   return standardFinish;
 }
 
+// Meta's error text plus its numeric error code. The session_id Meta sends
+// with a user-reported error is a support reference and is never shown.
+function metaReportedError(
+  data: Record<string, unknown> | undefined,
+): string | undefined {
+  const message = nonEmptyString(data?.error_message);
+  if (!message) return undefined;
+  const rawCode = data?.error_code;
+  let errorCode: string | undefined;
+  if (
+    typeof rawCode === "number" &&
+    Number.isSafeInteger(rawCode) &&
+    rawCode >= 0
+  ) {
+    errorCode = String(rawCode);
+  } else if (typeof rawCode === "string" && /^[0-9]{1,10}$/.test(rawCode)) {
+    errorCode = rawCode;
+  }
+  return errorCode ? `${message} (Meta error code ${errorCode})` : message;
+}
+
 function loginErrorMessage(
   response: Record<string, unknown>,
 ): string | undefined {
@@ -470,13 +491,21 @@ export function createMetaEmbeddedSignupSession(
     }
 
     switch (eventName) {
-      case "CANCEL":
+      case "CANCEL": {
+        // Meta reports an error the user hit in the flow as CANCEL with
+        // error_message and error_code, not as an abandoned step.
+        const reportedError = metaReportedError(message.data);
+        if (reportedError) {
+          abort("error", reportedError);
+          return;
+        }
         abort("cancelled", nonEmptyString(message.data?.current_step));
         return;
+      }
       case "ERROR":
         abort(
           "error",
-          nonEmptyString(message.data?.error_message) ||
+          metaReportedError(message.data) ||
             nonEmptyString(message.data?.message),
         );
         return;
