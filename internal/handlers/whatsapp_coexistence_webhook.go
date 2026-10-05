@@ -482,6 +482,24 @@ func normalizeCoexistencePhone(phone string) string {
 	return strings.TrimPrefix(strings.TrimSpace(phone), "+")
 }
 
+// isCoexistencePhoneAddress reports whether a Meta address field holds a
+// phone: 7 to 15 digits once an optional "+" and common separators are
+// removed. A BSUID such as "US.1234..." is not a phone.
+func isCoexistencePhoneAddress(value string) bool {
+	value = normalizeCoexistencePhone(value)
+	var digits strings.Builder
+	for _, char := range value {
+		switch {
+		case char >= '0' && char <= '9':
+			digits.WriteRune(char)
+		case char == ' ' || char == '-' || char == '(' || char == ')':
+		default:
+			return false
+		}
+	}
+	return isPlausibleWhatsAppPhone(digits.String())
+}
+
 func isCoexistencePlaceholderPhone(phone string) bool {
 	phone = strings.TrimSpace(phone)
 	return strings.HasPrefix(phone, "bsuid:") ||
@@ -916,11 +934,18 @@ func coexistenceMessageContactIdentity(
 	identity := fallback
 	identity.FallbackKey = strings.TrimSpace(message.ID)
 	if direction == models.DirectionOutgoing {
-		if value := strings.TrimSpace(message.To); value != "" {
-			identity.Phone = value
+		// Meta may address a WhatsApp username user by BSUID in "to". A value
+		// that is not a phone must never become a contact phone; with no
+		// to_user_id it is the recipient's BSUID.
+		to := strings.TrimSpace(message.To)
+		toIsPhone := isCoexistencePhoneAddress(to)
+		if toIsPhone {
+			identity.Phone = to
 		}
 		if value := strings.TrimSpace(message.ToUserID); value != "" {
 			identity.UserID = value
+		} else if to != "" && !toIsPhone && identity.UserID == "" {
+			identity.UserID = to
 		}
 		if value := strings.TrimSpace(message.ToParentUserID); value != "" {
 			identity.ParentUserID = value

@@ -22,15 +22,22 @@ import (
 //   - new_sender: the authenticated direct BSUID, parent BSUID, phone (from and
 //     contacts[].wa_id), username and their placeholder forms match no contact
 //     row in the tenant (including soft-deleted and merged rows) and no earlier
-//     identity-review hold with candidates. There is nobody to confuse the
-//     sender with, so one contact is created and bound to that BSUID.
-//   - phone_app_recipient: the only candidate is a phone-only contact that this
-//     Coexistence number itself created by messaging that phone from the
-//     WhatsApp Business app (a proven smb_message_echoes winner), with no
-//     inbound message, no BSUID, no merge alias and no review history. The
-//     reply authenticates the same phone with its BSUID, so the BSUID is bound
-//     to that contact exactly as the echo path would have done had Meta
-//     included the recipient BSUID in the echo.
+//     identity-review hold other than a zero-member copy of this same BSUID.
+//     There is nobody to confuse the sender with, so one contact is created and
+//     bound to that BSUID (and to wa_id as its phone when "from" is absent).
+//   - phone_app_recipient: the only match is a phone-only contact that the
+//     echo of this number's own WhatsApp Business app message created
+//     (coexistencePhoneAppRecipientAwaitingFirstReply): the contact row was
+//     written together with that echo, its first message is that echo, it has
+//     no inbound message, BSUID, merge alias, address-book or identity
+//     metadata, assignment, CRM lead, booking, package or review history, and
+//     this number messaged it from the app within the last seven days. The
+//     reply authenticates the same phone ("from", or contacts[].wa_id when
+//     "from" is absent) with its BSUID, so the BSUID is bound to that contact
+//     exactly as the echo path would have done had Meta included the recipient
+//     BSUID in the echo. An older CRM, address-book or history contact that
+//     merely received a later echo is never adopted: its number may have been
+//     recycled to someone else.
 //
 // Everything else (any other candidate, ambiguous owners, parent conflicts,
 // selector conflicts, a missing BSUID) keeps the existing review behaviour.
@@ -63,15 +70,33 @@ const (
 const coexistenceContactBSUIDMaxLength = 150
 
 // Contact metadata keys that associate a contact with some WhatsApp user
-// identity. A phone-only contact carrying any of them is not an unbound
-// phone-app recipient.
+// identity, or with the Business app's address book (smb_app_state_sync). A
+// phone-only contact carrying any of them is not one that a phone-app echo
+// created.
 var coexistenceContactIdentityMetadataKeys = []string{
 	"coexistence_user_id",
 	"coexistence_parent_user_id",
 	"coexistence_conflicting_user_id",
 	"coexistence_phone_conflict",
 	"coexistence_reconciled_contact_id",
+	"coexistence_app_contact",
 }
+
+// coexistencePhoneAppRecipientCreationSkew bounds the distance between a
+// contact's created_at and the ingested_at of the echo that created it.
+// persistCoexistenceMessage writes both rows in one transaction, each stamped
+// by this process's clock, so they are normally milliseconds apart.
+const coexistencePhoneAppRecipientCreationSkew = 2 * time.Minute
+
+// coexistencePhoneAppRecipientEchoMaxAge bounds how long after this number's
+// latest phone-app message to a recipient that recipient's first reply may
+// still be adopted. Older numbers can have changed hands.
+const coexistencePhoneAppRecipientEchoMaxAge = 7 * 24 * time.Hour
+
+// coexistencePhoneAppRecipientMessageLimit caps the history read for the
+// creation proof. A contact with more messages than this, all outgoing, is
+// not a fresh phone-app recipient; it keeps the review path.
+const coexistencePhoneAppRecipientMessageLimit = 200
 
 var errCoexistenceSenderAdmissionNotProven = errors.New("coexistence sender admission could not be proven")
 
@@ -135,6 +160,22 @@ func isPlausibleWhatsAppPhone(phone string) bool {
 	return true
 }
 
+// coexistenceSenderAdmissionPhone returns the phone a bound contact gets.
+// "from" must be a plausible phone equal to the claim's phone selector. When
+// Meta omitted "from", a plausible contacts[].wa_id stands in, as it does for
+// the classic resolver (inboundSenderIdentity), so a later phone-app echo to
+// that number finds the same contact. ok=false keeps the review path.
+func coexistenceSenderAdmissionPhone(message IncomingTextMessage, claimPhone string) (phone string, fromWaID, ok bool) {
+	if phone = normalizeCoexistencePhone(message.From); phone != "" {
+		return phone, false, isPlausibleWhatsAppPhone(phone) && phone == claimPhone
+	}
+	if waID := normalizeCoexistencePhone(message.senderWaID); isPlausibleWhatsAppPhone(waID) {
+		return waID, true, true
+	}
+	// No usable phone: the contact gets a bsuid:/user: placeholder phone.
+	return "", false, true
+}
+
 // admitCoexistenceSenderWithoutIdentityQuestion returns the re-evaluated
 // admission when it bound the sender to a contact, or nil when the existing
 // review path applies. tx-scoped: a must be the admission transaction's App.
@@ -162,14 +203,30 @@ func (a *App) admitCoexistenceSenderWithoutIdentityQuestion(
 		account.OrganizationID != normalized.OrganizationID || account.ID != normalized.WhatsAppAccountID {
 		return nil, nil
 	}
-	phone := normalizeCoexistencePhone(message.From)
-	if phone != "" && (!isPlausibleWhatsAppPhone(phone) || phone != normalized.Phone) {
+	phone, phoneFromWaID, ok := coexistenceSenderAdmissionPhone(message, normalized.Phone)
+	if !ok {
 		return nil, nil
 	}
 
-	kind, recipientID, err := a.classifyCoexistenceSenderAdmission(account, normalized, admission.Candidates, message, phone)
+	kind, recipientID, err := a.classifyCoexistenceSenderAdmission(
+		account, normalized, admission.Candidates, message, phone, phoneFromWaID,
+	)
 	if err != nil || kind == "" {
 		return nil, err
+	}
+	if phoneFromWaID {
+		// Same rule the classic resolver applies to a wa_id-only sender
+		// (getOrCreateNewInboundSenderContact): wa_id may become the contact
+		// phone only when it cannot move this BSUID onto, or a new phone onto,
+		// a contact that already belongs to someone.
+		keepWaID, _, waIDErr := a.inboundWaIDAcceptsUserID(account.OrganizationID, coexistenceContactIdentity{
+			Phone:        phone,
+			UserID:       normalized.DirectPrimaryBSUID,
+			ParentUserID: normalized.ParentBSUID,
+		})
+		if waIDErr != nil || !keepWaID {
+			return nil, waIDErr
+		}
 	}
 
 	var admitted *WhatsAppIdentityReviewAdmission
@@ -198,7 +255,8 @@ func (a *App) admitCoexistenceSenderWithoutIdentityQuestion(
 		default:
 			return errCoexistenceSenderAdmissionNotProven
 		}
-		if contact.BSUID != normalized.DirectPrimaryBSUID || contact.MergedIntoID != nil {
+		if contact.BSUID != normalized.DirectPrimaryBSUID || contact.MergedIntoID != nil ||
+			(phone != "" && normalizeCoexistencePhone(contact.PhoneNumber) != phone) {
 			return errCoexistenceSenderAdmissionNotProven
 		}
 		metadata := cloneMessageMetadata(contact.Metadata)
@@ -249,25 +307,37 @@ func (a *App) classifyCoexistenceSenderAdmission(
 	candidates []WhatsAppIdentityReviewCandidate,
 	message IncomingTextMessage,
 	phone string,
+	phoneFromWaID bool,
 ) (coexistenceSenderAdmissionKind, uuid.UUID, error) {
 	selectors := coexistenceSenderAdmissionSelectors(claim, message)
 	matches, err := a.coexistenceSenderSelectorMatches(account.OrganizationID, selectors)
 	if err != nil {
 		return "", uuid.Nil, err
 	}
-	reviewed, err := a.coexistenceSenderHasReviewEvidence(account.OrganizationID, selectors)
+	reviewed, err := a.coexistenceSenderHasReviewEvidence(account.OrganizationID, claim, selectors)
 	if err != nil || reviewed {
 		return "", uuid.Nil, err
 	}
-	if len(candidates) == 0 {
-		if len(matches) == 0 {
-			return coexistenceSenderAdmissionNewSender, uuid.Nil, nil
-		}
+	if len(candidates) == 0 && len(matches) == 0 {
+		return coexistenceSenderAdmissionNewSender, uuid.Nil, nil
+	}
+	if phone == "" || len(matches) != 1 {
 		return "", uuid.Nil, nil
 	}
-	if len(candidates) != 1 || phone == "" ||
-		candidates[0].SelectorReasons != models.WhatsAppIdentityReviewSelectorPhone ||
-		len(matches) != 1 || matches[0].ID != candidates[0].ContactID {
+	switch len(candidates) {
+	case 1:
+		// The evaluator's only candidate is the phone owner named by "from".
+		if candidates[0].SelectorReasons != models.WhatsAppIdentityReviewSelectorPhone ||
+			matches[0].ID != candidates[0].ContactID {
+			return "", uuid.Nil, nil
+		}
+	case 0:
+		// The evaluator never sees contacts[].wa_id. With "from" absent, the
+		// only widened match may be the phone-only contact that wa_id names.
+		if !phoneFromWaID {
+			return "", uuid.Nil, nil
+		}
+	default:
 		return "", uuid.Nil, nil
 	}
 	proven, err := a.coexistencePhoneAppRecipientAwaitingFirstReply(account, &matches[0], phone, selectors.username)
@@ -322,12 +392,16 @@ func (a *App) coexistenceSenderSelectorMatches(
 }
 
 // coexistenceSenderHasReviewEvidence reports whether any earlier review hold in
-// the tenant captured a candidate for one of these selectors. Such a sender
-// once matched a contact; the review path, not a fresh bootstrap, owns it.
-// Zero-member holds (an earlier held message from this same unknown sender)
-// are not evidence of another identity.
+// the tenant names one of these selectors, other than an earlier held copy of
+// this same sender. A hold that captured candidates means the sender once
+// matched a contact; a hold left by a different direct BSUID on the same phone
+// or parent is a second WhatsApp user behind these selectors. Either way the
+// review path, not a fresh bootstrap, owns the sender. Only a zero-member hold
+// whose direct BSUID is this sender's own (and whose parent is empty or the
+// same) is skipped: it is an earlier message from this same unknown sender.
 func (a *App) coexistenceSenderHasReviewEvidence(
 	organizationID uuid.UUID,
+	claim WhatsAppIdentityReviewClaim,
 	selectors coexistenceSenderSelectors,
 ) (bool, error) {
 	conditions := make([]string, 0, 3)
@@ -343,10 +417,18 @@ func (a *App) coexistenceSenderHasReviewEvidence(
 	if len(conditions) == 0 {
 		return true, nil
 	}
+	directBSUID := strings.TrimSpace(claim.DirectPrimaryBSUID)
+	if directBSUID == "" {
+		return true, nil
+	}
 	var count int64
 	if err := a.DB.Model(&models.WhatsAppIdentityReviewHold{}).
-		Where("organization_id = ? AND member_count > 0", organizationID).
+		Where("organization_id = ?", organizationID).
 		Where("("+strings.Join(conditions, " OR ")+")", args...).
+		Where(
+			"(member_count > 0 OR direct_primary_bsuid <> ? OR (parent_bsuid <> '' AND parent_bsuid <> ?))",
+			directBSUID, strings.TrimSpace(claim.ParentBSUID),
+		).
 		Count(&count).Error; err != nil {
 		return true, fmt.Errorf("read coexistence sender review evidence: %w", err)
 	}
@@ -354,16 +436,32 @@ func (a *App) coexistenceSenderHasReviewEvidence(
 }
 
 // coexistencePhoneAppRecipientAwaitingFirstReply proves that a phone-only
-// contact exists only because this Coexistence number messaged that phone from
-// the WhatsApp Business app, and has never received anything from anyone.
+// contact was created by the echo of a message this Coexistence number sent
+// from the WhatsApp Business app, has received nothing from anyone, and holds
+// nothing a person entered about someone else. Every condition fails closed:
+//
+//   - live, unmerged, no BSUID, a dialable phone equal to the sender's, no
+//     identity or address-book metadata, no assignment and no merge alias;
+//   - no open identity-review hold and no inbound message;
+//   - its first message (by ingestion) is a proven echo winner of this
+//     account, written within coexistencePhoneAppRecipientCreationSkew of the
+//     contact row itself, and no message on it is dated before that echo
+//     unless it is another proven echo of this account (so no history import);
+//   - no CRM lead, booking or contact package;
+//   - this account's latest proven echo to it is at most
+//     coexistencePhoneAppRecipientEchoMaxAge old.
+//
+// A manually created, imported or address-book contact that later received
+// one echo therefore stays in review: its phone may since have been recycled
+// to a different person, whose BSUID must not be bound to that record.
 func (a *App) coexistencePhoneAppRecipientAwaitingFirstReply(
 	account *models.WhatsAppAccount,
 	contact *models.Contact,
 	phone, username string,
 ) (bool, error) {
 	if contact == nil || contact.OrganizationID != account.OrganizationID || contact.DeletedAt.Valid ||
-		contact.MergedIntoID != nil || strings.TrimSpace(contact.BSUID) != "" || !contactHasDialablePhone(contact) ||
-		normalizeIdentityReviewPhone(contact.PhoneNumber) != phone {
+		contact.MergedIntoID != nil || contact.AssignedUserID != nil || strings.TrimSpace(contact.BSUID) != "" ||
+		!contactHasDialablePhone(contact) || normalizeIdentityReviewPhone(contact.PhoneNumber) != phone {
 		return false, nil
 	}
 	for _, key := range coexistenceContactIdentityMetadataKeys {
@@ -388,30 +486,91 @@ func (a *App) coexistencePhoneAppRecipientAwaitingFirstReply(
 	if err != nil || held {
 		return false, err
 	}
-	var incoming int64
-	if err := a.DB.Unscoped().Model(&models.Message{}).Where(
-		"organization_id = ? AND contact_id = ? AND direction = ?",
-		account.OrganizationID, contact.ID, models.DirectionIncoming,
-	).Count(&incoming).Error; err != nil {
-		return false, fmt.Errorf("read phone-app recipient inbound history: %w", err)
+	proven, err := a.coexistencePhoneAppEchoCreatedContact(account, contact)
+	if err != nil || !proven {
+		return false, err
 	}
-	if incoming > 0 {
-		return false, nil
-	}
-	var echoes []models.Message
-	if err := a.DB.Unscoped().Select("id", "whats_app_message_id").Where(
-		"organization_id = ? AND contact_id = ? AND direction = ? AND COALESCE(metadata, '{}'::jsonb) @> ?::jsonb",
-		account.OrganizationID, contact.ID, models.DirectionOutgoing, `{"coexistence_source":"smb_message_echoes"}`,
-	).Order("id").Limit(50).Find(&echoes).Error; err != nil {
-		return false, fmt.Errorf("read phone-app recipient echoes: %w", err)
-	}
-	for _, echo := range echoes {
-		wamid := strings.TrimSpace(echo.WhatsAppMessageID)
-		// persistCoexistenceMessage keys every echo winner by this account's ID,
-		// so a matching row proves THIS number's phone app addressed the contact.
-		if wamid != "" && echo.ID == uuid.NewSHA1(account.ID, []byte("coexistence-message:"+wamid)) {
-			return true, nil
+	// Records a person entered for this contact. Follow-up tasks are not
+	// listed: automations create them on contact.created for every contact,
+	// including one an echo created.
+	for _, record := range []struct {
+		model any
+		name  string
+	}{
+		{model: &models.CRMLead{}, name: "CRM leads"},
+		{model: &models.Booking{}, name: "bookings"},
+		{model: &models.ContactPackage{}, name: "packages"},
+	} {
+		var count int64
+		if err := a.DB.Unscoped().Model(record.model).Where(
+			"organization_id = ? AND contact_id = ?", account.OrganizationID, contact.ID,
+		).Count(&count).Error; err != nil {
+			return false, fmt.Errorf("read phone-app recipient %s: %w", record.name, err)
+		}
+		if count > 0 {
+			return false, nil
 		}
 	}
-	return false, nil
+	return true, nil
+}
+
+// coexistencePhoneAppEchoCreatedContact checks the message-history half of
+// coexistencePhoneAppRecipientAwaitingFirstReply.
+func (a *App) coexistencePhoneAppEchoCreatedContact(
+	account *models.WhatsAppAccount,
+	contact *models.Contact,
+) (bool, error) {
+	var messages []models.Message
+	if err := a.DB.Unscoped().
+		Select("id", "whats_app_message_id", "direction", "metadata", "created_at", "ingested_at").
+		Where("organization_id = ? AND contact_id = ?", account.OrganizationID, contact.ID).
+		Order("COALESCE(ingested_at, created_at) ASC, id ASC").
+		Limit(coexistencePhoneAppRecipientMessageLimit + 1).
+		Find(&messages).Error; err != nil {
+		return false, fmt.Errorf("read phone-app recipient messages: %w", err)
+	}
+	if len(messages) == 0 || len(messages) > coexistencePhoneAppRecipientMessageLimit {
+		return false, nil
+	}
+	isOwnEcho := func(message *models.Message) bool {
+		wamid := strings.TrimSpace(message.WhatsAppMessageID)
+		source, _ := message.Metadata["coexistence_source"].(string)
+		// persistCoexistenceMessage keys every echo winner by the receiving
+		// account's ID, so a matching row proves THIS number's phone app
+		// addressed the contact.
+		return message.Direction == models.DirectionOutgoing && source == "smb_message_echoes" && wamid != "" &&
+			message.ID == uuid.NewSHA1(account.ID, []byte("coexistence-message:"+wamid))
+	}
+	creating := &messages[0]
+	if !isOwnEcho(creating) || creating.IngestedAt == nil {
+		return false, nil
+	}
+	skew := contact.CreatedAt.Sub(*creating.IngestedAt)
+	if skew < -coexistencePhoneAppRecipientCreationSkew || skew > coexistencePhoneAppRecipientCreationSkew {
+		return false, nil
+	}
+	var latestEcho time.Time
+	for index := range messages {
+		message := &messages[index]
+		if message.Direction != models.DirectionOutgoing {
+			return false, nil
+		}
+		ownEcho := isOwnEcho(message)
+		if !ownEcho && message.CreatedAt.Before(creating.CreatedAt) {
+			// Dated before the echo that created the contact: imported history
+			// or another earlier conversation with this number.
+			return false, nil
+		}
+		if !ownEcho {
+			continue
+		}
+		at := message.CreatedAt
+		if message.IngestedAt != nil {
+			at = *message.IngestedAt
+		}
+		if at.After(latestEcho) {
+			latestEcho = at
+		}
+	}
+	return time.Since(latestEcho) <= coexistencePhoneAppRecipientEchoMaxAge, nil
 }

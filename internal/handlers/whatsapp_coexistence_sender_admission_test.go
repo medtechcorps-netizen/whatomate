@@ -247,8 +247,16 @@ func coexistenceUngrantedAdvisoryLocks(t *testing.T, db *gorm.DB) int64 {
 
 // Concurrent first messages from one new sender (plus a provider retry racing
 // its original) are proven to wait on the same organization admission fence
-// before any of them may create a contact. Exactly one contact results.
+// before any of them may create a contact. Exactly one contact results, and
+// every message is projected into the Omnichannel Inbox. Several rounds make
+// the mirror/admission deadlock likely enough to exercise its retry.
 func TestCoexistenceNewSenderConcurrentFirstMessagesBindOneContact(t *testing.T) {
+	for round := range 3 {
+		t.Run(fmt.Sprintf("round_%d", round), runCoexistenceNewSenderConcurrentRound)
+	}
+}
+
+func runCoexistenceNewSenderConcurrentRound(t *testing.T) {
 	app, account, _ := whatsappIdentityFixture(t)
 	organizationID := account.OrganizationID
 	bsuid := "US.race-" + uuid.NewString()
@@ -285,9 +293,9 @@ func TestCoexistenceNewSenderConcurrentFirstMessagesBindOneContact(t *testing.T)
 		go func(message IncomingTextMessage) {
 			defer wg.Done()
 			// /api/webhook answers a retryable PostgreSQL abort with 503 and Meta
-			// redelivers the same body; model that redelivery. (A deadlock between
-			// the post-commit legacy inbox mirror and the next admission predates
-			// this change and also occurs for already-known senders.)
+			// redelivers the same body; model that redelivery. The post-commit
+			// legacy inbox mirror can deadlock with the next admission (40P01);
+			// the mirror retries itself, which the projection check below proves.
 			var work *persistedIncomingMessage
 			var duplicate bool
 			var err error
@@ -334,6 +342,13 @@ func TestCoexistenceNewSenderConcurrentFirstMessagesBindOneContact(t *testing.T)
 	for contactID := range contactIDs {
 		assert.EqualValues(t, distinct, countCoexistenceAdmissionRows(t, app.DB, &models.Message{},
 			"organization_id = ? AND contact_id = ? AND direction = ?", organizationID, contactID, models.DirectionIncoming))
+		// Every admitted message reaches the Omnichannel Inbox, which lists
+		// messages by inbox_conversation_id.
+		assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.Message{},
+			"organization_id = ? AND contact_id = ? AND inbox_conversation_id IS NULL", organizationID, contactID),
+			"a message whose after-commit inbox mirror failed is missing from the Omnichannel Inbox")
+		assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.InboxConversation{},
+			"organization_id = ? AND contact_id = ?", organizationID, contactID))
 	}
 	assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.WhatsAppIdentityReviewHold{}, "organization_id = ?", organizationID))
 	assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.InboundEvent{},
@@ -579,59 +594,171 @@ func TestCoexistenceCustomerReplyThenPhoneAppEchoEndsInOneContact(t *testing.T) 
 	assert.EqualValues(t, 3, countCoexistenceAdmissionRows(t, app.DB, &models.Message{}, "organization_id = ? AND contact_id = ?", organizationID, contactID))
 }
 
-// Only this number's own proven echo, to a contact nobody has written from,
-// adopts the phone. Everything else stays held.
-func TestCoexistencePhoneAppRecipientAdoptionRequiresThisAccountsUnansweredEcho(t *testing.T) {
-	for _, variant := range []string{"echo_from_other_account", "recipient_has_inbound_history", "recipient_has_merge_alias"} {
-		t.Run(variant, func(t *testing.T) {
+// createCoexistenceAdmissionOtherSMBAccount adds a second Coexistence number to
+// the same workspace.
+func createCoexistenceAdmissionOtherSMBAccount(t *testing.T, app *App, account *models.WhatsAppAccount) *models.WhatsAppAccount {
+	t.Helper()
+	other := models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: account.OrganizationID,
+		Name:           "other-smb-" + uuid.NewString()[:8],
+		PhoneID:        testutil.NewTestGraphObjectID(),
+		BusinessID:     account.BusinessID,
+		AccessToken:    "other-token",
+		Status:         "active",
+		IsSMB:          true,
+	}
+	require.NoError(t, app.DB.Create(&other).Error)
+	require.NoError(t, app.DB.Create(&models.WhatsAppCoexistenceState{
+		ID: uuid.New(), OrganizationID: account.OrganizationID, WhatsAppAccountID: other.ID,
+		OnboardingStatus: models.CoexistenceOnboardingStatusConnected, OnboardingCycle: 1,
+		LifecycleStatus: models.CoexistenceLifecycleStatusConnected, LifecycleMetadata: models.JSONB{}, Version: 1,
+	}).Error)
+	return &other
+}
+
+func createCoexistenceAdmissionLead(t *testing.T, app *App, organizationID, contactID uuid.UUID) {
+	t.Helper()
+	pipeline := models.CRMPipeline{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organizationID,
+		Name: "Ads " + uuid.NewString()[:8], IsActive: true, Version: 1,
+	}
+	require.NoError(t, app.DB.Create(&pipeline).Error)
+	stage := models.CRMPipelineStage{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organizationID, PipelineID: pipeline.ID,
+		Name: "New", Kind: models.CRMPipelineStageKindOpen, IsActive: true, Version: 1,
+	}
+	require.NoError(t, app.DB.Create(&stage).Error)
+	require.NoError(t, app.DB.Create(&models.CRMLead{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organizationID, ContactID: contactID,
+		PipelineID: pipeline.ID, StageID: stage.ID, Title: "Earlier enquiry", Status: models.CRMLeadStatusOpen,
+		Source: models.CRMLeadSourceOther, Currency: "MYR", Metadata: models.JSONB{}, Version: 1,
+	}).Error)
+}
+
+// Only a contact that this number's own phone-app echo created, that nobody
+// has written from and that holds no CRM record, adopts the replying BSUID.
+// An older CRM record, an address-book contact or an imported history thread
+// that merely received a later echo stays held: its number may have been
+// recycled to a different person (the "Patient A" record must never receive
+// person B's BSUID).
+func TestCoexistencePhoneAppRecipientAdoptionRequiresAContactTheEchoCreated(t *testing.T) {
+	type setup struct {
+		app       *App
+		account   *models.WhatsAppAccount
+		phone     string
+		echoWAMID string
+	}
+	echoContact := func(t *testing.T, s setup) models.Message {
+		t.Helper()
+		var echoed models.Message
+		require.NoError(t, s.app.DB.Where("organization_id = ? AND whats_app_message_id = ?",
+			s.account.OrganizationID, s.echoWAMID).First(&echoed).Error)
+		return echoed
+	}
+	cases := []struct {
+		name    string
+		adopted bool
+		// before runs ahead of the echo; after runs once the echo is stored.
+		before func(*testing.T, setup) *models.WhatsAppAccount
+		after  func(*testing.T, setup)
+	}{
+		{name: "fresh_echo_contact_is_adopted", adopted: true},
+		{name: "echo_from_other_account", before: func(t *testing.T, s setup) *models.WhatsAppAccount {
+			return createCoexistenceAdmissionOtherSMBAccount(t, s.app, s.account)
+		}},
+		{name: "preexisting_manual_contact_then_echo", before: func(t *testing.T, s setup) *models.WhatsAppAccount {
+			contact := newWhatsAppIdentityReviewSelectorContact(s.account.OrganizationID, s.phone)
+			contact.ProfileName = "Patient A"
+			require.NoError(t, s.app.DB.Create(&contact).Error)
+			require.NoError(t, s.app.DB.Model(&models.Contact{}).Where("id = ?", contact.ID).
+				Update("created_at", time.Now().UTC().Add(-30*24*time.Hour)).Error)
+			return nil
+		}},
+		{name: "address_book_contact_then_echo", before: func(t *testing.T, s setup) *models.WhatsAppAccount {
+			// smb_app_state_sync created it moments before the echo.
+			contact := newWhatsAppIdentityReviewSelectorContact(s.account.OrganizationID, s.phone)
+			contact.Metadata = models.JSONB{"coexistence_app_contact": true}
+			require.NoError(t, s.app.DB.Create(&contact).Error)
+			return nil
+		}},
+		{name: "recipient_has_inbound_history", after: func(t *testing.T, s setup) {
+			require.NoError(t, s.app.DB.Create(&models.Message{
+				BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: s.account.OrganizationID,
+				WhatsAppAccount: s.account.Name, ContactID: echoContact(t, s).ContactID, WhatsAppMessageID: "wamid.history-" + uuid.NewString(),
+				Direction: models.DirectionIncoming, MessageType: models.MessageTypeText, Content: "imported",
+				Status: models.MessageStatusReceived, Metadata: models.JSONB{"coexistence_source": "history"},
+			}).Error)
+		}},
+		{name: "outgoing_history_dated_before_the_echo", after: func(t *testing.T, s setup) {
+			echoed := echoContact(t, s)
+			earlier := echoed.CreatedAt.Add(-24 * time.Hour)
+			require.NoError(t, s.app.DB.Create(&models.Message{
+				BaseModel:      models.BaseModel{ID: uuid.New(), CreatedAt: earlier, UpdatedAt: earlier},
+				OrganizationID: s.account.OrganizationID, WhatsAppAccount: s.account.Name, ContactID: echoed.ContactID,
+				WhatsAppMessageID: "wamid.history-out-" + uuid.NewString(), Direction: models.DirectionOutgoing,
+				MessageType: models.MessageTypeText, Content: "imported", Status: models.MessageStatusSent,
+				Metadata: models.JSONB{"coexistence_source": "history"},
+			}).Error)
+		}},
+		{name: "recipient_has_merge_alias", after: func(t *testing.T, s setup) {
+			alias := newWhatsAppIdentityReviewSelectorContact(s.account.OrganizationID, coexistenceAdmissionTestPhone())
+			require.NoError(t, s.app.DB.Create(&alias).Error)
+			require.NoError(t, s.app.DB.Model(&models.Contact{}).Where("id = ?", alias.ID).
+				Updates(map[string]any{"merged_into_id": echoContact(t, s).ContactID, "deleted_at": time.Now().UTC()}).Error)
+		}},
+		{name: "recipient_is_assigned", after: func(t *testing.T, s setup) {
+			agent := testutil.CreateTestUser(t, s.app.DB, s.account.OrganizationID)
+			require.NoError(t, s.app.DB.Model(&models.Contact{}).Where("id = ?", echoContact(t, s).ContactID).
+				Update("assigned_user_id", agent.ID).Error)
+		}},
+		{name: "recipient_has_crm_lead", after: func(t *testing.T, s setup) {
+			createCoexistenceAdmissionLead(t, s.app, s.account.OrganizationID, echoContact(t, s).ContactID)
+		}},
+		{name: "echo_older_than_seven_days", after: func(t *testing.T, s setup) {
+			echoed := echoContact(t, s)
+			require.NoError(t, s.app.DB.Model(&models.Contact{}).Where("id = ?", echoed.ContactID).
+				Update("created_at", gorm.Expr("created_at - interval '8 days'")).Error)
+			require.NoError(t, s.app.DB.Model(&models.Message{}).Where("id = ?", echoed.ID).
+				Update("ingested_at", gorm.Expr("ingested_at - interval '8 days'")).Error)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			app, account, _ := whatsappIdentityFixture(t)
 			organizationID := account.OrganizationID
-			phone := coexistenceAdmissionTestPhone()
+			s := setup{app: app, account: account, phone: coexistenceAdmissionTestPhone(), echoWAMID: "wamid.adopt-echo-" + uuid.NewString()}
 			echoAccount := account
-			if variant == "echo_from_other_account" {
-				other := models.WhatsAppAccount{
-					BaseModel:      models.BaseModel{ID: uuid.New()},
-					OrganizationID: organizationID,
-					Name:           "other-smb-" + uuid.NewString()[:8],
-					PhoneID:        testutil.NewTestGraphObjectID(),
-					BusinessID:     account.BusinessID,
-					AccessToken:    "other-token",
-					Status:         "active",
-					IsSMB:          true,
+			if tc.before != nil {
+				if other := tc.before(t, s); other != nil {
+					echoAccount = other
 				}
-				require.NoError(t, app.DB.Create(&other).Error)
-				require.NoError(t, app.DB.Create(&models.WhatsAppCoexistenceState{
-					ID: uuid.New(), OrganizationID: organizationID, WhatsAppAccountID: other.ID,
-					OnboardingStatus: models.CoexistenceOnboardingStatusConnected, OnboardingCycle: 1,
-					LifecycleStatus: models.CoexistenceLifecycleStatusConnected, LifecycleMetadata: models.JSONB{}, Version: 1,
-				}).Error)
-				echoAccount = &other
 			}
-			echoWAMID := "wamid.adopt-echo-" + uuid.NewString()
-			persistCoexistenceAdmissionEcho(t, app, echoAccount, echoWAMID, phone, "", "Hello")
-			var echoed models.Message
-			require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, echoWAMID).First(&echoed).Error)
-			switch variant {
-			case "recipient_has_inbound_history":
-				require.NoError(t, app.DB.Create(&models.Message{
-					BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organizationID,
-					WhatsAppAccount: account.Name, ContactID: echoed.ContactID, WhatsAppMessageID: "wamid.history-" + uuid.NewString(),
-					Direction: models.DirectionIncoming, MessageType: models.MessageTypeText, Content: "imported",
-					Status: models.MessageStatusReceived, Metadata: models.JSONB{"coexistence_source": "history"},
-				}).Error)
-			case "recipient_has_merge_alias":
-				alias := newWhatsAppIdentityReviewSelectorContact(organizationID, coexistenceAdmissionTestPhone())
-				require.NoError(t, app.DB.Create(&alias).Error)
-				require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", alias.ID).
-					Updates(map[string]any{"merged_into_id": echoed.ContactID, "deleted_at": time.Now().UTC()}).Error)
+			persistCoexistenceAdmissionEcho(t, app, echoAccount, s.echoWAMID, s.phone, "", "Hello")
+			echoed := echoContact(t, s)
+			if tc.after != nil {
+				tc.after(t, s)
 			}
 
-			reply := coexistenceAdmissionMessage(t, "wamid.adopt-reply-"+uuid.NewString(), phone, "US.adopt-"+uuid.NewString(), "reply")
+			bsuid := "US.adopt-" + uuid.NewString()
+			reply := coexistenceAdmissionMessage(t, "wamid.adopt-reply-"+uuid.NewString(), s.phone, bsuid, "wrong number")
 			work, duplicate := admitCoexistenceAdmissionMessage(t, app, account, reply, "")
 			assert.False(t, duplicate)
-			assert.Nil(t, work)
+			recipient := loadCoexistenceAdmissionContact(t, app.DB, organizationID, echoed.ContactID)
+			if tc.adopted {
+				require.NotNil(t, work)
+				assert.Equal(t, echoed.ContactID, work.Persisted.ContactID)
+				assert.Equal(t, bsuid, recipient.BSUID)
+				assert.Equal(t, string(coexistenceSenderAdmissionPhoneAppRecipient), recipient.Metadata[coexistenceIdentityAdmissionKey])
+				assert.Zero(t, countCoexistenceStagedReceipts(t, app, organizationID, reply.ID))
+				return
+			}
+			assert.Nil(t, work, "the reply must stay held")
 			assert.EqualValues(t, 1, countCoexistenceStagedReceipts(t, app, organizationID, reply.ID))
-			assert.Empty(t, loadCoexistenceAdmissionContact(t, app.DB, organizationID, echoed.ContactID).BSUID)
+			assert.Empty(t, recipient.BSUID, "the existing record must not receive the replying BSUID")
+			assert.NotContains(t, recipient.Metadata, coexistenceIdentityAdmissionKey)
+			assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{},
+				"organization_id = ? AND bs_uid = ?", organizationID, bsuid))
 		})
 	}
 }
@@ -663,7 +790,8 @@ func stageCoexistenceReceiptAsBeforeThisChange(
 		}
 		claim := WhatsAppIdentityReviewClaim{
 			OrganizationID: account.OrganizationID, WhatsAppAccountID: account.ID, OnboardingCycle: 1,
-			DirectPrimaryBSUID: message.FromUserID, Phone: normalizeIdentityReviewPhone(message.From),
+			DirectPrimaryBSUID: message.FromUserID, ParentBSUID: message.FromParentUserID,
+			Phone:                   normalizeIdentityReviewPhone(message.From),
 			VerifiedEventProvenance: WhatsAppIdentityReviewVerifiedMetaEvent,
 			VerifiedEventDigest:     strings.Repeat("c", 64), SelectorBodyDigest: strings.Repeat("d", 64),
 		}
@@ -736,7 +864,8 @@ func TestCoexistenceHeldNewSenderReceiptStaysInProtectedQueueAfterSenderIsAdmitt
 }
 
 // GET /api/identity-reviews/staged is the workspace-level entry point. It must
-// count and page open receipts newest first.
+// count and page open receipts newest first, and mark the receipts that no
+// decision can resolve (unsupported holds) as read-only.
 func TestListStagedContactIdentityReviewsCountsAndPagesOpenReceipts(t *testing.T) {
 	app, account, _ := whatsappIdentityFixture(t)
 	organizationID := account.OrganizationID
@@ -752,8 +881,29 @@ func TestListStagedContactIdentityReviewsCountsAndPagesOpenReceipts(t *testing.T
 		holds = append(holds, stageCoexistenceReceiptAsBeforeThisChange(t, app, account, message))
 		time.Sleep(5 * time.Millisecond)
 	}
+	// A real conflict between two existing contacts (the direct BSUID and its
+	// parent belong to different contacts) is held under a supported hold,
+	// which the flagged contact's Identity review can decide.
+	direct := "US.queue-direct-" + uuid.NewString()
+	parent := "US.queue-parent-" + uuid.NewString()
+	for _, bsuid := range []string{direct, parent} {
+		owner := newWhatsAppIdentityReviewSelectorContact(organizationID, coexistenceAdmissionTestPhone())
+		owner.BSUID = bsuid
+		require.NoError(t, app.DB.Create(&owner).Error)
+	}
+	conflict := coexistenceAdmissionMessage(t, "wamid.queue-conflict-"+uuid.NewString(), coexistenceAdmissionTestPhone(), direct, "conflict")
+	conflict.FromParentUserID = parent
+	conflictWork, _ := admitCoexistenceAdmissionMessage(t, app, account, conflict, "")
+	require.Nil(t, conflictWork)
+	var conflictEvent models.InboundEvent
+	require.NoError(t, app.DB.Where("organization_id = ? AND provider_event_id = ?", organizationID, conflict.ID).First(&conflictEvent).Error)
+	require.NotNil(t, conflictEvent.ReviewHoldID)
+	var conflictHold models.WhatsAppIdentityReviewHold
+	require.NoError(t, app.DB.Where("organization_id = ? AND id = ?", organizationID, *conflictEvent.ReviewHoldID).First(&conflictHold).Error)
+	require.True(t, conflictHold.Supported, "a conflict between existing contacts has a supported hold")
+
 	reviewer := createWhatsAppIdentityReviewResolver(t, app.DB, organizationID)
-	page := func(number, limit int) (items []stagedWhatsAppIdentityReviewItem, total int64) {
+	page := func(number, limit int) (items []stagedWhatsAppIdentityReviewItem, total, readOnly int64) {
 		t.Helper()
 		request := testutil.NewGETRequest(t)
 		testutil.SetAuthContext(request, organizationID, reviewer.ID)
@@ -763,25 +913,47 @@ func TestListStagedContactIdentityReviewsCountsAndPagesOpenReceipts(t *testing.T
 		require.Equal(t, 200, testutil.GetResponseStatusCode(request), string(testutil.GetResponseBody(request)))
 		assert.Equal(t, "private, no-store", string(request.RequestCtx.Response.Header.Peek("Cache-Control")))
 		var payload struct {
-			Reviews []stagedWhatsAppIdentityReviewItem `json:"reviews"`
-			Total   int64                              `json:"total"`
+			Reviews       []stagedWhatsAppIdentityReviewItem `json:"reviews"`
+			Total         int64                              `json:"total"`
+			ReadOnlyTotal int64                              `json:"read_only_total"`
 		}
 		testutil.ParseEnvelopeResponse(t, request, &payload)
-		return payload.Reviews, payload.Total
+		return payload.Reviews, payload.Total, payload.ReadOnlyTotal
 	}
-	first, total := page(1, 2)
-	assert.EqualValues(t, 3, total)
+	first, total, readOnly := page(1, 2)
+	assert.EqualValues(t, 4, total)
+	assert.EqualValues(t, 3, readOnly)
 	require.Len(t, first, 2)
-	assert.Equal(t, holds[2], first[0].HoldID, "newest first")
-	assert.Equal(t, holds[1], first[1].HoldID)
-	second, total := page(2, 2)
-	assert.EqualValues(t, 3, total)
-	require.Len(t, second, 1)
-	assert.Equal(t, holds[0], second[0].HoldID)
+	assert.Equal(t, conflictHold.ID, first[0].HoldID, "newest first")
+	assert.False(t, first[0].ReadOnly, "a supported hold can be decided")
+	assert.Equal(t, holds[2], first[1].HoldID)
+	second, total, readOnly := page(2, 2)
+	assert.EqualValues(t, 4, total)
+	assert.EqualValues(t, 3, readOnly)
+	require.Len(t, second, 2)
+	assert.Equal(t, holds[1], second[0].HoldID)
+	assert.Equal(t, holds[0], second[1].HoldID)
+	for _, item := range append(first[1:], second...) {
+		assert.True(t, item.ReadOnly, "a zero-member, unsupported hold can never be decided")
+	}
 	for _, item := range append(first, second...) {
 		assert.Equal(t, "text", item.MessageType)
 		assert.Equal(t, models.InboundEventStatusPending, item.Status)
 	}
+
+	detail := func(eventID uuid.UUID) stagedWhatsAppIdentityReviewDetail {
+		t.Helper()
+		request := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(request, organizationID, reviewer.ID)
+		testutil.SetPathParam(request, "id", eventID.String())
+		require.NoError(t, app.GetStagedContactIdentityReview(request))
+		require.Equal(t, 200, testutil.GetResponseStatusCode(request), string(testutil.GetResponseBody(request)))
+		var payload stagedWhatsAppIdentityReviewDetail
+		testutil.ParseEnvelopeResponse(t, request, &payload)
+		return payload
+	}
+	assert.False(t, detail(conflictEvent.ID).ReadOnly)
+	assert.True(t, detail(second[1].ID).ReadOnly)
 }
 
 func createCoexistenceAdmissionWebhookAccount(t *testing.T, app *App) models.WhatsAppAccount {
@@ -879,4 +1051,261 @@ func TestWebhookHandler_CoexistenceEmptyWorkspaceConversationIsVisible(t *testin
 			assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.WhatsAppIdentityReviewHold{}, "organization_id = ?", organizationID))
 		})
 	}
+}
+
+func TestCoexistenceSenderAdmissionPhone(t *testing.T) {
+	t.Parallel()
+	withWaID := func(from, waID string) IncomingTextMessage {
+		return IncomingTextMessage{ID: "wamid.phone", From: from, FromUserID: "US.direct"}.
+			withWebhookSenderContact(&CoexistenceWebhookContact{UserID: "US.direct", WaID: waID})
+	}
+	cases := []struct {
+		name      string
+		message   IncomingTextMessage
+		claim     string
+		wantPhone string
+		wantWaID  bool
+		wantOK    bool
+	}{
+		{name: "from_phone", message: withWaID("60123456789", "60999999999"), claim: "60123456789", wantPhone: "60123456789", wantOK: true},
+		{name: "from_differs_from_claim", message: withWaID("60123456789", ""), claim: "60120000000", wantPhone: "60123456789"},
+		{name: "non_phone_from", message: withWaID("US.1349120865530274", ""), claim: "1349120865530274", wantPhone: "US.1349120865530274"},
+		{name: "wa_id_without_from", message: withWaID("", "+60123456789"), wantPhone: "60123456789", wantWaID: true, wantOK: true},
+		{name: "non_phone_wa_id_without_from", message: withWaID("", "US.1349120865530274"), wantOK: true},
+		{name: "no_phone_at_all", message: withWaID("", ""), wantOK: true},
+	}
+	for _, tc := range cases {
+		phone, fromWaID, ok := coexistenceSenderAdmissionPhone(tc.message, tc.claim)
+		assert.Equal(t, tc.wantPhone, phone, tc.name)
+		assert.Equal(t, tc.wantWaID, fromWaID, tc.name)
+		assert.Equal(t, tc.wantOK, ok, tc.name)
+	}
+}
+
+func TestCoexistenceEchoRecipientThatIsNotAPhoneIsABSUID(t *testing.T) {
+	t.Parallel()
+	for value, want := range map[string]bool{
+		"60123456789":       true,
+		"+60 12-345 6789":   true,
+		"(555) 078-3881":    true,
+		"US.14839120865530": false,
+		"bsuid:abc":         false,
+		"12345":             false,
+		"":                  false,
+	} {
+		assert.Equal(t, want, isCoexistencePhoneAddress(value), value)
+	}
+	echo := func(to, toUserID string) CoexistenceMessage {
+		message := CoexistenceMessage{IncomingTextMessage: IncomingTextMessage{ID: "wamid.echo-identity", From: coexistenceAdmissionBusinessPhone}}
+		message.To = to
+		message.ToUserID = toUserID
+		return message
+	}
+	identity := coexistenceMessageContactIdentity(echo("US.14839120865530", ""), models.DirectionOutgoing, coexistenceContactIdentity{}, nil)
+	assert.Empty(t, identity.Phone, "a BSUID in to must not become a contact phone")
+	assert.Equal(t, "US.14839120865530", identity.UserID)
+	identity = coexistenceMessageContactIdentity(echo("US.14839120865530", "US.explicit"), models.DirectionOutgoing, coexistenceContactIdentity{}, nil)
+	assert.Empty(t, identity.Phone)
+	assert.Equal(t, "US.explicit", identity.UserID, "to_user_id wins")
+	identity = coexistenceMessageContactIdentity(echo("60123456789", ""), models.DirectionOutgoing, coexistenceContactIdentity{}, nil)
+	assert.Equal(t, "60123456789", identity.Phone)
+	assert.Empty(t, identity.UserID)
+}
+
+// A zero-member hold is skipped only when it is an earlier held copy of this
+// same sender. One left by a different BSUID on the same phone (number
+// recycling, or two users held during the transition) is review evidence, so
+// the second BSUID is neither bootstrapped nor adopted into a contact that may
+// hold the conversation written for the first.
+func TestCoexistenceOtherBSUIDHeldOnSamePhoneKeepsReview(t *testing.T) {
+	cases := []struct {
+		name string
+		// arrange stages earlier receipts and returns the message under test.
+		arrange func(t *testing.T, app *App, account *models.WhatsAppAccount, phone string) IncomingTextMessage
+		// echoBetween answers the phone from the Business app after staging.
+		echoBetween bool
+	}{
+		{name: "new_sender_after_other_bsuid_was_held", arrange: func(t *testing.T, app *App, account *models.WhatsAppAccount, phone string) IncomingTextMessage {
+			stageCoexistenceReceiptAsBeforeThisChange(t, app, account,
+				coexistenceAdmissionMessage(t, "wamid.held-y-"+uuid.NewString(), phone, "US.y-"+uuid.NewString(), "from Y"))
+			return coexistenceAdmissionMessage(t, "wamid.x-"+uuid.NewString(), phone, "US.x-"+uuid.NewString(), "from X")
+		}},
+		{name: "phone_app_recipient_after_other_bsuid_was_held", echoBetween: true, arrange: func(t *testing.T, app *App, account *models.WhatsAppAccount, phone string) IncomingTextMessage {
+			stageCoexistenceReceiptAsBeforeThisChange(t, app, account,
+				coexistenceAdmissionMessage(t, "wamid.held-y-"+uuid.NewString(), phone, "US.y-"+uuid.NewString(), "from Y"))
+			return coexistenceAdmissionMessage(t, "wamid.x-"+uuid.NewString(), phone, "US.x-"+uuid.NewString(), "from X")
+		}},
+		{name: "same_bsuid_held_with_another_parent", arrange: func(t *testing.T, app *App, account *models.WhatsAppAccount, phone string) IncomingTextMessage {
+			bsuid := "US.same-" + uuid.NewString()
+			earlier := coexistenceAdmissionMessage(t, "wamid.held-parent-"+uuid.NewString(), phone, bsuid, "earlier")
+			earlier.FromParentUserID = "US.parent-one-" + uuid.NewString()
+			stageCoexistenceReceiptAsBeforeThisChange(t, app, account, earlier)
+			message := coexistenceAdmissionMessage(t, "wamid.parent-two-"+uuid.NewString(), phone, bsuid, "later")
+			message.FromParentUserID = "US.parent-two-" + uuid.NewString()
+			return message
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app, account, _ := whatsappIdentityFixture(t)
+			organizationID := account.OrganizationID
+			phone := coexistenceAdmissionTestPhone()
+			message := tc.arrange(t, app, account, phone)
+			var recipient *models.Message
+			if tc.echoBetween {
+				echoWAMID := "wamid.between-echo-" + uuid.NewString()
+				persistCoexistenceAdmissionEcho(t, app, account, echoWAMID, phone, "", "Reply written for Y")
+				var echoed models.Message
+				require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, echoWAMID).First(&echoed).Error)
+				recipient = &echoed
+			}
+			contactsBefore := countCoexistenceAdmissionRows(t, app.DB, &models.Contact{}, "organization_id = ?", organizationID)
+
+			work, duplicate := admitCoexistenceAdmissionMessage(t, app, account, message, "")
+			assert.False(t, duplicate)
+			assert.Nil(t, work, "another BSUID's earlier hold on these selectors keeps the review path")
+			assert.EqualValues(t, 1, countCoexistenceStagedReceipts(t, app, organizationID, message.ID))
+			assert.Equal(t, contactsBefore, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{}, "organization_id = ?", organizationID))
+			assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{},
+				"organization_id = ? AND bs_uid = ?", organizationID, message.FromUserID))
+			if recipient != nil {
+				assert.Empty(t, loadCoexistenceAdmissionContact(t, app.DB, organizationID, recipient.ContactID).BSUID)
+			}
+		})
+	}
+}
+
+// A sender identified by BSUID with contacts[].wa_id but no "from" gets wa_id
+// as its contact phone, like the classic resolver, so the phone-app echo and
+// the customer's messages share one contact in either order.
+func TestCoexistenceWaIDOnlySenderAndPhoneAppEchoEndInOneContact(t *testing.T) {
+	waIDOnly := func(t *testing.T, wamid, phone, bsuid string) IncomingTextMessage {
+		t.Helper()
+		sidecar := &CoexistenceWebhookContact{UserID: bsuid, WaID: phone}
+		sidecar.Profile.Name = "Wa ID Customer"
+		return coexistenceAdmissionMessage(t, wamid, "", bsuid, "hello").withWebhookSenderContact(sidecar)
+	}
+	for _, customerFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("customer_first=%t", customerFirst), func(t *testing.T) {
+			app, account, _ := whatsappIdentityFixture(t)
+			organizationID := account.OrganizationID
+			phone := coexistenceAdmissionTestPhone()
+			bsuid := "US.wa-id-" + uuid.NewString()
+			echoWAMID := "wamid.wa-id-echo-" + uuid.NewString()
+			first := waIDOnly(t, "wamid.wa-id-first-"+uuid.NewString(), phone, bsuid)
+
+			if !customerFirst {
+				persistCoexistenceAdmissionEcho(t, app, account, echoWAMID, phone, "", "Hello from our phone")
+			}
+			work, duplicate := admitCoexistenceAdmissionMessage(t, app, account, first, "Wa ID Customer")
+			require.False(t, duplicate)
+			require.NotNil(t, work, "a wa_id-only sender must not be held")
+			if customerFirst {
+				persistCoexistenceAdmissionEcho(t, app, account, echoWAMID, phone, "", "Hello from our phone")
+			}
+			var echoed models.Message
+			require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, echoWAMID).First(&echoed).Error)
+			assert.Equal(t, work.Persisted.ContactID, echoed.ContactID, "echo and customer message share one contact")
+
+			contact := loadCoexistenceAdmissionContact(t, app.DB, organizationID, work.Persisted.ContactID)
+			assert.Equal(t, phone, contact.PhoneNumber, "wa_id became the contact phone")
+			assert.Equal(t, bsuid, contact.BSUID)
+			wantKind := coexistenceSenderAdmissionNewSender
+			if !customerFirst {
+				wantKind = coexistenceSenderAdmissionPhoneAppRecipient
+			}
+			assert.Equal(t, string(wantKind), contact.Metadata[coexistenceIdentityAdmissionKey])
+			assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{},
+				"organization_id = ? AND (phone_number = ? OR bs_uid = ?)", organizationID, phone, bsuid))
+			assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.WhatsAppIdentityReviewHold{}, "organization_id = ?", organizationID))
+
+			// Later messages in either shape stay on the same contact.
+			second := waIDOnly(t, "wamid.wa-id-second-"+uuid.NewString(), phone, bsuid)
+			secondWork, _ := admitCoexistenceAdmissionMessage(t, app, account, second, "Wa ID Customer")
+			require.NotNil(t, secondWork)
+			assert.Equal(t, contact.ID, secondWork.Persisted.ContactID)
+			withFrom := coexistenceAdmissionMessage(t, "wamid.wa-id-from-"+uuid.NewString(), phone, bsuid, "now with from")
+			withFromWork, _ := admitCoexistenceAdmissionMessage(t, app, account, withFrom, "Wa ID Customer")
+			require.NotNil(t, withFromWork)
+			assert.Equal(t, contact.ID, withFromWork.Persisted.ContactID)
+			assert.EqualValues(t, 4, countCoexistenceAdmissionRows(t, app.DB, &models.Message{},
+				"organization_id = ? AND contact_id = ?", organizationID, contact.ID))
+		})
+	}
+}
+
+// An echo may name a username user's BSUID in "to" without to_user_id. It
+// must land on that user's contact, not create a second contact whose phone
+// number is the BSUID.
+func TestCoexistenceEchoToUsernameRecipientBSUIDEndsInOneContact(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	bsuid := "US." + testutil.NewTestGraphObjectID()[:17]
+	sidecar := &CoexistenceWebhookContact{UserID: bsuid}
+	sidecar.Profile.Name = "Username Customer"
+	sidecar.Profile.Username = "handle_" + uuid.NewString()[:8]
+	first := coexistenceAdmissionMessage(t, "wamid.username-first-"+uuid.NewString(), "", bsuid, "hi").withWebhookSenderContact(sidecar)
+	work, _ := admitCoexistenceAdmissionMessage(t, app, account, first, "Username Customer")
+	require.NotNil(t, work)
+	contactID := work.Persisted.ContactID
+	require.True(t, isCoexistencePlaceholderPhone(loadCoexistenceAdmissionContact(t, app.DB, organizationID, contactID).PhoneNumber))
+
+	echoWAMID := "wamid.username-echo-" + uuid.NewString()
+	persistCoexistenceAdmissionEcho(t, app, account, echoWAMID, bsuid, "", "Answer from our phone")
+	var echoed models.Message
+	require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, echoWAMID).First(&echoed).Error)
+	assert.Equal(t, contactID, echoed.ContactID)
+	assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{},
+		"organization_id = ? AND phone_number = ?", organizationID, bsuid), "a BSUID is never stored as a phone")
+	assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{}, "organization_id = ? AND bs_uid = ?", organizationID, bsuid))
+	assert.EqualValues(t, 2, countCoexistenceAdmissionRows(t, app.DB, &models.Message{},
+		"organization_id = ? AND contact_id = ?", organizationID, contactID))
+}
+
+// The after-commit Omnichannel Inbox mirror is the only live projection of an
+// inbound message. A retryable PostgreSQL abort (here a synthetic 40P01 on the
+// first conversation insert, standing in for the mirror/admission deadlock)
+// must be retried rather than leave inbox_conversation_id NULL until the next
+// deploy's backfill.
+func TestLegacyWhatsAppMirrorAfterCommitRetriesRetryableAbort(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	sequenceName := "mirror_abort_seq_" + suffix
+	functionName := "mirror_abort_" + suffix
+	triggerName := "mirror_abort_trigger_" + suffix
+	require.NoError(t, app.DB.Exec("CREATE SEQUENCE "+sequenceName).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.organization_id = '%s'::uuid THEN
+				IF nextval('%s') = 1 THEN
+					RAISE EXCEPTION 'synthetic mirror deadlock' USING ERRCODE = '40P01';
+				END IF;
+			END IF;
+			RETURN NEW;
+		END;
+		$$`, functionName, organizationID, sequenceName)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE TRIGGER %s
+		BEFORE INSERT ON inbox_conversations
+		FOR EACH ROW EXECUTE FUNCTION %s()`, triggerName, functionName)).Error)
+	t.Cleanup(func() {
+		_ = app.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON inbox_conversations", triggerName)).Error
+		_ = app.DB.Exec(fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", functionName)).Error
+		_ = app.DB.Exec("DROP SEQUENCE IF EXISTS " + sequenceName).Error
+	})
+
+	message := coexistenceAdmissionMessage(t, "wamid.mirror-retry-"+uuid.NewString(), coexistenceAdmissionTestPhone(), "US.mirror-"+uuid.NewString(), "hi")
+	work, duplicate := admitCoexistenceAdmissionMessage(t, app, account, message, "Mirror Customer")
+	require.False(t, duplicate)
+	require.NotNil(t, work)
+	var calls int64
+	require.NoError(t, app.DB.Raw("SELECT last_value FROM "+sequenceName).Scan(&calls).Error)
+	require.GreaterOrEqual(t, calls, int64(2), "the first mirror attempt was aborted")
+	assert.NotNil(t, work.Persisted.InboxConversationID, "the retried mirror projected the message")
+	assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.InboxConversation{},
+		"organization_id = ? AND contact_id = ?", organizationID, work.Persisted.ContactID))
 }
