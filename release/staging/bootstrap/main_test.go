@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -157,20 +158,37 @@ func TestRunRefusesBeforeConnecting(t *testing.T) {
 	require.Equal(t, logPrefix+"refusing: cannot connect with database.migration_url\n", stderr)
 }
 
+// repositoryRoot is the module root, relative to this package.
+var repositoryRoot = filepath.Join("..", "..", "..")
+
+// TestBackfillsMatchRunRLSMigration keeps backfill() equal to the callback
+// runRLSMigration passes to database.RunRLSMigrationCoordinator as its
+// backfill parameter. It compares every call in the two, in source order, by
+// import path and with literal arguments kept. Only logging and error
+// construction are left out, so any new step in the callback, whatever its
+// name, fails here until backfill() runs it too. The staging-bootstrap CI job
+// cannot catch that drift: on the bootstrapped database rls-migrate takes the
+// verify-only path and never runs the callback.
 func TestBackfillsMatchRunRLSMigration(t *testing.T) {
-	production := backfillCalls(t, filepath.Join("..", "..", "..", "cmd", "whatomate", "main.go"), "runRLSMigration")
-	tool := backfillCalls(t, "main.go", "backfill")
-	require.NotEmpty(t, production, "runRLSMigration has no Backfill* calls; update this test with its new shape")
-	require.Equal(t, production, tool)
+	position := parameterIndex(t, filepath.Join(repositoryRoot, "internal", "database", "postgres.go"),
+		"RunRLSMigrationCoordinator", "backfill")
+	production := parseGoFile(t, filepath.Join(repositoryRoot, "cmd", "whatomate", "main.go"))
+	callback := production.coordinatorArgument(t, "runRLSMigration", position)
+	tool := parseGoFile(t, "main.go")
+	require.Equal(t, production.steps(callback.Body), tool.steps(tool.function(t, "backfill").Body))
 	require.Equal(t, []string{
 		"github.com/shridarpatil/whatomate/internal/handlers.BackfillChatbotFlowGraph(_, _)",
 		"github.com/shridarpatil/whatomate/internal/channel.BackfillLegacyWhatsAppInbox(_, 500)",
-	}, tool)
+	}, tool.steps(tool.function(t, "backfill").Body))
 }
 
-// backfillCalls lists, in source order, every package-qualified Backfill*
-// call inside one function, by import path, with literal arguments kept.
-func backfillCalls(t *testing.T, path, function string) []string {
+type goFile struct {
+	path    string
+	file    *ast.File
+	imports map[string]string // local name to import path
+}
+
+func parseGoFile(t *testing.T, path string) goFile {
 	t.Helper()
 	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
 	require.NoError(t, err)
@@ -184,28 +202,105 @@ func backfillCalls(t *testing.T, path, function string) []string {
 		}
 		imports[name] = importPath
 	}
-	var body *ast.BlockStmt
-	for _, declaration := range parsed.Decls {
-		if fn, ok := declaration.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == function {
-			require.Nil(t, body, "%s declares %s twice", path, function)
-			body = fn.Body
+	return goFile{path: path, file: parsed, imports: imports}
+}
+
+// function returns the one top-level function with this name.
+func (f goFile) function(t *testing.T, name string) *ast.FuncDecl {
+	t.Helper()
+	var found *ast.FuncDecl
+	for _, declaration := range f.file.Decls {
+		if fn, ok := declaration.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == name {
+			require.Nil(t, found, "%s declares %s twice", f.path, name)
+			found = fn
 		}
 	}
-	require.NotNil(t, body, "%s has no function %s", path, function)
-	var calls []string
+	require.NotNil(t, found, "%s has no function %s", f.path, name)
+	return found
+}
+
+// parameterIndex is the position of a named parameter of a function.
+func parameterIndex(t *testing.T, path, function, parameter string) int {
+	t.Helper()
+	position := 0
+	for _, field := range parseGoFile(t, path).function(t, function).Type.Params.List {
+		for _, name := range field.Names {
+			if name.Name == parameter {
+				return position
+			}
+			position++
+		}
+	}
+	t.Fatalf("%s: %s has no parameter %s", path, function, parameter)
+	return 0
+}
+
+// coordinatorArgument is the function literal that the one
+// database.RunRLSMigrationCoordinator call inside function passes at
+// position.
+func (f goFile) coordinatorArgument(t *testing.T, function string, position int) *ast.FuncLit {
+	t.Helper()
+	var calls []*ast.CallExpr
+	ast.Inspect(f.function(t, function).Body, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok && f.callee(call.Fun) ==
+			"github.com/shridarpatil/whatomate/internal/database.RunRLSMigrationCoordinator" {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	require.Len(t, calls, 1, "%s: %s does not call database.RunRLSMigrationCoordinator exactly once", f.path, function)
+	require.Greater(t, len(calls[0].Args), position)
+	literal, ok := calls[0].Args[position].(*ast.FuncLit)
+	require.True(t, ok, "%s: the coordinator's backfill argument is not a function literal; update this test", f.path)
+	return literal
+}
+
+// callee names a called function: a package-qualified call by its import
+// path, anything else as written.
+func (f goFile) callee(fun ast.Expr) string {
+	if selector, ok := fun.(*ast.SelectorExpr); ok {
+		if qualifier, ok := selector.X.(*ast.Ident); ok {
+			if importPath, ok := f.imports[qualifier.Name]; ok {
+				return importPath + "." + selector.Sel.Name
+			}
+		}
+	}
+	return types.ExprString(fun)
+}
+
+var (
+	// errorConstruction builds the returned error; it is not a step.
+	errorConstruction = map[string]bool{"fmt.Errorf": true, "errors.New": true, "errors.Join": true}
+	logLevels         = map[string]bool{"Debug": true, "Info": true, "Warn": true, "Error": true}
+)
+
+// logging reports a leveled call on a logger value, such as lo.Info(...).
+func (f goFile) logging(fun ast.Expr) bool {
+	selector, ok := fun.(*ast.SelectorExpr)
+	if !ok || !logLevels[selector.Sel.Name] {
+		return false
+	}
+	qualifier, ok := selector.X.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	_, isPackage := f.imports[qualifier.Name]
+	return !isPackage
+}
+
+// steps lists, in source order, every call in body except logging and error
+// construction, with literal arguments kept and the others written as _.
+func (f goFile) steps(body *ast.BlockStmt) []string {
+	var steps []string
 	ast.Inspect(body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || !strings.HasPrefix(selector.Sel.Name, "Backfill") {
+		callee := f.callee(call.Fun)
+		if errorConstruction[callee] || f.logging(call.Fun) {
 			return true
 		}
-		qualifier, ok := selector.X.(*ast.Ident)
-		require.True(t, ok, "%s: a Backfill call is not package-qualified", path)
-		importPath, ok := imports[qualifier.Name]
-		require.True(t, ok, "%s: %s is not an imported package", path, qualifier.Name)
 		arguments := make([]string, 0, len(call.Args))
 		for _, argument := range call.Args {
 			if literal, ok := argument.(*ast.BasicLit); ok {
@@ -214,10 +309,10 @@ func backfillCalls(t *testing.T, path, function string) []string {
 				arguments = append(arguments, "_")
 			}
 		}
-		calls = append(calls, fmt.Sprintf("%s.%s(%s)", importPath, selector.Sel.Name, strings.Join(arguments, ", ")))
+		steps = append(steps, fmt.Sprintf("%s(%s)", callee, strings.Join(arguments, ", ")))
 		return true
 	})
-	return calls
+	return steps
 }
 
 // ---------------------------------------------------------------------------
