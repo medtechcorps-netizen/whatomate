@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -482,22 +483,17 @@ func normalizeCoexistencePhone(phone string) string {
 	return strings.TrimPrefix(strings.TrimSpace(phone), "+")
 }
 
-// isCoexistencePhoneAddress reports whether a Meta address field holds a
-// phone: 7 to 15 digits once an optional "+" and common separators are
-// removed. A BSUID such as "US.1234..." is not a phone.
-func isCoexistencePhoneAddress(value string) bool {
-	value = normalizeCoexistencePhone(value)
-	var digits strings.Builder
-	for _, char := range value {
-		switch {
-		case char >= '0' && char <= '9':
-			digits.WriteRune(char)
-		case char == ' ' || char == '-' || char == '(' || char == ')':
-		default:
-			return false
-		}
-	}
-	return isPlausibleWhatsAppPhone(digits.String())
+// coexistenceBSUIDAddressPattern is the shape of a business-scoped user ID:
+// an ISO 3166 alpha-2 country code, then one or more dot-separated
+// alphanumeric segments (for example "US.1349..." or a parent "US.ENT.1181...").
+var coexistenceBSUIDAddressPattern = regexp.MustCompile(`^[A-Z]{2}(\.[A-Za-z0-9]{1,128}){1,3}$`)
+
+// isCoexistenceBSUIDAddress reports whether a Meta address field ("to" or
+// "from") holds a BSUID rather than a phone. Phone-shaped values, including
+// non-E.164 test and legacy values, are not BSUIDs.
+func isCoexistenceBSUIDAddress(value string) bool {
+	value = strings.TrimSpace(value)
+	return len(value) <= coexistenceContactBSUIDMaxLength && coexistenceBSUIDAddressPattern.MatchString(value)
 }
 
 func isCoexistencePlaceholderPhone(phone string) bool {
@@ -934,17 +930,17 @@ func coexistenceMessageContactIdentity(
 	identity := fallback
 	identity.FallbackKey = strings.TrimSpace(message.ID)
 	if direction == models.DirectionOutgoing {
-		// Meta may address a WhatsApp username user by BSUID in "to". A value
-		// that is not a phone must never become a contact phone; with no
-		// to_user_id it is the recipient's BSUID.
+		// Meta may address a WhatsApp username user by BSUID in "to". A BSUID
+		// must never become a contact phone; with no to_user_id it is the
+		// recipient's BSUID.
 		to := strings.TrimSpace(message.To)
-		toIsPhone := isCoexistencePhoneAddress(to)
-		if toIsPhone {
+		toIsBSUID := isCoexistenceBSUIDAddress(to)
+		if to != "" && !toIsBSUID {
 			identity.Phone = to
 		}
 		if value := strings.TrimSpace(message.ToUserID); value != "" {
 			identity.UserID = value
-		} else if to != "" && !toIsPhone && identity.UserID == "" {
+		} else if toIsBSUID && identity.UserID == "" {
 			identity.UserID = to
 		}
 		if value := strings.TrimSpace(message.ToParentUserID); value != "" {

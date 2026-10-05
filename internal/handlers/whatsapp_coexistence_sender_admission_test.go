@@ -1085,15 +1085,17 @@ func TestCoexistenceSenderAdmissionPhone(t *testing.T) {
 func TestCoexistenceEchoRecipientThatIsNotAPhoneIsABSUID(t *testing.T) {
 	t.Parallel()
 	for value, want := range map[string]bool{
-		"60123456789":       true,
-		"+60 12-345 6789":   true,
-		"(555) 078-3881":    true,
-		"US.14839120865530": false,
-		"bsuid:abc":         false,
-		"12345":             false,
-		"":                  false,
+		"US.14839120865530":           true,
+		"US.ENT.11815799212886844830": true,
+		"60123456789":                 false,
+		"+60 12-345 6789":             false,
+		"+1234567890ab12":             false,
+		"bsuid:abc":                   false,
+		"us.1483":                     false,
+		"US.":                         false,
+		"":                            false,
 	} {
-		assert.Equal(t, want, isCoexistencePhoneAddress(value), value)
+		assert.Equal(t, want, isCoexistenceBSUIDAddress(value), value)
 	}
 	echo := func(to, toUserID string) CoexistenceMessage {
 		message := CoexistenceMessage{IncomingTextMessage: IncomingTextMessage{ID: "wamid.echo-identity", From: coexistenceAdmissionBusinessPhone}}
