@@ -19,7 +19,18 @@ type SLAProcessor struct {
 	app      *App
 	interval time.Duration
 	stopCh   chan struct{}
+	// notices collects one organization pass's customer notices while
+	// processOrganizationSLA runs, so they go out after its agent events.
+	notices *[]slaNotice
 }
+
+// slaTransfersPerPass caps the transfers each SLA step writes in one
+// organization pass. Each written transfer uses a savepoint and, under RLS,
+// the whole pass is one transaction. PostgreSQL caches 64 subtransaction IDs
+// per backend; past that, every other backend's snapshot has to consult
+// pg_subtrans until the pass commits. Two capped steps plus the breach update
+// stay at 61. The rest wait for the next tick, oldest deadline first.
+const slaTransfersPerPass = 30
 
 // NewSLAProcessor creates a new SLA processor
 func NewSLAProcessor(app *App, interval time.Duration) *SLAProcessor {
@@ -112,6 +123,16 @@ func (p *SLAProcessor) processStaleTransfers() {
 func (p *SLAProcessor) processOrganizationSLA(settings models.ChatbotSettings, now time.Time) {
 	orgID := settings.OrganizationID
 
+	// Each step queues its agent events for after commit as it goes. Customer
+	// sends can take up to 30 s each, so they are queued once, at the end,
+	// and never hold up an agent event or escalation alert of this pass.
+	var notices []slaNotice
+	p.notices = &notices
+	defer func() {
+		p.notices = nil
+		p.sendSLANoticesAfterCommit(notices)
+	}()
+
 	// 1. Auto-close expired transfers
 	if settings.SLA.AutoCloseHours > 0 {
 		p.autoCloseExpiredTransfers(orgID, settings, now)
@@ -128,13 +149,17 @@ func (p *SLAProcessor) processOrganizationSLA(settings models.ChatbotSettings, n
 	}
 }
 
+// errSLATransferNoLongerActive means the transfer left the active state
+// between selection and its guarded SLA transition.
+var errSLATransferNoLongerActive = errors.New("transfer is no longer active")
+
 // autoCloseExpiredTransfers closes transfers that have exceeded their expiry time
 func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings models.ChatbotSettings, now time.Time) {
 	var transfers []models.AgentTransfer
 	if err := p.app.DB.Where(
 		"organization_id = ? AND status = ? AND expires_at IS NOT NULL AND expires_at < ?",
 		orgID, models.TransferStatusActive, now,
-	).Find(&transfers).Error; err != nil {
+	).Order("expires_at, id").Limit(slaTransfersPerPass).Find(&transfers).Error; err != nil {
 		p.app.Log.Error("Failed to find expired transfers", "error", err, "org_id", orgID)
 		return
 	}
@@ -146,18 +171,13 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 		deadline := transfer.SLA.ExpiresAt
 		if deadline != nil && p.agentRespondedSince(transfer, deadline.Add(-time.Duration(settings.SLA.AutoCloseHours)*time.Hour)) {
 			newExpiry := now.Add(time.Duration(settings.SLA.AutoCloseHours) * time.Hour)
-			if err := p.app.DB.Model(&transfer).Update("expires_at", newExpiry).Error; err != nil {
+			if err := p.extendTransferSLA(&transfer, "expires_at", newExpiry); err != nil {
 				p.app.Log.Error("Failed to extend transfer expiry", "error", err, "transfer_id", transfer.ID)
 			} else {
 				p.app.Log.Info("Extended transfer expiry due to agent activity",
 					"transfer_id", transfer.ID,
 					"new_expires_at", newExpiry,
 				)
-			}
-			// Also record first_response_at if not yet set
-			p.app.UpdateSLAOnFirstResponse(&transfer)
-			if transfer.SLA.FirstResponseAt != nil {
-				p.app.DB.Model(&transfer).Update("first_response_at", transfer.SLA.FirstResponseAt)
 			}
 			continue
 		}
@@ -194,15 +214,21 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 					return result.Error
 				}
 				if result.RowsAffected != 1 {
-					return errors.New("transfer expiry lost its active policy state")
+					return errSLATransferNoLongerActive
 				}
 				return nil
 			},
 		)
+		if errors.Is(expireErr, errSLATransferNoLongerActive) {
+			// Resumed, closed or expired by another instance since selection.
+			p.app.Log.Info("Skipped transfer expiry: transfer changed since selection", "transfer_id", transfer.ID)
+			continue
+		}
 		if expireErr != nil {
 			p.app.Log.Error("Failed to expire transfer", "error", expireErr, "transfer_id", transfer.ID)
 			continue
 		}
+		transfer.Status = models.TransferStatusExpired
 
 		closedCount++
 		p.app.Log.Info("Transfer auto-closed due to expiry",
@@ -216,7 +242,7 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 
 		// Only the tick that committed this expiry tells the customer.
 		if settings.SLA.AutoCloseMessage != "" {
-			p.sendSLATextAfterCommit(transfer, "SLA auto-close message", settings.SLA.AutoCloseMessage)
+			p.sendSLATextAfterCommit(transfer, "SLA auto-close message", settings.SLA.AutoCloseMessage, slaAutoCloseNoticeStillCurrent)
 		}
 	}
 
@@ -231,7 +257,7 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 	if err := p.app.DB.Where(
 		"organization_id = ? AND status = ? AND sla_escalation_at IS NOT NULL AND sla_escalation_at < ? AND escalation_level < 2",
 		orgID, models.TransferStatusActive, now,
-	).Find(&transfers).Error; err != nil {
+	).Order("sla_escalation_at, id").Limit(slaTransfersPerPass).Find(&transfers).Error; err != nil {
 		p.app.Log.Error("Failed to find transfers for escalation", "error", err, "org_id", orgID)
 		return
 	}
@@ -250,18 +276,13 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 		since := p.customerLastSpokeAt(transfer)
 		if p.agentRespondedSince(transfer, since) {
 			newEscalation := now.Add(time.Duration(settings.SLA.EscalationMinutes) * time.Minute)
-			if err := p.app.DB.Model(&transfer).Update("sla_escalation_at", newEscalation).Error; err != nil {
+			if err := p.extendTransferSLA(&transfer, "sla_escalation_at", newEscalation); err != nil {
 				p.app.Log.Error("Failed to extend transfer escalation", "error", err, "transfer_id", transfer.ID)
 			} else {
 				p.app.Log.Info("Extended transfer escalation — agent has replied since customer's last message",
 					"transfer_id", transfer.ID,
 					"new_escalation_at", newEscalation,
 				)
-			}
-			// Also record first_response_at if not yet set
-			p.app.UpdateSLAOnFirstResponse(&transfer)
-			if transfer.SLA.FirstResponseAt != nil {
-				p.app.DB.Model(&transfer).Update("first_response_at", transfer.SLA.FirstResponseAt)
 			}
 			continue
 		}
@@ -282,18 +303,32 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 
 		// Escalate only from the level this tick selected. Every server instance
 		// runs this processor; the losing tick must not notify or warn again.
-		result := p.app.DB.Model(&transfer).Where(
-			"organization_id = ? AND status = ? AND escalation_level = ?",
-			orgID,
-			models.TransferStatusActive,
-			transfer.SLA.EscalationLevel,
-		).Updates(updates)
-		if result.Error != nil {
-			p.app.Log.Error("Failed to escalate transfer", "error", result.Error, "transfer_id", transfer.ID)
+		// The savepoint keeps a failing row from aborting the rest of the tick.
+		selectedLevel := transfer.SLA.EscalationLevel
+		var escalated int64
+		if err := p.app.DB.Transaction(func(tx *gorm.DB) error {
+			result := tx.Model(&transfer).Where(
+				"organization_id = ? AND status = ? AND escalation_level = ?",
+				orgID,
+				models.TransferStatusActive,
+				selectedLevel,
+			).Updates(updates)
+			escalated = result.RowsAffected
+			return result.Error
+		}); err != nil {
+			p.app.Log.Error("Failed to escalate transfer", "error", err, "transfer_id", transfer.ID)
 			continue
 		}
-		if result.RowsAffected != 1 {
+		if escalated != 1 {
+			p.app.Log.Info("Skipped transfer escalation: transfer changed since selection",
+				"transfer_id", transfer.ID,
+				"selected_level", selectedLevel,
+			)
 			continue
+		}
+		transfer.SLA.EscalationLevel = newLevel
+		if breached, ok := updates["sla_breached"].(bool); ok {
+			transfer.SLA.Breached = breached
 		}
 
 		escalatedCount++
@@ -312,7 +347,7 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 
 		// Send warning message to customer if configured
 		if newLevel == 1 && settings.SLA.WarningMessage != "" {
-			p.sendSLATextAfterCommit(transfer, "SLA warning message", settings.SLA.WarningMessage)
+			p.sendSLATextAfterCommit(transfer, "SLA warning message", settings.SLA.WarningMessage, slaWarningNoticeStillCurrent)
 		}
 	}
 
@@ -323,22 +358,43 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 
 // markSLABreached marks transfers as SLA breached when past response deadline
 func (p *SLAProcessor) markSLABreached(orgID uuid.UUID, now time.Time) {
-	result := p.app.DB.Model(&models.AgentTransfer{}).Where(
-		"organization_id = ? AND status = ? AND sla_breached = ? AND sla_response_deadline IS NOT NULL AND sla_response_deadline < ? AND agent_id IS NULL",
-		orgID, models.TransferStatusActive, false, now,
-	).Updates(map[string]any{
-		"sla_breached":    true,
-		"sla_breached_at": now,
-	})
-
-	if result.Error != nil {
-		p.app.Log.Error("Failed to mark SLA breached", "error", result.Error, "org_id", orgID)
+	var marked int64
+	// The savepoint keeps a failure here from undoing the tick's expiries.
+	if err := p.app.DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.AgentTransfer{}).Where(
+			"organization_id = ? AND status = ? AND sla_breached = ? AND sla_response_deadline IS NOT NULL AND sla_response_deadline < ? AND agent_id IS NULL",
+			orgID, models.TransferStatusActive, false, now,
+		).Updates(map[string]any{
+			"sla_breached":    true,
+			"sla_breached_at": now,
+		})
+		marked = result.RowsAffected
+		return result.Error
+	}); err != nil {
+		p.app.Log.Error("Failed to mark SLA breached", "error", err, "org_id", orgID)
 		return
 	}
 
-	if result.RowsAffected > 0 {
-		p.app.Log.Warn("Marked transfers as SLA breached", "count", result.RowsAffected, "org_id", orgID)
+	if marked > 0 {
+		p.app.Log.Warn("Marked transfers as SLA breached", "count", marked, "org_id", orgID)
 	}
+}
+
+// extendTransferSLA moves one SLA deadline after agent activity and records
+// the first response. Under RLS it runs as a savepoint, so a failing row
+// cannot abort the rest of the organization's tick.
+func (p *SLAProcessor) extendTransferSLA(transfer *models.AgentTransfer, column string, deadline time.Time) error {
+	return p.app.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(transfer).Update(column, deadline).Error; err != nil {
+			return err
+		}
+		// Also record first_response_at if not yet set
+		p.app.UpdateSLAOnFirstResponse(transfer)
+		if transfer.SLA.FirstResponseAt != nil {
+			return tx.Model(transfer).Update("first_response_at", transfer.SLA.FirstResponseAt).Error
+		}
+		return nil
+	})
 }
 
 // notifyEscalation sends notifications to escalation contacts via WebSocket broadcast
@@ -377,34 +433,146 @@ func (p *SLAProcessor) notifyEscalation(transfer models.AgentTransfer, settings 
 	if transfer.TeamID != nil {
 		payload["team_id"] = transfer.TeamID.String()
 	}
-	p.app.WSHub.BroadcastToOrg(transfer.OrganizationID, websocket.WSMessage{
+	p.broadcastAfterCommit(transfer.OrganizationID, websocket.WSMessage{
 		Type:    websocket.TypeTransferEscalation,
 		Payload: payload,
 	})
 
-	p.app.Log.Info("Escalation notification sent",
+	p.app.Log.Info("Escalation notification queued",
 		"transfer_id", transfer.ID,
 		"level", level,
 		"notify_count", len(settings.SLA.EscalationNotifyIDs),
 	)
 }
 
+// broadcastAfterCommit tells agents about a transfer transition only once the
+// caller's tenant transaction has committed it; a rolled-back tick says nothing.
+func (p *SLAProcessor) broadcastAfterCommit(organizationID uuid.UUID, message websocket.WSMessage) {
+	hub := p.app.WSHub
+	if hub == nil {
+		return
+	}
+	p.app.afterTenantCommit(func() {
+		hub.BroadcastToOrg(organizationID, message)
+	})
+}
+
+// slaNoticeStillCurrent reports whether a committed transfer is still in the
+// state its queued customer notice announces. Sends run one after another
+// after the tick commits, so a later one can trail its transition.
+type slaNoticeStillCurrent func(tx *gorm.DB, transfer models.AgentTransfer) (bool, error)
+
+// slaAutoCloseNoticeStillCurrent: the transfer is still expired and the
+// contact has not started a new human handover.
+func slaAutoCloseNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) (bool, error) {
+	current, found, err := loadSLANoticeTransfer(tx, transfer)
+	if err != nil || !found || current.Status != models.TransferStatusExpired {
+		return false, err
+	}
+	var active int64
+	if err := tx.Model(&models.AgentTransfer{}).Where(
+		"organization_id = ? AND contact_id = ? AND status = ?",
+		transfer.OrganizationID,
+		transfer.ContactID,
+		models.TransferStatusActive,
+	).Count(&active).Error; err != nil {
+		return false, err
+	}
+	return active == 0, nil
+}
+
+// slaWarningNoticeStillCurrent: the transfer is still waiting for an agent at
+// or past the escalation that triggered the warning, and no agent has replied
+// to the customer since that escalation.
+func slaWarningNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) (bool, error) {
+	current, found, err := loadSLANoticeTransfer(tx, transfer)
+	if err != nil || !found ||
+		current.Status != models.TransferStatusActive || current.SLA.EscalationLevel < 1 {
+		return false, err
+	}
+	if current.SLA.EscalatedAt == nil {
+		return true, nil
+	}
+	var replies int64
+	if err := tx.Model(&models.Message{}).Where(
+		"organization_id = ? AND contact_id = ? AND direction = ? AND sent_by_user_id IS NOT NULL AND created_at > ?",
+		transfer.OrganizationID,
+		transfer.ContactID,
+		models.DirectionOutgoing,
+		*current.SLA.EscalatedAt,
+	).Count(&replies).Error; err != nil {
+		return false, err
+	}
+	return replies == 0, nil
+}
+
+func loadSLANoticeTransfer(tx *gorm.DB, transfer models.AgentTransfer) (models.AgentTransfer, bool, error) {
+	var current models.AgentTransfer
+	err := tx.Select("id", "status", "escalation_level", "escalated_at").Where(
+		"id = ? AND organization_id = ?",
+		transfer.ID,
+		transfer.OrganizationID,
+	).First(&current).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return current, false, nil
+	}
+	return current, err == nil, err
+}
+
 // sendSLATextAfterCommit sends an SLA-related text message to the customer
 // once the caller's tenant transaction commits, and not at all if it rolls
 // back. Under RLS that transaction can hold the organization policy fence and
 // contact locks, which the send's own Message insert would wait on until the
-// send timeout.
-func (p *SLAProcessor) sendSLATextAfterCommit(transfer models.AgentTransfer, label, message string) {
+// send timeout. Just before sending, stillCurrent re-reads the committed
+// transfer and the notice is skipped once the transfer has moved on.
+func (p *SLAProcessor) sendSLATextAfterCommit(
+	transfer models.AgentTransfer,
+	label, message string,
+	stillCurrent slaNoticeStillCurrent,
+) {
+	notice := slaNotice{transfer: transfer, label: label, message: message, stillCurrent: stillCurrent}
+	if p.notices != nil {
+		*p.notices = append(*p.notices, notice)
+		return
+	}
+	p.sendSLANoticesAfterCommit([]slaNotice{notice})
+}
+
+// slaNotice is one queued customer notice for a committed transfer transition.
+type slaNotice struct {
+	transfer     models.AgentTransfer
+	label        string
+	message      string
+	stillCurrent slaNoticeStillCurrent
+}
+
+// sendSLANoticesAfterCommit queues one after-commit callback that sends the
+// notices in order, from the root pool.
+func (p *SLAProcessor) sendSLANoticesAfterCommit(notices []slaNotice) {
+	if len(notices) == 0 {
+		return
+	}
 	committed := *p
 	committed.app = p.app.rootApp()
+	committed.notices = nil
 	p.app.afterTenantCommit(func() {
-		committed.sendSLATextToCustomer(transfer, label, message)
+		for _, notice := range notices {
+			committed.sendSLAText(notice.transfer, notice.label, notice.message, notice.stillCurrent)
+		}
 	})
 }
 
 // sendSLATextToCustomer sends an SLA-related text message to the customer.
 // It refuses to run inside a caller transaction; use sendSLATextAfterCommit.
 func (p *SLAProcessor) sendSLATextToCustomer(transfer models.AgentTransfer, label, message string) {
+	p.sendSLAText(transfer, label, message, nil)
+}
+
+func (p *SLAProcessor) sendSLAText(
+	transfer models.AgentTransfer,
+	label, message string,
+	stillCurrent slaNoticeStillCurrent,
+) {
 	if _, transactional := p.app.DB.Statement.ConnPool.(gorm.TxCommitter); transactional {
 		p.app.Log.Error("Refusing to send "+label+" inside a caller transaction", "transfer_id", transfer.ID)
 		return
@@ -415,9 +583,17 @@ func (p *SLAProcessor) sendSLATextToCustomer(transfer models.AgentTransfer, labe
 	var (
 		account *models.WhatsAppAccount
 		contact models.Contact
+		current = true
 	)
 	failure := "Failed to open tenant scope for "
 	if err := root.WithTenantApp(transfer.OrganizationID, func(scoped *App) error {
+		if stillCurrent != nil {
+			failure = "Failed to re-check transfer for "
+			var err error
+			if current, err = stillCurrent(scoped.DB, transfer); err != nil || !current {
+				return err
+			}
+		}
 		failure = "Failed to load WhatsApp account for "
 		resolved, err := scoped.resolveWhatsAppAccount(transfer.OrganizationID, transfer.WhatsAppAccount)
 		if err != nil {
@@ -427,7 +603,15 @@ func (p *SLAProcessor) sendSLATextToCustomer(transfer models.AgentTransfer, labe
 		failure = "Failed to load contact for "
 		return scoped.DB.Where("id = ?", transfer.ContactID).First(&contact).Error
 	}); err != nil {
-		p.app.Log.Error(failure+label, "error", err)
+		p.app.Log.Error(failure+label,
+			"error", err,
+			"transfer_id", transfer.ID,
+			"organization_id", transfer.OrganizationID,
+		)
+		return
+	}
+	if !current {
+		p.app.Log.Info("Skipped "+label+": transfer left the notified state", "transfer_id", transfer.ID)
 		return
 	}
 
@@ -447,7 +631,8 @@ func (p *SLAProcessor) sendSLATextToCustomer(transfer models.AgentTransfer, labe
 	p.app.Log.Info(label+" sent to customer", "phone", transfer.PhoneNumber, "transfer_id", transfer.ID)
 }
 
-// broadcastTransferUpdate broadcasts transfer update via WebSocket
+// broadcastTransferUpdate tells agents about a transfer's committed SLA
+// transition. The caller passes the transfer with its new state.
 func (p *SLAProcessor) broadcastTransferUpdate(transfer models.AgentTransfer, wsType string) {
 	// Get contact info
 	var contact models.Contact
@@ -455,7 +640,7 @@ func (p *SLAProcessor) broadcastTransferUpdate(transfer models.AgentTransfer, ws
 
 	contactName, phoneNumber := p.app.MaskContactFields(transfer.OrganizationID, contact.ProfileName, contact.PhoneNumber)
 
-	p.app.WSHub.BroadcastToOrg(transfer.OrganizationID, websocket.WSMessage{
+	p.broadcastAfterCommit(transfer.OrganizationID, websocket.WSMessage{
 		Type: wsType,
 		Payload: map[string]any{
 			"id":               transfer.ID.String(),
