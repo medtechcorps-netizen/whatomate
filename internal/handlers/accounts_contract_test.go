@@ -130,6 +130,8 @@ type whatsappContractMeta struct {
 	phoneID            string
 	wabaID             string
 	listedPhoneID      string
+	listedDisplay      string
+	extraListedPhones  []whatsapp.WABAPhoneNumber
 	granularTargetIDs  []string
 	messagingTargetIDs []string
 	lookupStatus       int
@@ -153,6 +155,7 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 		phoneID:            phoneID,
 		wabaID:             wabaID,
 		listedPhoneID:      phoneID,
+		listedDisplay:      "+60123456789",
 		granularTargetIDs:  []string{wabaID},
 		lookupStatus:       http.StatusOK,
 		registrationStatus: http.StatusOK,
@@ -245,14 +248,21 @@ func newWhatsAppContractMeta(t *testing.T, phoneID, wabaID string) *whatsappCont
 				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "synthetic lookup failure", "code": 100}})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"data": []map[string]string{{
-					"id":                   meta.listedPhoneID,
-					"display_phone_number": "+60123456789",
-					"verified_name":        "Synthetic Clinic",
+			listed := []map[string]string{{
+				"id":                   meta.listedPhoneID,
+				"display_phone_number": meta.listedDisplay,
+				"verified_name":        "Synthetic Clinic",
+				"quality_rating":       "GREEN",
+			}}
+			for _, phone := range meta.extraListedPhones {
+				listed = append(listed, map[string]string{
+					"id":                   phone.ID,
+					"display_phone_number": phone.DisplayPhoneNumber,
+					"verified_name":        phone.VerifiedName,
 					"quality_rating":       "GREEN",
-				}},
-			})
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": listed})
 		case strings.HasSuffix(r.URL.Path, "/"+meta.wabaID):
 			_ = json.NewEncoder(w).Encode(map[string]string{"id": meta.wabaID, "name": "Synthetic WABA"})
 		case strings.HasSuffix(r.URL.Path, "/"+meta.phoneID+"/register"):
