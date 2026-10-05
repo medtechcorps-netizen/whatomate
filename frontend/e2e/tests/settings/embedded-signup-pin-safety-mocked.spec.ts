@@ -23,7 +23,11 @@ const accountWriter = {
   },
 };
 
-type MetaLoginMode = "complete" | "pending" | "wrong_coexistence_signals";
+type MetaLoginMode =
+  | "complete"
+  | "pending"
+  | "wrong_coexistence_signals"
+  | "coexistence_waba_only";
 
 interface EmbeddedSignupMockOptions {
   accounts?: Array<Record<string, unknown>>;
@@ -31,6 +35,7 @@ interface EmbeddedSignupMockOptions {
   coexistenceRetryWarning?: string;
   exchangeWarning?: string;
   exchangeDelayMs?: number;
+  exchangeErrorMessage?: string;
   exchangeXHRTimeoutMs?: number;
   metaLoginMode?: MetaLoginMode;
   exposeMultipleOrganizations?: boolean;
@@ -108,6 +113,20 @@ async function installEmbeddedSignupMocks(
     let loginImplementation: string;
     if (options.metaLoginMode === "pending") {
       loginImplementation = "window.__embeddedSignupLoginCallback = callback;";
+    } else if (options.metaLoginMode === "coexistence_waba_only") {
+      // Meta's documented Coexistence completion names only the WABA.
+      loginImplementation = `
+            window.dispatchEvent(new MessageEvent('message', {
+              origin: 'https://www.facebook.com',
+              data: {
+                type: 'WA_EMBEDDED_SIGNUP',
+                event: 'FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING',
+                version: 3,
+                data: { waba_id: '1000000000000004' }
+              }
+            }));
+            callback({ authResponse: { code: 'review-safe-code' } });
+          `;
     } else if (options.metaLoginMode === "wrong_coexistence_signals") {
       loginImplementation = `
             window.dispatchEvent(new MessageEvent('message', {
@@ -115,6 +134,7 @@ async function installEmbeddedSignupMocks(
               data: {
                 type: 'WA_EMBEDDED_SIGNUP',
                 event: 'FINISH',
+                version: 2,
                 data: {
                   phone_number_id: 'wrong-mode-phone',
                   waba_id: 'wrong-mode-waba'
@@ -280,6 +300,13 @@ async function installEmbeddedSignupMocks(
           setTimeout(resolve, options.exchangeDelayMs),
         );
       }
+      if (options.exchangeErrorMessage) {
+        capture.exchangeRoutesSettled += 1;
+        return route.fulfill({
+          status: 400,
+          json: { status: "error", message: options.exchangeErrorMessage },
+        });
+      }
       try {
         await route.fulfill({
           json: {
@@ -325,6 +352,32 @@ async function openConnectionMethodDialog(page: Page) {
   await connectButton.click();
 }
 
+// Synthetic number. Meta's Coexistence completion names only the WABA, so the
+// operator enters the number being connected before Meta's login opens.
+const syntheticCoexistenceNumber = "+60 12-345 6789";
+
+async function continueCoexistenceSignup(
+  page: Page,
+  phoneNumber = syntheticCoexistenceNumber,
+) {
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await page
+    .getByLabel("WhatsApp Business app number", { exact: true })
+    .fill(phoneNumber);
+  await page.getByRole("button", { name: "Continue with Facebook" }).click();
+}
+
+async function metaLoginOptions(page: Page) {
+  return page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __embeddedSignupLoginOptions?: Record<string, unknown>;
+        }
+      ).__embeddedSignupLoginOptions,
+  );
+}
+
 test("launches Coexistence with Meta's Business App onboarding contract", async ({
   page,
 }) => {
@@ -350,16 +403,17 @@ test("launches Coexistence with Meta's Business App onboarding contract", async 
 
   // A real button makes the full-card choice keyboard operable.
   await coexistenceOption.press("Enter");
+  const phoneNumber = page.getByLabel("WhatsApp Business app number", {
+    exact: true,
+  });
+  await expect(phoneNumber).toBeVisible();
+  expect(await metaLoginOptions(page)).toBeUndefined();
+  await phoneNumber.fill(syntheticCoexistenceNumber);
+  // Submitting with Enter keeps Meta's login inside the user gesture.
+  await phoneNumber.press("Enter");
   await expect.poll(() => capture.exchangeRequests).toBe(1);
 
-  const loginOptions = await page.evaluate(
-    () =>
-      (
-        window as typeof window & {
-          __embeddedSignupLoginOptions?: Record<string, unknown>;
-        }
-      ).__embeddedSignupLoginOptions,
-  );
+  const loginOptions = await metaLoginOptions(page);
   expect(loginOptions).toEqual({
     config_id: "1000000000000002",
     response_type: "code",
@@ -371,6 +425,7 @@ test("launches Coexistence with Meta's Business App onboarding contract", async 
     },
   });
   expect(capture.exchangeOrganizationIds).toEqual([organizationId]);
+  // Meta named the phone, so the entered number is not sent.
   expect(capture.exchangeBodies).toEqual([
     {
       code: "review-safe-code",
@@ -381,23 +436,310 @@ test("launches Coexistence with Meta's Business App onboarding contract", async 
   ]);
 });
 
-test("Coexistence ignores wrong finish signals and falls back with a mode-bound code only", async ({
+test("Coexistence sends the entered number's digits when Meta names only the WABA", async ({
   page,
 }) => {
   const capture = await installEmbeddedSignupMocks(page, {
-    metaLoginMode: "wrong_coexistence_signals",
+    metaLoginMode: "coexistence_waba_only",
+  });
+  await page.goto("/settings/accounts");
+  await openConnectionMethodDialog(page);
+  await continueCoexistenceSignup(page);
+
+  await expect.poll(() => capture.exchangeRequests).toBe(1);
+  expect(capture.exchangeOrganizationIds).toEqual([organizationId]);
+  expect(capture.exchangeBodies).toEqual([
+    {
+      code: "review-safe-code",
+      signup_mode: "coexistence",
+      waba_id: "1000000000000004",
+      phone_number_hint: "60123456789",
+    },
+  ]);
+  await expect(
+    page.locator("[data-sonner-toast]").filter({
+      hasText: "WhatsApp account connected successfully!",
+    }),
+  ).toBeVisible();
+
+  // The connected number is forgotten, so adding another number starts empty
+  // and Continue never silently reuses it.
+  await openConnectionMethodDialog(page);
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await expect(
+    page.getByLabel("WhatsApp Business app number", { exact: true }),
+  ).toHaveValue("");
+});
+
+test("Coexistence refuses a number without its country code before Meta's login", async ({
+  page,
+}) => {
+  const capture = await installEmbeddedSignupMocks(page, {
+    metaLoginMode: "coexistence_waba_only",
+    // The server refuses a number that is not listed under the WABA and names
+    // at most its last four digits.
+    exchangeErrorMessage:
+      "the number ending in 6789 is not listed in the selected WhatsApp Business Account; check that it matches the number the WhatsApp Business app shows, digit for digit from the country code (no extra 0 after it), and that you selected the account holding it. If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
   });
   await page.goto("/settings/accounts");
   await openConnectionMethodDialog(page);
   await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
 
-  await page.waitForTimeout(250);
+  const phoneNumber = page.getByLabel("WhatsApp Business app number", {
+    exact: true,
+  });
+  const continueButton = page.getByRole("button", {
+    name: "Continue with Facebook",
+  });
+  await continueButton.click();
+  await expect(
+    page.getByText("Enter the number you are connecting."),
+  ).toBeVisible();
+  await phoneNumber.fill("012-345 6789");
+  await continueButton.click();
+  await expect(
+    page.getByText(
+      "Replace the first 0 with the country code: 012-345 6789 becomes +60 12-345 6789.",
+    ),
+  ).toBeVisible();
+  await expect(phoneNumber).toHaveAttribute("aria-invalid", "true");
+  await expect(phoneNumber).toBeFocused();
+  // A Malaysian number that keeps its 0 after +60 can never match.
+  await phoneNumber.fill("+60 012-345 6789");
+  await continueButton.click();
+  await expect(
+    page.getByText(
+      "Leave out the 0 after +60: +60 012-345 6789 becomes +60 12-345 6789.",
+    ),
+  ).toBeVisible();
+  // A mobile number without its 0 and without +60 reads as a short +1 number.
+  await phoneNumber.fill("12-345 6789");
+  await continueButton.click();
+  await expect(
+    page.getByText(
+      "Add the country code first, for example +60 12-345 6789. A number starting with 1 is read as a US or Canada number, which has 11 digits.",
+    ),
+  ).toBeVisible();
+  await expect(page.getByText("Number to match:")).toHaveCount(0);
+  expect(await metaLoginOptions(page)).toBeUndefined();
   expect(capture.exchangeRequests).toBe(0);
-  await expect.poll(() => capture.exchangeRequests, { timeout: 7_000 }).toBe(1);
+
+  // Back returns to the mode choice; the dialog keeps the typed number.
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: "Back", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: /Direct Cloud API \(Classic\)/ }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await expect(phoneNumber).toHaveValue("12-345 6789");
+  // Copied from a contacts app: bidi marks and no-break spaces.
+  await phoneNumber.fill("\u202a+60\u00a012-345\u00a06789\u202c");
+  await expect(page.getByText("Number to match:")).toContainText(
+    "+60123456789",
+  );
+  await expect(phoneNumber).not.toHaveAttribute("aria-invalid", "true");
+  await phoneNumber.fill(syntheticCoexistenceNumber);
+  await expect(page.getByText("Number to match:")).toContainText(
+    "+60123456789",
+  );
+  await continueButton.click();
+
+  await expect.poll(() => capture.exchangeRequests).toBe(1);
+  expect(capture.exchangeBodies[0]?.phone_number_hint).toBe("60123456789");
+  const refusal = page
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: "the number ending in 6789 is not listed" });
+  await expect(refusal).toContainText(
+    "Meta signup diagnostics: FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=3 waba_id=present waba_ids=absent phone_number_id=absent (before code); coexistence sent code+waba_id+phone_number_hint",
+  );
+  await expect(refusal).not.toContainText("12-345");
+  await expect(refusal).not.toContainText("60123456789");
+  await expect(refusal).not.toContainText("review-safe-code");
+
+  // After a refusal the typed number stays, so it can be corrected.
+  await openConnectionMethodDialog(page);
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await expect(phoneNumber).toHaveValue(syntheticCoexistenceNumber);
+});
+
+test("Coexistence reconnects a workspace account by its phone ID without a number", async ({
+  page,
+}) => {
+  const capture = await installEmbeddedSignupMocks(page, {
+    metaLoginMode: "coexistence_waba_only",
+    accounts: [
+      {
+        id: "b4444444-4444-4444-8444-444444444445",
+        name: "Existing classic number",
+        phone_id: "1000000000000003",
+        business_id: "1000000000000004",
+        api_version: "v21.0",
+        status: "active",
+        is_smb: false,
+        has_access_token: true,
+        created_at: "2026-09-04T01:00:00Z",
+      },
+    ],
+  });
+  await page.goto("/settings/accounts");
+  await openConnectionMethodDialog(page);
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+
+  const reconnect = page.getByLabel(
+    "Or reconnect a number already in this workspace",
+  );
+  await reconnect.selectOption({
+    label: "Existing classic number (Phone Number ID 1000000000000003)",
+  });
+  await expect(
+    page.getByLabel("WhatsApp Business app number", { exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Continue with Facebook" }).click();
+
+  await expect.poll(() => capture.exchangeRequests).toBe(1);
   expect(capture.exchangeBodies).toEqual([
     {
       code: "review-safe-code",
       signup_mode: "coexistence",
+      phone_id: "1000000000000003",
+      waba_id: "1000000000000004",
+    },
+  ]);
+});
+
+test("Coexistence never sends IDs from unsupported finish versions and falls back to a code-only exchange", async ({
+  page,
+}) => {
+  const capture = await installEmbeddedSignupMocks(page, {
+    metaLoginMode: "wrong_coexistence_signals",
+    // The server refuses a code-only exchange whose token grants several
+    // WABAs. The UI adds only privacy-safe diagnostics to that refusal.
+    exchangeErrorMessage:
+      "embedded signup token grants access to multiple WhatsApp Business Accounts; reconnect and select exactly one account",
+  });
+  await page.goto("/settings/accounts");
+  await openConnectionMethodDialog(page);
+  await page.clock.install();
+  await continueCoexistenceSignup(page);
+
+  await page.clock.fastForward(5_001);
+  expect(capture.exchangeRequests).toBe(0);
+  await page.clock.fastForward(10_000);
+  // The server accepts a code-only exchange only when the token grants
+  // exactly one WABA and refuses ambiguity. The entered number still picks
+  // the phone if the token's single WABA lists several.
+  await expect.poll(() => capture.exchangeRequests).toBe(1);
+  expect(capture.exchangeBodies).toEqual([
+    {
+      code: "review-safe-code",
+      signup_mode: "coexistence",
+      phone_number_hint: "60123456789",
+    },
+  ]);
+
+  const refusal = page
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: "multiple WhatsApp Business Accounts" });
+  await expect(refusal).toContainText(
+    "Meta signup diagnostics: " +
+      "FINISH v=2 waba_id=present waba_ids=absent phone_number_id=present (before code); " +
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=2 waba_id=present waba_ids=absent phone_number_id=absent (before code); " +
+      "coexistence sent code+phone_number_hint after a 15s wait",
+  );
+  await expect(refusal).not.toContainText("wrong-");
+  await expect(refusal).not.toContainText("review-safe-code");
+  await expect(refusal).not.toContainText("60123456789");
+  // The diagnostic toast stays until the operator closes it.
+  await page.clock.fastForward(60_000);
+  await expect(refusal).toBeVisible();
+});
+
+test("Coexistence refuses an ambiguous Meta selection with privacy-safe diagnostics", async ({
+  page,
+}) => {
+  const capture = await installEmbeddedSignupMocks(page, {
+    metaLoginMode: "pending",
+  });
+  await page.goto("/settings/accounts");
+  await openConnectionMethodDialog(page);
+  await continueCoexistenceSignup(page);
+  await page.evaluate(() => {
+    (
+      window as typeof window & {
+        __embeddedSignupLoginCallback?: (response: unknown) => void;
+      }
+    ).__embeddedSignupLoginCallback?.({
+      authResponse: { code: "review-safe-code" },
+    });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "https://www.facebook.com",
+        data: JSON.stringify({
+          type: "WA_EMBEDDED_SIGNUP",
+          event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+          version: 3,
+          data: { waba_ids: ["1000000000000004", "1000000000000006"] },
+        }),
+      }),
+    );
+  });
+
+  const refusal = page
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: "more than one selected WhatsApp account" });
+  await expect(refusal).toContainText(
+    "Meta signup diagnostics: FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=3 waba_id=absent waba_ids=2 listed phone_number_id=absent (0s after code); coexistence sent nothing",
+  );
+  await expect(refusal).not.toContainText("1000000000000");
+  await expect(refusal).not.toContainText("review-safe-code");
+  expect(capture.exchangeRequests).toBe(0);
+});
+
+test("Coexistence preserves the selected account from a delayed standard finish without a version", async ({
+  page,
+}) => {
+  const capture = await installEmbeddedSignupMocks(page, {
+    metaLoginMode: "pending",
+  });
+  await page.goto("/settings/accounts");
+  await openConnectionMethodDialog(page);
+  await page.clock.install();
+  await continueCoexistenceSignup(page);
+  await page.evaluate(() => {
+    const loginCallback = (
+      window as typeof window & {
+        __embeddedSignupLoginCallback?: (response: unknown) => void;
+      }
+    ).__embeddedSignupLoginCallback;
+    loginCallback?.({ authResponse: { code: "review-safe-code" } });
+  });
+  await page.clock.fastForward(5_001);
+  expect(capture.exchangeRequests).toBe(0);
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "https://www.facebook.com",
+        data: {
+          type: "WA_EMBEDDED_SIGNUP",
+          event: "FINISH",
+          data: {
+            waba_id: "1000000000000004",
+            phone_number_id: "1000000000000003",
+          },
+        },
+      }),
+    );
+  });
+  await expect.poll(() => capture.exchangeRequests).toBe(1);
+  expect(capture.exchangeOrganizationIds).toEqual([organizationId]);
+  expect(capture.exchangeBodies).toEqual([
+    {
+      code: "review-safe-code",
+      signup_mode: "coexistence",
+      phone_id: "1000000000000003",
+      waba_id: "1000000000000004",
     },
   ]);
 });
@@ -517,6 +859,7 @@ test("embedded signup never renders the generated two-step verification PIN in a
   await expect(page.locator("[data-sonner-toast]")).not.toContainText("483920");
   await expect(page.getByText(/Your 2FA PIN/i)).toHaveCount(0);
   expect(capture.exchangeBodies[0]?.signup_mode).toBe("classic");
+  expect(capture.exchangeBodies[0]).not.toHaveProperty("phone_number_hint");
 });
 
 test("an active embedded signup still surfaces a backend recovery warning", async ({
@@ -574,6 +917,8 @@ test("a client timeout refreshes durable accounts and warns against replay", asy
         name: "Pending connection for reconciliation",
         status: "pending_registration",
         phone_id: "1000000000000003",
+        // The accounts API always returns created_at, and the row renders it.
+        created_at: "2026-09-04T01:00:00Z",
       },
     ],
   });

@@ -1577,6 +1577,11 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		WABAID             string `json:"waba_id"`  // Optional: Discovered via token if missing
 		Name               string `json:"name"`
 		WebhookVerifyToken string `json:"webhook_verify_token"`
+		// PhoneNumberHint is the number the operator typed for a Coexistence
+		// signup. It is used only to choose among the phones Meta lists under the
+		// granted WABA when Meta's completion omitted the phone ID; it is never
+		// logged and never stored.
+		PhoneNumberHint string `json:"phone_number_hint"`
 	}
 	if err := a.decodeRequest(r, &req); err != nil {
 		return nil
@@ -1585,6 +1590,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 	a.Log.Info("Received embedded signup exchange token request",
 		"phone_id", req.PhoneID,
 		"waba_id", req.WABAID,
+		"phone_number_hint_provided", strings.TrimSpace(req.PhoneNumberHint) != "",
 		"organization_id", orgID)
 
 	if strings.TrimSpace(req.Code) == "" {
@@ -1598,6 +1604,17 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 			nil,
 			"",
 		)
+	}
+	// Meta's Coexistence completion carries only the WABA ID, so the operator's
+	// number disambiguates a WABA that lists several phones. Classic completions
+	// carry the phone ID and ignore the hint. Validate it before the one-time
+	// code is spent.
+	phoneNumberHint := ""
+	if signupMode == embeddedSignupModeCoexistence {
+		phoneNumberHint, err = normalizeEmbeddedSignupPhoneNumberHint(req.PhoneNumberHint)
+		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
 	}
 	// The browser posts immediately after Meta's Embedded Signup completion.
 	// Capture that boundary before any Graph round trips so the server never
@@ -1644,6 +1661,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		accessToken,
 		req.PhoneID,
 		req.WABAID,
+		phoneNumberHint,
 		req.Name,
 		metaSnapshot,
 	)
@@ -2607,7 +2625,7 @@ func (a *App) discoverWABAAndPhone(
 	ctx context.Context,
 	orgID uuid.UUID,
 	signupMode string,
-	accessToken, phoneID, wabaID, name string,
+	accessToken, phoneID, wabaID, phoneNumberHint, name string,
 	metaSnapshot embeddedSignupMetaSnapshot,
 ) (string, string, string, *time.Time, *whatsapp.PhoneNumberInfo, embeddedSignupAccountVersion, error) {
 	a.Log.Info("Validating embedded signup token via debug_token")
@@ -2680,16 +2698,18 @@ func (a *App) discoverWABAAndPhone(
 			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("no phone numbers found in this WhatsApp Business Account")
 		}
 
-		if len(phonesResp.Data) > 1 {
-			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("multiple phone numbers found in this WhatsApp Business Account; reconnect and select exactly one phone number")
+		phone, err := selectEmbeddedSignupDiscoveredPhone(phonesResp.Data, signupMode, phoneNumberHint)
+		if err != nil {
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, err
 		}
-
-		phone := phonesResp.Data[0]
 		phoneID = strings.TrimSpace(phone.ID)
 		if phoneID == "" {
 			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, fmt.Errorf("meta returned a phone number without an ID")
 		}
-		a.Log.Info("Discovered Phone ID", "phone_id", phoneID)
+		a.Log.Info("Discovered Phone ID",
+			"phone_id", phoneID,
+			"listed_phones", len(phonesResp.Data),
+			"matched_phone_number_hint", phoneNumberHint != "")
 	}
 
 	accountVersion, err := a.embeddedSignupAccountAPIVersion(orgID, signupMode, phoneID, wabaID, metaSnapshot)
@@ -2722,6 +2742,149 @@ func (a *App) discoverWABAAndPhone(
 		PlatformType:       validation.PlatformType,
 	}
 	return phoneID, wabaID, name, tokenExpiresAt, phoneInfo, accountVersion, nil
+}
+
+const (
+	// An E.164 number has at most 15 digits, and no country code starts with 0.
+	embeddedSignupPhoneHintMinDigits = 7
+	embeddedSignupPhoneHintMaxDigits = 15
+	embeddedSignupPhoneHintMaxLength = 32
+	// Country codes are prefix-free, so "60" is only Malaysia, and no
+	// Malaysian number has a 0 after it: "+60 012-…" keeps the domestic
+	// trunk 0 and can never match a listed number.
+	embeddedSignupPhoneHintMalaysiaTrunkZeroPrefix = "600"
+	// Country code 1 is only the North American Numbering Plan, whose
+	// numbers are always 1 followed by 10 digits. A shorter or longer number
+	// starting with 1 is almost always a local number typed without its
+	// country code, such as a Malaysian mobile number without its first 0.
+	embeddedSignupPhoneHintNANPDigits = 11
+)
+
+var (
+	errEmbeddedSignupPhoneNumberHintInvalid = errors.New(
+		"phone_number_hint must be the full international phone number, including its country code",
+	)
+	errEmbeddedSignupPhoneNumberHintTrunkZero = fmt.Errorf(
+		"%w; leave out the 0 after the +60 country code",
+		errEmbeddedSignupPhoneNumberHintInvalid,
+	)
+	errEmbeddedSignupPhoneNumberHintNANPLength = fmt.Errorf(
+		"%w; a number starting with 1 is read as a US or Canada number, which has 11 digits",
+		errEmbeddedSignupPhoneNumberHintInvalid,
+	)
+)
+
+// normalizeEmbeddedSignupPhoneNumberHint reduces the operator's typed number
+// to its E.164 digits. Spaces, hyphens, dots, parentheses and one leading +
+// are accepted as formatting; anything else is refused rather than guessed.
+// So are a local number without its country code (a leading 0), a Malaysian
+// number that keeps its trunk 0 after +60, and a number starting with 1 that
+// is not an 11-digit US or Canada number. Each would match no listed phone,
+// and refusing it here costs nothing because the one-time code has not been
+// exchanged yet. An empty hint is "none". The browser applies the same rules.
+func normalizeEmbeddedSignupPhoneNumberHint(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if len(raw) > embeddedSignupPhoneHintMaxLength {
+		return "", errEmbeddedSignupPhoneNumberHintInvalid
+	}
+	var digits strings.Builder
+	for index, character := range raw {
+		switch {
+		case character >= '0' && character <= '9':
+			digits.WriteRune(character)
+		case character == '+' && index == 0:
+		case character == ' ', character == '-', character == '.', character == '(', character == ')':
+		default:
+			return "", errEmbeddedSignupPhoneNumberHintInvalid
+		}
+	}
+	normalized := digits.String()
+	switch {
+	case normalized == "" || normalized[0] == '0':
+		return "", errEmbeddedSignupPhoneNumberHintInvalid
+	case strings.HasPrefix(normalized, embeddedSignupPhoneHintMalaysiaTrunkZeroPrefix):
+		return "", errEmbeddedSignupPhoneNumberHintTrunkZero
+	case len(normalized) < embeddedSignupPhoneHintMinDigits ||
+		len(normalized) > embeddedSignupPhoneHintMaxDigits:
+		return "", errEmbeddedSignupPhoneNumberHintInvalid
+	case normalized[0] == '1' && len(normalized) != embeddedSignupPhoneHintNANPDigits:
+		return "", errEmbeddedSignupPhoneNumberHintNANPLength
+	}
+	return normalized, nil
+}
+
+// embeddedSignupPhoneDigits keeps only the ASCII digits of Meta's
+// display_phone_number (for example "+60 12-345 6789" becomes "60123456789").
+func embeddedSignupPhoneDigits(displayPhoneNumber string) string {
+	var digits strings.Builder
+	for _, character := range displayPhoneNumber {
+		if character >= '0' && character <= '9' {
+			digits.WriteRune(character)
+		}
+	}
+	return digits.String()
+}
+
+// selectEmbeddedSignupDiscoveredPhone chooses the phone when Meta's completion
+// omitted its ID. The candidates are only the phones Meta lists under the WABA
+// the token was proven to grant, so the hint can never introduce a phone, and
+// the caller still validates the chosen phone's membership, mode, tenant and
+// ownership exactly as for a phone ID Meta supplied.
+//
+// Without a hint, a single listed phone is used, as before. With a hint, the
+// hint must match exactly one listed display number, even when the WABA lists
+// only one phone: the operator named the number being connected, and Meta's
+// list can lag a fresh onboarding, so its only phone may be a different number.
+// Error messages name at most the last four digits of the typed number and
+// never another listed number.
+func selectEmbeddedSignupDiscoveredPhone(
+	phones []whatsapp.WABAPhoneNumber,
+	signupMode, phoneNumberHint string,
+) (whatsapp.WABAPhoneNumber, error) {
+	if phoneNumberHint == "" {
+		if len(phones) == 1 {
+			return phones[0], nil
+		}
+		if signupMode == embeddedSignupModeCoexistence {
+			return whatsapp.WABAPhoneNumber{}, errors.New(
+				"multiple phone numbers found in this WhatsApp Business Account; restart Sync with Mobile App and enter the WhatsApp Business app number you are connecting",
+			)
+		}
+		return whatsapp.WABAPhoneNumber{}, errors.New(
+			"multiple phone numbers found in this WhatsApp Business Account; reconnect and select exactly one phone number",
+		)
+	}
+
+	matches := make([]whatsapp.WABAPhoneNumber, 0, 1)
+	for _, phone := range phones {
+		if embeddedSignupPhoneDigits(phone.DisplayPhoneNumber) == phoneNumberHint {
+			matches = append(matches, phone)
+		}
+	}
+	lastDigits := phoneNumberHint[len(phoneNumberHint)-4:]
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return whatsapp.WABAPhoneNumber{}, fmt.Errorf(
+			// The usual causes, in order: a typo or a 0 the app does not show
+			// after the country code, the wrong account picked in Meta's
+			// popup, and Meta's list not yet showing a number it has just
+			// onboarded. The app shows each number in international form, so
+			// matching it digit for digit is right in every country, including
+			// those that keep a 0 after the country code.
+			"the number ending in %s is not listed in the selected WhatsApp Business Account; check that it matches the number the WhatsApp Business app shows, digit for digit from the country code (no extra 0 after it), and that you selected the account holding it. If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
+			lastDigits,
+		)
+	default:
+		return whatsapp.WABAPhoneNumber{}, fmt.Errorf(
+			"more than one phone in the selected WhatsApp Business Account matches the number ending in %s; check the account's numbers in WhatsApp Manager before reconnecting",
+			lastDigits,
+		)
+	}
 }
 
 func (a *App) debugAndValidateMetaAccessToken(
