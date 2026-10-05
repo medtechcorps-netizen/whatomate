@@ -4,6 +4,7 @@ import {
   isAllowedMetaEmbeddedSignupOrigin,
   META_COEXISTENCE_SELECTION_TIMEOUT_MS,
   META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS,
+  normalizeCoexistencePhoneNumber,
   type MetaEmbeddedSignupAbortReason,
   type MetaEmbeddedSignupMode,
   type MetaEmbeddedSignupResult,
@@ -26,6 +27,7 @@ function createHarness(
   codeFallbackMs = 50,
   context?: { isCurrent: () => boolean },
   mode: MetaEmbeddedSignupMode = "classic",
+  target: { phoneNumberHint?: string; reconnectPhoneNumberId?: string } = {},
 ) {
   const completed: Array<Omit<MetaEmbeddedSignupResult, "diagnostics">> = [];
   const aborted: Array<{
@@ -39,6 +41,7 @@ function createHarness(
   const session = createMetaEmbeddedSignupSession({
     mode,
     codeFallbackMs,
+    ...target,
     onComplete: ({ diagnostics: summary, ...result }) => {
       diagnostics.push(summary);
       completed.push(result);
@@ -981,5 +984,243 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.completed).toHaveLength(0);
     expect(harness.aborted).toHaveLength(0);
     expect(harness.settledCount()).toBe(1);
+  });
+});
+
+describe("normalizeCoexistencePhoneNumber", () => {
+  // The same rules as the server's normalizeEmbeddedSignupPhoneNumberHint.
+  it.each([
+    ["60123456789", "60123456789"],
+    ["+60123456789", "60123456789"],
+    [" +60 12-345 6789 ", "60123456789"],
+    ["+1 (631) 555.0100", "16315550100"],
+    ["(60) 12 345 6789", "60123456789"],
+    ["+6831234", "6831234"],
+    ["+123456789012345", "123456789012345"],
+  ])("accepts %j as %s", (value, digits) => {
+    expect(normalizeCoexistencePhoneNumber(value)).toEqual({ digits });
+  });
+
+  it.each([
+    ["", "empty"],
+    ["   ", "empty"],
+    ["012-345 6789", "missing_country_code"],
+    ["0060123456789", "missing_country_code"],
+    ["+1234567890123456", "invalid"],
+    ["+60 1234", "invalid"],
+    ["++60123456789", "invalid"],
+    ["60+123456789", "invalid"],
+    ["+6O123456789", "invalid"],
+    ["+60123456789 ext 2", "invalid"],
+    ["+60/123456789", "invalid"],
+    ["\uff16\uff10123456789", "invalid"],
+    ["1 ".repeat(17), "invalid"],
+    ["tel:+60123456789", "invalid"],
+    ["+ - ( )", "invalid"],
+  ])("refuses %j as %s", (value, problem) => {
+    expect(normalizeCoexistencePhoneNumber(value)).toEqual({ problem });
+  });
+});
+
+describe("Coexistence phone selection", () => {
+  const wabaOnlyFinish = {
+    origin: facebookOrigin,
+    data: {
+      type: "WA_EMBEDDED_SIGNUP",
+      event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+      version: 3,
+      data: { waba_id: "1000000000000004" },
+    },
+  };
+
+  it("sends the operator's number when Meta names only the WABA", () => {
+    const harness = createHarness(50, undefined, "coexistence", {
+      phoneNumberHint: "60123456789",
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.handleMessage(wabaOnlyFinish);
+
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: undefined,
+        wabaId: "1000000000000004",
+        phoneNumberHint: "60123456789",
+      },
+    ]);
+    expect(harness.diagnostics).toEqual([
+      "Meta signup diagnostics: FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=3 waba_id=present waba_ids=absent phone_number_id=absent (0s after code); coexistence sent code+waba_id+phone_number_hint",
+    ]);
+    expect(harness.diagnostics[0]).not.toMatch(/6789|10000000000|code-/);
+  });
+
+  it("keeps the operator's number for a code-only fallback", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence", {
+      phoneNumberHint: "60123456789",
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+
+    // The server can still discover a single granted WABA and then needs the
+    // number to choose among its phones.
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: undefined,
+        wabaId: undefined,
+        phoneNumberHint: "60123456789",
+      },
+    ]);
+    expect(harness.diagnostics).toEqual([
+      "Meta signup diagnostics: no WA_EMBEDDED_SIGNUP message received; coexistence sent code+phone_number_hint after a 15s wait",
+    ]);
+  });
+
+  it("sends Meta's phone ID instead of the operator's number when Meta supplies one", () => {
+    const harness = createHarness(50, undefined, "coexistence", {
+      phoneNumberHint: "60123456789",
+    });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH",
+        data: {
+          waba_id: "1000000000000004",
+          phone_number_id: "1000000000000003",
+        },
+      },
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: "1000000000000003",
+        wabaId: "1000000000000004",
+      },
+    ]);
+    expect(harness.completed[0]).not.toHaveProperty("phoneNumberHint");
+    expect(harness.diagnostics[0]).toMatch(
+      /coexistence sent code\+waba_id\+phone_number_id$/,
+    );
+  });
+
+  it("never sends the operator's number or a reconnect phone in classic mode", () => {
+    const harness = createHarness(50, undefined, "classic", {
+      phoneNumberHint: "60123456789",
+      reconnectPhoneNumberId: "1000000000000009",
+    });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_ONLY_WABA",
+        data: { waba_id: "1000000000000004" },
+      },
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "classic",
+        phoneNumberId: undefined,
+        wabaId: "1000000000000004",
+      },
+    ]);
+    expect(harness.completed[0]).not.toHaveProperty("phoneNumberHint");
+    expect(harness.diagnostics[0]).toMatch(/classic sent code\+waba_id$/);
+  });
+
+  it("sends a chosen workspace account's phone ID for a reconnect", () => {
+    const harness = createHarness(50, undefined, "coexistence", {
+      // A reconnect makes the typed number unnecessary; it is never sent.
+      phoneNumberHint: "60123456789",
+      reconnectPhoneNumberId: " 1000000000000003 ",
+    });
+    harness.session.handleMessage(wabaOnlyFinish);
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: "1000000000000003",
+        wabaId: "1000000000000004",
+      },
+    ]);
+    expect(harness.completed[0]).not.toHaveProperty("phoneNumberHint");
+    expect(harness.diagnostics[0]).toMatch(
+      /coexistence sent code\+waba_id\+reconnect_account_phone_id$/,
+    );
+    expect(harness.diagnostics[0]).not.toMatch(/10000000000|6789/);
+  });
+
+  it("accepts Meta's phone ID when it is the reconnected account's phone", () => {
+    const harness = createHarness(50, undefined, "coexistence", {
+      reconnectPhoneNumberId: "1000000000000003",
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH",
+        data: {
+          waba_id: "1000000000000004",
+          phone_number_id: "1000000000000003",
+        },
+      },
+    });
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: "1000000000000003",
+        wabaId: "1000000000000004",
+      },
+    ]);
+    expect(harness.diagnostics[0]).toMatch(
+      /coexistence sent code\+waba_id\+phone_number_id$/,
+    );
+  });
+
+  it("refuses a Meta phone ID that differs from the reconnected account's phone", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence", {
+      reconnectPhoneNumberId: "1000000000000009",
+    });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH",
+        data: {
+          waba_id: "1000000000000004",
+          phone_number_id: "1000000000000003",
+        },
+      },
+    });
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+
+    expect(harness.completed).toHaveLength(0);
+    expect(harness.aborted).toEqual([
+      {
+        reason: "error",
+        detail: expect.stringContaining(
+          "different phone number from the account you chose to reconnect",
+        ),
+      },
+    ]);
+    expect(harness.settledCount()).toBe(1);
+    expect(harness.diagnostics).toEqual([
+      "Meta signup diagnostics: FINISH v=none waba_id=present waba_ids=absent phone_number_id=present (before code); coexistence sent nothing",
+    ]);
   });
 });

@@ -37,11 +37,15 @@ import { useAuthStore } from "@/stores/auth";
 import { toast } from "vue-sonner";
 import { getErrorMessage } from "@/lib/api-utils";
 import { formatDate } from "@/lib/utils";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   createMetaEmbeddedSignupSession,
   META_COEXISTENCE_SESSION_INFO_VERSION,
+  normalizeCoexistencePhoneNumber,
   type MetaEmbeddedSignupAbortReason,
   type MetaEmbeddedSignupMode,
+  type MetaEmbeddedSignupResult,
   type MetaEmbeddedSignupSession,
 } from "@/lib/metaEmbeddedSignup";
 import {
@@ -57,6 +61,7 @@ import {
   PlugZap,
   RefreshCw,
   X,
+  ArrowLeft,
 } from "lucide-vue-next";
 
 declare global {
@@ -125,6 +130,12 @@ const initializedFacebookAppId = ref<string | null>(null);
 const isConnectingFB = ref(false);
 const canCancelEmbeddedSignup = ref(false);
 const showOnboardingDialog = ref(false);
+// The Coexistence step asks which number is being connected, because Meta's
+// Coexistence completion names only the WhatsApp Business Account.
+const onboardingStep = ref<"choose" | "coexistence-number">("choose");
+const coexistencePhoneNumber = ref("");
+const coexistencePhoneNumberTouched = ref(false);
+const coexistenceReconnectAccountId = ref("");
 let isFacebookSDKLoading = false;
 let accountsFetchSequence = 0;
 let activeEmbeddedSignupSession: MetaEmbeddedSignupSession | null = null;
@@ -153,6 +164,28 @@ const isMetaIntegrationReady = computed(() =>
     whatsappConfig.value?.has_app_secret,
   ),
 );
+const coexistenceReconnectCandidates = computed(() =>
+  accounts.value.filter((account) => account.phone_id?.trim()),
+);
+const coexistenceReconnectAccount = computed(
+  () =>
+    coexistenceReconnectCandidates.value.find(
+      (account) => account.id === coexistenceReconnectAccountId.value,
+    ) ?? null,
+);
+const coexistencePhoneNumberResult = computed(() =>
+  normalizeCoexistencePhoneNumber(coexistencePhoneNumber.value),
+);
+const coexistencePhoneNumberError = computed(() => {
+  if (coexistenceReconnectAccount.value) return "";
+  const problem = coexistencePhoneNumberResult.value.problem;
+  if (!problem || !coexistencePhoneNumberTouched.value) return "";
+  if (problem === "empty") return t("accounts.coexistenceNumberRequired");
+  if (problem === "missing_country_code") {
+    return t("accounts.coexistenceNumberMissingCountryCode");
+  }
+  return t("accounts.coexistenceNumberInvalid");
+});
 const breadcrumbs = computed(() => [
   { label: t("nav.settings"), href: "/settings" },
   { label: t("settings.accounts") },
@@ -187,7 +220,12 @@ const columns = computed<Column<WhatsAppAccount>[]>(() => [
   { key: "actions", label: t("common.actions"), align: "right" },
 ]);
 
+watch(showOnboardingDialog, (isOpen) => {
+  if (!isOpen) onboardingStep.value = "choose";
+});
 watch(activeOrganizationId, (organizationId) => {
+  // A reconnect choice names an account of the previous workspace.
+  coexistenceReconnectAccountId.value = "";
   if (
     activeEmbeddedSignupOrganizationId &&
     organizationId !== activeEmbeddedSignupOrganizationId
@@ -401,7 +439,40 @@ function loadFacebookSDK() {
   document.body.appendChild(script);
 }
 
-function launchWhatsAppSignup(isCoexistence: boolean = true) {
+function openCoexistenceNumberStep() {
+  coexistencePhoneNumberTouched.value = false;
+  if (!coexistenceReconnectAccount.value) {
+    coexistenceReconnectAccountId.value = "";
+  }
+  onboardingStep.value = "coexistence-number";
+}
+
+// Runs synchronously in the submit gesture, so Meta's login popup is not
+// blocked. Only E.164 digits or a workspace account's phone ID leave here.
+function submitCoexistenceNumber() {
+  const reconnectAccount = coexistenceReconnectAccount.value;
+  if (reconnectAccount) {
+    launchWhatsAppSignup(true, {
+      reconnectPhoneNumberId: reconnectAccount.phone_id.trim(),
+    });
+    return;
+  }
+  const result = coexistencePhoneNumberResult.value;
+  if (!result.digits) {
+    coexistencePhoneNumberTouched.value = true;
+    document.getElementById("coexistence-phone-number")?.focus();
+    return;
+  }
+  launchWhatsAppSignup(true, { phoneNumberHint: result.digits });
+}
+
+function launchWhatsAppSignup(
+  isCoexistence: boolean = true,
+  coexistenceTarget: {
+    phoneNumberHint?: string;
+    reconnectPhoneNumberId?: string;
+  } = {},
+) {
   const signupMode: MetaEmbeddedSignupMode = isCoexistence
     ? "coexistence"
     : "classic";
@@ -483,19 +554,18 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
 
   session = createMetaEmbeddedSignupSession({
     mode: signupMode,
-    onComplete: ({ code, mode, phoneNumberId, wabaId, diagnostics }) => {
+    phoneNumberHint: isCoexistence
+      ? coexistenceTarget.phoneNumberHint
+      : undefined,
+    reconnectPhoneNumberId: isCoexistence
+      ? coexistenceTarget.reconnectPhoneNumberId
+      : undefined,
+    onComplete: (result) => {
       if (!isEmbeddedSignupOrganizationCurrent(signupOrganizationId)) {
         cancelPendingEmbeddedSignup(true);
         return;
       }
-      exchangeCodeForToken(
-        code,
-        mode,
-        signupOrganizationId,
-        phoneNumberId,
-        wabaId,
-        diagnostics,
-      );
+      exchangeCodeForToken(result, signupOrganizationId);
     },
     onAbort: handleAbort,
     isContextCurrent: () =>
@@ -542,12 +612,8 @@ function showEmbeddedSignupError(message: string, diagnostics?: string) {
 }
 
 async function exchangeCodeForToken(
-  code: string,
-  signupMode: MetaEmbeddedSignupMode,
+  signup: MetaEmbeddedSignupResult,
   organizationId: string,
-  phoneNumberId?: string,
-  wabaId?: string,
-  signupDiagnostics?: string,
 ) {
   if (!isEmbeddedSignupOrganizationCurrent(organizationId)) {
     cancelPendingEmbeddedSignup(true);
@@ -564,10 +630,13 @@ async function exchangeCodeForToken(
     const response = await api.post(
       "/accounts/exchange-token",
       {
-        code,
-        signup_mode: signupMode,
-        phone_id: phoneNumberId,
-        waba_id: wabaId,
+        code: signup.code,
+        signup_mode: signup.mode,
+        phone_id: signup.phoneNumberId,
+        waba_id: signup.wabaId,
+        // Coexistence only, and only when no phone ID is sent.
+        phone_number_hint:
+          signup.mode === "coexistence" ? signup.phoneNumberHint : undefined,
       },
       {
         headers: { "X-Organization-ID": organizationId },
@@ -625,7 +694,7 @@ async function exchangeCodeForToken(
     } else {
       showEmbeddedSignupError(
         getErrorMessage(error, "Failed to connect WhatsApp account"),
-        signupDiagnostics,
+        signup.diagnostics,
       );
     }
   } finally {
@@ -1139,19 +1208,134 @@ async function confirmDelete() {
           <DialogTitle
             class="text-xl font-bold bg-gradient-to-r from-emerald-400 to-green-400 light:from-emerald-600 light:to-green-600 bg-clip-text text-transparent flex items-center gap-2"
           >
-            {{ $t("accounts.connectTitle") }}
+            {{
+              onboardingStep === "coexistence-number"
+                ? $t("accounts.coexistenceNumberTitle")
+                : $t("accounts.connectTitle")
+            }}
           </DialogTitle>
           <DialogDescription class="text-gray-400 light:text-gray-500 mt-1">
-            {{ $t("accounts.connectDesc") }}
+            {{
+              onboardingStep === "coexistence-number"
+                ? $t("accounts.coexistenceNumberDesc")
+                : $t("accounts.connectDesc")
+            }}
           </DialogDescription>
         </DialogHeader>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 my-4">
+        <!-- Coexistence start step: which number is being connected -->
+        <form
+          v-if="onboardingStep === 'coexistence-number'"
+          class="my-2 space-y-5"
+          novalidate
+          @submit.prevent="submitCoexistenceNumber"
+        >
+          <div class="space-y-2">
+            <Label
+              for="coexistence-phone-number"
+              class="text-gray-200 light:text-gray-800"
+            >
+              {{ $t("accounts.coexistenceNumberLabel") }}
+            </Label>
+            <Input
+              id="coexistence-phone-number"
+              v-model="coexistencePhoneNumber"
+              type="tel"
+              name="coexistence-phone-number"
+              autocomplete="tel"
+              inputmode="tel"
+              maxlength="32"
+              :placeholder="$t('accounts.coexistenceNumberPlaceholder')"
+              :disabled="Boolean(coexistenceReconnectAccount)"
+              :aria-invalid="coexistencePhoneNumberError ? 'true' : undefined"
+              :class="
+                coexistencePhoneNumberError
+                  ? 'border-red-500/70 light:border-red-500'
+                  : undefined
+              "
+              aria-describedby="coexistence-phone-number-help coexistence-phone-number-error"
+              @blur="coexistencePhoneNumberTouched = true"
+            />
+            <p
+              id="coexistence-phone-number-help"
+              class="text-xs leading-relaxed text-gray-400 light:text-gray-600"
+            >
+              {{ $t("accounts.coexistenceNumberHelp") }}
+            </p>
+            <p
+              id="coexistence-phone-number-error"
+              class="min-h-4 text-xs font-medium text-red-400 light:text-red-600"
+              aria-live="polite"
+            >
+              {{ coexistencePhoneNumberError }}
+            </p>
+          </div>
+
+          <div v-if="coexistenceReconnectCandidates.length" class="space-y-2">
+            <Label
+              for="coexistence-reconnect-account"
+              class="text-gray-200 light:text-gray-800"
+            >
+              {{ $t("accounts.coexistenceReconnectLabel") }}
+            </Label>
+            <select
+              id="coexistence-reconnect-account"
+              v-model="coexistenceReconnectAccountId"
+              aria-describedby="coexistence-reconnect-account-help"
+              class="flex h-10 w-full rounded-lg border border-white/[0.1] bg-white/[0.04] px-3 py-2 text-sm text-white transition-all duration-200 hover:border-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/30 focus-visible:border-emerald-500/60 light:bg-slate-50 light:border-slate-300 light:text-slate-950 light:hover:border-slate-400 light:focus-visible:ring-emerald-500 light:focus-visible:border-emerald-500 [&>option]:bg-[#141419] [&>option]:text-white light:[&>option]:bg-white light:[&>option]:text-slate-950"
+            >
+              <option value="">
+                {{ $t("accounts.coexistenceReconnectNone") }}
+              </option>
+              <option
+                v-for="account in coexistenceReconnectCandidates"
+                :key="account.id"
+                :value="account.id"
+              >
+                {{
+                  $t("accounts.coexistenceReconnectOption", {
+                    name: account.name,
+                    phoneId: account.phone_id,
+                  })
+                }}
+              </option>
+            </select>
+            <p
+              id="coexistence-reconnect-account-help"
+              class="text-xs leading-relaxed text-gray-400 light:text-gray-600"
+            >
+              {{ $t("accounts.coexistenceReconnectHelp") }}
+            </p>
+          </div>
+
+          <div
+            class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between"
+          >
+            <Button
+              type="button"
+              variant="outline"
+              @click="onboardingStep = 'choose'"
+            >
+              <ArrowLeft class="h-4 w-4 mr-2" aria-hidden="true" />
+              {{ $t("common.back") }}
+            </Button>
+            <Button
+              type="submit"
+              :disabled="isConnectingFB || !isFBSDKLoaded"
+              class="bg-gradient-to-br from-facebook to-facebook-dark hover:from-facebook-hover hover:to-facebook-hoverDark text-white border-none shadow-none"
+            >
+              <Facebook class="h-4 w-4 mr-2" aria-hidden="true" />
+              {{ $t("accounts.coexistenceNumberContinue") }}
+            </Button>
+          </div>
+        </form>
+
+        <div v-else class="grid grid-cols-1 md:grid-cols-2 gap-4 my-4">
           <!-- Coexistence Option Card -->
           <button
             type="button"
             aria-describedby="coexistence-mode-description"
-            @click="launchWhatsAppSignup(true)"
+            @click="openCoexistenceNumberStep"
             class="relative group flex flex-col overflow-hidden rounded-xl border border-emerald-500/20 bg-[#141419] p-5 text-left transition-all duration-300 hover:border-emerald-500/50 hover:bg-[#181822] hover:shadow-[0_0_20px_rgba(16,185,129,0.1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0e0e11] light:bg-gray-50/50 light:border-emerald-200 light:hover:bg-gray-100/70 light:hover:border-emerald-400 light:hover:shadow-[0_0_20px_rgba(16,185,129,0.05)] light:focus-visible:ring-emerald-600 light:focus-visible:ring-offset-white"
           >
             <!-- Badge -->

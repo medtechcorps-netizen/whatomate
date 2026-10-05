@@ -20,8 +20,14 @@ export interface MetaEmbeddedSignupResult {
   phoneNumberId?: string;
   wabaId?: string;
   /**
+   * Coexistence only: the E.164 digits the operator entered, present only
+   * when no phone ID is sent. The server uses it solely to choose among the
+   * phones Meta lists under the selected WhatsApp Business Account.
+   */
+  phoneNumberHint?: string;
+  /**
    * Privacy-safe summary of the Meta signup messages this session observed
-   * and of what it sent. It never contains an ID, code or token.
+   * and of what it sent. It never contains an ID, code, token or number.
    */
   diagnostics: string;
 }
@@ -40,6 +46,64 @@ interface MetaEmbeddedSignupSessionOptions {
   isContextCurrent?: () => boolean;
   onContextChanged?: () => void;
   codeFallbackMs?: number;
+  /**
+   * Coexistence only: the operator's number, already normalized by
+   * normalizeCoexistencePhoneNumber. Meta's Coexistence completion carries no
+   * phone ID, so the number tells the server which listed phone to connect.
+   * It is sent only when no phone ID is sent, and never in classic mode.
+   */
+  phoneNumberHint?: string;
+  /**
+   * Coexistence only: the phone ID of the workspace account the operator
+   * chose to reconnect. It is sent when Meta's completion has no phone ID;
+   * a different phone ID from Meta aborts the session without an exchange.
+   */
+  reconnectPhoneNumberId?: string;
+}
+
+// The operator's number for a Coexistence signup, as E.164 digits. The rules
+// match the server's: digits with spaces, hyphens, dots, parentheses and one
+// leading +; 7 to 15 digits; a country code never starts with 0.
+const COEXISTENCE_PHONE_NUMBER_MAX_LENGTH = 32;
+const COEXISTENCE_PHONE_NUMBER_MIN_DIGITS = 7;
+const COEXISTENCE_PHONE_NUMBER_MAX_DIGITS = 15;
+
+export type CoexistencePhoneNumberProblem =
+  | "empty"
+  | "missing_country_code"
+  | "invalid";
+
+export type CoexistencePhoneNumber =
+  | { digits: string; problem?: undefined }
+  | { digits?: undefined; problem: CoexistencePhoneNumberProblem };
+
+export function normalizeCoexistencePhoneNumber(
+  value: string,
+): CoexistencePhoneNumber {
+  const trimmed = value.trim();
+  if (!trimmed) return { problem: "empty" };
+  if (trimmed.length > COEXISTENCE_PHONE_NUMBER_MAX_LENGTH) {
+    return { problem: "invalid" };
+  }
+  let digits = "";
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const character = trimmed[index];
+    if (character >= "0" && character <= "9") {
+      digits += character;
+    } else if (character === "+" && index === 0) {
+      continue;
+    } else if (!" -.()".includes(character)) {
+      return { problem: "invalid" };
+    }
+  }
+  if (digits.startsWith("0")) return { problem: "missing_country_code" };
+  if (
+    digits.length < COEXISTENCE_PHONE_NUMBER_MIN_DIGITS ||
+    digits.length > COEXISTENCE_PHONE_NUMBER_MAX_DIGITS
+  ) {
+    return { problem: "invalid" };
+  }
+  return { digits };
 }
 
 export interface MetaEmbeddedSignupSession {
@@ -350,32 +414,63 @@ export function createMetaEmbeddedSignupSession(
     return false;
   };
 
+  // Meta's Coexistence completion carries only the WABA ID. The operator
+  // either chose an existing workspace account to reconnect, whose phone ID is
+  // known, or entered the number being connected. Classic ignores both.
+  const reconnectPhoneNumberId =
+    options.mode === "coexistence"
+      ? nonEmptyString(options.reconnectPhoneNumberId)
+      : undefined;
+  const phoneNumberHint =
+    options.mode === "coexistence" && !reconnectPhoneNumberId
+      ? nonEmptyString(options.phoneNumberHint)
+      : undefined;
+
   const complete = (allowMissingWabaId: boolean, waitedMs?: number) => {
-    if (
-      !ensureContextCurrent() ||
-      !code ||
-      (!allowMissingWabaId && !wabaId) ||
-      !settle()
-    ) {
+    if (!ensureContextCurrent() || !code || (!allowMissingWabaId && !wabaId)) {
       return;
     }
+    if (
+      reconnectPhoneNumberId &&
+      phoneNumberId &&
+      phoneNumberId !== reconnectPhoneNumberId
+    ) {
+      abort(
+        "error",
+        "Meta returned a different phone number from the account you chose to reconnect. Restart the connection and choose the matching account or number.",
+      );
+      return;
+    }
+    if (!settle()) return;
 
     const sent = ["code"];
     if (wabaId) sent.push("waba_id");
-    if (phoneNumberId) sent.push("phone_number_id");
+    let sentPhoneNumberId = phoneNumberId;
+    let sentPhoneNumberHint: string | undefined;
+    if (phoneNumberId) {
+      sent.push("phone_number_id");
+    } else if (reconnectPhoneNumberId) {
+      sentPhoneNumberId = reconnectPhoneNumberId;
+      sent.push("reconnect_account_phone_id");
+    } else if (phoneNumberHint) {
+      sentPhoneNumberHint = phoneNumberHint;
+      sent.push("phone_number_hint");
+    }
     const waited =
       waitedMs === undefined
         ? ""
         : ` after a ${Math.round(waitedMs / 1000)}s wait`;
-    options.onComplete({
+    const result: MetaEmbeddedSignupResult = {
       code,
       mode: options.mode,
-      phoneNumberId,
+      phoneNumberId: sentPhoneNumberId,
       wabaId,
       diagnostics: diagnostics(
         `${options.mode} sent ${sent.join("+")}${waited}`,
       ),
-    });
+    };
+    if (sentPhoneNumberHint) result.phoneNumberHint = sentPhoneNumberHint;
+    options.onComplete(result);
   };
 
   const scheduleCompletionDeadline = () => {
