@@ -280,6 +280,8 @@ describe("createMetaEmbeddedSignupSession", () => {
     ["FINISH_ONLY_WABA", undefined],
     ["FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING", undefined],
     ["FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING", "3"],
+    ["FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING", 4],
+    ["FINISH", "4"],
   ])(
     "retains selected assets and Coexistence mode for %s version %s",
     (event, version) => {
@@ -332,7 +334,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.settledCount()).toBe(1);
   });
 
-  it.each([2, "2", 4, "", null, true, {}, []])(
+  it.each([1, 2, "2", "", " 3", "3.0", 3.5, 1000, null, true, {}, []])(
     "never uses IDs from unsupported Coexistence version %j and falls back to a code-only exchange",
     (version) => {
       vi.useFakeTimers();
@@ -418,8 +420,12 @@ describe("createMetaEmbeddedSignupSession", () => {
   it.each([
     { waba_ids: [" selected-waba ", "selected-waba", ""] },
     { waba_id: "selected-waba", waba_ids: ["selected-waba"] },
+    // Meta's documented multi-WABA shape lists every shared WABA in waba_ids
+    // and names the flow's WABA in waba_id.
+    { waba_id: "selected-waba", waba_ids: ["other-waba", "selected-waba"] },
+    { waba_id: null, waba_ids: ["selected-waba"] },
   ])(
-    "accepts one distinct selected WABA from singular/plural fields",
+    "accepts one distinct selected WABA from singular/plural fields %j",
     (data) => {
       const harness = createHarness(50, undefined, "coexistence");
       harness.session.handleMessage({
@@ -440,10 +446,45 @@ describe("createMetaEmbeddedSignupSession", () => {
     },
   );
 
+  it("prefers the singular waba_id in Meta's documented multi-WABA Coexistence completion", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+        version: 3,
+        data: { waba_id: "waba-a", waba_ids: ["waba-a", "waba-b"] },
+      },
+    });
+    vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: undefined,
+        wabaId: "waba-a",
+      },
+    ]);
+    expect(harness.aborted).toHaveLength(0);
+  });
+
   it.each([
-    { waba_ids: ["waba-a", "waba-b"] },
-    { waba_id: "waba-a", waba_ids: ["waba-b"] },
-  ])("rejects ambiguous or conflicting selected WABAs", (data) => {
+    [
+      { waba_ids: ["waba-a", "waba-b"] },
+      "more than one selected WhatsApp account",
+    ],
+    [
+      { waba_id: "waba-a", waba_ids: ["waba-b"] },
+      "conflicting WhatsApp account selections",
+    ],
+    [
+      { waba_id: "waba-a", waba_ids: ["waba-b", "waba-c"] },
+      "conflicting WhatsApp account selections",
+    ],
+  ])("rejects ambiguous or conflicting selected WABAs %j", (data, detail) => {
     vi.useFakeTimers();
     const harness = createHarness(50, undefined, "coexistence");
     harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
@@ -456,9 +497,41 @@ describe("createMetaEmbeddedSignupSession", () => {
     expect(harness.aborted).toEqual([
       {
         reason: "error",
-        detail: expect.stringContaining(
-          "more than one selected WhatsApp account",
-        ),
+        detail: expect.stringContaining(detail),
+      },
+    ]);
+  });
+
+  it("treats a null Coexistence waba_id as absent and waits for the fallback", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+        version: 3,
+        data: { waba_id: null },
+      },
+    });
+    expect(harness.aborted).toHaveLength(0);
+    expect(harness.settledCount()).toBe(0);
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+        version: 3,
+        data: { waba_id: "late-waba" },
+      },
+    });
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: undefined,
+        wabaId: "late-waba",
       },
     ]);
   });
@@ -481,8 +554,9 @@ describe("createMetaEmbeddedSignupSession", () => {
   it.each([
     { waba_ids: ["waba-a", 123] },
     { waba_id: "waba-a", waba_ids: "waba-b" },
-    { waba_id: null, waba_ids: ["waba-a"] },
-  ])("rejects malformed explicit WABA selections", (data) => {
+    { waba_id: 123, waba_ids: ["waba-a"] },
+    { waba_ids: ["waba-a", null] },
+  ])("rejects malformed explicit WABA selections %j", (data) => {
     const harness = createHarness(50, undefined, "coexistence");
     harness.session.handleMessage({
       origin: facebookOrigin,

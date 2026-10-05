@@ -107,6 +107,25 @@ export function parseMetaEmbeddedSignupMessage(
   };
 }
 
+// Meta's v4 payloads omit the version; Coexistence needs session info 3 or
+// newer. A later version keeps the same selection fields, and the server
+// still proves the grant, the phone's WABA and the mode, so accepting it
+// keeps signup working when Meta raises the version.
+function isSupportedCoexistenceSessionVersion(version: unknown): boolean {
+  if (version === undefined) return true;
+  let parsed = Number.NaN;
+  if (typeof version === "number") {
+    parsed = version;
+  } else if (typeof version === "string" && /^[1-9][0-9]{0,2}$/.test(version)) {
+    parsed = Number(version);
+  }
+  return (
+    Number.isInteger(parsed) &&
+    parsed >= Number(META_COEXISTENCE_SESSION_INFO_VERSION) &&
+    parsed < 1000
+  );
+}
+
 function isExpectedFinishMessage(
   message: EmbeddedSignupMessage,
   mode: MetaEmbeddedSignupMode,
@@ -119,9 +138,7 @@ function isExpectedFinishMessage(
     // independently proves that mode from Meta phone data.
     return (
       (standardFinish || event === "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING") &&
-      (message.version === undefined ||
-        message.version === 3 ||
-        message.version === META_COEXISTENCE_SESSION_INFO_VERSION)
+      isSupportedCoexistenceSessionVersion(message.version)
     );
   }
   return standardFinish;
@@ -224,9 +241,9 @@ export function createMetaEmbeddedSignupSession(
         complete(false);
         return;
       }
-      const selectedWabaIds = new Set<string>();
-      const singularSelection = message.data?.waba_id;
-      const pluralSelection = message.data?.waba_ids;
+      // null is treated as absent; any other non-string value is malformed.
+      const singularSelection = message.data?.waba_id ?? undefined;
+      const pluralSelection = message.data?.waba_ids ?? undefined;
       if (
         (singularSelection !== undefined &&
           typeof singularSelection !== "string") ||
@@ -240,19 +257,36 @@ export function createMetaEmbeddedSignupSession(
         );
         return;
       }
-      const singularWabaId = nonEmptyString(singularSelection);
-      if (singularWabaId) selectedWabaIds.add(singularWabaId);
+      const listedWabaIds = new Set<string>();
       if (Array.isArray(pluralSelection)) {
         for (const value of pluralSelection) {
-          const selectedWabaId = nonEmptyString(value);
-          if (selectedWabaId) selectedWabaIds.add(selectedWabaId);
+          const listedWabaId = nonEmptyString(value);
+          if (listedWabaId) listedWabaIds.add(listedWabaId);
         }
       }
-      const selectedWabaId = [...selectedWabaIds][0];
-      if (
-        selectedWabaIds.size > 1 ||
-        (wabaId && selectedWabaId && wabaId !== selectedWabaId)
-      ) {
+      // Meta documents waba_id as the flow's WhatsApp account and waba_ids as
+      // every account shared in a multi-WABA flow, so waba_id wins when present.
+      const singularWabaId = nonEmptyString(singularSelection);
+      let selectedWabaId: string | undefined;
+      if (singularWabaId) {
+        if (listedWabaIds.size > 0 && !listedWabaIds.has(singularWabaId)) {
+          abort(
+            "error",
+            "Meta returned conflicting WhatsApp account selections. Restart the connection and select exactly one account.",
+          );
+          return;
+        }
+        selectedWabaId = singularWabaId;
+      } else if (listedWabaIds.size === 1) {
+        [selectedWabaId] = listedWabaIds;
+      } else if (listedWabaIds.size > 1) {
+        abort(
+          "error",
+          "Meta returned more than one selected WhatsApp account. Restart the connection and select exactly one account.",
+        );
+        return;
+      }
+      if (wabaId && selectedWabaId && wabaId !== selectedWabaId) {
         abort(
           "error",
           "Meta returned more than one selected WhatsApp account. Restart the connection and select exactly one account.",
