@@ -16,6 +16,7 @@ import { contactAddressDisplay, contactDisplayName } from '@/lib/contactAddress'
 import { useSearchPagination } from '@/composables/useSearchPagination'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
 
 const { t } = useI18n()
 const router = useRouter()
@@ -23,6 +24,8 @@ const authStore = useAuthStore()
 const canWriteContacts = authStore.hasPermission('contacts', 'write')
 const canImportContacts = authStore.hasPermission('contacts', 'import')
 const canExportContacts = authStore.hasPermission('contacts', 'export')
+// Same authority the protected staged queue endpoints enforce.
+const canViewStagedIdentityReviews = canWriteContacts && authStore.hasPermission('contacts.identity_review', 'write')
 
 // Import/Export dialog state
 const isImportExportOpen = ref(false)
@@ -170,6 +173,8 @@ function getDisplayName(contact: Contact): string {
         <Button v-if="canWriteContacts" variant="outline" size="sm" @click="openCreateDialog"><Plus class="h-4 w-4 mr-2" />{{ $t('contacts.addContact') }}</Button>
       </template>
     </PageHeader>
+
+    <StagedIdentityReviewNotice :can-view="canViewStagedIdentityReviews" />
 
     <!-- Error State -->
     <ErrorState

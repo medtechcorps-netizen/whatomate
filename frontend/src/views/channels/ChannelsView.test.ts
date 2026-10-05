@@ -59,6 +59,16 @@ vi.mock('@/components/chat/ContactIdentityReviewDialog.vue', () => ({
   },
 }))
 
+// The staged-queue notice has its own contract tests; stub it so this suite
+// makes no protected queue request.
+vi.mock('@/components/chat/StagedIdentityReviewNotice.vue', () => ({
+  default: {
+    name: 'StagedIdentityReviewNotice',
+    props: ['canView'],
+    template: '<div data-testid="staged-identity-review-notice-stub" :data-can-view="String(canView)" />',
+  },
+}))
+
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
     organizationId: 'organization-1',
@@ -1181,6 +1191,8 @@ describe('ChannelsView messaging behavior', () => {
   it('keeps a resolved identity state ahead of an older in-flight list response', async () => {
     const { selectedAccount, conversation } = setInbox({ channel: 'instagram', selectedProvider: 'relay' })
     const view = await mountAndSelectConversation()
+    // Reviewers get the workspace-level held-message entry point.
+    expect(view.get('[data-testid="staged-identity-review-notice-stub"]').attributes('data-can-view')).toBe('true')
     const oldAccounts = deferred<unknown>()
     const oldConversations = deferred<unknown>()
     const canonicalAccounts = deferred<unknown>()
@@ -1284,6 +1296,7 @@ describe('ChannelsView messaging behavior', () => {
 
     expect(view.find('[data-testid="channel-identity-review"]').exists()).toBe(false)
     expect(view.findComponent({ name: 'ContactIdentityReviewDialog' }).props('canReview')).toBe(false)
+    expect(view.get('[data-testid="staged-identity-review-notice-stub"]').attributes('data-can-view')).toBe('false')
   })
 
   it('invalidates colliding old-workspace responses and clears protected conversation state', async () => {

@@ -114,6 +114,7 @@ import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
+import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
@@ -2330,6 +2331,9 @@ async function sendMediaMessage() {
           </TagBadge>
         </div>
       </div>
+
+      <!-- Held messages that have no contact yet (protected staged queue) -->
+      <StagedIdentityReviewNotice :can-view="canViewStagedContactIdentity" />
 
       <!-- Contacts -->
       <ScrollArea :ref="(el: any) => contactsScroll.scrollAreaRef.value = el" orientation="vertical" class="flex-1">
