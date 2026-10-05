@@ -267,7 +267,8 @@ func (a *App) CreateOrReuseWhatsAppIdentityReviewHold(
 // may be selected for a new durable admission. Before review, a missing or
 // ambiguous principal, an open hold, or an authenticated selector contradiction
 // blocks admission. An exact current future-routing decision may select only a
-// member of the unchanged complete candidate set.
+// member of the unchanged complete candidate set, whether the direct BSUID has
+// one owner, several owners, or none yet.
 func (a *App) EvaluateWhatsAppIdentityReviewAdmission(
 	tx *gorm.DB,
 	claim *WhatsAppIdentityReviewClaim,
@@ -299,12 +300,35 @@ func (a *App) EvaluateWhatsAppIdentityReviewAdmission(
 		result.Reason = "direct_primary_missing"
 		return result, nil
 	}
-	if !candidates.supported || len(candidates.directPrimaryOwners) != 1 || candidates.multipleOwners {
+	if !candidates.supported {
+		// No selector matched a contact, or a raw owner no longer resolves to a
+		// live canonical contact: there is no member a reviewer could choose.
 		result.Reason = "direct_primary_ambiguous"
 		return result, nil
 	}
-	directOwner := candidates.directPrimaryOwners[0]
-	directRouteAllowed, selectorConflict := identityReviewDirectRouteAllowed(candidates.items, directOwner)
+	owned := len(candidates.directPrimaryOwners) == 1 && !candidates.multipleOwners
+	var directOwner uuid.UUID
+	directRouteAllowed, selectorConflict := false, false
+	if owned {
+		directOwner = candidates.directPrimaryOwners[0]
+		directRouteAllowed, selectorConflict = identityReviewDirectRouteAllowed(candidates.items, directOwner)
+	}
+	// unreviewed blocks admission before a current future-routing decision.
+	// Only a proven direct owner may still hold the message with sticky AI
+	// suppression. A direct BSUID with no owner or several owners stays
+	// contact-free: a phone or parent match alone may be a recycled number.
+	unreviewed := func(ownedReason string) *WhatsAppIdentityReviewAdmission {
+		switch {
+		case owned && !directRouteAllowed:
+			result.Reason = "primary_parent_conflict"
+		case owned:
+			result.RouteContactID = &directOwner
+			result.Reason = ownedReason
+		default:
+			result.Reason = "direct_primary_ambiguous"
+		}
+		return result
+	}
 
 	var latest models.WhatsAppIdentityReviewHold
 	err = tx.Where(
@@ -315,26 +339,21 @@ func (a *App) EvaluateWhatsAppIdentityReviewAdmission(
 		normalized.DirectPrimaryBSUID,
 	).Order("principal_generation DESC").First(&latest).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		if !directRouteAllowed {
-			result.Reason = "primary_parent_conflict"
-			return result, nil
+		if !owned || !directRouteAllowed || selectorConflict {
+			return unreviewed("phone_selector_conflict"), nil
 		}
 		result.RouteContactID = &directOwner
-		if selectorConflict {
-			result.Reason = "phone_selector_conflict"
-		} else {
-			blocked, blockErr := database.ContactHasBlockingIdentityReviewHold(tx, normalized.OrganizationID, directOwner)
-			if blockErr != nil {
-				return nil, blockErr
-			}
-			if blocked {
-				result.Reason = "another_review_open"
-				return result, nil
-			}
-			result.Blocked = false
-			result.NeedsReview = false
-			result.Reason = "unique_direct_primary"
+		blocked, blockErr := database.ContactHasBlockingIdentityReviewHold(tx, normalized.OrganizationID, directOwner)
+		if blockErr != nil {
+			return nil, blockErr
 		}
+		if blocked {
+			result.Reason = "another_review_open"
+			return result, nil
+		}
+		result.Blocked = false
+		result.NeedsReview = false
+		result.Reason = "unique_direct_primary"
 		return result, nil
 	}
 	if err != nil {
@@ -353,26 +372,14 @@ func (a *App) EvaluateWhatsAppIdentityReviewAdmission(
 		// unique direct-primary owner may still receive this one new event (with
 		// sticky suppression installed by admission), but drift must never fall
 		// through as an unreviewed allow decision.
-		if !directRouteAllowed {
-			result.Reason = "primary_parent_conflict"
-			return result, nil
-		}
-		result.RouteContactID = &directOwner
+		ownedReason := "unique_direct_primary_drift"
 		if selectorConflict {
-			result.Reason = "phone_selector_drift"
-		} else {
-			result.Reason = "unique_direct_primary_drift"
+			ownedReason = "phone_selector_drift"
 		}
-		return result, nil
+		return unreviewed(ownedReason), nil
 	}
 	if latest.Disposition != models.WhatsAppIdentityReviewDispositionFutureRouting {
-		if !directRouteAllowed {
-			result.Reason = "primary_parent_conflict"
-			return result, nil
-		}
-		result.RouteContactID = &directOwner
-		result.Reason = "review_open"
-		return result, nil
+		return unreviewed("review_open"), nil
 	}
 	if latest.DecisionTargetContactID == nil {
 		result.Reason = "decision_target_missing"
@@ -945,7 +952,10 @@ func enumerateWhatsAppIdentityReviewCandidates(
 			directOwners = append(directOwners, item.ContactID)
 		}
 	}
-	if len(directOwners) == 0 {
+	// The authenticated direct BSUID is the routing principal even before any
+	// contact owns it, so a phone or parent match is still a decidable review.
+	// Only an empty complete set leaves nothing a reviewer could choose.
+	if len(items) == 0 {
 		supported = false
 	}
 	return identityReviewCandidateSet{

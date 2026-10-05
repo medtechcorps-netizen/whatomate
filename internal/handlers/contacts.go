@@ -110,9 +110,11 @@ type stagedWhatsAppIdentityReviewItem struct {
 	MessageType     string                    `json:"message_type"`
 	MediaStatus     string                    `json:"media_status,omitempty"`
 	ReceivedAt      time.Time                 `json:"received_at"`
-	// ReadOnly is true when the receipt's hold is unsupported (no unique
-	// direct-BSUID owner). The hold guard lets such a hold close only when the
-	// account starts a new onboarding cycle, so no decision can resolve it.
+	// ReadOnly is true when the receipt's hold is unsupported (no direct BSUID,
+	// no live contact matching any selector, or a matched row that no longer
+	// resolves to a live contact). The hold guard lets such a hold close only
+	// when the account starts a new onboarding cycle, so no decision can
+	// resolve it.
 	ReadOnly bool `json:"read_only"`
 }
 
