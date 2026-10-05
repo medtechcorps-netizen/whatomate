@@ -705,6 +705,9 @@ STAGING_BOOTSTRAP_JOB = "staging-bootstrap"
 STAGING_BOOTSTRAP_TIMEOUT = 20
 STAGING_BOOTSTRAP_SETUP = ("actions/checkout@", "actions/setup-go@")
 RLS_MIGRATE = '"$dir/rereply" rls-migrate -config "$dir/migrate.toml"'
+# Any failure after the server starts prints its log.
+SERVER_LOG_TRAP = ("trap 'status=$?; kill \"$server\" 2>/dev/null || true; "
+                   "if [[ \"$status\" -ne 0 ]]; then cat \"$dir/server.log\"; fi' EXIT")
 STAGING_BOOTSTRAP_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Create the DigitalOcean role shape", (
         "set -euo pipefail",
@@ -751,6 +754,7 @@ STAGING_BOOTSTRAP_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Serve, log in and read the current user", (
         "set -euo pipefail",
         '"$dir/rereply" server -config "$dir/server.toml" > "$dir/server.log" 2>&1 &',
+        SERVER_LOG_TRAP,
         "grep -q 'PostgreSQL tenant RLS verified' \"$dir/server.log\"",
         'test "$(code --cookie-jar "$dir/cookies" --header \'Content-Type: application/json\' --data "@$dir/login.json" '
         'http://127.0.0.1:8080/api/auth/login)" = 200',
@@ -1205,6 +1209,8 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "test.yml", '          test "$status" -eq 2\n          grep -q \'^staging-bootstrap', "          grep -q '^staging-bootstrap")),
     "tolerate a failure outside the pinned lines": ("staging-bootstrap", lambda: replaced(
         "test.yml", '          cat "$dir/second.err"\n', '          cat "$dir/second.err" || true\n')),
+    "stop printing the server log on failure": ("staging-bootstrap", lambda: replaced(
+        "test.yml", SERVER_LOG_TRAP, "trap 'kill \"$server\" 2>/dev/null || true' EXIT")),
     "skip the login": ("staging-bootstrap", lambda: replaced(
         "test.yml", '          test "$(code --cookie "$dir/cookies" http://127.0.0.1:8080/api/me)" = 200\n', "")),
     "drop the negative case": ("staging-bootstrap", without_negative_case),

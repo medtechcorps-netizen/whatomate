@@ -364,7 +364,8 @@ jobs:
           dir="$RUNNER_TEMP/staging-bootstrap"
           "$dir/rereply" server -config "$dir/server.toml" > "$dir/server.log" 2>&1 &
           server=$!
-          trap 'kill "$server" 2>/dev/null || true' EXIT
+          # On any failure, show the server's log before the step ends.
+          trap 'status=$?; kill "$server" 2>/dev/null || true; if [[ "$status" -ne 0 ]]; then cat "$dir/server.log"; fi' EXIT
           code() { curl --silent --output /dev/null --write-out '%{http_code}' "$@"; }
           ready=""
           for attempt in $(seq 1 60); do
@@ -376,7 +377,7 @@ jobs:
             sleep 2
           done
           if [[ -z "$ready" ]]; then
-            cat "$dir/server.log"
+            echo "the server never answered /ready" >&2
             exit 1
           fi
           grep -q 'PostgreSQL tenant RLS verified' "$dir/server.log"
