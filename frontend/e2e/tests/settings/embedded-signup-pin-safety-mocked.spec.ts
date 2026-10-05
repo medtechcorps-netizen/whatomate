@@ -694,6 +694,8 @@ test("a client timeout refreshes durable accounts and warns against replay", asy
         name: "Pending connection for reconciliation",
         status: "pending_registration",
         phone_id: "1000000000000003",
+        // The accounts API always returns created_at, and the row renders it.
+        created_at: "2026-09-04T01:00:00Z",
       },
     ],
   });
