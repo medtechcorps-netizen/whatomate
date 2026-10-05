@@ -102,6 +102,64 @@ func TestSLATransitionLostToConcurrentResumeSendsNoNotice(t *testing.T) {
 	}
 }
 
+// slaPassWithFirstNoticeHeld runs one SLA pass over transfers a and b while
+// the pass's first customer notice is held at the provider. It calls
+// meanwhile with the transfer whose notice is still queued, releases the
+// provider, and returns every delivery plus that other transfer.
+func slaPassWithFirstNoticeHeld(
+	t *testing.T,
+	app *App,
+	organizationID uuid.UUID,
+	settings models.ChatbotSettings,
+	a, b *models.AgentTransfer,
+	meanwhile func(other *models.AgentTransfer),
+) ([]slaNoticeDelivery, *models.AgentTransfer) {
+	t.Helper()
+	first := make(chan string, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	deliveries := slaNoticeProviderWithHook(t, app, app.DB, func(to string) {
+		if calls.Add(1) != 1 {
+			return
+		}
+		first <- to
+		select {
+		case <-release:
+		case <-time.After(20 * time.Second):
+		}
+	})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- app.WithTenantApp(organizationID, func(scoped *App) error {
+			NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+			return nil
+		})
+	}()
+	var firstPhone string
+	select {
+	case firstPhone = <-first:
+	case <-time.After(15 * time.Second):
+		t.Fatal("no notice reached the provider")
+	}
+	other := b
+	if firstPhone == b.PhoneNumber {
+		other = a
+	}
+	// The pass has committed, so nothing meanwhile does waits on it.
+	meanwhile(other)
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("SLA tick did not finish")
+	}
+	return deliveries(), other
+}
+
 // Notices go out one after another once the tick commits, each bounded only
 // by the provider. A transfer that moves on while an earlier notice is still
 // in flight must not get its now-stale notice: a resumed transfer, or one an
@@ -118,86 +176,43 @@ func TestSLADeferredNoticeSkipsTransferThatMovedOn(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/%s/rls=%v", kind, change, rls), func(t *testing.T) {
 				app, organization, createTransfer, _ := slaAfterCommitFixture(t)
 				app.Config.Database.RLSEnabled = rls
-				first := make(chan string, 1)
-				release := make(chan struct{})
-				var calls atomic.Int32
-				deliveries := slaNoticeProviderWithHook(t, app, app.DB, func(to string) {
-					if calls.Add(1) != 1 {
-						return
-					}
-					first <- to
-					select {
-					case <-release:
-					case <-time.After(20 * time.Second):
+				sla := models.SLATracking{ExpiresAt: &past}
+				if kind == "escalation" {
+					sla = models.SLATracking{EscalationAt: &past}
+				}
+				a := createTransfer(sla)
+				b := createTransfer(sla)
+				settings := slaNoticeStateSettings(organization.ID)
+				got, other := slaPassWithFirstNoticeHeld(t, app, organization.ID, settings, a, b, func(other *models.AgentTransfer) {
+					switch change {
+					case "resumed":
+						result := app.DB.Model(&models.AgentTransfer{}).
+							Where("id = ? AND status = ?", other.ID, models.TransferStatusActive).
+							Update("status", models.TransferStatusResumed)
+						require.NoError(t, result.Error)
+						require.EqualValues(t, 1, result.RowsAffected)
+					case "agent_replied":
+						agent := testutil.CreateTestUser(t, app.DB, organization.ID)
+						require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+							Where("id = ?", other.ID).Update("agent_id", agent.ID).Error)
+						createTestAgentMessage(t, app, organization.ID, other.ContactID, agent.ID,
+							other.WhatsAppAccount, time.Now())
+					default:
+						require.NoError(t, app.DB.Create(&models.AgentTransfer{
+							BaseModel:       models.BaseModel{ID: uuid.New()},
+							OrganizationID:  organization.ID,
+							ContactID:       other.ContactID,
+							WhatsAppAccount: other.WhatsAppAccount,
+							PhoneNumber:     other.PhoneNumber,
+							Status:          models.TransferStatusActive,
+							Source:          models.TransferSourceManual,
+							TransferredAt:   time.Now().UTC(),
+						}).Error)
 					}
 				})
-				var releaseOnce sync.Once
-				t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 
-				sla := func() models.SLATracking {
-					if kind == "escalation" {
-						return models.SLATracking{EscalationAt: &past}
-					}
-					return models.SLATracking{ExpiresAt: &past}
-				}
-				a := createTransfer(sla())
-				b := createTransfer(sla())
-				settings := slaNoticeStateSettings(organization.ID)
-				done := make(chan error, 1)
-				go func() {
-					done <- app.WithTenantApp(organization.ID, func(scoped *App) error {
-						NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
-						return nil
-					})
-				}()
-				var firstPhone string
-				select {
-				case firstPhone = <-first:
-				case <-time.After(15 * time.Second):
-					t.Fatal("no notice reached the provider")
-				}
-				other := b
-				if firstPhone == b.PhoneNumber {
-					other = a
-				}
-
-				// The tick has committed, so no change waits on it.
-				switch change {
-				case "resumed":
-					result := app.DB.Model(&models.AgentTransfer{}).
-						Where("id = ? AND status = ?", other.ID, models.TransferStatusActive).
-						Update("status", models.TransferStatusResumed)
-					require.NoError(t, result.Error)
-					require.EqualValues(t, 1, result.RowsAffected)
-				case "agent_replied":
-					agent := testutil.CreateTestUser(t, app.DB, organization.ID)
-					require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
-						Where("id = ?", other.ID).Update("agent_id", agent.ID).Error)
-					createTestAgentMessage(t, app, organization.ID, other.ContactID, agent.ID,
-						other.WhatsAppAccount, time.Now())
-				default:
-					require.NoError(t, app.DB.Create(&models.AgentTransfer{
-						BaseModel:       models.BaseModel{ID: uuid.New()},
-						OrganizationID:  organization.ID,
-						ContactID:       other.ContactID,
-						WhatsAppAccount: other.WhatsAppAccount,
-						PhoneNumber:     other.PhoneNumber,
-						Status:          models.TransferStatusActive,
-						Source:          models.TransferSourceManual,
-						TransferredAt:   time.Now().UTC(),
-					}).Error)
-				}
-				releaseOnce.Do(func() { close(release) })
-				select {
-				case err := <-done:
-					require.NoError(t, err)
-				case <-time.After(20 * time.Second):
-					t.Fatal("SLA tick did not finish")
-				}
-
-				got := deliveries()
 				require.Len(t, got, 1, "the moved-on transfer must not get its stale notice: %+v", got)
-				assert.Equal(t, firstPhone, got[0].To)
+				assert.NotEqual(t, other.PhoneNumber, got[0].To)
 				var notices int64
 				require.NoError(t, app.DB.Model(&models.Message{}).Where(
 					"organization_id = ? AND contact_id = ? AND direction = ? AND content IN ?",
@@ -209,6 +224,185 @@ func TestSLADeferredNoticeSkipsTransferThatMovedOn(t *testing.T) {
 				assert.Zero(t, notices)
 			})
 		}
+	}
+}
+
+// Only a real reply since this escalation makes the "still waiting" warning
+// untrue. A failed agent text never reached the customer; an API-key
+// integration sends templates under its key owner's user id; and a reply that
+// came before the escalation was already answered by it.
+func TestSLAWarningIsNotSuppressedByNonReplies(t *testing.T) {
+	past := time.Now().UTC().Add(-time.Hour)
+	outgoing := func(t *testing.T, app *App, other *models.AgentTransfer, messageType models.MessageType, status models.MessageStatus, at time.Time) {
+		t.Helper()
+		user := testutil.CreateTestUser(t, app.DB, other.OrganizationID)
+		require.NoError(t, app.DB.Create(&models.Message{
+			BaseModel:       models.BaseModel{ID: uuid.New(), CreatedAt: at},
+			OrganizationID:  other.OrganizationID,
+			ContactID:       other.ContactID,
+			WhatsAppAccount: other.WhatsAppAccount,
+			Direction:       models.DirectionOutgoing,
+			MessageType:     messageType,
+			Content:         "synthetic non-reply",
+			SentByUserID:    &user.ID,
+			Status:          status,
+		}).Error)
+	}
+	for _, kind := range []string{"failed_agent_text", "api_template"} {
+		t.Run(kind, func(t *testing.T) {
+			app, organization, createTransfer, _ := slaAfterCommitFixture(t)
+			a := createTransfer(models.SLATracking{EscalationAt: &past})
+			b := createTransfer(models.SLATracking{EscalationAt: &past})
+			settings := slaNoticeStateSettings(organization.ID)
+			got, other := slaPassWithFirstNoticeHeld(t, app, organization.ID, settings, a, b, func(other *models.AgentTransfer) {
+				if kind == "failed_agent_text" {
+					outgoing(t, app, other, models.MessageTypeText, models.MessageStatusFailed, time.Now())
+				} else {
+					outgoing(t, app, other, models.MessageTypeTemplate, models.MessageStatusSent, time.Now())
+				}
+			})
+			delivered := map[string]bool{}
+			for _, delivery := range got {
+				delivered[delivery.To] = true
+			}
+			assert.True(t, delivered[other.PhoneNumber], "%s must not suppress the warning: %+v", kind, got)
+			assert.Len(t, got, 2)
+		})
+	}
+	t.Run("reply_before_this_escalation", func(t *testing.T) {
+		app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+		transfer := createTransfer(models.SLATracking{EscalationAt: &past})
+		// The tick started a minute ago; earlier organizations' passes took
+		// that long. The reply came before this transfer's escalation.
+		tickStart := time.Now().Add(-time.Minute)
+		outgoing(t, app, transfer, models.MessageTypeText, models.MessageStatusSent, time.Now().Add(-30*time.Second))
+		settings := slaNoticeStateSettings(organization.ID)
+		require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+			NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, tickStart)
+			return nil
+		}))
+		var stored models.AgentTransfer
+		require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+		assert.Equal(t, 1, stored.SLA.EscalationLevel)
+		require.NotNil(t, stored.SLA.EscalatedAt)
+		assert.True(t, stored.SLA.EscalatedAt.After(time.Now().Add(-20*time.Second)),
+			"escalated_at is the escalation's own time, not the tick's start")
+		assert.Len(t, deliveries(), 1, "a reply before the escalation does not answer it")
+	})
+}
+
+// A panic while handling one queued notice (its re-check, the recipient
+// lookup) must not drop the other notices of the pass: their transitions have
+// committed and no later tick would send them.
+func TestSLAPanicInOneNoticeKeepsTheRestOfThePass(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	first := createTransfer(models.SLATracking{})
+	second := createTransfer(models.SLATracking{})
+	panicking := func(*gorm.DB, models.AgentTransfer) (bool, error) {
+		panic("synthetic re-check panic")
+	}
+	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+		NewSLAProcessor(scoped, time.Minute).sendSLANoticesAfterCommit([]slaNotice{
+			{transfer: *first, label: "Synthetic SLA notice", message: "Synthetic notice one", stillCurrent: panicking},
+			{transfer: *second, label: "Synthetic SLA notice", message: "Synthetic notice two"},
+		})
+		return nil
+	}))
+	got := deliveries()
+	require.Len(t, got, 1, "the second notice must survive the first one's panic")
+	assert.Equal(t, second.PhoneNumber, got[0].To)
+	assert.Equal(t, "Synthetic notice two", got[0].Body)
+}
+
+// Rows that fail on every tick must not use up the per-pass cap. The routine
+// cause is a contact deleted during the handover: such a transfer is closed
+// without a notice. Any other permanently failing row (here a trigger) is
+// skipped, and the transfer behind 30 of them is still handled, and its
+// customer told, in the same tick.
+func TestSLAFailingRowsDoNotStarveTheTransfersBehindThem(t *testing.T) {
+	for _, tc := range []struct{ step, poison string }{
+		{"auto_close", "deleted_contact"},
+		{"auto_close", "trigger"},
+		{"escalation", "trigger"},
+	} {
+		t.Run(tc.step+"/"+tc.poison, func(t *testing.T) {
+			app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+			deadline := func(at time.Time) models.SLATracking {
+				if tc.step == "escalation" {
+					return models.SLATracking{EscalationAt: &at}
+				}
+				return models.SLATracking{ExpiresAt: &at}
+			}
+			oldest := time.Now().UTC().Add(-48 * time.Hour)
+			poisoned := make([]*models.AgentTransfer, 0, slaTransfersPerPass)
+			for i := range slaTransfersPerPass {
+				transfer := createTransfer(deadline(oldest.Add(time.Duration(i) * time.Minute)))
+				poisoned = append(poisoned, transfer)
+				if tc.poison == "deleted_contact" {
+					require.NoError(t, app.DB.Delete(&models.Contact{}, "id = ?", transfer.ContactID).Error)
+				} else {
+					require.NoError(t, app.DB.Model(transfer).Update("notes", "synthetic poisoned row").Error)
+				}
+			}
+			normal := createTransfer(deadline(time.Now().UTC().Add(-time.Hour)))
+			if tc.poison == "trigger" {
+				suffix := uuid.NewString()[:8]
+				function := "sla_poisoned_row_" + suffix
+				trigger := "sla_poisoned_row_trigger_" + suffix
+				require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+					CREATE FUNCTION %s() RETURNS trigger
+					LANGUAGE plpgsql
+					AS $$
+					BEGIN
+						IF OLD.notes = 'synthetic poisoned row' THEN
+							RAISE EXCEPTION 'synthetic poisoned SLA row';
+						END IF;
+						RETURN NEW;
+					END;
+					$$`, function)).Error)
+				require.NoError(t, app.DB.Exec(fmt.Sprintf(
+					"CREATE TRIGGER %s BEFORE UPDATE ON agent_transfers FOR EACH ROW EXECUTE FUNCTION %s()",
+					trigger, function,
+				)).Error)
+				t.Cleanup(func() {
+					_ = app.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON agent_transfers", trigger)).Error
+					_ = app.DB.Exec(fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", function)).Error
+				})
+			}
+
+			settings := slaNoticeStateSettings(organization.ID)
+			require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+				NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+				return nil
+			}))
+
+			var stored models.AgentTransfer
+			require.NoError(t, app.DB.First(&stored, "id = ?", normal.ID).Error)
+			wantNotice := settings.SLA.AutoCloseMessage
+			if tc.step == "escalation" {
+				assert.Equal(t, 1, stored.SLA.EscalationLevel)
+				wantNotice = settings.SLA.WarningMessage
+			} else {
+				assert.Equal(t, models.TransferStatusExpired, stored.Status)
+			}
+			got := deliveries()
+			require.Len(t, got, 1, "only the transfer behind the failing rows is notified: %+v", got)
+			assert.Equal(t, normal.PhoneNumber, got[0].To)
+			assert.Equal(t, wantNotice, got[0].Body)
+
+			for _, transfer := range poisoned {
+				var row models.AgentTransfer
+				require.NoError(t, app.DB.First(&row, "id = ?", transfer.ID).Error)
+				switch tc.poison {
+				case "deleted_contact":
+					assert.Equal(t, models.TransferStatusExpired, row.Status, "closed without a notice")
+					assert.Contains(t, row.Notes, "contact deleted")
+				default:
+					assert.Equal(t, models.TransferStatusActive, row.Status)
+					assert.Zero(t, row.SLA.EscalationLevel)
+				}
+			}
+		})
 	}
 }
 
