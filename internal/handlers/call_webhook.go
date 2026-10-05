@@ -676,26 +676,20 @@ const callPermissionReplyRequestSkew = 2 * time.Minute
 // second, or from the same second with the other status. A replay of the
 // stored reply, or an older reply, matches neither. responded_at is the stored
 // reply's own time (or, for a row answered before replies were ordered, the
-// time it was processed). When the reply does not name this row's request
-// (answersRow false), an unanswered row also requires that the reply is not
-// older than the request, so that it does not answer a request sent after it.
+// time it was processed). A reply that does not name its request only ever
+// reaches a request sent before it: processCallPermissionReply selects the
+// row that way, and requested_at never changes.
 //
 // The condition is part of the UPDATE rather than checked against a row read
 // earlier: each delivery runs in its own goroutine, and PostgreSQL re-checks
 // the condition against the row as a concurrent delivery left it. Of two
 // different replies processed concurrently, the newer one is therefore applied
 // whichever commits first, and two copies of one reply apply it once.
-func callPermissionReplyNewerCondition(repliedAt int64, status models.CallPermissionStatus, answersRow bool) (string, []any) {
-	const answeredEarlier = `responded_at IS NOT NULL AND (
+func callPermissionReplyNewerCondition(repliedAt int64, status models.CallPermissionStatus) (string, []any) {
+	return `(responded_at IS NULL OR (
 		FLOOR(EXTRACT(EPOCH FROM responded_at)) < ?
 		OR (FLOOR(EXTRACT(EPOCH FROM responded_at)) = ? AND status <> ?)
-	)`
-	if answersRow {
-		return "(responded_at IS NULL OR (" + answeredEarlier + "))", []any{repliedAt, repliedAt, string(status)}
-	}
-	notBeforeRequest := time.Unix(repliedAt, 0).Add(callPermissionReplyRequestSkew)
-	return "((responded_at IS NULL AND (requested_at IS NULL OR requested_at <= ?)) OR (" + answeredEarlier + "))",
-		[]any{notBeforeRequest, repliedAt, repliedAt, string(status)}
+	))`, []any{repliedAt, repliedAt, string(status)}
 }
 
 // processCallPermissionReply handles the call_permission_reply interactive webhook.
@@ -828,7 +822,7 @@ func (a *App) processCallPermissionReply(phoneNumberID, fromPhone string, reply 
 		// than the stored response is applied. A reply without a usable
 		// timestamp cannot be ordered and applies as before this guard.
 		if repliedAt > 0 {
-			condition, args := callPermissionReplyNewerCondition(repliedAt, newStatus, answersRow)
+			condition, args := callPermissionReplyNewerCondition(repliedAt, newStatus)
 			query = query.Where(condition, args...)
 		}
 		result := query.Updates(updates)

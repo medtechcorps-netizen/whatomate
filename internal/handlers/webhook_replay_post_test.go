@@ -300,7 +300,9 @@ func TestOutgoingCallLateEventsAfterAcceptedAreIgnored(t *testing.T) {
 
 // An incoming call event that carries an error fails the call once. Its
 // replay changes nothing: the failure, its message and its ended_at stay as
-// the first delivery recorded them, and nothing is announced again.
+// the first delivery recorded them, and nothing is announced again. A replay
+// of the end event whose own error failed the call is stopped by the
+// ended-call guard, before any claim.
 func TestIncomingCallErrorEventReplayKeepsFailure(t *testing.T) {
 	app := webhookTestApp(t)
 	account := orphanStatusTestAccount(t, app, true)
@@ -319,6 +321,7 @@ func TestIncomingCallErrorEventReplayKeepsFailure(t *testing.T) {
 		"error":     map[string]any{"code": 138000, "message": "synthetic call failure"},
 	}}, nil))
 	const quiet = 300 * time.Millisecond
+	logs := captureStatusTestLogs(app)
 
 	deliverReplayedPOST(t, app, ringing, 1)
 	deliverReplayedPOST(t, app, failed, 1)
@@ -336,6 +339,8 @@ func TestIncomingCallErrorEventReplayKeepsFailure(t *testing.T) {
 	assert.Equal(t, models.CallStatusFailed, final.Status)
 	assert.Equal(t, first.ErrorMessage, final.ErrorMessage)
 	assert.True(t, first.EndedAt.Equal(*final.EndedAt), "a replayed error does not move ended_at")
+	assert.Len(t, logs.lines("info", "Ignoring call event for a call that has already ended"), 3)
+	assert.Empty(t, logs.lines("info", "Ignoring repeated call end event"))
 }
 
 // A template status update replayed in its POST is applied once and moves
