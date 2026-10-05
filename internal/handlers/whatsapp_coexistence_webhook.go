@@ -496,6 +496,39 @@ func isCoexistenceBSUIDAddress(value string) bool {
 	return len(value) <= coexistenceContactBSUIDMaxLength && coexistenceBSUIDAddressPattern.MatchString(value)
 }
 
+// coexistenceLegacyBSUIDPhoneContact reports whether contact is a row the
+// previous release wrote for an echo addressed by BSUID: it stored that BSUID
+// unchanged as the contact phone and left bs_uid empty. The row is keyed by the
+// BSUID itself, so it is that WhatsApp user's thread. Replays, edits and
+// revokes of the echoes stored on it must keep proving against it, and a later
+// echo to the same BSUID must land on it rather than start a second contact.
+func coexistenceLegacyBSUIDPhoneContact(contact *models.Contact, userID string) bool {
+	userID = strings.TrimSpace(userID)
+	return contact != nil && strings.TrimSpace(contact.BSUID) == "" && isCoexistenceBSUIDAddress(userID) &&
+		normalizeCoexistencePhone(contact.PhoneNumber) == userID
+}
+
+// findCoexistenceLegacyBSUIDPhoneContact returns the canonical contact whose
+// phone is this identity's BSUID (coexistenceLegacyBSUIDPhoneContact), or
+// gorm.ErrRecordNotFound.
+func (a *App) findCoexistenceLegacyBSUIDPhoneContact(
+	organizationID uuid.UUID,
+	identity coexistenceContactIdentity,
+) (*models.Contact, error) {
+	userID := identity.primaryUserID()
+	if !isCoexistenceBSUIDAddress(userID) {
+		return nil, gorm.ErrRecordNotFound
+	}
+	contact, err := a.findCoexistenceContactByPhone(organizationID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !coexistenceLegacyBSUIDPhoneContact(contact, userID) {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return contact, nil
+}
+
 func isCoexistencePlaceholderPhone(phone string) bool {
 	phone = strings.TrimSpace(phone)
 	return strings.HasPrefix(phone, "bsuid:") ||
@@ -736,6 +769,22 @@ func (a *App) getOrCreateCoexistenceContact(
 		return byUserID, false, nil
 	}
 
+	if identity.Phone == "" {
+		// A BSUID-only identity whose BSUID the previous release stored as a
+		// contact phone continues that contact's thread and binds the BSUID
+		// to it, instead of starting a second contact for the same user.
+		legacy, legacyErr := a.findCoexistenceLegacyBSUIDPhoneContact(account.OrganizationID, identity)
+		if legacyErr != nil && !errors.Is(legacyErr, gorm.ErrRecordNotFound) {
+			return nil, false, legacyErr
+		}
+		if legacyErr == nil {
+			if err := a.updateCoexistenceContactIdentity(account, legacy, identity, true); err != nil {
+				return nil, false, err
+			}
+			return legacy, false, nil
+		}
+	}
+
 	phone := identity.Phone
 	phoneUnavailable := phone == ""
 	if phoneUnavailable {
@@ -929,12 +978,16 @@ func coexistenceMessageContactIdentity(
 ) coexistenceContactIdentity {
 	identity := fallback
 	identity.FallbackKey = strings.TrimSpace(message.ID)
+	// addressedByBSUID marks an echo whose "to" is a BSUID. Such an echo names
+	// its recipient by BSUID only, so no sidecar entry may supply a phone for it.
+	addressedByBSUID := false
 	if direction == models.DirectionOutgoing {
 		// Meta may address a WhatsApp username user by BSUID in "to". A BSUID
 		// must never become a contact phone; with no to_user_id it is the
 		// recipient's BSUID.
 		to := strings.TrimSpace(message.To)
 		toIsBSUID := isCoexistenceBSUIDAddress(to)
+		addressedByBSUID = toIsBSUID
 		if to != "" && !toIsBSUID {
 			identity.Phone = to
 		}
@@ -958,9 +1011,15 @@ func coexistenceMessageContactIdentity(
 		}
 	}
 
+	// An echo addressed by BSUID takes only names from a sidecar entry for that
+	// same BSUID, never a phone and never from an unrelated single entry. A
+	// sidecar wa_id there could otherwise bind this BSUID onto whichever older
+	// contact owns that phone (Meta documents no contacts[] for echoes, and a
+	// recipient with a phone to show would be addressed by it in "to"). The
+	// recipient's phone is revealed later only by its own authenticated message.
 	matched := -1
 	for index, contact := range contacts {
-		phoneMatches := identity.Phone != "" && sameWhatsAppPhone(identity.Phone, contact.WaID)
+		phoneMatches := !addressedByBSUID && identity.Phone != "" && sameWhatsAppPhone(identity.Phone, contact.WaID)
 		userMatches := identity.primaryUserID() != "" &&
 			(identity.primaryUserID() == strings.TrimSpace(contact.UserID) ||
 				identity.primaryUserID() == strings.TrimSpace(contact.ParentUserID))
@@ -969,12 +1028,12 @@ func coexistenceMessageContactIdentity(
 			break
 		}
 	}
-	if matched < 0 && len(contacts) == 1 {
+	if matched < 0 && len(contacts) == 1 && !addressedByBSUID {
 		matched = 0
 	}
 	if matched >= 0 {
 		contact := contacts[matched]
-		if identity.Phone == "" {
+		if identity.Phone == "" && !addressedByBSUID {
 			identity.Phone = strings.TrimSpace(contact.WaID)
 		}
 		if identity.UserID == "" {

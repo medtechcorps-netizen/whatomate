@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -119,6 +120,8 @@ func TestCoexistenceSenderAdmissionSelectorsCoverEveryAuthenticatedValue(t *test
 		coexistenceIdentityPlaceholder(coexistenceContactIdentity{ParentUserID: "US.parent"}),
 		coexistenceIdentityPlaceholder(coexistenceContactIdentity{Username: "handle"}),
 	}, selectors.placeholders)
+	// The previous release stored a BSUID-addressed echo's BSUID as the phone.
+	assert.Equal(t, []string{"US.direct", "US.parent"}, selectors.legacyPhones)
 
 	withoutFrom := IncomingTextMessage{ID: "wamid.selectors-wa", FromUserID: "US.direct"}.
 		withWebhookSenderContact(&CoexistenceWebhookContact{WaID: "60999999999"})
@@ -715,6 +718,29 @@ func TestCoexistencePhoneAppRecipientAdoptionRequiresAContactTheEchoCreated(t *t
 		{name: "recipient_has_crm_lead", after: func(t *testing.T, s setup) {
 			createCoexistenceAdmissionLead(t, s.app, s.account.OrganizationID, echoContact(t, s).ContactID)
 		}},
+		{name: "manual_contact_created_30s_before_echo", before: func(t *testing.T, s setup) *models.WhatsAppAccount {
+			// Staff saved "Patient A" moments before messaging the number from the
+			// Business app; the echo then lands on that record.
+			contact := newWhatsAppIdentityReviewSelectorContact(s.account.OrganizationID, s.phone)
+			contact.ProfileName = "Patient A"
+			require.NoError(t, s.app.DB.Create(&contact).Error)
+			require.NoError(t, s.app.DB.Model(&models.Contact{}).Where("id = ?", contact.ID).
+				Update("created_at", time.Now().UTC().Add(-30*time.Second)).Error)
+			return nil
+		}},
+		{name: "old_echo_contact_refreshed_by_a_new_echo", after: func(t *testing.T, s setup) {
+			// The echo created the contact 30 days ago; today's echo to the same
+			// number does not make that older thread adoptable.
+			echoed := echoContact(t, s)
+			require.NoError(t, s.app.DB.Model(&models.Contact{}).Where("id = ?", echoed.ContactID).
+				Update("created_at", gorm.Expr("created_at - interval '30 days'")).Error)
+			require.NoError(t, s.app.DB.Model(&models.Message{}).Where("id = ?", echoed.ID).
+				Updates(map[string]any{
+					"created_at":  gorm.Expr("created_at - interval '30 days'"),
+					"ingested_at": gorm.Expr("ingested_at - interval '30 days'"),
+				}).Error)
+			persistCoexistenceAdmissionEcho(t, s.app, s.account, "wamid.adopt-fresh-echo-"+uuid.NewString(), s.phone, "", "Hello again")
+		}},
 		{name: "echo_older_than_seven_days", after: func(t *testing.T, s setup) {
 			echoed := echoContact(t, s)
 			require.NoError(t, s.app.DB.Model(&models.Contact{}).Where("id = ?", echoed.ContactID).
@@ -1262,6 +1288,149 @@ func TestCoexistenceEchoToUsernameRecipientBSUIDEndsInOneContact(t *testing.T) {
 	assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{}, "organization_id = ? AND bs_uid = ?", organizationID, bsuid))
 	assert.EqualValues(t, 2, countCoexistenceAdmissionRows(t, app.DB, &models.Message{},
 		"organization_id = ? AND contact_id = ?", organizationID, contactID))
+}
+
+// coexistenceAdmissionEchoEvent builds a smb_message_echoes event from JSON.
+func coexistenceAdmissionEchoEvent(t *testing.T, fields string) CoexistenceMessage {
+	t.Helper()
+	var echo CoexistenceMessage
+	require.NoError(t, json.Unmarshal([]byte(`{"from":"`+coexistenceAdmissionBusinessPhone+`","timestamp":"1722222222",`+fields+`}`), &echo))
+	return echo
+}
+
+// An echo addressed by BSUID ("to" is the BSUID) never takes a phone from the
+// contacts[] sidecar, whether the only entry names another user or the same
+// one. Otherwise its wa_id would bind the BSUID onto whichever older record
+// owns that phone, and every later message from that BSUID would route there.
+func TestCoexistenceEchoAddressedByBSUIDTakesNoPhoneFromTheSidecar(t *testing.T) {
+	for _, sidecarIsRecipient := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sidecar_names_the_recipient=%t", sidecarIsRecipient), func(t *testing.T) {
+			app, account, _ := whatsappIdentityFixture(t)
+			organizationID := account.OrganizationID
+			phone := coexistenceAdmissionTestPhone()
+			old := newWhatsAppIdentityReviewSelectorContact(organizationID, phone)
+			old.ProfileName = "Patient M old"
+			require.NoError(t, app.DB.Create(&old).Error)
+			require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", old.ID).
+				Update("created_at", time.Now().UTC().Add(-30*24*time.Hour)).Error)
+
+			// Another person's record, holding the parent BSUID that the unrelated
+			// sidecar entry names.
+			otherParent := "US.ENT." + testutil.NewTestGraphObjectID()[:17]
+			other := newWhatsAppIdentityReviewSelectorContact(organizationID, coexistenceAdmissionTestPhone())
+			other.ProfileName = "Patient Z"
+			other.BSUID = otherParent
+			require.NoError(t, app.DB.Create(&other).Error)
+
+			bsuid := "US." + testutil.NewTestGraphObjectID()[:17]
+			sidecar := CoexistenceWebhookContact{UserID: "US." + testutil.NewTestGraphObjectID()[:16], ParentUserID: otherParent, WaID: phone}
+			if sidecarIsRecipient {
+				sidecar.UserID, sidecar.ParentUserID = bsuid, ""
+			}
+			sidecar.Profile.Name = "Sidecar Name"
+			echoWAMID := "wamid.bsuid-to-echo-" + uuid.NewString()
+			echo := coexistenceAdmissionEchoEvent(t, `"to":"`+bsuid+`","id":"`+echoWAMID+`","type":"text","text":{"body":"Hello"}`)
+			for range 2 { // the second delivery is Meta's replay
+				require.NoError(t, app.persistMessageEchoesBeforeAck(account.PhoneID, []CoexistenceMessage{echo}, []CoexistenceWebhookContact{sidecar}))
+			}
+
+			var echoed models.Message
+			require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, echoWAMID).First(&echoed).Error)
+			assert.NotEqual(t, old.ID, echoed.ContactID, "the echo must not land on the phone's older record")
+			assert.NotEqual(t, other.ID, echoed.ContactID, "the echo must not land on another user's record")
+			assert.Equal(t, otherParent, loadCoexistenceAdmissionContact(t, app.DB, organizationID, other.ID).BSUID)
+			stored := loadCoexistenceAdmissionContact(t, app.DB, organizationID, old.ID)
+			assert.Empty(t, stored.BSUID, "the older record must not receive the echo's BSUID")
+			assert.NotContains(t, stored.Metadata, "coexistence_user_id")
+			recipient := loadCoexistenceAdmissionContact(t, app.DB, organizationID, echoed.ContactID)
+			assert.Equal(t, bsuid, recipient.BSUID)
+			assert.True(t, isCoexistencePlaceholderPhone(recipient.PhoneNumber), recipient.PhoneNumber)
+			if sidecarIsRecipient {
+				assert.Equal(t, "Sidecar Name", recipient.ProfileName, "names from the recipient's own entry are kept")
+			} else {
+				assert.NotEqual(t, "Sidecar Name", recipient.ProfileName, "an unrelated entry supplies nothing")
+			}
+			assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{},
+				"organization_id = ? AND phone_number = ?", organizationID, bsuid), "a BSUID is never stored as a phone")
+			assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.Message{},
+				"organization_id = ? AND whats_app_message_id = ?", organizationID, echoWAMID))
+		})
+	}
+}
+
+// The previous release stored an echo addressed by BSUID on a contact whose
+// phone_number is that BSUID and whose bs_uid is empty. Meta's replay of that
+// echo, an edit or revoke of it, and a new echo to the same BSUID must still
+// prove against that row instead of failing every retry (503) or starting a
+// second contact for the same user.
+func TestCoexistenceEchoStoredWithABSUIDPhoneByThePreviousReleaseStaysProvable(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	bsuid := "US." + testutil.NewTestGraphObjectID()[:17]
+
+	// Reproduce the stored shape: the same echo row the previous release wrote,
+	// on a contact whose phone_number is the BSUID and whose bs_uid is empty.
+	originalWAMID := "wamid.legacy-bsuid-echo-" + uuid.NewString()
+	persistCoexistenceAdmissionEcho(t, app, account, originalWAMID, coexistenceAdmissionTestPhone(), "", "Stored by the previous release")
+	var original models.Message
+	require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, originalWAMID).First(&original).Error)
+	legacyID := original.ContactID
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("organization_id = ? AND id = ?", organizationID, legacyID).
+		Update("phone_number", bsuid).Error)
+	legacy := loadCoexistenceAdmissionContact(t, app.DB, organizationID, legacyID)
+	require.Empty(t, legacy.BSUID)
+	require.Equal(t, bsuid, legacy.PhoneNumber)
+	persist := func(events ...CoexistenceMessage) {
+		t.Helper()
+		require.NoError(t, app.persistMessageEchoesBeforeAck(account.PhoneID, events, nil))
+	}
+
+	// Meta replays the stored echo, still addressed by the BSUID.
+	persist(coexistenceAdmissionEchoEvent(t, `"to":"`+bsuid+`","id":"`+originalWAMID+`","type":"text","text":{"body":"Stored by the previous release"}`))
+	// The recipient (a username user) writes before any new echo. The legacy
+	// row is that user's thread, so the sender is not new: the message is held
+	// as before this change rather than starting a second contact.
+	heldWAMID := "wamid.legacy-bsuid-inbound-" + uuid.NewString()
+	held, _ := admitCoexistenceAdmissionMessage(t, app, account,
+		coexistenceAdmissionMessage(t, heldWAMID, "", bsuid, "hi"), "Username Customer")
+	assert.Nil(t, held)
+	assert.EqualValues(t, 1, countCoexistenceStagedReceipts(t, app, organizationID, heldWAMID))
+	assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{}, "organization_id = ? AND bs_uid = ?", organizationID, bsuid))
+
+	// Staff edit the stored message.
+	persist(coexistenceAdmissionEchoEvent(t, `"to":"`+bsuid+`","id":"wamid.legacy-edit-`+uuid.NewString()+`","type":"edit","edit":{"original_message_id":"`+originalWAMID+`","message":{"type":"text","text":{"body":"Edited after the release"}}}`))
+	edited := models.Message{}
+	require.NoError(t, app.DB.Where("id = ?", original.ID).First(&edited).Error)
+	assert.Equal(t, "Edited after the release", edited.Content)
+	assert.Equal(t, legacyID, edited.ContactID)
+
+	// A new echo to the same BSUID continues the stored thread and binds it.
+	nextWAMID := "wamid.legacy-bsuid-next-" + uuid.NewString()
+	persist(coexistenceAdmissionEchoEvent(t, `"to":"`+bsuid+`","id":"`+nextWAMID+`","type":"text","text":{"body":"Another answer"}`))
+	var next models.Message
+	require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, nextWAMID).First(&next).Error)
+	assert.Equal(t, legacyID, next.ContactID, "a new echo must not split the thread")
+	assert.Equal(t, bsuid, loadCoexistenceAdmissionContact(t, app.DB, organizationID, legacyID).BSUID)
+	assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{},
+		"organization_id = ? AND (bs_uid = ? OR phone_number = ? OR phone_number = ?)",
+		organizationID, bsuid, bsuid, coexistenceIdentityPlaceholder(coexistenceContactIdentity{UserID: bsuid})))
+	// Now that the row holds the BSUID, the user's next message joins it.
+	reply, _ := admitCoexistenceAdmissionMessage(t, app, account,
+		coexistenceAdmissionMessage(t, "wamid.legacy-bsuid-reply-"+uuid.NewString(), "", bsuid, "thanks"), "Username Customer")
+	require.NotNil(t, reply, "the user's message after the binding echo opens the stored thread")
+	assert.Equal(t, legacyID, reply.Persisted.ContactID)
+
+	// Staff delete the stored message for everyone; it is sanitized in place.
+	persist(coexistenceAdmissionEchoEvent(t, `"to":"`+bsuid+`","id":"wamid.legacy-revoke-`+uuid.NewString()+`","type":"revoke","revoke":{"original_message_id":"`+originalWAMID+`"}`))
+	revoked := models.Message{}
+	require.NoError(t, app.DB.Where("id = ?", original.ID).First(&revoked).Error)
+	assert.Equal(t, "[Message deleted from WhatsApp Business App]", revoked.Content)
+	assert.Equal(t, true, revoked.Metadata[coexistenceMediaRevokedMetadataKey])
+
+	// Replays still prove against the now-bound row.
+	persist(coexistenceAdmissionEchoEvent(t, `"to":"`+bsuid+`","id":"`+originalWAMID+`","type":"text","text":{"body":"Stored by the previous release"}`))
+	assert.EqualValues(t, 3, countCoexistenceAdmissionRows(t, app.DB, &models.Message{},
+		"organization_id = ? AND contact_id = ?", organizationID, legacyID))
 }
 
 // The after-commit Omnichannel Inbox mirror is the only live projection of an

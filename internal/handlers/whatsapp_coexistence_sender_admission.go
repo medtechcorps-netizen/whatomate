@@ -31,7 +31,7 @@ import (
 //     written together with that echo, its first message is that echo, it has
 //     no inbound message, BSUID, merge alias, address-book or identity
 //     metadata, assignment, CRM lead, booking, package or review history, and
-//     this number messaged it from the app within the last seven days. The
+//     this number first messaged it from the app within the last seven days. The
 //     reply authenticates the same phone ("from", or contacts[].wa_id when
 //     "from" is absent) with its BSUID, so the BSUID is bound to that contact
 //     exactly as the echo path would have done had Meta included the recipient
@@ -82,15 +82,21 @@ var coexistenceContactIdentityMetadataKeys = []string{
 	"coexistence_app_contact",
 }
 
-// coexistencePhoneAppRecipientCreationSkew bounds the distance between a
-// contact's created_at and the ingested_at of the echo that created it.
-// persistCoexistenceMessage writes both rows in one transaction, each stamped
-// by this process's clock, so they are normally milliseconds apart.
-const coexistencePhoneAppRecipientCreationSkew = 2 * time.Minute
+// coexistencePhoneAppRecipientCreationWindow bounds how long before the
+// creating echo's ingested_at the contact row may have been written.
+// persistCoexistenceMessage creates the contact and only then stamps the
+// echo's ingested_at, both from this process's clock inside one transaction,
+// so an echo-created contact is never newer than its echo and normally only
+// milliseconds older. A contact written earlier than this (manually, by
+// import or by a sync just before staff messaged the number) is not one the
+// echo created.
+const coexistencePhoneAppRecipientCreationWindow = 5 * time.Second
 
 // coexistencePhoneAppRecipientEchoMaxAge bounds how long after this number's
-// latest phone-app message to a recipient that recipient's first reply may
-// still be adopted. Older numbers can have changed hands.
+// first phone-app message to a recipient (the echo that created the contact)
+// that recipient's first reply may still be adopted. Every earlier outgoing
+// message on the contact then falls inside the same window; a number can
+// change hands over a longer lifetime.
 const coexistencePhoneAppRecipientEchoMaxAge = 7 * 24 * time.Hour
 
 // coexistencePhoneAppRecipientMessageLimit caps the history read for the
@@ -104,6 +110,11 @@ type coexistenceSenderSelectors struct {
 	userIDs      []string
 	phones       []string
 	placeholders []string
+	// legacyPhones are this sender's BSUIDs as the previous release stored
+	// them in phone_number for an echo addressed by BSUID
+	// (coexistenceLegacyBSUIDPhoneContact): such a row is the sender's own
+	// earlier thread, so the sender is not new.
+	legacyPhones []string
 	username     string
 }
 
@@ -140,6 +151,11 @@ func coexistenceSenderAdmissionSelectors(
 			continue
 		}
 		add(&selectors.placeholders, coexistenceIdentityPlaceholder(identity))
+	}
+	for _, userID := range selectors.userIDs {
+		if isCoexistenceBSUIDAddress(userID) {
+			selectors.legacyPhones = append(selectors.legacyPhones, userID)
+		}
 	}
 	return selectors
 }
@@ -370,9 +386,9 @@ func (a *App) coexistenceSenderSelectorMatches(
 		conditions = append(conditions, "regexp_replace(phone_number, '[^0-9]', '', 'g') IN ?")
 		args = append(args, selectors.phones)
 	}
-	if len(selectors.placeholders) > 0 {
+	if exact := append(append([]string{}, selectors.placeholders...), selectors.legacyPhones...); len(exact) > 0 {
 		conditions = append(conditions, "phone_number IN ?")
-		args = append(args, selectors.placeholders)
+		args = append(args, exact)
 	}
 	if selectors.username != "" {
 		conditions = append(conditions, "LOWER(metadata->>'coexistence_username') = LOWER(?)")
@@ -444,12 +460,13 @@ func (a *App) coexistenceSenderHasReviewEvidence(
 //     identity or address-book metadata, no assignment and no merge alias;
 //   - no open identity-review hold and no inbound message;
 //   - its first message (by ingestion) is a proven echo winner of this
-//     account, written within coexistencePhoneAppRecipientCreationSkew of the
-//     contact row itself, and no message on it is dated before that echo
-//     unless it is another proven echo of this account (so no history import);
+//     account, ingested no earlier than the contact row and at most
+//     coexistencePhoneAppRecipientCreationWindow after it, and no message on
+//     it is dated before that echo unless it is another proven echo of this
+//     account (so no history import);
 //   - no CRM lead, booking or contact package;
-//   - this account's latest proven echo to it is at most
-//     coexistencePhoneAppRecipientEchoMaxAge old.
+//   - that creating echo is at most coexistencePhoneAppRecipientEchoMaxAge
+//     old, so a later echo does not refresh an older contact.
 //
 // A manually created, imported or address-book contact that later received
 // one echo therefore stays in review: its phone may since have been recycled
@@ -545,32 +562,27 @@ func (a *App) coexistencePhoneAppEchoCreatedContact(
 	if !isOwnEcho(creating) || creating.IngestedAt == nil {
 		return false, nil
 	}
-	skew := contact.CreatedAt.Sub(*creating.IngestedAt)
-	if skew < -coexistencePhoneAppRecipientCreationSkew || skew > coexistencePhoneAppRecipientCreationSkew {
+	// The contact must not predate its creating echo by more than the
+	// in-transaction gap, and can never be newer than it.
+	gap := creating.IngestedAt.Sub(contact.CreatedAt)
+	if gap < 0 || gap > coexistencePhoneAppRecipientCreationWindow {
 		return false, nil
 	}
-	var latestEcho time.Time
+	// The creating echo (and so the contact and every message on it) must be
+	// recent; a later echo does not refresh an older contact.
+	if time.Since(*creating.IngestedAt) > coexistencePhoneAppRecipientEchoMaxAge {
+		return false, nil
+	}
 	for index := range messages {
 		message := &messages[index]
 		if message.Direction != models.DirectionOutgoing {
 			return false, nil
 		}
-		ownEcho := isOwnEcho(message)
-		if !ownEcho && message.CreatedAt.Before(creating.CreatedAt) {
+		if !isOwnEcho(message) && message.CreatedAt.Before(creating.CreatedAt) {
 			// Dated before the echo that created the contact: imported history
 			// or another earlier conversation with this number.
 			return false, nil
 		}
-		if !ownEcho {
-			continue
-		}
-		at := message.CreatedAt
-		if message.IngestedAt != nil {
-			at = *message.IngestedAt
-		}
-		if at.After(latestEcho) {
-			latestEcho = at
-		}
 	}
-	return time.Since(latestEcho) <= coexistencePhoneAppRecipientEchoMaxAge, nil
+	return true, nil
 }
