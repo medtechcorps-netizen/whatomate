@@ -72,6 +72,12 @@ const heldMessageState = ref<HeldMessageState>('idle')
 const readOnlyReview = ref('')
 const primaryBSUIDReason = 1
 const heldCopyLimit = 25
+// The held list accepts at most this many hold IDs per request.
+const heldHoldIDLimit = 50
+// The open generations whose held copies the dialog lists, and, while set,
+// the filter the held queue applies to show only this review's copies.
+const heldHoldIDs = ref<string[]>([])
+const stagedHoldFilter = ref<string[]>([])
 let requestGeneration = 0
 let requestController: AbortController | null = null
 let mediaRequestController: AbortController | null = null
@@ -190,6 +196,8 @@ function resetProtectedState() {
   heldCopies.value = []
   heldTotal.value = 0
   heldMessageState.value = 'idle'
+  heldHoldIDs.value = []
+  stagedHoldFilter.value = []
   readOnlyReview.value = ''
   pendingDecision = null
   closeMediaURL()
@@ -318,8 +326,9 @@ async function loadContactReview() {
       }
       if (props.canViewStaged) {
         const holdIDs = Array.isArray(nextPreview.open_hold_ids) && nextPreview.open_hold_ids.length > 0
-          ? nextPreview.open_hold_ids
+          ? nextPreview.open_hold_ids.slice(-heldHoldIDLimit)
           : [nextPreview.snapshot.hold_id]
+        heldHoldIDs.value = holdIDs
         void loadHeldMessages(holdIDs, generation, contactID, controller.signal)
       }
     }
@@ -393,6 +402,17 @@ async function loadHeldMessages(holdIDs: string[], generation: number, contactID
   }
 }
 
+function openReviewHeldQueue() {
+  if (!props.canViewStaged || heldHoldIDs.value.length === 0) return
+  stagedHoldFilter.value = [...heldHoldIDs.value]
+  void loadStagedQueue(1)
+}
+
+function showWholeHeldQueue() {
+  stagedHoldFilter.value = []
+  void loadStagedQueue(1)
+}
+
 function openHeldCopy(item: StagedIdentityReviewItem) {
   if (!props.canViewStaged) return
   section.value = 'staged'
@@ -437,13 +457,22 @@ async function decide() {
         // A definite refusal, not an ambiguous failure: never resend this
         // request ID. Re-read the review so the next choice is made against
         // its current state.
-        const refusal = getErrorMessage(requestError, 'The review decision was refused.')
+        // After a 409 the review has just been re-read, so say that rather than
+        // the server's "reload"; a 422 names the refused contact.
+        const refusal = status === 409
+          ? 'This review changed and has been reloaded; choose again.'
+          : getErrorMessage(requestError, 'The review decision was refused.')
         pendingDecision = null
         selectedTarget.value = ''
         decisionInFlightToken = null
         deciding.value = false
         await loadContactReview()
-        error.value = refusal
+        if (state.value && effectiveAIIsAllowed(state.value)) {
+          // Another reviewer resolved it meanwhile.
+          emit('resolved', state.value)
+        } else if (!readOnlyReview.value) {
+          error.value = refusal
+        }
         return
       }
       // Retain the exact request ID/body so an ambiguous retry is idempotent.
@@ -470,10 +499,15 @@ async function loadStagedQueue(page = 1) {
   error.value = ''
   closeMediaURL()
   try {
-    const response = await contactsService.listStagedIdentityReviews(
-      { page: requestedPage, limit: stagedPageSize },
-      controller.signal,
-    )
+    const filtered = stagedHoldFilter.value.length > 0
+    const response = filtered
+      ? await contactsService.listStagedIdentityReviewsForHolds(
+        stagedHoldFilter.value, stagedPageSize, controller.signal, requestedPage,
+      )
+      : await contactsService.listStagedIdentityReviews(
+        { page: requestedPage, limit: stagedPageSize },
+        controller.signal,
+      )
     if (generation !== requestGeneration || section.value !== 'staged') return
     const payload = unwrapItemResponse<{
       reviews: StagedIdentityReviewItem[]
@@ -495,7 +529,8 @@ async function loadStagedQueue(page = 1) {
     staged.value = payload.reviews
     stagedPage.value = requestedPage
     stagedTotal.value = payload.total
-    emit('staged-total', payload.total)
+    // The notice counts the whole queue; a review-filtered page is not that.
+    if (!filtered) emit('staged-total', payload.total)
   } catch (requestError) {
     if (generation === requestGeneration && !controller.signal.aborted) {
       error.value = getErrorMessage(requestError, 'The protected staged queue could not be loaded.')
@@ -721,7 +756,10 @@ onBeforeUnmount(() => {
                     </p>
                   </li>
                 </ol>
-                <p v-if="heldTotal > heldCopies.length" class="mt-2 text-white/50 light:text-slate-600">Open the held-message queue to read the remaining {{ heldTotal - heldCopies.length }}.</p>
+                <p v-if="heldTotal > heldCopies.length" class="mt-2 text-white/50 light:text-slate-600">
+                  {{ heldTotal - heldCopies.length }} more held for this review.
+                  <button type="button" data-testid="identity-review-held-open-queue" class="ml-1 font-medium text-sky-300 underline light:text-sky-700" @click="openReviewHeldQueue">Open them in the held queue</button>
+                </p>
                 <p class="mt-2 text-white/50 light:text-slate-600">Read these held copies before you confirm: once a decision is confirmed, they leave the review list and are not moved into any conversation.</p>
               </template>
               <p v-else-if="heldMessageState === 'loading'" class="mt-1 text-white/45 light:text-slate-600">Loading the held messages…</p>
@@ -807,6 +845,10 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <ScrollArea v-else class="max-h-[22rem]">
+          <div v-if="stagedHoldFilter.length > 0" data-testid="staged-review-filter" class="mb-2 flex items-center justify-between gap-3 rounded-xl border border-sky-300/15 bg-sky-300/[0.04] px-3 py-2 text-xs text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900">
+            <span>Showing this review's held messages, oldest first</span>
+            <button type="button" class="font-medium underline" @click="showWholeHeldQueue">Show all held messages</button>
+          </div>
           <button
             v-for="item in staged"
             :key="item.id"

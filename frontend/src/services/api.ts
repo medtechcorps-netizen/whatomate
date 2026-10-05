@@ -386,11 +386,11 @@ export const contactsService = {
     { params, signal },
   ),
   // Held copies of the given holds, oldest first. hold_id repeats once per hold.
-  listStagedIdentityReviewsForHolds: (holdIds: string[], limit: number, signal?: AbortSignal) => {
+  listStagedIdentityReviewsForHolds: (holdIds: string[], limit: number, signal?: AbortSignal, page = 1) => {
     const params = new URLSearchParams();
     for (const holdId of holdIds) params.append("hold_id", holdId);
     params.set("order", "oldest");
-    params.set("page", "1");
+    params.set("page", String(page));
     params.set("limit", String(limit));
     return api.get<{ reviews: StagedIdentityReviewItem[]; total: number; read_only_total?: number }>(
       "/identity-reviews/staged",

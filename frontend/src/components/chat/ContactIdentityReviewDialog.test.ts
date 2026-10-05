@@ -284,7 +284,7 @@ describe('ContactIdentityReviewDialog', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-testid="identity-review-held-count"]').text()).toContain('30 held messages')
-    expect(wrapper.get('[data-testid="identity-review-held-message"]').text()).toContain('read the remaining 29')
+    expect(wrapper.get('[data-testid="identity-review-held-message"]').text()).toContain('29 more held for this review')
   })
 
   it('explains a review without a held copy and never reads the queue without access', async () => {
@@ -302,34 +302,99 @@ describe('ContactIdentityReviewDialog', () => {
   })
 
   it.each([
-    [422, 'This contact belongs to a different WhatsApp user and cannot receive this sender'],
-    [409, 'Identity review state changed; reload and try again'],
-  ])('drops a %s-refused request and re-reads the review instead of resending it', async (status, message) => {
+    [422, 'This contact belongs to a different WhatsApp user and cannot receive this sender',
+      'This contact belongs to a different WhatsApp user and cannot receive this sender'],
+    [409, 'Identity review state changed; reload and try again',
+      'This review changed and has been reloaded; choose again.'],
+  ])('drops a %s-refused request and re-reads the review instead of resending it', async (status, serverMessage, shown) => {
     vi.mocked(crypto.randomUUID)
       .mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
       .mockReturnValueOnce('00000000-0000-4000-8000-000000000002')
     mocks.decide
-      .mockRejectedValueOnce({ isAxiosError: true, response: { status, data: { message } } })
+      .mockRejectedValueOnce({ isAxiosError: true, response: { status, data: { message: serverMessage } } })
       .mockResolvedValueOnce({ data: { data: { disposition: 'future_routing' } } })
     wrapper = mountDialog()
     await flushPromises()
 
     await wrapper.findAll('input[name="identity-review-target"]')[1].setValue()
     await wrapper.get('[data-testid="identity-review-decision"]').trigger('click')
-    await flushPromises()
-
-    expect(mocks.decide).toHaveBeenCalledTimes(1)
-    expect(mocks.preview).toHaveBeenCalledTimes(2)
-    expect(wrapper.get('[role="alert"]').text()).toContain(message)
+    // decide() awaits the real request digest before posting.
+    await vi.waitFor(() => {
+      expect(mocks.decide).toHaveBeenCalledTimes(1)
+      expect(mocks.preview).toHaveBeenCalledTimes(2)
+      expect(wrapper!.find('[role="alert"]').exists()).toBe(true)
+    })
+    expect(wrapper.get('[role="alert"]').text()).toContain(shown)
+    expect(wrapper.emitted('resolved')).toBeUndefined()
     expect((wrapper.findAll('input[name="identity-review-target"]')[1].element as HTMLInputElement).checked).toBe(false)
     expect(wrapper.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeDefined()
 
     await wrapper.findAll('input[name="identity-review-target"]')[1].setValue()
     await wrapper.get('[data-testid="identity-review-decision"]').trigger('click')
-    await flushPromises()
-    expect(mocks.decide).toHaveBeenCalledTimes(2)
+    await vi.waitFor(() => expect(mocks.decide).toHaveBeenCalledTimes(2))
     expect(mocks.decide.mock.calls[0][1].request_id).toBe('00000000-0000-4000-8000-000000000001')
     expect(mocks.decide.mock.calls[1][1].request_id).toBe('00000000-0000-4000-8000-000000000002')
+  })
+
+  it('reports a review that another reviewer resolved before this decision', async () => {
+    mocks.getState
+      .mockResolvedValueOnce({ data: { data: blocked } })
+      .mockResolvedValueOnce({ data: { data: allowed } })
+    mocks.decide.mockRejectedValueOnce({
+      isAxiosError: true,
+      response: { status: 409, data: { message: 'Identity review state changed; reload and try again' } },
+    })
+    wrapper = mountDialog()
+    await flushPromises()
+
+    await wrapper.findAll('input[name="identity-review-target"]')[1].setValue()
+    await wrapper.get('[data-testid="identity-review-decision"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper!.emitted('resolved')).toEqual([[allowed]]))
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="identity-review-effective-state"]').text()).toBe('AI allowed')
+  })
+
+  it('sends at most 50 open holds and opens the review-filtered queue for the rest', async () => {
+    const openHoldIDs = Array.from({ length: 60 }, (_, index) => `hold-${index}`)
+    mocks.preview.mockResolvedValueOnce({ data: { data: { ...preview, open_hold_ids: openHoldIDs } } })
+    mocks.listStagedForHold
+      .mockResolvedValueOnce({
+        data: {
+          data: {
+            reviews: [{ id: 'staged-first', hold_id: 'hold-10', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-10-06T08:00:00Z', read_only: false }],
+            total: 30,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          data: {
+            reviews: [{ id: 'staged-first', hold_id: 'hold-10', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-10-06T08:00:00Z', read_only: false }],
+            total: 30,
+          },
+        },
+      })
+    mocks.getStaged.mockResolvedValueOnce({
+      data: { data: { id: 'staged-first', hold_id: 'hold-10', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-10-06T08:00:00Z', read_only: false, content: 'first', media_available: false } },
+    })
+    wrapper = mountDialog()
+    await flushPromises()
+
+    const sentHoldIDs = mocks.listStagedForHold.mock.calls[0][0]
+    expect(sentHoldIDs).toHaveLength(50)
+    expect(sentHoldIDs).toEqual(openHoldIDs.slice(-50))
+    expect(wrapper.get('[data-testid="identity-review-held-message"]').text()).toContain('29 more held for this review')
+
+    await wrapper.get('[data-testid="identity-review-held-open-queue"]').trigger('click')
+    await flushPromises()
+    expect(mocks.listStagedForHold).toHaveBeenLastCalledWith(openHoldIDs.slice(-50), 100, expect.any(AbortSignal), 1)
+    expect(wrapper.get('[data-testid="staged-review-filter"]').text()).toContain("this review's held messages")
+    expect(wrapper.emitted('staged-total')).toBeUndefined()
+
+    await wrapper.get('[data-testid="staged-review-filter"] button').trigger('click')
+    await flushPromises()
+    expect(mocks.listStaged).toHaveBeenLastCalledWith({ page: 1, limit: 100 }, expect.any(AbortSignal))
+    expect(wrapper.find('[data-testid="staged-review-filter"]').exists()).toBe(false)
   })
 
   it('explains a read-only review instead of asking for a reload', async () => {
