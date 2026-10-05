@@ -86,8 +86,9 @@ jobs:
               if event == "pull_request":
                   # The checkout is GitHub's merge of the pull request into
                   # main; its merge base with main is the main commit it was
-                  # merged onto, so commits already on main never count.
-                  base = commit("merge-base", "origin/main", head)
+                  # merged onto, so commits already on main never count. It
+                  # names the full ref: a tag origin/main would win the short one.
+                  base = commit("merge-base", "refs/remotes/origin/main", head)
               elif event == "push":
                   base = commit("rev-parse", "--verify", head + "^1^{commit}")
               else:

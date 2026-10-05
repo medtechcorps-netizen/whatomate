@@ -538,6 +538,7 @@ GUARD_SCENARIOS: dict[str, tuple[str, str | None, str | None, bool]] = {
     "pull request without origin/main": ("handlers", None, "pull_request", True),
     "pull request behind a main that moved on with a guarded change": ("handlers", "main-moved", "pull_request", False),
     "pull request whose guarded commit is not its last": ("models-then-handlers", "main", "pull_request", True),
+    "pull request beside a tag named origin/main at its head": ("models", "main", "pull_request", True),
     "pull request adding an AutoMigrate call to internal/handlers": ("auto-migrate", "main", "pull_request", True),
     "pull request changing only a test under internal/database": ("database-test", "main", "pull_request", False),
     "pull request changing only release/staging": ("staging", "main", "pull_request", False),
@@ -549,6 +550,9 @@ GUARD_SCENARIOS: dict[str, tuple[str, str | None, str | None, bool]] = {
     "push of a commit without a parent": ("root", "head", "push", True),
     "run without an event name": ("handlers", "main", None, True),
 }
+# Scenarios whose checkout also has a tag named origin/main, at this commit:
+# the short name would resolve to the tag instead of the remote branch.
+GUARD_TAGS = {"pull request beside a tag named origin/main at its head": "models"}
 
 
 class GuardFixture:
@@ -606,14 +610,19 @@ class GuardFixture:
         self.repo.git("merge", "--quiet", "--no-ff", "-m", "merge", branch)
         return self.repo.head()
 
-    def run(self, script: str, head: str, main: str | None, event: str | None) -> tuple[int, str, str]:
+    def point(self, ref: str, sha: str | None) -> None:
+        if sha is not None:
+            self.repo.git("update-ref", ref, sha)
+        elif self.repo.git("for-each-ref", ref).strip():
+            self.repo.git("update-ref", "-d", ref)
+
+    def run(self, script: str, head: str, main: str | None, event: str | None,
+            tag: str | None = None) -> tuple[int, str, str]:
         """Run the step's script the way the step does, from the checkout."""
         sha = self.commits[head]
         self.repo.checkout(sha)
-        if main is not None:
-            self.repo.git("update-ref", "refs/remotes/origin/main", sha if main == "head" else self.commits[main])
-        elif self.repo.git("for-each-ref", "refs/remotes/origin/main").strip():
-            self.repo.git("update-ref", "-d", "refs/remotes/origin/main")
+        self.point("refs/remotes/origin/main", None if main is None else sha if main == "head" else self.commits[main])
+        self.point("refs/tags/origin/main", None if tag is None else self.commits[tag])
         self.summary.write_text("", encoding="utf-8")
         # The release tests themselves run in Actions: none of that run's
         # GITHUB_* variables (its event, its step summary) may leak in.
@@ -636,7 +645,7 @@ def guard_fixture() -> GuardFixture:
 @functools.lru_cache(maxsize=None)
 def run_guard(script: str, scenario: str) -> tuple[int, str, str]:
     head, main, event, _refused = GUARD_SCENARIOS[scenario]
-    return guard_fixture().run(script, head, main, event)
+    return guard_fixture().run(script, head, main, event, GUARD_TAGS.get(scenario))
 
 
 def schema_guard_script(sources: dict[str, str]) -> str:
@@ -744,7 +753,7 @@ GUARD_JOB = "  schema-guard:\n    name: schema-guard\n"
 GUARD_CHECKOUT = ("      contents: read\n    steps:\n      - name: Checkout repository\n"
                   "        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
                   "        with:\n          fetch-depth: 0\n")
-GUARD_PR_BASE = 'base = commit("merge-base", "origin/main", head)'
+GUARD_PR_BASE = 'base = commit("merge-base", "refs/remotes/origin/main", head)'
 GUARD_PUSH_BASE = 'base = commit("rev-parse", "--verify", head + "^1^{commit}")'
 
 
@@ -956,7 +965,9 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     "run the schema guard in another directory": ("schema-guard", lambda: replaced(
         "test.yml", GUARD_STEP, GUARD_STEP + "        working-directory: release\n")),
     "compare a pull request with main's tip": ("schema-guard", lambda: replaced(
-        "test.yml", GUARD_PR_BASE, 'base = commit("rev-parse", "--verify", "origin/main^{commit}")')),
+        "test.yml", GUARD_PR_BASE, 'base = commit("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")')),
+    "compare a pull request with whatever origin/main names": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_PR_BASE, 'base = commit("merge-base", "origin/main", head)')),
     "compare a pull request with its first parent": ("schema-guard", lambda: replaced(
         "test.yml", GUARD_PR_BASE, GUARD_PUSH_BASE)),
     "compare a push with itself": ("schema-guard", lambda: replaced("test.yml", GUARD_PUSH_BASE, "base = head")),
@@ -1123,6 +1134,9 @@ class SchemaGuardScriptTests(unittest.TestCase):
         self.assert_refused("pull request adding an AutoMigrate call to internal/handlers", "main", "auto-migrate",
                             ["migration-call:internal/handlers/messages.go"])
         self.assert_refused("pull request whose guarded commit is not its last", "main", "models-then-handlers",
+                            ["guarded-tree:internal/models/models.go"])
+        # A tag named origin/main does not move the base off the remote branch.
+        self.assert_refused("pull request beside a tag named origin/main at its head", "main", "models",
                             ["guarded-tree:internal/models/models.go"])
 
     def test_only_the_pull_requests_own_changes_count(self) -> None:
