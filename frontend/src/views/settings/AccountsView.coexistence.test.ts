@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AccountsView from "./AccountsView.vue";
 
 const organizationId = "b1111111-1111-4111-8111-111111111111";
+const otherOrganizationId = "b9999999-9999-4999-8999-999999999999";
 
 const mocks = vi.hoisted(() => ({
   get: vi.fn(),
@@ -12,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   login: vi.fn(),
   toastError: vi.fn(),
   accounts: [] as Array<Record<string, unknown>>,
+  organizations: { selectedOrgId: "" } as { selectedOrgId: string },
 }));
 
 vi.mock("@/services/api", () => ({
@@ -23,13 +25,16 @@ vi.mock("@/stores/auth", () => ({
     organizationId,
   }),
 }));
-vi.mock("@/stores/organizations", () => ({
-  useOrganizationsStore: () => ({
-    selectedOrgId: organizationId,
+vi.mock("@/stores/organizations", async () => {
+  const { reactive } = await import("vue");
+  const store = reactive({
+    selectedOrgId: "",
     blockOrganizationSwitch: vi.fn(),
     unblockOrganizationSwitch: vi.fn(),
-  }),
-}));
+  });
+  mocks.organizations = store;
+  return { useOrganizationsStore: () => store };
+});
 vi.mock("vue-router", () => ({ onBeforeRouteLeave: vi.fn() }));
 vi.mock("vue-i18n", async (importOriginal) => ({
   ...(await importOriginal<typeof import("vue-i18n")>()),
@@ -155,25 +160,28 @@ beforeEach(() => {
   mocks.login.mockReset();
   mocks.toastError.mockReset();
   mocks.accounts = [];
-  mocks.get.mockImplementation(async (url: string) => {
-    if (url === "/embedded-signup/config") {
-      return {
-        data: {
+  mocks.organizations.selectedOrgId = organizationId;
+  mocks.get.mockImplementation(
+    async (url: string, config?: { headers?: Record<string, string> }) => {
+      if (url === "/embedded-signup/config") {
+        return {
           data: {
-            organization_id: organizationId,
-            whatsapp_app_id: "1000000000000001",
-            whatsapp_config_id: "1000000000000002",
-            whatsapp_api_version: "v24.0",
-            has_app_secret: true,
+            data: {
+              organization_id: config?.headers?.["X-Organization-ID"],
+              whatsapp_app_id: "1000000000000001",
+              whatsapp_config_id: "1000000000000002",
+              whatsapp_api_version: "v24.0",
+              has_app_secret: true,
+            },
           },
-        },
-      };
-    }
-    if (url === "/accounts") {
-      return { data: { data: { accounts: mocks.accounts } } };
-    }
-    throw new Error(`unexpected GET ${url}`);
-  });
+        };
+      }
+      if (url === "/accounts") {
+        return { data: { data: { accounts: mocks.accounts } } };
+      }
+      throw new Error(`unexpected GET ${url}`);
+    },
+  );
   mocks.post.mockResolvedValue({
     data: {
       data: {
@@ -337,5 +345,39 @@ describe("AccountsView Coexistence number step", () => {
         phone_number_hint: undefined,
       },
     ]);
+  });
+
+  it("forgets the number and reconnect choice when the workspace changes", async () => {
+    mocks.accounts = [
+      {
+        id: "b4444444-4444-4444-8444-444444444444",
+        name: "Existing clinic number",
+        phone_id: "1000000000000003",
+        status: "active",
+        created_at: "2026-09-04T01:00:00Z",
+      },
+    ];
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    await view.get("#coexistence-phone-number").setValue("+60 12-345 6789");
+    await view
+      .get("#coexistence-reconnect-account")
+      .setValue("b4444444-4444-4444-8444-444444444444");
+
+    mocks.organizations.selectedOrgId = otherOrganizationId;
+    await flushPromises();
+    mocks.organizations.selectedOrgId = organizationId;
+    await flushPromises();
+
+    expect(view.text()).toContain("accounts.coexistenceTitle");
+    await chooseCoexistence(view);
+    expect(
+      (view.get("#coexistence-phone-number").element as HTMLInputElement).value,
+    ).toBe("");
+    expect(
+      (view.get("#coexistence-reconnect-account").element as HTMLSelectElement)
+        .value,
+    ).toBe("");
+    expect(mocks.login).not.toHaveBeenCalled();
   });
 });

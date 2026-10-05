@@ -224,8 +224,11 @@ watch(showOnboardingDialog, (isOpen) => {
   if (!isOpen) onboardingStep.value = "choose";
 });
 watch(activeOrganizationId, (organizationId) => {
-  // A reconnect choice names an account of the previous workspace.
+  // The number and reconnect choice belong to the previous workspace.
+  coexistencePhoneNumber.value = "";
+  coexistencePhoneNumberTouched.value = false;
   coexistenceReconnectAccountId.value = "";
+  onboardingStep.value = "choose";
   if (
     activeEmbeddedSignupOrganizationId &&
     organizationId !== activeEmbeddedSignupOrganizationId
