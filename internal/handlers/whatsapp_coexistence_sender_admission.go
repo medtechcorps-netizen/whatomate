@@ -395,8 +395,9 @@ func (a *App) classifyCoexistenceSenderAdmission(
 		return "", uuid.Nil, nil
 	}
 	if reviewed {
-		// A review closed only by an onboarding-cycle change neither stays open
-		// nor records a decision, so it does not bar classic history.
+		// This sender's own review closed only by an onboarding-cycle change
+		// neither stays open nor records a decision, so it does not bar classic
+		// history; any other review of these selectors does.
 		live, liveErr := a.coexistenceSenderHasLiveReviewEvidence(account.OrganizationID, claim, selectors)
 		if liveErr != nil || live {
 			return "", uuid.Nil, liveErr
@@ -466,29 +467,27 @@ func (a *App) coexistenceSenderHasReviewEvidence(
 	claim WhatsAppIdentityReviewClaim,
 	selectors coexistenceSenderSelectors,
 ) (bool, error) {
-	return a.coexistenceSenderReviewEvidence(organizationID, claim, selectors, nil)
+	return a.coexistenceSenderReviewEvidence(organizationID, claim, selectors, false)
 }
 
 // coexistenceSenderHasLiveReviewEvidence is coexistenceSenderHasReviewEvidence
-// restricted to holds that are still open or that record a review decision.
-// A hold closed only by an onboarding-cycle change carries no decision.
+// without this sender's own holds that an onboarding-cycle change closed: such
+// a hold neither stays open nor records a decision, and it names no other
+// user. A cycle-closed hold left by any other direct BSUID on these selectors
+// still shows that a second WhatsApp user wrote from them.
 func (a *App) coexistenceSenderHasLiveReviewEvidence(
 	organizationID uuid.UUID,
 	claim WhatsAppIdentityReviewClaim,
 	selectors coexistenceSenderSelectors,
 ) (bool, error) {
-	return a.coexistenceSenderReviewEvidence(organizationID, claim, selectors, []models.WhatsAppIdentityReviewDisposition{
-		models.WhatsAppIdentityReviewDispositionOpen,
-		models.WhatsAppIdentityReviewDispositionFutureRouting,
-		models.WhatsAppIdentityReviewDispositionSupersededByLatest,
-	})
+	return a.coexistenceSenderReviewEvidence(organizationID, claim, selectors, true)
 }
 
 func (a *App) coexistenceSenderReviewEvidence(
 	organizationID uuid.UUID,
 	claim WhatsAppIdentityReviewClaim,
 	selectors coexistenceSenderSelectors,
-	dispositions []models.WhatsAppIdentityReviewDisposition,
+	ignoreOwnCycleClosed bool,
 ) (bool, error) {
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 3)
@@ -514,8 +513,9 @@ func (a *App) coexistenceSenderReviewEvidence(
 			"(member_count > 0 OR direct_primary_bsuid <> ? OR (parent_bsuid <> '' AND parent_bsuid <> ?))",
 			directBSUID, strings.TrimSpace(claim.ParentBSUID),
 		)
-	if len(dispositions) > 0 {
-		query = query.Where("disposition IN ?", dispositions)
+	if ignoreOwnCycleClosed {
+		query = query.Where("NOT (disposition = ? AND direct_primary_bsuid = ?)",
+			models.WhatsAppIdentityReviewDispositionSupersededByCycle, directBSUID)
 	}
 	var count int64
 	if err := query.Count(&count).Error; err != nil {
@@ -532,9 +532,11 @@ func (a *App) coexistenceSenderReviewEvidence(
 //
 //   - live, unmerged, a dialable phone equal to the sender's, and no BSUID or
 //     this sender's parent BSUID (the direct BSUID has no owner);
-//   - no stored Coexistence identity naming another user, no unresolved
-//     identity conflict, no merge alias carrying another BSUID, and no open
-//     identity-review hold;
+//   - no stored username other than the sender's, nothing tying its canonical
+//     family to another WhatsApp user (identityReviewMembersOfOtherUsers: a
+//     merged contact with another BSUID, stored identity naming another user
+//     or a conflict, or a reviewer's decision routing another principal to
+//     it in this cycle), and no open identity-review hold;
 //   - at least one inbound message stored on this exact contact (not on a
 //     merge alias), not soft-deleted and not placed by identity review, whose
 //     inbound continuation job passes validateInboundContinuationJobProof for
@@ -543,8 +545,9 @@ func (a *App) coexistenceSenderReviewEvidence(
 //     to account.PhoneID, the message ID and the WAMID, and returns Meta's raw
 //     signed "from", from_user_id and from_parent_user_id, stored verbatim at
 //     admission. The raw "from" must be the sender's phone;
-//   - no validated job among the newest coexistenceClassicHistoryEvidenceLimit
-//     names a different sender BSUID or parent BSUID.
+//   - no validated job among this account's newest
+//     coexistenceClassicHistoryEvidenceLimit (filtered by Meta phone ID before
+//     the limit) names a different sender BSUID or parent BSUID.
 //
 // Only the live inbound admission path creates continuation jobs: history
 // imports and echoes never do, so address-book and history-only contacts and
@@ -565,22 +568,17 @@ func (a *App) coexistenceClassicHistoryContact(
 	if bsuid := strings.TrimSpace(contact.BSUID); bsuid != "" && (parent == "" || bsuid != parent) {
 		return false, nil
 	}
-	if !coexistenceClassicHistoryMetadataAgrees(contact, direct, parent, username) {
+	if stored, present := contact.Metadata["coexistence_username"].(string); present &&
+		!strings.EqualFold(strings.TrimSpace(stored), strings.TrimSpace(username)) {
 		return false, nil
 	}
-	allowedBSUIDs := []string{direct}
-	if parent != "" {
-		allowedBSUIDs = append(allowedBSUIDs, parent)
-	}
-	var foreignAliases int64
-	if err := a.DB.Unscoped().Model(&models.Contact{}).Where(
-		"organization_id = ? AND merged_into_id = ? AND COALESCE(BTRIM(bs_uid), '') <> '' AND BTRIM(bs_uid) NOT IN ?",
-		account.OrganizationID, contact.ID, allowedBSUIDs,
-	).Count(&foreignAliases).Error; err != nil {
-		return false, fmt.Errorf("read classic-history merge aliases: %w", err)
-	}
-	if foreignAliases > 0 {
-		return false, nil
+	// The same family rule that makes a review member unroutable: another
+	// user's BSUID on a merged contact, stored identity naming another user,
+	// or a reviewer's decision for another principal in this cycle.
+	otherUsers, err := identityReviewMembersOfOtherUsers(a.DB, claim, []uuid.UUID{contact.ID},
+		map[uuid.UUID]*models.Contact{contact.ID: contact})
+	if err != nil || otherUsers[contact.ID] {
+		return false, err
 	}
 	held, err := database.ContactHasBlockingIdentityReviewHold(a.DB, account.OrganizationID, contact.ID)
 	if err != nil || held {
@@ -596,10 +594,14 @@ func (a *App) coexistenceClassicHistoryContact(
 	if err := a.DB.Table("scheduled_jobs AS job").
 		Select("job.id AS job_id, message.id AS message_id, message.whats_app_message_id AS wamid").
 		Joins("JOIN messages AS message ON message.organization_id = job.organization_id AND message.id = job.aggregate_id").
+		// Filter to this account's Meta phone ID before the window so another
+		// account's traffic can neither crowd out nor hide this account's jobs;
+		// validateInboundContinuationJobProof still checks every row.
 		Where(`job.organization_id = ? AND job.kind = ? AND job.aggregate_type = ?
+			AND BTRIM(job.payload ->> 'phone_number_id') = ?
 			AND message.contact_id = ? AND message.direction = ? AND message.deleted_at IS NULL
 			AND (COALESCE(message.metadata, '{}'::jsonb) ->> ?) IS NULL`,
-			account.OrganizationID, inboundContinuationJobKind, "message",
+			account.OrganizationID, inboundContinuationJobKind, "message", strings.TrimSpace(account.PhoneID),
 			contact.ID, models.DirectionIncoming, incomingIdentityReviewHoldIDKey).
 		Order("job.created_at DESC, job.id DESC").
 		Limit(coexistenceClassicHistoryEvidenceLimit).
@@ -641,38 +643,6 @@ func (a *App) coexistenceClassicHistoryContact(
 		}
 	}
 	return attested, nil
-}
-
-// coexistenceClassicHistoryMetadataAgrees rejects a contact whose stored
-// Coexistence identity names another WhatsApp user, or that records an
-// unresolved identity conflict or BSUID reconciliation.
-func coexistenceClassicHistoryMetadataAgrees(contact *models.Contact, direct, parent, username string) bool {
-	for _, key := range []string{
-		"coexistence_conflicting_user_id",
-		"coexistence_phone_conflict",
-		"coexistence_reconciled_contact_id",
-	} {
-		if _, present := contact.Metadata[key]; present {
-			return false
-		}
-	}
-	if stored, present := contact.Metadata["coexistence_user_id"]; present {
-		value, _ := stored.(string)
-		if value = strings.TrimSpace(value); value != "" && value != direct && (parent == "" || value != parent) {
-			return false
-		}
-	}
-	if stored, present := contact.Metadata["coexistence_parent_user_id"]; present {
-		value, _ := stored.(string)
-		if value = strings.TrimSpace(value); value != "" && value != parent {
-			return false
-		}
-	}
-	if stored, present := contact.Metadata["coexistence_username"].(string); present &&
-		!strings.EqualFold(strings.TrimSpace(stored), strings.TrimSpace(username)) {
-		return false
-	}
-	return true
 }
 
 // coexistencePhoneAppRecipientAwaitingFirstReply proves that a phone-only

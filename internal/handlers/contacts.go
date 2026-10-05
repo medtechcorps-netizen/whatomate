@@ -246,6 +246,10 @@ func (a *App) DecideContactIdentityReview(r *fastglue.Request) error {
 	return r.SendEnvelope(result)
 }
 
+// stagedIdentityReviewMaxHoldFilters bounds the hold_id values one list call
+// accepts: the open generations of a single review chain.
+const stagedIdentityReviewMaxHoldFilters = 50
+
 // ListStagedContactIdentityReviews returns only sanitized queue metadata. It is
 // a full-tenant surface because contact-free arrivals have no safe assignment
 // boundary until a reviewer resolves identity.
@@ -255,19 +259,31 @@ func (a *App) ListStagedContactIdentityReviews(r *fastglue.Request) error {
 		return nil
 	}
 	pg := parsePagination(r)
-	// An optional hold_id narrows the list to one open hold's receipts, so the
-	// contact review dialog can show the held message beside its decision.
-	var holdFilter uuid.UUID
-	if raw := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("hold_id"))); raw != "" {
-		parsed, err := uuid.Parse(raw)
+	// Optional repeated hold_id values narrow the list to those open holds'
+	// receipts, and order=oldest lists them oldest first, so the contact review
+	// dialog can show every held copy its decision would close.
+	var holdFilters []uuid.UUID
+	for _, raw := range r.RequestCtx.QueryArgs().PeekMulti("hold_id") {
+		value := strings.TrimSpace(string(raw))
+		if value == "" {
+			continue
+		}
+		parsed, err := uuid.Parse(value)
 		if err != nil || parsed == uuid.Nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid identity review hold ID", nil, "")
 		}
-		holdFilter = parsed
+		holdFilters = append(holdFilters, parsed)
+	}
+	if len(holdFilters) > stagedIdentityReviewMaxHoldFilters {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Too many identity review hold IDs", nil, "")
+	}
+	order := "inbound_events.received_at DESC, inbound_events.id DESC"
+	if strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("order"))) == "oldest" {
+		order = "inbound_events.received_at ASC, inbound_events.id ASC"
 	}
 	scope := func(query *gorm.DB) *gorm.DB {
-		if holdFilter != uuid.Nil {
-			return query.Where("inbound_events.review_hold_id = ?", holdFilter)
+		if len(holdFilters) > 0 {
+			return query.Where("inbound_events.review_hold_id IN ?", holdFilters)
 		}
 		return query
 	}
@@ -287,7 +303,7 @@ func (a *App) ListStagedContactIdentityReviews(r *fastglue.Request) error {
 	}
 	var events []models.InboundEvent
 	if err := scope(a.stagedIdentityReviewEventsQuery(orgID)).
-		Order("inbound_events.received_at DESC, inbound_events.id DESC").
+		Order(order).
 		Offset(pg.Offset).Limit(pg.Limit).Find(&events).Error; err != nil {
 		a.Log.Error("Failed to list staged identity reviews", "error", err, "organization_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
@@ -521,6 +537,10 @@ func (a *App) sendWhatsAppIdentityReviewError(r *fastglue.Request, err error, op
 	case errors.Is(err, ErrWhatsAppIdentityReviewTargetRefused):
 		return r.SendErrorEnvelope(fasthttp.StatusUnprocessableEntity,
 			"This contact belongs to a different WhatsApp user and cannot receive this sender", nil, "")
+	case errors.Is(err, ErrWhatsAppIdentityReviewReadOnly):
+		return r.SendErrorEnvelope(fasthttp.StatusConflict,
+			"This identity review is read-only: no decision can resolve it until the WhatsApp number is onboarded again. Automated replies stay off for this contact until then.",
+			nil, "identity_review_read_only")
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Identity review not found", nil, "")
 	default:

@@ -476,6 +476,8 @@ func TestWhatsAppIdentityReviewUnownedPrincipalOtherUsersContactStaysReadOnly(t 
 	resolver := createWhatsAppIdentityReviewResolver(t, app.DB, account.OrganizationID)
 	status, body, _ := previewContactIdentityReviewOverHTTP(t, app, account.OrganizationID, resolver.ID, owner.ID)
 	assert.Equal(t, fasthttp.StatusConflict, status, body)
+	assert.Contains(t, body, "identity review is read-only")
+	assert.Contains(t, body, "identity_review_read_only")
 	probeErr := probeWhatsAppIdentityReviewDecisionTransition(t, app.DB, hold, owner.ID, resolver.ID)
 	assert.Error(t, probeErr, "the database guard keeps the read-only hold closed to decisions")
 }

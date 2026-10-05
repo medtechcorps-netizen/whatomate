@@ -323,31 +323,85 @@ func TestCoexistenceClassicHistoryRequiresThisAccountsOwnAttestedHistory(t *test
 	}
 }
 
-// A review closed only by an onboarding-cycle change (a reconnect) records no
-// decision, so after the reconnect a classic-history customer is bound; while
-// that legacy review is still open the customer stays held.
-func TestCoexistenceClassicHistoryIgnoresReviewsClosedByReconnect(t *testing.T) {
-	for _, reconnected := range []bool{false, true} {
-		t.Run(fmt.Sprintf("reconnected=%t", reconnected), func(t *testing.T) {
+// insertMainShapeUnsupportedHoldForTest writes the hold the releases before
+// #226 created for a sender whose direct BSUID had no owner but whose phone
+// matched a contact: unsupported, generation 0, the sender's BSUID, and that
+// contact as a phone-only member.
+func insertMainShapeUnsupportedHoldForTest(
+	t *testing.T,
+	app *App,
+	account *models.WhatsAppAccount,
+	direct, phone string,
+	memberID uuid.UUID,
+) uuid.UUID {
+	t.Helper()
+	var cycle uint64
+	require.NoError(t, app.DB.Model(&models.WhatsAppCoexistenceState{}).Select("onboarding_cycle").Where(
+		"organization_id = ? AND whats_app_account_id = ?", account.OrganizationID, account.ID,
+	).Scan(&cycle).Error)
+	members := []WhatsAppIdentityReviewCandidate{{ContactID: memberID, SelectorReasons: models.WhatsAppIdentityReviewSelectorPhone}}
+	memberDigest := identityReviewMemberDigest(members)
+	claim := WhatsAppIdentityReviewClaim{
+		OrganizationID: account.OrganizationID, WhatsAppAccountID: account.ID, OnboardingCycle: cycle,
+		DirectPrimaryBSUID: direct, Phone: phone,
+	}
+	hold := models.WhatsAppIdentityReviewHold{
+		ID: uuid.New(), OrganizationID: account.OrganizationID, WhatsAppAccountID: account.ID,
+		OnboardingCycle: cycle, ProtocolVersion: models.WhatsAppIdentityReviewProtocolVersion,
+		DirectPrimaryBSUID: direct, Phone: phone,
+		SemanticClaimDigest: identityReviewSemanticDigest(claim, memberDigest),
+		SelectorBodyDigest:  strings.Repeat("e", 64), VerifiedEventDigest: strings.Repeat("f", 64),
+		VerifiedEventProvenance: WhatsAppIdentityReviewVerifiedMetaEvent,
+		MemberCount:             1, MemberDigest: memberDigest, Version: 1,
+		Disposition: models.WhatsAppIdentityReviewDispositionOpen,
+	}
+	require.NoError(t, app.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&hold).Error; err != nil {
+			return err
+		}
+		return tx.Create(&models.WhatsAppIdentityReviewMember{
+			OrganizationID: account.OrganizationID, HoldID: hold.ID, ContactID: memberID,
+			SelectorReasons: models.WhatsAppIdentityReviewSelectorPhone,
+		}).Error
+	}))
+	return hold.ID
+}
+
+func reconnectCoexistenceAccountForTest(t *testing.T, app *App, account *models.WhatsAppAccount, holdID uuid.UUID) {
+	t.Helper()
+	require.NoError(t, app.DB.Model(&models.WhatsAppCoexistenceState{}).Where(
+		"organization_id = ? AND whats_app_account_id = ?", account.OrganizationID, account.ID,
+	).Update("onboarding_cycle", gorm.Expr("onboarding_cycle + 1")).Error)
+	var hold models.WhatsAppIdentityReviewHold
+	require.NoError(t, app.DB.First(&hold, "id = ?", holdID).Error)
+	require.Equal(t, models.WhatsAppIdentityReviewDispositionSupersededByCycle, hold.Disposition)
+}
+
+// A reconnect closes this sender's own pre-#226 review without recording a
+// decision, so afterwards the classic-history customer is bound. While that
+// review is still open, or when the closed review was left by a different
+// BSUID on the same phone (a second WhatsApp user), the sender stays held.
+func TestCoexistenceClassicHistoryAfterReconnect(t *testing.T) {
+	for _, variant := range []string{"own_review_open", "own_review_closed_by_reconnect", "other_bsuid_review_closed_by_reconnect"} {
+		t.Run(variant, func(t *testing.T) {
 			app, account, _ := whatsappIdentityFixture(t)
 			organizationID := account.OrganizationID
 			phone := coexistenceAdmissionTestPhone()
 			classic := deliverClassicInboundForTest(t, app, account, phone, "")
-			legacyHold := createLegacyUnsupportedHoldForTest(t, app, account, phone)
-			if reconnected {
-				require.NoError(t, app.DB.Model(&models.WhatsAppCoexistenceState{}).Where(
-					"organization_id = ? AND whats_app_account_id = ?", organizationID, account.ID,
-				).Update("onboarding_cycle", 2).Error)
-				var hold models.WhatsAppIdentityReviewHold
-				require.NoError(t, app.DB.First(&hold, "id = ?", legacyHold).Error)
-				require.Equal(t, models.WhatsAppIdentityReviewDispositionSupersededByCycle, hold.Disposition)
+			bsuid := "US.reconnect-" + uuid.NewString()
+			holdBSUID := bsuid
+			if variant == "other_bsuid_review_closed_by_reconnect" {
+				holdBSUID = "US.second-user-" + uuid.NewString()
+			}
+			legacyHold := insertMainShapeUnsupportedHoldForTest(t, app, account, holdBSUID, phone, classic.ContactID)
+			if variant != "own_review_open" {
+				reconnectCoexistenceAccountForTest(t, app, account, legacyHold)
 			}
 
-			bsuid := "US.reconnect-" + uuid.NewString()
 			message := coexistenceAdmissionMessage(t, "wamid.reconnect-"+uuid.NewString(), phone, bsuid, "after the reconnect")
 			work, _ := admitCoexistenceAdmissionMessage(t, app, account, message, "Classic Customer")
-			if !reconnected {
-				assert.Nil(t, work, "an open review of this phone keeps the sender held")
+			if variant != "own_review_closed_by_reconnect" {
+				assert.Nil(t, work, "the sender must stay held")
 				assert.Empty(t, loadCoexistenceAdmissionContact(t, app.DB, organizationID, classic.ContactID).BSUID)
 				return
 			}
@@ -359,4 +413,52 @@ func TestCoexistenceClassicHistoryIgnoresReviewsClosedByReconnect(t *testing.T) 
 			assert.True(t, state.AIAllowed)
 		})
 	}
+}
+
+// Another account's newer inbound traffic on the same contact can neither
+// crowd this account's attested history out of the evidence window nor stand
+// in for it.
+func TestCoexistenceClassicHistoryEvidenceWindowCoversOnlyThisAccount(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	phone := coexistenceAdmissionTestPhone()
+	classic := deliverClassicInboundForTest(t, app, account, phone, "")
+	other := testutil.CreateTestWhatsAppAccount(t, app.DB, organizationID)
+
+	crowd := coexistenceClassicHistoryEvidenceLimit + 1
+	base := time.Now().UTC().Add(time.Minute)
+	messages := make([]models.Message, 0, crowd)
+	jobs := make([]models.ScheduledJob, 0, crowd)
+	for index := range crowd {
+		wamid := fmt.Sprintf("wamid.other-account-%d-%s", index, uuid.NewString())
+		messageID := uuid.New()
+		messages = append(messages, models.Message{
+			BaseModel:      models.BaseModel{ID: messageID, CreatedAt: base, UpdatedAt: base},
+			OrganizationID: organizationID, WhatsAppAccount: other.Name, ContactID: classic.ContactID,
+			WhatsAppMessageID: wamid, Direction: models.DirectionIncoming, MessageType: models.MessageTypeText,
+			Content: "other account", Status: models.MessageStatusReceived, Metadata: models.JSONB{},
+		})
+		created := base.Add(time.Duration(index) * time.Millisecond)
+		jobs = append(jobs, models.ScheduledJob{
+			BaseModel:      models.BaseModel{ID: uuid.New(), CreatedAt: created, UpdatedAt: created},
+			OrganizationID: organizationID, Kind: inboundContinuationJobKind, AggregateType: "message",
+			AggregateID: &messageID, RunAt: created, Status: models.ScheduledJobStatusCompleted,
+			MaxAttempts:    defaultInboundContinuationMaxTry,
+			IdempotencyKey: "inbound-message-continuation:" + uuid.NewSHA1(other.ID, []byte(wamid)).String(),
+			Payload: models.JSONB{
+				"phone_number_id": other.PhoneID, "wamid": wamid, "message_id": messageID.String(),
+				"message": map[string]any{"from": phone, "id": wamid, "type": "text", "timestamp": "1722222222"},
+			},
+			Version: 1,
+		})
+	}
+	require.NoError(t, app.DB.CreateInBatches(&messages, 100).Error)
+	require.NoError(t, app.DB.CreateInBatches(&jobs, 100).Error)
+
+	bsuid := "US.window-" + uuid.NewString()
+	work, _ := admitCoexistenceAdmissionMessage(t, app, account,
+		coexistenceAdmissionMessage(t, "wamid.window-"+uuid.NewString(), phone, bsuid, "after the switch"), "Classic Customer")
+	require.NotNil(t, work, "this account's attested history must stay inside the evidence window")
+	assert.Equal(t, classic.ContactID, work.Persisted.ContactID)
+	assert.Equal(t, bsuid, loadCoexistenceAdmissionContact(t, app.DB, organizationID, classic.ContactID).BSUID)
 }

@@ -25,10 +25,13 @@ var (
 	ErrWhatsAppIdentityReviewInvalid      = errors.New("WhatsApp identity review input is invalid")
 	ErrWhatsAppIdentityReviewUnauthorized = errors.New("WhatsApp identity review is not authorized")
 
-	// ErrWhatsAppIdentityReviewTargetRefused marks a member that already carries
-	// a different WhatsApp user's BSUID; routing this principal to it would put
-	// two WhatsApp users behind one contact.
+	// ErrWhatsAppIdentityReviewTargetRefused marks a member that already belongs
+	// to a different WhatsApp user; routing this principal to it would put two
+	// WhatsApp users behind one contact.
 	ErrWhatsAppIdentityReviewTargetRefused = errors.New("WhatsApp identity review target belongs to another WhatsApp user")
+	// ErrWhatsAppIdentityReviewReadOnly marks an open unsupported hold: the
+	// hold guard lets it close only on a new onboarding cycle.
+	ErrWhatsAppIdentityReviewReadOnly = errors.New("WhatsApp identity review is read-only")
 )
 
 // WhatsAppIdentityReviewClaim is the account-bound input from the authenticated
@@ -109,9 +112,12 @@ type WhatsAppIdentityReviewPreview struct {
 	UnionCandidates []WhatsAppIdentityReviewCandidate `json:"union_candidates"`
 	OpenGenerations []uint64                          `json:"open_generations"`
 	// RoutableContactIDs are the current members a decision may target: every
-	// direct-BSUID owner, and any other member that carries no BSUID or this
-	// claim's parent BSUID.
+	// direct-BSUID owner, and any other member whose canonical family belongs
+	// to no other WhatsApp user (identityReviewMembersOfOtherUsers).
 	RoutableContactIDs []uuid.UUID `json:"routable_contact_ids"`
+	// OpenHoldIDs are every open generation a decision on this hold closes, so
+	// a reviewer can read all of their held copies first.
+	OpenHoldIDs []uuid.UUID `json:"open_hold_ids"`
 }
 
 type WhatsAppIdentityReviewDecisionInput struct {
@@ -412,10 +418,10 @@ func (a *App) EvaluateWhatsAppIdentityReviewAdmission(
 		return result, nil
 	}
 	if !candidates.routable[*latest.DecisionTargetContactID] {
-		// The decided contact has since been bound to another WhatsApp user.
-		// The decision cannot follow it; a fresh generation asks again.
-		result.Reason = "decision_target_contradicted"
-		return result, nil
+		// The decided contact has since come to belong to another WhatsApp
+		// user. The decision cannot follow it; a fresh generation asks again,
+		// and a proven direct owner still holds the message meanwhile.
+		return unreviewed("decision_target_contradicted"), nil
 	}
 	target := *latest.DecisionTargetContactID
 	result.RouteContactID = &target
@@ -606,6 +612,11 @@ func (a *App) previewWhatsAppIdentityReviewDecision(
 		return nil, err
 	}
 
+	if !hold.Supported && hold.Disposition == models.WhatsAppIdentityReviewDispositionOpen {
+		// Say so plainly instead of a "state changed" conflict that reloading
+		// can never clear.
+		return nil, ErrWhatsAppIdentityReviewReadOnly
+	}
 	if !hold.Supported || hold.Disposition != models.WhatsAppIdentityReviewDispositionOpen ||
 		hold.WhatsAppAccountID != normalized.WhatsAppAccountID ||
 		hold.OnboardingCycle != normalized.OnboardingCycle ||
@@ -648,6 +659,7 @@ func (a *App) previewWhatsAppIdentityReviewDecision(
 	}
 	union := make(map[uuid.UUID]models.WhatsAppIdentityReviewSelectorReason)
 	openGenerations := make([]uint64, 0, len(openHolds))
+	openHoldIDs := make([]uuid.UUID, 0, len(openHolds))
 	chainParts := make([]string, 0, len(openHolds))
 	for index := range openHolds {
 		generationSnapshot, loadErr := loadWhatsAppIdentityReviewSnapshot(tx, &openHolds[index])
@@ -655,6 +667,7 @@ func (a *App) previewWhatsAppIdentityReviewDecision(
 			return nil, loadErr
 		}
 		openGenerations = append(openGenerations, openHolds[index].PrincipalGeneration)
+		openHoldIDs = append(openHoldIDs, openHolds[index].ID)
 		chainParts = append(chainParts, identityReviewChainPart(openHolds[index]))
 		for _, member := range generationSnapshot.Candidates {
 			union[member.ContactID] |= member.SelectorReasons
@@ -670,6 +683,7 @@ func (a *App) previewWhatsAppIdentityReviewDecision(
 		UnionCandidates:    unionCandidates,
 		OpenGenerations:    openGenerations,
 		RoutableContactIDs: identityReviewRoutableContactIDs(candidates),
+		OpenHoldIDs:        openHoldIDs,
 	}, nil
 }
 
@@ -966,7 +980,7 @@ func enumerateWhatsAppIdentityReviewCandidates(
 	}
 	sort.Slice(rawIDs, func(i, j int) bool { return rawIDs[i].String() < rawIDs[j].String() })
 	reasons := make(map[uuid.UUID]models.WhatsAppIdentityReviewSelectorReason)
-	canonicalBSUIDs := make(map[uuid.UUID]string)
+	canonicalContacts := make(map[uuid.UUID]*models.Contact)
 	supported := claim.DirectPrimaryBSUID != ""
 	for _, rawID := range rawIDs {
 		// The organization-scoped selector fence prevents every selector or merge
@@ -981,16 +995,29 @@ func enumerateWhatsAppIdentityReviewCandidates(
 			continue
 		}
 		reasons[canonical.ID] |= reasonsByRawID[rawID]
-		canonicalBSUIDs[canonical.ID] = strings.TrimSpace(canonical.BSUID)
+		canonicalContacts[canonical.ID] = canonical
 	}
 	items := identityReviewCandidateMapSlice(reasons)
 	directOwners := make([]uuid.UUID, 0, len(items))
-	routable := make(map[uuid.UUID]bool, len(items))
+	selectorOnly := make([]uuid.UUID, 0, len(items))
 	for _, item := range items {
 		if item.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID) {
 			directOwners = append(directOwners, item.ContactID)
+		} else if canonicalContacts[item.ContactID] != nil {
+			selectorOnly = append(selectorOnly, item.ContactID)
 		}
-		routable[item.ContactID] = identityReviewMemberRoutable(item, canonicalBSUIDs, claim)
+	}
+	otherUsers, err := identityReviewMembersOfOtherUsers(tx, claim, selectorOnly, canonicalContacts)
+	if err != nil {
+		return identityReviewCandidateSet{}, err
+	}
+	// A direct-BSUID owner (possibly through a merge alias) is the principal's
+	// own contact. Any other member is routable only while nothing ties its
+	// canonical family to a different WhatsApp user.
+	routable := make(map[uuid.UUID]bool, len(items))
+	for _, item := range items {
+		routable[item.ContactID] = item.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID) ||
+			(canonicalContacts[item.ContactID] != nil && !otherUsers[item.ContactID])
 	}
 	// The authenticated direct BSUID is the routing principal even before any
 	// contact owns it, so a phone or parent match is still a decidable review.
@@ -1011,24 +1038,154 @@ func enumerateWhatsAppIdentityReviewCandidates(
 	}, nil
 }
 
-// identityReviewMemberRoutable reports whether a decision may route the
-// claim's principal to this member. A direct-BSUID owner (possibly through a
-// merge alias) is the principal's own contact. Any other member qualifies
-// only while its canonical contact carries no BSUID or the claim's parent
-// BSUID; a different BSUID means the phone or parent now names someone else.
-func identityReviewMemberRoutable(
-	item WhatsAppIdentityReviewCandidate,
-	canonicalBSUIDs map[uuid.UUID]string,
+// identityReviewMembersOfOtherUsers marks the canonical contacts whose family
+// already belongs to a WhatsApp user other than the claim's principal:
+//
+//   - the canonical contact, or any contact merged into it (directly or
+//     through a chain), carries a BSUID other than the claim's direct or
+//     parent BSUID;
+//   - its stored Coexistence identity names another user or records an
+//     unresolved identity conflict (coexistenceIdentityMetadataNamesAnotherUser);
+//   - a reviewer already routed a different direct BSUID to it in this
+//     account's onboarding cycle.
+//
+// Routing the claim's principal to such a contact would put two WhatsApp
+// users behind one contact, as a recycled phone number does.
+func identityReviewMembersOfOtherUsers(
+	db *gorm.DB,
 	claim WhatsAppIdentityReviewClaim,
-) bool {
-	if item.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID) {
-		return true
+	contactIDs []uuid.UUID,
+	canonical map[uuid.UUID]*models.Contact,
+) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(contactIDs))
+	if len(contactIDs) == 0 {
+		return result, nil
 	}
-	bsuid, resolved := canonicalBSUIDs[item.ContactID]
-	if !resolved {
-		return false
+	allowed := identityReviewClaimBSUIDs(claim)
+	for _, contactID := range contactIDs {
+		contact := canonical[contactID]
+		if contact == nil {
+			result[contactID] = true
+			continue
+		}
+		if bsuid := strings.TrimSpace(contact.BSUID); bsuid != "" && !containsIdentityReviewBSUID(allowed, bsuid) {
+			result[contactID] = true
+			continue
+		}
+		if coexistenceIdentityMetadataNamesAnotherUser(contact, claim.DirectPrimaryBSUID, claim.ParentBSUID) {
+			result[contactID] = true
+		}
 	}
-	return bsuid == "" || bsuid == claim.DirectPrimaryBSUID || (claim.ParentBSUID != "" && bsuid == claim.ParentBSUID)
+	families, err := contactFamiliesWithForeignBSUID(db, claim.OrganizationID, contactIDs, allowed)
+	if err != nil {
+		return nil, err
+	}
+	for contactID := range families {
+		result[contactID] = true
+	}
+	var decidedForOthers []uuid.UUID
+	if err := db.Model(&models.WhatsAppIdentityReviewHold{}).
+		Where(`organization_id = ? AND whats_app_account_id = ? AND onboarding_cycle = ?
+			AND disposition = ? AND direct_primary_bsuid <> ? AND decision_target_contact_id IN ?`,
+			claim.OrganizationID, claim.WhatsAppAccountID, claim.OnboardingCycle,
+			models.WhatsAppIdentityReviewDispositionFutureRouting, claim.DirectPrimaryBSUID, contactIDs).
+		Pluck("decision_target_contact_id", &decidedForOthers).Error; err != nil {
+		return nil, fmt.Errorf("read identity-review decisions for other principals: %w", err)
+	}
+	for _, contactID := range decidedForOthers {
+		result[contactID] = true
+	}
+	return result, nil
+}
+
+// contactFamiliesWithForeignBSUID returns the canonical contacts that have a
+// contact merged into them (directly or through a chain) carrying a BSUID
+// outside allowed.
+func contactFamiliesWithForeignBSUID(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	canonicalIDs []uuid.UUID,
+	allowed []string,
+) (map[uuid.UUID]bool, error) {
+	result := make(map[uuid.UUID]bool, len(canonicalIDs))
+	if len(canonicalIDs) == 0 {
+		return result, nil
+	}
+	if len(allowed) == 0 {
+		allowed = []string{""}
+	}
+	var roots []uuid.UUID
+	if err := db.Raw(`WITH RECURSIVE family(root_id, id, depth) AS (
+			SELECT alias.merged_into_id, alias.id, 1
+			FROM contacts AS alias
+			WHERE alias.organization_id = ? AND alias.merged_into_id IN ?
+			UNION ALL
+			SELECT family.root_id, alias.id, family.depth + 1
+			FROM contacts AS alias
+			JOIN family ON alias.merged_into_id = family.id
+			WHERE alias.organization_id = ? AND family.depth < 16
+		)
+		SELECT DISTINCT family.root_id
+		FROM family
+		JOIN contacts AS member ON member.organization_id = ? AND member.id = family.id
+		WHERE COALESCE(BTRIM(member.bs_uid), '') <> '' AND BTRIM(member.bs_uid) NOT IN ?`,
+		organizationID, canonicalIDs, organizationID, organizationID, allowed,
+	).Scan(&roots).Error; err != nil {
+		return nil, fmt.Errorf("read merged contact BSUIDs: %w", err)
+	}
+	for _, root := range roots {
+		result[root] = true
+	}
+	return result, nil
+}
+
+// coexistenceIdentityMetadataNamesAnotherUser reports whether a contact's
+// stored Coexistence identity names a WhatsApp user other than direct/parent,
+// or records an unresolved identity conflict or BSUID reconciliation.
+func coexistenceIdentityMetadataNamesAnotherUser(contact *models.Contact, direct, parent string) bool {
+	direct, parent = strings.TrimSpace(direct), strings.TrimSpace(parent)
+	for _, key := range []string{
+		"coexistence_conflicting_user_id",
+		"coexistence_phone_conflict",
+		"coexistence_reconciled_contact_id",
+	} {
+		if _, present := contact.Metadata[key]; present {
+			return true
+		}
+	}
+	if stored, present := contact.Metadata["coexistence_user_id"]; present {
+		value, _ := stored.(string)
+		if value = strings.TrimSpace(value); value != "" && value != direct && (parent == "" || value != parent) {
+			return true
+		}
+	}
+	if stored, present := contact.Metadata["coexistence_parent_user_id"]; present {
+		value, _ := stored.(string)
+		if value = strings.TrimSpace(value); value != "" && value != parent {
+			return true
+		}
+	}
+	return false
+}
+
+func identityReviewClaimBSUIDs(claim WhatsAppIdentityReviewClaim) []string {
+	allowed := make([]string, 0, 2)
+	if direct := strings.TrimSpace(claim.DirectPrimaryBSUID); direct != "" {
+		allowed = append(allowed, direct)
+	}
+	if parent := strings.TrimSpace(claim.ParentBSUID); parent != "" {
+		allowed = append(allowed, parent)
+	}
+	return allowed
+}
+
+func containsIdentityReviewBSUID(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 func identityReviewRoutableContactIDs(candidates identityReviewCandidateSet) []uuid.UUID {
@@ -1236,9 +1393,11 @@ func identityReviewDirectRouteAllowed(items []WhatsAppIdentityReviewCandidate, d
 // identityReviewDecisionCoversOwnerDrift reports whether a future-routing
 // decision still covers a changed complete set: the only change is that the
 // decided target now also owns the direct BSUID and is its unique owner, as
-// happens once a Business app reply teaches that contact the principal. Every
-// other member and reason bit, and the claim's parent BSUID and phone, are
-// unchanged, so no new person entered the review.
+// happens once a Business app reply teaches that contact the principal. When
+// that reply also carried the parent BSUID the contact used to hold, the
+// target's parent bit is replaced by the direct bit. Every other member and
+// reason bit, and the claim's parent BSUID and phone, are unchanged, so no new
+// person entered the review.
 func identityReviewDecisionCoversOwnerDrift(
 	latest *models.WhatsAppIdentityReviewHold,
 	decided []WhatsAppIdentityReviewCandidate,
@@ -1254,6 +1413,7 @@ func identityReviewDecisionCoversOwnerDrift(
 	}
 	target := *latest.DecisionTargetContactID
 	primary := models.WhatsAppIdentityReviewSelectorPrimaryBSUID
+	parent := models.WhatsAppIdentityReviewSelectorParentBSUID
 	gained := false
 	for index := range current.items {
 		before, after := decided[index], current.items[index]
@@ -1261,7 +1421,8 @@ func identityReviewDecisionCoversOwnerDrift(
 			return false
 		}
 		if after.ContactID == target && !before.SelectorReasons.Has(primary) &&
-			after.SelectorReasons == before.SelectorReasons|primary {
+			(after.SelectorReasons == before.SelectorReasons|primary ||
+				(before.SelectorReasons.Has(parent) && after.SelectorReasons == (before.SelectorReasons&^parent)|primary)) {
 			gained = true
 			continue
 		}
