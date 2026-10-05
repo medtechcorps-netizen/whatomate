@@ -1754,58 +1754,81 @@ func (a *App) SendReaction(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 	}
 
-	// Parse existing reactions from Metadata
-	var metadata map[string]any
-	if message.Metadata != nil {
-		metadata = message.Metadata
-	} else {
-		metadata = make(map[string]any)
-	}
-
-	// Get or initialize reactions array
 	type Reaction struct {
 		Emoji     string `json:"emoji"`
 		FromPhone string `json:"from_phone,omitempty"`
 		FromUser  string `json:"from_user,omitempty"`
 	}
-	var reactions []Reaction
-	if reactionsRaw, ok := metadata["reactions"]; ok {
-		if reactionsArray, ok := reactionsRaw.([]any); ok {
-			for _, r := range reactionsArray {
-				if rMap, ok := r.(map[string]any); ok {
-					emoji, _ := rMap["emoji"].(string)
-					fromPhone, _ := rMap["from_phone"].(string)
-					fromUser, _ := rMap["from_user"].(string)
-					reactions = append(reactions, Reaction{
-						Emoji:     emoji,
-						FromPhone: fromPhone,
-						FromUser:  fromUser,
-					})
+	var newReactions []Reaction
+	// The reactions are read and written back under the message's row lock,
+	// in a transaction (a savepoint inside a request's tenant transaction).
+	// The metadata also holds what other writers keep there under the same
+	// lock: a customer's reactions and their replay record
+	// (incomingReactionEventsMetadataKey) and the WAMIDs of earlier reactions
+	// sent from here (sentReactionWAMIDsMetadataKey). Rewriting a copy read
+	// before such a write committed would drop it.
+	if err := a.DB.Transaction(func(tx *gorm.DB) error {
+		var locked models.Message
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND contact_id = ?", messageID, contactID).
+			First(&locked).Error; err != nil {
+			return err
+		}
+
+		// Parse existing reactions from Metadata
+		var metadata map[string]any
+		if locked.Metadata != nil {
+			metadata = locked.Metadata
+		} else {
+			metadata = make(map[string]any)
+		}
+
+		// Get or initialize reactions array
+		var reactions []Reaction
+		if reactionsRaw, ok := metadata["reactions"]; ok {
+			if reactionsArray, ok := reactionsRaw.([]any); ok {
+				for _, r := range reactionsArray {
+					if rMap, ok := r.(map[string]any); ok {
+						emoji, _ := rMap["emoji"].(string)
+						fromPhone, _ := rMap["from_phone"].(string)
+						fromUser, _ := rMap["from_user"].(string)
+						reactions = append(reactions, Reaction{
+							Emoji:     emoji,
+							FromPhone: fromPhone,
+							FromUser:  fromUser,
+						})
+					}
 				}
 			}
 		}
-	}
 
-	// Remove existing reaction from this user (each user can only have one reaction)
-	userIDStr := userID.String()
-	var newReactions []Reaction
-	for _, r := range reactions {
-		if r.FromUser != userIDStr {
-			newReactions = append(newReactions, r)
+		// Remove existing reaction from this user (each user can only have one reaction)
+		userIDStr := userID.String()
+		for _, r := range reactions {
+			if r.FromUser != userIDStr {
+				newReactions = append(newReactions, r)
+			}
 		}
-	}
 
-	// Add new reaction if emoji is not empty
-	if req.Emoji != "" {
-		newReactions = append(newReactions, Reaction{
-			Emoji:    req.Emoji,
-			FromUser: userIDStr,
-		})
-	}
+		// Add new reaction if emoji is not empty
+		if req.Emoji != "" {
+			newReactions = append(newReactions, Reaction{
+				Emoji:    req.Emoji,
+				FromUser: userIDStr,
+			})
+		}
 
-	// Update metadata
-	metadata["reactions"] = newReactions
-	if err := a.DB.Model(&message).Update("metadata", metadata).Error; err != nil {
+		// Update metadata
+		metadata["reactions"] = newReactions
+		if err := tx.Model(&locked).Update("metadata", metadata).Error; err != nil {
+			return err
+		}
+		message = locked
+		return nil
+	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Message not found", nil, "")
+		}
 		a.Log.Error("Failed to update message reactions", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update reaction", nil, "")
 	}
