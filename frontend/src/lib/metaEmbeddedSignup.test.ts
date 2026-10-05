@@ -993,10 +993,13 @@ describe("normalizeCoexistencePhoneNumber", () => {
     ["60123456789", "60123456789"],
     ["+60123456789", "60123456789"],
     [" +60 12-345 6789 ", "60123456789"],
+    ["+6012-345 6789", "60123456789"],
+    ["+60 11-2345 6789", "601123456789"],
     ["+1 (631) 555.0100", "16315550100"],
     ["(60) 12 345 6789", "60123456789"],
     ["+6831234", "6831234"],
-    ["+123456789012345", "123456789012345"],
+    ["+49 1234 567890123", "491234567890123"],
+    ["+44 20 7946 0000", "442079460000"],
   ])("accepts %j as %s", (value, digits) => {
     expect(normalizeCoexistencePhoneNumber(value)).toEqual({ digits });
   });
@@ -1013,11 +1016,72 @@ describe("normalizeCoexistencePhoneNumber", () => {
     ["+6O123456789", "invalid"],
     ["+60123456789 ext 2", "invalid"],
     ["+60/123456789", "invalid"],
-    ["\uff16\uff10123456789", "invalid"],
+    ["+60_123456789", "invalid"],
+    ["+60\u0009123456789", "invalid"],
     ["1 ".repeat(17), "invalid"],
     ["tel:+60123456789", "invalid"],
     ["+ - ( )", "invalid"],
+    // A Malaysian number that keeps its trunk 0 after +60 matches nothing.
+    ["+60 012-345 6789", "zero_after_country_code"],
+    ["+60 (0) 12 345 6789", "zero_after_country_code"],
+    ["60 011-2345 6789", "zero_after_country_code"],
+    ["+600", "zero_after_country_code"],
+    // A number starting with 1 must be an 11-digit US or Canada number;
+    // these are Malaysian mobile numbers typed without 0 and without +60.
+    ["12-345 6789", "us_canada_length"],
+    ["11-2345 6789", "us_canada_length"],
+    ["+1 631 555 01000", "us_canada_length"],
+    ["+123456789012345", "us_canada_length"],
   ])("refuses %j as %s", (value, problem) => {
+    expect(normalizeCoexistencePhoneNumber(value)).toEqual({ problem });
+  });
+
+  // Only the browser folds what a phone or contacts app adds when a number
+  // is copied; only ASCII digits are sent, so the server's rules stay strict.
+  it.each([
+    ["no-break spaces", "+60\u00a012-345\u00a06789"],
+    ["narrow no-break and thin spaces", "+60\u202f12-345\u20096789"],
+    ["bidi embedding marks", "\u202a+60 12-345 6789\u202c"],
+    ["bidi isolates", "\u2066+60 12-345 6789\u2069"],
+    ["a byte order mark", "\ufeff+60 12-345 6789"],
+    ["zero-width spaces", "+60\u200b 12-345\u200b 6789"],
+    ["a left-to-right mark", "\u200e+60 12-345 6789"],
+    ["a soft hyphen", "+60 12\u00ad-345 6789"],
+    ["non-breaking hyphens", "+60 12\u2011345\u20116789"],
+    ["en and em dashes", "+60 12\u2013345\u20146789"],
+    ["a minus sign", "+60 12\u2212345 6789"],
+    ["full-width digits", "\uff0b\uff16\uff10 \uff11\uff12-345 6789"],
+    ["full-width parentheses", "\uff0860\uff09 12\uff0e345 6789"],
+    [
+      "Arabic-Indic digits",
+      "+\u0666\u0660 \u0661\u0662-\u0663\u0664\u0665 \u0666\u0667\u0668\u0669",
+    ],
+    [
+      "Extended Arabic-Indic digits",
+      "+\u06f6\u06f0 \u06f1\u06f2-\u06f3\u06f4\u06f5 \u06f6\u06f7\u06f8\u06f9",
+    ],
+  ])("accepts a pasted number with %s", (_, value) => {
+    expect(normalizeCoexistencePhoneNumber(value)).toEqual({
+      digits: "60123456789",
+    });
+  });
+
+  it.each([
+    ["only invisible marks", "\u200b\u202a\u202c", "empty"],
+    [
+      "a kept 0 behind bidi marks",
+      "\u202a012-345 6789\u202c",
+      "missing_country_code",
+    ],
+    [
+      "a kept 0 after +60 with a no-break space",
+      "+60\u00a0012 345 6789",
+      "zero_after_country_code",
+    ],
+    ["trailing text after folding", "+60\u00a012-345 6789 ext", "invalid"],
+    ["a circled digit", "+60 12-345 678\u2468", "invalid"],
+    ["a superscript digit", "+60 12-345 678\u2079", "invalid"],
+  ])("still refuses a pasted number with %s", (_, value, problem) => {
     expect(normalizeCoexistencePhoneNumber(value)).toEqual({ problem });
   });
 });

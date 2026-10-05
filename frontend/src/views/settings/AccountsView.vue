@@ -184,7 +184,20 @@ const coexistencePhoneNumberError = computed(() => {
   if (problem === "missing_country_code") {
     return t("accounts.coexistenceNumberMissingCountryCode");
   }
+  if (problem === "zero_after_country_code") {
+    return t("accounts.coexistenceNumberZeroAfterCountryCode");
+  }
+  if (problem === "us_canada_length") {
+    return t("accounts.coexistenceNumberUsCanadaLength");
+  }
   return t("accounts.coexistenceNumberInvalid");
+});
+// The digits that will be matched, shown back as +digits so a missing or
+// wrong country code is visible before Meta's login opens.
+const coexistencePhoneNumberPreview = computed(() => {
+  if (coexistenceReconnectAccount.value) return "";
+  const digits = coexistencePhoneNumberResult.value.digits;
+  return digits ? `+${digits}` : "";
 });
 const breadcrumbs = computed(() => [
   { label: t("nav.settings"), href: "/settings" },
@@ -1256,7 +1269,7 @@ async function confirmDelete() {
                   ? 'border-red-500/70 light:border-red-500'
                   : undefined
               "
-              aria-describedby="coexistence-phone-number-help coexistence-phone-number-error"
+              aria-describedby="coexistence-phone-number-help coexistence-phone-number-preview coexistence-phone-number-error"
               @blur="coexistencePhoneNumberTouched = true"
             />
             <p
@@ -1264,6 +1277,16 @@ async function confirmDelete() {
               class="text-xs leading-relaxed text-gray-400 light:text-gray-600"
             >
               {{ $t("accounts.coexistenceNumberHelp") }}
+            </p>
+            <p
+              v-if="coexistencePhoneNumberPreview"
+              id="coexistence-phone-number-preview"
+              class="text-xs text-gray-300 light:text-gray-700"
+            >
+              {{ $t("accounts.coexistenceNumberPreview") }}
+              <span dir="ltr" class="font-mono font-medium">{{
+                coexistencePhoneNumberPreview
+              }}</span>
             </p>
             <p
               id="coexistence-phone-number-error"

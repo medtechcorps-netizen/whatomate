@@ -62,25 +62,71 @@ interface MetaEmbeddedSignupSessionOptions {
 }
 
 // The operator's number for a Coexistence signup, as E.164 digits. The rules
-// match the server's: digits with spaces, hyphens, dots, parentheses and one
-// leading +; 7 to 15 digits; a country code never starts with 0.
+// match the server's normalizeEmbeddedSignupPhoneNumberHint: digits with
+// spaces, hyphens, dots, parentheses and one leading +; 7 to 15 digits; a
+// country code never starts with 0; no Malaysian number has a 0 after +60
+// (country codes are prefix-free, so 60 is only Malaysia); and a number
+// starting with 1 is a US or Canada number, which always has 11 digits.
+// Only the browser folds pasted look-alike characters first (see
+// foldPastedPhoneNumber); the server then receives ASCII digits only.
 const COEXISTENCE_PHONE_NUMBER_MAX_LENGTH = 32;
 const COEXISTENCE_PHONE_NUMBER_MIN_DIGITS = 7;
 const COEXISTENCE_PHONE_NUMBER_MAX_DIGITS = 15;
+const MALAYSIA_TRUNK_ZERO_PREFIX = "600";
+const NANP_DIGITS = 11;
 
 export type CoexistencePhoneNumberProblem =
   | "empty"
   | "missing_country_code"
+  | "zero_after_country_code"
+  | "us_canada_length"
   | "invalid";
 
 export type CoexistencePhoneNumber =
   | { digits: string; problem?: undefined }
   | { digits?: undefined; problem: CoexistencePhoneNumberProblem };
 
+// Look-alike digits a phone keyboard or contacts app may produce: full-width
+// (U+FF10), Arabic-Indic (U+0660) and Extended Arabic-Indic (U+06F0).
+const PHONE_DIGIT_ZEROS = [0xff10, 0x0660, 0x06f0];
+const PHONE_LOOKALIKE_PUNCTUATION: Record<string, string> = {
+  "\uff0b": "+", // full-width plus
+  "\uff08": "(",
+  "\uff09": ")",
+  "\uff0e": ".",
+  "\u2212": "-", // minus sign
+};
+
+// Numbers copied from a phone or contacts app can carry invisible format
+// characters (bidi marks such as U+202A/U+202C, zero-width spaces, a BOM),
+// no-break or thin spaces, typographic dashes and look-alike digits. They
+// look correct, so refusing them as "invalid" would confuse the operator.
+// Only the resulting ASCII digits ever leave the browser, so folding them
+// here never widens what the server accepts.
+function foldPastedPhoneNumber(value: string): string {
+  let folded = "";
+  for (const character of value.replace(/\p{Cf}/gu, "")) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    const zero = PHONE_DIGIT_ZEROS.find(
+      (start) => codePoint >= start && codePoint <= start + 9,
+    );
+    if (zero !== undefined) {
+      folded += String(codePoint - zero);
+    } else if (/\p{Zs}/u.test(character)) {
+      folded += " ";
+    } else if (/\p{Pd}/u.test(character)) {
+      folded += "-";
+    } else {
+      folded += PHONE_LOOKALIKE_PUNCTUATION[character] ?? character;
+    }
+  }
+  return folded;
+}
+
 export function normalizeCoexistencePhoneNumber(
   value: string,
 ): CoexistencePhoneNumber {
-  const trimmed = value.trim();
+  const trimmed = foldPastedPhoneNumber(value).trim();
   if (!trimmed) return { problem: "empty" };
   if (trimmed.length > COEXISTENCE_PHONE_NUMBER_MAX_LENGTH) {
     return { problem: "invalid" };
@@ -97,11 +143,17 @@ export function normalizeCoexistencePhoneNumber(
     }
   }
   if (digits.startsWith("0")) return { problem: "missing_country_code" };
+  if (digits.startsWith(MALAYSIA_TRUNK_ZERO_PREFIX)) {
+    return { problem: "zero_after_country_code" };
+  }
   if (
     digits.length < COEXISTENCE_PHONE_NUMBER_MIN_DIGITS ||
     digits.length > COEXISTENCE_PHONE_NUMBER_MAX_DIGITS
   ) {
     return { problem: "invalid" };
+  }
+  if (digits.startsWith("1") && digits.length !== NANP_DIGITS) {
+    return { problem: "us_canada_length" };
   }
   return { digits };
 }

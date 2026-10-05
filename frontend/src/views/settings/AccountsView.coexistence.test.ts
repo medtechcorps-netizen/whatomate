@@ -225,6 +225,9 @@ describe("AccountsView Coexistence number step", () => {
   it.each([
     ["", "accounts.coexistenceNumberRequired"],
     ["012-345 6789", "accounts.coexistenceNumberMissingCountryCode"],
+    ["+60 012-345 6789", "accounts.coexistenceNumberZeroAfterCountryCode"],
+    ["+60 (0)12-345 6789", "accounts.coexistenceNumberZeroAfterCountryCode"],
+    ["12-345 6789", "accounts.coexistenceNumberUsCanadaLength"],
     ["+60 12 34", "accounts.coexistenceNumberInvalid"],
     ["+60 12-345-6789 x2", "accounts.coexistenceNumberInvalid"],
   ])(
@@ -379,5 +382,47 @@ describe("AccountsView Coexistence number step", () => {
         .value,
     ).toBe("");
     expect(mocks.login).not.toHaveBeenCalled();
+  });
+
+  it("shows the digits it will match and sends a pasted number as ASCII digits", async () => {
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    const input = view.get("#coexistence-phone-number");
+    expect(view.find("#coexistence-phone-number-preview").exists()).toBe(false);
+
+    // A kept 0 after +60 shows the fix, not a preview.
+    await input.setValue("+60 012-345 6789");
+    expect(view.find("#coexistence-phone-number-preview").exists()).toBe(false);
+
+    // Copied from a contacts app: bidi marks, no-break spaces and a
+    // non-breaking hyphen around an otherwise valid number.
+    await input.setValue("\u202a+60\u00a012\u2011345\u00a06789\u202c");
+    const preview = view.get("#coexistence-phone-number-preview");
+    expect(preview.text()).toContain("accounts.coexistenceNumberPreview");
+    expect(preview.text()).toContain("+60123456789");
+    expect(preview.get("span").attributes("dir")).toBe("ltr");
+    expect(input.attributes("aria-describedby")).toContain(
+      "coexistence-phone-number-preview",
+    );
+    expect(view.get("#coexistence-phone-number-error").text()).toBe("");
+
+    await view.get("form").trigger("submit");
+    const { callback } = lastLogin();
+    finishMessage(
+      { waba_id: "1000000000000004" },
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+    );
+    callback({ authResponse: { code: "review-safe-code" } });
+    await flushPromises();
+
+    expect(exchangeBodies()).toEqual([
+      {
+        code: "review-safe-code",
+        signup_mode: "coexistence",
+        phone_id: undefined,
+        waba_id: "1000000000000004",
+        phone_number_hint: "60123456789",
+      },
+    ]);
   });
 });
