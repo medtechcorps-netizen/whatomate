@@ -21,6 +21,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
 	"github.com/shridarpatil/whatomate/internal/websocket"
+	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
@@ -935,7 +936,7 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 			// produces a Message (a call permission request or a reaction) can
 			// never gain an owner. Its status is acknowledged at once, on both
 			// account kinds and at any age, without any write.
-			source, sourceErr := scoped.whatsAppStatusNonMessageSend(&account, messageID, status.RecipientID)
+			source, sourceErr := scoped.whatsAppStatusNonMessageSend(&account, messageID, status.RecipientID, whatsAppReactionStatusSearchFrom(status, time.Now()))
 			if sourceErr != nil {
 				return fmt.Errorf("check WhatsApp status non-message send: %w", sourceErr)
 			}
@@ -990,7 +991,7 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 			}
 			switch {
 			case !orphanTimestampUsable:
-				// Meta stamps every status, so a missing, malformed or
+				// Meta stamps every status, so a missing, malformed, tiny or
 				// far-future timestamp is an anomaly rather than an expected
 				// wait: such a status can never settle and is retried for
 				// Meta's whole retry window.
@@ -1115,6 +1116,37 @@ const (
 	whatsAppNonMessageSendReaction       = "reaction"
 )
 
+// whatsAppReactionStatusLookback bounds the reacted-to messages searched for
+// the WAMID of a reaction whose status is not a failure. Meta delivers a
+// reaction only to a message at most 30 days old, so such a status names a
+// message created at most 30 days before it; a week more absorbs a message
+// row created before its send, and clock differences between Meta and the
+// database.
+const whatsAppReactionStatusLookback = 37 * 24 * time.Hour
+
+// whatsAppStatusRetryHorizon is how long Meta keeps retrying an
+// unacknowledged webhook POST. A status without a usable timestamp may be
+// that old.
+const whatsAppStatusRetryHorizon = 7 * 24 * time.Hour
+
+// whatsAppReactionStatusSearchFrom is the earliest created_at of a message
+// whose sentReactionWAMIDsMetadataKey can hold the WAMID of status: the
+// status's own time (or, without a usable timestamp, now less Meta's retry
+// horizon) less whatsAppReactionStatusLookback. A failed status gets the zero
+// time, so every message of the contact is searched: Meta accepts a reaction
+// to an older message and reports the failure only in its status.
+func whatsAppReactionStatusSearchFrom(status WebhookStatus, now time.Time) time.Time {
+	if strings.EqualFold(strings.TrimSpace(status.Status), "failed") || len(status.Errors) > 0 {
+		return time.Time{}
+	}
+	statusAt := now.Add(-whatsAppStatusRetryHorizon)
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(status.Timestamp), 10, 64); err == nil &&
+		usableWhatsAppEventUnix(seconds, now) != 0 {
+		statusAt = time.Unix(seconds, 0)
+	}
+	return statusAt.Add(-whatsAppReactionStatusLookback)
+}
+
 // whatsAppStatusNonMessageSend reports which ReReply send that never produces
 // a Message owns wamid, or "" when none is recorded in the tenant: a call
 // permission request (CallPermission.MessageID, any account of the tenant,
@@ -1124,8 +1156,12 @@ const (
 // reaction whose recipient carries no phone number, or whose contact stores a
 // different form of it, is not recognised here and falls back to the grace
 // windows. Both lookups use existing indexes: call_permissions by
-// organization, messages by contact.
-func (a *App) whatsAppStatusNonMessageSend(account *models.WhatsAppAccount, wamid, recipientID string) (string, error) {
+// organization, and messages by contact and, unless reactedSince is zero,
+// created_at (idx_messages_contact_created): only messages created at or
+// after reactedSince (whatsAppReactionStatusSearchFrom) are searched, so that
+// a status still waiting for its Message does not scan a contact's whole
+// history on every retry.
+func (a *App) whatsAppStatusNonMessageSend(account *models.WhatsAppAccount, wamid, recipientID string, reactedSince time.Time) (string, error) {
 	wamid = strings.TrimSpace(wamid)
 	if a == nil || a.DB == nil || account == nil || account.OrganizationID == uuid.Nil || wamid == "" {
 		return "", errors.New("WhatsApp status non-message send lookup is incomplete")
@@ -1148,13 +1184,17 @@ func (a *App) whatsAppStatusNonMessageSend(account *models.WhatsAppAccount, wami
 	if err != nil {
 		return "", err
 	}
-	var reactions int64
-	if err := a.DB.Unscoped().Model(&models.Message{}).Where(
+	query := a.DB.Unscoped().Model(&models.Message{}).Where(
 		`organization_id = ? AND contact_id IN (
 			SELECT id FROM contacts WHERE organization_id = ? AND phone_number IN ?
 		) AND COALESCE(metadata, '{}'::jsonb) @> ?::jsonb`,
 		account.OrganizationID, account.OrganizationID, []string{recipient, "+" + recipient}, string(marker),
-	).Count(&reactions).Error; err != nil {
+	)
+	if !reactedSince.IsZero() {
+		query = query.Where("created_at >= ?", reactedSince)
+	}
+	var reactions int64
+	if err := query.Count(&reactions).Error; err != nil {
 		return "", fmt.Errorf("find reaction WAMID: %w", err)
 	}
 	if reactions > 0 {
@@ -1187,13 +1227,15 @@ func usableWhatsAppEventUnix(unix int64, now time.Time) int64 {
 
 // whatsAppOrphanStatusAge reports the age of a status event, whether its
 // timestamp is usable, and whether it is past whatsAppOrphanStatusGrace. A
-// missing, malformed, zero or future timestamp is never settled, so such a
-// status keeps the retry contract; one that is missing, malformed, zero or
-// more than whatsAppStatusClockSkew in the future (for example milliseconds
-// read as seconds) is also reported as unusable.
+// missing, malformed, zero, tiny or future timestamp is never settled, so such
+// a status keeps the retry contract; one that is missing, malformed, below
+// whatsAppEventUnixFloor (a tiny value, which would otherwise read as decades
+// old) or more than whatsAppStatusClockSkew in the future (for example
+// milliseconds read as seconds) is also reported as unusable, as
+// usableWhatsAppEventUnix rejects it.
 func whatsAppOrphanStatusAge(rawTimestamp string, now time.Time) (age time.Duration, usable, settled bool) {
 	seconds, err := strconv.ParseInt(strings.TrimSpace(rawTimestamp), 10, 64)
-	if err != nil || seconds <= 0 {
+	if err != nil || seconds < whatsAppEventUnixFloor {
 		return 0, false, false
 	}
 	age = now.Sub(time.Unix(seconds, 0))
@@ -1586,16 +1628,18 @@ func (a *App) broadcastCampaignStatusProjection(campaign models.BulkMessageCampa
 
 // templateReviewDecisionTolerance is how much older than a PENDING
 // template's updated_at a review decision (APPROVED or REJECTED) may be
-// stamped and still be applied. updated_at is written by local saves on the
-// server's clock, not only by Meta's events: Meta may decide while the create
-// call is still returning, so its decision can carry an earlier second than
-// the local PENDING save that follows, and editing a PENDING template (which
-// keeps its status) moves updated_at too. A decision on an earlier version can
-// only reach a PENDING template again after a person edited and resubmitted
-// it, so inside this window such a replay is unlikely; outside it a decision
-// older than the stored state is still skipped (logged at Warn when the
-// stored status differs; a template Sync from Meta corrects it).
-const templateReviewDecisionTolerance = 5 * time.Minute
+// stamped and still be applied directly. It covers the submit race only: Meta
+// may decide while the create or edit call is still returning (bounded by
+// whatsapp.DefaultTimeout, 30s), so its decision can carry an earlier second
+// than the PENDING save that SubmitTemplate makes afterwards; the rest absorbs
+// processing time and clock differences. The window is kept that short
+// because a replayed decision on the previous version of a template finds the
+// template PENDING again once it has been resubmitted: inside this window such
+// a replay is applied (Meta's next decision corrects it), outside it it is
+// skipped. Any other decision older than the stored template, for example one
+// delayed past a local edit of a PENDING template, is skipped and checked
+// against Meta's current status (handleSkippedTemplateStatusUpdate).
+const templateReviewDecisionTolerance = time.Minute
 
 // processTemplateStatusUpdate updates template status when Meta sends a status
 // update webhook. eventUnix is the entry's time, the time of the event; a
@@ -1606,7 +1650,11 @@ const templateReviewDecisionTolerance = 5 * time.Minute
 // PENDING template, at most templateReviewDecisionTolerance after the event,
 // and then moves updated_at forward to the event's second if it is earlier: a
 // replayed or older event never overwrites the status that a newer event, a
-// local edit or submission, or a sync from Meta has already set. Without a
+// local edit or submission, or a sync from Meta has already set. updated_at is
+// the server's clock for local writes and Meta's for events, so a genuine
+// event can also be skipped, when it arrives after a later local write; a
+// skipped event whose status differs from the stored one is therefore checked
+// against Meta's current status (handleSkippedTemplateStatusUpdate). Without a
 // usable time (0, or one usableWhatsAppEventUnix rejects) the update applies
 // as before.
 func (a *App) processTemplateStatusUpdate(wabaID string, eventUnix int64, event, templateName, templateLanguage, reason string) {
@@ -1703,31 +1751,41 @@ func (a *App) processTemplateStatusUpdate(wabaID string, eventUnix int64, event,
 				"reason", reason,
 			)
 		} else if eventUnix > 0 {
-			a.logSkippedTemplateStatusUpdate(templateRow(), account.Name, templateName, templateLanguage, status, eventUnix)
+			a.handleSkippedTemplateStatusUpdate(templateRow(), account, templateName, templateLanguage, status, eventUnix)
 		}
 	}
 }
 
-// logSkippedTemplateStatusUpdate logs a template status event that the order
-// check did not apply. A replay of the stored status is routine (Info). A
-// different status is either an older event (a replay after a newer one) or a
-// genuine event whose delivery was delayed past a local save of the template;
-// Warn makes the second case visible, and a template Sync corrects it.
-func (a *App) logSkippedTemplateStatusUpdate(templateRow *gorm.DB, accountName, templateName, templateLanguage, status string, eventUnix int64) {
-	var stored struct {
-		Status    string
-		UpdatedAt time.Time
-	}
-	if err := templateRow.Select("status", "updated_at").Take(&stored).Error; err != nil {
+// skippedTemplateState is the stored state of a template whose status event
+// the order check skipped.
+type skippedTemplateState struct {
+	Status         string
+	UpdatedAt      time.Time
+	MetaTemplateID string
+}
+
+// handleSkippedTemplateStatusUpdate handles a template status event that the
+// order check did not apply. A replay of the stored status is routine (Info).
+// A different status is either an older event (a replay after a newer one) or
+// a genuine event that arrived after a later local write of the template: a
+// template Sync whose read from Meta preceded the event, an edit made while
+// the event was in flight or deferred, or a server clock running ahead of
+// Meta's. It is logged at Warn, and once the tenant work has committed the
+// template's current status is read from Meta and stored if it still differs
+// (refreshTemplateStatusFromMeta), so that the second case corrects itself
+// without a Sync; for a replay, Meta confirms the stored status.
+func (a *App) handleSkippedTemplateStatusUpdate(templateRow *gorm.DB, account models.WhatsAppAccount, templateName, templateLanguage, status string, eventUnix int64) {
+	var stored skippedTemplateState
+	if err := templateRow.Select("status", "updated_at", "meta_template_id").Take(&stored).Error; err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			a.Log.Error("Failed to read template after a skipped status update",
-				"error", err, "account", accountName, "template", templateName, "language", templateLanguage)
+				"error", err, "account", account.Name, "template", templateName, "language", templateLanguage)
 		}
 		return
 	}
 	if stored.Status == status {
 		a.Log.Info("Template status update not applied: not newer than its stored state",
-			"account", accountName,
+			"account", account.Name,
 			"template", templateName,
 			"language", templateLanguage,
 			"status", status,
@@ -1735,8 +1793,8 @@ func (a *App) logSkippedTemplateStatusUpdate(templateRow *gorm.DB, accountName, 
 		)
 		return
 	}
-	a.Log.Warn("Template status update older than the stored template was not applied; sync templates if Meta's status differs",
-		"account", accountName,
+	a.Log.Warn("Template status update older than the stored template was not applied; checking Meta's current status",
+		"account", account.Name,
 		"template", templateName,
 		"language", templateLanguage,
 		"status", status,
@@ -1744,6 +1802,72 @@ func (a *App) logSkippedTemplateStatusUpdate(templateRow *gorm.DB, accountName, 
 		"stored_updated_at", stored.UpdatedAt.Unix(),
 		"event_time", eventUnix,
 	)
+	a.afterTenantCommit(func() {
+		a.rootApp().refreshTemplateStatusFromMeta(account, templateName, templateLanguage, status, stored)
+	})
+}
+
+// refreshTemplateStatusFromMeta reads one template's current status from Meta
+// (by its Meta template ID) and stores it when it differs from stored, the
+// state that handleSkippedTemplateStatusUpdate read, as a template Sync would.
+// It runs after that tenant work has committed, never inside a transaction.
+// The write is made only while the template still has that status and
+// updated_at, so a newer event, edit or Sync that committed while Meta was
+// being read is never overwritten, and it leaves updated_at as it is, so later
+// events are still ordered against the last local write. A failure is logged
+// and leaves the stored status for a template Sync to correct.
+func (a *App) refreshTemplateStatusFromMeta(account models.WhatsAppAccount, templateName, templateLanguage, eventStatus string, stored skippedTemplateState) {
+	fields := []any{
+		"account", account.Name,
+		"template", templateName,
+		"language", templateLanguage,
+		"status", eventStatus,
+		"stored_status", stored.Status,
+	}
+	templateID := strings.TrimSpace(stored.MetaTemplateID)
+	if a.WhatsApp == nil || templateID == "" {
+		a.Log.Warn("Cannot check the template's status with Meta (no WhatsApp client or Meta template ID); sync templates", fields...)
+		return
+	}
+	if err := a.prepareWhatsAppAccountForRuntime(&account); err != nil {
+		a.Log.Warn("Cannot check the template's status with Meta; sync templates", append(fields, "error", err)...)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), whatsapp.DefaultTimeout)
+	defer cancel()
+	current, err := a.WhatsApp.FetchTemplate(ctx, a.toWhatsAppAccount(&account), templateID)
+	if err != nil {
+		a.Log.Error("Failed to check the template's status with Meta; sync templates", append(fields, "error", err)...)
+		return
+	}
+	metaStatus := strings.ToUpper(strings.TrimSpace(current.Status))
+	if current.Name != templateName || current.Language != templateLanguage || metaStatus == "" {
+		a.Log.Warn("Meta returned another template, or no status, for the stored Meta template ID; sync templates",
+			append(fields, "meta_template_id", templateID, "meta_name", current.Name, "meta_language", current.Language)...)
+		return
+	}
+	fields = append(fields, "meta_status", metaStatus)
+	if metaStatus == stored.Status {
+		a.Log.Info("Meta confirms the stored template status", fields...)
+		return
+	}
+	applied := false
+	if err := a.WithTenantApp(account.OrganizationID, func(scoped *App) error {
+		result := scoped.DB.Model(&models.Template{}).
+			Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ? AND status = ? AND updated_at = ?",
+				account.OrganizationID, account.Name, templateName, templateLanguage, stored.Status, stored.UpdatedAt).
+			UpdateColumn("status", metaStatus)
+		applied = result.RowsAffected > 0
+		return result.Error
+	}); err != nil {
+		a.Log.Error("Failed to store the template status read from Meta; sync templates", append(fields, "error", err)...)
+		return
+	}
+	if !applied {
+		a.Log.Info("Template changed while its status was read from Meta; keeping the newer state", fields...)
+		return
+	}
+	a.Log.Info("Updated template status from Meta after a skipped status update", fields...)
 }
 
 // verifyMetaWebhookPayload verifies every dispatch target with its current

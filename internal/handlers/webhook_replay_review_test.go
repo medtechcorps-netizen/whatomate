@@ -22,11 +22,17 @@ import (
 
 const (
 	templateReplaySkippedLog = "Template status update not applied: not newer than its stored state"
-	templateOlderSkippedLog  = "Template status update older than the stored template was not applied; sync templates if Meta's status differs"
+	templateOlderSkippedLog  = "Template status update older than the stored template was not applied; checking Meta's current status"
 	templateUnusableTimeLog  = "Template status update has an unusable event time; applying it unordered"
 	permissionIgnoredLog     = "Ignoring replayed or older call permission reply"
 	permissionUnusableLog    = "Call permission reply has an unusable timestamp; applying it unordered"
 	reactionUnusableLog      = "Reaction has an unusable timestamp; ordering it by its WAMID only"
+
+	templateMetaCheckUnavailableLog = "Cannot check the template's status with Meta (no WhatsApp client or Meta template ID); sync templates"
+	templateMetaConfirmsLog         = "Meta confirms the stored template status"
+	templateMetaUpdatedLog          = "Updated template status from Meta after a skipped status update"
+	templateMetaChangedLog          = "Template changed while its status was read from Meta; keeping the newer state"
+	templateMetaFailedLog           = "Failed to check the template's status with Meta; sync templates"
 )
 
 func TestUsableWhatsAppEventUnix(t *testing.T) {
@@ -80,8 +86,9 @@ func TestTemplateReviewDecisionStampedBeforeLocalSaveIsApplied(t *testing.T) {
 // The tolerance for a decision older than updated_at applies only to a
 // review decision on a PENDING template, and only within
 // templateReviewDecisionTolerance. Outside it the decision is skipped and,
-// because the stored status differs, logged at Warn so that a template Sync
-// can be run.
+// because the stored status differs, logged at Warn and checked against Meta
+// (here the App has no WhatsApp client, so the check only logs; see
+// TestSkippedTemplateStatusEventIsCheckedWithMeta).
 func TestTemplateReviewDecisionToleranceIsBounded(t *testing.T) {
 	app := webhookTestApp(t)
 	account := orphanStatusTestAccount(t, app, false)
@@ -96,13 +103,14 @@ func TestTemplateReviewDecisionToleranceIsBounded(t *testing.T) {
 	}
 	now := time.Now()
 
-	// A PENDING template edited locally (its status unchanged) a few minutes
-	// after Meta approved it.
+	// The PENDING save made half a minute after Meta decided, while the
+	// create call was returning.
 	edited := createReplayGuardTemplate(t, app, account, now)
-	assert.Equal(t, "APPROVED", apply(edited, now.Add(-4*time.Minute), "APPROVED").Status)
+	assert.Equal(t, "APPROVED", apply(edited, now.Add(-templateReviewDecisionTolerance/2), "APPROVED").Status)
 
-	// The same edit made longer after the decision than the tolerance: the
-	// decision is skipped and reported.
+	// A local save made longer after the decision than the tolerance (for
+	// example an edit of the PENDING template): the decision is skipped and
+	// reported.
 	late := createReplayGuardTemplate(t, app, account, now)
 	assert.Equal(t, "PENDING", apply(late, now.Add(-templateReviewDecisionTolerance-time.Minute), "APPROVED").Status)
 	require.Len(t, logs.lines("warn", templateOlderSkippedLog), 1)
@@ -119,6 +127,7 @@ func TestTemplateReviewDecisionToleranceIsBounded(t *testing.T) {
 	assert.Equal(t, "DRAFT", apply(draft, now.Add(-time.Minute), "APPROVED").Status)
 	assert.Len(t, logs.lines("warn", templateOlderSkippedLog), 3)
 	assert.Len(t, logs.lines("info", retryTestTemplateUpdatedLog), 1)
+	assert.Len(t, logs.lines("warn", templateMetaCheckUnavailableLog), 3, "each skip with another status is checked with Meta")
 }
 
 // An entry time that is not plausible Unix seconds (milliseconds, the far

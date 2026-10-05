@@ -173,6 +173,67 @@ func TestClient_SubmitTemplate_MissingVariableSamples(t *testing.T) {
 	assert.Contains(t, err.Error(), "sample values are required")
 }
 
+// --- FetchTemplate ---
+
+func TestClient_FetchTemplate_Success(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v21.0/1234567890", r.URL.Path)
+		assert.Equal(t, "id,name,language,status", r.URL.Query().Get("fields"))
+		assert.Equal(t, "Bearer test-access-token", r.Header.Get("Authorization"))
+
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "1234567890", "name": "order_update", "language": "en_US", "status": "PAUSED",
+		})
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server)
+	template, err := client.FetchTemplate(context.Background(), testAccount(server.URL), " 1234567890 ")
+	require.NoError(t, err)
+	assert.Equal(t, "1234567890", template.ID)
+	assert.Equal(t, "order_update", template.Name)
+	assert.Equal(t, "en_US", template.Language)
+	assert.Equal(t, "PAUSED", template.Status)
+}
+
+func TestClient_FetchTemplate_RejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %s", r.URL.Path)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server)
+	_, err := client.FetchTemplate(context.Background(), testAccount(server.URL), "123/../456")
+	require.Error(t, err)
+	account := testAccount(server.URL)
+	account.APIVersion = "latest"
+	_, err = client.FetchTemplate(context.Background(), account, "1234567890")
+	require.Error(t, err)
+	_, err = client.FetchTemplate(context.Background(), nil, "1234567890")
+	require.Error(t, err)
+}
+
+func TestClient_FetchTemplate_APIError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Unsupported get request","type":"GraphMethodException","code":100}}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server)
+	_, err := client.FetchTemplate(context.Background(), testAccount(server.URL), "1234567890")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Unsupported get request")
+}
+
 // --- FetchTemplates ---
 
 func TestClient_FetchTemplates_Success(t *testing.T) {

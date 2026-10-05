@@ -261,6 +261,14 @@ func TestWebhookStatusCoexistenceOrphanBackstop(t *testing.T) {
 	untimed := orphanStatusBody(t, account, map[string]any{"id": wamid, "status": "delivered"})
 	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, untimed))
 
+	// A tiny timestamp (here 1970) is not a usable time, however old it
+	// reads: it is retried, never settled.
+	tiny := orphanStatusBody(t, account, map[string]any{"id": wamid, "status": "delivered", "timestamp": "5"})
+	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, tiny))
+	assert.Len(t, logs.lines("warn", statusTestUnusableLog), 2, "the untimed and the tiny status are both unusable")
+	err := app.processStatusUpdate(account.PhoneID, WebhookStatus{ID: wamid, Status: "read", Timestamp: "5", RecipientID: "15550000002"})
+	require.ErrorIs(t, err, errWhatsAppStatusOwnerPending)
+
 	past := orphanStatusBody(t, account, orphanStatusAt(wamid, "read",
 		time.Now().Add(-whatsAppCoexistenceOrphanStatusGrace-time.Minute)))
 	assert.Equal(t, http.StatusOK, signedWebhookStatusCode(t, app, past))
