@@ -24,6 +24,8 @@ import {
   type StagedIdentityReviewItem,
 } from '@/services/api'
 
+type DialogSection = 'contact' | 'staged'
+
 const props = defineProps<{
   open: boolean
   contactId: string | null
@@ -31,14 +33,16 @@ const props = defineProps<{
   effectiveState?: ContactIdentityReviewEffectiveState | null
   canReview: boolean
   canViewStaged: boolean
+  // 'staged' opens straight into the protected queue. With no contact it is
+  // the workspace-level entry point for held messages that have no contact.
+  initialSection?: DialogSection
 }>()
 
 const emit = defineEmits<{
   'update:open': [value: boolean]
   resolved: [state: ContactIdentityReviewEffectiveState]
+  'staged-total': [value: number]
 }>()
-
-type DialogSection = 'contact' | 'staged'
 
 const section = ref<DialogSection>('contact')
 const state = ref<ContactIdentityReviewEffectiveState | null>(null)
@@ -71,6 +75,8 @@ interface DecisionAttemptContext {
 }
 
 const blocked = computed(() => !effectiveAIIsAllowed(state.value))
+const hasContact = computed(() => Boolean(props.contactId))
+const opensStaged = computed(() => props.initialSection === 'staged' && props.canViewStaged)
 const previewIsComplete = computed(() => {
   const value = preview.value
   const snapshot = value?.snapshot
@@ -349,6 +355,7 @@ async function loadStagedQueue(page = 1) {
     staged.value = payload.reviews
     stagedPage.value = requestedPage
     stagedTotal.value = payload.total
+    emit('staged-total', payload.total)
   } catch (requestError) {
     if (generation === requestGeneration && !controller.signal.aborted) {
       error.value = getErrorMessage(requestError, 'The protected staged queue could not be loaded.')
@@ -431,8 +438,12 @@ watch(
   () => [props.open, props.contactId] as const,
   ([open]) => {
     if (open) {
-      section.value = 'contact'
-      void loadContactReview()
+      if (opensStaged.value) {
+        void loadStagedQueue(1)
+      } else {
+        section.value = 'contact'
+        void loadContactReview()
+      }
     } else {
       requestGeneration += 1
       requestController?.abort()
@@ -466,12 +477,18 @@ onBeforeUnmount(() => {
             <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-amber-300 light:text-amber-700">
               Identity safety
             </p>
-            <DialogTitle class="mt-1">Review automated reply routing</DialogTitle>
+            <DialogTitle class="mt-1">{{ hasContact ? 'Review automated reply routing' : 'Held WhatsApp messages' }}</DialogTitle>
             <DialogDescription class="mt-1 text-white/50 light:text-slate-600">
-              {{ contactLabel || 'Selected contact' }} · decisions affect future messages only.
+              <template v-if="hasContact">
+                {{ contactLabel || 'Selected contact' }} · decisions affect future messages only.
+              </template>
+              <template v-else>
+                Messages kept out of every conversation because their sender's identity is unclear. Items marked Read-only cannot be resolved yet.
+              </template>
             </DialogDescription>
           </div>
           <Badge
+            v-if="hasContact"
             :class="blocked ? 'bg-amber-400/15 text-amber-200 light:bg-amber-100 light:text-amber-800' : 'bg-emerald-400/15 text-emerald-200 light:bg-emerald-100 light:text-emerald-800'"
             data-testid="identity-review-effective-state"
           >
@@ -481,7 +498,7 @@ onBeforeUnmount(() => {
       </DialogHeader>
 
       <div v-if="canReview" class="flex gap-2 border-b border-white/10 pb-3 light:border-slate-200">
-        <Button size="sm" :variant="section === 'contact' ? 'default' : 'outline'" @click="showContactReview">
+        <Button v-if="hasContact" size="sm" :variant="section === 'contact' ? 'default' : 'outline'" @click="showContactReview">
           Contact review
         </Button>
         <Button v-if="canViewStaged" size="sm" :variant="section === 'staged' ? 'default' : 'outline'" @click="loadStagedQueue(1)">
@@ -580,6 +597,14 @@ onBeforeUnmount(() => {
             </Button>
             <a v-if="mediaURL" :href="mediaURL" :download="mediaFileName" class="ml-3 text-xs font-medium text-sky-300 underline light:text-sky-700">Download media</a>
           </div>
+          <div data-testid="staged-identity-review-guidance" class="rounded-xl border border-sky-300/15 bg-sky-300/[0.04] p-3 text-xs leading-5 text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900">
+            <template v-if="stagedDetail.read_only">
+              This held copy is read-only for now: no review decision can resolve it. It is never moved into a conversation and stays in this list until the WhatsApp number is onboarded again. The sender's later messages may be held too, for example when their number came from the WhatsApp Business app's contacts or chat history, or when this copy is their reply to a message sent from the Business app. Their contact then keeps automated replies off.
+            </template>
+            <template v-else>
+              This held copy is never moved into a conversation. It conflicts with existing contacts: open the contact marked Review and use its Identity review to choose where future messages go.
+            </template>
+          </div>
         </div>
         <ScrollArea v-else class="max-h-[22rem]">
           <button
@@ -593,7 +618,17 @@ onBeforeUnmount(() => {
               <span class="block text-sm font-medium">{{ item.message_type }}</span>
               <span class="mt-1 block text-xs text-white/40 light:text-slate-600">{{ item.received_at }} · revision {{ item.revision || 'not applicable' }}</span>
             </span>
-            <Badge variant="outline">{{ item.status }}</Badge>
+            <span class="flex shrink-0 items-center gap-1.5">
+              <Badge
+                v-if="item.read_only"
+                variant="outline"
+                class="border-amber-300/30 text-amber-200 light:border-amber-300 light:text-amber-800"
+                data-testid="staged-read-only-badge"
+              >
+                Read-only
+              </Badge>
+              <Badge variant="outline">{{ item.status }}</Badge>
+            </span>
           </button>
           <div v-if="staged.length === 0" class="py-12 text-center text-sm text-white/40 light:text-slate-600">No staged reviews.</div>
           <div class="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3 text-xs text-white/45 light:border-slate-200 light:text-slate-600">

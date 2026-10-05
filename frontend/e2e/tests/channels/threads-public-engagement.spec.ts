@@ -139,6 +139,12 @@ async function mockChannels(
   await page.route(/\/api\/auth\/ws-token(?:\?.*)?$/, route =>
     route.fulfill({ json: { data: { token: '' } } }),
   )
+  // The mocked super admin sees the held-message notice above the Inbox list.
+  // Unmocked, its count request reaches the real backend, which answers 401
+  // for this mocked session and sends the page to /login.
+  await page.route(/\/api\/identity-reviews\/staged(?:\?.*)?$/, route =>
+    route.fulfill({ json: { data: { reviews: [], total: 0, read_only_total: 0 } } }),
+  )
   await page.route(/\/api\/channel-accounts(?:\?.*)?$/, async route => {
     if (route.request().method() === 'POST') {
       createdAccount = route.request().postDataJSON() as Record<string, unknown>

@@ -718,7 +718,8 @@ func (a *App) validateWhatsAppMessageContactIdentity(orgID uuid.UUID, canonical 
 		if err := a.DB.Unscoped().Where("organization_id = ? AND bs_uid IN ?", orgID, identifiers).Find(&aliases).Error; err != nil {
 			return err
 		}
-		matched := canonical.BSUID == userID || (parentID != "" && canonical.BSUID == parentID)
+		matched := canonical.BSUID == userID || (parentID != "" && canonical.BSUID == parentID) ||
+			coexistenceLegacyBSUIDPhoneContact(canonical, userID)
 		for _, alias := range aliases {
 			resolved, err := contactutil.ResolveCanonicalContact(a.DB, orgID, alias.ID)
 			if err != nil || resolved.ID != canonical.ID {

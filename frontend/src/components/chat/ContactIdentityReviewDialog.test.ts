@@ -537,3 +537,125 @@ describe('ContactIdentityReviewDialog', () => {
     expect(wrapper.get('[data-testid="staged-pagination-status"]').text()).toContain('Showing 1–1 of 1 · Page 1 of 1')
   })
 })
+
+describe('ContactIdentityReviewDialog workspace staged entry point', () => {
+  let wrapper: VueWrapper | null = null
+
+  beforeEach(() => {
+    for (const mock of Object.values(mocks)) mock.mockReset()
+    mocks.listStaged.mockResolvedValue({
+      data: {
+        data: {
+          reviews: [{
+            id: 'staged-new-sender',
+            hold_id: 'hold-new-sender',
+            protocol_version: 1,
+            status: 'pending',
+            message_type: 'text',
+            received_at: '2026-01-15T08:30:00Z',
+            read_only: true,
+          }],
+          total: 1,
+          read_only_total: 1,
+        },
+      },
+    })
+    mocks.getStaged.mockResolvedValue({
+      data: {
+        data: {
+          id: 'staged-new-sender',
+          hold_id: 'hold-new-sender',
+          protocol_version: 1,
+          status: 'pending',
+          message_type: 'text',
+          received_at: '2026-01-15T08:30:00Z',
+          read_only: true,
+          content: 'Saw your ad, price?',
+          media_available: false,
+        },
+      },
+    })
+  })
+
+  afterEach(() => {
+    wrapper?.unmount()
+    wrapper = null
+    vi.restoreAllMocks()
+  })
+
+  it('opens straight into the protected queue without any contact request', async () => {
+    wrapper = mountDialog({ contactId: null, effectiveState: null, initialSection: 'staged' })
+    await flushPromises()
+
+    expect(mocks.getState).not.toHaveBeenCalled()
+    expect(mocks.preview).not.toHaveBeenCalled()
+    expect(mocks.listStaged).toHaveBeenCalledWith({ page: 1, limit: 100 }, expect.any(AbortSignal))
+    expect(wrapper.text()).toContain('Held WhatsApp messages')
+    expect(wrapper.text()).not.toContain('Contact review')
+    expect(wrapper.find('[data-testid="identity-review-effective-state"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="identity-review-decision"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="staged-pagination-status"]').text()).toContain('Showing 1–1 of 1')
+    expect(wrapper.emitted('staged-total')).toEqual([[1]])
+
+    const item = wrapper.findAll('button').find(button => button.text().includes('2026-01-15T08:30:00Z'))
+    await item!.trigger('click')
+    await flushPromises()
+
+    expect(mocks.getStaged).toHaveBeenCalledWith('staged-new-sender', expect.any(AbortSignal))
+    expect(wrapper.text()).toContain('Saw your ad, price?')
+    const guidance = wrapper.get('[data-testid="staged-identity-review-guidance"]').text()
+    expect(guidance).toContain('never moved into a conversation')
+    expect(guidance).toContain('read-only for now')
+    expect(guidance).toContain('later messages may be held too')
+    // The sender may match a contact by phone, and an earlier held copy can
+    // keep later messages held, so neither claim is made.
+    expect(guidance).not.toContain('matches no single contact')
+    expect(guidance).not.toContain('next message opens a normal conversation')
+    expect(guidance).not.toContain('Identity review to choose')
+  })
+
+  it('marks read-only items in the list and points decidable ones to the flagged contact', async () => {
+    mocks.listStaged.mockResolvedValue({
+      data: {
+        data: {
+          reviews: [
+            { id: 'staged-conflict', hold_id: 'hold-conflict', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-01-15T09:00:00Z', read_only: false },
+            { id: 'staged-new-sender', hold_id: 'hold-new-sender', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-01-15T08:30:00Z', read_only: true },
+          ],
+          total: 2,
+          read_only_total: 1,
+        },
+      },
+    })
+    mocks.getStaged.mockResolvedValue({
+      data: {
+        data: {
+          id: 'staged-conflict', hold_id: 'hold-conflict', protocol_version: 1, status: 'pending', message_type: 'text',
+          received_at: '2026-01-15T09:00:00Z', read_only: false, content: 'Conflict', media_available: false,
+        },
+      },
+    })
+    wrapper = mountDialog({ contactId: null, effectiveState: null, initialSection: 'staged' })
+    await flushPromises()
+
+    expect(wrapper.findAll('[data-testid="staged-read-only-badge"]')).toHaveLength(1)
+    const conflict = wrapper.findAll('button').find(button => button.text().includes('2026-01-15T09:00:00Z'))
+    expect(conflict!.text()).not.toContain('Read-only')
+    await conflict!.trigger('click')
+    await flushPromises()
+
+    const guidance = wrapper.get('[data-testid="staged-identity-review-guidance"]').text()
+    expect(guidance).toContain('open the contact marked Review')
+    expect(guidance).not.toContain('read-only for now')
+  })
+
+  it('stays on the contact review when the viewer cannot read the protected queue', async () => {
+    mocks.getState.mockResolvedValue({ data: { data: blocked } })
+    mocks.preview.mockResolvedValue({ data: { data: preview } })
+    wrapper = mountDialog({ initialSection: 'staged', canViewStaged: false })
+    await flushPromises()
+
+    expect(mocks.listStaged).not.toHaveBeenCalled()
+    expect(mocks.getState).toHaveBeenCalled()
+  })
+})

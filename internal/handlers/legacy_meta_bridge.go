@@ -14,21 +14,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// mirrorLegacyWhatsAppMessage is deliberately best-effort for inbound and
-// repair paths. Outbound delivery uses requireLegacyWhatsAppMessageMirror so a
-// provider attempt can never outrun the durable account provenance required by
-// later receipts and reactions.
-func (a *App) mirrorLegacyWhatsAppMessage(
-	account *models.WhatsAppAccount,
-	messageID uuid.UUID,
-) {
-	if account == nil || messageID == uuid.Nil {
-		return
-	}
-	err := persistLegacyWhatsAppMessageMirror(a.DB, account, messageID)
-	a.logLegacyWhatsAppMessageMirrorError(err, account, messageID)
-}
-
 // requireLegacyWhatsAppMessageMirror establishes the normalized WhatsApp
 // account/contact/conversation proof in its own committed transaction before
 // any provider call. Starting from the root pool preserves the bridge's global
@@ -60,13 +45,22 @@ func (a *App) requireLegacyWhatsAppMessageMirror(
 	return nil
 }
 
-// mirrorLegacyWhatsAppMessageAfterCommit gives every live legacy bridge call
-// the same lock boundary. Message/contact persistence commits first; the
+// mirrorLegacyWhatsAppMessageAfterCommit is deliberately best-effort for
+// inbound and repair paths: a failure is logged, never returned. Outbound
+// delivery uses requireLegacyWhatsAppMessageMirror so a provider attempt can
+// never outrun the durable account provenance required by later receipts and
+// reactions. It gives every live legacy bridge call the same lock boundary. Message/contact persistence commits first; the
 // idempotent mirror then owns a fresh short tenant transaction whose global
 // lock order is ChannelAccount -> ContactIdentity -> InboxConversation ->
 // Contact -> Message, followed by the ConversationParticipant write.
 // This is especially important for webhook and async-send paths which may
 // already hold Contact or Message locks in their surrounding transaction.
+//
+// The mirror's ChannelAccount -> organizations lock path can deadlock with a
+// concurrent Coexistence admission, which takes organizations before the
+// ChannelAccount (40P01). Nothing else re-projects an inbound message whose
+// mirror failed until the next startup backfill, so a retryable abort is
+// retried from a fresh transaction; the mirror is idempotent.
 func (a *App) mirrorLegacyWhatsAppMessageAfterCommit(
 	account *models.WhatsAppAccount,
 	messageID uuid.UUID,
@@ -81,17 +75,19 @@ func (a *App) mirrorLegacyWhatsAppMessageAfterCommit(
 		if root == nil {
 			return
 		}
-		if err := root.WithCommittedTenantApp(organizationID, func(scoped *App) error {
-			scoped.mirrorLegacyWhatsAppMessage(&accountCopy, messageID)
-			return nil
-		}); err != nil {
-			root.Log.Error(
-				"Failed to run deferred legacy WhatsApp mirror phase",
-				"error", err,
-				"organization_id", organizationID,
-				"message_id", messageID,
-			)
+		var err error
+		for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
+			err = root.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+				return persistLegacyWhatsAppMessageMirror(scoped.DB, &accountCopy, messageID)
+			})
+			if !isRetryableCanonicalContactWrite(err) || attempt+1 == canonicalContactWriteAttempts {
+				break
+			}
+			if waitErr := waitForCanonicalContactWriteRetry(context.Background(), attempt); waitErr != nil {
+				break
+			}
 		}
+		root.logLegacyWhatsAppMessageMirrorError(err, &accountCopy, messageID)
 	})
 }
 

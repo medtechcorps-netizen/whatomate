@@ -37,6 +37,7 @@ import {
 } from '@/components/ui/sheet'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
+import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
@@ -2826,6 +2827,8 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
             </button>
           </div>
         </div>
+
+        <StagedIdentityReviewNotice :can-view="canViewStagedContactIdentity" />
 
         <div class="flex-1 overflow-y-auto">
           <button

@@ -330,6 +330,9 @@ export interface StagedIdentityReviewItem {
   message_type: string;
   media_status?: string;
   received_at: string;
+  // True when no decision can resolve the receipt (its hold has no unique
+  // direct-BSUID owner); it closes only when the account is onboarded again.
+  read_only?: boolean;
 }
 
 export interface StagedIdentityReviewDetail extends StagedIdentityReviewItem {
@@ -373,7 +376,7 @@ export const contactsService = {
   listStagedIdentityReviews: (
     params?: { page?: number; limit?: number },
     signal?: AbortSignal,
-  ) => api.get<{ reviews: StagedIdentityReviewItem[]; total: number }>(
+  ) => api.get<{ reviews: StagedIdentityReviewItem[]; total: number; read_only_total?: number }>(
     "/identity-reviews/staged",
     { params, signal },
   ),

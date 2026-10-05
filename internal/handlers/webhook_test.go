@@ -5349,7 +5349,10 @@ func TestWhatsAppIdentityReviewPhoneConflictPersistsVisibleSuppressedWinner(t *t
 }
 
 func TestWhatsAppIdentityReviewAmbiguityStagesContactFreeAndKeepsCrossStoreWinner(t *testing.T) {
-	for _, variant := range []string{"primary_parent_conflict", "no_owner"} {
+	// An unowned BSUID with no other match is a new sender and is admitted
+	// (TestCoexistenceNewSenderIsAdmittedWithOneBoundContact). An unowned BSUID
+	// whose phone belongs to another BSUID's contact is a genuine conflict.
+	for _, variant := range []string{"primary_parent_conflict", "unowned_bsuid_phone_conflict"} {
 		t.Run(variant, func(t *testing.T) {
 			app, account, direct := whatsappIdentityFixture(t)
 			direct.BSUID = "US.direct-" + uuid.NewString()
@@ -5376,7 +5379,14 @@ func TestWhatsAppIdentityReviewAmbiguityStagesContactFreeAndKeepsCrossStoreWinne
 			case "primary_parent_conflict":
 				inbound.FromUserID = direct.BSUID
 				inbound.FromParentUserID = parent.BSUID
-			case "no_owner":
+			case "unowned_bsuid_phone_conflict":
+				phone := "6012" + strings.ReplaceAll(uuid.NewString(), "-", "")[:8]
+				require.NoError(t, app.DB.Model(&models.Contact{}).Where(
+					"organization_id = ? AND id = ?",
+					account.OrganizationID,
+					direct.ID,
+				).Update("phone_number", phone).Error)
+				inbound.From = phone
 				inbound.FromUserID = "US.unknown-" + uuid.NewString()
 			}
 			var contactsBefore int64
@@ -5587,7 +5597,16 @@ func TestWhatsAppIdentityReviewReservedWAMIDIsUniqueAcrossAccountShadows(t *test
 		"",
 		"one tenant-wide reserved winner",
 	)
+	// The unowned BSUID's parent belongs to another contact, so the first
+	// admission is a contact-free staged winner rather than a new sender.
+	parentOwner := testutil.CreateTestContact(t, app.DB, first.OrganizationID)
 	inbound.FromUserID = "US.unowned-" + uuid.NewString()
+	inbound.FromParentUserID = "US.parent-" + uuid.NewString()
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where(
+		"organization_id = ? AND id = ?",
+		first.OrganizationID,
+		parentOwner.ID,
+	).Update("bs_uid", inbound.FromParentUserID).Error)
 
 	work, duplicate, err := app.persistAuthenticatedIncomingMessageBeforeAck(
 		first.PhoneID, inbound, "", strings.Repeat("e", sha256.Size*2),

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -482,6 +483,52 @@ func normalizeCoexistencePhone(phone string) string {
 	return strings.TrimPrefix(strings.TrimSpace(phone), "+")
 }
 
+// coexistenceBSUIDAddressPattern is the shape of a business-scoped user ID:
+// an ISO 3166 alpha-2 country code, then one or more dot-separated
+// alphanumeric segments (for example "US.1349..." or a parent "US.ENT.1181...").
+var coexistenceBSUIDAddressPattern = regexp.MustCompile(`^[A-Z]{2}(\.[A-Za-z0-9]{1,128}){1,3}$`)
+
+// isCoexistenceBSUIDAddress reports whether a Meta address field ("to" or
+// "from") holds a BSUID rather than a phone. Phone-shaped values, including
+// non-E.164 test and legacy values, are not BSUIDs.
+func isCoexistenceBSUIDAddress(value string) bool {
+	value = strings.TrimSpace(value)
+	return len(value) <= coexistenceContactBSUIDMaxLength && coexistenceBSUIDAddressPattern.MatchString(value)
+}
+
+// coexistenceLegacyBSUIDPhoneContact reports whether contact is a row the
+// previous release wrote for an echo addressed by BSUID: it stored that BSUID
+// unchanged as the contact phone and left bs_uid empty. The row is keyed by the
+// BSUID itself, so it is that WhatsApp user's thread. Replays, edits and
+// revokes of the echoes stored on it must keep proving against it, and a later
+// echo to the same BSUID must land on it rather than start a second contact.
+func coexistenceLegacyBSUIDPhoneContact(contact *models.Contact, userID string) bool {
+	userID = strings.TrimSpace(userID)
+	return contact != nil && strings.TrimSpace(contact.BSUID) == "" && isCoexistenceBSUIDAddress(userID) &&
+		normalizeCoexistencePhone(contact.PhoneNumber) == userID
+}
+
+// findCoexistenceLegacyBSUIDPhoneContact returns the canonical contact whose
+// phone is this identity's BSUID (coexistenceLegacyBSUIDPhoneContact), or
+// gorm.ErrRecordNotFound.
+func (a *App) findCoexistenceLegacyBSUIDPhoneContact(
+	organizationID uuid.UUID,
+	identity coexistenceContactIdentity,
+) (*models.Contact, error) {
+	userID := identity.primaryUserID()
+	if !isCoexistenceBSUIDAddress(userID) {
+		return nil, gorm.ErrRecordNotFound
+	}
+	contact, err := a.findCoexistenceContactByPhone(organizationID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if !coexistenceLegacyBSUIDPhoneContact(contact, userID) {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return contact, nil
+}
+
 func isCoexistencePlaceholderPhone(phone string) bool {
 	phone = strings.TrimSpace(phone)
 	return strings.HasPrefix(phone, "bsuid:") ||
@@ -722,6 +769,22 @@ func (a *App) getOrCreateCoexistenceContact(
 		return byUserID, false, nil
 	}
 
+	if identity.Phone == "" {
+		// A BSUID-only identity whose BSUID the previous release stored as a
+		// contact phone continues that contact's thread and binds the BSUID
+		// to it, instead of starting a second contact for the same user.
+		legacy, legacyErr := a.findCoexistenceLegacyBSUIDPhoneContact(account.OrganizationID, identity)
+		if legacyErr != nil && !errors.Is(legacyErr, gorm.ErrRecordNotFound) {
+			return nil, false, legacyErr
+		}
+		if legacyErr == nil {
+			if err := a.updateCoexistenceContactIdentity(account, legacy, identity, true); err != nil {
+				return nil, false, err
+			}
+			return legacy, false, nil
+		}
+	}
+
 	phone := identity.Phone
 	phoneUnavailable := phone == ""
 	if phoneUnavailable {
@@ -915,12 +978,23 @@ func coexistenceMessageContactIdentity(
 ) coexistenceContactIdentity {
 	identity := fallback
 	identity.FallbackKey = strings.TrimSpace(message.ID)
+	// addressedByBSUID marks an echo whose "to" is a BSUID. Such an echo names
+	// its recipient by BSUID only, so no sidecar entry may supply a phone for it.
+	addressedByBSUID := false
 	if direction == models.DirectionOutgoing {
-		if value := strings.TrimSpace(message.To); value != "" {
-			identity.Phone = value
+		// Meta may address a WhatsApp username user by BSUID in "to". A BSUID
+		// must never become a contact phone; with no to_user_id it is the
+		// recipient's BSUID.
+		to := strings.TrimSpace(message.To)
+		toIsBSUID := isCoexistenceBSUIDAddress(to)
+		addressedByBSUID = toIsBSUID
+		if to != "" && !toIsBSUID {
+			identity.Phone = to
 		}
 		if value := strings.TrimSpace(message.ToUserID); value != "" {
 			identity.UserID = value
+		} else if toIsBSUID && identity.UserID == "" {
+			identity.UserID = to
 		}
 		if value := strings.TrimSpace(message.ToParentUserID); value != "" {
 			identity.ParentUserID = value
@@ -937,9 +1011,15 @@ func coexistenceMessageContactIdentity(
 		}
 	}
 
+	// An echo addressed by BSUID takes only names from a sidecar entry for that
+	// same BSUID, never a phone and never from an unrelated single entry. A
+	// sidecar wa_id there could otherwise bind this BSUID onto whichever older
+	// contact owns that phone (Meta documents no contacts[] for echoes, and a
+	// recipient with a phone to show would be addressed by it in "to"). The
+	// recipient's phone is revealed later only by its own authenticated message.
 	matched := -1
 	for index, contact := range contacts {
-		phoneMatches := identity.Phone != "" && sameWhatsAppPhone(identity.Phone, contact.WaID)
+		phoneMatches := !addressedByBSUID && identity.Phone != "" && sameWhatsAppPhone(identity.Phone, contact.WaID)
 		userMatches := identity.primaryUserID() != "" &&
 			(identity.primaryUserID() == strings.TrimSpace(contact.UserID) ||
 				identity.primaryUserID() == strings.TrimSpace(contact.ParentUserID))
@@ -948,12 +1028,12 @@ func coexistenceMessageContactIdentity(
 			break
 		}
 	}
-	if matched < 0 && len(contacts) == 1 {
+	if matched < 0 && len(contacts) == 1 && !addressedByBSUID {
 		matched = 0
 	}
 	if matched >= 0 {
 		contact := contacts[matched]
-		if identity.Phone == "" {
+		if identity.Phone == "" && !addressedByBSUID {
 			identity.Phone = strings.TrimSpace(contact.WaID)
 		}
 		if identity.UserID == "" {
@@ -1175,6 +1255,26 @@ func (a *App) persistAuthenticatedIncomingMessageBeforeAck(
 		admission, admissionErr := scoped.EvaluateWhatsAppIdentityReviewAdmission(scoped.DB, &claim)
 		if admissionErr != nil {
 			return admissionErr
+		}
+		if admission.Blocked {
+			// A sender with no identity question (nobody in the tenant matches
+			// any of its selectors, or the only match is the phone this number
+			// just messaged from the Business app) is bound to one contact and
+			// re-evaluated under the same locks. Every other blocked admission
+			// keeps the review path below unchanged.
+			admitted, bindErr := scoped.admitCoexistenceSenderWithoutIdentityQuestion(
+				account,
+				&claim,
+				admission,
+				message,
+				profileName,
+			)
+			if bindErr != nil {
+				return bindErr
+			}
+			if admitted != nil {
+				admission = admitted
+			}
 		}
 		if admission.Blocked != admission.NeedsReview {
 			return errors.New("WhatsApp identity-review admission state is inconsistent")

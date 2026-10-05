@@ -559,6 +559,16 @@ func createStagedIdentityReviewMediaFixtureWithMimeType(
 		"staged-media-"+uuid.NewString(),
 	)
 	message.Image.MimeType = mimeType
+	// An unowned BSUID alone is a new sender and is admitted with a contact.
+	// A parent BSUID owned by another contact is a genuine identity question,
+	// so the message stays contact-free in the protected staged queue.
+	parentOwner := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
+	message.FromParentUserID = "US.staged-parent-" + uuid.NewString()
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where(
+		"organization_id = ? AND id = ?",
+		account.OrganizationID,
+		parentOwner.ID,
+	).Update("bs_uid", message.FromParentUserID).Error)
 	work, duplicate, err := app.persistAuthenticatedIncomingMessageBeforeAck(
 		account.PhoneID,
 		message,

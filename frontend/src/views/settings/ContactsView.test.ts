@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   listContacts: vi.fn(),
   getContact: vi.fn(),
   listAccounts: vi.fn(),
+  listStaged: vi.fn(),
   hasPermission: vi.fn(),
   push: vi.fn(),
 }))
@@ -20,6 +21,7 @@ vi.mock('@/services/api', () => ({
     get: mocks.getContact,
     update: vi.fn(),
     delete: vi.fn(),
+    listStagedIdentityReviews: mocks.listStaged,
   },
   accountsService: { list: mocks.listAccounts },
 }))
@@ -104,6 +106,7 @@ beforeEach(() => {
   for (const mock of Object.values(mocks)) mock.mockReset()
   mocks.hasPermission.mockReturnValue(true)
   mocks.listAccounts.mockResolvedValue({ data: { data: { accounts: [] } } })
+  mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 0 } } })
 })
 
 afterEach(() => {
@@ -193,6 +196,22 @@ describe('ContactsView phone column', () => {
   it('falls back to the phone number as the name when there is no name', async () => {
     const view = await openList([contact({ phone_number: '+10000000002' })])
     expect(view.get('[data-column="profile_name"]').text()).toContain('+10000000002')
+  })
+
+  it('shows held WhatsApp messages to identity reviewers even with no contacts', async () => {
+    mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 1 } } })
+    const view = await openList([])
+    await vi.waitFor(() => expect(view.find('[data-testid="staged-identity-review-notice"]').exists()).toBe(true))
+    expect(mocks.listStaged).toHaveBeenCalledWith({ page: 1, limit: 1 }, expect.any(AbortSignal))
+    expect(view.get('[data-testid="staged-identity-review-count"]').text()).toBe('1')
+  })
+
+  it('does not request the protected queue without identity-review authority', async () => {
+    mocks.hasPermission.mockImplementation((resource: string) => resource !== 'contacts.identity_review')
+    mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 1 } } })
+    const view = await openList([contact({ phone_number: '+10000000006' })])
+    expect(mocks.listStaged).not.toHaveBeenCalled()
+    expect(view.find('[data-testid="staged-identity-review-notice"]').exists()).toBe(false)
   })
 })
 
