@@ -59,6 +59,10 @@ const stagedLoading = ref(false)
 const mediaLoading = ref(false)
 const mediaURL = ref('')
 const mediaFileName = ref('')
+type HeldMessageState = 'idle' | 'loading' | 'loaded' | 'none' | 'unavailable'
+const heldMessage = ref<StagedIdentityReviewDetail | null>(null)
+const heldMessageState = ref<HeldMessageState>('idle')
+const primaryBSUIDReason = 1
 let requestGeneration = 0
 let requestController: AbortController | null = null
 let mediaRequestController: AbortController | null = null
@@ -77,10 +81,19 @@ interface DecisionAttemptContext {
 const blocked = computed(() => !effectiveAIIsAllowed(state.value))
 const hasContact = computed(() => Boolean(props.contactId))
 const opensStaged = computed(() => props.initialSection === 'staged' && props.canViewStaged)
+const routableTargets = computed(() => new Set(preview.value?.routable_contact_ids ?? []))
+// No member owns this sender's WhatsApp ID: every choice rests on a phone or
+// parent-ID match, which a reassigned number can also produce.
+const onlySelectorMatches = computed(() => (
+  preview.value?.snapshot.candidates.every(
+    candidate => (candidate.selector_reasons & primaryBSUIDReason) !== primaryBSUIDReason,
+  ) === true
+))
 const previewIsComplete = computed(() => {
   const value = preview.value
   const snapshot = value?.snapshot
   if (!value || !snapshot || snapshot.disposition !== 'open' || !snapshot.supported) return false
+  if (!Array.isArray(value.routable_contact_ids)) return false
   if (snapshot.protocol_version !== 1) return false
   if (!Number.isSafeInteger(snapshot.version) || snapshot.version < 1) return false
   if (!Number.isSafeInteger(snapshot.principal_generation) || snapshot.principal_generation < 1) return false
@@ -96,6 +109,7 @@ const previewIsComplete = computed(() => {
   ))) return false
   const currentIDs = new Set(snapshot.candidates.map(candidate => candidate.contact_id))
   if (currentIDs.size !== snapshot.member_count) return false
+  if (value.routable_contact_ids.some(id => !currentIDs.has(id))) return false
   if (value.union_candidates.length < snapshot.member_count) return false
   if (value.union_candidates.some(candidate => (
     !candidate.contact_id
@@ -121,8 +135,22 @@ const canDecide = computed(() => (
   props.canReview
   && previewIsComplete.value
   && preview.value?.snapshot.candidates.some(candidate => candidate.contact_id === selectedTarget.value) === true
+  && routableTargets.value.has(selectedTarget.value)
   && !deciding.value
 ))
+
+function candidateIsSelectable(contactID: string): boolean {
+  return preview.value?.snapshot.candidates.some(current => current.contact_id === contactID) === true
+    && routableTargets.value.has(contactID)
+}
+
+function selectorReasonLabel(reasons: number): string {
+  const labels: string[] = []
+  if ((reasons & primaryBSUIDReason) === primaryBSUIDReason) labels.push('WhatsApp ID')
+  if ((reasons & 2) === 2) labels.push('parent WhatsApp ID')
+  if ((reasons & 4) === 4) labels.push('phone')
+  return labels.length > 0 ? `Matches by ${labels.join(' + ')}` : 'No selector match'
+}
 const stagedPageCount = computed(() => Math.max(1, Math.ceil(stagedTotal.value / stagedPageSize)))
 const stagedRangeStart = computed(() => (
   stagedTotal.value === 0 ? 0 : ((stagedPage.value - 1) * stagedPageSize) + 1
@@ -150,6 +178,8 @@ function resetProtectedState() {
   stagedPage.value = 1
   stagedTotal.value = 0
   stagedDetail.value = null
+  heldMessage.value = null
+  heldMessageState.value = 'idle'
   pendingDecision = null
   closeMediaURL()
 }
@@ -185,6 +215,7 @@ function decisionContextIsCurrent(context: DecisionAttemptContext): boolean {
     && context.preview.snapshot.candidates.some(
       candidate => candidate.contact_id === context.targetContactID,
     )
+    && routableTargets.value.has(context.targetContactID)
   )
 }
 
@@ -259,11 +290,23 @@ async function loadContactReview() {
       if (generation !== requestGeneration || props.contactId !== contactID) return
       const nextPreview = unwrapItemResponse<ContactIdentityReviewPreview>(previewResponse)
       preview.value = nextPreview
-      if (nextPreview.snapshot.candidates.length === 1) {
-        selectedTarget.value = nextPreview.snapshot.candidates[0].contact_id
+      // Pre-select only a single candidate that owns this sender's WhatsApp
+      // ID. A phone or parent-ID match is never chosen for the reviewer.
+      const onlyCandidate = nextPreview.snapshot.candidates.length === 1
+        ? nextPreview.snapshot.candidates[0]
+        : null
+      if (
+        onlyCandidate
+        && (onlyCandidate.selector_reasons & primaryBSUIDReason) === primaryBSUIDReason
+        && routableTargets.value.has(onlyCandidate.contact_id)
+      ) {
+        selectedTarget.value = onlyCandidate.contact_id
       }
       if (!previewIsComplete.value) {
         error.value = 'The complete current candidate set could not be verified. No decision is allowed.'
+      }
+      if (props.canViewStaged) {
+        void loadHeldMessage(nextPreview.snapshot.hold_id, generation, contactID, controller.signal)
       }
     }
   } catch (requestError) {
@@ -275,6 +318,36 @@ async function loadContactReview() {
       loading.value = false
       if (requestController === controller) requestController = null
     }
+  }
+}
+
+// The held copy of this review's message, if one was kept out of every
+// conversation. It is context for the decision only; a failure here never
+// blocks or enables a decision.
+async function loadHeldMessage(holdID: string, generation: number, contactID: string, signal: AbortSignal) {
+  heldMessage.value = null
+  heldMessageState.value = 'loading'
+  try {
+    const listResponse = await contactsService.listStagedIdentityReviewsForHold(holdID, signal)
+    if (generation !== requestGeneration || props.contactId !== contactID) return
+    const payload = unwrapItemResponse<{ reviews: StagedIdentityReviewItem[] }>(listResponse)
+    const item = Array.isArray(payload?.reviews) ? payload.reviews[0] : undefined
+    if (!item || item.hold_id !== holdID) {
+      heldMessageState.value = 'none'
+      return
+    }
+    const detailResponse = await contactsService.getStagedIdentityReview(item.id, signal)
+    if (generation !== requestGeneration || props.contactId !== contactID) return
+    const detail = unwrapItemResponse<StagedIdentityReviewDetail>(detailResponse)
+    if (!detail || detail.hold_id !== holdID) {
+      heldMessageState.value = 'unavailable'
+      return
+    }
+    heldMessage.value = detail
+    heldMessageState.value = 'loaded'
+  } catch {
+    if (generation !== requestGeneration || signal.aborted) return
+    heldMessageState.value = 'unavailable'
   }
 }
 
@@ -546,6 +619,27 @@ onBeforeUnmount(() => {
               <Badge variant="outline">v{{ preview.snapshot.version }}</Badge>
             </div>
 
+            <div data-testid="identity-review-held-message" class="rounded-xl border border-white/10 bg-white/[0.025] p-3 text-xs leading-5 light:border-slate-200 light:bg-slate-50">
+              <p class="font-semibold text-white/80 light:text-slate-800">Held message</p>
+              <template v-if="heldMessageState === 'loaded' && heldMessage">
+                <p class="mt-1 text-[11px] text-white/40 light:text-slate-600">{{ heldMessage.message_type }} · {{ heldMessage.received_at }}</p>
+                <pre data-testid="identity-review-held-message-content" class="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-black/20 p-2 text-white/70 light:bg-white light:text-slate-700">{{ heldMessage.content || '(no text)' }}</pre>
+                <p class="mt-2 text-white/50 light:text-slate-600">Read it before you confirm: once a decision is confirmed, this held copy leaves the review list and is not moved into any conversation.</p>
+              </template>
+              <p v-else-if="heldMessageState === 'loading'" class="mt-1 text-white/45 light:text-slate-600">Loading the held message…</p>
+              <p v-else-if="heldMessageState === 'none'" class="mt-1 text-white/45 light:text-slate-600">No held copy for this review: a message routed to a proven contact is already in that contact's conversation.</p>
+              <p v-else-if="!canViewStaged" class="mt-1 text-white/45 light:text-slate-600">Viewing held messages needs access to the held-message queue.</p>
+              <p v-else class="mt-1 text-white/45 light:text-slate-600">The held message could not be loaded.</p>
+            </div>
+
+            <div
+              v-if="onlySelectorMatches"
+              data-testid="identity-review-recycled-number-warning"
+              class="rounded-xl border border-amber-300/20 bg-amber-300/[0.06] p-3 text-xs leading-5 text-amber-50/80 light:border-amber-200 light:bg-amber-50 light:text-amber-900"
+            >
+              No contact owns this sender's WhatsApp ID yet; these matches rest on a phone number or parent ID only. A phone number can be reassigned to someone else, so confirm only when the held message shows it is the same person.
+            </div>
+
             <fieldset :disabled="!previewIsComplete || deciding" class="space-y-2">
               <label
                 v-for="(candidate, candidateIndex) in preview.union_candidates"
@@ -558,14 +652,22 @@ onBeforeUnmount(() => {
                   type="radio"
                   name="identity-review-target"
                   :value="candidate.contact_id"
-                  :disabled="!preview.snapshot.candidates.some(current => current.contact_id === candidate.contact_id)"
+                  :disabled="!candidateIsSelectable(candidate.contact_id)"
                   class="h-4 w-4 accent-amber-400"
                 />
                 <span class="min-w-0 flex-1">
                   <span class="block truncate text-sm font-medium">Candidate {{ candidateIndex + 1 }}</span>
                   <span class="block truncate font-mono text-[10px] text-white/40 light:text-slate-600">{{ candidate.contact_id }}</span>
+                  <span class="block truncate text-[11px] text-white/45 light:text-slate-600">{{ selectorReasonLabel(candidate.selector_reasons) }}</span>
                 </span>
-                <span class="font-mono text-[10px] text-white/30 light:text-slate-500">reason {{ candidate.selector_reasons }}</span>
+                <span
+                  v-if="preview.snapshot.candidates.some(current => current.contact_id === candidate.contact_id) && !routableTargets.has(candidate.contact_id)"
+                  data-testid="identity-review-candidate-other-user"
+                  title="This contact is already linked to a different WhatsApp user, so this sender cannot be routed to it."
+                  class="shrink-0 rounded-md border border-amber-300/30 px-1.5 py-0.5 text-[10px] text-amber-200 light:border-amber-300 light:text-amber-800"
+                >
+                  Another WhatsApp user
+                </span>
               </label>
             </fieldset>
 
@@ -599,10 +701,10 @@ onBeforeUnmount(() => {
           </div>
           <div data-testid="staged-identity-review-guidance" class="rounded-xl border border-sky-300/15 bg-sky-300/[0.04] p-3 text-xs leading-5 text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900">
             <template v-if="stagedDetail.read_only">
-              This held copy is read-only for now: no review decision can resolve it. It is never moved into a conversation and stays in this list until the WhatsApp number is onboarded again. The sender's later messages may be held too, for example when their number came from the WhatsApp Business app's contacts or chat history, or when this copy is their reply to a message sent from the Business app. Their contact then keeps automated replies off.
+              This held copy is read-only for now: no review decision can resolve it. That happens when no contact matches the sender, when the message carried no WhatsApp ID, when the only matching contact already belongs to a different WhatsApp user, or when the review was created before reviews could be decided. It is never moved into a conversation and stays in this list until the WhatsApp number is onboarded again. The sender's later messages may be held too, and a matching contact keeps automated replies off until then.
             </template>
             <template v-else>
-              This held copy is never moved into a conversation. It conflicts with existing contacts: open the contact marked Review and use its Identity review to choose where future messages go.
+              This held copy is never moved into a conversation. It matches existing contacts: open the contact marked Review and use its Identity review to choose where future messages go. Read this message first: once a decision is confirmed, it leaves this list.
             </template>
           </div>
         </div>

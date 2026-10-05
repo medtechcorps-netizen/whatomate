@@ -303,6 +303,9 @@ export interface ContactIdentityReviewPreview {
   chain_digest: string;
   union_candidates: ContactIdentityReviewCandidate[];
   open_generations: number[];
+  // Current members a decision may target. A member already bound to a
+  // different WhatsApp user is listed as a candidate but never here.
+  routable_contact_ids?: string[];
 }
 
 export interface ContactIdentityReviewDecisionRequest {
@@ -380,6 +383,11 @@ export const contactsService = {
     "/identity-reviews/staged",
     { params, signal },
   ),
+  listStagedIdentityReviewsForHold: (holdId: string, signal?: AbortSignal) =>
+    api.get<{ reviews: StagedIdentityReviewItem[]; total: number; read_only_total?: number }>(
+      "/identity-reviews/staged",
+      { params: { hold_id: holdId, page: 1, limit: 1 }, signal },
+    ),
   getStagedIdentityReview: (id: string, signal?: AbortSignal) =>
     api.get<StagedIdentityReviewDetail>(
       `/identity-reviews/staged/${encodeURIComponent(id)}`,

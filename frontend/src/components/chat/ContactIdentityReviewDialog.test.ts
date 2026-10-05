@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   preview: vi.fn(),
   decide: vi.fn(),
   listStaged: vi.fn(),
+  listStagedForHold: vi.fn(),
   getStaged: vi.fn(),
   getMedia: vi.fn(),
 }))
@@ -20,6 +21,7 @@ vi.mock('@/services/api', async importOriginal => ({
     previewIdentityReview: mocks.preview,
     decideIdentityReview: mocks.decide,
     listStagedIdentityReviews: mocks.listStaged,
+    listStagedIdentityReviewsForHold: mocks.listStagedForHold,
     getStagedIdentityReview: mocks.getStaged,
     getStagedIdentityReviewMedia: mocks.getMedia,
   },
@@ -74,6 +76,7 @@ const preview = {
     { contact_id: 'contact-b', selector_reasons: 4 },
   ],
   open_generations: [3],
+  routable_contact_ids: ['contact-a', 'contact-b'],
 }
 
 function mountDialog(overrides: Record<string, unknown> = {}) {
@@ -112,6 +115,7 @@ describe('ContactIdentityReviewDialog', () => {
     mocks.getState.mockResolvedValue({ data: { data: blocked } })
     mocks.preview.mockResolvedValue({ data: { data: preview } })
     mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 0 } } })
+    mocks.listStagedForHold.mockResolvedValue({ data: { data: { reviews: [], total: 0 } } })
   })
 
   afterEach(() => {
@@ -170,6 +174,95 @@ describe('ContactIdentityReviewDialog', () => {
     expect(wrapper.text()).toContain('complete current candidate set could not be verified')
     expect(wrapper.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeDefined()
     expect(mocks.decide).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when the preview does not list routable targets', async () => {
+    const { routable_contact_ids: _omitted, ...withoutRoutable } = preview
+    mocks.preview.mockResolvedValueOnce({ data: { data: withoutRoutable } })
+    wrapper = mountDialog()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('complete current candidate set could not be verified')
+    expect(wrapper.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('pre-selects a single candidate only when it owns the sender WhatsApp ID', async () => {
+    const single = (reasons: number) => ({
+      ...preview,
+      snapshot: { ...preview.snapshot, member_count: 1, candidates: [{ contact_id: 'contact-b', selector_reasons: reasons }] },
+      union_candidates: [{ contact_id: 'contact-b', selector_reasons: reasons }],
+      routable_contact_ids: ['contact-b'],
+    })
+    mocks.preview.mockResolvedValueOnce({ data: { data: single(1) } })
+    wrapper = mountDialog()
+    await flushPromises()
+    expect((wrapper.get('input[name="identity-review-target"]').element as HTMLInputElement).checked).toBe(true)
+    expect(wrapper.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[data-testid="identity-review-recycled-number-warning"]').exists()).toBe(false)
+    wrapper.unmount()
+
+    mocks.preview.mockResolvedValueOnce({ data: { data: single(4) } })
+    wrapper = mountDialog()
+    await flushPromises()
+    const phoneOnly = wrapper.get('input[name="identity-review-target"]')
+    expect((phoneOnly.element as HTMLInputElement).checked).toBe(false)
+    expect(wrapper.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="identity-review-recycled-number-warning"]').text()).toContain('can be reassigned')
+    expect(wrapper.text()).toContain('Matches by phone')
+    await phoneOnly.setValue()
+    expect(wrapper.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it('never offers a member that belongs to another WhatsApp user', async () => {
+    mocks.preview.mockResolvedValueOnce({ data: { data: { ...preview, routable_contact_ids: ['contact-a'] } } })
+    wrapper = mountDialog()
+    await flushPromises()
+
+    const inputs = wrapper.findAll('input[name="identity-review-target"]')
+    expect(inputs[0].attributes('disabled')).toBeUndefined()
+    expect(inputs[1].attributes('disabled')).toBeDefined()
+    expect(wrapper.findAll('[data-testid="identity-review-candidate-other-user"]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-testid="identity-review-candidate"]')[1].text()).toContain('Another WhatsApp user')
+    expect(wrapper.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('shows the held message beside the decision when one is held', async () => {
+    mocks.listStagedForHold.mockResolvedValueOnce({
+      data: {
+        data: {
+          reviews: [{ id: 'staged-held', hold_id: 'hold-1', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-10-06T08:00:00Z', read_only: false }],
+          total: 1,
+        },
+      },
+    })
+    mocks.getStaged.mockResolvedValueOnce({
+      data: {
+        data: {
+          id: 'staged-held', hold_id: 'hold-1', protocol_version: 1, status: 'pending', message_type: 'text',
+          received_at: '2026-10-06T08:00:00Z', read_only: false, content: 'Is my order ready?', media_available: false,
+        },
+      },
+    })
+    wrapper = mountDialog()
+    await flushPromises()
+
+    expect(mocks.listStagedForHold).toHaveBeenCalledWith('hold-1', expect.any(AbortSignal))
+    expect(mocks.getStaged).toHaveBeenCalledWith('staged-held', expect.any(AbortSignal))
+    expect(wrapper.get('[data-testid="identity-review-held-message-content"]').text()).toBe('Is my order ready?')
+    expect(wrapper.get('[data-testid="identity-review-held-message"]').text()).toContain('leaves the review list')
+  })
+
+  it('explains a review without a held copy and never reads the queue without access', async () => {
+    wrapper = mountDialog()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="identity-review-held-message"]').text()).toContain('No held copy for this review')
+    expect(mocks.getStaged).not.toHaveBeenCalled()
+    wrapper.unmount()
+
+    wrapper = mountDialog({ canViewStaged: false })
+    await flushPromises()
+    expect(mocks.listStagedForHold).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="identity-review-held-message"]').text()).toContain('needs access')
   })
 
   it('reuses the exact idempotency request after an ambiguous decision failure', async () => {
