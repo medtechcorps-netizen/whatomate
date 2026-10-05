@@ -606,6 +606,11 @@ describe('ContactIdentityReviewDialog workspace staged entry point', () => {
     const guidance = wrapper.get('[data-testid="staged-identity-review-guidance"]').text()
     expect(guidance).toContain('never moved into a conversation')
     expect(guidance).toContain('read-only for now')
+    expect(guidance).toContain('later messages may be held too')
+    // The sender may match a contact by phone, and an earlier held copy can
+    // keep later messages held, so neither claim is made.
+    expect(guidance).not.toContain('matches no single contact')
+    expect(guidance).not.toContain('next message opens a normal conversation')
     expect(guidance).not.toContain('Identity review to choose')
   })
 

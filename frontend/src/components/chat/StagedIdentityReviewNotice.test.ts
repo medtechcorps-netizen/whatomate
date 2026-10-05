@@ -120,6 +120,10 @@ describe('StagedIdentityReviewNotice', () => {
     await flushPromises()
     expect(wrapper.get('[data-testid="staged-identity-review-notice"]').text())
       .toContain('1 WhatsApp message is held for identity review · read-only for now')
+    // The sender of a read-only copy may still match a contact by phone.
+    const hint = wrapper.get('[data-testid="staged-identity-review-read-only"]').attributes('title')
+    expect(hint).toContain('No review decision can resolve')
+    expect(hint).not.toContain('match no single contact')
     wrapper.unmount()
 
     mocks.listStaged.mockResolvedValueOnce(stagedResponse(3, 2))

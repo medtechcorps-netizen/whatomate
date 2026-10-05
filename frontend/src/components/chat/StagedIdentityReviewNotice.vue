@@ -19,9 +19,9 @@ const props = withDefaults(defineProps<{
 })
 
 const total = ref(0)
-// Held messages that no decision can resolve: their sender matches no unique
-// contact, so they stay as read-only records until the account is onboarded
-// again. Saying so keeps a count that cannot reach zero from looking stuck.
+// Held messages that no decision can resolve (their hold is unsupported), so
+// they stay as read-only records until the account is onboarded again. Saying
+// so keeps a count that cannot reach zero from looking stuck.
 const readOnlyTotal = ref(0)
 const dialogOpen = ref(false)
 // Mounted on first use only: no hidden dialog per view, and it then stays
@@ -119,7 +119,7 @@ onBeforeUnmount(() => {
         {{ total === 1 ? 'WhatsApp message is' : 'WhatsApp messages are' }} held for identity review<template v-if="readOnlyTotal > 0">
           <span
             class="text-amber-50/60 light:text-amber-800/80"
-            title="These held messages match no single contact, so no decision can resolve them. They stay readable here until the WhatsApp number is onboarded again."
+            title="No review decision can resolve these held messages. They stay readable here until the WhatsApp number is onboarded again, and their senders' later messages may be held too."
             data-testid="staged-identity-review-read-only"
           >
             · {{ readOnlyTotal === total ? (total === 1 ? 'read-only for now' : 'all read-only for now') : `${readOnlyTotal} read-only for now` }}

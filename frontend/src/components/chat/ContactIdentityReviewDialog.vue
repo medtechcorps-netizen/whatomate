@@ -599,7 +599,7 @@ onBeforeUnmount(() => {
           </div>
           <div data-testid="staged-identity-review-guidance" class="rounded-xl border border-sky-300/15 bg-sky-300/[0.04] p-3 text-xs leading-5 text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900">
             <template v-if="stagedDetail.read_only">
-              This held copy is read-only for now: its sender matches no single contact, so no review decision can resolve it. It is never moved into a conversation and stays in this list until the WhatsApp number is onboarded again. If the sender is new to this workspace, their next message opens a normal conversation. A sender already in the WhatsApp Business app's contacts or chat history is still held for now.
+              This held copy is read-only for now: no review decision can resolve it. It is never moved into a conversation and stays in this list until the WhatsApp number is onboarded again. The sender's later messages may be held too, for example when their number came from the WhatsApp Business app's contacts or chat history, or when this copy is their reply to a message sent from the Business app. Their contact then keeps automated replies off.
             </template>
             <template v-else>
               This held copy is never moved into a conversation. It conflicts with existing contacts: open the contact marked Review and use its Identity review to choose where future messages go.
