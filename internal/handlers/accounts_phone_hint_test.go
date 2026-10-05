@@ -28,37 +28,54 @@ func TestNormalizeEmbeddedSignupPhoneNumberHint(t *testing.T) {
 	for _, tc := range []struct {
 		raw     string
 		want    string
-		wantErr bool
+		wantErr error
 	}{
 		{raw: "", want: ""},
 		{raw: "   ", want: ""},
 		{raw: "60123456789", want: "60123456789"},
 		{raw: "+60123456789", want: "60123456789"},
 		{raw: " +60 12-345 6789 ", want: "60123456789"},
+		{raw: "+6012-345 6789", want: "60123456789"}, // the usual Malaysian way of writing it
+		{raw: "+60 11-2345 6789", want: "601123456789"},
 		{raw: "+1 (631) 555.0100", want: "16315550100"},
 		{raw: "+6831234", want: "6831234"},
-		{raw: "+123456789012345", want: "123456789012345"},
-		{raw: "012-345 6789", wantErr: true},               // local number without country code
-		{raw: "0060123456789", wantErr: true},              // international dialling prefix
-		{raw: "+1234567890123456", wantErr: true},          // 16 digits
-		{raw: "+60 1234", wantErr: true},                   // 6 digits
-		{raw: "++60123456789", wantErr: true},              // second plus
-		{raw: "60+123456789", wantErr: true},               // plus inside the number
-		{raw: "+6O123456789", wantErr: true},               // letter O
-		{raw: "+60123456789 ext 2", wantErr: true},         // extension text
-		{raw: "+60/123456789", wantErr: true},              // unsupported separator
-		{raw: "６０123456789", wantErr: true},                // full-width digits
-		{raw: strings.Repeat("1 ", 17), wantErr: true},     // longer than 32 characters
-		{raw: "+60_123456789", wantErr: true},              // underscore
-		{raw: "+60\t123456789", wantErr: true},             // tab inside the number
-		{raw: "tel:+60123456789", wantErr: true},           // URI scheme
-		{raw: "+60 12 345 6789; DROP", wantErr: true},      // trailing text
-		{raw: "+60-12-345-6789", want: "60123456789"},      // hyphenated
-		{raw: "(60) 12 345 6789", want: "60123456789"},     // parentheses
-		{raw: "+60 (0) 12 345 6789", want: "600123456789"}, // trunk zero kept as typed; it then matches nothing
+		{raw: "+49 1234 567890123", want: "491234567890123"},                              // 15 digits
+		{raw: "+60-12-345-6789", want: "60123456789"},                                     // hyphenated
+		{raw: "(60) 12 345 6789", want: "60123456789"},                                    // parentheses
+		{raw: "+44 20 7946 0000", want: "442079460000"},                                   // a 0 later in the number is fine
+		{raw: "012-345 6789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},           // local number without country code
+		{raw: "0060123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},          // international dialling prefix
+		{raw: "+1234567890123456", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},      // 16 digits
+		{raw: "+60 1234", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},               // 6 digits
+		{raw: "++60123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},          // second plus
+		{raw: "60+123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},           // plus inside the number
+		{raw: "+6O123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},           // letter O
+		{raw: "+60123456789 ext 2", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},     // extension text
+		{raw: "+60/123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},          // unsupported separator
+		{raw: "６０123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},            // full-width digits (the browser folds them)
+		{raw: "+60\u00a012-345 6789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},   // no-break space (the browser folds it)
+		{raw: strings.Repeat("1 ", 17), wantErr: errEmbeddedSignupPhoneNumberHintInvalid}, // longer than 32 characters
+		{raw: "+60_123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},          // underscore
+		{raw: "+60\t123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},         // tab inside the number
+		{raw: "tel:+60123456789", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},       // URI scheme
+		{raw: "+60 12 345 6789; DROP", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},  // trailing text
+		{raw: "+ - ( )", wantErr: errEmbeddedSignupPhoneNumberHintInvalid},                // no digits
+		// A Malaysian number that keeps its trunk 0 after +60 matches nothing.
+		{raw: "+60 012-345 6789", wantErr: errEmbeddedSignupPhoneNumberHintTrunkZero},
+		{raw: "+60 (0) 12 345 6789", wantErr: errEmbeddedSignupPhoneNumberHintTrunkZero},
+		{raw: "60 011-2345 6789", wantErr: errEmbeddedSignupPhoneNumberHintTrunkZero},
+		{raw: "+600", wantErr: errEmbeddedSignupPhoneNumberHintTrunkZero},
+		// A number starting with 1 must be an 11-digit US or Canada number;
+		// these are Malaysian mobile numbers typed without 0 and without +60.
+		{raw: "12-345 6789", wantErr: errEmbeddedSignupPhoneNumberHintNANPLength},
+		{raw: "11-2345 6789", wantErr: errEmbeddedSignupPhoneNumberHintNANPLength},
+		{raw: "+1 631 555 01000", wantErr: errEmbeddedSignupPhoneNumberHintNANPLength},
 	} {
 		got, err := normalizeEmbeddedSignupPhoneNumberHint(tc.raw)
-		if tc.wantErr {
+		if tc.wantErr != nil {
+			require.ErrorIs(t, err, tc.wantErr, "%q", tc.raw)
+			// Every refusal is the documented invalid-number error, so its
+			// message always starts the same way.
 			require.ErrorIs(t, err, errEmbeddedSignupPhoneNumberHintInvalid, "%q", tc.raw)
 			assert.Empty(t, got, "%q", tc.raw)
 			continue
@@ -110,6 +127,21 @@ func TestSelectEmbeddedSignupDiscoveredPhone(t *testing.T) {
 			assert.NotContains(t, err.Error(), phoneHintDecoyDisplay)
 		})
 	}
+}
+
+// The "not listed" refusal names the usual causes: a typo or a kept 0 after
+// the country code, the wrong account picked in Meta's popup, and Meta's
+// list lagging a fresh onboarding.
+func TestSelectEmbeddedSignupDiscoveredPhoneNotListedGuidance(t *testing.T) {
+	decoy := whatsapp.WABAPhoneNumber{ID: "110000000000902", DisplayPhoneNumber: phoneHintDecoyDisplay}
+	_, err := selectEmbeddedSignupDiscoveredPhone(
+		[]whatsapp.WABAPhoneNumber{decoy}, embeddedSignupModeCoexistence, phoneHintSelectedDigits)
+	require.Error(t, err)
+	assert.Equal(t,
+		"the number ending in 6789 is not listed in the selected WhatsApp Business Account; "+
+			"check the number (country code first, with no 0 after it) and that you selected the account holding it. "+
+			"If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
+		err.Error())
 }
 
 type phoneHintFixture struct {
@@ -378,14 +410,45 @@ func TestEmbeddedSignupClassicIgnoresPhoneHint(t *testing.T) {
 
 func TestEmbeddedSignupCoexistenceRejectsMalformedPhoneHintBeforeMeta(t *testing.T) {
 	f := newPhoneHintFixture(t, true)
-	for _, hint := range []string{"012-345 6789", "+60 12 345 6789 ext 1", "60+123456789", "+1234567890123456"} {
-		body := f.codeAndWABA("synthetic-malformed-hint-code", embeddedSignupModeCoexistence, hint)
+	for _, tc := range []struct {
+		hint        string
+		wantMessage string
+	}{
+		{hint: "012-345 6789", wantMessage: "phone_number_hint must be the full international phone number"},
+		{hint: "+60 12 345 6789 ext 1", wantMessage: "phone_number_hint must be the full international phone number"},
+		{hint: "60+123456789", wantMessage: "phone_number_hint must be the full international phone number"},
+		{hint: "+1234567890123456", wantMessage: "phone_number_hint must be the full international phone number"},
+		{hint: "+60 012-345 6789", wantMessage: "leave out the 0 after the +60 country code"},
+		{hint: "12-345 6789", wantMessage: "a number starting with 1 is read as a US or Canada number, which has 11 digits"},
+	} {
+		body := f.codeAndWABA("synthetic-malformed-hint-code", embeddedSignupModeCoexistence, tc.hint)
 		body["phone_id"] = f.phoneID
 		req := f.exchange(t, body)
-		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "phone_number_hint must be the full international phone number")
-		assert.NotContains(t, string(testutil.GetResponseBody(req)), hint)
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, tc.wantMessage)
+		responseBody := string(testutil.GetResponseBody(req))
+		assert.Contains(t, responseBody, "phone_number_hint must be the full international phone number")
+		assert.NotContains(t, responseBody, tc.hint)
+		assert.NotContains(t, responseBody, "123456789")
 	}
 	assert.Zero(t, f.meta.totalHits(), "a malformed number fails before the one-time code is spent")
+}
+
+// The field is a string in both modes. Classic never uses its value, but a
+// JSON value of another type fails request decoding before any Meta call,
+// as for any other mistyped field; the docs say so.
+func TestEmbeddedSignupPhoneHintMustBeAString(t *testing.T) {
+	for _, mode := range []string{embeddedSignupModeCoexistence, embeddedSignupModeClassic} {
+		t.Run(mode, func(t *testing.T) {
+			f := newPhoneHintFixture(t, mode == embeddedSignupModeCoexistence)
+			body := f.codeAndWABA("synthetic-non-string-hint", mode, "")
+			body["phone_id"] = f.phoneID
+			body["phone_number_hint"] = 60123456789
+			req := f.exchange(t, body)
+			testutil.AssertErrorResponse(t, req, fasthttp.StatusBadRequest, "Invalid request body")
+			assert.Zero(t, f.meta.totalHits())
+			assert.Zero(t, f.rowsFor(t, f.phoneID))
+		})
+	}
 }
 
 func TestEmbeddedSignupPhoneHintChoiceKeepsEveryExistingCheck(t *testing.T) {

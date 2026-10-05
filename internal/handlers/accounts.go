@@ -2749,16 +2749,39 @@ const (
 	embeddedSignupPhoneHintMinDigits = 7
 	embeddedSignupPhoneHintMaxDigits = 15
 	embeddedSignupPhoneHintMaxLength = 32
+	// Country codes are prefix-free, so "60" is only Malaysia, and no
+	// Malaysian number has a 0 after it: "+60 012-…" keeps the domestic
+	// trunk 0 and can never match a listed number.
+	embeddedSignupPhoneHintMalaysiaTrunkZeroPrefix = "600"
+	// Country code 1 is only the North American Numbering Plan, whose
+	// numbers are always 1 followed by 10 digits. A shorter or longer number
+	// starting with 1 is almost always a local number typed without its
+	// country code, such as a Malaysian mobile number without its first 0.
+	embeddedSignupPhoneHintNANPDigits = 11
 )
 
-var errEmbeddedSignupPhoneNumberHintInvalid = errors.New(
-	"phone_number_hint must be the full international phone number, including its country code",
+var (
+	errEmbeddedSignupPhoneNumberHintInvalid = errors.New(
+		"phone_number_hint must be the full international phone number, including its country code",
+	)
+	errEmbeddedSignupPhoneNumberHintTrunkZero = fmt.Errorf(
+		"%w; leave out the 0 after the +60 country code",
+		errEmbeddedSignupPhoneNumberHintInvalid,
+	)
+	errEmbeddedSignupPhoneNumberHintNANPLength = fmt.Errorf(
+		"%w; a number starting with 1 is read as a US or Canada number, which has 11 digits",
+		errEmbeddedSignupPhoneNumberHintInvalid,
+	)
 )
 
 // normalizeEmbeddedSignupPhoneNumberHint reduces the operator's typed number
 // to its E.164 digits. Spaces, hyphens, dots, parentheses and one leading +
-// are accepted as formatting; anything else is refused rather than guessed,
-// and so is a local number without its country code. An empty hint is "none".
+// are accepted as formatting; anything else is refused rather than guessed.
+// So are a local number without its country code (a leading 0), a Malaysian
+// number that keeps its trunk 0 after +60, and a number starting with 1 that
+// is not an 11-digit US or Canada number. Each would match no listed phone,
+// and refusing it here costs nothing because the one-time code has not been
+// exchanged yet. An empty hint is "none". The browser applies the same rules.
 func normalizeEmbeddedSignupPhoneNumberHint(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -2779,10 +2802,16 @@ func normalizeEmbeddedSignupPhoneNumberHint(raw string) (string, error) {
 		}
 	}
 	normalized := digits.String()
-	if len(normalized) < embeddedSignupPhoneHintMinDigits ||
-		len(normalized) > embeddedSignupPhoneHintMaxDigits ||
-		normalized[0] == '0' {
+	switch {
+	case normalized == "" || normalized[0] == '0':
 		return "", errEmbeddedSignupPhoneNumberHintInvalid
+	case strings.HasPrefix(normalized, embeddedSignupPhoneHintMalaysiaTrunkZeroPrefix):
+		return "", errEmbeddedSignupPhoneNumberHintTrunkZero
+	case len(normalized) < embeddedSignupPhoneHintMinDigits ||
+		len(normalized) > embeddedSignupPhoneHintMaxDigits:
+		return "", errEmbeddedSignupPhoneNumberHintInvalid
+	case normalized[0] == '1' && len(normalized) != embeddedSignupPhoneHintNANPDigits:
+		return "", errEmbeddedSignupPhoneNumberHintNANPLength
 	}
 	return normalized, nil
 }
@@ -2841,7 +2870,10 @@ func selectEmbeddedSignupDiscoveredPhone(
 		return matches[0], nil
 	case 0:
 		return whatsapp.WABAPhoneNumber{}, fmt.Errorf(
-			"the number ending in %s is not listed in the selected WhatsApp Business Account; check the number and its country code, then restart Sync with Mobile App",
+			// The usual causes, in order: a typo or a kept 0 after another
+			// country code, the wrong account picked in Meta's popup, and
+			// Meta's list not yet showing a number it has just onboarded.
+			"the number ending in %s is not listed in the selected WhatsApp Business Account; check the number (country code first, with no 0 after it) and that you selected the account holding it. If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
 			lastDigits,
 		)
 	default:
