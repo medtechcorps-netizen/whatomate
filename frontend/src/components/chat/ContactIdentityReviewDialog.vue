@@ -483,7 +483,7 @@ onBeforeUnmount(() => {
                 {{ contactLabel || 'Selected contact' }} · decisions affect future messages only.
               </template>
               <template v-else>
-                Messages kept out of every conversation until their sender's identity is reviewed.
+                Messages kept out of every conversation because their sender's identity is unclear. Items marked Read-only cannot be resolved yet.
               </template>
             </DialogDescription>
           </div>
@@ -598,7 +598,12 @@ onBeforeUnmount(() => {
             <a v-if="mediaURL" :href="mediaURL" :download="mediaFileName" class="ml-3 text-xs font-medium text-sky-300 underline light:text-sky-700">Download media</a>
           </div>
           <div data-testid="staged-identity-review-guidance" class="rounded-xl border border-sky-300/15 bg-sky-300/[0.04] p-3 text-xs leading-5 text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900">
-            This held copy is read-only and is never moved into a conversation. If it came from a new customer, their next message opens a normal conversation, and you can also answer them from the WhatsApp Business app. If it conflicts with existing contacts, open the contact marked Review and use its Identity review to choose where future messages go.
+            <template v-if="stagedDetail.read_only">
+              This held copy is read-only for now: its sender matches no single contact, so no review decision can resolve it. It is never moved into a conversation and stays in this list until the WhatsApp number is onboarded again. If the sender is new to this workspace, their next message opens a normal conversation. A sender already in the WhatsApp Business app's contacts or chat history is still held for now.
+            </template>
+            <template v-else>
+              This held copy is never moved into a conversation. It conflicts with existing contacts: open the contact marked Review and use its Identity review to choose where future messages go.
+            </template>
           </div>
         </div>
         <ScrollArea v-else class="max-h-[22rem]">
@@ -613,7 +618,17 @@ onBeforeUnmount(() => {
               <span class="block text-sm font-medium">{{ item.message_type }}</span>
               <span class="mt-1 block text-xs text-white/40 light:text-slate-600">{{ item.received_at }} · revision {{ item.revision || 'not applicable' }}</span>
             </span>
-            <Badge variant="outline">{{ item.status }}</Badge>
+            <span class="flex shrink-0 items-center gap-1.5">
+              <Badge
+                v-if="item.read_only"
+                variant="outline"
+                class="border-amber-300/30 text-amber-200 light:border-amber-300 light:text-amber-800"
+                data-testid="staged-read-only-badge"
+              >
+                Read-only
+              </Badge>
+              <Badge variant="outline">{{ item.status }}</Badge>
+            </span>
           </button>
           <div v-if="staged.length === 0" class="py-12 text-center text-sm text-white/40 light:text-slate-600">No staged reviews.</div>
           <div class="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3 text-xs text-white/45 light:border-slate-200 light:text-slate-600">

@@ -553,8 +553,10 @@ describe('ContactIdentityReviewDialog workspace staged entry point', () => {
             status: 'pending',
             message_type: 'text',
             received_at: '2026-01-15T08:30:00Z',
+            read_only: true,
           }],
           total: 1,
+          read_only_total: 1,
         },
       },
     })
@@ -567,6 +569,7 @@ describe('ContactIdentityReviewDialog workspace staged entry point', () => {
           status: 'pending',
           message_type: 'text',
           received_at: '2026-01-15T08:30:00Z',
+          read_only: true,
           content: 'Saw your ad, price?',
           media_available: false,
         },
@@ -600,7 +603,45 @@ describe('ContactIdentityReviewDialog workspace staged entry point', () => {
 
     expect(mocks.getStaged).toHaveBeenCalledWith('staged-new-sender', expect.any(AbortSignal))
     expect(wrapper.text()).toContain('Saw your ad, price?')
-    expect(wrapper.get('[data-testid="staged-identity-review-guidance"]').text()).toContain('never moved into a conversation')
+    const guidance = wrapper.get('[data-testid="staged-identity-review-guidance"]').text()
+    expect(guidance).toContain('never moved into a conversation')
+    expect(guidance).toContain('read-only for now')
+    expect(guidance).not.toContain('Identity review to choose')
+  })
+
+  it('marks read-only items in the list and points decidable ones to the flagged contact', async () => {
+    mocks.listStaged.mockResolvedValue({
+      data: {
+        data: {
+          reviews: [
+            { id: 'staged-conflict', hold_id: 'hold-conflict', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-01-15T09:00:00Z', read_only: false },
+            { id: 'staged-new-sender', hold_id: 'hold-new-sender', protocol_version: 1, status: 'pending', message_type: 'text', received_at: '2026-01-15T08:30:00Z', read_only: true },
+          ],
+          total: 2,
+          read_only_total: 1,
+        },
+      },
+    })
+    mocks.getStaged.mockResolvedValue({
+      data: {
+        data: {
+          id: 'staged-conflict', hold_id: 'hold-conflict', protocol_version: 1, status: 'pending', message_type: 'text',
+          received_at: '2026-01-15T09:00:00Z', read_only: false, content: 'Conflict', media_available: false,
+        },
+      },
+    })
+    wrapper = mountDialog({ contactId: null, effectiveState: null, initialSection: 'staged' })
+    await flushPromises()
+
+    expect(wrapper.findAll('[data-testid="staged-read-only-badge"]')).toHaveLength(1)
+    const conflict = wrapper.findAll('button').find(button => button.text().includes('2026-01-15T09:00:00Z'))
+    expect(conflict!.text()).not.toContain('Read-only')
+    await conflict!.trigger('click')
+    await flushPromises()
+
+    const guidance = wrapper.get('[data-testid="staged-identity-review-guidance"]').text()
+    expect(guidance).toContain('open the contact marked Review')
+    expect(guidance).not.toContain('read-only for now')
   })
 
   it('stays on the contact review when the viewer cannot read the protected queue', async () => {

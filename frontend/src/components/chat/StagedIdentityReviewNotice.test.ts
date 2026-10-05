@@ -36,8 +36,8 @@ vi.mock('./ContactIdentityReviewDialog.vue', async () => {
 
 const DialogName = defineComponent({ name: 'ContactIdentityReviewDialog' }).name
 
-function stagedResponse(total: number) {
-  return { data: { data: { reviews: [], total } } }
+function stagedResponse(total: number, readOnlyTotal?: number) {
+  return { data: { data: { reviews: [], total, read_only_total: readOnlyTotal } } }
 }
 
 function mountNotice(props: Record<string, unknown> = {}) {
@@ -112,6 +112,34 @@ describe('StagedIdentityReviewNotice', () => {
     await flushPromises()
     expect(mocks.listStaged).toHaveBeenCalledTimes(2)
     expect(wrapper.find('[data-testid="staged-identity-review-notice"]').exists()).toBe(false)
+  })
+
+  it('says which held messages no decision can resolve', async () => {
+    mocks.listStaged.mockResolvedValueOnce(stagedResponse(1, 1))
+    wrapper = mountNotice()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="staged-identity-review-notice"]').text())
+      .toContain('1 WhatsApp message is held for identity review · read-only for now')
+    wrapper.unmount()
+
+    mocks.listStaged.mockResolvedValueOnce(stagedResponse(3, 2))
+    wrapper = mountNotice()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="staged-identity-review-read-only"]').text()).toBe('· 2 read-only for now')
+    wrapper.unmount()
+
+    mocks.listStaged.mockResolvedValueOnce(stagedResponse(4, 4))
+    wrapper = mountNotice()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="staged-identity-review-read-only"]').text()).toBe('· all read-only for now')
+    wrapper.unmount()
+
+    // A server without the field, or a decidable queue, shows no marker.
+    mocks.listStaged.mockResolvedValueOnce(stagedResponse(2))
+    wrapper = mountNotice()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="staged-identity-review-count"]').text()).toBe('2')
+    expect(wrapper.find('[data-testid="staged-identity-review-read-only"]').exists()).toBe(false)
   })
 
   it('refreshes on an interval while visible', async () => {
