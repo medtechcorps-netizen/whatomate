@@ -1,6 +1,8 @@
 export const META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS = 5_000;
-// Leave time to exchange Meta's short-lived code after waiting for selection.
-export const META_COEXISTENCE_SELECTION_TIMEOUT_MS = 20_000;
+// Meta's exchangeable code lives for 30 seconds. Coexistence waits at most half
+// of that for the selected-asset message, so a code-only fallback still reaches
+// the server early enough to redeem the code.
+export const META_COEXISTENCE_SELECTION_TIMEOUT_MS = 15_000;
 export const META_COEXISTENCE_SESSION_INFO_VERSION = "3";
 
 export type MetaEmbeddedSignupMode = "coexistence" | "classic";
@@ -190,21 +192,17 @@ export function createMetaEmbeddedSignupSession(
 
   const scheduleCompletionDeadline = () => {
     if (settled || !code || fallbackTimer !== undefined) return;
-    if (options.mode === "coexistence") {
-      // Token grants may include previously connected WABAs. Never substitute
-      // those grants for the user's selected account or discard a late finish.
-      fallbackTimer = setTimeout(() => {
-        if (!ensureContextCurrent()) return;
-        abort(
-          "error",
-          "Meta did not return the selected WhatsApp account. Restart the connection and complete account selection in Meta.",
-        );
-      }, META_COEXISTENCE_SELECTION_TIMEOUT_MS);
-      return;
-    }
+    // Without a selected-asset message, submit the code alone. The server
+    // uses the token's WABA only when it grants exactly one and refuses more
+    // than one, so a code-only exchange never substitutes another granted WABA
+    // for the user's selection, and single-WABA signups keep working when
+    // Meta's message is missing or unrecognised. Coexistence waits longer for
+    // the message because its tokens often grant previously shared WABAs.
     fallbackTimer = setTimeout(
       () => complete(true),
-      options.codeFallbackMs ?? META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS,
+      options.mode === "coexistence"
+        ? META_COEXISTENCE_SELECTION_TIMEOUT_MS
+        : (options.codeFallbackMs ?? META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS),
     );
   };
 

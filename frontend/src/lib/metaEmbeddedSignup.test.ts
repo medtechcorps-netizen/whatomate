@@ -3,6 +3,7 @@ import {
   createMetaEmbeddedSignupSession,
   isAllowedMetaEmbeddedSignupOrigin,
   META_COEXISTENCE_SELECTION_TIMEOUT_MS,
+  META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS,
   type MetaEmbeddedSignupAbortReason,
   type MetaEmbeddedSignupMode,
   type MetaEmbeddedSignupResult,
@@ -332,7 +333,7 @@ describe("createMetaEmbeddedSignupSession", () => {
   });
 
   it.each([2, "2", 4, "", null, true, {}, []])(
-    "rejects explicit unsupported or malformed Coexistence version %j without code-only completion",
+    "never uses IDs from unsupported Coexistence version %j and falls back to a code-only exchange",
     (version) => {
       vi.useFakeTimers();
       const harness = createHarness(50, undefined, "coexistence");
@@ -354,23 +355,27 @@ describe("createMetaEmbeddedSignupSession", () => {
           },
         });
       }
-      vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
-
+      vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS - 1);
       expect(harness.completed).toHaveLength(0);
-      expect(harness.aborted).toEqual([
+      vi.advanceTimersByTime(1);
+
+      // The server accepts a code-only exchange only when the token grants
+      // exactly one WABA, so the unsupported message's ID is never sent.
+      expect(harness.completed).toEqual([
         {
-          reason: "error",
-          detail: expect.stringContaining(
-            "Meta did not return the selected WhatsApp account",
-          ),
+          code: "code-abc",
+          mode: "coexistence",
+          phoneNumberId: undefined,
+          wabaId: undefined,
         },
       ]);
+      expect(harness.aborted).toHaveLength(0);
       expect(harness.settledCount()).toBe(1);
     },
   );
 
   it.each([undefined, { phone_number_id: "phone-only" }])(
-    "requires a selected WABA before exchanging the Coexistence code",
+    "falls back to a bounded code-only exchange when no Coexistence WABA arrives",
     (data) => {
       vi.useFakeTimers();
       const harness = createHarness(50, undefined, "coexistence");
@@ -387,13 +392,28 @@ describe("createMetaEmbeddedSignupSession", () => {
       expect(harness.completed).toHaveLength(0);
       expect(harness.aborted).toHaveLength(0);
       vi.advanceTimersByTime(1);
+      // A selection after the deadline cannot change the settled exchange.
       harness.session.handleMessage(finishMessage());
 
-      expect(harness.completed).toHaveLength(0);
-      expect(harness.aborted).toHaveLength(1);
+      expect(harness.completed).toEqual([
+        {
+          code: "code-abc",
+          mode: "coexistence",
+          phoneNumberId: undefined,
+          wabaId: undefined,
+        },
+      ]);
+      expect(harness.aborted).toHaveLength(0);
       expect(harness.settledCount()).toBe(1);
     },
   );
+
+  it("keeps the Coexistence wait within half of Meta's 30 second code lifetime", () => {
+    expect(META_COEXISTENCE_SELECTION_TIMEOUT_MS).toBeGreaterThan(
+      META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS,
+    );
+    expect(META_COEXISTENCE_SELECTION_TIMEOUT_MS).toBeLessThanOrEqual(15_000);
+  });
 
   it.each([
     { waba_ids: [" selected-waba ", "selected-waba", ""] },
@@ -517,7 +537,7 @@ describe("createMetaEmbeddedSignupSession", () => {
     ]);
   });
 
-  it("does not accept a forged Coexistence selection before its deadline", () => {
+  it("never uses a forged Coexistence selection, even at the deadline", () => {
     vi.useFakeTimers();
     const harness = createHarness(50, undefined, "coexistence");
     harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
@@ -525,8 +545,15 @@ describe("createMetaEmbeddedSignupSession", () => {
       finishMessage("https://www.facebook.com.example.org"),
     );
     vi.advanceTimersByTime(META_COEXISTENCE_SELECTION_TIMEOUT_MS);
-    expect(harness.completed).toHaveLength(0);
-    expect(harness.aborted).toHaveLength(1);
+    expect(harness.completed).toEqual([
+      {
+        code: "code-abc",
+        mode: "coexistence",
+        phoneNumberId: undefined,
+        wabaId: undefined,
+      },
+    ]);
+    expect(harness.aborted).toHaveLength(0);
   });
 
   it("cleans up the Coexistence deadline if the workspace changes", () => {

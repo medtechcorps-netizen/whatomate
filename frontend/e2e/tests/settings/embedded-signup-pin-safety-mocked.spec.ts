@@ -382,7 +382,7 @@ test("launches Coexistence with Meta's Business App onboarding contract", async 
   ]);
 });
 
-test("Coexistence rejects unsupported finish versions without exchanging a code-only request", async ({
+test("Coexistence never sends IDs from unsupported finish versions and falls back to a code-only exchange", async ({
   page,
 }) => {
   const capture = await installEmbeddedSignupMocks(page, {
@@ -395,12 +395,16 @@ test("Coexistence rejects unsupported finish versions without exchanging a code-
 
   await page.clock.fastForward(5_001);
   expect(capture.exchangeRequests).toBe(0);
-  await page.clock.fastForward(15_000);
-  await expect(
-    page.getByText(/Meta did not return the selected WhatsApp account/),
-  ).toBeVisible();
-  expect(capture.exchangeRequests).toBe(0);
-  expect(capture.exchangeBodies).toEqual([]);
+  await page.clock.fastForward(10_000);
+  // The server accepts a code-only exchange only when the token grants
+  // exactly one WABA and refuses ambiguity.
+  await expect.poll(() => capture.exchangeRequests).toBe(1);
+  expect(capture.exchangeBodies).toEqual([
+    {
+      code: "review-safe-code",
+      signup_mode: "coexistence",
+    },
+  ]);
 });
 
 test("Coexistence preserves the selected account from a delayed standard finish without a version", async ({
