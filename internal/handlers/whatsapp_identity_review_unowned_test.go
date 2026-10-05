@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"strings"
 	"testing"
@@ -450,10 +451,11 @@ func TestWhatsAppIdentityReviewPhoneAppRecipientIsAdoptedBeforeUnownedReview(t *
 	assert.Zero(t, holds)
 }
 
-// A phone owner that already carries a different BSUID contradicts the
-// principal: the message stays contact-free, but the review is still a
-// decidable supported generation rather than a permanent blocker.
-func TestWhatsAppIdentityReviewUnownedPrincipalContradictedPhoneOwnerStaysContactFreeButDecidable(t *testing.T) {
+// A phone owner that already carries a different BSUID belongs to another
+// WhatsApp user (a recycled number, typically). No decision may route the new
+// principal into that contact: with no other member the hold stays read-only,
+// exactly as before this review became decidable.
+func TestWhatsAppIdentityReviewUnownedPrincipalOtherUsersContactStaysReadOnly(t *testing.T) {
 	app, account, owner := whatsappIdentityFixture(t)
 	require.NoError(t, app.DB.Model(&models.Contact{}).Where(
 		"organization_id = ? AND id = ?", account.OrganizationID, owner.ID,
@@ -468,26 +470,51 @@ func TestWhatsAppIdentityReviewUnownedPrincipalContradictedPhoneOwnerStaysContac
 	assert.Nil(t, work)
 	assert.EqualValues(t, 1, countStagedWhatsAppIdentityReviewEvents(t, app, account.OrganizationID, inbound.ID))
 	hold := loadOnlyWhatsAppIdentityReviewHold(t, app, account)
-	require.True(t, hold.Supported)
+	assert.False(t, hold.Supported)
+	assert.Zero(t, hold.PrincipalGeneration)
 
-	state, err := app.GetWhatsAppIdentityReviewEffectiveState(app.DB, account.OrganizationID, owner.ID)
-	require.NoError(t, err)
-	require.True(t, state.Blocked)
 	resolver := createWhatsAppIdentityReviewResolver(t, app.DB, account.OrganizationID)
-	resolveLatestContactIdentityReviewForTest(t, app, account.OrganizationID, resolver.ID, owner.ID, owner.ID)
-	state, err = app.GetWhatsAppIdentityReviewEffectiveState(app.DB, account.OrganizationID, owner.ID)
-	require.NoError(t, err)
-	assert.True(t, state.AIAllowed)
+	status, body, _ := previewContactIdentityReviewOverHTTP(t, app, account.OrganizationID, resolver.ID, owner.ID)
+	assert.Equal(t, fasthttp.StatusConflict, status, body)
+	probeErr := probeWhatsAppIdentityReviewDecisionTransition(t, app.DB, hold, owner.ID, resolver.ID)
+	assert.Error(t, probeErr, "the database guard keeps the read-only hold closed to decisions")
+}
 
-	next := inbound
-	next.ID = "wamid.contradicted-next-" + uuid.NewString()
-	work, _, err = app.persistAuthenticatedIncomingMessageBeforeAck(
-		account.PhoneID, next, "New holder", strings.Repeat("b", sha256.Size*2),
+// When the direct BSUID has its own contact, a phone owner bound to another
+// BSUID is offered as a member but never as a target: the preview lists only
+// the direct owner as routable, and Decide refuses the other user's contact.
+func TestWhatsAppIdentityReviewDecisionRefusesOtherUsersContact(t *testing.T) {
+	app, account, direct := whatsappIdentityFixture(t)
+	principal := "US.direct-" + uuid.NewString()
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where(
+		"organization_id = ? AND id = ?", account.OrganizationID, direct.ID,
+	).Update("bs_uid", principal).Error)
+	phoneOwner := testutil.CreateTestContactWith(t, app.DB, account.OrganizationID,
+		testutil.WithPhoneNumber("60"+testutil.NewTestGraphObjectID()[:10]))
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where(
+		"organization_id = ? AND id = ?", account.OrganizationID, phoneOwner.ID,
+	).Update("bs_uid", "US.previous-owner-"+uuid.NewString()).Error)
+	inbound := inboundContinuationTextMessage(t, "wamid.refuse-"+uuid.NewString(), phoneOwner.PhoneNumber, "phone conflict")
+	inbound.FromUserID = principal
+	work, _, err := app.persistAuthenticatedIncomingMessageBeforeAck(
+		account.PhoneID, inbound, "Direct owner", strings.Repeat("a", sha256.Size*2),
 	)
 	require.NoError(t, err)
-	require.NotNil(t, work)
-	assert.Equal(t, owner.ID, work.Persisted.ContactID)
-	assert.Equal(t, "reviewed_future_route", work.Persisted.Metadata[incomingIdentityReviewReasonKey])
+	require.NotNil(t, work, "the proven direct owner still receives the held message")
+	assert.Equal(t, direct.ID, work.Persisted.ContactID)
+
+	resolver := createWhatsAppIdentityReviewResolver(t, app.DB, account.OrganizationID)
+	status, body, preview := previewContactIdentityReviewOverHTTP(t, app, account.OrganizationID, resolver.ID, direct.ID)
+	require.Equal(t, fasthttp.StatusOK, status, body)
+	require.True(t, preview.Snapshot.Supported)
+	require.Len(t, preview.Snapshot.Candidates, 2)
+	assert.Equal(t, []uuid.UUID{direct.ID}, preview.RoutableContactIDs)
+
+	status, body, _ = decideContactIdentityReviewOverHTTP(t, app, account.OrganizationID, resolver.ID, direct.ID, phoneOwner.ID, preview)
+	assert.Equal(t, fasthttp.StatusUnprocessableEntity, status, body)
+	status, body, decision := decideContactIdentityReviewOverHTTP(t, app, account.OrganizationID, resolver.ID, direct.ID, direct.ID, preview)
+	require.Equal(t, fasthttp.StatusOK, status, body)
+	assert.Equal(t, models.WhatsAppIdentityReviewDispositionFutureRouting, decision.Snapshot.Disposition)
 }
 
 // A contact holding the parent BSUID of the claim is not adopted either: the
@@ -635,4 +662,128 @@ func TestWhatsAppIdentityReviewUnownedAdmissionKeepsNewSenderGateShape(t *testin
 	state, err := app.GetWhatsAppIdentityReviewEffectiveState(db, organization.ID, bystander.ID)
 	require.NoError(t, err)
 	assert.True(t, state.AIAllowed)
+}
+
+// Once a reviewer routes an unowned principal to a contact, the first Business
+// app reply that teaches that contact the principal's BSUID changes only the
+// target's reason bits. The decision still covers that set: the next message
+// is routed with AI and opens no second review. Any other change still asks
+// again.
+func TestWhatsAppIdentityReviewDecisionSurvivesTargetLearningTheBSUID(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	phone := "60" + testutil.NewTestGraphObjectID()[:10]
+	synced := syncPhoneOnlyCoexistenceContact(t, app, account, phone)
+	principal := "US.learn-" + uuid.NewString()
+
+	first := inboundContinuationTextMessage(t, "wamid.learn-first-"+uuid.NewString(), phone, "held first")
+	first.FromUserID = principal
+	work, _, err := app.persistAuthenticatedIncomingMessageBeforeAck(
+		account.PhoneID, first, "Learner", strings.Repeat("a", sha256.Size*2),
+	)
+	require.NoError(t, err)
+	require.Nil(t, work)
+	resolver := createWhatsAppIdentityReviewResolver(t, app.DB, organizationID)
+	decision := resolveLatestContactIdentityReviewForTest(t, app, organizationID, resolver.ID, synced.ID, synced.ID)
+
+	echo := CoexistenceMessage{IncomingTextMessage: inboundContinuationTextMessage(
+		t, "wamid.learn-echo-"+uuid.NewString(), "15550783881", "reply from the app",
+	)}
+	echo.To = phone
+	echo.ToUserID = principal
+	require.NoError(t, app.persistMessageEchoesBeforeAck(account.PhoneID, []CoexistenceMessage{echo}, nil))
+	require.Equal(t, principal, loadCoexistenceAdmissionContact(t, app.DB, organizationID, synced.ID).BSUID)
+
+	next := first
+	next.ID = "wamid.learn-next-" + uuid.NewString()
+	work, _, err = app.persistAuthenticatedIncomingMessageBeforeAck(
+		account.PhoneID, next, "Learner", strings.Repeat("b", sha256.Size*2),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, work)
+	assert.Equal(t, synced.ID, work.Persisted.ContactID)
+	assert.Equal(t, "reviewed_future_route", work.Persisted.Metadata[incomingIdentityReviewReasonKey])
+	assert.Equal(t, decision.Snapshot.HoldID.String(), work.Persisted.Metadata[incomingIdentityReviewHoldIDKey])
+	assert.False(t, incomingMessageAutomaticAISuppressed(&work.Persisted))
+	assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.WhatsAppIdentityReviewHold{}, "organization_id = ?", organizationID))
+	state, err := app.GetWhatsAppIdentityReviewEffectiveState(app.DB, organizationID, synced.ID)
+	require.NoError(t, err)
+	assert.True(t, state.AIAllowed)
+
+	require.NoError(t, app.DB.Create(&models.ChatbotSettings{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organizationID,
+		WhatsAppAccount: account.Name, IsEnabled: false, AI: models.AIConfig{Enabled: false},
+	}).Error)
+	processor := NewInboundContinuationProcessor(app, time.Hour)
+	require.NoError(t, processor.ProcessMessage(context.Background(), organizationID, work.Persisted.ID))
+	assert.Equal(t, models.ScheduledJobStatusCompleted, loadInboundContinuationJob(t, app, organizationID, work.Persisted.ID).Status)
+
+	// A second phone owner is a new person in the set: two contacts now own the
+	// phone, so the message is held contact-free under a fresh generation.
+	testutil.CreateTestContactWith(t, app.DB, organizationID, testutil.WithPhoneNumber("+"+phone))
+	again := first
+	again.ID = "wamid.learn-again-" + uuid.NewString()
+	work, _, err = app.persistAuthenticatedIncomingMessageBeforeAck(
+		account.PhoneID, again, "Learner", strings.Repeat("c", sha256.Size*2),
+	)
+	require.NoError(t, err)
+	assert.Nil(t, work)
+	assert.EqualValues(t, 1, countStagedWhatsAppIdentityReviewEvents(t, app, organizationID, again.ID))
+	assert.EqualValues(t, 2, countCoexistenceAdmissionRows(t, app.DB, &models.WhatsAppIdentityReviewHold{}, "organization_id = ?", organizationID))
+	state, err = app.GetWhatsAppIdentityReviewEffectiveState(app.DB, organizationID, synced.ID)
+	require.NoError(t, err)
+	assert.True(t, state.Blocked)
+}
+
+// The held list can be narrowed to one hold, which lets the contact dialog
+// show the held message beside the decision.
+func TestListStagedContactIdentityReviewsFiltersByHold(t *testing.T) {
+	app, account, _ := whatsappIdentityFixture(t)
+	organizationID := account.OrganizationID
+	heldFor := func(label string) uuid.UUID {
+		phone := "60" + testutil.NewTestGraphObjectID()[:10]
+		syncPhoneOnlyCoexistenceContact(t, app, account, phone)
+		message := inboundContinuationTextMessage(t, "wamid.filter-"+label+"-"+uuid.NewString(), phone, "held "+label)
+		message.FromUserID = "US.filter-" + uuid.NewString()
+		work, _, err := app.persistAuthenticatedIncomingMessageBeforeAck(
+			account.PhoneID, message, "Held", strings.Repeat("a", sha256.Size*2),
+		)
+		require.NoError(t, err)
+		require.Nil(t, work)
+		var hold models.WhatsAppIdentityReviewHold
+		require.NoError(t, app.DB.Where("organization_id = ? AND direct_primary_bsuid = ?", organizationID, message.FromUserID).
+			First(&hold).Error)
+		return hold.ID
+	}
+	first := heldFor("first")
+	heldFor("second")
+
+	resolver := createWhatsAppIdentityReviewResolver(t, app.DB, organizationID)
+	list := func(holdID string) (int, []stagedWhatsAppIdentityReviewItem, int64) {
+		request := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(request, organizationID, resolver.ID)
+		if holdID != "" {
+			testutil.SetQueryParam(request, "hold_id", holdID)
+		}
+		require.NoError(t, app.ListStagedContactIdentityReviews(request))
+		status := testutil.GetResponseStatusCode(request)
+		if status != fasthttp.StatusOK {
+			return status, nil, 0
+		}
+		var page struct {
+			Reviews []stagedWhatsAppIdentityReviewItem `json:"reviews"`
+			Total   int64                              `json:"total"`
+		}
+		testutil.ParseEnvelopeResponse(t, request, &page)
+		return status, page.Reviews, page.Total
+	}
+	_, all, total := list("")
+	assert.Len(t, all, 2)
+	assert.EqualValues(t, 2, total)
+	_, narrowed, total := list(first.String())
+	require.Len(t, narrowed, 1)
+	assert.Equal(t, first, narrowed[0].HoldID)
+	assert.EqualValues(t, 1, total)
+	status, _, _ := list("not-a-uuid")
+	assert.Equal(t, fasthttp.StatusBadRequest, status)
 }
