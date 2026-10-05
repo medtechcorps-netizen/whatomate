@@ -2870,10 +2870,13 @@ func selectEmbeddedSignupDiscoveredPhone(
 		return matches[0], nil
 	case 0:
 		return whatsapp.WABAPhoneNumber{}, fmt.Errorf(
-			// The usual causes, in order: a typo or a kept 0 after another
-			// country code, the wrong account picked in Meta's popup, and
-			// Meta's list not yet showing a number it has just onboarded.
-			"the number ending in %s is not listed in the selected WhatsApp Business Account; check the number (country code first, with no 0 after it) and that you selected the account holding it. If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
+			// The usual causes, in order: a typo or a 0 the app does not show
+			// after the country code, the wrong account picked in Meta's
+			// popup, and Meta's list not yet showing a number it has just
+			// onboarded. The app shows each number in international form, so
+			// matching it digit for digit is right in every country, including
+			// those that keep a 0 after the country code.
+			"the number ending in %s is not listed in the selected WhatsApp Business Account; check that it matches the number the WhatsApp Business app shows, digit for digit from the country code (no extra 0 after it), and that you selected the account holding it. If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
 			lastDigits,
 		)
 	default:

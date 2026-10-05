@@ -479,7 +479,7 @@ test("Coexistence refuses a number without its country code before Meta's login"
     // The server refuses a number that is not listed under the WABA and names
     // at most its last four digits.
     exchangeErrorMessage:
-      "the number ending in 6789 is not listed in the selected WhatsApp Business Account; check the number (country code first, with no 0 after it) and that you selected the account holding it. If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
+      "the number ending in 6789 is not listed in the selected WhatsApp Business Account; check that it matches the number the WhatsApp Business app shows, digit for digit from the country code (no extra 0 after it), and that you selected the account holding it. If Meta onboarded the number just now, it may not be listed yet: wait a minute, then restart Sync with Mobile App",
   });
   await page.goto("/settings/accounts");
   await openConnectionMethodDialog(page);
