@@ -110,6 +110,9 @@ interface WhatsAppCoexistenceStatus {
 }
 
 const accounts = ref<WhatsAppAccount[]>([]);
+// The workspace whose GET /accounts filled `accounts`. A workspace switch
+// clears both, so another workspace's accounts are never offered here.
+const accountsOrganizationId = ref<string | null>(null);
 const isLoading = ref(true);
 const fetchError = ref(false);
 const deleteDialogOpen = ref(false);
@@ -164,9 +167,19 @@ const isMetaIntegrationReady = computed(() =>
     whatsappConfig.value?.has_app_secret,
   ),
 );
-const coexistenceReconnectCandidates = computed(() =>
-  accounts.value.filter((account) => account.phone_id?.trim()),
-);
+// Only accounts this workspace's own GET /accounts returned can be
+// reconnected, and only once that fetch has finished without an error.
+const coexistenceReconnectCandidates = computed(() => {
+  if (
+    isLoading.value ||
+    fetchError.value ||
+    !accountsOrganizationId.value ||
+    accountsOrganizationId.value !== activeOrganizationId.value
+  ) {
+    return [];
+  }
+  return accounts.value.filter((account) => account.phone_id?.trim());
+});
 const coexistenceReconnectAccount = computed(
   () =>
     coexistenceReconnectCandidates.value.find(
@@ -237,10 +250,13 @@ watch(showOnboardingDialog, (isOpen) => {
   if (!isOpen) onboardingStep.value = "choose";
 });
 watch(activeOrganizationId, (organizationId) => {
-  // The number and reconnect choice belong to the previous workspace.
-  coexistencePhoneNumber.value = "";
-  coexistencePhoneNumberTouched.value = false;
-  coexistenceReconnectAccountId.value = "";
+  // The number, the reconnect choice and the account list belong to the
+  // previous workspace. The list stays empty until this workspace's own
+  // fetch succeeds, so a slow or failed fetch never offers the previous
+  // workspace's accounts for reconnection here.
+  forgetCoexistenceTarget();
+  accounts.value = [];
+  accountsOrganizationId.value = null;
   onboardingStep.value = "choose";
   if (
     activeEmbeddedSignupOrganizationId &&
@@ -343,6 +359,7 @@ async function fetchAccounts() {
       return;
     }
     accounts.value = response.data.data?.accounts || [];
+    accountsOrganizationId.value = organizationId;
   } catch {
     if (
       requestSequence !== accountsFetchSequence ||
@@ -453,6 +470,16 @@ function loadFacebookSDK() {
     script.remove();
   };
   document.body.appendChild(script);
+}
+
+// Clears the typed number and the reconnect choice. Called when the
+// workspace changes and when a connection may have succeeded, so the next
+// signup never silently reuses a number that is already connected. After a
+// refusal or a cancelled Meta login the values stay, so they can be fixed.
+function forgetCoexistenceTarget() {
+  coexistencePhoneNumber.value = "";
+  coexistencePhoneNumberTouched.value = false;
+  coexistenceReconnectAccountId.value = "";
 }
 
 function openCoexistenceNumberStep() {
@@ -668,6 +695,8 @@ async function exchangeCodeForToken(
     ) {
       return;
     }
+    // The number is connected now; a later signup must name its own.
+    forgetCoexistenceTarget();
 
     const exchangeResult = response.data.data;
     const account = exchangeResult.account;
@@ -703,6 +732,8 @@ async function exchangeCodeForToken(
     if (!error.response || error.response.status >= 500) {
       // A lost response cannot prove whether Meta accepted a mutation. Read
       // the committed state; never replay the code or start signup again here.
+      // The number may be connected, so a later signup must name its own.
+      forgetCoexistenceTarget();
       toast.warning(
         "Connection result could not be confirmed. Check the refreshed account status and reconcile any pending connection before starting again.",
       );

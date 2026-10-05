@@ -461,6 +461,14 @@ test("Coexistence sends the entered number's digits when Meta names only the WAB
       hasText: "WhatsApp account connected successfully!",
     }),
   ).toBeVisible();
+
+  // The connected number is forgotten, so adding another number starts empty
+  // and Continue never silently reuses it.
+  await openConnectionMethodDialog(page);
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await expect(
+    page.getByLabel("WhatsApp Business app number", { exact: true }),
+  ).toHaveValue("");
 });
 
 test("Coexistence refuses a number without its country code before Meta's login", async ({
@@ -549,6 +557,11 @@ test("Coexistence refuses a number without its country code before Meta's login"
   await expect(refusal).not.toContainText("12-345");
   await expect(refusal).not.toContainText("60123456789");
   await expect(refusal).not.toContainText("review-safe-code");
+
+  // After a refusal the typed number stays, so it can be corrected.
+  await openConnectionMethodDialog(page);
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await expect(phoneNumber).toHaveValue(syntheticCoexistenceNumber);
 });
 
 test("Coexistence reconnects a workspace account by its phone ID without a number", async ({

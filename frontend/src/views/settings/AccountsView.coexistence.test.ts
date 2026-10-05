@@ -13,6 +13,11 @@ const mocks = vi.hoisted(() => ({
   login: vi.fn(),
   toastError: vi.fn(),
   accounts: [] as Array<Record<string, unknown>>,
+  // Overrides GET /accounts for one workspace, for example to keep it
+  // loading or to fail it.
+  accountsFor: undefined as
+    | ((organizationId: string | undefined) => Promise<unknown> | undefined)
+    | undefined,
   organizations: { selectedOrgId: "" } as { selectedOrgId: string },
 }));
 
@@ -160,6 +165,7 @@ beforeEach(() => {
   mocks.login.mockReset();
   mocks.toastError.mockReset();
   mocks.accounts = [];
+  mocks.accountsFor = undefined;
   mocks.organizations.selectedOrgId = organizationId;
   mocks.get.mockImplementation(
     async (url: string, config?: { headers?: Record<string, string> }) => {
@@ -177,6 +183,10 @@ beforeEach(() => {
         };
       }
       if (url === "/accounts") {
+        const override = mocks.accountsFor?.(
+          config?.headers?.["X-Organization-ID"],
+        );
+        if (override) return override;
         return { data: { data: { accounts: mocks.accounts } } };
       }
       throw new Error(`unexpected GET ${url}`);
@@ -424,5 +434,262 @@ describe("AccountsView Coexistence number step", () => {
         phone_number_hint: "60123456789",
       },
     ]);
+  });
+
+  it("forgets the number after a connection, so the next signup names its own", async () => {
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    await view.get("#coexistence-phone-number").setValue("+60 12-345 6789");
+    await view.get("form").trigger("submit");
+    const { callback } = lastLogin();
+    finishMessage(
+      { waba_id: "1000000000000004" },
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+    );
+    callback({ authResponse: { code: "review-safe-code" } });
+    await flushPromises();
+    expect(exchangeBodies()).toHaveLength(1);
+
+    // Adding another number starts empty: pressing Continue without typing
+    // never reuses the number that is now connected.
+    await chooseCoexistence(view);
+    expect(
+      (view.get("#coexistence-phone-number").element as HTMLInputElement).value,
+    ).toBe("");
+    expect(view.find("#coexistence-phone-number-preview").exists()).toBe(false);
+    await view.get("form").trigger("submit");
+    await flushPromises();
+    expect(view.get("#coexistence-phone-number-error").text()).toBe(
+      "accounts.coexistenceNumberRequired",
+    );
+    expect(mocks.login).toHaveBeenCalledTimes(1);
+    expect(exchangeBodies()).toHaveLength(1);
+  });
+
+  it("forgets the reconnect choice after a connection", async () => {
+    mocks.accounts = [
+      {
+        id: "b4444444-4444-4444-8444-444444444444",
+        name: "Existing clinic number",
+        phone_id: "1000000000000003",
+        status: "active",
+        created_at: "2026-09-04T01:00:00Z",
+      },
+    ];
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    await view
+      .get("#coexistence-reconnect-account")
+      .setValue("b4444444-4444-4444-8444-444444444444");
+    await view.get("form").trigger("submit");
+    const { callback } = lastLogin();
+    finishMessage(
+      { waba_id: "1000000000000004" },
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+    );
+    callback({ authResponse: { code: "review-safe-code" } });
+    await flushPromises();
+    expect(exchangeBodies()).toHaveLength(1);
+
+    await chooseCoexistence(view);
+    expect(
+      (view.get("#coexistence-reconnect-account").element as HTMLSelectElement)
+        .value,
+    ).toBe("");
+    expect(
+      view.get("#coexistence-phone-number").attributes("disabled"),
+    ).toBeUndefined();
+  });
+
+  it("keeps the number after a refusal so it can be corrected", async () => {
+    mocks.post.mockRejectedValueOnce({
+      isAxiosError: true,
+      response: {
+        status: 400,
+        data: {
+          message:
+            "the number ending in 6789 is not listed in the selected WhatsApp Business Account",
+        },
+      },
+    });
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    await view.get("#coexistence-phone-number").setValue("+60 12-345 6789");
+    await view.get("form").trigger("submit");
+    const { callback } = lastLogin();
+    finishMessage(
+      { waba_id: "1000000000000004" },
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+    );
+    callback({ authResponse: { code: "review-safe-code" } });
+    await flushPromises();
+    expect(exchangeBodies()).toHaveLength(1);
+    expect(mocks.toastError).toHaveBeenCalled();
+
+    await chooseCoexistence(view);
+    expect(
+      (view.get("#coexistence-phone-number").element as HTMLInputElement).value,
+    ).toBe("+60 12-345 6789");
+  });
+
+  it("forgets the number when the connection result could not be confirmed", async () => {
+    // No response: Meta may have accepted the number.
+    mocks.post.mockRejectedValueOnce(new Error("Network Error"));
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    await view.get("#coexistence-phone-number").setValue("+60 12-345 6789");
+    await view.get("form").trigger("submit");
+    const { callback } = lastLogin();
+    finishMessage(
+      { waba_id: "1000000000000004" },
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+    );
+    callback({ authResponse: { code: "review-safe-code" } });
+    await flushPromises();
+    expect(exchangeBodies()).toHaveLength(1);
+
+    await chooseCoexistence(view);
+    expect(
+      (view.get("#coexistence-phone-number").element as HTMLInputElement).value,
+    ).toBe("");
+  });
+
+  it("never offers another workspace's accounts while this workspace's list loads", async () => {
+    mocks.accounts = [
+      {
+        id: "b4444444-4444-4444-8444-444444444444",
+        name: "Workspace A number",
+        phone_id: "1000000000000003",
+        status: "active",
+        created_at: "2026-09-04T01:00:00Z",
+      },
+    ];
+    let resolveOtherAccounts: (value: unknown) => void = () => {};
+    mocks.accountsFor = (requestedOrganizationId) =>
+      requestedOrganizationId === otherOrganizationId
+        ? new Promise((resolve) => {
+            resolveOtherAccounts = resolve;
+          })
+        : undefined;
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    expect(
+      view
+        .findAll("#coexistence-reconnect-account option")
+        .map((option) => option.attributes("value")),
+    ).toEqual(["", "b4444444-4444-4444-8444-444444444444"]);
+
+    mocks.organizations.selectedOrgId = otherOrganizationId;
+    await flushPromises();
+    await chooseCoexistence(view);
+    // Workspace B's list is still loading: nothing to reconnect, and
+    // workspace A's account is gone from the page.
+    expect(view.find("#coexistence-reconnect-account").exists()).toBe(false);
+    expect(view.text()).not.toContain("Workspace A number");
+
+    resolveOtherAccounts({
+      data: {
+        data: {
+          accounts: [
+            {
+              id: "b5555555-5555-4555-8555-555555555555",
+              name: "Workspace B number",
+              phone_id: "1000000000000005",
+              status: "active",
+              created_at: "2026-09-04T01:00:00Z",
+            },
+          ],
+        },
+      },
+    });
+    await flushPromises();
+    expect(
+      view
+        .findAll("#coexistence-reconnect-account option")
+        .map((option) => option.attributes("value")),
+    ).toEqual(["", "b5555555-5555-4555-8555-555555555555"]);
+  });
+
+  it("never offers another workspace's accounts when this workspace's list fails", async () => {
+    mocks.accounts = [
+      {
+        id: "b4444444-4444-4444-8444-444444444444",
+        name: "Workspace A number",
+        phone_id: "1000000000000003",
+        status: "active",
+        created_at: "2026-09-04T01:00:00Z",
+      },
+    ];
+    mocks.accountsFor = (requestedOrganizationId) =>
+      requestedOrganizationId === otherOrganizationId
+        ? Promise.reject(new Error("accounts unavailable"))
+        : undefined;
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    expect(view.find("#coexistence-reconnect-account").exists()).toBe(true);
+
+    mocks.organizations.selectedOrgId = otherOrganizationId;
+    await flushPromises();
+    await chooseCoexistence(view);
+    expect(view.find("#coexistence-reconnect-account").exists()).toBe(false);
+    expect(view.text()).not.toContain("Workspace A number");
+
+    // Workspace A's phone ID can no longer be sent with workspace B.
+    await view.get("#coexistence-phone-number").setValue("+60 12-345 6789");
+    await view.get("form").trigger("submit");
+    const { callback } = lastLogin();
+    finishMessage(
+      { waba_id: "1000000000000004" },
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+    );
+    callback({ authResponse: { code: "review-safe-code" } });
+    await flushPromises();
+
+    const exchanges = mocks.post.mock.calls.filter(
+      ([url]) => url === "/accounts/exchange-token",
+    );
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0]?.[1]).toEqual({
+      code: "review-safe-code",
+      signup_mode: "coexistence",
+      phone_id: undefined,
+      waba_id: "1000000000000004",
+      phone_number_hint: "60123456789",
+    });
+    expect(exchanges[0]?.[2]).toMatchObject({
+      headers: { "X-Organization-ID": otherOrganizationId },
+    });
+  });
+
+  it("offers no reconnect choice after this workspace's list fails to reload", async () => {
+    mocks.accounts = [
+      {
+        id: "b4444444-4444-4444-8444-444444444444",
+        name: "Existing clinic number",
+        phone_id: "1000000000000003",
+        status: "active",
+        created_at: "2026-09-04T01:00:00Z",
+      },
+    ];
+    const view = await openAccounts();
+    await chooseCoexistence(view);
+    expect(view.find("#coexistence-reconnect-account").exists()).toBe(true);
+    await view.get("#coexistence-phone-number").setValue("+60 12-345 6789");
+    // The list reload that follows the connection fails.
+    mocks.accountsFor = () => Promise.reject(new Error("accounts unavailable"));
+    await view.get("form").trigger("submit");
+    const { callback } = lastLogin();
+    finishMessage(
+      { waba_id: "1000000000000004" },
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+    );
+    callback({ authResponse: { code: "review-safe-code" } });
+    await flushPromises();
+    expect(exchangeBodies()).toHaveLength(1);
+
+    // The earlier list of this workspace is still in memory, but it is no
+    // longer known to be current, so nothing is offered.
+    await chooseCoexistence(view);
+    expect(view.find("#coexistence-reconnect-account").exists()).toBe(false);
   });
 });
