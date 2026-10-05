@@ -1692,6 +1692,109 @@ func TestApp_ReturnAgentTransfersToQueue_ClearsAssignmentWhenItPointsAtAgent(t *
 		"assignment pointing at the offline agent must be cleared")
 }
 
+// returnToQueueRacing runs ReturnAgentTransfersToQueue while a concurrent
+// writer (the SLA tick, a reassignment) holds the transfer row, commits that
+// writer once the return's own write is waiting on it, and returns the count.
+func returnToQueueRacing(t *testing.T, app *handlers.App, agentID, orgID uuid.UUID, concurrent string, args ...any) int {
+	t.Helper()
+	writer := app.DB.Begin()
+	require.NoError(t, writer.Error)
+	t.Cleanup(func() { _ = writer.Rollback().Error })
+	require.NoError(t, writer.Exec(concurrent, args...).Error)
+	returned := make(chan int, 1)
+	go func() { returned <- app.ReturnAgentTransfersToQueue(agentID, orgID) }()
+	require.Eventually(t, func() bool {
+		var waiting int64
+		return app.DB.Raw(
+			`SELECT COUNT(*) FROM pg_catalog.pg_stat_activity
+			  WHERE datname = pg_catalog.current_database()
+			    AND wait_event_type = 'Lock'
+			    AND query LIKE 'UPDATE "agent_transfers"%'`,
+		).Scan(&waiting).Error == nil && waiting == 1
+	}, 10*time.Second, 10*time.Millisecond, "the return must reach its transfer write")
+	require.NoError(t, writer.Commit().Error)
+	select {
+	case count := <-returned:
+		return count
+	case <-time.After(10 * time.Second):
+		t.Fatal("return to queue did not finish")
+		return 0
+	}
+}
+
+// An agent going away races the SLA tick. Returning the transfer to the queue
+// must not write back the stale row it loaded: that would revive an expiry
+// (or reset an escalation) the tick committed meanwhile, and the next tick
+// would send the same customer notice again.
+func TestApp_ReturnAgentTransfersToQueue_DoesNotReviveConcurrentExpiry(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	agent := createTestAgent(t, app, org.ID)
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", contact.ID).
+		Update("assigned_user_id", agent.ID).Error)
+	transfer := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, &agent.ID)
+
+	count := returnToQueueRacing(t, app, agent.ID, org.ID,
+		"UPDATE agent_transfers SET status = ? WHERE id = ?", models.TransferStatusExpired, transfer.ID)
+	assert.Zero(t, count, "an expired transfer is no longer in the agent's queue")
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Equal(t, models.TransferStatusExpired, stored.Status, "the committed expiry must stand")
+	require.NotNil(t, stored.AgentID)
+	assert.Equal(t, agent.ID, *stored.AgentID)
+	assigned := readContactAssignedUser(t, app, contact.ID)
+	require.NotNil(t, assigned, "a transfer that was not returned leaves the contact's manager alone")
+	assert.Equal(t, agent.ID, *assigned)
+}
+
+// The SLA tick escalates the transfer while its agent goes away. The return
+// still unassigns it, but must keep the committed escalation level: resetting
+// it to 0 would make the next tick warn the customer a second time.
+func TestApp_ReturnAgentTransfersToQueue_KeepsConcurrentEscalation(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	agent := createTestAgent(t, app, org.ID)
+	transfer := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, &agent.ID)
+
+	count := returnToQueueRacing(t, app, agent.ID, org.ID,
+		"UPDATE agent_transfers SET escalation_level = 1, escalated_at = NOW() WHERE id = ?", transfer.ID)
+	assert.Equal(t, 1, count)
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Equal(t, models.TransferStatusActive, stored.Status)
+	assert.Nil(t, stored.AgentID)
+	assert.Equal(t, 1, stored.SLA.EscalationLevel, "the committed escalation must survive the return")
+	assert.NotNil(t, stored.SLA.EscalatedAt)
+}
+
+// A manager reassigns the transfer to a colleague while the first agent goes
+// away. The away agent's return must not unassign the colleague.
+func TestApp_ReturnAgentTransfersToQueue_KeepsConcurrentReassignment(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	agent := createTestAgent(t, app, org.ID)
+	colleague := createTestAgent(t, app, org.ID)
+	transfer := createTestTransfer(t, app, org.ID, contact.ID, account.Name, models.TransferStatusActive, &agent.ID)
+
+	count := returnToQueueRacing(t, app, agent.ID, org.ID,
+		"UPDATE agent_transfers SET agent_id = ? WHERE id = ?", colleague.ID, transfer.ID)
+	assert.Zero(t, count, "the transfer is no longer the away agent's")
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Equal(t, models.TransferStatusActive, stored.Status)
+	require.NotNil(t, stored.AgentID, "the colleague's assignment must survive the return")
+	assert.Equal(t, colleague.ID, *stored.AgentID)
+}
+
 // --- Cross-organization membership (Pause AI root cause) ---
 //
 // users.organization_id is only a user's home organization. Members who work
