@@ -52,7 +52,9 @@
 // Its own output is fixed messages and counts, never a URL, a password or the
 // administrator's address. It lives under release/, outside the schema guard's
 // scanned roots (release/deployment/schema_change.py) and outside every release
-// binary (placement_test.go).
+// binary (release/staging/graphstub/placement_test.go rejects release/ in each
+// release binary's dependencies; this package's placement_test.go pins that
+// the tool is a main package under release/).
 package main
 
 import (
