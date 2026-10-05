@@ -301,7 +301,17 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 
 	switch event {
 	case "ringing":
+		// Replay guard: Meta replays a whole POST until it is acknowledged.
+		// Only the first ringing of a call that is still initiating applies;
+		// a replayed or late one must not move an answered call back to
+		// ringing or restart the ringback tone.
 		session.mu.Lock()
+		if session.Status != models.CallStatusInitiating {
+			current := session.Status
+			session.mu.Unlock()
+			m.log.Info("Ignoring repeated or late outgoing call ringing event", "call_id", callID, "status", current)
+			return
+		}
 		session.Status = models.CallStatusRinging
 		session.mu.Unlock()
 
@@ -333,6 +343,15 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 	case "accepted", "in_call", "connect":
 		// Stop ringback tone
 		session.mu.Lock()
+		// Replay guard: the ACCEPTED status and the connect event both answer
+		// the call, and either may be replayed. Only the first one records
+		// answered_at and announces it.
+		if session.Status == models.CallStatusAnswered || session.Status == models.CallStatusCompleted {
+			current := session.Status
+			session.mu.Unlock()
+			m.log.Info("Ignoring repeated outgoing call answer event", "call_id", callID, "event", event, "status", current)
+			return
+		}
 		if session.RingbackPlayer != nil {
 			session.RingbackPlayer.Stop()
 			session.RingbackPlayer = nil

@@ -315,13 +315,16 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 	// remembers only the latest edit: replayed after a newer edit of the same
 	// message, it would restore the older text.
 	//
-	// The skipped changes have no such guard, or depend on their order. Calls,
-	// template status updates, call-permission replies and reactions have no
-	// replay guard: run on the first attempt and again on each replay, they
-	// could overwrite newer state with older state or repeat call events.
-	// Inbound messages must not be admitted, and their automatic replies
-	// started, ahead of Meta's replay, and later statuses keep per-message
-	// order by waiting too.
+	// The skipped changes depend on their order. Calls, template status
+	// updates, call-permission replies and reactions ignore an event that is a
+	// replay of, or older than, the state already applied (see
+	// processCallWebhook, processTemplateStatusUpdate,
+	// processCallPermissionReply and handleIncomingReactionEvent), so a copy
+	// that ran before the status on an earlier attempt is not applied again by
+	// each replay; after the status they still wait here, so that they never
+	// run ahead of Meta's replay. Inbound messages must not be admitted, and
+	// their automatic replies started, ahead of Meta's replay, and later
+	// statuses keep per-message order by waiting too.
 	//
 	// As when the 503 ended the POST at the status, a skipped change is
 	// processed only by a replay that no longer has to retry a status, never
@@ -388,7 +391,7 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 					"template_language", change.Value.MessageTemplateLanguage,
 					"waba_id", entry.ID,
 				)
-				go a.processTemplateStatusUpdate(entry.ID, change.Value.Event, change.Value.MessageTemplateName, change.Value.MessageTemplateLanguage, change.Value.Reason)
+				go a.processTemplateStatusUpdate(entry.ID, entry.Time, change.Value.Event, change.Value.MessageTemplateName, change.Value.MessageTemplateLanguage, change.Value.Reason)
 				continue
 			}
 
@@ -598,11 +601,13 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 						a.Log.Error("Failed to parse call permission expiration timestamp", "error", err, "from", msg.From)
 						continue
 					}
+					replyAt, _ := strconv.ParseInt(strings.TrimSpace(msg.Timestamp), 10, 64)
 					go a.processCallPermissionReply(phoneNumberID, msg.From, &CallPermissionReplyData{
 						Response:            cpr.Response,
 						IsPermanent:         cpr.IsPermanent,
 						ExpirationTimestamp: expTS,
 						ResponseSource:      cpr.ResponseSource,
+						RepliedAt:           replyAt,
 					})
 					continue
 				}
@@ -714,9 +719,12 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 		// process exits or the matching outgoing WAMID has not yet committed.
 		// processStatusUpdate also returns nil without a mutation in other
 		// cases, among them a durable tombstone, a duplicate or non-forward
-		// status, an unknown status value and, on a classic account only, a
+		// status, an unknown status value, the WAMID of a ReReply call
+		// permission request or reaction (whatsAppStatusNonMessageSend), and a
 		// WAMID proven absent once its status is older than
-		// whatsAppOrphanStatusGrace (see that constant for the bound). The 503
+		// whatsAppOrphanStatusGrace on a classic account or
+		// whatsAppCoexistenceOrphanStatusGrace on a Coexistence account (see
+		// those constants for the bounds). The 503
 		// is sent only now, so that an smb_message_echoes change after the
 		// status that stores its message is committed in this attempt and
 		// Meta's replay can apply the status. Every other change after the
@@ -890,6 +898,7 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 	orphanTimestampUsable := false
 	orphanSettled := false
 	orphanCoexistenceAccount := false
+	nonMessageSend := ""
 	err = a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
 		if err := database.LockWhatsAppWAMIDScopes(scoped.DB, organizationID, messageID); err != nil {
 			return err
@@ -917,20 +926,36 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 			return nil // durable tombstones reserve the WAMID but accept no replay mutation.
 		}
 		if errors.Is(err, errWhatsAppMessageOwnerNotStored) {
+			// A WAMID that ReReply itself recorded for a send that never
+			// produces a Message (a call permission request or a reaction) can
+			// never gain an owner. Its status is acknowledged at once, on both
+			// account kinds and at any age, without any write.
+			source, sourceErr := scoped.whatsAppStatusNonMessageSend(&account, messageID, status.RecipientID)
+			if sourceErr != nil {
+				return fmt.Errorf("check WhatsApp status non-message send: %w", sourceErr)
+			}
+			if source != "" {
+				nonMessageSend = source
+				return nil
+			}
 			// No Message is a candidate owner of this WAMID yet, but one that
 			// has not committed may still claim it: an early receipt for a
 			// ReReply send inside the grace window, or, on a Coexistence
-			// account, a status that overtook its smb_message_echoes echo,
-			// whose ingestion has no bound short of Meta's own retry horizon.
-			// Keep the error so Meta retries. Only a classic account past the
-			// grace window may acknowledge, and only a proven absent owner;
-			// any row carrying the WAMID keeps failing closed exactly as
-			// before. A stored owner whose dependent lookup misses (for
-			// example a soft-deleted contact) is not this case: its bare
-			// gorm.ErrRecordNotFound is returned below as a real rejection.
+			// account, a status that overtook its smb_message_echoes echo.
+			// Keep the error so Meta retries. Only a proven absent owner past
+			// its account's grace window (whatsAppOrphanStatusGrace on a
+			// classic account, whatsAppCoexistenceOrphanStatusGrace on a
+			// Coexistence account) may be acknowledged; any row carrying the
+			// WAMID keeps failing closed exactly as before. A stored owner
+			// whose dependent lookup misses (for example a soft-deleted
+			// contact) is not this case: its bare gorm.ErrRecordNotFound is
+			// returned below as a real rejection.
 			orphanAge, orphanTimestampUsable, orphanSettled = whatsAppOrphanStatusAge(status.Timestamp, time.Now())
 			orphanCoexistenceAccount = account.IsSMB
-			if account.IsSMB || !orphanSettled {
+			if account.IsSMB {
+				orphanSettled = orphanTimestampUsable && orphanAge >= whatsAppCoexistenceOrphanStatusGrace
+			}
+			if !orphanSettled {
 				return fmt.Errorf("%w: %w", errWhatsAppStatusOwnerPending, err)
 			}
 			absent, probeErr := scoped.whatsAppStatusOwnerAbsent(&account, messageID)
@@ -966,9 +991,10 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 				// Meta's whole retry window.
 				a.Log.Warn("Retrying WhatsApp status without a usable timestamp",
 					append(fields, "timestamp", status.Timestamp)...)
-			case orphanSettled:
-				// Only a Coexistence account defers a settled status; past
-				// the grace window it points at a lagging echo ingestion.
+			case orphanAge >= whatsAppOrphanStatusGrace:
+				// Only a Coexistence account still defers a status past the
+				// classic grace window; there it points at a lagging echo
+				// ingestion, or at a send whose WAMID ReReply never recorded.
 				a.Log.Warn("Deferred WhatsApp status until its message is stored", fields...)
 			default:
 				// An expected wait, not a persistence failure.
@@ -978,6 +1004,24 @@ func (a *App) processStatusUpdate(phoneNumberID string, status WebhookStatus) (r
 		}
 		a.Log.Warn("Rejected WhatsApp status update", "error", err, "phone_id", phoneNumberID, "status_id", messageID)
 		return err
+	}
+	if nonMessageSend != "" {
+		fields := []any{
+			"phone_id", phoneNumberID,
+			"status_id", messageID,
+			"status", status.Status,
+			"send", nonMessageSend,
+		}
+		if len(status.Errors) > 0 {
+			// The send itself failed at Meta (for example a reaction to a
+			// message older than 30 days). Nothing is stored for it, so the
+			// log is the only trace.
+			a.Log.Warn("Acknowledged failed WhatsApp status for a ReReply send that stores no message",
+				append(fields, "errors", status.Errors)...)
+			return nil
+		}
+		a.Log.Info("Acknowledged WhatsApp status for a ReReply send that stores no message", fields...)
+		return nil
 	}
 	if orphanAcknowledged {
 		a.Log.Warn("Acknowledged WhatsApp status for a message ReReply never stored",
@@ -1005,7 +1049,7 @@ var errWhatsAppStatusOwnerPending = errors.New("WhatsApp status owner is not sto
 // early receipt. It applies to classic accounts only: on a Coexistence account
 // the WhatsApp Business app echo that creates the Message has no such bound
 // (it depends on Meta's retries and on our own admission and availability),
-// so there an absent WAMID is never acknowledged.
+// so there only the much longer whatsAppCoexistenceOrphanStatusGrace applies.
 //
 // On a classic account only a ReReply send can create the owner. Every
 // ReReply WhatsApp send that produces a Message commits it as pending (with
@@ -1028,6 +1072,91 @@ var errWhatsAppStatusOwnerPending = errors.New("WhatsApp status owner is not sto
 // within a few minutes. A clock running fast by more than the window would
 // acknowledge genuine early receipts; a slow clock only delays acknowledgement.
 const whatsAppOrphanStatusGrace = 15 * time.Minute
+
+// whatsAppCoexistenceOrphanStatusGrace is the Coexistence counterpart of
+// whatsAppOrphanStatusGrace: a backstop for statuses whose WAMID no tenant
+// Message carries and that whatsAppStatusNonMessageSend does not recognise.
+// On a Coexistence account such a status may have overtaken the
+// smb_message_echoes echo that stores its Message, so it is retried; but some
+// of these WAMIDs can never gain an owner: a send by another app on the
+// number, which Meta never echoes, a ReReply send whose Graph result was lost
+// before its WAMID committed, or a reaction or call permission request whose
+// WAMID could not be recorded.
+//
+// Without a bound such a status is answered 503 for Meta's whole retry window
+// (up to 7 days, at decreasing frequency), and every change after it in the
+// same POST except echoes waits that long and is then lost when Meta stops
+// retrying. Past this window an echo can only still be missing if its own
+// delivery has failed for days; acknowledging then loses at most this
+// receipt step of a Message that the echo still stores, while waiting would
+// hold the rest of the POST for days more. The window rides out a
+// weekend-long outage of echo ingestion. The same absence proof as on a
+// classic account is required, and a status without a usable timestamp is
+// never settled.
+const whatsAppCoexistenceOrphanStatusGrace = 72 * time.Hour
+
+// sentReactionWAMIDsMetadataKey lists, in the metadata of the message a
+// ReReply user reacted to, the WAMIDs Meta returned for those reaction sends
+// (the most recent sentReactionWAMIDsLimit). A reaction produces no Message,
+// so this is the only durable record that its statuses are ReReply's own.
+const (
+	sentReactionWAMIDsMetadataKey = "rereply_sent_reaction_wamids"
+	sentReactionWAMIDsLimit       = 32
+)
+
+// Kinds of ReReply sends that never produce a Message, as named in logs.
+const (
+	whatsAppNonMessageSendCallPermission = "call_permission_request"
+	whatsAppNonMessageSendReaction       = "reaction"
+)
+
+// whatsAppStatusNonMessageSend reports which ReReply send that never produces
+// a Message owns wamid, or "" when none is recorded in the tenant: a call
+// permission request (CallPermission.MessageID, any account of the tenant,
+// soft-deleted rows included) or a reaction (sentReactionWAMIDsMetadataKey on
+// a message of a contact whose phone number is the status's recipient). Meta
+// WAMIDs are globally unique, so a recorded match is proof on its own. A
+// reaction whose recipient carries no phone number, or whose contact stores a
+// different form of it, is not recognised here and falls back to the grace
+// windows. Both lookups use existing indexes: call_permissions by
+// organization, messages by contact.
+func (a *App) whatsAppStatusNonMessageSend(account *models.WhatsAppAccount, wamid, recipientID string) (string, error) {
+	wamid = strings.TrimSpace(wamid)
+	if a == nil || a.DB == nil || account == nil || account.OrganizationID == uuid.Nil || wamid == "" {
+		return "", errors.New("WhatsApp status non-message send lookup is incomplete")
+	}
+	var permissions int64
+	if err := a.DB.Unscoped().Model(&models.CallPermission{}).Where(
+		"organization_id = ? AND BTRIM(message_id) = ?", account.OrganizationID, wamid,
+	).Count(&permissions).Error; err != nil {
+		return "", fmt.Errorf("find call permission request WAMID: %w", err)
+	}
+	if permissions > 0 {
+		return whatsAppNonMessageSendCallPermission, nil
+	}
+
+	recipient := strings.TrimPrefix(strings.TrimSpace(recipientID), "+")
+	if recipient == "" {
+		return "", nil
+	}
+	marker, err := json.Marshal(map[string][]string{sentReactionWAMIDsMetadataKey: {wamid}})
+	if err != nil {
+		return "", err
+	}
+	var reactions int64
+	if err := a.DB.Unscoped().Model(&models.Message{}).Where(
+		`organization_id = ? AND contact_id IN (
+			SELECT id FROM contacts WHERE organization_id = ? AND phone_number IN ?
+		) AND COALESCE(metadata, '{}'::jsonb) @> ?::jsonb`,
+		account.OrganizationID, account.OrganizationID, []string{recipient, "+" + recipient}, string(marker),
+	).Count(&reactions).Error; err != nil {
+		return "", fmt.Errorf("find reaction WAMID: %w", err)
+	}
+	if reactions > 0 {
+		return whatsAppNonMessageSendReaction, nil
+	}
+	return "", nil
+}
 
 // whatsAppStatusClockSkew is how far in the future a status timestamp may lie
 // and still count as a fresh event rather than an unusable one. It only
@@ -1433,8 +1562,16 @@ func (a *App) broadcastCampaignStatusProjection(campaign models.BulkMessageCampa
 	})
 }
 
-// processTemplateStatusUpdate updates template status when Meta sends a status update webhook
-func (a *App) processTemplateStatusUpdate(wabaID, event, templateName, templateLanguage, reason string) {
+// processTemplateStatusUpdate updates template status when Meta sends a status
+// update webhook. eventUnix is the entry's time, the time of the event; a
+// retry resends the same body and so the same time (the Coexistence
+// lifecycle handler orders by it the same way). With a usable time the update is
+// applied only to a template whose updated_at is in an earlier second, or in
+// the same second with a different status, and then moves updated_at forward
+// to the event's second: a replayed or older event never overwrites the status
+// that a newer event, a local edit or submission, or a sync from Meta has
+// already set. Without a time (0) the update applies as before.
+func (a *App) processTemplateStatusUpdate(wabaID string, eventUnix int64, event, templateName, templateLanguage, reason string) {
 	if a.rlsEnabled() && !a.hasTenantScope() {
 		organizationIDs, err := a.resolveWABAOrganizations(wabaID)
 		if err != nil {
@@ -1443,7 +1580,7 @@ func (a *App) processTemplateStatusUpdate(wabaID, event, templateName, templateL
 		}
 		for _, organizationID := range organizationIDs {
 			if err := a.WithTenantApp(organizationID, func(scoped *App) error {
-				scoped.processTemplateStatusUpdate(wabaID, event, templateName, templateLanguage, reason)
+				scoped.processTemplateStatusUpdate(wabaID, eventUnix, event, templateName, templateLanguage, reason)
 				return nil
 			}); err != nil {
 				a.Log.Error("Failed to process tenant template status", "error", err, "organization_id", organizationID)
@@ -1475,10 +1612,23 @@ func (a *App) processTemplateStatusUpdate(wabaID, event, templateName, templateL
 
 	// Update template for each account that has it
 	for _, account := range accounts {
-		// Find and update the template
-		result := a.DB.Model(&models.Template{}).
-			Where("whats_app_account = ? AND name = ? AND language = ?", account.Name, templateName, templateLanguage).
-			Update("status", status)
+		// Find and update the template. The row filter and the order check
+		// are one statement, so concurrent deliveries (each runs in its own
+		// goroutine) cannot interleave between them.
+		query := a.DB.Model(&models.Template{}).
+			Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ?",
+				account.OrganizationID, account.Name, templateName, templateLanguage)
+		updates := map[string]any{"status": status}
+		if eventUnix > 0 {
+			eventAt := time.Unix(eventUnix, 0).UTC()
+			query = query.Where(`(
+					FLOOR(EXTRACT(EPOCH FROM updated_at)) < ?
+					OR (FLOOR(EXTRACT(EPOCH FROM updated_at)) = ? AND status IS DISTINCT FROM ?)
+					OR updated_at IS NULL
+				)`, eventUnix, eventUnix, status)
+			updates["updated_at"] = gorm.Expr("GREATEST(COALESCE(updated_at, ?), ?)", eventAt, eventAt)
+		}
+		result := query.Updates(updates)
 
 		if result.Error != nil {
 			a.Log.Error("Failed to update template status",
@@ -1497,6 +1647,14 @@ func (a *App) processTemplateStatusUpdate(wabaID, event, templateName, templateL
 				"language", templateLanguage,
 				"status", status,
 				"reason", reason,
+			)
+		} else if eventUnix > 0 {
+			a.Log.Info("Template status update not applied: no such template, or not newer than its stored state",
+				"account", account.Name,
+				"template", templateName,
+				"language", templateLanguage,
+				"status", status,
+				"event_time", eventUnix,
 			)
 		}
 	}
