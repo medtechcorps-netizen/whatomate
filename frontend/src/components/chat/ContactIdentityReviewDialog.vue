@@ -60,9 +60,18 @@ const mediaLoading = ref(false)
 const mediaURL = ref('')
 const mediaFileName = ref('')
 type HeldMessageState = 'idle' | 'loading' | 'loaded' | 'none' | 'unavailable'
-const heldMessage = ref<StagedIdentityReviewDetail | null>(null)
+interface HeldCopy {
+  item: StagedIdentityReviewItem
+  detail: StagedIdentityReviewDetail | null
+}
+const heldCopies = ref<HeldCopy[]>([])
+const heldTotal = ref(0)
 const heldMessageState = ref<HeldMessageState>('idle')
+// Set when the latest hold is read-only: no decision can resolve it, so the
+// dialog explains that instead of an error that reloading cannot clear.
+const readOnlyReview = ref('')
 const primaryBSUIDReason = 1
+const heldCopyLimit = 25
 let requestGeneration = 0
 let requestController: AbortController | null = null
 let mediaRequestController: AbortController | null = null
@@ -178,8 +187,10 @@ function resetProtectedState() {
   stagedPage.value = 1
   stagedTotal.value = 0
   stagedDetail.value = null
-  heldMessage.value = null
+  heldCopies.value = []
+  heldTotal.value = 0
   heldMessageState.value = 'idle'
+  readOnlyReview.value = ''
   pendingDecision = null
   closeMediaURL()
 }
@@ -306,11 +317,20 @@ async function loadContactReview() {
         error.value = 'The complete current candidate set could not be verified. No decision is allowed.'
       }
       if (props.canViewStaged) {
-        void loadHeldMessage(nextPreview.snapshot.hold_id, generation, contactID, controller.signal)
+        const holdIDs = Array.isArray(nextPreview.open_hold_ids) && nextPreview.open_hold_ids.length > 0
+          ? nextPreview.open_hold_ids
+          : [nextPreview.snapshot.hold_id]
+        void loadHeldMessages(holdIDs, generation, contactID, controller.signal)
       }
     }
   } catch (requestError) {
     if (generation !== requestGeneration || controller.signal.aborted) return
+    if (isReadOnlyReviewError(requestError)) {
+      // The effective state already loaded stays shown; only the decision is
+      // unavailable.
+      readOnlyReview.value = getErrorMessage(requestError, 'This identity review is read-only.')
+      return
+    }
     state.value = safeFallbackState()
     error.value = getErrorMessage(requestError, 'Identity review state is unavailable. AI remains blocked.')
   } finally {
@@ -321,34 +341,67 @@ async function loadContactReview() {
   }
 }
 
-// The held copy of this review's message, if one was kept out of every
-// conversation. It is context for the decision only; a failure here never
-// blocks or enables a decision.
-async function loadHeldMessage(holdID: string, generation: number, contactID: string, signal: AbortSignal) {
-  heldMessage.value = null
+function errorResponse(error: unknown): { status?: number; data?: { error_type?: unknown } } | undefined {
+  if (typeof error !== 'object' || error === null || !('response' in error)) return undefined
+  const response = (error as { response?: unknown }).response
+  return typeof response === 'object' && response !== null
+    ? response as { status?: number; data?: { error_type?: unknown } }
+    : undefined
+}
+
+function isReadOnlyReviewError(error: unknown): boolean {
+  const response = errorResponse(error)
+  return response?.status === 409 && response.data?.error_type === 'identity_review_read_only'
+}
+
+// Every held copy a decision on this review would close, oldest first, kept
+// out of every conversation. They are context for the decision only: a
+// failure here never blocks or enables a decision.
+async function loadHeldMessages(holdIDs: string[], generation: number, contactID: string, signal: AbortSignal) {
+  heldCopies.value = []
+  heldTotal.value = 0
   heldMessageState.value = 'loading'
   try {
-    const listResponse = await contactsService.listStagedIdentityReviewsForHold(holdID, signal)
+    const listResponse = await contactsService.listStagedIdentityReviewsForHolds(holdIDs, heldCopyLimit, signal)
     if (generation !== requestGeneration || props.contactId !== contactID) return
-    const payload = unwrapItemResponse<{ reviews: StagedIdentityReviewItem[] }>(listResponse)
-    const item = Array.isArray(payload?.reviews) ? payload.reviews[0] : undefined
-    if (!item || item.hold_id !== holdID) {
+    const payload = unwrapItemResponse<{ reviews: StagedIdentityReviewItem[]; total: number }>(listResponse)
+    const wanted = new Set(holdIDs)
+    const items = Array.isArray(payload?.reviews)
+      ? payload.reviews.filter(item => wanted.has(item.hold_id)).slice(0, heldCopyLimit)
+      : []
+    if (items.length === 0) {
       heldMessageState.value = 'none'
       return
     }
-    const detailResponse = await contactsService.getStagedIdentityReview(item.id, signal)
+    const details = await Promise.all(items.map(async item => {
+      try {
+        const detail = unwrapItemResponse<StagedIdentityReviewDetail>(
+          await contactsService.getStagedIdentityReview(item.id, signal),
+        )
+        return detail && detail.id === item.id ? detail : null
+      } catch {
+        return null
+      }
+    }))
     if (generation !== requestGeneration || props.contactId !== contactID) return
-    const detail = unwrapItemResponse<StagedIdentityReviewDetail>(detailResponse)
-    if (!detail || detail.hold_id !== holdID) {
-      heldMessageState.value = 'unavailable'
-      return
-    }
-    heldMessage.value = detail
+    heldCopies.value = items.map((item, index) => ({ item, detail: details[index] }))
+    heldTotal.value = Number.isSafeInteger(payload?.total) && payload.total > items.length ? payload.total : items.length
     heldMessageState.value = 'loaded'
   } catch {
     if (generation !== requestGeneration || signal.aborted) return
     heldMessageState.value = 'unavailable'
   }
+}
+
+function openHeldCopy(item: StagedIdentityReviewItem) {
+  if (!props.canViewStaged) return
+  section.value = 'staged'
+  void loadStagedDetail(item)
+}
+
+function heldCopyMediaLabel(detail: StagedIdentityReviewDetail): string {
+  const kind = detail.media_mime_type || detail.message_type
+  return detail.media_filename ? `${kind} · ${detail.media_filename}` : kind
 }
 
 async function decide() {
@@ -379,6 +432,20 @@ async function decide() {
     if (state.value) emit('resolved', state.value)
   } catch (requestError) {
     if (decisionContextIsCurrent(context)) {
+      const status = errorResponse(requestError)?.status
+      if (status === 409 || status === 422) {
+        // A definite refusal, not an ambiguous failure: never resend this
+        // request ID. Re-read the review so the next choice is made against
+        // its current state.
+        const refusal = getErrorMessage(requestError, 'The review decision was refused.')
+        pendingDecision = null
+        selectedTarget.value = ''
+        decisionInFlightToken = null
+        deciding.value = false
+        await loadContactReview()
+        error.value = refusal
+        return
+      }
       // Retain the exact request ID/body so an ambiguous retry is idempotent.
       error.value = getErrorMessage(requestError, 'The review decision was not confirmed. Retry the same decision.')
     }
@@ -608,6 +675,14 @@ onBeforeUnmount(() => {
             A reviewer with identity-review permission must inspect the complete candidate set. No other contact details are visible here.
           </div>
 
+          <div
+            v-else-if="readOnlyReview"
+            data-testid="identity-review-read-only"
+            class="rounded-xl border border-sky-300/15 bg-sky-300/[0.04] p-3 text-xs leading-5 text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900"
+          >
+            {{ readOnlyReview }}
+          </div>
+
           <div v-else-if="preview" class="space-y-3">
             <div class="flex items-center justify-between gap-3">
               <div>
@@ -620,16 +695,39 @@ onBeforeUnmount(() => {
             </div>
 
             <div data-testid="identity-review-held-message" class="rounded-xl border border-white/10 bg-white/[0.025] p-3 text-xs leading-5 light:border-slate-200 light:bg-slate-50">
-              <p class="font-semibold text-white/80 light:text-slate-800">Held message</p>
-              <template v-if="heldMessageState === 'loaded' && heldMessage">
-                <p class="mt-1 text-[11px] text-white/40 light:text-slate-600">{{ heldMessage.message_type }} · {{ heldMessage.received_at }}</p>
-                <pre data-testid="identity-review-held-message-content" class="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-black/20 p-2 text-white/70 light:bg-white light:text-slate-700">{{ heldMessage.content || '(no text)' }}</pre>
-                <p class="mt-2 text-white/50 light:text-slate-600">Read it before you confirm: once a decision is confirmed, this held copy leaves the review list and is not moved into any conversation.</p>
+              <p class="font-semibold text-white/80 light:text-slate-800">Held messages</p>
+              <template v-if="heldMessageState === 'loaded' && heldCopies.length > 0">
+                <p data-testid="identity-review-held-count" class="mt-1 text-[11px] text-white/40 light:text-slate-600">
+                  {{ heldTotal }} held {{ heldTotal === 1 ? 'message' : 'messages' }}, oldest first<template v-if="heldTotal > heldCopies.length"> · showing the first {{ heldCopies.length }}</template>
+                </p>
+                <ol class="mt-2 space-y-2">
+                  <li
+                    v-for="copy in heldCopies"
+                    :key="copy.item.id"
+                    data-testid="identity-review-held-copy"
+                    class="rounded-lg bg-black/20 p-2 light:bg-white"
+                  >
+                    <p class="text-[11px] text-white/40 light:text-slate-600">{{ copy.item.received_at }} · {{ copy.item.message_type }}</p>
+                    <template v-if="copy.detail && copy.detail.content">
+                      <pre data-testid="identity-review-held-copy-content" class="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words text-white/70 light:text-slate-700">{{ copy.detail.content }}</pre>
+                    </template>
+                    <p v-if="copy.detail && copy.detail.message_type !== 'text'" data-testid="identity-review-held-copy-media" class="mt-1 text-white/55 light:text-slate-600">
+                      Media: {{ heldCopyMediaLabel(copy.detail) }}
+                      <button type="button" class="ml-1 font-medium text-sky-300 underline light:text-sky-700" @click="openHeldCopy(copy.item)">Open in the held queue</button>
+                    </p>
+                    <p v-else-if="!copy.detail" class="mt-1 text-white/45 light:text-slate-600">
+                      This copy could not be loaded.
+                      <button type="button" class="ml-1 font-medium text-sky-300 underline light:text-sky-700" @click="openHeldCopy(copy.item)">Open in the held queue</button>
+                    </p>
+                  </li>
+                </ol>
+                <p v-if="heldTotal > heldCopies.length" class="mt-2 text-white/50 light:text-slate-600">Open the held-message queue to read the remaining {{ heldTotal - heldCopies.length }}.</p>
+                <p class="mt-2 text-white/50 light:text-slate-600">Read these held copies before you confirm: once a decision is confirmed, they leave the review list and are not moved into any conversation.</p>
               </template>
-              <p v-else-if="heldMessageState === 'loading'" class="mt-1 text-white/45 light:text-slate-600">Loading the held message…</p>
+              <p v-else-if="heldMessageState === 'loading'" class="mt-1 text-white/45 light:text-slate-600">Loading the held messages…</p>
               <p v-else-if="heldMessageState === 'none'" class="mt-1 text-white/45 light:text-slate-600">No held copy for this review: a message routed to a proven contact is already in that contact's conversation.</p>
               <p v-else-if="!canViewStaged" class="mt-1 text-white/45 light:text-slate-600">Viewing held messages needs access to the held-message queue.</p>
-              <p v-else class="mt-1 text-white/45 light:text-slate-600">The held message could not be loaded.</p>
+              <p v-else class="mt-1 text-white/45 light:text-slate-600">The held messages could not be loaded.</p>
             </div>
 
             <div
