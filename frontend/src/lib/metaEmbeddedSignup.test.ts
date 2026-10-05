@@ -27,18 +27,26 @@ function createHarness(
   context?: { isCurrent: () => boolean },
   mode: MetaEmbeddedSignupMode = "classic",
 ) {
-  const completed: MetaEmbeddedSignupResult[] = [];
+  const completed: Array<Omit<MetaEmbeddedSignupResult, "diagnostics">> = [];
   const aborted: Array<{
     reason: MetaEmbeddedSignupAbortReason;
     detail?: string;
   }> = [];
+  // Every settled outcome's diagnostics, in order.
+  const diagnostics: string[] = [];
   let settledCount = 0;
   let contextChangedCount = 0;
   const session = createMetaEmbeddedSignupSession({
     mode,
     codeFallbackMs,
-    onComplete: (result) => completed.push(result),
-    onAbort: (reason, detail) => aborted.push({ reason, detail }),
+    onComplete: ({ diagnostics: summary, ...result }) => {
+      diagnostics.push(summary);
+      completed.push(result);
+    },
+    onAbort: (reason, detail, summary) => {
+      diagnostics.push(summary);
+      aborted.push({ reason, detail });
+    },
     onSettled: () => {
       settledCount += 1;
     },
@@ -51,6 +59,7 @@ function createHarness(
   return {
     aborted,
     completed,
+    diagnostics,
     session,
     contextChangedCount: () => contextChangedCount,
     settledCount: () => settledCount,
@@ -373,6 +382,14 @@ describe("createMetaEmbeddedSignupSession", () => {
       ]);
       expect(harness.aborted).toHaveLength(0);
       expect(harness.settledCount()).toBe(1);
+      expect(harness.diagnostics).toHaveLength(1);
+      expect(harness.diagnostics[0]).toContain(
+        "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=",
+      );
+      expect(harness.diagnostics[0]).toMatch(
+        /; coexistence sent code after a 15s wait$/,
+      );
+      expect(harness.diagnostics[0]).not.toMatch(/wrong-version-waba|code-abc/);
     },
   );
 
@@ -407,6 +424,11 @@ describe("createMetaEmbeddedSignupSession", () => {
       ]);
       expect(harness.aborted).toHaveLength(0);
       expect(harness.settledCount()).toBe(1);
+      expect(harness.diagnostics).toEqual([
+        data
+          ? "Meta signup diagnostics: FINISH v=none waba_id=absent waba_ids=absent phone_number_id=present (0s after code); coexistence sent code after a 15s wait"
+          : "Meta signup diagnostics: no WA_EMBEDDED_SIGNUP message received; coexistence sent code after a 15s wait",
+      ]);
     },
   );
 
@@ -628,6 +650,132 @@ describe("createMetaEmbeddedSignupSession", () => {
       },
     ]);
     expect(harness.aborted).toHaveLength(0);
+    expect(harness.diagnostics).toEqual([
+      "Meta signup diagnostics: no WA_EMBEDDED_SIGNUP message received; 1 message(s) ignored from unlisted non-Meta origin; coexistence sent code after a 15s wait",
+    ]);
+  });
+
+  it("reports what Meta sent and what was exchanged, never IDs, codes or raw values", () => {
+    vi.useFakeTimers();
+    const harness = createHarness(50, undefined, "coexistence");
+    const syntheticIds = {
+      phone_number_id: "1000000000000003",
+      waba_id: "1000000000000004",
+      business_id: "1000000000000005",
+    };
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: JSON.stringify({
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "finish<img src=x>",
+        version: "1000000000000004",
+        data: syntheticIds,
+      }),
+    });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_1000000000000004",
+        version: 1000000000000004,
+        data: { waba_ids: ["1000000000000004", "1000000000000006"] },
+      },
+    });
+    // Same payload type from origins outside the allowlist: counted, not used.
+    harness.session.handleMessage({
+      origin: "https://m.facebook.com",
+      data: { type: "WA_EMBEDDED_SIGNUP", event: "FINISH", data: syntheticIds },
+    });
+    harness.session.handleMessage({
+      origin: "https://1000000000000004.example.org",
+      data: { type: "WA_EMBEDDED_SIGNUP", event: "FINISH", data: syntheticIds },
+    });
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: { type: "WA_EMBEDDED_SIGNUP", event: 1000000000000004 },
+    });
+    harness.session.handleLoginResponse({
+      authResponse: { code: "code-1000000000000007" },
+    });
+    vi.advanceTimersByTime(3_000);
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+        version: 3,
+        data: { waba_id: "1000000000000004" },
+      },
+    });
+
+    expect(harness.completed[0]?.wabaId).toBe("1000000000000004");
+    expect(harness.diagnostics).toEqual([
+      "Meta signup diagnostics: " +
+        "UNRECOGNIZED v=invalid waba_id=present waba_ids=absent phone_number_id=present (before code); " +
+        "UNRECOGNIZED v=invalid waba_id=absent waba_ids=2 listed phone_number_id=absent (before code); " +
+        "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=3 waba_id=present waba_ids=absent phone_number_id=absent (3s after code); " +
+        "1 malformed message(s) ignored; " +
+        "1 message(s) ignored from unlisted m.facebook.com; " +
+        "1 message(s) ignored from unlisted non-Meta origin; " +
+        "coexistence sent code+waba_id",
+    ]);
+    expect(harness.diagnostics[0]).not.toMatch(/10000000000|<img|code-/);
+  });
+
+  it("adds diagnostics to a refused Coexistence selection", () => {
+    const harness = createHarness(50, undefined, "coexistence");
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: {
+        type: "WA_EMBEDDED_SIGNUP",
+        event: "FINISH",
+        version: "3",
+        data: { waba_ids: ["waba-a", "waba-b"], phone_number_id: "phone-a" },
+      },
+    });
+    expect(harness.aborted).toEqual([
+      {
+        reason: "error",
+        detail: expect.stringContaining(
+          "more than one selected WhatsApp account",
+        ),
+      },
+    ]);
+    expect(harness.diagnostics).toEqual([
+      'Meta signup diagnostics: FINISH v="3" waba_id=absent waba_ids=2 listed phone_number_id=present (before code); coexistence sent nothing',
+    ]);
+  });
+
+  it("lists at most six messages in diagnostics", () => {
+    const harness = createHarness(50, undefined, "coexistence");
+    for (let index = 0; index < 8; index += 1) {
+      harness.session.handleMessage({
+        origin: facebookOrigin,
+        data: { type: "WA_EMBEDDED_SIGNUP", event: "FINISH", data: {} },
+      });
+    }
+    harness.session.handleMessage({
+      origin: facebookOrigin,
+      data: { type: "WA_EMBEDDED_SIGNUP", event: "CANCEL", data: {} },
+    });
+    expect(harness.diagnostics[0]?.split("; ")).toEqual([
+      ...Array.from(
+        { length: 6 },
+        (_, index) =>
+          `${index === 0 ? "Meta signup diagnostics: " : ""}FINISH v=none waba_id=absent waba_ids=absent phone_number_id=absent (before code)`,
+      ),
+      "3 more not listed",
+      "coexistence sent nothing",
+    ]);
+  });
+
+  it("reports what a Classic exchange sent", () => {
+    const harness = createHarness();
+    harness.session.handleMessage(finishMessage());
+    harness.session.handleLoginResponse({ authResponse: { code: "code-abc" } });
+    expect(harness.diagnostics).toEqual([
+      "Meta signup diagnostics: FINISH v=none waba_id=present waba_ids=absent phone_number_id=present (before code); classic sent code+waba_id+phone_number_id",
+    ]);
   });
 
   it("cleans up the Coexistence deadline if the workspace changes", () => {

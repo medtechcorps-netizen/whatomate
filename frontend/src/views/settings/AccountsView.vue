@@ -463,7 +463,8 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
   let session: MetaEmbeddedSignupSession;
   const handleAbort = (
     reason: MetaEmbeddedSignupAbortReason,
-    detail?: string,
+    detail: string | undefined,
+    diagnostics: string,
   ) => {
     if (reason === "cancelled") {
       toast.error(
@@ -472,14 +473,17 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
           : "Facebook login was cancelled",
       );
     } else {
-      toast.error(detail ? `Facebook error: ${detail}` : "Facebook error");
+      showEmbeddedSignupError(
+        detail ? `Facebook error: ${detail}` : "Facebook error",
+        diagnostics,
+      );
     }
     isConnectingFB.value = false;
   };
 
   session = createMetaEmbeddedSignupSession({
     mode: signupMode,
-    onComplete: ({ code, mode, phoneNumberId, wabaId }) => {
+    onComplete: ({ code, mode, phoneNumberId, wabaId, diagnostics }) => {
       if (!isEmbeddedSignupOrganizationCurrent(signupOrganizationId)) {
         cancelPendingEmbeddedSignup(true);
         return;
@@ -490,6 +494,7 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
         signupOrganizationId,
         phoneNumberId,
         wabaId,
+        diagnostics,
       );
     },
     onAbort: handleAbort,
@@ -521,12 +526,28 @@ function launchWhatsAppSignup(isCoexistence: boolean = true) {
   }
 }
 
+// Embedded Signup diagnostics hold only Meta event names, versions, whether
+// asset IDs were present, timing and what was sent, never IDs, codes or
+// tokens. The toast stays until closed so the operator can report it.
+function showEmbeddedSignupError(message: string, diagnostics?: string) {
+  if (!diagnostics) {
+    toast.error(message);
+    return;
+  }
+  toast.error(message, {
+    description: diagnostics,
+    duration: Infinity,
+    closeButton: true,
+  });
+}
+
 async function exchangeCodeForToken(
   code: string,
   signupMode: MetaEmbeddedSignupMode,
   organizationId: string,
   phoneNumberId?: string,
   wabaId?: string,
+  signupDiagnostics?: string,
 ) {
   if (!isEmbeddedSignupOrganizationCurrent(organizationId)) {
     cancelPendingEmbeddedSignup(true);
@@ -602,7 +623,10 @@ async function exchangeCodeForToken(
       );
       await fetchAccounts();
     } else {
-      toast.error(getErrorMessage(error, "Failed to connect WhatsApp account"));
+      showEmbeddedSignupError(
+        getErrorMessage(error, "Failed to connect WhatsApp account"),
+        signupDiagnostics,
+      );
     }
   } finally {
     if (activeEmbeddedSignupExchange === exchange) {

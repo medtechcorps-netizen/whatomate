@@ -19,6 +19,11 @@ export interface MetaEmbeddedSignupResult {
   mode: MetaEmbeddedSignupMode;
   phoneNumberId?: string;
   wabaId?: string;
+  /**
+   * Privacy-safe summary of the Meta signup messages this session observed
+   * and of what it sent. It never contains an ID, code or token.
+   */
+  diagnostics: string;
 }
 
 export type MetaEmbeddedSignupAbortReason = "cancelled" | "error";
@@ -26,7 +31,11 @@ export type MetaEmbeddedSignupAbortReason = "cancelled" | "error";
 interface MetaEmbeddedSignupSessionOptions {
   mode: MetaEmbeddedSignupMode;
   onComplete: (result: MetaEmbeddedSignupResult) => void;
-  onAbort: (reason: MetaEmbeddedSignupAbortReason, detail?: string) => void;
+  onAbort: (
+    reason: MetaEmbeddedSignupAbortReason,
+    detail: string | undefined,
+    diagnostics: string,
+  ) => void;
   onSettled?: () => void;
   isContextCurrent?: () => boolean;
   onContextChanged?: () => void;
@@ -54,6 +63,81 @@ function nonEmptyString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+// Diagnostics. Production builds drop console output (esbuild.drop in
+// vite.config.ts), so the summary is shown with the error instead. It holds
+// only event names, versions, whether asset IDs were present, timing and what
+// was sent. It never holds an ID, code or token, and it never echoes a value
+// that could carry one.
+const MAX_DIAGNOSTIC_MESSAGES = 6;
+const MAX_DIAGNOSTIC_ORIGINS = 3;
+
+function diagnosticEventName(value: string): string {
+  const upper = value.trim().toUpperCase();
+  // Letters and underscores only, so an echoed name can never carry an ID.
+  return /^[A-Z_]{1,48}$/.test(upper) ? upper : "UNRECOGNIZED";
+}
+
+function diagnosticVersion(value: unknown): string {
+  if (value === undefined) return "none";
+  if (value === null) return "null";
+  if (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value < 1000
+  ) {
+    return String(value);
+  }
+  if (typeof value === "string" && /^[0-9]{1,3}$/.test(value)) {
+    return `"${value}"`;
+  }
+  return "invalid";
+}
+
+function diagnosticPresence(value: unknown): string {
+  if (value === undefined) return "absent";
+  if (value === null) return "null";
+  if (typeof value !== "string") return "invalid";
+  return value.trim() ? "present" : "empty";
+}
+
+function diagnosticListPresence(value: unknown): string {
+  if (value === undefined) return "absent";
+  if (value === null) return "null";
+  if (!Array.isArray(value)) return "invalid";
+  return `${value.length} listed`;
+}
+
+function diagnosticOrigin(origin: string): string {
+  try {
+    const parsed = new URL(origin);
+    const hostname = parsed.hostname.toLowerCase();
+    if (
+      parsed.protocol === "https:" &&
+      /^[a-z0-9.-]{1,253}$/.test(hostname) &&
+      (hostname === "facebook.com" || hostname.endsWith(".facebook.com"))
+    ) {
+      return parsed.port ? `${hostname}:${parsed.port}` : hostname;
+    }
+  } catch {
+    // An unparseable origin is reported generically below.
+  }
+  return "non-Meta origin";
+}
+
+function looksLikeEmbeddedSignupPayload(data: unknown): boolean {
+  let payload: unknown = data;
+  if (typeof payload === "string") {
+    if (!payload.includes("WA_EMBEDDED_SIGNUP")) return false;
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      return false;
+    }
+  }
+  return isRecord(payload) && payload.type === "WA_EMBEDDED_SIGNUP";
 }
 
 export function isAllowedMetaEmbeddedSignupOrigin(origin: string): boolean {
@@ -166,6 +250,62 @@ export function createMetaEmbeddedSignupSession(
   let wabaId: string | undefined;
   let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
+  let codeReceivedAt: number | undefined;
+  const observedMessages: string[] = [];
+  let omittedMessages = 0;
+  let malformedMessages = 0;
+  const unlistedOrigins = new Map<string, number>();
+
+  const recordMessage = (message: EmbeddedSignupMessage) => {
+    if (observedMessages.length >= MAX_DIAGNOSTIC_MESSAGES) {
+      omittedMessages += 1;
+      return;
+    }
+    const data = message.data;
+    const timing =
+      codeReceivedAt === undefined
+        ? "before code"
+        : `${Math.max(0, Math.round((Date.now() - codeReceivedAt) / 1000))}s after code`;
+    observedMessages.push(
+      `${diagnosticEventName(message.event)} v=${diagnosticVersion(message.version)}` +
+        ` waba_id=${diagnosticPresence(data?.waba_id)}` +
+        ` waba_ids=${diagnosticListPresence(data?.waba_ids)}` +
+        ` phone_number_id=${diagnosticPresence(data?.phone_number_id)}` +
+        ` (${timing})`,
+    );
+  };
+
+  const recordUnparsedMessage = (
+    event: Pick<MessageEvent, "data" | "origin">,
+  ) => {
+    if (!looksLikeEmbeddedSignupPayload(event.data)) return;
+    if (isAllowedMetaEmbeddedSignupOrigin(event.origin)) {
+      malformedMessages += 1;
+      return;
+    }
+    const origin = diagnosticOrigin(event.origin);
+    if (
+      unlistedOrigins.has(origin) ||
+      unlistedOrigins.size < MAX_DIAGNOSTIC_ORIGINS
+    ) {
+      unlistedOrigins.set(origin, (unlistedOrigins.get(origin) ?? 0) + 1);
+    }
+  };
+
+  const diagnostics = (outcome: string): string => {
+    const parts = observedMessages.length
+      ? [...observedMessages]
+      : ["no WA_EMBEDDED_SIGNUP message received"];
+    if (omittedMessages) parts.push(`${omittedMessages} more not listed`);
+    if (malformedMessages) {
+      parts.push(`${malformedMessages} malformed message(s) ignored`);
+    }
+    for (const [origin, count] of unlistedOrigins) {
+      parts.push(`${count} message(s) ignored from unlisted ${origin}`);
+    }
+    parts.push(outcome);
+    return `Meta signup diagnostics: ${parts.join("; ")}`;
+  };
 
   const clearFallback = () => {
     if (fallbackTimer !== undefined) {
@@ -189,7 +329,7 @@ export function createMetaEmbeddedSignupSession(
     return false;
   };
 
-  const complete = (allowMissingWabaId: boolean) => {
+  const complete = (allowMissingWabaId: boolean, waitedMs?: number) => {
     if (
       !ensureContextCurrent() ||
       !code ||
@@ -199,11 +339,21 @@ export function createMetaEmbeddedSignupSession(
       return;
     }
 
+    const sent = ["code"];
+    if (wabaId) sent.push("waba_id");
+    if (phoneNumberId) sent.push("phone_number_id");
+    const waited =
+      waitedMs === undefined
+        ? ""
+        : ` after a ${Math.round(waitedMs / 1000)}s wait`;
     options.onComplete({
       code,
       mode: options.mode,
       phoneNumberId,
       wabaId,
+      diagnostics: diagnostics(
+        `${options.mode} sent ${sent.join("+")}${waited}`,
+      ),
     });
   };
 
@@ -215,23 +365,30 @@ export function createMetaEmbeddedSignupSession(
     // for the user's selection, and single-WABA signups keep working when
     // Meta's message is missing or unrecognised. Coexistence waits longer for
     // the message because its tokens often grant previously shared WABAs.
-    fallbackTimer = setTimeout(
-      () => complete(true),
+    const waitMs =
       options.mode === "coexistence"
         ? META_COEXISTENCE_SELECTION_TIMEOUT_MS
-        : (options.codeFallbackMs ?? META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS),
-    );
+        : (options.codeFallbackMs ?? META_EMBEDDED_SIGNUP_CODE_FALLBACK_MS);
+    fallbackTimer = setTimeout(() => complete(true, waitMs), waitMs);
   };
 
   const abort = (reason: MetaEmbeddedSignupAbortReason, detail?: string) => {
     if (!settle()) return;
-    options.onAbort(reason, detail);
+    options.onAbort(
+      reason,
+      detail,
+      diagnostics(`${options.mode} sent nothing`),
+    );
   };
 
   const handleMessage = (event: Pick<MessageEvent, "data" | "origin">) => {
     if (!ensureContextCurrent()) return;
     const message = parseMetaEmbeddedSignupMessage(event);
-    if (!message) return;
+    if (!message) {
+      recordUnparsedMessage(event);
+      return;
+    }
+    recordMessage(message);
 
     const eventName = message.event.toUpperCase();
     if (isExpectedFinishMessage(message, options.mode)) {
@@ -331,6 +488,7 @@ export function createMetaEmbeddedSignupSession(
 
     if (isRecord(response) && isRecord(response.authResponse)) {
       code = nonEmptyString(response.authResponse.code);
+      codeReceivedAt = Date.now();
       if (!code) {
         abort("error", "Meta did not return an authorization code.");
         return;

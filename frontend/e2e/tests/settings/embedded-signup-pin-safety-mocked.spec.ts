@@ -31,6 +31,7 @@ interface EmbeddedSignupMockOptions {
   coexistenceRetryWarning?: string;
   exchangeWarning?: string;
   exchangeDelayMs?: number;
+  exchangeErrorMessage?: string;
   exchangeXHRTimeoutMs?: number;
   metaLoginMode?: MetaLoginMode;
   exposeMultipleOrganizations?: boolean;
@@ -281,6 +282,13 @@ async function installEmbeddedSignupMocks(
           setTimeout(resolve, options.exchangeDelayMs),
         );
       }
+      if (options.exchangeErrorMessage) {
+        capture.exchangeRoutesSettled += 1;
+        return route.fulfill({
+          status: 400,
+          json: { status: "error", message: options.exchangeErrorMessage },
+        });
+      }
       try {
         await route.fulfill({
           json: {
@@ -387,6 +395,10 @@ test("Coexistence never sends IDs from unsupported finish versions and falls bac
 }) => {
   const capture = await installEmbeddedSignupMocks(page, {
     metaLoginMode: "wrong_coexistence_signals",
+    // The server refuses a code-only exchange whose token grants several
+    // WABAs. The UI adds only privacy-safe diagnostics to that refusal.
+    exchangeErrorMessage:
+      "embedded signup token grants access to multiple WhatsApp Business Accounts; reconnect and select exactly one account",
   });
   await page.goto("/settings/accounts");
   await openConnectionMethodDialog(page);
@@ -405,6 +417,62 @@ test("Coexistence never sends IDs from unsupported finish versions and falls bac
       signup_mode: "coexistence",
     },
   ]);
+
+  const refusal = page
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: "multiple WhatsApp Business Accounts" });
+  await expect(refusal).toContainText(
+    "Meta signup diagnostics: " +
+      "FINISH v=2 waba_id=present waba_ids=absent phone_number_id=present (before code); " +
+      "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=2 waba_id=present waba_ids=absent phone_number_id=absent (before code); " +
+      "coexistence sent code after a 15s wait",
+  );
+  await expect(refusal).not.toContainText("wrong-");
+  await expect(refusal).not.toContainText("review-safe-code");
+  // The diagnostic toast stays until the operator closes it.
+  await page.clock.fastForward(60_000);
+  await expect(refusal).toBeVisible();
+});
+
+test("Coexistence refuses an ambiguous Meta selection with privacy-safe diagnostics", async ({
+  page,
+}) => {
+  const capture = await installEmbeddedSignupMocks(page, {
+    metaLoginMode: "pending",
+  });
+  await page.goto("/settings/accounts");
+  await openConnectionMethodDialog(page);
+  await page.getByRole("button", { name: /Sync with Mobile App/i }).click();
+  await page.evaluate(() => {
+    (
+      window as typeof window & {
+        __embeddedSignupLoginCallback?: (response: unknown) => void;
+      }
+    ).__embeddedSignupLoginCallback?.({
+      authResponse: { code: "review-safe-code" },
+    });
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        origin: "https://www.facebook.com",
+        data: JSON.stringify({
+          type: "WA_EMBEDDED_SIGNUP",
+          event: "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING",
+          version: 3,
+          data: { waba_ids: ["1000000000000004", "1000000000000006"] },
+        }),
+      }),
+    );
+  });
+
+  const refusal = page
+    .locator("[data-sonner-toast]")
+    .filter({ hasText: "more than one selected WhatsApp account" });
+  await expect(refusal).toContainText(
+    "Meta signup diagnostics: FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING v=3 waba_id=absent waba_ids=2 listed phone_number_id=absent (0s after code); coexistence sent nothing",
+  );
+  await expect(refusal).not.toContainText("1000000000000");
+  await expect(refusal).not.toContainText("review-safe-code");
+  expect(capture.exchangeRequests).toBe(0);
 });
 
 test("Coexistence preserves the selected account from a delayed standard finish without a version", async ({
