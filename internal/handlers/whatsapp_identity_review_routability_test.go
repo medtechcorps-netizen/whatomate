@@ -2,6 +2,11 @@ package handlers
 
 import (
 	"crypto/sha256"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -25,12 +30,59 @@ var preIdentityReviewRolloutRouteReasons = []string{
 
 func TestWhatsAppIdentityReviewPersistedReasonsStayRollbackSafe(t *testing.T) {
 	t.Parallel()
-	for _, reason := range preIdentityReviewRolloutRouteReasons {
-		assert.True(t, whatsAppIdentityReviewRouteReasonAllowed(reason), reason)
+	// The switch itself must list exactly the previous release's reasons, so
+	// adding any new persisted reason fails here rather than after a rollback.
+	file, err := parser.ParseFile(token.NewFileSet(), "chatbot_processor.go", nil, 0)
+	require.NoError(t, err)
+	var allowed []string
+	found := false
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "whatsAppIdentityReviewRouteReasonAllowed" {
+			continue
+		}
+		found = true
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			clause, ok := node.(*ast.CaseClause)
+			if !ok || len(clause.List) == 0 {
+				return true
+			}
+			returnsTrue := false
+			for _, statement := range clause.Body {
+				if result, ok := statement.(*ast.ReturnStmt); ok && len(result.Results) == 1 {
+					if ident, ok := result.Results[0].(*ast.Ident); ok && ident.Name == "true" {
+						returnsTrue = true
+					}
+				}
+			}
+			if !returnsTrue {
+				return false
+			}
+			for _, expression := range clause.List {
+				literal, ok := expression.(*ast.BasicLit)
+				require.True(t, ok && literal.Kind == token.STRING, "allowed reasons must be string literals")
+				value, unquoteErr := strconv.Unquote(literal.Value)
+				require.NoError(t, unquoteErr)
+				allowed = append(allowed, value)
+			}
+			return false
+		})
 	}
-	for _, reason := range []string{"decision_target_contradicted", "direct_primary_unowned", "direct_primary_ambiguous", "decision_target_missing"} {
-		assert.False(t, whatsAppIdentityReviewRouteReasonAllowed(reason),
-			"%s must never be persisted: the previous release would reject it", reason)
+	require.True(t, found, "whatsAppIdentityReviewRouteReasonAllowed must exist")
+	assert.ElementsMatch(t, preIdentityReviewRolloutRouteReasons, allowed)
+
+	// Every reason the admission can produce is accepted exactly when the
+	// previous release accepts it.
+	produced := []string{
+		"direct_primary_missing", "direct_primary_ambiguous", "primary_parent_conflict",
+		"phone_selector_conflict", "phone_selector_drift", "unique_direct_primary",
+		"unique_direct_primary_drift", "review_open", "another_review_open",
+		"decision_target_missing", "decision_target_contradicted", "reviewed_future_route",
+		"direct_primary_unowned",
+	}
+	for _, reason := range produced {
+		assert.Equal(t, slices.Contains(preIdentityReviewRolloutRouteReasons, reason),
+			whatsAppIdentityReviewRouteReasonAllowed(reason), reason)
 	}
 }
 
@@ -324,4 +376,48 @@ func TestWhatsAppIdentityReviewDecisionForAnotherPrincipalOnAnotherAccountBlocks
 	assert.Nil(t, work)
 	assert.False(t, latestWhatsAppIdentityReviewHoldForBSUID(t, app, organizationID, principal).Supported,
 		"a contact decided for another WhatsApp ID on another number is that user's")
+}
+
+// A decision routing the sender's own parent BSUID to a contact is the same
+// user's decision, so the contact stays routable for the sender; a sibling
+// WhatsApp ID under the same parent is another user, and its decision keeps
+// the contact from the sender.
+func TestWhatsAppIdentityReviewDecisionForTheSendersParentIsTheSameUser(t *testing.T) {
+	for _, variant := range []string{"parent_principal_decided", "sibling_principal_decided"} {
+		t.Run(variant, func(t *testing.T) {
+			app, account, _ := whatsappIdentityFixture(t)
+			organizationID := account.OrganizationID
+			phone := "60" + testutil.NewTestGraphObjectID()[:10]
+			contact := syncPhoneOnlyCoexistenceContact(t, app, account, phone)
+			parent := "US.ENT.parent-" + uuid.NewString()[:8]
+			earlier := coexistenceAdmissionMessage(t, "wamid.earlier-"+uuid.NewString(), phone, parent, "earlier")
+			if variant == "sibling_principal_decided" {
+				earlier = coexistenceAdmissionMessage(t, earlier.ID, phone, "US.sibling-"+uuid.NewString(), "earlier")
+				earlier.FromParentUserID = parent
+			}
+			work, _ := admitCoexistenceAdmissionMessage(t, app, account, earlier, "Earlier")
+			require.Nil(t, work)
+			resolver := createWhatsAppIdentityReviewResolver(t, app.DB, organizationID)
+			earlierHold := latestWhatsAppIdentityReviewHoldForBSUID(t, app, organizationID, earlier.FromUserID)
+			decideWhatsAppIdentityReviewForTest(t, app, app.DB, organizationID, resolver.ID, earlierHold.ID, contact.ID)
+
+			sender := coexistenceAdmissionMessage(t, "wamid.sender-"+uuid.NewString(), phone, "US.child-"+uuid.NewString(), "sender")
+			sender.FromParentUserID = parent
+			work, _ = admitCoexistenceAdmissionMessage(t, app, account, sender, "Sender")
+			require.Nil(t, work)
+			hold := latestWhatsAppIdentityReviewHoldForBSUID(t, app, organizationID, sender.FromUserID)
+			if variant == "sibling_principal_decided" {
+				assert.False(t, hold.Supported, "a sibling WhatsApp ID's decision keeps the contact from the sender")
+				return
+			}
+			require.True(t, hold.Supported, "the sender's own parent decision does not make the contact another user's")
+			resolveLatestContactIdentityReviewForTest(t, app, organizationID, resolver.ID, contact.ID, contact.ID)
+			next := sender
+			next.ID = "wamid.sender-next-" + uuid.NewString()
+			work, _ = admitCoexistenceAdmissionMessage(t, app, account, next, "Sender")
+			require.NotNil(t, work)
+			assert.Equal(t, contact.ID, work.Persisted.ContactID)
+			assert.Equal(t, "reviewed_future_route", work.Persisted.Metadata[incomingIdentityReviewReasonKey])
+		})
+	}
 }

@@ -545,7 +545,8 @@ func (a *App) coexistenceSenderReviewEvidence(
 //     family to another WhatsApp user (identityReviewMembersOfOtherUsers: a
 //     merged contact with another BSUID, stored identity naming another user
 //     or a conflict, or a reviewer's decision routing another principal to
-//     it in this cycle), and no open identity-review hold;
+//     it on any account and in any onboarding cycle), and no open
+//     identity-review hold;
 //   - at least one inbound message stored on this exact contact (not on a
 //     merge alias), not soft-deleted and not placed by identity review, whose
 //     inbound continuation job passes validateInboundContinuationJobProof for
@@ -583,7 +584,8 @@ func (a *App) coexistenceClassicHistoryContact(
 	}
 	// The same family rule that makes a review member unroutable: another
 	// user's BSUID on a merged contact, stored identity naming another user,
-	// or a reviewer's decision for another principal in this cycle.
+	// or a reviewer's decision for another principal on any account and in
+	// any onboarding cycle.
 	otherUsers, err := identityReviewMembersOfOtherUsers(a.DB, claim, []uuid.UUID{contact.ID},
 		map[uuid.UUID]*models.Contact{contact.ID: contact})
 	if err != nil || otherUsers[contact.ID] {

@@ -336,6 +336,27 @@ describe('ContactIdentityReviewDialog', () => {
     expect(mocks.decide.mock.calls[1][1].request_id).toBe('00000000-0000-4000-8000-000000000002')
   })
 
+  it('does not claim a reload when re-reading the refused review fails', async () => {
+    mocks.getState
+      .mockResolvedValueOnce({ data: { data: blocked } })
+      .mockRejectedValueOnce(new Error('network down'))
+    mocks.decide.mockRejectedValueOnce({
+      isAxiosError: true,
+      response: { status: 409, data: { message: 'Identity review state changed; reload and try again' } },
+    })
+    wrapper = mountDialog()
+    await flushPromises()
+
+    await wrapper.findAll('input[name="identity-review-target"]')[1].setValue()
+    await wrapper.get('[data-testid="identity-review-decision"]').trigger('click')
+    await vi.waitFor(() => expect(mocks.getState).toHaveBeenCalledTimes(2))
+    await flushPromises()
+    const alert = wrapper.get('[role="alert"]').text()
+    expect(alert).not.toContain('has been reloaded')
+    expect(alert).toContain('network down')
+    expect(wrapper.get('[data-testid="identity-review-effective-state"]').text()).toBe('AI blocked')
+  })
+
   it('reports a review that another reviewer resolved before this decision', async () => {
     mocks.getState
       .mockResolvedValueOnce({ data: { data: blocked } })
@@ -384,6 +405,8 @@ describe('ContactIdentityReviewDialog', () => {
     expect(sentHoldIDs).toHaveLength(50)
     expect(sentHoldIDs).toEqual(openHoldIDs.slice(-50))
     expect(wrapper.get('[data-testid="identity-review-held-message"]').text()).toContain('29 more held for this review')
+    expect(wrapper.get('[data-testid="identity-review-held-unlisted-generations"]').text())
+      .toContain('10 older open review generations are not listed here')
 
     await wrapper.get('[data-testid="identity-review-held-open-queue"]').trigger('click')
     await flushPromises()

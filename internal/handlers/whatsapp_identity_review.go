@@ -1055,8 +1055,9 @@ func enumerateWhatsAppIdentityReviewCandidates(
 //     parent BSUID;
 //   - its stored Coexistence identity names another user or records an
 //     unresolved identity conflict (coexistenceIdentityMetadataNamesAnotherUser);
-//   - a reviewer's decision routes a different direct BSUID to it, on any
-//     account and in any onboarding cycle of the organization.
+//   - a reviewer's decision routes a direct BSUID other than the claim's
+//     direct or parent BSUID to it, on any account and in any onboarding
+//     cycle of the organization.
 //
 // Routing the claim's principal to such a contact would put two WhatsApp
 // users behind one contact, as a recycled phone number does.
@@ -1094,10 +1095,10 @@ func identityReviewMembersOfOtherUsers(
 	}
 	var decidedForOthers []uuid.UUID
 	if err := db.Model(&models.WhatsAppIdentityReviewHold{}).
-		Where(`organization_id = ? AND disposition = ? AND direct_primary_bsuid <> ?
+		Where(`organization_id = ? AND disposition = ? AND direct_primary_bsuid NOT IN ?
 			AND decision_target_contact_id IN ?`,
 			claim.OrganizationID, models.WhatsAppIdentityReviewDispositionFutureRouting,
-			claim.DirectPrimaryBSUID, contactIDs).
+			allowed, contactIDs).
 		Pluck("decision_target_contact_id", &decidedForOthers).Error; err != nil {
 		return nil, fmt.Errorf("read identity-review decisions for other principals: %w", err)
 	}

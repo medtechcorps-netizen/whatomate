@@ -77,6 +77,9 @@ const heldHoldIDLimit = 50
 // The open generations whose held copies the dialog lists, and, while set,
 // the filter the held queue applies to show only this review's copies.
 const heldHoldIDs = ref<string[]>([])
+// Open generations beyond the newest heldHoldIDLimit: the decision closes
+// them too, but their copies are not listed here.
+const unlistedOpenGenerations = ref(0)
 const stagedHoldFilter = ref<string[]>([])
 let requestGeneration = 0
 let requestController: AbortController | null = null
@@ -197,6 +200,7 @@ function resetProtectedState() {
   heldTotal.value = 0
   heldMessageState.value = 'idle'
   heldHoldIDs.value = []
+  unlistedOpenGenerations.value = 0
   stagedHoldFilter.value = []
   readOnlyReview.value = ''
   pendingDecision = null
@@ -329,6 +333,9 @@ async function loadContactReview() {
           ? nextPreview.open_hold_ids.slice(-heldHoldIDLimit)
           : [nextPreview.snapshot.hold_id]
         heldHoldIDs.value = holdIDs
+        unlistedOpenGenerations.value = Array.isArray(nextPreview.open_hold_ids)
+          ? Math.max(0, nextPreview.open_hold_ids.length - holdIDs.length)
+          : 0
         void loadHeldMessages(holdIDs, generation, contactID, controller.signal)
       }
     }
@@ -470,7 +477,9 @@ async function decide() {
         if (state.value && effectiveAIIsAllowed(state.value)) {
           // Another reviewer resolved it meanwhile.
           emit('resolved', state.value)
-        } else if (!readOnlyReview.value) {
+        } else if (!readOnlyReview.value && !error.value && state.value?.known === true) {
+          // Only claim a reload that succeeded; a failed re-read keeps its
+          // own fail-closed message.
           error.value = refusal
         }
         return
@@ -766,6 +775,9 @@ onBeforeUnmount(() => {
               <p v-else-if="heldMessageState === 'none'" class="mt-1 text-white/45 light:text-slate-600">No held copy for this review: a message routed to a proven contact is already in that contact's conversation.</p>
               <p v-else-if="!canViewStaged" class="mt-1 text-white/45 light:text-slate-600">Viewing held messages needs access to the held-message queue.</p>
               <p v-else class="mt-1 text-white/45 light:text-slate-600">The held messages could not be loaded.</p>
+              <p v-if="unlistedOpenGenerations > 0" data-testid="identity-review-held-unlisted-generations" class="mt-2 text-amber-200/80 light:text-amber-800">
+                {{ unlistedOpenGenerations }} older open {{ unlistedOpenGenerations === 1 ? 'review generation is' : 'review generations are' }} not listed here; the decision closes {{ unlistedOpenGenerations === 1 ? 'it' : 'them' }} too. Read {{ unlistedOpenGenerations === 1 ? 'its' : 'their' }} held messages in the held queue first.
+              </p>
             </div>
 
             <div
