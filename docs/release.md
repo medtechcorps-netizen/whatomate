@@ -190,8 +190,8 @@ Until Stage 2 adds steady-state migrations, any non-test change under
 `internal/database/` or `internal/models/`, the chatbot flow migration file,
 the rls-migrate and startup-contract functions in `cmd/whatomate/main.go`,
 `BackfillLegacyWhatsAppInbox`, or a newly added migration or DDL call in Go
-blocks promotion (`schema-change-blocked`). Reverting the change unblocks.
-Stage 2 lifts the freeze.
+blocks promotion (`schema-change-blocked`). Reverting the change unblocks
+promotion. Stage 2 lifts the freeze.
 
 The `schema-guard` job of the `Test` workflow runs the same check on every
 pull request, so such a change fails the required `test` check before it can
@@ -200,9 +200,20 @@ commit with its merge base on `main`, so only the pull request's own changes
 count, and each push to `main` with its first parent. Split or revert a
 refused pull request. The check cannot see product code that rewrites
 existing rows: such a pull request merges only when the owner says so, with a
-data-change note in its description. It also refuses a pull request that
-reverts a guarded change already on `main`, because the revert edits the same
-paths.
+data-change note in its description.
+
+Two edge cases need care. A pull request that reverts a guarded change
+already on `main` is refused too, because the revert edits the same guarded
+paths. That can only happen if a guarded change reaches `main` despite the
+check (a miss, or a rule added later). To merge the revert, the owner turns
+off admin enforcement in `main`'s branch protection, merges it, turns
+enforcement back on straight away and records both steps in the revert's
+description. And a rebase merge is checked on its last commit only: a pull
+request that adds a guarded edit in one commit and removes it in a later one
+passes, but once rebase-merged its last commit edits the guarded path, so
+merge such a pull request with a merge commit or squash it. Either way the
+push run on `main` for that commit is red, so that commit cannot be promoted
+and promotion waits for the next merge.
 
 ## Secrets and token
 
