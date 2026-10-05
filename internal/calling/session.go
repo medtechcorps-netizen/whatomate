@@ -84,6 +84,11 @@ type CallSession struct {
 	WARemoteTrack  *webrtc.TrackRemote         // WhatsApp's remote audio track
 	SDPAnswerReady chan string                 // webhook delivers SDP answer here
 
+	// appliedOutgoingEvents records the business-initiated call webhook
+	// events (see claimOutgoingCallEvent) already applied to this session, so
+	// that a replayed or late copy is not applied again. Guarded by mu.
+	appliedOutgoingEvents map[string]bool
+
 	mu sync.Mutex
 }
 

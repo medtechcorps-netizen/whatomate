@@ -276,6 +276,38 @@ func (m *Manager) waitForWASDPAnswer(session *CallSession, waPC *webrtc.PeerConn
 	}
 }
 
+// Business-initiated call webhook events, as tracked by
+// claimOutgoingCallEvent. in_call counts as outgoingCallEventAccepted.
+const (
+	outgoingCallEventConnect  = "connect"
+	outgoingCallEventRinging  = "ringing"
+	outgoingCallEventAccepted = "accepted"
+)
+
+// claimOutgoingCallEvent reports whether a business-initiated call webhook
+// event may be applied to the session, and if so marks it applied. Meta sends
+// the connect webhook (carrying the SDP answer) as soon as the call is ready
+// to connect, ahead of the RINGING status and of the ACCEPTED status that
+// marks the user's pick-up, and it replays a whole webhook POST until it is
+// acknowledged. Each event therefore applies once per session; neither
+// connect nor ringing applies once ACCEPTED has (it would be late, and would
+// move the call back from its answer); and nothing applies after the call
+// completed. First deliveries in Meta's order apply exactly as before this
+// guard. The caller holds s.mu.
+func (s *CallSession) claimOutgoingCallEvent(event string) bool {
+	if s.Status == models.CallStatusCompleted || s.appliedOutgoingEvents[event] {
+		return false
+	}
+	if event != outgoingCallEventAccepted && s.appliedOutgoingEvents[outgoingCallEventAccepted] {
+		return false
+	}
+	if s.appliedOutgoingEvents == nil {
+		s.appliedOutgoingEvents = make(map[string]bool, 3)
+	}
+	s.appliedOutgoingEvents[event] = true
+	return true
+}
+
 // HandleOutgoingCallWebhook processes webhook events for outgoing calls.
 func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 	m.mu.RLock()
@@ -301,12 +333,11 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 
 	switch event {
 	case "ringing":
-		// Replay guard: Meta replays a whole POST until it is acknowledged.
-		// Only the first ringing of a call that is still initiating applies;
-		// a replayed or late one must not move an answered call back to
+		// Replay guard (see claimOutgoingCallEvent): a replayed ringing, or
+		// one after the call was accepted, must not move the call back to
 		// ringing or restart the ringback tone.
 		session.mu.Lock()
-		if session.Status != models.CallStatusInitiating {
+		if !session.claimOutgoingCallEvent(outgoingCallEventRinging) {
 			current := session.Status
 			session.mu.Unlock()
 			m.log.Info("Ignoring repeated or late outgoing call ringing event", "call_id", callID, "status", current)
@@ -343,10 +374,15 @@ func (m *Manager) HandleOutgoingCallWebhook(callID, event, sdpAnswer string) {
 	case "accepted", "in_call", "connect":
 		// Stop ringback tone
 		session.mu.Lock()
-		// Replay guard: the ACCEPTED status and the connect event both answer
-		// the call, and either may be replayed. Only the first one records
-		// answered_at and announces it.
-		if session.Status == models.CallStatusAnswered || session.Status == models.CallStatusCompleted {
+		// Replay guard (see claimOutgoingCallEvent): the connect event and
+		// the ACCEPTED status (or in_call) each apply once, so a replay does
+		// not move answered_at or announce the answer again, and a connect
+		// after the ACCEPTED status does not replace its answered_at.
+		answerEvent := outgoingCallEventAccepted
+		if event == "connect" {
+			answerEvent = outgoingCallEventConnect
+		}
+		if !session.claimOutgoingCallEvent(answerEvent) {
 			current := session.Status
 			session.mu.Unlock()
 			m.log.Info("Ignoring repeated outgoing call answer event", "call_id", callID, "event", event, "status", current)

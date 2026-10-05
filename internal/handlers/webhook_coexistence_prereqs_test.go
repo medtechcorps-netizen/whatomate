@@ -490,9 +490,13 @@ func TestIncomingCallWebhookReplayGuard(t *testing.T) {
 	assert.EqualValues(t, 1, logs)
 }
 
-// A business-initiated call's RINGING and ACCEPTED statuses (and its connect
-// event) apply once: a replayed RINGING after the answer does not move the
-// call back to ringing, and a replayed ACCEPTED does not reset answered_at.
+// A business-initiated call's events apply once each, in Meta's documented
+// order: the connect webhook (with the SDP answer) as soon as the call is
+// ready to connect, then the RINGING status, then the ACCEPTED status when the
+// user picks up. The first deliveries apply exactly as before the guard (the
+// connect answers, the RINGING that follows it still rings, the ACCEPTED sets
+// the final answered_at); replays of any of them, or a connect or RINGING
+// after the ACCEPTED, change nothing and are not announced.
 func TestOutgoingCallStatusReplayGuard(t *testing.T) {
 	app := webhookTestApp(t)
 	account := orphanStatusTestAccount(t, app, false)
@@ -515,59 +519,121 @@ func TestOutgoingCallStatusReplayGuard(t *testing.T) {
 	status := func(value string) {
 		app.processCallStatusWebhook(account.PhoneID, WebhookStatus{ID: callLog.WhatsAppCallID, Status: value})
 	}
+	connect := func() {
+		app.processCallWebhook(account.PhoneID, map[string]any{
+			"id": callLog.WhatsAppCallID, "event": "connect", "direction": "BUSINESS_INITIATED",
+		})
+	}
+	stored := func() models.CallLog {
+		var current models.CallLog
+		require.NoError(t, app.DB.First(&current, "id = ?", callLog.ID).Error)
+		return current
+	}
 	const quiet = 300 * time.Millisecond
 
+	connect()
+	assert.Equal(t, []string{appwebsocket.TypeOutgoingCallAnswered}, wsTypes(t, client, quiet),
+		"the connect answers the call, as before the guard")
+	connected := stored()
+	require.NotNil(t, connected.AnsweredAt)
+	connect()
+	assert.Empty(t, wsTypes(t, client, quiet), "a replayed connect is not announced")
+	assert.True(t, connected.AnsweredAt.Equal(*stored().AnsweredAt))
+
 	status("RINGING")
-	assert.Equal(t, []string{appwebsocket.TypeOutgoingCallRinging}, wsTypes(t, client, quiet))
-	status("ACCEPTED")
-	assert.Equal(t, []string{appwebsocket.TypeOutgoingCallAnswered}, wsTypes(t, client, quiet))
-	var answered models.CallLog
-	require.NoError(t, app.DB.First(&answered, "id = ?", callLog.ID).Error)
-	require.NotNil(t, answered.AnsweredAt)
+	assert.Equal(t, []string{appwebsocket.TypeOutgoingCallRinging}, wsTypes(t, client, quiet),
+		"the RINGING that follows the connect still applies")
+	assert.Equal(t, models.CallStatusRinging, stored().Status)
+	status("RINGING")
+	assert.Empty(t, wsTypes(t, client, quiet), "a replayed RINGING is not announced")
 
 	time.Sleep(10 * time.Millisecond)
-	status("RINGING")
 	status("ACCEPTED")
-	app.processCallWebhook(account.PhoneID, map[string]any{
-		"id": callLog.WhatsAppCallID, "event": "connect", "direction": "BUSINESS_INITIATED",
-	})
-	assert.Empty(t, wsTypes(t, client, quiet), "replayed statuses are not announced")
-	var final models.CallLog
-	require.NoError(t, app.DB.First(&final, "id = ?", callLog.ID).Error)
+	assert.Equal(t, []string{appwebsocket.TypeOutgoingCallAnswered}, wsTypes(t, client, quiet))
+	accepted := stored()
+	require.NotNil(t, accepted.AnsweredAt)
+	assert.Equal(t, models.CallStatusAnswered, accepted.Status)
+	assert.True(t, accepted.AnsweredAt.After(*connected.AnsweredAt), "the ACCEPTED status sets the final answered_at")
+
+	time.Sleep(10 * time.Millisecond)
+	status("ACCEPTED")
+	status("RINGING")
+	connect()
+	assert.Empty(t, wsTypes(t, client, quiet), "replayed events are not announced")
+	final := stored()
 	assert.Equal(t, models.CallStatusAnswered, final.Status, "a replayed RINGING does not move the call back")
-	assert.True(t, answered.AnsweredAt.Equal(*final.AnsweredAt), "a replayed ACCEPTED does not reset answered_at")
+	assert.True(t, accepted.AnsweredAt.Equal(*final.AnsweredAt), "a replayed ACCEPTED or connect does not move answered_at")
 	assert.Equal(t, models.CallStatusAnswered, manager.GetSession(callLog.WhatsAppCallID).Status)
 }
 
 // A terminate for a business-initiated call whose session is gone applies
-// once; its replay does not move ended_at or announce the end again.
+// once; its replay does not move ended_at or announce the end again. When the
+// call had already ended (an agent hangup recorded it, or the live session's
+// terminate did), Meta's terminate only corrects the duration, keeps the first
+// ended_at, and is announced once.
 func TestOrphanedOutgoingCallTerminateReplayGuard(t *testing.T) {
 	app := webhookTestApp(t)
 	account := orphanStatusTestAccount(t, app, false)
 	hub, client := replayGuardHub(t, account.OrganizationID)
 	app.WSHub = hub
 	contact := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
-	callLog := createOutgoingCallWebhookTestLog(t, app.DB, account.OrganizationID, contact, "synthetic-orphan-replay")
-	terminate := func() {
+	const quiet = 300 * time.Millisecond
+	terminate := func(callID string, duration int) {
 		app.processCallWebhook(account.PhoneID, map[string]any{
-			"id": callLog.WhatsAppCallID, "event": "terminate", "direction": "BUSINESS_INITIATED", "duration": 42,
+			"id": callID, "event": "terminate", "direction": "BUSINESS_INITIATED", "duration": duration,
 		})
 	}
+	stored := func(id uuid.UUID) models.CallLog {
+		var current models.CallLog
+		require.NoError(t, app.DB.First(&current, "id = ?", id).Error)
+		return current
+	}
 
-	terminate()
-	assert.Equal(t, []string{appwebsocket.TypeOutgoingCallEnded}, wsTypes(t, client, 300*time.Millisecond))
-	var first models.CallLog
-	require.NoError(t, app.DB.First(&first, "id = ?", callLog.ID).Error)
-	require.NotNil(t, first.EndedAt)
-	assert.Equal(t, 42, first.Duration)
+	t.Run("unanswered", func(t *testing.T) {
+		callLog := createOutgoingCallWebhookTestLog(t, app.DB, account.OrganizationID, contact, "synthetic-orphan-replay")
+		terminate(callLog.WhatsAppCallID, 42)
+		assert.Equal(t, []string{appwebsocket.TypeOutgoingCallEnded}, wsTypes(t, client, quiet))
+		first := stored(callLog.ID)
+		require.NotNil(t, first.EndedAt)
+		assert.Equal(t, 42, first.Duration)
+		assert.Equal(t, models.CallStatusMissed, first.Status)
 
-	time.Sleep(10 * time.Millisecond)
-	terminate()
-	assert.Empty(t, wsTypes(t, client, 300*time.Millisecond))
-	var replayed models.CallLog
-	require.NoError(t, app.DB.First(&replayed, "id = ?", callLog.ID).Error)
-	assert.True(t, first.EndedAt.Equal(*replayed.EndedAt))
-	assert.Equal(t, first.Status, replayed.Status)
+		time.Sleep(10 * time.Millisecond)
+		terminate(callLog.WhatsAppCallID, 42)
+		terminate(callLog.WhatsAppCallID, 0)
+		assert.Empty(t, wsTypes(t, client, quiet))
+		replayed := stored(callLog.ID)
+		assert.True(t, first.EndedAt.Equal(*replayed.EndedAt))
+		assert.Equal(t, first.Status, replayed.Status)
+		assert.Equal(t, 42, replayed.Duration)
+	})
+
+	t.Run("after an agent hangup", func(t *testing.T) {
+		callLog := createOutgoingCallWebhookTestLog(t, app.DB, account.OrganizationID, contact, "synthetic-orphan-hangup")
+		answeredAt := time.Now().Add(-time.Minute).Truncate(time.Microsecond)
+		endedAt := time.Now().Add(-10 * time.Second).Truncate(time.Microsecond)
+		require.NoError(t, app.DB.Model(&models.CallLog{}).Where("id = ?", callLog.ID).Updates(map[string]any{
+			"status":          models.CallStatusCompleted,
+			"answered_at":     answeredAt,
+			"ended_at":        endedAt,
+			"duration":        49,
+			"disconnected_by": models.DisconnectedByAgent,
+		}).Error)
+
+		terminate(callLog.WhatsAppCallID, 50)
+		assert.Equal(t, []string{appwebsocket.TypeOutgoingCallEnded}, wsTypes(t, client, quiet),
+			"Meta's duration corrects the one the hangup recorded")
+		corrected := stored(callLog.ID)
+		assert.Equal(t, 50, corrected.Duration)
+		assert.Equal(t, models.CallStatusCompleted, corrected.Status)
+		assert.Equal(t, models.DisconnectedByAgent, corrected.DisconnectedBy)
+		require.NotNil(t, corrected.EndedAt)
+		assert.True(t, endedAt.Equal(*corrected.EndedAt), "the first ended_at is kept")
+
+		terminate(callLog.WhatsAppCallID, 50)
+		assert.Empty(t, wsTypes(t, client, quiet), "the replay is not announced again")
+		assert.Equal(t, 50, stored(callLog.ID).Duration)
+	})
 }
 
 func storedCallPermission(t *testing.T, app *App, id uuid.UUID) models.CallPermission {

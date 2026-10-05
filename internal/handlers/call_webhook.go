@@ -499,9 +499,17 @@ func (a *App) handleOrphanedOutgoingCallEvent(organizationID uuid.UUID, callID, 
 			return
 		}
 
+		// A call that has already ended keeps its first ended_at; this
+		// terminate only corrects its status or duration (Meta's duration
+		// replaces the one an agent hangup computed).
+		endedAt := now
 		updates := map[string]any{
-			"status":   finalStatus,
-			"ended_at": now,
+			"status": finalStatus,
+		}
+		if callLog.EndedAt != nil {
+			endedAt = *callLog.EndedAt
+		} else {
+			updates["ended_at"] = now
 		}
 		if duration > 0 {
 			updates["duration"] = duration
@@ -510,16 +518,27 @@ func (a *App) handleOrphanedOutgoingCallEvent(organizationID uuid.UUID, callID, 
 		if callLog.DisconnectedBy == "" {
 			updates["disconnected_by"] = models.DisconnectedByClient
 		}
-		a.DB.Model(&models.CallLog{}).
+		// The statement repeats the replay guard, so that of two concurrent
+		// deliveries of this terminate only one applies and announces it. A
+		// failed write is logged and announced, as before this guard.
+		result := a.DB.Model(&models.CallLog{}).
 			Where("id = ? AND organization_id = ?", callLog.ID, organizationID).
+			Where("NOT (ended_at IS NOT NULL AND status = ? AND (? <= 0 OR duration = ?))",
+				finalStatus, duration, duration).
 			Updates(updates)
+		if result.Error != nil {
+			a.Log.Error("Failed to record orphaned outgoing call terminate", "error", result.Error, "call_id", callID)
+		} else if result.RowsAffected == 0 {
+			a.Log.Info("Ignoring repeated orphaned outgoing call terminate", "call_id", callID, "status", finalStatus)
+			return
+		}
 
 		a.broadcastCallEvent(callLog.OrganizationID, websocket.TypeOutgoingCallEnded, map[string]any{
 			"call_log_id": callLog.ID.String(),
 			"call_id":     callID,
 			"status":      string(finalStatus),
 			"duration":    duration,
-			"ended_at":    now.Format(time.RFC3339),
+			"ended_at":    endedAt.Format(time.RFC3339),
 		})
 
 		a.Log.Info("Handled orphaned outgoing call terminate", "call_id", callID, "duration", duration)
