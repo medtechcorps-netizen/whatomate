@@ -617,33 +617,45 @@ type CallPermissionReplyData struct {
 	// RepliedAt is the reply message's own timestamp (Unix seconds), which
 	// Meta keeps on its retries; 0 when the payload carries none.
 	RepliedAt int64 `json:"-"`
+	// RequestMessageID is the WAMID of the permission request the reply
+	// answers (the reply message's context.id); "" when the payload has none.
+	RequestMessageID string `json:"-"`
 }
 
 // callPermissionReplyRequestSkew is how much earlier than a permission row's
-// requested_at a reply may be stamped and still answer that request. The row
-// is created only after the Graph send returns (bounded by
-// whatsapp.DefaultTimeout, 30s), while Meta may answer an automatic reply as
-// soon as it accepts the request; the margin also absorbs clock skew.
+// requested_at a reply may be stamped and still answer that request when the
+// reply does not name its request. The row is created only after the Graph
+// send returns (bounded by whatsapp.DefaultTimeout, 30s), while Meta may
+// answer an automatic reply as soon as it accepts the request; the margin also
+// absorbs clock skew.
 const callPermissionReplyRequestSkew = 2 * time.Minute
 
-// callPermissionReplyIsStale reports whether a reply stamped repliedAt must not
-// be applied to permission, the newest permission row of the contact: it is a
-// replay of, or older than, the response already stored (responded_at is the
-// stored reply's own time, or the time it was processed for rows stored
-// before replies were ordered), or it predates the request the row records.
-// A reply without a timestamp is never stale, as before this guard.
-func callPermissionReplyIsStale(permission *models.CallPermission, status models.CallPermissionStatus, repliedAt int64) bool {
-	if permission == nil || repliedAt <= 0 {
-		return false
+// callPermissionReplyNewerCondition is the SQL condition under which a
+// call_permissions row may take a reply stamped repliedAt (Unix seconds, > 0)
+// with status: the row records no response yet, or a response from an earlier
+// second, or from the same second with the other status. A replay of the
+// stored reply, or an older reply, matches neither. responded_at is the stored
+// reply's own time (or, for a row answered before replies were ordered, the
+// time it was processed). When the reply does not name this row's request
+// (answersRow false), an unanswered row also requires that the reply is not
+// older than the request, so that it does not answer a request sent after it.
+//
+// The condition is part of the UPDATE rather than checked against a row read
+// earlier: each delivery runs in its own goroutine, and PostgreSQL re-checks
+// the condition against the row as a concurrent delivery left it. Of two
+// different replies processed concurrently, the newer one is therefore applied
+// whichever commits first, and two copies of one reply apply it once.
+func callPermissionReplyNewerCondition(repliedAt int64, status models.CallPermissionStatus, answersRow bool) (string, []any) {
+	const answeredEarlier = `responded_at IS NOT NULL AND (
+		FLOOR(EXTRACT(EPOCH FROM responded_at)) < ?
+		OR (FLOOR(EXTRACT(EPOCH FROM responded_at)) = ? AND status <> ?)
+	)`
+	if answersRow {
+		return "(responded_at IS NULL OR (" + answeredEarlier + "))", []any{repliedAt, repliedAt, string(status)}
 	}
-	if permission.RespondedAt != nil {
-		stored := permission.RespondedAt.Unix()
-		return repliedAt < stored || (repliedAt == stored && permission.Status == status)
-	}
-	if permission.RequestedAt.IsZero() {
-		return false
-	}
-	return time.Unix(repliedAt, 0).Before(permission.RequestedAt.Add(-callPermissionReplyRequestSkew))
+	notBeforeRequest := time.Unix(repliedAt, 0).Add(callPermissionReplyRequestSkew)
+	return "((responded_at IS NULL AND (requested_at IS NULL OR requested_at <= ?)) OR (" + answeredEarlier + "))",
+		[]any{notBeforeRequest, repliedAt, repliedAt, string(status)}
 }
 
 // processCallPermissionReply handles the call_permission_reply interactive webhook.
@@ -673,73 +685,75 @@ func (a *App) processCallPermissionReply(phoneNumberID, fromPhone string, reply 
 		return
 	}
 
-	// Load the most recent permission request for this contact. If none exists
-	// (e.g. the permission prompt was sent out-of-band by Meta, or the request
-	// went out while outside business calling hours), create one from the reply
-	// so the grant/decline is captured instead of being dropped.
+	repliedAt := usableWhatsAppEventUnix(reply.RepliedAt, time.Now())
+	if reply.RepliedAt != 0 && repliedAt == 0 {
+		a.Log.Warn("Call permission reply has an unusable timestamp; applying it unordered",
+			"contact_id", contact.ID, "replied_at", reply.RepliedAt)
+	}
+
+	// The reply names the request it answers (context.id, the WAMID stored as
+	// CallPermission.message_id), so it updates exactly that row. Without a
+	// context, or for a request ReReply did not record, it falls back to the
+	// contact's most recent request. If none exists (e.g. the permission prompt
+	// was sent out-of-band by Meta, or the request went out while outside
+	// business calling hours), create one from the reply so the grant/decline
+	// is captured instead of being dropped.
 	var permission models.CallPermission
 	isNewPermission := false
-	if err := a.DB.Where("organization_id = ? AND contact_id = ?", account.OrganizationID, contact.ID).
-		Order("created_at DESC").
-		First(&permission).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
+	answersRow := false
+	if requestWAMID := strings.TrimSpace(reply.RequestMessageID); requestWAMID != "" {
+		err := a.DB.Where("organization_id = ? AND contact_id = ? AND BTRIM(message_id) = ?",
+			account.OrganizationID, contact.ID, requestWAMID).
+			Order("created_at DESC").
+			First(&permission).Error
+		switch {
+		case err == nil:
+			answersRow = true
+		case !errors.Is(err, gorm.ErrRecordNotFound):
 			a.Log.Error("Failed to load call permission for reply", "error", err, "contact_id", contact.ID)
 			return
 		}
-		isNewPermission = true
-		permission = models.CallPermission{
-			BaseModel:       models.BaseModel{ID: uuid.New()},
-			OrganizationID:  account.OrganizationID,
-			ContactID:       contact.ID,
-			WhatsAppAccount: account.Name,
-			Status:          models.CallPermissionPending,
+	}
+	if !answersRow {
+		if err := a.DB.Where("organization_id = ? AND contact_id = ?", account.OrganizationID, contact.ID).
+			Order("created_at DESC").
+			First(&permission).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				a.Log.Error("Failed to load call permission for reply", "error", err, "contact_id", contact.ID)
+				return
+			}
+			isNewPermission = true
+			permission = models.CallPermission{
+				BaseModel:       models.BaseModel{ID: uuid.New()},
+				OrganizationID:  account.OrganizationID,
+				ContactID:       contact.ID,
+				WhatsAppAccount: account.Name,
+				Status:          models.CallPermissionPending,
+			}
+			a.Log.Info("No prior permission record for reply; creating one (out-of-band grant)", "contact_id", contact.ID)
 		}
-		a.Log.Info("No prior permission record for reply; creating one (out-of-band grant)", "contact_id", contact.ID)
 	}
 
 	newStatus := models.CallPermissionDeclined
 	if reply.Response == "accept" {
 		newStatus = models.CallPermissionAccepted
 	}
-	// Replay guard: Meta replays a whole POST until it is acknowledged, and
-	// this reply may also arrive after a newer one. Only a reply newer than
-	// the stored response, and not older than the request, is applied.
-	if !isNewPermission && callPermissionReplyIsStale(&permission, newStatus, reply.RepliedAt) {
-		a.Log.Info("Ignoring replayed or older call permission reply",
-			"contact_id", contact.ID,
-			"permission_id", permission.ID,
-			"replied_at", reply.RepliedAt,
-			"stored_status", permission.Status,
-		)
-		return
-	}
-	previousRespondedAt := permission.RespondedAt
 
 	// responded_at records the reply's own time when Meta stamped it, so that
 	// the next reply is ordered against it rather than against the time this
 	// one happened to be processed.
 	now := time.Now()
-	if reply.RepliedAt > 0 {
-		now = time.Unix(reply.RepliedAt, 0)
+	if repliedAt > 0 {
+		now = time.Unix(repliedAt, 0)
 	}
 	permission.RespondedAt = &now
+	permission.Status = newStatus
 
 	var expiresAt *time.Time
-	if reply.Response == "accept" {
-		permission.Status = models.CallPermissionAccepted
-		if reply.ExpirationTimestamp > 0 {
-			t := time.Unix(reply.ExpirationTimestamp, 0)
-			expiresAt = &t
-			permission.ExpiresAt = &t
-		}
-		a.Log.Info("Call permission accepted",
-			"contact_id", contact.ID,
-			"is_permanent", reply.IsPermanent,
-			"expiration", reply.ExpirationTimestamp,
-		)
-	} else {
-		permission.Status = models.CallPermissionDeclined
-		a.Log.Info("Call permission declined", "contact_id", contact.ID)
+	if newStatus == models.CallPermissionAccepted && reply.ExpirationTimestamp > 0 {
+		t := time.Unix(reply.ExpirationTimestamp, 0)
+		expiresAt = &t
+		permission.ExpiresAt = &t
 	}
 
 	if isNewPermission {
@@ -755,21 +769,42 @@ func (a *App) processCallPermissionReply(phoneNumberID, fromPhone string, reply 
 		if expiresAt != nil {
 			updates["expires_at"] = *expiresAt
 		}
-		// Compare-and-set on the responded_at read above, so that a concurrent
-		// delivery of this reply (each runs in its own goroutine) applies and
-		// announces it once.
-		result := a.DB.Model(&models.CallPermission{}).
-			Where("id = ? AND organization_id = ? AND responded_at IS NOT DISTINCT FROM ?",
-				permission.ID, account.OrganizationID, previousRespondedAt).
-			Updates(updates)
+		query := a.DB.Model(&models.CallPermission{}).
+			Where("id = ? AND organization_id = ?", permission.ID, account.OrganizationID)
+		// Replay guard: Meta replays a whole POST until it is acknowledged,
+		// and this reply may also arrive after a newer one. Only a reply newer
+		// than the stored response is applied. A reply without a usable
+		// timestamp cannot be ordered and applies as before this guard.
+		if repliedAt > 0 {
+			condition, args := callPermissionReplyNewerCondition(repliedAt, newStatus, answersRow)
+			query = query.Where(condition, args...)
+		}
+		result := query.Updates(updates)
 		if result.Error != nil {
 			a.Log.Error("Failed to update call permission from reply", "error", result.Error, "permission_id", permission.ID)
 			return
 		}
 		if result.RowsAffected == 0 {
-			a.Log.Info("Call permission changed concurrently; reply not applied", "permission_id", permission.ID)
+			a.Log.Info("Ignoring replayed or older call permission reply",
+				"contact_id", contact.ID,
+				"permission_id", permission.ID,
+				"replied_at", repliedAt,
+				"status", newStatus,
+				"answers_request", answersRow,
+			)
 			return
 		}
+	}
+
+	if newStatus == models.CallPermissionAccepted {
+		a.Log.Info("Call permission accepted",
+			"contact_id", contact.ID,
+			"permission_id", permission.ID,
+			"is_permanent", reply.IsPermanent,
+			"expiration", reply.ExpirationTimestamp,
+		)
+	} else {
+		a.Log.Info("Call permission declined", "contact_id", contact.ID, "permission_id", permission.ID)
 	}
 
 	// Broadcast permission update to agents via WebSocket

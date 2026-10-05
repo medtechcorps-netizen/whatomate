@@ -391,7 +391,7 @@ func TestWebhookTemplateStatusReplayAfterNewerEventIsIgnored(t *testing.T) {
 
 	assert.Equal(t, http.StatusServiceUnavailable, signedWebhookStatusCode(t, app, first))
 	require.Eventually(t, func() bool {
-		return len(logs.lines("info", "Template status update not applied: no such template, or not newer than its stored state")) == 1
+		return len(logs.lines("warn", templateOlderSkippedLog)) == 1
 	}, 10*time.Second, 20*time.Millisecond)
 	assert.Equal(t, "REJECTED", storedTemplate(t, app, template.ID).Status)
 }

@@ -602,12 +602,17 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 						continue
 					}
 					replyAt, _ := strconv.ParseInt(strings.TrimSpace(msg.Timestamp), 10, 64)
+					requestWAMID := ""
+					if msg.Context != nil {
+						requestWAMID = strings.TrimSpace(msg.Context.ID)
+					}
 					go a.processCallPermissionReply(phoneNumberID, msg.From, &CallPermissionReplyData{
 						Response:            cpr.Response,
 						IsPermanent:         cpr.IsPermanent,
 						ExpirationTimestamp: expTS,
 						ResponseSource:      cpr.ResponseSource,
 						RepliedAt:           replyAt,
+						RequestMessageID:    requestWAMID,
 					})
 					continue
 				}
@@ -1163,6 +1168,23 @@ func (a *App) whatsAppStatusNonMessageSend(account *models.WhatsAppAccount, wami
 // chooses the log level: a future timestamp is never settled.
 const whatsAppStatusClockSkew = time.Minute
 
+// whatsAppEventUnixFloor is the earliest value accepted as a webhook event
+// time in Unix seconds (2001-09-09); anything smaller is not one.
+const whatsAppEventUnixFloor = 1_000_000_000
+
+// usableWhatsAppEventUnix returns unix when it is a plausible webhook event
+// time in Unix seconds: not before whatsAppEventUnixFloor and not more than
+// whatsAppStatusClockSkew after now. Otherwise (milliseconds, a far-future or
+// a tiny value) it returns 0, and the caller applies the event without
+// ordering it, as before the replay guards, instead of letting one bad time
+// order every later event of the same object.
+func usableWhatsAppEventUnix(unix int64, now time.Time) int64 {
+	if unix < whatsAppEventUnixFloor || unix > now.Add(whatsAppStatusClockSkew).Unix() {
+		return 0
+	}
+	return unix
+}
+
 // whatsAppOrphanStatusAge reports the age of a status event, whether its
 // timestamp is usable, and whether it is past whatsAppOrphanStatusGrace. A
 // missing, malformed, zero or future timestamp is never settled, so such a
@@ -1562,16 +1584,41 @@ func (a *App) broadcastCampaignStatusProjection(campaign models.BulkMessageCampa
 	})
 }
 
+// templateReviewDecisionTolerance is how much older than a PENDING
+// template's updated_at a review decision (APPROVED or REJECTED) may be
+// stamped and still be applied. updated_at is written by local saves on the
+// server's clock, not only by Meta's events: Meta may decide while the create
+// call is still returning, so its decision can carry an earlier second than
+// the local PENDING save that follows, and editing a PENDING template (which
+// keeps its status) moves updated_at too. A decision on an earlier version can
+// only reach a PENDING template again after a person edited and resubmitted
+// it, so inside this window such a replay is unlikely; outside it a decision
+// older than the stored state is still skipped (logged at Warn when the
+// stored status differs; a template Sync from Meta corrects it).
+const templateReviewDecisionTolerance = 5 * time.Minute
+
 // processTemplateStatusUpdate updates template status when Meta sends a status
 // update webhook. eventUnix is the entry's time, the time of the event; a
 // retry resends the same body and so the same time (the Coexistence
 // lifecycle handler orders by it the same way). With a usable time the update is
 // applied only to a template whose updated_at is in an earlier second, or in
-// the same second with a different status, and then moves updated_at forward
-// to the event's second: a replayed or older event never overwrites the status
-// that a newer event, a local edit or submission, or a sync from Meta has
-// already set. Without a time (0) the update applies as before.
+// the same second with a different status, or, for a review decision on a
+// PENDING template, at most templateReviewDecisionTolerance after the event,
+// and then moves updated_at forward to the event's second if it is earlier: a
+// replayed or older event never overwrites the status that a newer event, a
+// local edit or submission, or a sync from Meta has already set. Without a
+// usable time (0, or one usableWhatsAppEventUnix rejects) the update applies
+// as before.
 func (a *App) processTemplateStatusUpdate(wabaID string, eventUnix int64, event, templateName, templateLanguage, reason string) {
+	if eventUnix != 0 && usableWhatsAppEventUnix(eventUnix, time.Now()) == 0 {
+		a.Log.Warn("Template status update has an unusable event time; applying it unordered",
+			"waba_id", wabaID,
+			"template", templateName,
+			"language", templateLanguage,
+			"event_time", eventUnix,
+		)
+		eventUnix = 0
+	}
 	if a.rlsEnabled() && !a.hasTenantScope() {
 		organizationIDs, err := a.resolveWABAOrganizations(wabaID)
 		if err != nil {
@@ -1615,17 +1662,24 @@ func (a *App) processTemplateStatusUpdate(wabaID string, eventUnix int64, event,
 		// Find and update the template. The row filter and the order check
 		// are one statement, so concurrent deliveries (each runs in its own
 		// goroutine) cannot interleave between them.
-		query := a.DB.Model(&models.Template{}).
-			Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ?",
-				account.OrganizationID, account.Name, templateName, templateLanguage)
+		templateRow := func() *gorm.DB {
+			return a.DB.Model(&models.Template{}).
+				Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ?",
+					account.OrganizationID, account.Name, templateName, templateLanguage)
+		}
+		query := templateRow()
 		updates := map[string]any{"status": status}
 		if eventUnix > 0 {
 			eventAt := time.Unix(eventUnix, 0).UTC()
-			query = query.Where(`(
-					FLOOR(EXTRACT(EPOCH FROM updated_at)) < ?
-					OR (FLOOR(EXTRACT(EPOCH FROM updated_at)) = ? AND status IS DISTINCT FROM ?)
-					OR updated_at IS NULL
-				)`, eventUnix, eventUnix, status)
+			newer := `FLOOR(EXTRACT(EPOCH FROM updated_at)) < ?
+				OR (FLOOR(EXTRACT(EPOCH FROM updated_at)) = ? AND status IS DISTINCT FROM ?)
+				OR updated_at IS NULL`
+			args := []any{eventUnix, eventUnix, status}
+			if status == "APPROVED" || status == "REJECTED" {
+				newer += ` OR (status = 'PENDING' AND FLOOR(EXTRACT(EPOCH FROM updated_at)) <= ?)`
+				args = append(args, eventUnix+int64(templateReviewDecisionTolerance/time.Second))
+			}
+			query = query.Where("("+newer+")", args...)
 			updates["updated_at"] = gorm.Expr("GREATEST(COALESCE(updated_at, ?), ?)", eventAt, eventAt)
 		}
 		result := query.Updates(updates)
@@ -1649,15 +1703,47 @@ func (a *App) processTemplateStatusUpdate(wabaID string, eventUnix int64, event,
 				"reason", reason,
 			)
 		} else if eventUnix > 0 {
-			a.Log.Info("Template status update not applied: no such template, or not newer than its stored state",
-				"account", account.Name,
-				"template", templateName,
-				"language", templateLanguage,
-				"status", status,
-				"event_time", eventUnix,
-			)
+			a.logSkippedTemplateStatusUpdate(templateRow(), account.Name, templateName, templateLanguage, status, eventUnix)
 		}
 	}
+}
+
+// logSkippedTemplateStatusUpdate logs a template status event that the order
+// check did not apply. A replay of the stored status is routine (Info). A
+// different status is either an older event (a replay after a newer one) or a
+// genuine event whose delivery was delayed past a local save of the template;
+// Warn makes the second case visible, and a template Sync corrects it.
+func (a *App) logSkippedTemplateStatusUpdate(templateRow *gorm.DB, accountName, templateName, templateLanguage, status string, eventUnix int64) {
+	var stored struct {
+		Status    string
+		UpdatedAt time.Time
+	}
+	if err := templateRow.Select("status", "updated_at").Take(&stored).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			a.Log.Error("Failed to read template after a skipped status update",
+				"error", err, "account", accountName, "template", templateName, "language", templateLanguage)
+		}
+		return
+	}
+	if stored.Status == status {
+		a.Log.Info("Template status update not applied: not newer than its stored state",
+			"account", accountName,
+			"template", templateName,
+			"language", templateLanguage,
+			"status", status,
+			"event_time", eventUnix,
+		)
+		return
+	}
+	a.Log.Warn("Template status update older than the stored template was not applied; sync templates if Meta's status differs",
+		"account", accountName,
+		"template", templateName,
+		"language", templateLanguage,
+		"status", status,
+		"stored_status", stored.Status,
+		"stored_updated_at", stored.UpdatedAt.Unix(),
+		"event_time", eventUnix,
+	)
 }
 
 // verifyMetaWebhookPayload verifies every dispatch target with its current

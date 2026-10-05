@@ -352,7 +352,7 @@ func TestWebhookReplayedPOSTAppliesTemplateStatusOnce(t *testing.T) {
 		retryPOSTTemplateStatusChange(template, "APPROVED"),
 		retryPOSTStatusChange(account, orphanStatusAt(pending, "read", time.Now())),
 	)
-	const notApplied = "Template status update not applied: no such template, or not newer than its stored state"
+	const notApplied = templateReplaySkippedLog
 
 	deliverReplayedPOST(t, app, body, 1)
 	require.Eventually(t, func() bool { return storedTemplate(t, app, template.ID).Status == "APPROVED" },
