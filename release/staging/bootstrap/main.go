@@ -13,10 +13,11 @@
 //   - database.migration_url and database.url are both set, connect to the
 //     same database as two different roles with current_user = session_user,
 //     and database.url connects as database.runtime_role;
+//   - the server runs a PostgreSQL major the database package authorizes
+//     (14 or 17);
 //   - the owner is not a superuser, and the runtime role is NOSUPERUSER,
 //     NOCREATEROLE, NOBYPASSRLS and NOREPLICATION and is not a member of a
-//     role with any of those attributes (ApplyTenantRLS's own gate, checked
-//     here before the schema exists);
+//     role with any of those attributes;
 //   - no role other than the owner is a direct or transitive member of the
 //     owner or of the runtime role (the membership preflight). The platform
 //     compliance verifier counts every such member, so it would otherwise
@@ -25,11 +26,22 @@
 //     creates, so an owner role that doadmin created is refused here; the
 //     owner's own membership in the runtime role (doadmin created it) is
 //     allowed, as the verifier allows it;
+//   - the owner's sessions start with session_replication_role = origin, the
+//     runtime role can neither set session_replication_role nor has it
+//     configured, and the owner's default privileges give the runtime role
+//     no TRUNCATE, REFERENCES, TRIGGER or MAINTAIN on new tables;
+//   - the owner owns the database, so no third role holds it or (on
+//     PostgreSQL 15+, through pg_database_owner) its public schema, and the
+//     owner can create in that schema;
 //   - the default administrator is not admin@admin.com (which the migration
 //     makes a super admin) and its password is neither config.example.toml's
 //     nor shorter than 16 characters;
 //   - the public schema holds no relation, function or type, so a production
 //     database, or one this tool already built, is refused by construction.
+//
+// The version, role, session_replication_role and default-privilege checks
+// are ApplyTenantRLS's own gates (internal/database/tenant.go), which would
+// otherwise fire only after the schema has been written.
 //
 // Then, as the owner, it creates the legacy chatbot_flow_steps table that
 // production still carries, runs database.RunMigrationWithProgress with the
@@ -88,6 +100,9 @@ const (
 
 var (
 	allowedEnvironments = map[string]bool{"staging": true, "test": true}
+	// releaseMajors are the PostgreSQL majors supportedPostgresMajor in
+	// internal/database/postgres.go authorizes; main_test.go keeps them equal.
+	releaseMajors = map[int]bool{14: true, 17: true}
 	// Same rule as the database package's identifier check.
 	roleIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)
 )
@@ -326,6 +341,16 @@ func preflight(owner, runtime *gorm.DB, runtimeRole string) error {
 		return refuse("database.migration_url and database.url name different databases")
 	}
 
+	var major int
+	if err := owner.Raw(
+		"SELECT pg_catalog.current_setting('server_version_num')::integer / 10000",
+	).Scan(&major).Error; err != nil {
+		return refuse("cannot read the PostgreSQL version%s", sqlState(err))
+	}
+	if !releaseMajors[major] {
+		return refuse("PostgreSQL %d is not a release-authorized major (14 or 17)", major)
+	}
+
 	var roles roleState
 	if err := owner.Raw(`
 		SELECT
@@ -397,6 +422,10 @@ func preflight(owner, runtime *gorm.DB, runtimeRole string) error {
 			members.OwnerMembers, members.RuntimeMembers)
 	}
 
+	if err := checkAuthority(owner, runtimeRole, major); err != nil {
+		return err
+	}
+
 	public, err := readPublicSchema(owner)
 	if err != nil {
 		return refuse("cannot inspect the public schema%s", sqlState(err))
@@ -404,9 +433,140 @@ func preflight(owner, runtime *gorm.DB, runtimeRole string) error {
 	if public.Schemas != 1 {
 		return refuse("the public schema is missing")
 	}
+	var creatable bool
+	if err := owner.Raw(`
+		SELECT COALESCE(pg_catalog.bool_or(pg_catalog.has_schema_privilege(namespace.oid, 'CREATE')), false)
+		FROM pg_catalog.pg_namespace AS namespace
+		WHERE namespace.nspname = 'public'
+	`).Scan(&creatable).Error; err != nil {
+		return refuse("cannot read the public schema's privileges%s", sqlState(err))
+	}
+	if !creatable {
+		return refuse("the migration owner cannot create in the public schema")
+	}
 	if public.Relations != 0 || public.Functions != 0 || public.Types != 0 {
 		return refuse("public schema is not empty relations=%d functions=%d types=%d",
 			public.Relations, public.Functions, public.Types)
+	}
+	return nil
+}
+
+type authority struct {
+	OwnsDatabase         bool   `gorm:"column:owns_database"`
+	OwnerReplicationRole string `gorm:"column:owner_replication_role"`
+	RuntimeReplication   bool   `gorm:"column:runtime_replication_configured"`
+	RuntimeDefaultGrants int64  `gorm:"column:runtime_default_grants"`
+}
+
+// checkAuthority mirrors ApplyTenantRLS's session_replication_role and
+// default-privilege gates (internal/database/tenant.go, which calls
+// roleCanSetSessionReplicationRole and
+// verifyNoDangerousRuntimeDefaultTablePrivileges in postgres.go), and
+// requires the owner to own the database: ApplyTenantRLS does not check that,
+// but a third role that owns the database could create in its public schema.
+// It never writes.
+func checkAuthority(owner *gorm.DB, runtimeRole string, major int) error {
+	var state authority
+	if err := owner.Raw(`
+		WITH owner_role AS (
+			SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user
+		), runtime_role AS (
+			SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ?
+		)
+		SELECT
+			COALESCE((
+				SELECT database.datdba = owner_role.oid
+				FROM pg_catalog.pg_database AS database, owner_role
+				WHERE database.datname = pg_catalog.current_database()
+			), false) AS owns_database,
+			pg_catalog.current_setting('session_replication_role') AS owner_replication_role,
+			EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_db_role_setting AS role_setting
+				CROSS JOIN LATERAL pg_catalog.pg_options_to_table(role_setting.setconfig)
+				  AS option(option_name, option_value)
+				WHERE role_setting.setrole IN (0::oid, (SELECT oid FROM runtime_role))
+				  AND role_setting.setdatabase IN (
+					0::oid,
+					(SELECT database.oid FROM pg_catalog.pg_database AS database
+					 WHERE database.datname = pg_catalog.current_database())
+				  )
+				  AND option.option_name = 'session_replication_role'
+				  AND option.option_value <> 'origin'
+			) AS runtime_replication_configured,
+			(
+				SELECT COUNT(*)
+				FROM pg_catalog.pg_default_acl AS defaults
+				CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS grant_state
+				CROSS JOIN owner_role
+				CROSS JOIN runtime_role
+				WHERE defaults.defaclrole = owner_role.oid
+				  AND defaults.defaclobjtype = 'r'
+				  AND (
+					defaults.defaclnamespace = 0
+					OR defaults.defaclnamespace = (
+						SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'public'
+					)
+				  )
+				  AND grant_state.privilege_type IN ('TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN')
+				  AND (
+					grant_state.grantee = 0
+					OR grant_state.grantee = runtime_role.oid
+					OR pg_catalog.pg_has_role(runtime_role.oid, grant_state.grantee, 'MEMBER')
+				  )
+			) AS runtime_default_grants
+	`, runtimeRole).Scan(&state).Error; err != nil {
+		return refuse("cannot read the migration owner's authority%s", sqlState(err))
+	}
+	if state.OwnerReplicationRole != "origin" {
+		return refuse("the migration owner's session_replication_role is not origin")
+	}
+	settable := false
+	// PostgreSQL 14 has no parameter privileges.
+	if major != 14 {
+		if err := owner.Raw(`
+			WITH RECURSIVE settable_role(role_oid, path, can_set) AS (
+				SELECT role.oid, ARRAY[role.oid]::oid[], true
+				FROM pg_catalog.pg_roles AS role
+				WHERE role.rolname = ?
+				UNION ALL
+				SELECT membership.roleid,
+					settable_role.path || membership.roleid,
+					settable_role.can_set AND COALESCE(
+						(pg_catalog.to_jsonb(membership)->>'set_option')::boolean,
+						true
+					)
+				FROM settable_role
+				JOIN pg_catalog.pg_auth_members AS membership
+				  ON membership.member = settable_role.role_oid
+				WHERE NOT membership.roleid = ANY(settable_role.path)
+			)
+			SELECT EXISTS (
+				SELECT 1
+				FROM settable_role
+				WHERE can_set
+				  AND (
+					pg_catalog.has_parameter_privilege(
+						CAST(role_oid AS oid), 'session_replication_role', 'SET'
+					)
+					OR pg_catalog.has_parameter_privilege(
+						CAST(role_oid AS oid), 'session_replication_role', 'ALTER SYSTEM'
+					)
+				  )
+			)
+		`, runtimeRole).Scan(&settable).Error; err != nil {
+			return refuse("cannot read the runtime role's parameter privileges%s", sqlState(err))
+		}
+	}
+	if state.RuntimeReplication || settable {
+		return refuse("the runtime role can set or has configured session_replication_role")
+	}
+	if state.RuntimeDefaultGrants != 0 {
+		return refuse("the migration owner's default privileges give the runtime role dangerous table grants=%d",
+			state.RuntimeDefaultGrants)
+	}
+	if !state.OwnsDatabase {
+		return refuse("the migration owner does not own the database")
 	}
 	return nil
 }

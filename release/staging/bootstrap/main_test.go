@@ -182,6 +182,29 @@ func TestBackfillsMatchRunRLSMigration(t *testing.T) {
 	}, tool.steps(tool.function(t, "backfill").Body))
 }
 
+// TestReleaseMajorsMatchTheDatabasePackage keeps releaseMajors equal to the
+// majors supportedPostgresMajor accepts (its "version != N" comparisons).
+func TestReleaseMajorsMatchTheDatabasePackage(t *testing.T) {
+	source := parseGoFile(t, filepath.Join(repositoryRoot, "internal", "database", "postgres.go"))
+	authorized := map[int]bool{}
+	ast.Inspect(source.function(t, "supportedPostgresMajor").Body, func(node ast.Node) bool {
+		comparison, ok := node.(*ast.BinaryExpr)
+		if !ok || comparison.Op != token.NEQ {
+			return true
+		}
+		literal, ok := comparison.Y.(*ast.BasicLit)
+		if !ok || literal.Kind != token.INT {
+			return true
+		}
+		major, err := strconv.Atoi(literal.Value)
+		require.NoError(t, err)
+		authorized[major] = true
+		return true
+	})
+	require.NotEmpty(t, authorized, "supportedPostgresMajor changed shape; update this test")
+	require.Equal(t, authorized, releaseMajors)
+}
+
 type goFile struct {
 	path    string
 	file    *ast.File
@@ -618,6 +641,70 @@ func TestPublicSchemaRefusals(t *testing.T) {
 		shape := newDOShape(t)
 		require.NoError(t, shape.open(shape.superuserURL(shape.database)).Exec("DROP SCHEMA public").Error)
 		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime, "the public schema is missing")
+	})
+}
+
+// ApplyTenantRLS's session_replication_role and default-privilege gates,
+// checked before any write.
+func TestAuthorityRefusals(t *testing.T) {
+	t.Run("the owner's sessions start in replica mode", func(t *testing.T) {
+		shape := newDOShape(t)
+		shape.exec("ALTER ROLE " + shape.owner + " IN DATABASE " + shape.database + " SET session_replication_role = 'replica'")
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the migration owner's session_replication_role is not origin")
+	})
+	t.Run("the runtime role has session_replication_role configured", func(t *testing.T) {
+		shape := newDOShape(t)
+		shape.exec("ALTER ROLE " + shape.runtime + " SET session_replication_role = 'replica'")
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the runtime role can set or has configured session_replication_role")
+	})
+	t.Run("the runtime role may set session_replication_role", func(t *testing.T) {
+		shape := newDOShape(t)
+		shape.exec("GRANT SET ON PARAMETER session_replication_role TO " + shape.runtime)
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the runtime role can set or has configured session_replication_role")
+	})
+	t.Run("the runtime role may set session_replication_role through a role", func(t *testing.T) {
+		shape := newDOShape(t)
+		setter, _ := shape.role("replication_setter", "NOSUPERUSER", "")
+		shape.exec("GRANT SET ON PARAMETER session_replication_role TO "+setter, "GRANT "+setter+" TO "+shape.runtime)
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the runtime role can set or has configured session_replication_role")
+	})
+	t.Run("the owner's default privileges on public give the runtime role TRUNCATE", func(t *testing.T) {
+		shape := newDOShape(t)
+		require.NoError(t, shape.open(shape.ownerURL()).Exec(
+			"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT TRUNCATE ON TABLES TO "+shape.runtime).Error)
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the migration owner's default privileges give the runtime role dangerous table grants=1")
+	})
+	t.Run("the owner's default privileges give PUBLIC TRIGGER everywhere", func(t *testing.T) {
+		shape := newDOShape(t)
+		require.NoError(t, shape.open(shape.ownerURL()).Exec(
+			"ALTER DEFAULT PRIVILEGES GRANT TRIGGER ON TABLES TO PUBLIC").Error)
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the migration owner's default privileges give the runtime role dangerous table grants=1")
+	})
+}
+
+func TestDatabaseOwnershipRefusals(t *testing.T) {
+	t.Run("the owner does not own the database", func(t *testing.T) {
+		shape := newDOShape(t)
+		other, _ := shape.role("other_owner", "NOSUPERUSER", "")
+		shape.database = shape.cluster.database("rereply_unowned", other)
+		// So that only the ownership check can refuse it.
+		require.NoError(t, shape.open(shape.superuserURL(shape.database)).Exec(
+			"GRANT CREATE ON SCHEMA public TO "+shape.owner).Error)
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the migration owner does not own the database")
+	})
+	t.Run("the owner cannot create in the public schema", func(t *testing.T) {
+		shape := newDOShape(t)
+		require.NoError(t, shape.open(shape.superuserURL(shape.database)).Exec(
+			"ALTER SCHEMA public OWNER TO CURRENT_USER").Error)
+		shape.refused(shape.ownerURL(), shape.runtimeURL(), shape.runtime,
+			"the migration owner cannot create in the public schema")
 	})
 }
 
