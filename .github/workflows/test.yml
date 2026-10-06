@@ -40,6 +40,82 @@ jobs:
           set -euo pipefail
           python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v
 
+  # Stage 1's interim schema freeze (release/deployment/schema_change.py) at
+  # pull-request time. A change the Release plan would refuse with
+  # schema-change-blocked fails here, through the required 'test' check,
+  # before it can merge and leave main unpromotable. A pull request is checked
+  # from its merge base with main to GitHub's merge commit, so only its own
+  # changes count; a push to main is checked against its first parent, so
+  # the job always runs and the aggregator needs no exception.
+  # test_ci_workflows.py runs this script against synthetic repositories.
+  schema-guard:
+    name: schema-guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse guarded database changes
+        run: |
+          set -euo pipefail
+          python3 -B - <<'GUARD'
+          import os, sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("release/deployment").resolve()))
+          import release_record
+          import schema_change
+          import ship_common as common
+
+          MESSAGE = "guarded database code changed; it cannot be promoted in Part A; split or revert"
+          REPO = Path.cwd()
+
+          def commit(*args):
+              raw = release_record.git_output(REPO, list(args), code="git-failed:schema-guard")
+              return common.require_sha1(raw.decode("ascii", "replace").strip(), "git-failed:schema-guard")
+
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          try:
+              head = commit("rev-parse", "--verify", "HEAD^{commit}")
+              if event == "pull_request":
+                  # The checkout is GitHub's merge of the pull request into
+                  # main; its merge base with main is the main commit it was
+                  # merged onto, so commits already on main never count. It
+                  # names the full ref: a tag origin/main would win the short one.
+                  base = commit("merge-base", "refs/remotes/origin/main", head)
+              elif event == "push":
+                  base = commit("rev-parse", "--verify", head + "^1^{commit}")
+              else:
+                  common.fail("context-invalid:event")
+              reasons = schema_change.check(REPO, base, head)
+          except common.ReleaseError as error:
+              print("schema guard failed closed: %s" % error)
+              sys.exit(1)
+          print("schema guard: %s, %s..%s" % (event, base, head))
+          if not reasons:
+              print("schema guard: clean")
+              sys.exit(0)
+          shown = []
+          for reason in reasons:
+              try:
+                  shown.append(common.require_public_text(reason))
+              except common.ReleaseError:
+                  shown.append("(path withheld)")
+          print(MESSAGE)
+          for line in shown:
+              print("  " + line)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("### Schema guard refused\n\n%s\n\n" % MESSAGE)
+              summary.write("".join("- %s\n" % line for line in shown))
+          sys.exit(1)
+          GUARD
+
   tenant-isolation:
     name: tenant-isolation
     runs-on: ubuntu-24.04
@@ -76,6 +152,252 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_tenant_test?sslmode=disable
         run: go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'
+
+  # Part A's staging database bootstrap (release/staging/bootstrap) on
+  # DigitalOcean's role shape. PostgreSQL plays the control plane: it creates
+  # a doadmin-like migration owner (NOSUPERUSER CREATEDB CREATEROLE BYPASSRLS)
+  # that owns the database, and rereply_app is created through that owner, so
+  # PostgreSQL 16+ makes the owner an implicit ADMIN member of rereply_app, as
+  # DigitalOcean is inferred to do. The tool builds the empty database. This
+  # commit's own `rereply rls-migrate`, production's PRE_DEPLOY command, must
+  # then accept it twice on its verify-only path with the schema and data
+  # unchanged; a second bootstrap must be refused without writing; the server
+  # must start on it and serve a login; and an owner role that the doadmin-like
+  # role created must be refused before any write. Synthetic credentials only;
+  # nothing here reaches DigitalOcean. test_ci_workflows.py checks this job.
+  staging-bootstrap:
+    name: staging-bootstrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: Create the DigitalOcean role shape
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          dir="$RUNNER_TEMP/staging-bootstrap"
+          mkdir -p "$dir/uploads"
+          owner_password="$(openssl rand -hex 24)"
+          runtime_password="$(openssl rand -hex 24)"
+          negative_password="$(openssl rand -hex 24)"
+          admin_password="$(openssl rand -hex 24)"
+          jwt_secret="$(openssl rand -hex 32)"
+          encryption_key="$(openssl rand -hex 32)"
+          for value in "$owner_password" "$runtime_password" "$negative_password" "$admin_password" "$jwt_secret" "$encryption_key"; do
+            echo "::add-mask::$value"
+          done
+          psql() { docker exec -i "$PG_CONTAINER" psql -X -v ON_ERROR_STOP=1 -q -At -U postgres -d postgres "$@"; }
+          # rereply_owner is the negative case: an owner role that the
+          # doadmin-like role created, so it has an implicit ADMIN member.
+          psql <<SQL
+          CREATE ROLE doadmin LOGIN PASSWORD '$owner_password' NOSUPERUSER CREATEDB CREATEROLE BYPASSRLS;
+          CREATE DATABASE rereply OWNER doadmin;
+          SET ROLE doadmin;
+          CREATE ROLE rereply_app LOGIN PASSWORD '$runtime_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+          CREATE ROLE rereply_owner LOGIN PASSWORD '$negative_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+          RESET ROLE;
+          CREATE DATABASE rereply_negative OWNER rereply_owner;
+          SQL
+          memberships="$(psql -c "SELECT string_agg(format('%s>%s:%s', member.rolname, granted.rolname, membership.admin_option), ',' ORDER BY member.rolname, granted.rolname) FROM pg_catalog.pg_auth_members AS membership JOIN pg_catalog.pg_roles AS member ON member.oid = membership.member JOIN pg_catalog.pg_roles AS granted ON granted.oid = membership.roleid WHERE granted.rolname IN ('doadmin', 'rereply_app', 'rereply_owner') OR member.rolname IN ('doadmin', 'rereply_app', 'rereply_owner')")"
+          owners="$(psql -c "SELECT string_agg(format('%s:%s', datname, pg_catalog.pg_get_userbyid(datdba)), ',' ORDER BY datname) FROM pg_catalog.pg_database WHERE datname IN ('rereply', 'rereply_negative')")"
+          echo "memberships: $memberships"
+          echo "database owners: $owners"
+          test "$memberships" = "doadmin>rereply_app:t,doadmin>rereply_owner:t"
+          test "$owners" = "rereply:doadmin,rereply_negative:rereply_owner"
+          database_url() { printf 'postgres://%s:%s@127.0.0.1:5432/%s?sslmode=disable' "$1" "$2" "$3"; }
+          # Every overridable external base URL points at the discard port,
+          # as in e2e-tests.yml; Messenger, Instagram, Threads, SSO, TTS and
+          # AI stay off. [database] comes last so each file can finish it.
+          cat > "$dir/common.toml" <<TOML
+          [app]
+          name = "ReReply"
+          environment = "test"
+          encryption_key = "$encryption_key"
+
+          [server]
+          host = "127.0.0.1"
+          port = 8080
+
+          [redis]
+          url = "redis://127.0.0.1:6379/0"
+
+          [jwt]
+          secret = "$jwt_secret"
+
+          [storage]
+          type = "local"
+          local_path = "$dir/uploads"
+
+          [whatsapp]
+          base_url = "http://127.0.0.1:9"
+
+          [ai]
+          qwen_base_url = "http://127.0.0.1:9"
+
+          [google_search_console]
+          auth_url = "http://127.0.0.1:9"
+          token_url = "http://127.0.0.1:9"
+          api_base_url = "http://127.0.0.1:9"
+
+          [meta_messenger_onboarding]
+          enabled = false
+          graph_base_url = "http://127.0.0.1:9"
+
+          [meta_instagram_onboarding]
+          enabled = false
+          authorization_base_url = "http://127.0.0.1:9"
+          token_base_url = "http://127.0.0.1:9"
+          graph_base_url = "http://127.0.0.1:9"
+
+          [threads_managed]
+          enabled = false
+
+          [default_admin]
+          email = "staging-admin@example.com"
+          password = "$admin_password"
+          full_name = "Synthetic Administrator"
+
+          [database]
+          runtime_role = "rereply_app"
+          rls_enabled = true
+          TOML
+          { cat "$dir/common.toml"
+            printf 'url = "%s"\n' "$(database_url rereply_app "$runtime_password" rereply)"
+          } > "$dir/server.toml"
+          { cat "$dir/server.toml"
+            printf 'migration_url = "%s"\n' "$(database_url doadmin "$owner_password" rereply)"
+          } > "$dir/migrate.toml"
+          { cat "$dir/common.toml"
+            printf 'url = "%s"\n' "$(database_url rereply_app "$runtime_password" rereply_negative)"
+            printf 'migration_url = "%s"\n' "$(database_url rereply_owner "$negative_password" rereply_negative)"
+          } > "$dir/negative.toml"
+          printf '{"email":"staging-admin@example.com","password":"%s"}' "$admin_password" > "$dir/login.json"
+          rm "$dir/common.toml"
+
+      - name: Build the bootstrap tool and the server
+        run: |
+          set -euo pipefail
+          go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/bootstrap" ./release/staging/bootstrap
+          go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/rereply" ./cmd/whatomate
+
+      - name: Bootstrap the staging database
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/staging-bootstrap/bootstrap" -config "$RUNNER_TEMP/staging-bootstrap/migrate.toml"
+
+      - name: Accept the database with rls-migrate twice and refuse a second bootstrap
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/staging-bootstrap"
+          # pg_dump 17.6+ brackets its output with a random \restrict key.
+          snapshot() {
+            docker exec "$PG_CONTAINER" pg_dump -U postgres --schema-only rereply \
+              | sed -e '/^[\]restrict /d' -e '/^[\]unrestrict /d' > "$dir/schema-$1.sql"
+            docker exec "$PG_CONTAINER" pg_dump -U postgres --data-only rereply 2> "$dir/data-$1.err" \
+              | sed -e '/^[\]restrict /d' -e '/^[\]unrestrict /d' > "$dir/data-$1.sql"
+          }
+          unchanged() {
+            cmp "$dir/schema-bootstrap.sql" "$dir/schema-$1.sql"
+            cmp "$dir/data-bootstrap.sql" "$dir/data-$1.sql"
+          }
+          snapshot bootstrap
+          "$dir/rereply" rls-migrate -config "$dir/migrate.toml"
+          snapshot rls-migrate-1
+          unchanged rls-migrate-1
+          "$dir/rereply" rls-migrate -config "$dir/migrate.toml"
+          snapshot rls-migrate-2
+          unchanged rls-migrate-2
+          status=0
+          "$dir/bootstrap" -config "$dir/migrate.toml" 2> "$dir/second.err" || status=$?
+          cat "$dir/second.err"
+          test "$status" -eq 2
+          grep -q '^staging-bootstrap: refusing: public schema is not empty ' "$dir/second.err"
+          snapshot second-bootstrap
+          unchanged second-bootstrap
+          sha256sum "$dir"/schema-*.sql "$dir"/data-*.sql | sed "s#$dir/##"
+
+      - name: Serve, log in and read the current user
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/staging-bootstrap"
+          "$dir/rereply" server -config "$dir/server.toml" > "$dir/server.log" 2>&1 &
+          server=$!
+          # On any failure, show the server's log before the step ends.
+          trap 'status=$?; kill "$server" 2>/dev/null || true; if [[ "$status" -ne 0 ]]; then cat "$dir/server.log"; fi' EXIT
+          code() { curl --silent --output /dev/null --write-out '%{http_code}' "$@"; }
+          ready=""
+          for attempt in $(seq 1 60); do
+            if [[ "$(code http://127.0.0.1:8080/ready)" == 200 ]]; then
+              ready="$attempt"
+              break
+            fi
+            kill -0 "$server" 2>/dev/null || break
+            sleep 2
+          done
+          if [[ -z "$ready" ]]; then
+            echo "the server never answered /ready" >&2
+            exit 1
+          fi
+          grep -q 'PostgreSQL tenant RLS verified' "$dir/server.log"
+          test "$(code --cookie-jar "$dir/cookies" --header 'Content-Type: application/json' --data "@$dir/login.json" http://127.0.0.1:8080/api/auth/login)" = 200
+          test "$(code --cookie "$dir/cookies" http://127.0.0.1:8080/api/me)" = 200
+          echo "/ready, login and /api/me answered 200"
+
+      - name: Refuse an owner that the doadmin-like role created
+        env:
+          PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/staging-bootstrap"
+          status=0
+          "$dir/bootstrap" -config "$dir/negative.toml" 2> "$dir/negative.err" || status=$?
+          cat "$dir/negative.err"
+          test "$status" -eq 2
+          grep -qx 'staging-bootstrap: refusing: membership preflight: roles other than the migration owner are members of the owner=1 runtime=1' "$dir/negative.err"
+          objects="$(docker exec "$PG_CONTAINER" psql -X -At -U postgres -d rereply_negative -c "SELECT (SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace = 'public'::regnamespace) + (SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace) + (SELECT count(*) FROM pg_catalog.pg_type WHERE typnamespace = 'public'::regnamespace)")"
+          test "$objects" = 0
 
   go-race:
     name: go-race
@@ -365,7 +687,9 @@ jobs:
     if: ${{ always() }}
     needs:
       - release-tests
+      - schema-guard
       - tenant-isolation
+      - staging-bootstrap
       - go-race
       - lint
       - build

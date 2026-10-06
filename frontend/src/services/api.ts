@@ -303,6 +303,11 @@ export interface ContactIdentityReviewPreview {
   chain_digest: string;
   union_candidates: ContactIdentityReviewCandidate[];
   open_generations: number[];
+  // Current members a decision may target. A member that already belongs to
+  // a different WhatsApp user is listed as a candidate but never here.
+  routable_contact_ids?: string[];
+  // Every open generation a decision on this hold closes.
+  open_hold_ids?: string[];
 }
 
 export interface ContactIdentityReviewDecisionRequest {
@@ -380,6 +385,18 @@ export const contactsService = {
     "/identity-reviews/staged",
     { params, signal },
   ),
+  // Held copies of the given holds, oldest first. hold_id repeats once per hold.
+  listStagedIdentityReviewsForHolds: (holdIds: string[], limit: number, signal?: AbortSignal, page = 1) => {
+    const params = new URLSearchParams();
+    for (const holdId of holdIds) params.append("hold_id", holdId);
+    params.set("order", "oldest");
+    params.set("page", String(page));
+    params.set("limit", String(limit));
+    return api.get<{ reviews: StagedIdentityReviewItem[]; total: number; read_only_total?: number }>(
+      "/identity-reviews/staged",
+      { params, signal },
+    );
+  },
   getStagedIdentityReview: (id: string, signal?: AbortSignal) =>
     api.get<StagedIdentityReviewDetail>(
       `/identity-reviews/staged/${encodeURIComponent(id)}`,
