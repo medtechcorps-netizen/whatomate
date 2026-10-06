@@ -32,6 +32,16 @@ negative cases that break the property and must make the checker fail:
     test aggregator needs. Its embedded script runs against a synthetic
     repository: it must refuse exactly the guarded changes, judge a pull
     request only by its own changes, and fail closed on anything unexpected.
+13. the Test workflow proves Part A's staging database bootstrap
+    (release/staging/bootstrap) in a required job: on DigitalOcean's role
+    shape it builds the database, this commit's rls-migrate accepts it twice
+    with the schema and data unchanged, a second bootstrap is refused, the
+    server serves a login on it, and an owner role that the doadmin-like role
+    created is refused; every step runs unconditionally and fails closed;
+14. no release image and no workflow that builds or tests one references the
+    staging code (release/staging, the graph stub): the Dockerfiles under
+    docker/ outside docker/staging/, ship.yml, e2e-tests.yml, and every Test
+    job except staging-bootstrap.
 
 The workflows are read with test_ship_workflow's YAML-subset reader plus the
 folded scalars the CI workflows use; when PyYAML happens to be importable the
@@ -82,7 +92,8 @@ FORBIDDEN_TRIGGERS = ("pull_request_target", "workflow_run")
 ENVIRONMENTS = {("ship.yml", "production"): "production"}
 SECRET_WORKFLOWS = {"ship.yml"}
 PG17_IMAGE = "postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
-POSTGRES_JOBS = (("test.yml", "tenant-isolation"), ("test.yml", "go-race"), ("e2e-tests.yml", "e2e-shard"))
+POSTGRES_JOBS = (("test.yml", "tenant-isolation"), ("test.yml", "go-race"), ("test.yml", "staging-bootstrap"),
+                 ("e2e-tests.yml", "e2e-shard"))
 PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
 DIGEST_IMAGE = re.compile(r"[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}")
 TENANT_TEST = "go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'"
@@ -685,6 +696,174 @@ def assert_schema_guard(sources: dict[str, str]) -> None:
             raise AssertionError(f"the schema guard {'passes' if refused else 'refuses'} a {scenario}")
 
 
+# The staging bootstrap job (Part A PR 4): its steps in order, each with the
+# lines it must run in this order. The lines pin what the proof is (the
+# DigitalOcean role shape, two verify-only rls-migrate runs compared with the
+# bootstrap snapshot, the refusals and their exit status), not how the rest of
+# each script is written.
+STAGING_BOOTSTRAP_JOB = "staging-bootstrap"
+STAGING_BOOTSTRAP_TIMEOUT = 20
+STAGING_BOOTSTRAP_SETUP = ("actions/checkout@", "actions/setup-go@")
+RLS_MIGRATE = '"$dir/rereply" rls-migrate -config "$dir/migrate.toml"'
+# Any failure after the server starts prints its log.
+SERVER_LOG_TRAP = ("trap 'status=$?; kill \"$server\" 2>/dev/null || true; "
+                   "if [[ \"$status\" -ne 0 ]]; then cat \"$dir/server.log\"; fi' EXIT")
+STAGING_BOOTSTRAP_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Create the DigitalOcean role shape", (
+        "set -euo pipefail",
+        "umask 077",
+        "CREATE ROLE doadmin LOGIN PASSWORD '$owner_password' NOSUPERUSER CREATEDB CREATEROLE BYPASSRLS;",
+        "CREATE DATABASE rereply OWNER doadmin;",
+        "SET ROLE doadmin;",
+        "CREATE ROLE rereply_app LOGIN PASSWORD '$runtime_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;",
+        "CREATE ROLE rereply_owner LOGIN PASSWORD '$negative_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;",
+        "RESET ROLE;",
+        "CREATE DATABASE rereply_negative OWNER rereply_owner;",
+        'test "$memberships" = "doadmin>rereply_app:t,doadmin>rereply_owner:t"',
+        'test "$owners" = "rereply:doadmin,rereply_negative:rereply_owner"',
+        'environment = "test"',
+        "rls_enabled = true",
+    )),
+    ("Build the bootstrap tool and the server", (
+        "set -euo pipefail",
+        'go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/bootstrap" ./release/staging/bootstrap',
+        'go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/rereply" ./cmd/whatomate',
+    )),
+    ("Bootstrap the staging database", (
+        "set -euo pipefail",
+        '"$RUNNER_TEMP/staging-bootstrap/bootstrap" -config "$RUNNER_TEMP/staging-bootstrap/migrate.toml"',
+    )),
+    ("Accept the database with rls-migrate twice and refuse a second bootstrap", (
+        "set -euo pipefail",
+        'cmp "$dir/schema-bootstrap.sql" "$dir/schema-$1.sql"',
+        'cmp "$dir/data-bootstrap.sql" "$dir/data-$1.sql"',
+        "snapshot bootstrap",
+        RLS_MIGRATE,
+        "snapshot rls-migrate-1",
+        "unchanged rls-migrate-1",
+        RLS_MIGRATE,
+        "snapshot rls-migrate-2",
+        "unchanged rls-migrate-2",
+        "status=0",
+        '"$dir/bootstrap" -config "$dir/migrate.toml" 2> "$dir/second.err" || status=$?',
+        'test "$status" -eq 2',
+        "grep -q '^staging-bootstrap: refusing: public schema is not empty ' \"$dir/second.err\"",
+        "snapshot second-bootstrap",
+        "unchanged second-bootstrap",
+    )),
+    ("Serve, log in and read the current user", (
+        "set -euo pipefail",
+        '"$dir/rereply" server -config "$dir/server.toml" > "$dir/server.log" 2>&1 &',
+        SERVER_LOG_TRAP,
+        "grep -q 'PostgreSQL tenant RLS verified' \"$dir/server.log\"",
+        'test "$(code --cookie-jar "$dir/cookies" --header \'Content-Type: application/json\' --data "@$dir/login.json" '
+        'http://127.0.0.1:8080/api/auth/login)" = 200',
+        'test "$(code --cookie "$dir/cookies" http://127.0.0.1:8080/api/me)" = 200',
+    )),
+    ("Refuse an owner that the doadmin-like role created", (
+        "set -euo pipefail",
+        "status=0",
+        '"$dir/bootstrap" -config "$dir/negative.toml" 2> "$dir/negative.err" || status=$?',
+        'test "$status" -eq 2',
+        "grep -qx 'staging-bootstrap: refusing: membership preflight: roles other than the migration owner are "
+        "members of the owner=1 runtime=1' \"$dir/negative.err\"",
+        'test "$objects" = 0',
+    )),
+)
+# Ways a line can swallow a failure; "|| status=$?" is how a step captures an
+# expected refusal, which a later test of $status then requires. EXIT trap
+# lines are cleanup and exempt.
+TOLERATED_FAILURE = re.compile(r"\|\|\s*(?:true\b|:|exit 0\b)|\bset \+[a-z]*[eo]\b")
+
+
+def ordered_subsequence(lines: list[str], required: tuple[str, ...]) -> bool:
+    position = 0
+    for line in lines:
+        if position < len(required) and line == required[position]:
+            position += 1
+    return position == len(required)
+
+
+def assert_staging_bootstrap(sources: dict[str, str]) -> None:
+    test_jobs = jobs(parse(sources)["test.yml"])
+    job = test_jobs.get(STAGING_BOOTSTRAP_JOB)
+    if job is None or job.get("name") != STAGING_BOOTSTRAP_JOB:
+        raise AssertionError("the Test workflow has no staging-bootstrap job")
+    if STAGING_BOOTSTRAP_JOB not in needs(test_jobs["test"]):
+        raise AssertionError("the staging-bootstrap job is not in the test aggregator's needs")
+    if job.get("timeout-minutes") != STAGING_BOOTSTRAP_TIMEOUT or job.get("permissions") != {"contents": "read"}:
+        raise AssertionError("the staging-bootstrap job has no 20-minute timeout or more than read access")
+    if sorted(job.get("services", {})) != ["postgres", "redis"]:
+        raise AssertionError("the staging-bootstrap job does not run on its PostgreSQL and Redis services")
+    steps = job.get("steps", [])
+    setup = [str(item.get("uses", "")) for item in steps[:len(STAGING_BOOTSTRAP_SETUP)]]
+    if len(setup) != len(STAGING_BOOTSTRAP_SETUP) or not all(
+            value.startswith(prefix) for value, prefix in zip(setup, STAGING_BOOTSTRAP_SETUP)):
+        raise AssertionError("the staging-bootstrap job does not start with checkout and Go setup")
+    proof = steps[len(STAGING_BOOTSTRAP_SETUP):]
+    if [item.get("name") for item in proof] != [name for name, _ in STAGING_BOOTSTRAP_STEPS]:
+        raise AssertionError("the staging-bootstrap steps differ: %s" % [item.get("name") for item in proof])
+    for item in steps:
+        if any(key in item for key in ("if", "continue-on-error", "shell", "working-directory")):
+            raise AssertionError(f"staging-bootstrap step {item.get('name')!r} is conditional or runs elsewhere")
+    for item, (name, required) in zip(proof, STAGING_BOOTSTRAP_STEPS):
+        lines = run_lines(item)
+        if lines[:1] != ["set -euo pipefail"]:
+            raise AssertionError(f"staging-bootstrap step {name!r} does not fail on the first error")
+        if not ordered_subsequence(lines, required):
+            raise AssertionError(f"staging-bootstrap step {name!r} does not run its proof in order")
+        # An EXIT trap's cleanup may ignore a server that already stopped.
+        tolerated = [line for line in lines if TOLERATED_FAILURE.search(line) and not line.startswith("trap ")]
+        if tolerated:
+            raise AssertionError(f"staging-bootstrap step {name!r} tolerates a failure: {tolerated[0]}")
+
+
+# Staging code: the bootstrap tool, the graph stub and anything else under
+# release/staging. In the workflows that build or test the release images,
+# only the staging-bootstrap job may build or run it. Workflows that exist for
+# staging code (the planned staging-images.yml and canary-local.yml) are not
+# in this list.
+STAGING_REFERENCE = re.compile(r"release/staging|graph-stub|graphstub")
+STAGING_REFERENCE_WORKFLOWS = ("ship.yml", "test.yml", "e2e-tests.yml")
+STAGING_REFERENCE_JOBS = {("test.yml", STAGING_BOOTSTRAP_JOB)}
+
+
+def text_nodes(value: Any) -> list[str]:
+    if type(value) is dict:
+        return [text for key, child in value.items() for text in (str(key), *text_nodes(child))]
+    if type(value) is list:
+        return [text for child in value for text in text_nodes(child)]
+    return [str(value)]
+
+
+def release_dockerfiles() -> dict[str, str]:
+    files = {}
+    for path in sorted((ROOT / "docker").rglob("*")):
+        relative = path.relative_to(ROOT).as_posix()
+        if path.is_file() and "Dockerfile" in path.name and not relative.startswith("docker/staging/"):
+            files[relative] = path.read_text(encoding="utf-8")
+    return files
+
+
+def assert_staging_placement(sources: dict[str, str], dockerfiles: dict[str, str] | None = None) -> None:
+    docs = parse(sources)
+    for workflow in STAGING_REFERENCE_WORKFLOWS:
+        doc = dict(docs[workflow])
+        doc["jobs"] = {job_id: job for job_id, job in jobs(doc).items()
+                       if (workflow, job_id) not in STAGING_REFERENCE_JOBS}
+        for job_id, job in doc["jobs"].items():
+            if any(STAGING_REFERENCE.search(text) for text in text_nodes(job)):
+                raise AssertionError(f"{workflow} job {job_id} references staging code")
+        if any(STAGING_REFERENCE.search(text) for text in text_nodes({k: v for k, v in doc.items() if k != "jobs"})):
+            raise AssertionError(f"{workflow} references staging code outside its jobs")
+    files = release_dockerfiles() if dockerfiles is None else dockerfiles
+    if not any(name.startswith("docker/release/") for name in files) or "docker/Dockerfile" not in files:
+        raise AssertionError("the release Dockerfiles were not found")
+    for name, text in files.items():
+        if STAGING_REFERENCE.search(text):
+            raise AssertionError(f"{name} references staging code")
+
+
 CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
     ("required-contexts", assert_required_contexts),
     ("unique-context-names", assert_context_names_unique),
@@ -697,6 +876,8 @@ CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
     ("braces-audit", assert_frontend_audit_policy),
     ("unconditional-jobs", assert_unconditional_jobs),
     ("lint-build-and-scans", assert_lint_build_and_scans),
+    ("staging-bootstrap", assert_staging_bootstrap),
+    ("staging-placement", assert_staging_placement),
     # Last: it runs the guard script, so earlier checks fail a mutant first.
     ("schema-guard", assert_schema_guard),
 )
@@ -766,6 +947,20 @@ def without_schema_guard_job() -> dict[str, str]:
     if mutated.count("      - schema-guard\n") != 1:
         raise AssertionError("the aggregator does not need the schema guard once")
     return {**SOURCES, "test.yml": mutated.replace("      - schema-guard\n", "", 1)}
+
+
+STAGING_JOB = "  staging-bootstrap:\n    name: staging-bootstrap\n"
+STAGING_HEAD = ("    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n    permissions:\n      contents: read\n\n"
+                "    services:\n      postgres:\n")
+NEGATIVE_STEP = "      - name: Refuse an owner that the doadmin-like role created\n"
+
+
+def without_negative_case() -> dict[str, str]:
+    source = SOURCES["test.yml"]
+    start, end = source.find(NEGATIVE_STEP), source.find("  go-race:\n")
+    if source.count(NEGATIVE_STEP) != 1 or not 0 <= start < end:
+        raise AssertionError("the negative case is not where the mutation expects it")
+    return {**SOURCES, "test.yml": source[:start] + source[end:]}
 
 
 # Each case breaks one property; the checker must fail on the named check.
@@ -961,7 +1156,7 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "test.yml", GUARD_STEP,
         "      - name: Compare with main\n        run: git checkout --quiet origin/main\n\n" + GUARD_STEP)),
     "give the schema guard step an environment": ("schema-guard", lambda: replaced(
-        "test.yml", GUARD_STEP, GUARD_STEP + "        env:\n          PYTHONPATH: release/staging\n")),
+        "test.yml", GUARD_STEP, GUARD_STEP + "        env:\n          PYTHONPATH: release\n")),
     "run the schema guard in another directory": ("schema-guard", lambda: replaced(
         "test.yml", GUARD_STEP, GUARD_STEP + "        working-directory: release\n")),
     "compare a pull request with main's tip": ("schema-guard", lambda: replaced(
@@ -982,6 +1177,57 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     "pass when git fails": ("schema-guard", lambda: replaced(
         "test.yml", '"schema guard failed closed: %s" % error)\n              sys.exit(1)\n',
         '"schema guard failed closed: %s" % error)\n              sys.exit(0)\n')),
+    # 13. The staging bootstrap proof. Dropping the job or making it
+    # conditional trips the generic aggregator and unconditional-job checks.
+    "drop the staging bootstrap from the aggregator": ("aggregators", lambda: replaced(
+        "test.yml", "      - staging-bootstrap\n", "")),
+    "run the staging bootstrap only on push": ("unconditional-jobs", lambda: replaced(
+        "test.yml", STAGING_JOB, STAGING_JOB + "    if: github.event_name == 'push'\n")),
+    "prove the staging bootstrap on another PostgreSQL": ("triggers-and-pins", lambda: replaced(
+        "test.yml", STAGING_JOB + STAGING_HEAD + "        image: " + PG17_IMAGE,
+        STAGING_JOB + STAGING_HEAD + "        image: postgres:16@sha256:" + "0" * 64)),
+    "drop the staging bootstrap timeout": ("staging-bootstrap", lambda: replaced(
+        "test.yml", STAGING_JOB + "    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n",
+        STAGING_JOB + "    runs-on: ubuntu-24.04\n")),
+    "give the staging bootstrap write access": ("staging-bootstrap", lambda: replaced(
+        "test.yml", STAGING_JOB + "    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n    permissions:\n      contents: read\n",
+        STAGING_JOB + "    runs-on: ubuntu-24.04\n    timeout-minutes: 20\n    permissions:\n      contents: write\n")),
+    "make doadmin a superuser": ("staging-bootstrap", lambda: replaced(
+        "test.yml", "PASSWORD '$owner_password' NOSUPERUSER CREATEDB", "PASSWORD '$owner_password' SUPERUSER CREATEDB")),
+    "create rereply_app without doadmin": ("staging-bootstrap", lambda: replaced(
+        "test.yml", "          SET ROLE doadmin;\n", "")),
+    "skip the role shape assertion": ("staging-bootstrap", lambda: replaced(
+        "test.yml", '          test "$memberships" = "doadmin>rereply_app:t,doadmin>rereply_owner:t"\n', "")),
+    "run rls-migrate once": ("staging-bootstrap", lambda: replaced(
+        "test.yml", "          snapshot rls-migrate-2\n          unchanged rls-migrate-2\n", "")),
+    "tolerate a failing rls-migrate": ("staging-bootstrap", lambda: replaced(
+        "test.yml", "          " + RLS_MIGRATE + "\n          snapshot rls-migrate-1\n",
+        "          " + RLS_MIGRATE + " || true\n          snapshot rls-migrate-1\n")),
+    "stop comparing the data": ("staging-bootstrap", lambda: replaced(
+        "test.yml", '            cmp "$dir/data-bootstrap.sql" "$dir/data-$1.sql"\n', "")),
+    "accept any second-bootstrap status": ("staging-bootstrap", lambda: replaced(
+        "test.yml", '          test "$status" -eq 2\n          grep -q \'^staging-bootstrap', "          grep -q '^staging-bootstrap")),
+    "tolerate a failure outside the pinned lines": ("staging-bootstrap", lambda: replaced(
+        "test.yml", '          cat "$dir/second.err"\n', '          cat "$dir/second.err" || true\n')),
+    "stop printing the server log on failure": ("staging-bootstrap", lambda: replaced(
+        "test.yml", SERVER_LOG_TRAP, "trap 'kill \"$server\" 2>/dev/null || true' EXIT")),
+    "skip the login": ("staging-bootstrap", lambda: replaced(
+        "test.yml", '          test "$(code --cookie "$dir/cookies" http://127.0.0.1:8080/api/me)" = 200\n', "")),
+    "drop the negative case": ("staging-bootstrap", without_negative_case),
+    "make the negative case conditional": ("staging-bootstrap", lambda: replaced(
+        "test.yml", NEGATIVE_STEP, NEGATIVE_STEP + "        if: ${{ github.event_name == 'push' }}\n")),
+    "stop failing on the first error": ("staging-bootstrap", lambda: replaced(
+        "test.yml", "      - name: Bootstrap the staging database\n        run: |\n          set -euo pipefail\n",
+        "      - name: Bootstrap the staging database\n        run: |\n          set -uo pipefail\n")),
+    # 14. Staging code stays out of the release images and their workflows.
+    "build the bootstrap tool in the build job": ("staging-placement", lambda: replaced(
+        "test.yml", "        run: go build -mod=readonly -v ./...\n",
+        "        run: |\n          go build -mod=readonly -v ./...\n          go build -o tool ./release/staging/bootstrap\n")),
+    "run the graph stub in the E2E shards": ("staging-placement", lambda: replaced(
+        "e2e-tests.yml", "      - name: Build backend\n        run: go build -o rereply ./cmd/whatomate\n",
+        "      - name: Build backend\n        run: go build -o rereply ./cmd/whatomate ./release/staging/graphstub/cmd/graph-stub\n")),
+    "point a Release job at the stub": ("staging-placement", lambda: replaced(
+        "ship.yml", "    name: Release plan\n", "    name: Release plan\n    env:\n      GRAPH_BASE: http://graph-stub:8090\n")),
 }
 
 
@@ -1217,6 +1463,51 @@ class FrontendAuditPolicyTests(unittest.TestCase):
             with self.subTest(case=name):
                 returned = run_audit_policy(run, body, 1, lock)
                 self.assertEqual(returned != 0, expected == 1, returned)
+
+
+class StagingPlacementTests(unittest.TestCase):
+    """The release Dockerfiles half of property 14, on synthetic files."""
+
+    def test_checked_in_dockerfiles_are_found_and_clean(self) -> None:
+        files = release_dockerfiles()
+        self.assertIn("docker/Dockerfile", files)
+        self.assertIn("docker/release/web.Dockerfile", files)
+        self.assertFalse(any(name.startswith("docker/staging/") for name in files))
+        assert_staging_placement(SOURCES)
+
+    def test_a_release_dockerfile_referencing_staging_code_fails(self) -> None:
+        files = release_dockerfiles()
+        for name, line in (
+            ("docker/release/web.Dockerfile", "RUN go build -o /out/bootstrap ./release/staging/bootstrap\n"),
+            ("docker/Dockerfile", "COPY --from=stub /graph-stub /usr/local/bin/graph-stub\n"),
+            ("docker/meta-relay.Dockerfile", "COPY release/staging/graphstub/ ./graphstub/\n"),
+        ):
+            with self.subTest(file=name):
+                with self.assertRaisesRegex(AssertionError, re.escape(name)):
+                    assert_staging_placement(SOURCES, {**files, name: files[name] + line})
+
+    def test_missing_release_dockerfiles_fail(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "release Dockerfiles were not found"):
+            assert_staging_placement(SOURCES, {})
+
+    def test_the_staging_bootstrap_job_may_reference_staging_code(self) -> None:
+        job = jobs(parse(SOURCES)["test.yml"])[STAGING_BOOTSTRAP_JOB]
+        self.assertTrue(any(STAGING_REFERENCE.search(text) for text in text_nodes(job)))
+
+
+class StagingBootstrapJobTests(unittest.TestCase):
+    def test_the_proof_runs_rls_migrate_twice_between_snapshots(self) -> None:
+        job = jobs(parse(SOURCES)["test.yml"])[STAGING_BOOTSTRAP_JOB]
+        accept = step_named(job, "Accept the database with rls-migrate twice and refuse a second bootstrap")
+        self.assertEqual(run_lines(accept).count(RLS_MIGRATE), 2)
+
+    def test_tolerated_failures_are_recognised(self) -> None:
+        for line in ("make || true", "make ||:", "make || exit 0", "set +e", "set +euo pipefail"):
+            with self.subTest(line=line):
+                self.assertIsNotNone(TOLERATED_FAILURE.search(line))
+        for line in ('"$dir/bootstrap" -config x 2> err || status=$?', "set -euo pipefail", "truest"):
+            with self.subTest(line=line):
+                self.assertIsNone(TOLERATED_FAILURE.search(line))
 
 
 if __name__ == "__main__":
