@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,22 +23,37 @@ type SLAProcessor struct {
 	// notices collects one organization pass's customer notices while
 	// processOrganizationSLA runs, so they go out after its agent events.
 	notices *[]slaNotice
+	// resume is shared by the per-organization copies made for each pass.
+	resume *slaResumeCursors
 }
 
 // slaTransfersPerPass caps the transfers each SLA step writes in one
-// organization pass. Each kept write holds a savepoint and, under RLS, the
-// whole pass is one transaction. PostgreSQL caches 64 subtransaction IDs per
-// backend; past that, every other backend's snapshot has to consult
-// pg_subtrans until the pass commits. Two capped steps plus the deleted-contact
-// close and the breach update stay at 62. The rest wait for the next tick,
-// oldest deadline first.
+// organization pass. Under RLS the whole pass is one transaction, and every
+// kept write holds one subtransaction ID until it commits (a released
+// savepoint's ID stays). PostgreSQL caches 64 per backend; past that, every
+// other backend's snapshot has to consult pg_subtrans until the pass commits.
+// withSLARowSavepoint rolls a failed write back and releases its savepoint,
+// which frees its ID. Two capped steps plus the deleted-contact close and the
+// breach update therefore stay at 62, however many writes fail. The rest wait
+// for the next tick.
 const slaTransfersPerPass = 30
 
-// slaAttemptsPerPass bounds the transfers one SLA step tries in a pass. A
-// failed write rolls its savepoint back and frees its subtransaction ID, so it
-// does not count against slaTransfersPerPass; this bound only stops a pass
-// from walking an unbounded backlog of rows that fail on every tick.
+// slaAttemptsPerPass bounds the transfers one SLA step tries in a pass, so a
+// pass cannot walk an unbounded backlog of rows that fail on every tick. A
+// pass that stops early leaves its cursor for the next one (slaResumeCursors),
+// so such rows cannot pin the start of every pass either.
 const slaAttemptsPerPass = 100
+
+// slaRowSavepoint names the one per-transfer savepoint open at a time.
+const slaRowSavepoint = "sla_transfer_row"
+
+// slaContactDeleted holds for a transfer whose contact was soft-deleted.
+const slaContactDeleted = `EXISTS (
+	SELECT 1 FROM contacts
+	 WHERE contacts.id = agent_transfers.contact_id
+	   AND contacts.organization_id = agent_transfers.organization_id
+	   AND contacts.deleted_at IS NOT NULL
+)`
 
 // NewSLAProcessor creates a new SLA processor
 func NewSLAProcessor(app *App, interval time.Duration) *SLAProcessor {
@@ -45,7 +61,75 @@ func NewSLAProcessor(app *App, interval time.Duration) *SLAProcessor {
 		app:      app,
 		interval: interval,
 		stopCh:   make(chan struct{}),
+		resume:   &slaResumeCursors{byStep: map[slaResumeKey]slaCursor{}},
 	}
+}
+
+// slaResumeCursors remembers, per organization and SLA step, where a pass
+// that stopped early left off. The next pass continues from there and wraps
+// to the oldest deadline once it reaches the end. Each instance keeps its own.
+type slaResumeCursors struct {
+	mu     sync.Mutex
+	byStep map[slaResumeKey]slaCursor
+}
+
+type slaResumeKey struct {
+	organizationID uuid.UUID
+	step           string
+}
+
+type slaCursor struct {
+	deadline time.Time
+	id       uuid.UUID
+}
+
+func (r *slaResumeCursors) load(key slaResumeKey) slaCursor {
+	if r == nil {
+		return slaCursor{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.byStep[key]
+}
+
+func (r *slaResumeCursors) store(key slaResumeKey, cursor slaCursor) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cursor.id == uuid.Nil {
+		delete(r.byStep, key)
+		return
+	}
+	r.byStep[key] = cursor
+}
+
+// withSLARowSavepoint runs one transfer's SLA write so that, inside the RLS
+// pass transaction, it keeps a subtransaction ID only if it kept a write. It
+// takes a SAVEPOINT, then RELEASEs it on success, or rolls back to it and
+// releases it on error. GORM's nested Transaction never releases: a
+// rolled-back savepoint stays open around the rest of the pass, and the next
+// write inside it costs an ID anyway. Without an outer transaction this is
+// one short READ COMMITTED tenant transaction.
+func (p *SLAProcessor) withSLARowSavepoint(orgID uuid.UUID, write func(tx *gorm.DB) error) error {
+	db := p.app.DB
+	if _, inTransaction := db.Statement.ConnPool.(gorm.TxCommitter); !inTransaction {
+		return database.WithTenantReadCommitted(db, orgID, write)
+	}
+	if err := db.Exec("SAVEPOINT " + slaRowSavepoint).Error; err != nil {
+		return err
+	}
+	if err := write(db); err != nil {
+		if rollbackErr := db.Exec("ROLLBACK TO SAVEPOINT " + slaRowSavepoint).Error; rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		if releaseErr := db.Exec("RELEASE SAVEPOINT " + slaRowSavepoint).Error; releaseErr != nil {
+			return errors.Join(err, releaseErr)
+		}
+		return err
+	}
+	return db.Exec("RELEASE SAVEPOINT " + slaRowSavepoint).Error
 }
 
 // Start begins the SLA processing loop
@@ -163,42 +247,45 @@ var errSLATransferNoLongerActive = errors.New("transfer is no longer active")
 // forEachSLACandidate pages through one SLA step's transfers in (deadline, id)
 // order and calls handle on each, until slaTransfersPerPass of them kept a
 // write or slaAttemptsPerPass were tried. handle reports whether it kept a
-// write (its savepoint was not rolled back). Rows that fail on every tick
-// therefore neither use up the cap nor starve the transfers behind them.
+// write (its savepoint was released, not rolled back). Rows that fail on
+// every tick therefore neither use up the cap nor starve the transfers behind
+// them. A pass that stops early leaves its cursor for the next pass of this
+// processor, which wraps to the oldest deadline after reaching the end.
 func (p *SLAProcessor) forEachSLACandidate(
+	orgID uuid.UUID,
 	deadlineColumn string,
 	candidates func(*gorm.DB) *gorm.DB,
 	deadlineOf func(*models.AgentTransfer) *time.Time,
 	handle func(models.AgentTransfer) bool,
 ) error {
+	key := slaResumeKey{organizationID: orgID, step: deadlineColumn}
+	after := p.resume.load(key)
 	written, attempted := 0, 0
-	var (
-		afterDeadline time.Time
-		afterID       uuid.UUID
-	)
 	for {
 		query := candidates(p.app.DB)
-		if afterID != uuid.Nil {
-			query = query.Where("("+deadlineColumn+", id) > (?, ?)", afterDeadline, afterID)
+		if after.id != uuid.Nil {
+			query = query.Where("("+deadlineColumn+", id) > (?, ?)", after.deadline, after.id)
 		}
 		var page []models.AgentTransfer
 		if err := query.Order(deadlineColumn + ", id").Limit(slaTransfersPerPass).Find(&page).Error; err != nil {
 			return err
 		}
 		for i := range page {
-			afterID = page[i].ID
+			after.id = page[i].ID
 			if deadline := deadlineOf(&page[i]); deadline != nil {
-				afterDeadline = *deadline
+				after.deadline = *deadline
 			}
 			attempted++
 			if handle(page[i]) {
 				written++
 			}
 			if written >= slaTransfersPerPass || attempted >= slaAttemptsPerPass {
+				p.resume.store(key, after)
 				return nil
 			}
 		}
 		if len(page) < slaTransfersPerPass {
+			p.resume.store(key, slaCursor{})
 			return nil
 		}
 	}
@@ -210,10 +297,11 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 
 	closedCount := 0
 	err := p.forEachSLACandidate(
+		orgID,
 		"expires_at",
 		func(db *gorm.DB) *gorm.DB {
 			return db.Where(
-				"organization_id = ? AND status = ? AND expires_at IS NOT NULL AND expires_at < ?",
+				"organization_id = ? AND status = ? AND expires_at IS NOT NULL AND expires_at < ? AND NOT "+slaContactDeleted,
 				orgID, models.TransferStatusActive, now,
 			)
 		},
@@ -239,8 +327,7 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 			// currently running AI provider attempt. Under RLS this runs inside the
 			// organization's tenant transaction, so the fence is held until the
 			// whole tick commits; the customer notice below is sent only after that.
-			expireErr := database.WithTenantReadCommitted(
-				p.app.DB,
+			expireErr := p.withSLARowSavepoint(
 				orgID,
 				func(tx *gorm.DB) error {
 					if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
@@ -316,13 +403,8 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 // fail on every tick. There is nobody to notify. One statement closes them
 // all under one savepoint, so they never use up slaTransfersPerPass.
 func (p *SLAProcessor) closeExpiredTransfersOfDeletedContacts(orgID uuid.UUID, now time.Time) {
-	const orphaned = `organization_id = ? AND status = ? AND expires_at IS NOT NULL AND expires_at < ?
-		AND EXISTS (
-			SELECT 1 FROM contacts
-			 WHERE contacts.id = agent_transfers.contact_id
-			   AND contacts.organization_id = agent_transfers.organization_id
-			   AND contacts.deleted_at IS NOT NULL
-		)`
+	const orphaned = "organization_id = ? AND status = ? AND expires_at IS NOT NULL AND expires_at < ? AND " +
+		slaContactDeleted
 	var orphans []models.AgentTransfer
 	if err := p.app.DB.Where(orphaned, orgID, models.TransferStatusActive, now).
 		Order("expires_at, id").Find(&orphans).Error; err != nil {
@@ -340,7 +422,7 @@ func (p *SLAProcessor) closeExpiredTransfersOfDeletedContacts(orgID uuid.UUID, n
 	}
 
 	var closedIDs []uuid.UUID
-	err := database.WithTenantReadCommitted(p.app.DB, orgID, func(tx *gorm.DB) error {
+	err := p.withSLARowSavepoint(orgID, func(tx *gorm.DB) error {
 		// The per-transfer expiry's lock order: the organization policy fence,
 		// then the contact rows, here soft-deleted ones too, in id order.
 		if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
@@ -391,10 +473,13 @@ func (p *SLAProcessor) closeExpiredTransfersOfDeletedContacts(orgID uuid.UUID, n
 func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.ChatbotSettings, now time.Time) {
 	escalatedCount := 0
 	err := p.forEachSLACandidate(
+		orgID,
 		"sla_escalation_at",
 		func(db *gorm.DB) *gorm.DB {
+			// A deleted contact can be neither warned nor shown in an alert.
 			return db.Where(
-				"organization_id = ? AND status = ? AND sla_escalation_at IS NOT NULL AND sla_escalation_at < ? AND escalation_level < 2",
+				"organization_id = ? AND status = ? AND sla_escalation_at IS NOT NULL AND sla_escalation_at < ? AND escalation_level < 2 AND NOT "+
+					slaContactDeleted,
 				orgID, models.TransferStatusActive, now,
 			)
 		},
@@ -443,7 +528,7 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 			// The savepoint keeps a failing row from aborting the rest of the tick.
 			selectedLevel := transfer.SLA.EscalationLevel
 			var escalated int64
-			if err := p.app.DB.Transaction(func(tx *gorm.DB) error {
+			if err := p.withSLARowSavepoint(orgID, func(tx *gorm.DB) error {
 				result := tx.Model(&transfer).Where(
 					"organization_id = ? AND status = ? AND escalation_level = ?",
 					orgID,
@@ -456,8 +541,9 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 				p.app.Log.Error("Failed to escalate transfer", "error", err, "transfer_id", transfer.ID)
 				return false
 			}
-			// The savepoint is kept even when the compare-and-set loses, so it
-			// counts as a write either way.
+			// A lost compare-and-set may still have taken a subtransaction ID
+			// (heap_update takes one before rechecking), and its savepoint is
+			// released, not rolled back, so it counts as a write either way.
 			if escalated != 1 {
 				p.app.Log.Info("Skipped transfer escalation: transfer changed since selection",
 					"transfer_id", transfer.ID,
@@ -504,7 +590,7 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 func (p *SLAProcessor) markSLABreached(orgID uuid.UUID, now time.Time) {
 	var marked int64
 	// The savepoint keeps a failure here from undoing the tick's expiries.
-	if err := p.app.DB.Transaction(func(tx *gorm.DB) error {
+	if err := p.withSLARowSavepoint(orgID, func(tx *gorm.DB) error {
 		result := tx.Model(&models.AgentTransfer{}).Where(
 			"organization_id = ? AND status = ? AND sla_breached = ? AND sla_response_deadline IS NOT NULL AND sla_response_deadline < ? AND agent_id IS NULL",
 			orgID, models.TransferStatusActive, false, now,
@@ -528,7 +614,7 @@ func (p *SLAProcessor) markSLABreached(orgID uuid.UUID, now time.Time) {
 // the first response. Under RLS it runs as a savepoint, so a failing row
 // cannot abort the rest of the organization's tick.
 func (p *SLAProcessor) extendTransferSLA(transfer *models.AgentTransfer, column string, deadline time.Time) error {
-	return p.app.DB.Transaction(func(tx *gorm.DB) error {
+	return p.withSLARowSavepoint(transfer.OrganizationID, func(tx *gorm.DB) error {
 		if err := tx.Model(transfer).Update(column, deadline).Error; err != nil {
 			return err
 		}
@@ -781,9 +867,9 @@ func (p *SLAProcessor) sendSLAText(
 // broadcastTransferUpdate tells agents about a transfer's committed SLA
 // transition. The caller passes the transfer with its new state.
 func (p *SLAProcessor) broadcastTransferUpdate(transfer models.AgentTransfer, wsType string) {
-	// Get contact info
+	// Get contact info, including a deleted contact's, for the agents' view.
 	var contact models.Contact
-	p.app.DB.Where("id = ?", transfer.ContactID).First(&contact)
+	p.app.DB.Unscoped().Where("id = ?", transfer.ContactID).First(&contact)
 
 	contactName, phoneNumber := p.app.MaskContactFields(transfer.OrganizationID, contact.ProfileName, contact.PhoneNumber)
 

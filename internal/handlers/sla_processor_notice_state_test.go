@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/websocket"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -323,6 +324,7 @@ func TestSLAFailingRowsDoNotStarveTheTransfersBehindThem(t *testing.T) {
 	for _, tc := range []struct{ step, poison string }{
 		{"auto_close", "deleted_contact"},
 		{"auto_close", "trigger"},
+		{"escalation", "deleted_contact"},
 		{"escalation", "trigger"},
 	} {
 		t.Run(tc.step+"/"+tc.poison, func(t *testing.T) {
@@ -393,8 +395,8 @@ func TestSLAFailingRowsDoNotStarveTheTransfersBehindThem(t *testing.T) {
 			for _, transfer := range poisoned {
 				var row models.AgentTransfer
 				require.NoError(t, app.DB.First(&row, "id = ?", transfer.ID).Error)
-				switch tc.poison {
-				case "deleted_contact":
+				switch {
+				case tc.poison == "deleted_contact" && tc.step == "auto_close":
 					assert.Equal(t, models.TransferStatusExpired, row.Status, "closed without a notice")
 					assert.Contains(t, row.Notes, "contact deleted")
 				default:
@@ -565,6 +567,54 @@ func TestSLAAgentEventsAreNotHeldBehindCustomerSends(t *testing.T) {
 	}
 }
 
+// slaPassSubxacts reports the subtransaction cache of the backend running scoped's
+// transaction, read from another connection.
+func slaPassSubxacts(t *testing.T, app *App, scoped *App) (int64, bool) {
+	t.Helper()
+	var subxacts struct {
+		Count      int64 `gorm:"column:subxact_count"`
+		Overflowed bool  `gorm:"column:subxact_overflowed"`
+	}
+	var pid int
+	require.NoError(t, scoped.DB.Raw("SELECT pg_catalog.pg_backend_pid()").Scan(&pid).Error)
+	require.NoError(t, app.DB.Raw(`
+		SELECT subxact.subxact_count, subxact.subxact_overflowed
+		  FROM pg_catalog.pg_stat_get_backend_idset() AS backend(id),
+		       LATERAL pg_catalog.pg_stat_get_backend_subxact(backend.id) AS subxact
+		 WHERE pg_catalog.pg_stat_get_backend_pid(backend.id) = ?`,
+		pid,
+	).Scan(&subxacts).Error)
+	return subxacts.Count, subxacts.Overflowed
+}
+
+// slaRowTrigger installs a BEFORE UPDATE trigger on agent_transfers that runs
+// body (PL/pgSQL) for rows whose notes equal marker.
+func slaRowTrigger(t *testing.T, app *App, marker, body string) {
+	t.Helper()
+	suffix := uuid.NewString()[:8]
+	function := "sla_row_" + suffix
+	trigger := "sla_row_trigger_" + suffix
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF OLD.notes = '%s' THEN
+				%s
+			END IF;
+			RETURN NEW;
+		END;
+		$$`, function, marker, body)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(
+		"CREATE TRIGGER %s BEFORE UPDATE ON agent_transfers FOR EACH ROW EXECUTE FUNCTION %s()",
+		trigger, function,
+	)).Error)
+	t.Cleanup(func() {
+		_ = app.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON agent_transfers", trigger)).Error
+		_ = app.DB.Exec(fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", function)).Error
+	})
+}
+
 // Under RLS a pass is one transaction and each written transfer a savepoint.
 // After a backlog (processor downtime, a mass expiry) one pass must still stay
 // inside PostgreSQL's 64-entry per-backend subtransaction cache, handling the
@@ -630,6 +680,259 @@ func TestSLAPassStaysWithinTheSubtransactionCache(t *testing.T) {
 		assert.Equal(t, wantLevel, stored(escalating[i].ID).SLA.EscalationLevel, "escalation %d", i)
 	}
 	assert.True(t, stored(unanswered.ID).SLA.Breached)
+}
+
+// Failed writes must not cost subtransaction IDs: each is rolled back to its
+// savepoint and released. Failing rows ahead of full caps, plus the
+// deleted-contact close and the breach update, stay at exactly 62.
+func TestSLAPassStaysWithinTheSubtransactionCacheWhenWritesFail(t *testing.T) {
+	app, organization, createTransfer, _ := slaAfterCommitFixture(t)
+	const failing = 5
+	slaRowTrigger(t, app, "synthetic failing row", "RAISE EXCEPTION 'synthetic failing SLA row';")
+	oldest := time.Now().UTC().Add(-5 * time.Hour)
+	orphanAt := oldest
+	orphan := createTransfer(models.SLATracking{ExpiresAt: &orphanAt})
+	require.NoError(t, app.DB.Delete(&models.Contact{}, "id = ?", orphan.ContactID).Error)
+	for i := range failing {
+		expiresAt := oldest.Add(time.Duration(i) * time.Second)
+		escalationAt := oldest.Add(time.Duration(i) * time.Second)
+		for _, sla := range []models.SLATracking{{ExpiresAt: &expiresAt}, {EscalationAt: &escalationAt}} {
+			row := createTransfer(sla)
+			require.NoError(t, app.DB.Model(row).Update("notes", "synthetic failing row").Error)
+		}
+	}
+	for i := range slaTransfersPerPass + 5 {
+		expiresAt := oldest.Add(time.Minute + time.Duration(i)*time.Second)
+		escalationAt := oldest.Add(time.Minute + time.Duration(i)*time.Second)
+		createTransfer(models.SLATracking{ExpiresAt: &expiresAt})
+		createTransfer(models.SLATracking{EscalationAt: &escalationAt})
+	}
+	responseDeadline := oldest
+	createTransfer(models.SLATracking{ResponseDeadline: &responseDeadline})
+	settings := models.ChatbotSettings{
+		OrganizationID: organization.ID,
+		SLA:            models.SLAConfig{Enabled: true, AutoCloseHours: 2, EscalationMinutes: 30, ResponseMinutes: 15},
+	}
+
+	var count int64
+	var overflowed bool
+	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+		NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+		count, overflowed = slaPassSubxacts(t, app, scoped)
+		return nil
+	}))
+	assert.False(t, overflowed, "failing writes overflowed the subtransaction cache (%d)", count)
+	assert.EqualValues(t, 2*slaTransfersPerPass+2, count)
+	var expired, escalated int64
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND status = ?", organization.ID, models.TransferStatusExpired).Count(&expired).Error)
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND escalation_level = 1", organization.ID).Count(&escalated).Error)
+	assert.EqualValues(t, slaTransfersPerPass+1, expired, "30 expiries plus the deleted contact's transfer")
+	assert.EqualValues(t, slaTransfersPerPass, escalated)
+}
+
+// Every instance runs the processor. Two passes over a backlog of twice the
+// cap race on the same rows: the loser's lost transitions must not overflow
+// its cache before it moves on to rows of its own.
+func TestSLAConcurrentPassesStayWithinTheSubtransactionCache(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	oldest := time.Now().UTC().Add(-5 * time.Hour)
+	for i := range 2 * slaTransfersPerPass {
+		expiresAt := oldest.Add(time.Duration(i) * time.Second)
+		escalationAt := oldest.Add(time.Duration(i) * time.Second)
+		createTransfer(models.SLATracking{ExpiresAt: &expiresAt})
+		createTransfer(models.SLATracking{EscalationAt: &escalationAt})
+	}
+	settings := slaNoticeStateSettings(organization.ID)
+	type result struct {
+		count      int64
+		overflowed bool
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			assert.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+				NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+				var r result
+				r.count, r.overflowed = slaPassSubxacts(t, app, scoped)
+				results <- r
+				return nil
+			}))
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for r := range results {
+		assert.False(t, r.overflowed, "a pass overflowed the subtransaction cache (%d)", r.count)
+		assert.LessOrEqual(t, r.count, int64(2*slaTransfersPerPass+2))
+	}
+	byPhone := map[string]int{}
+	for _, delivery := range deliveries() {
+		byPhone[delivery.To]++
+	}
+	for phone, sent := range byPhone {
+		assert.Equal(t, 1, sent, "notice to %s sent more than once", phone)
+	}
+}
+
+// More than slaAttemptsPerPass rows that fail on every tick at the head of the
+// order stop one pass (the bound), but the next pass of the same processor
+// continues past them, so the transfer behind them is still handled.
+func TestSLAAttemptBoundRotatesPastPersistentFailures(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	slaRowTrigger(t, app, "synthetic failing row", "RAISE EXCEPTION 'synthetic failing SLA row';")
+	oldest := time.Now().UTC().Add(-48 * time.Hour)
+	for i := range slaAttemptsPerPass + 5 {
+		expiresAt := oldest.Add(time.Duration(i) * time.Second)
+		row := createTransfer(models.SLATracking{ExpiresAt: &expiresAt})
+		require.NoError(t, app.DB.Model(row).Update("notes", "synthetic failing row").Error)
+	}
+	recent := time.Now().UTC().Add(-time.Hour)
+	normal := createTransfer(models.SLATracking{ExpiresAt: &recent})
+	settings := slaNoticeStateSettings(organization.ID)
+	processor := NewSLAProcessor(app, time.Minute)
+	pass := func() {
+		require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+			tick := *processor
+			tick.app = scoped
+			tick.processOrganizationSLA(settings, time.Now())
+			return nil
+		}))
+	}
+	status := func() models.TransferStatus {
+		var stored models.AgentTransfer
+		require.NoError(t, app.DB.First(&stored, "id = ?", normal.ID).Error)
+		return stored.Status
+	}
+
+	pass()
+	assert.Equal(t, models.TransferStatusActive, status(), "one pass stops after slaAttemptsPerPass attempts")
+	assert.Empty(t, deliveries())
+	pass()
+	assert.Equal(t, models.TransferStatusExpired, status(), "the next pass continues past the failing rows")
+	got := deliveries()
+	require.Len(t, got, 1)
+	assert.Equal(t, normal.PhoneNumber, got[0].To)
+}
+
+// The deleted-contact close takes the organization fence before it locks or
+// closes anything. A contact restored while it waits for that fence is
+// customer-facing again: its transfer must get the normal auto-close and
+// notice, not the silent close.
+func TestSLADeletedContactCloseSkipsAContactRestoredMeanwhile(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	past := time.Now().UTC().Add(-time.Hour)
+	transfer := createTransfer(models.SLATracking{ExpiresAt: &past})
+	require.NoError(t, app.DB.Delete(&models.Contact{}, "id = ?", transfer.ContactID).Error)
+
+	restore := app.DB.Begin()
+	require.NoError(t, restore.Error)
+	t.Cleanup(func() { _ = restore.Rollback().Error })
+	require.NoError(t, database.LockOrganizationPolicyScope(restore, organization.ID))
+	require.NoError(t, restore.Exec("UPDATE contacts SET deleted_at = NULL WHERE id = ?", transfer.ContactID).Error)
+
+	settings := slaNoticeStateSettings(organization.ID)
+	done := make(chan error, 1)
+	go func() {
+		done <- app.WithTenantApp(organization.ID, func(scoped *App) error {
+			NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+			return nil
+		})
+	}()
+	require.Eventually(t, func() bool {
+		var waiting int64
+		return app.DB.Raw(`SELECT COUNT(*) FROM pg_catalog.pg_stat_activity
+			WHERE datname = pg_catalog.current_database() AND wait_event_type = 'Lock'
+			  AND query LIKE '%pg_advisory_xact_lock%'`).Scan(&waiting).Error == nil && waiting == 1
+	}, 10*time.Second, 10*time.Millisecond, "the close must wait on the fence")
+	require.NoError(t, restore.Commit().Error)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(20 * time.Second):
+		t.Fatal("SLA tick did not finish")
+	}
+
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+	assert.Equal(t, models.TransferStatusExpired, stored.Status)
+	assert.NotContains(t, stored.Notes, "contact deleted")
+	assert.Contains(t, stored.Notes, "No agent response within SLA")
+	got := deliveries()
+	require.Len(t, got, 1, "the restored contact gets its auto-close notice")
+	assert.Equal(t, transfer.PhoneNumber, got[0].To)
+}
+
+// A deleted contact's transfer is closed when its SLA would have closed it,
+// not before; agents see that close, with the contact's name.
+func TestSLADeletedContactCloseWaitsForExpiryAndTellsAgents(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	client := websocket.NewClient(app.WSHub, nil, uuid.New(), organization.ID)
+	app.WSHub.Register(client)
+	testutil.AssertEventually(t, func() bool { return app.WSHub.GetClientCount() == 1 }, 2*time.Second, "client registers")
+	past := time.Now().UTC().Add(-time.Hour)
+	future := time.Now().UTC().Add(time.Hour)
+	expired := createTransfer(models.SLATracking{ExpiresAt: &past})
+	notYet := createTransfer(models.SLATracking{ExpiresAt: &future})
+	var contact models.Contact
+	require.NoError(t, app.DB.First(&contact, "id = ?", expired.ContactID).Error)
+	for _, transfer := range []*models.AgentTransfer{expired, notYet} {
+		require.NoError(t, app.DB.Delete(&models.Contact{}, "id = ?", transfer.ContactID).Error)
+	}
+
+	settings := slaNoticeStateSettings(organization.ID)
+	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+		NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+		return nil
+	}))
+
+	stored := func(id uuid.UUID) models.AgentTransfer {
+		var transfer models.AgentTransfer
+		require.NoError(t, app.DB.First(&transfer, "id = ?", id).Error)
+		return transfer
+	}
+	assert.Equal(t, models.TransferStatusExpired, stored(expired.ID).Status)
+	assert.Equal(t, models.TransferStatusActive, stored(notYet.ID).Status, "not past its expiry yet")
+	assert.Empty(t, deliveries(), "nobody to notify")
+	events := collectSLATransferEvents(client, 1, 5*time.Second)
+	require.Len(t, events, 1)
+	assert.Equal(t, websocket.TypeTransferExpired, events[0].Type)
+	assert.Equal(t, expired.ID.String(), events[0].Payload["id"])
+	assert.Equal(t, string(models.TransferStatusExpired), events[0].Payload["status"])
+	assert.Equal(t, contact.ProfileName, events[0].Payload["contact_name"])
+}
+
+// A lost escalation compare-and-set may still have taken a subtransaction ID,
+// and its savepoint is released, so it counts toward the cap like a write.
+func TestSLALostEscalationCountsTowardTheCap(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	// A BEFORE trigger returning NULL skips the row without an error: the
+	// compare-and-set matches nothing, exactly like a lost race.
+	slaRowTrigger(t, app, "synthetic skipped row", "RETURN NULL;")
+	oldest := time.Now().UTC().Add(-48 * time.Hour)
+	for i := range slaTransfersPerPass {
+		escalationAt := oldest.Add(time.Duration(i) * time.Second)
+		row := createTransfer(models.SLATracking{EscalationAt: &escalationAt})
+		require.NoError(t, app.DB.Model(row).Update("notes", "synthetic skipped row").Error)
+	}
+	recent := time.Now().UTC().Add(-time.Hour)
+	behind := createTransfer(models.SLATracking{EscalationAt: &recent})
+	settings := slaNoticeStateSettings(organization.ID)
+	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+		NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+		return nil
+	}))
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", behind.ID).Error)
+	assert.Zero(t, stored.SLA.EscalationLevel, "30 lost compare-and-sets used up this pass's cap")
+	assert.Empty(t, deliveries())
 }
 
 // Under RLS the whole organization tick is one transaction. A write that fails
