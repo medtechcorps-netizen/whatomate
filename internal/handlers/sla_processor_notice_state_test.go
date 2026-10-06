@@ -588,8 +588,9 @@ func slaPassSubxacts(t *testing.T, app *App, scoped *App) (int64, bool) {
 }
 
 // slaRowTrigger installs a BEFORE UPDATE trigger on agent_transfers that runs
-// body (PL/pgSQL) for rows whose notes equal marker.
-func slaRowTrigger(t *testing.T, app *App, marker, body string) {
+// body (PL/pgSQL) for rows whose notes equal marker. It returns a function
+// that drops it early; cleanup drops it in any case.
+func slaRowTrigger(t *testing.T, app *App, marker, body string) func() {
 	t.Helper()
 	suffix := uuid.NewString()[:8]
 	function := "sla_row_" + suffix
@@ -609,10 +610,38 @@ func slaRowTrigger(t *testing.T, app *App, marker, body string) {
 		"CREATE TRIGGER %s BEFORE UPDATE ON agent_transfers FOR EACH ROW EXECUTE FUNCTION %s()",
 		trigger, function,
 	)).Error)
-	t.Cleanup(func() {
+	drop := func() {
 		_ = app.DB.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON agent_transfers", trigger)).Error
 		_ = app.DB.Exec(fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", function)).Error
-	})
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// slaAgentReplied assigns an agent who replied half an hour ago, so the tick
+// extends the transfer's deadline instead of acting on it.
+func slaAgentReplied(t *testing.T, app *App, transfer *models.AgentTransfer) {
+	t.Helper()
+	agent := testutil.CreateTestUser(t, app.DB, transfer.OrganizationID)
+	require.NoError(t, app.DB.Model(transfer).Update("agent_id", agent.ID).Error)
+	createTestAgentMessage(t, app, transfer.OrganizationID, transfer.ContactID, agent.ID,
+		transfer.WhatsAppAccount, time.Now().Add(-30*time.Minute))
+}
+
+// slaProcessorPasses runs passes of one long-lived processor, the way
+// processStaleTransfers does: a per-organization copy bound to the tenant scope.
+func slaProcessorPasses(t *testing.T, app *App, processor *SLAProcessor, settings ...models.ChatbotSettings) func() {
+	t.Helper()
+	return func() {
+		for _, organizationSettings := range settings {
+			require.NoError(t, app.WithTenantApp(organizationSettings.OrganizationID, func(scoped *App) error {
+				tick := *processor
+				tick.app = scoped
+				tick.processOrganizationSLA(organizationSettings, time.Now())
+				return nil
+			}))
+		}
+	}
 }
 
 // Under RLS a pass is one transaction and each written transfer a savepoint.
@@ -696,8 +725,13 @@ func TestSLAPassStaysWithinTheSubtransactionCacheWhenWritesFail(t *testing.T) {
 	for i := range failing {
 		expiresAt := oldest.Add(time.Duration(i) * time.Second)
 		escalationAt := oldest.Add(time.Duration(i) * time.Second)
-		for _, sla := range []models.SLATracking{{ExpiresAt: &expiresAt}, {EscalationAt: &escalationAt}} {
+		extendAt := oldest.Add(time.Duration(i) * time.Second)
+		for _, sla := range []models.SLATracking{{ExpiresAt: &expiresAt}, {EscalationAt: &escalationAt}, {ExpiresAt: &extendAt}} {
 			row := createTransfer(sla)
+			if sla.ExpiresAt == &extendAt {
+				// Its agent replied, so the tick tries (and fails) to extend it.
+				slaAgentReplied(t, app, row)
+			}
 			require.NoError(t, app.DB.Model(row).Update("notes", "synthetic failing row").Error)
 		}
 	}
@@ -798,14 +832,7 @@ func TestSLAAttemptBoundRotatesPastPersistentFailures(t *testing.T) {
 	normal := createTransfer(models.SLATracking{ExpiresAt: &recent})
 	settings := slaNoticeStateSettings(organization.ID)
 	processor := NewSLAProcessor(app, time.Minute)
-	pass := func() {
-		require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
-			tick := *processor
-			tick.app = scoped
-			tick.processOrganizationSLA(settings, time.Now())
-			return nil
-		}))
-	}
+	pass := slaProcessorPasses(t, app, processor, settings)
 	status := func() models.TransferStatus {
 		var stored models.AgentTransfer
 		require.NoError(t, app.DB.First(&stored, "id = ?", normal.ID).Error)
@@ -1022,4 +1049,284 @@ func TestSLAFailingTransferRowDoesNotAbortTheTick(t *testing.T) {
 			}, byPhone)
 		})
 	}
+}
+
+// A rotating pass wraps to the oldest deadline once it reaches the end, so a
+// row behind the stored cursor is handled in that same pass. When a walk gets
+// all the way round, the cursor is dropped and passes start at the oldest
+// deadline again.
+func TestSLACursorWrapsAndIsDroppedAfterAFullRound(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	dropTrigger := slaRowTrigger(t, app, "synthetic failing row", "RAISE EXCEPTION 'synthetic failing SLA row';")
+	oldest := time.Now().UTC().Add(-48 * time.Hour)
+	for i := range slaAttemptsPerPass + 5 {
+		expiresAt := oldest.Add(time.Duration(i) * time.Second)
+		row := createTransfer(models.SLATracking{ExpiresAt: &expiresAt})
+		require.NoError(t, app.DB.Model(row).Update("notes", "synthetic failing row").Error)
+	}
+	settings := slaNoticeStateSettings(organization.ID)
+	processor := NewSLAProcessor(app, time.Minute)
+	pass := slaProcessorPasses(t, app, processor, settings)
+	key := slaResumeKey{organizationID: organization.ID, step: "expires_at"}
+
+	pass()
+	require.NotEqual(t, uuid.Nil, processor.resume.byStep[key].id, "the attempt bound left a cursor")
+	behindAt := oldest.Add(-time.Hour)
+	behind := createTransfer(models.SLATracking{ExpiresAt: &behindAt})
+	pass()
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", behind.ID).Error)
+	assert.Equal(t, models.TransferStatusExpired, stored.Status, "the rotating pass wrapped to the row behind its cursor")
+	require.Len(t, deliveries(), 1)
+
+	// Once the rows stop failing, rotation drains them and ends.
+	dropTrigger()
+	for range 6 {
+		pass()
+	}
+	var active int64
+	require.NoError(t, app.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND status = ?", organization.ID, models.TransferStatusActive).Count(&active).Error)
+	assert.Zero(t, active)
+	assert.NotContains(t, processor.resume.byStep, key, "a walk that got all the way round drops its cursor")
+}
+
+// Each organization keeps its own cursor: one organization's rotation must not
+// move where another one resumes.
+func TestSLACursorsAreKeptPerOrganization(t *testing.T) {
+	app, first, createFirst, deliveries := slaAfterCommitFixture(t)
+	second := testutil.CreateTestOrganization(t, app.DB)
+	secondAccount := testutil.CreateTestWhatsAppAccount(t, app.DB, second.ID)
+	createSecond := func(sla models.SLATracking) *models.AgentTransfer {
+		contact := testutil.CreateTestContactWith(t, app.DB, second.ID,
+			testutil.WithContactAccount(secondAccount.Name),
+			testutil.WithPhoneNumber("60"+testutil.NewTestGraphObjectID()[:10]))
+		transfer := &models.AgentTransfer{
+			BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: second.ID, ContactID: contact.ID,
+			WhatsAppAccount: secondAccount.Name, PhoneNumber: contact.PhoneNumber,
+			Status: models.TransferStatusActive, Source: models.TransferSourceManual,
+			TransferredAt: time.Now().UTC().Add(-2 * time.Hour), SLA: sla,
+		}
+		require.NoError(t, app.DB.Create(transfer).Error)
+		return transfer
+	}
+	slaRowTrigger(t, app, "synthetic failing row", "RAISE EXCEPTION 'synthetic failing SLA row';")
+	// The second organization's deadlines all come after the first's, so a
+	// shared cursor would skip the first organization's normal transfer.
+	oldest := time.Now().UTC().Add(-48 * time.Hour)
+	var normals []*models.AgentTransfer
+	for offset, create := range map[time.Duration]func(models.SLATracking) *models.AgentTransfer{
+		0:             createFirst,
+		2 * time.Hour: createSecond,
+	} {
+		for i := range slaAttemptsPerPass + 5 {
+			expiresAt := oldest.Add(offset + time.Duration(i)*time.Second)
+			row := create(models.SLATracking{ExpiresAt: &expiresAt})
+			require.NoError(t, app.DB.Model(row).Update("notes", "synthetic failing row").Error)
+		}
+		normalAt := oldest.Add(offset + time.Hour)
+		normals = append(normals, create(models.SLATracking{ExpiresAt: &normalAt}))
+	}
+	processor := NewSLAProcessor(app, time.Minute)
+	pass := slaProcessorPasses(t, app, processor, slaNoticeStateSettings(first.ID), slaNoticeStateSettings(second.ID))
+
+	pass()
+	assert.Empty(t, deliveries(), "the attempt bound stops both organizations' first pass")
+	pass()
+	for _, normal := range normals {
+		var stored models.AgentTransfer
+		require.NoError(t, app.DB.First(&stored, "id = ?", normal.ID).Error)
+		assert.Equal(t, models.TransferStatusExpired, stored.Status, "organization %s resumed from its own cursor", normal.OrganizationID)
+	}
+	assert.Len(t, deliveries(), 2)
+}
+
+// A pass stopped by the write cap leaves no cursor: the rows it wrote left the
+// window or moved up a level, and the next pass must start at the oldest
+// deadline. Escalated rows reach level 2 (the critical alert) on the very next
+// pass, not one idle pass later.
+func TestSLAWriteCapLeavesNoCursorForTheNextPass(t *testing.T) {
+	for _, backlog := range []int{slaTransfersPerPass, slaTransfersPerPass + 15} {
+		t.Run(fmt.Sprintf("rows=%d", backlog), func(t *testing.T) {
+			app, organization, createTransfer, _ := slaAfterCommitFixture(t)
+			oldest := time.Now().UTC().Add(-5 * time.Hour)
+			var rows []*models.AgentTransfer
+			for i := range backlog {
+				escalationAt := oldest.Add(time.Duration(i) * time.Second)
+				rows = append(rows, createTransfer(models.SLATracking{EscalationAt: &escalationAt}))
+			}
+			settings := models.ChatbotSettings{
+				OrganizationID: organization.ID,
+				SLA:            models.SLAConfig{Enabled: true, EscalationMinutes: 30},
+			}
+			processor := NewSLAProcessor(app, time.Minute)
+			pass := slaProcessorPasses(t, app, processor, settings)
+			level := func(i int) int {
+				var stored models.AgentTransfer
+				require.NoError(t, app.DB.First(&stored, "id = ?", rows[i].ID).Error)
+				return stored.SLA.EscalationLevel
+			}
+
+			pass()
+			pass()
+			// The second pass starts at the oldest deadline again: it takes the
+			// oldest rows to level 2 (none idle), and newer rows wait.
+			for i := range backlog {
+				want := 2
+				if i >= slaTransfersPerPass {
+					want = 0
+				}
+				assert.Equal(t, want, level(i), "row %d after two passes", i)
+			}
+		})
+	}
+}
+
+// A failed deleted-contact close is rolled back and released like any other
+// failed write: it costs no subtransaction ID, so the writes after it in the
+// pass are the only ones held.
+func TestSLAFailedDeletedContactCloseCostsNoSubtransaction(t *testing.T) {
+	app, organization, createTransfer, _ := slaAfterCommitFixture(t)
+	slaRowTrigger(t, app, "synthetic failing orphan", "RAISE EXCEPTION 'synthetic failing orphan close';")
+	oldest := time.Now().UTC().Add(-5 * time.Hour)
+	orphanAt := oldest
+	orphan := createTransfer(models.SLATracking{ExpiresAt: &orphanAt})
+	require.NoError(t, app.DB.Model(orphan).Update("notes", "synthetic failing orphan").Error)
+	require.NoError(t, app.DB.Delete(&models.Contact{}, "id = ?", orphan.ContactID).Error)
+	const expiring = 3
+	for i := range expiring {
+		expiresAt := oldest.Add(time.Minute + time.Duration(i)*time.Second)
+		createTransfer(models.SLATracking{ExpiresAt: &expiresAt})
+	}
+	settings := models.ChatbotSettings{
+		OrganizationID: organization.ID,
+		SLA:            models.SLAConfig{Enabled: true, AutoCloseHours: 2},
+	}
+
+	var count int64
+	var overflowed bool
+	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+		NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+		count, overflowed = slaPassSubxacts(t, app, scoped)
+		return nil
+	}))
+	assert.False(t, overflowed)
+	assert.EqualValues(t, expiring, count, "only the kept expiries hold a subtransaction ID")
+	var stored models.AgentTransfer
+	require.NoError(t, app.DB.First(&stored, "id = ?", orphan.ID).Error)
+	assert.Equal(t, models.TransferStatusActive, stored.Status, "the failed close was rolled back")
+}
+
+// The extension's deadline and first-response writes are one unit, in both
+// modes: if recording the first response fails, the deadline is not moved.
+func TestSLAFailedFirstResponseLeavesTheDeadlineUnchanged(t *testing.T) {
+	for _, rls := range []bool{true, false} {
+		t.Run(fmt.Sprintf("rls=%v", rls), func(t *testing.T) {
+			app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+			app.Config.Database.RLSEnabled = rls
+			slaRowTrigger(t, app, "synthetic first response failure", `
+				IF NEW.first_response_at IS DISTINCT FROM OLD.first_response_at THEN
+					RAISE EXCEPTION 'synthetic first response failure';
+				END IF;`)
+			past := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+			transfer := createTransfer(models.SLATracking{ExpiresAt: &past})
+			require.NoError(t, app.DB.Model(transfer).Update("notes", "synthetic first response failure").Error)
+			slaAgentReplied(t, app, transfer)
+
+			settings := slaNoticeStateSettings(organization.ID)
+			require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+				NewSLAProcessor(scoped, time.Minute).processOrganizationSLA(settings, time.Now())
+				return nil
+			}))
+			var stored models.AgentTransfer
+			require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+			assert.Equal(t, models.TransferStatusActive, stored.Status)
+			assert.Nil(t, stored.SLA.FirstResponseAt)
+			require.NotNil(t, stored.SLA.ExpiresAt)
+			assert.True(t, past.Equal(stored.SLA.ExpiresAt.UTC()), "the deadline moved without its first response: %s", stored.SLA.ExpiresAt)
+			assert.Empty(t, deliveries())
+		})
+	}
+}
+
+// A write that swallows a failed statement returns nil but leaves its savepoint
+// aborted. The helper rolls it back, so the pass transaction stays usable and
+// later writes still commit.
+func TestSLARowSavepointRecoversFromAFailedRelease(t *testing.T) {
+	for _, rls := range []bool{true, false} {
+		t.Run(fmt.Sprintf("rls=%v", rls), func(t *testing.T) {
+			app, organization, createTransfer, _ := slaAfterCommitFixture(t)
+			app.Config.Database.RLSEnabled = rls
+			transfer := createTransfer(models.SLATracking{})
+			require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+				processor := NewSLAProcessor(scoped, time.Minute)
+				swallowed := processor.withSLARowSavepoint(organization.ID, func(tx *gorm.DB) error {
+					_ = tx.Exec("SELECT 1 / 0").Error
+					return nil
+				})
+				assert.Error(t, swallowed, "an aborted savepoint cannot be kept")
+				return processor.withSLARowSavepoint(organization.ID, func(tx *gorm.DB) error {
+					return tx.Model(&models.AgentTransfer{}).Where("id = ?", transfer.ID).Update("notes", "synthetic kept write").Error
+				})
+			}))
+			var stored models.AgentTransfer
+			require.NoError(t, app.DB.First(&stored, "id = ?", transfer.ID).Error)
+			assert.Equal(t, "synthetic kept write", stored.Notes)
+		})
+	}
+}
+
+// Side effects a write queued for after commit belong to that write: they are
+// discarded when it is rolled back and run when it is kept.
+func TestSLARowSavepointDiscardsSideEffectsOfARolledBackWrite(t *testing.T) {
+	for _, rls := range []bool{true, false} {
+		t.Run(fmt.Sprintf("rls=%v", rls), func(t *testing.T) {
+			app, organization, _, _ := slaAfterCommitFixture(t)
+			app.Config.Database.RLSEnabled = rls
+			var ran []string
+			errRolledBack := errors.New("synthetic rolled-back write")
+			require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
+				processor := NewSLAProcessor(scoped, time.Minute)
+				err := processor.withSLARowSavepoint(organization.ID, func(*gorm.DB) error {
+					scoped.afterTenantCommit(func() { ran = append(ran, "rolled back") })
+					return errRolledBack
+				})
+				require.ErrorIs(t, err, errRolledBack)
+				return processor.withSLARowSavepoint(organization.ID, func(*gorm.DB) error {
+					scoped.afterTenantCommit(func() { ran = append(ran, "kept") })
+					return nil
+				})
+			}))
+			assert.Equal(t, []string{"kept"}, ran)
+		})
+	}
+}
+
+// Cursors no pass used during a tick (organization gone, SLA or the step
+// turned off) are dropped at the end of that tick.
+func TestSLAResumeCursorsPruneUnused(t *testing.T) {
+	cursors := &slaResumeCursors{byStep: map[slaResumeKey]slaCursor{}, used: map[slaResumeKey]bool{}}
+	active := slaResumeKey{organizationID: uuid.New(), step: "expires_at"}
+	stale := slaResumeKey{organizationID: uuid.New(), step: "sla_escalation_at"}
+	cursors.store(active, slaCursor{deadline: time.Now(), id: uuid.New()})
+	cursors.store(stale, slaCursor{deadline: time.Now(), id: uuid.New()})
+
+	cursors.load(active)
+	cursors.pruneUnused()
+	assert.Contains(t, cursors.byStep, active)
+	assert.NotContains(t, cursors.byStep, stale)
+	cursors.pruneUnused()
+	assert.NotContains(t, cursors.byStep, active, "not used during the next tick either")
+}
+
+// The tick itself prunes: a cursor for an organization the tick did not
+// process is gone after it.
+func TestSLATickPrunesCursorsOfOrganizationsItDidNotProcess(t *testing.T) {
+	testutil.TruncateTables(testutil.SetupTestDB(t))
+	app := newSLATestApp(t)
+	processor := NewSLAProcessor(app, time.Minute)
+	stale := slaResumeKey{organizationID: uuid.New(), step: "expires_at"}
+	processor.resume.store(stale, slaCursor{deadline: time.Now(), id: uuid.New()})
+	processor.processStaleTransfers()
+	assert.NotContains(t, processor.resume.byStep, stale)
 }

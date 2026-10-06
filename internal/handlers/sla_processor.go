@@ -40,7 +40,7 @@ const slaTransfersPerPass = 30
 
 // slaAttemptsPerPass bounds the transfers one SLA step tries in a pass, so a
 // pass cannot walk an unbounded backlog of rows that fail on every tick. A
-// pass that stops early leaves its cursor for the next one (slaResumeCursors),
+// pass this bound stops leaves its cursor for the next one (slaResumeCursors),
 // so such rows cannot pin the start of every pass either.
 const slaAttemptsPerPass = 100
 
@@ -61,16 +61,18 @@ func NewSLAProcessor(app *App, interval time.Duration) *SLAProcessor {
 		app:      app,
 		interval: interval,
 		stopCh:   make(chan struct{}),
-		resume:   &slaResumeCursors{byStep: map[slaResumeKey]slaCursor{}},
+		resume:   &slaResumeCursors{byStep: map[slaResumeKey]slaCursor{}, used: map[slaResumeKey]bool{}},
 	}
 }
 
 // slaResumeCursors remembers, per organization and SLA step, where a pass
-// that stopped early left off. The next pass continues from there and wraps
-// to the oldest deadline once it reaches the end. Each instance keeps its own.
+// stopped by slaAttemptsPerPass left off. The next pass continues from there,
+// wraps to the oldest deadline at the end and stops at that cursor. Each
+// instance keeps its own; entries no pass used during a tick are pruned.
 type slaResumeCursors struct {
 	mu     sync.Mutex
 	byStep map[slaResumeKey]slaCursor
+	used   map[slaResumeKey]bool
 }
 
 type slaResumeKey struct {
@@ -89,7 +91,26 @@ func (r *slaResumeCursors) load(key slaResumeKey) slaCursor {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.used != nil {
+		r.used[key] = true
+	}
 	return r.byStep[key]
+}
+
+// pruneUnused drops the cursors of organizations or steps that no pass loaded
+// since the last prune (organization gone, SLA disabled, step turned off).
+func (r *slaResumeCursors) pruneUnused() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key := range r.byStep {
+		if !r.used[key] {
+			delete(r.byStep, key)
+		}
+	}
+	r.used = map[slaResumeKey]bool{}
 }
 
 func (r *slaResumeCursors) store(key slaResumeKey, cursor slaCursor) {
@@ -111,25 +132,42 @@ func (r *slaResumeCursors) store(key slaResumeKey, cursor slaCursor) {
 // releases it on error. GORM's nested Transaction never releases: a
 // rolled-back savepoint stays open around the rest of the pass, and the next
 // write inside it costs an ID anyway. Without an outer transaction this is
-// one short READ COMMITTED tenant transaction.
+// one short READ COMMITTED tenant transaction. After-commit side effects that
+// write queued are discarded when its write is rolled back.
 func (p *SLAProcessor) withSLARowSavepoint(orgID uuid.UUID, write func(tx *gorm.DB) error) error {
+	queued := len(p.app.afterCommit)
+	discardQueued := func() {
+		if len(p.app.afterCommit) > queued {
+			p.app.afterCommit = p.app.afterCommit[:queued]
+		}
+	}
 	db := p.app.DB
 	if _, inTransaction := db.Statement.ConnPool.(gorm.TxCommitter); !inTransaction {
-		return database.WithTenantReadCommitted(db, orgID, write)
+		err := database.WithTenantReadCommitted(db, orgID, write)
+		if err != nil {
+			discardQueued()
+		}
+		return err
 	}
 	if err := db.Exec("SAVEPOINT " + slaRowSavepoint).Error; err != nil {
 		return err
 	}
-	if err := write(db); err != nil {
-		if rollbackErr := db.Exec("ROLLBACK TO SAVEPOINT " + slaRowSavepoint).Error; rollbackErr != nil {
-			return errors.Join(err, rollbackErr)
+	err := write(db)
+	if err == nil {
+		// A write that swallowed a failed statement leaves the savepoint
+		// aborted, so RELEASE fails; roll it back like any failed write.
+		if err = db.Exec("RELEASE SAVEPOINT " + slaRowSavepoint).Error; err == nil {
+			return nil
 		}
-		if releaseErr := db.Exec("RELEASE SAVEPOINT " + slaRowSavepoint).Error; releaseErr != nil {
-			return errors.Join(err, releaseErr)
-		}
-		return err
 	}
-	return db.Exec("RELEASE SAVEPOINT " + slaRowSavepoint).Error
+	discardQueued()
+	if rollbackErr := db.Exec("ROLLBACK TO SAVEPOINT " + slaRowSavepoint).Error; rollbackErr != nil {
+		return errors.Join(err, rollbackErr)
+	}
+	if releaseErr := db.Exec("RELEASE SAVEPOINT " + slaRowSavepoint).Error; releaseErr != nil {
+		return errors.Join(err, releaseErr)
+	}
+	return err
 }
 
 // Start begins the SLA processing loop
@@ -208,6 +246,7 @@ func (p *SLAProcessor) processStaleTransfers() {
 			p.processClientInactivity(organizationID, *inactivitySettings, now)
 		}
 	}
+	p.resume.pruneUnused()
 }
 
 // processOrganizationSLA processes SLA for a single organization
@@ -249,8 +288,12 @@ var errSLATransferNoLongerActive = errors.New("transfer is no longer active")
 // write or slaAttemptsPerPass were tried. handle reports whether it kept a
 // write (its savepoint was released, not rolled back). Rows that fail on
 // every tick therefore neither use up the cap nor starve the transfers behind
-// them. A pass that stops early leaves its cursor for the next pass of this
-// processor, which wraps to the oldest deadline after reaching the end.
+// them.
+//
+// A pass normally starts at the oldest deadline. A pass the attempt bound
+// stops leaves its cursor, and the next pass rotates: it starts after that
+// cursor, wraps to the oldest deadline at the end, and stops at the cursor it
+// started from. Rotation ends when a pass gets all the way round.
 func (p *SLAProcessor) forEachSLACandidate(
 	orgID uuid.UUID,
 	deadlineColumn string,
@@ -259,12 +302,17 @@ func (p *SLAProcessor) forEachSLACandidate(
 	handle func(models.AgentTransfer) bool,
 ) error {
 	key := slaResumeKey{organizationID: orgID, step: deadlineColumn}
-	after := p.resume.load(key)
+	start := p.resume.load(key)
+	rotating := start.id != uuid.Nil
+	after, wrapped := start, false
 	written, attempted := 0, 0
 	for {
 		query := candidates(p.app.DB)
 		if after.id != uuid.Nil {
 			query = query.Where("("+deadlineColumn+", id) > (?, ?)", after.deadline, after.id)
+		}
+		if wrapped {
+			query = query.Where("("+deadlineColumn+", id) <= (?, ?)", start.deadline, start.id)
 		}
 		var page []models.AgentTransfer
 		if err := query.Order(deadlineColumn + ", id").Limit(slaTransfersPerPass).Find(&page).Error; err != nil {
@@ -279,12 +327,23 @@ func (p *SLAProcessor) forEachSLACandidate(
 			if handle(page[i]) {
 				written++
 			}
-			if written >= slaTransfersPerPass || attempted >= slaAttemptsPerPass {
+			if attempted >= slaAttemptsPerPass || (rotating && written >= slaTransfersPerPass) {
 				p.resume.store(key, after)
+				return nil
+			}
+			if written >= slaTransfersPerPass {
+				// The written rows left the window (or moved up a level), so
+				// the next pass starts at the oldest deadline again.
+				p.resume.store(key, slaCursor{})
 				return nil
 			}
 		}
 		if len(page) < slaTransfersPerPass {
+			if rotating && !wrapped {
+				wrapped = true
+				after = slaCursor{}
+				continue
+			}
 			p.resume.store(key, slaCursor{})
 			return nil
 		}
@@ -713,9 +772,12 @@ func slaAutoCloseNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) 
 
 // slaWarningNoticeStillCurrent: the transfer is still waiting for an agent at
 // or past the escalation that triggered the warning, and no agent has replied
-// to the customer since that escalation. A reply is a non-template outgoing
-// message from a user that did not fail: API-key integrations send templates
-// under their key owner's user id, and a failed text never reached anyone.
+// to the customer since that escalation. A reply is an outgoing message from
+// a user, sent after the escalation, that is not a template and did not fail
+// (a failed text never reached the customer). Caveat: API-key requests carry
+// the key owner's user id and are not marked on the stored message, so a text
+// or media message an integration sends through an API key also counts as a
+// reply; the template exclusion covers the usual integration notifications.
 func slaWarningNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) (bool, error) {
 	current, found, err := loadSLANoticeTransfer(tx, transfer)
 	if err != nil || !found ||
