@@ -1,6 +1,9 @@
 package testutil
 
 import (
+	"fmt"
+	"math/rand/v2"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +24,25 @@ const TestJWTSecret = "test-secret-key-must-be-at-least-32-chars"
 // testBcryptCost keeps fixture creation fast while still producing valid bcrypt
 // hashes for authentication tests. Production password hashing remains unchanged.
 const testBcryptCost = bcrypt.MinCost
+
+// testContactPhoneSequence numbers fixture contact phones. Phone numbers are
+// unique per organization (idx_contacts_org_phone) and every contact of a test
+// organization is created in one test process, so a per-process counter cannot
+// collide. It starts at a random point so that separate test packages sharing
+// the database do not hand out the same numbers in the same order.
+var testContactPhoneSequence = func() *atomic.Uint64 {
+	var sequence atomic.Uint64
+	sequence.Store(rand.Uint64N(10_000_000))
+	return &sequence
+}()
+
+// NewTestContactPhoneNumber returns an E.164 mobile number (+46 70 and seven
+// digits) that no other call in this test process returns, for up to ten
+// million calls. Only digits follow the plus sign, so phone validators and
+// digit normalization see a real-looking number.
+func NewTestContactPhoneNumber() string {
+	return fmt.Sprintf("+4670%07d", testContactPhoneSequence.Add(1)%10_000_000)
+}
 
 // NewTestGraphObjectID returns a unique, numeric identifier shaped like the
 // object IDs accepted by Meta's Graph API. Keeping shared fixtures realistic
@@ -261,7 +283,7 @@ func CreateTestContact(t *testing.T, db *gorm.DB, orgID uuid.UUID) *models.Conta
 	contact := &models.Contact{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: orgID,
-		PhoneNumber:    "+1234567890" + uniqueID[:4],
+		PhoneNumber:    NewTestContactPhoneNumber(),
 		ProfileName:    "Test Contact " + uniqueID,
 	}
 	require.NoError(t, db.Create(contact).Error)
@@ -293,7 +315,7 @@ func CreateTestContactWith(t *testing.T, db *gorm.DB, orgID uuid.UUID, opts ...C
 	contact := &models.Contact{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: orgID,
-		PhoneNumber:    "+1234567890" + uniqueID[:4],
+		PhoneNumber:    NewTestContactPhoneNumber(),
 		ProfileName:    "Test Contact " + uniqueID,
 	}
 
