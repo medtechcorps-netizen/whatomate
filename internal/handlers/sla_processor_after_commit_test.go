@@ -195,13 +195,19 @@ func TestSLATextRefusesToSendInsideCallerTransaction(t *testing.T) {
 	assert.Less(t, time.Since(started), 10*time.Second)
 	assert.Empty(t, deliveries())
 	assert.Zero(t, countSLATestOutgoing(t, app, transfer))
+}
 
-	// The same notice queued for after commit is delivered once.
+// The same notice queued for after commit is delivered once the transaction
+// holding the fence has committed.
+func TestSLATextAfterCommitDeliversOnceAfterTheFenceIsReleased(t *testing.T) {
+	app, organization, createTransfer, deliveries := slaAfterCommitFixture(t)
+	transfer := createTransfer(models.SLATracking{})
+
 	require.NoError(t, app.WithTenantApp(organization.ID, func(scoped *App) error {
 		if err := database.LockOrganizationPolicyScope(scoped.DB, organization.ID); err != nil {
 			return err
 		}
-		NewSLAProcessor(scoped, time.Minute).sendSLATextAfterCommit(*transfer, "Synthetic SLA notice", "Synthetic queued notice")
+		NewSLAProcessor(scoped, time.Minute).sendSLATextAfterCommit(*transfer, "Synthetic SLA notice", "Synthetic queued notice", nil)
 		return nil
 	}))
 	require.Len(t, deliveries(), 1)
