@@ -300,6 +300,98 @@ func TestLegacyMetaAccountRenameFinalizerReconcilesShadowCreatedAfterStage(t *te
 	assert.Contains(t, storedShadow.Name, nextName)
 }
 
+// A rename keeps the shadow locked for the rest of its request transaction,
+// which later writes organization-scoped rows such as the audit entry. It must
+// therefore queue on the organization behind a Coexistence admission's policy
+// fence instead of owning the shadow that admission takes next.
+func TestLegacyMetaAccountRenameStageQueuesBehindAdmissionFence(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := createLegacyMetaTestOrganization(t, db, "rename-fence")
+	suffix := uuid.NewString()[:8]
+	account := createLegacyMetaTestAccount(t, db, org.ID, "Before Fence "+suffix)
+	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	require.NoError(t, err)
+	nextName := "After Fence " + suffix
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admission := db.WithContext(ctx).Begin()
+	require.NoError(t, admission.Error)
+	defer func() { _ = admission.Rollback().Error }()
+	require.NoError(t, database.LockOrganizationPolicyScope(admission, org.ID))
+	var admissionPID int
+	require.NoError(t, admission.Session(&gorm.Session{NewDB: true}).
+		Raw("SELECT pg_backend_pid()").Scan(&admissionPID).Error)
+
+	staged := make(chan struct{})
+	release := make(chan struct{})
+	renamed := make(chan error, 1)
+	go func() {
+		renamed <- db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			_, stageErr := channelapi.StageLegacyMetaWhatsAppAccountRename(
+				tx,
+				org.ID,
+				account.ID,
+				account.Name,
+				nextName,
+			)
+			close(staged)
+			if stageErr != nil {
+				return stageErr
+			}
+			// Keep the rename transaction open, as the request transaction does.
+			<-release
+			return nil
+		})
+	}()
+	var releaseOnce sync.Once
+	releaseRename := func() { releaseOnce.Do(func() { close(release) }) }
+	defer func() {
+		_ = admission.Rollback().Error
+		releaseRename()
+		cancel()
+	}()
+
+	// Either the stage is queued on the admission or it already returned.
+	require.Eventually(t, func() bool {
+		select {
+		case <-staged:
+			return true
+		default:
+		}
+		var waiting bool
+		return db.Raw(
+			"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid)))",
+			admissionPID,
+		).Scan(&waiting).Error == nil && waiting
+	}, 10*time.Second, 10*time.Millisecond, "the rename never reached the admission fence")
+
+	var probed models.ChannelAccount
+	require.NoError(t, admission.Clauses(clause.Locking{Strength: "UPDATE", Options: "NOWAIT"}).
+		Select("id").
+		Where("id = ? AND organization_id = ?", shadow.ID, org.ID).
+		First(&probed).Error,
+		"the rename owned the shadow while the admission held its policy fence")
+	require.NoError(t, admission.Commit().Error)
+
+	select {
+	case <-staged:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "rename stage did not continue after the admission committed")
+	}
+	releaseRename()
+	select {
+	case err := <-renamed:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "rename transaction did not finish")
+	}
+	var storedShadow models.ChannelAccount
+	require.NoError(t, db.Where("id = ? AND organization_id = ?", shadow.ID, org.ID).
+		First(&storedShadow).Error)
+	assert.Equal(t, nextName, storedShadow.Metadata["legacy_account_name"])
+}
+
 func TestLegacyMetaMirrorRejectsAccountAndExistingLinkConflicts(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 
@@ -1791,6 +1883,89 @@ func TestLegacyMetaSharersDoNotQueueBehindAFenceWaitingForAJoinedMemberThatWaits
 		require.NoError(t, fenceErr)
 	case <-time.After(10 * time.Second):
 		require.Fail(t, "the policy fence did not acquire after the send and the mirror")
+	}
+	require.NoError(t, fence.Commit().Error)
+}
+
+// Waiting sharers of one organization share one lock-table query per
+// legacyMetaPolicyFenceStateTTL: the query reads every lock in the cluster.
+func TestLegacyMetaPolicyFenceStateIsQueriedOncePerTTL(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	org := createLegacyMetaTestOrganization(t, db, "state-queries")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	// A fence that holds the key and works keeps sharers polling for the
+	// whole queue bound.
+	fence := db.WithContext(ctx).Begin()
+	require.NoError(t, fence.Error)
+	t.Cleanup(func() { _ = fence.Rollback().Error })
+	require.NoError(t, fence.Exec(
+		"SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
+		database.WhatsAppIdentityReviewContactSelectorFenceKey(org.ID),
+	).Error)
+
+	before := channelapi.LegacyMetaPolicyFenceStateQueriesForTest()
+	const sharers = 32
+	var group sync.WaitGroup
+	errs := make(chan error, sharers)
+	for range sharers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			errs <- db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				return channelapi.LockLegacyMetaOrganization(tx, org.ID)
+			})
+		}()
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	queries := channelapi.LegacyMetaPolicyFenceStateQueriesForTest() - before
+	t.Logf("%d sharers polled for the queue bound with %d state queries", sharers, queries)
+	assert.LessOrEqual(t, queries, int64(25), "waiting sharers must share the state query")
+}
+
+// A strict reply's pre-provider transaction takes the organization and the
+// shadow, then mirrors in the same transaction, which takes them again. When
+// the first acquisition went past a fence that is still waiting, the second
+// must not queue for that fence again.
+func TestLegacyMetaReentryAfterGoingPastAWaitingFenceDoesNotQueueAgain(t *testing.T) {
+	const bound = time.Second
+	defer channelapi.SetLegacyMetaPolicyFenceQueueWaitForTest(bound)()
+	db := testutil.SetupTestDB(t)
+	org, account, pending := legacyMetaFenceFixture(t, db, "reentry", 1, 1)
+	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	sharer := holdLegacyMetaPolicyFenceKeyShared(ctx, t, db, org.ID)
+	fence, fenced := queueLegacyMetaPolicyFence(ctx, t, db, org.ID)
+	var first, reentry time.Duration
+	require.NoError(t, db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		started := time.Now()
+		if err := channelapi.LockLegacyMetaOrganizationAndShadow(tx, org.ID, shadow.ID); err != nil {
+			return err
+		}
+		first = time.Since(started)
+		started = time.Now()
+		if _, err := channelapi.MirrorLegacyWhatsAppMessage(tx, legacyMetaRef(account), pending[0][0]); err != nil {
+			return err
+		}
+		reentry = time.Since(started)
+		return nil
+	}))
+	assert.GreaterOrEqual(t, first, bound, "the first acquisition queues behind the waiting fence")
+	assert.Less(t, reentry, bound/2, "the re-entry queued for the fence again")
+
+	require.NoError(t, sharer.Commit().Error)
+	select {
+	case fenceErr := <-fenced:
+		require.NoError(t, fenceErr)
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "the policy fence did not acquire after the sharer committed")
 	}
 	require.NoError(t, fence.Commit().Error)
 }

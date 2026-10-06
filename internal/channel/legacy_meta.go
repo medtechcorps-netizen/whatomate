@@ -135,10 +135,24 @@ func LegacyMetaAIBookingAuthority(shadow *models.ChannelAccount, native *models.
 }
 
 // StageLegacyMetaWhatsAppAccountRename refreshes the mutable display-name
-// projection of an established WhatsApp account. Callers must invoke it in the
-// same transaction as the corresponding whatsapp_accounts update and before
-// taking that account row lock. That preserves the bridge-wide lock order
-// (ChannelAccount -> WhatsAppAccount) used by strict replies.
+// projection of an established WhatsApp account. Callers must invoke it first
+// in the transaction that updates the whatsapp_accounts row and then writes
+// the update's audit row, before taking that account row lock. It takes the
+// bridge-wide lock order (Organization -> ChannelAccount -> WhatsAppAccount)
+// used by strict replies, and the organization and the account row even when
+// the name is unchanged and there is no shadow to refresh. The organization
+// comes first because the audit row's INSERT locks it (the platform-compliance
+// write guard takes it FOR SHARE) while the transaction owns the account row
+// and the shadow, which a Coexistence admission locks after its policy fence.
+// The account and shadow UPDATEs themselves do not lock it: the guard fires
+// only for an UPDATE that sets organization_id, which they never do (keep it
+// out of their SET lists), and their organization foreign keys are unchanged
+// and checked again only when a row is updated twice in one transaction. The
+// shadow and the account row are taken with
+// lockLegacyMetaOrganizationThenShadow, so an update queued on either (sends
+// hold the account row FOR SHARE across their Meta call) never holds the
+// organization, except in that helper's bounded fallback after
+// lockLegacyMetaShadowRounds lost rounds.
 //
 // A missing shadow is valid: the first mirror/backfill will create one from the
 // renamed account. An existing shadow, however, must still carry the exact
@@ -159,21 +173,36 @@ func StageLegacyMetaWhatsAppAccountRename(
 		return false, errors.New("legacy Meta account rename names are required")
 	}
 	if previousName == nextName {
+		if err := LockLegacyMetaOrganizationAndWhatsAppAccount(db, organizationID, accountID); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 
 	externalID := legacyMetaIDPrefix + "account:" + accountID.String()
+	shadowRows := func(tx *gorm.DB, lockOptions string) *gorm.DB {
+		return tx.Unscoped().
+			Clauses(clause.Locking{Strength: "UPDATE", Options: lockOptions}).
+			Where(
+				"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
+				organizationID,
+				models.ChannelWhatsApp,
+				LegacyMetaProvider,
+				externalID,
+			)
+	}
+	if err := lockLegacyMetaOrganizationThenShadow(db, organizationID, func(tx *gorm.DB, nowait bool) error {
+		lockOptions := legacyMetaNowaitOption(nowait)
+		var shadows []models.ChannelAccount
+		if err := shadowRows(tx, lockOptions).Find(&shadows).Error; err != nil {
+			return fmt.Errorf("lock legacy Meta shadow for account rename: %w", err)
+		}
+		return lockLegacyMetaWhatsAppAccount(tx, organizationID, accountID, lockOptions)
+	}); err != nil {
+		return false, err
+	}
 	var shadow models.ChannelAccount
-	err := db.Unscoped().
-		Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where(
-			"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
-			organizationID,
-			models.ChannelWhatsApp,
-			LegacyMetaProvider,
-			externalID,
-		).
-		First(&shadow).Error
+	err := shadowRows(db, "").First(&shadow).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
@@ -223,6 +252,35 @@ func StageLegacyMetaWhatsAppAccountRename(
 		)
 	}
 	return true, nil
+}
+
+// LockLegacyMetaOrganizationAndWhatsAppAccount takes the organization row FOR
+// SHARE behind the policy fence queue and then the whatsapp_accounts row FOR
+// UPDATE, never waiting for the row while it holds the organization (sends
+// hold it FOR SHARE across their Meta call), except in the bounded fallback of
+// lockLegacyMetaOrganizationThenShadow. A transaction that updates the account
+// row and then writes an audit row must take both first: with the
+// platform-compliance write guard the audit INSERT locks the organization FOR
+// SHARE, after the row, and a Coexistence admission locks the row only after
+// its policy fence owns the organization FOR UPDATE.
+func LockLegacyMetaOrganizationAndWhatsAppAccount(db *gorm.DB, organizationID, accountID uuid.UUID) error {
+	if db == nil || organizationID == uuid.Nil || accountID == uuid.Nil {
+		return errors.New("legacy Meta account lock scope is required")
+	}
+	return lockLegacyMetaOrganizationThenShadow(db, organizationID, func(tx *gorm.DB, nowait bool) error {
+		return lockLegacyMetaWhatsAppAccount(tx, organizationID, accountID, legacyMetaNowaitOption(nowait))
+	})
+}
+
+func lockLegacyMetaWhatsAppAccount(db *gorm.DB, organizationID, accountID uuid.UUID, lockOptions string) error {
+	var accounts []models.WhatsAppAccount
+	if err := db.Clauses(clause.Locking{Strength: "UPDATE", Options: lockOptions}).
+		Select("id").
+		Where("id = ? AND organization_id = ?", accountID, organizationID).
+		Find(&accounts).Error; err != nil {
+		return fmt.Errorf("lock WhatsApp account: %w", err)
+	}
+	return nil
 }
 
 // FinalizeLegacyMetaWhatsAppAccountRename closes the only creation race left
@@ -1088,6 +1146,44 @@ func lockLegacyMetaOrganizationThenShadow(
 		return err
 	}
 	return lockShadow(db, false)
+}
+
+// LockLegacyMetaOrganization passes the policy fence queue, with the same
+// limits as lockLegacyMetaOrganizationThenShadow and not at all while the fence
+// is stuck, and takes the tenant organization row FOR SHARE, before any other
+// lock, for a transaction that owns no legacy shadow. Outgoing delivery
+// recovery uses it for every non-AI WhatsApp send, classic accounts included;
+// such a send may run under an AI attempt fence that a waiting policy fence is
+// itself queued behind.
+func LockLegacyMetaOrganization(db *gorm.DB, organizationID uuid.UUID) error {
+	if db == nil || organizationID == uuid.Nil {
+		return errors.New("legacy Meta organization lock scope is required")
+	}
+	return lockLegacyMetaOrganizationShare(db, organizationID, newLegacyMetaPolicyFenceDeadlines(), false)
+}
+
+// LockLegacyMetaOrganizationAndShadow takes the organization row FOR SHARE and
+// the legacy shadow FOR UPDATE for a transaction that does not own the policy
+// fence and will write organization-scoped rows while it owns the shadow, using
+// lockLegacyMetaOrganizationThenShadow. It locks exactly the live row that a
+// later id-scoped shadow lock in the same transaction re-enters.
+func LockLegacyMetaOrganizationAndShadow(
+	db *gorm.DB,
+	organizationID, channelAccountID uuid.UUID,
+) error {
+	if db == nil || organizationID == uuid.Nil || channelAccountID == uuid.Nil {
+		return errors.New("legacy Meta shadow lock scope is required")
+	}
+	return lockLegacyMetaOrganizationThenShadow(db, organizationID, func(tx *gorm.DB, nowait bool) error {
+		var shadows []models.ChannelAccount
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: legacyMetaNowaitOption(nowait)}).
+			Select("id").
+			Where("id = ? AND organization_id = ?", channelAccountID, organizationID).
+			Find(&shadows).Error; err != nil {
+			return fmt.Errorf("lock legacy Meta shadow: %w", err)
+		}
+		return nil
+	})
 }
 
 func legacyMetaNowaitOption(nowait bool) string {

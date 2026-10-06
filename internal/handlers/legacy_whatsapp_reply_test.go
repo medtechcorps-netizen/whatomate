@@ -1,17 +1,20 @@
 package handlers_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
 	appwebsocket "github.com/shridarpatil/whatomate/internal/websocket"
@@ -21,6 +24,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type legacyReplyFixture struct {
@@ -617,4 +621,318 @@ func cloneReplyJSON(source models.JSONB) models.JSONB {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+// legacyReplyAdmissionFence holds the lock prefix of a Coexistence admission
+// on the fixture's tenant (WAMID fence, then the organization policy fence) in
+// its own transaction, as persistAuthenticatedIncomingMessageBeforeAck does,
+// so a test can interleave it with a reply exactly.
+type legacyReplyAdmissionFence struct {
+	tx  *gorm.DB
+	pid int
+}
+
+func holdLegacyReplyAdmissionFence(
+	ctx context.Context,
+	t *testing.T,
+	fixture *legacyReplyFixture,
+) *legacyReplyAdmissionFence {
+	t.Helper()
+	tx := fixture.app.DB.WithContext(ctx).Begin()
+	require.NoError(t, tx.Error)
+	t.Cleanup(func() { _ = tx.Rollback().Error })
+	require.NoError(t, database.LockWhatsAppWAMIDScopes(
+		tx,
+		fixture.organization.ID,
+		"wamid.fence-"+uuid.NewString(),
+	))
+	require.NoError(t, database.LockOrganizationPolicyScope(tx, fixture.organization.ID))
+	fence := &legacyReplyAdmissionFence{tx: tx}
+	require.NoError(t, tx.Session(&gorm.Session{NewDB: true}).
+		Raw("SELECT pg_backend_pid()").Scan(&fence.pid).Error)
+	return fence
+}
+
+// ensureShadow continues like the admission and locks the reply's shadow.
+func (fence *legacyReplyAdmissionFence) ensureShadow(fixture *legacyReplyFixture) error {
+	_, err := channelapi.EnsureLegacyMetaWhatsAppAccount(fence.tx, channelapi.LegacyMetaAccountRef{
+		ID:             fixture.selected.ID,
+		OrganizationID: fixture.organization.ID,
+		Name:           fixture.selected.Name,
+		Status:         fixture.selected.Status,
+	})
+	return err
+}
+
+// waiter returns the query of the one backend waiting on the fence, if any.
+func (fence *legacyReplyAdmissionFence) waiter(db *gorm.DB) (string, bool) {
+	var waiters []struct{ Query string }
+	if db.Raw(
+		`SELECT query FROM pg_catalog.pg_stat_activity
+		  WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid))`,
+		fence.pid,
+	).Scan(&waiters).Error != nil || len(waiters) != 1 {
+		return "", false
+	}
+	return waiters[0].Query, true
+}
+
+func (fence *legacyReplyAdmissionFence) waiting(db *gorm.DB) bool {
+	var blockers []int64
+	return db.Raw("SELECT unnest(pg_catalog.pg_blocking_pids(?))", fence.pid).
+		Scan(&blockers).Error == nil && len(blockers) > 0
+}
+
+// A strict reply's pre-provider transaction inserts the pending Message, which
+// locks the organization row, while it owns the legacy shadow. It must take the
+// organization first and queue behind a Coexistence admission's policy fence
+// instead of holding the shadow that admission needs next.
+func TestSendLegacyWhatsAppConversationReplyQueuesBehindCoexistenceAdmissionFence(t *testing.T) {
+	fixture := newLegacyReplyFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	fence := holdLegacyReplyAdmissionFence(ctx, t, fixture)
+
+	request := legacyReplyRequest(t, fixture, "Reply racing an inbound admission")
+	var replyErr error
+	replied := make(chan struct{})
+	go func() {
+		defer close(replied)
+		replyErr = fixture.app.SendLegacyWhatsAppConversationReply(request)
+	}()
+	defer func() {
+		_ = fence.tx.Rollback().Error
+		select {
+		case <-replied:
+		case <-time.After(10 * time.Second):
+			t.Error("legacy reply did not terminate after the admission ended")
+		}
+	}()
+
+	var waitingQuery string
+	require.Eventually(t, func() bool {
+		var waiting bool
+		waitingQuery, waiting = fence.waiter(fixture.app.DB)
+		return waiting
+	}, 10*time.Second, 10*time.Millisecond, "the reply must wait on the admission's policy fence")
+	var probed models.ChannelAccount
+	require.NoError(t, fence.tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "NOWAIT"}).
+		Select("id").
+		Where("id = ? AND organization_id = ?", fixture.shadow.ID, fixture.organization.ID).
+		First(&probed).Error,
+		"the reply owned the shadow while waiting in %q", waitingQuery)
+	require.NoError(t, fence.ensureShadow(fixture))
+	require.NoError(t, fence.tx.Commit().Error)
+
+	select {
+	case <-replied:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "legacy reply did not finish after the admission committed")
+	}
+	require.NoError(t, replyErr)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+	assert.Equal(t, 1, fixture.mock.sentMessageCount())
+	var persisted models.Message
+	require.NoError(t, fixture.app.DB.Where(
+		"id = ? AND organization_id = ?",
+		legacyReplyResponseID(t, request),
+		fixture.organization.ID,
+	).First(&persisted).Error)
+	assert.Equal(t, models.MessageStatusSent, persisted.Status)
+	assert.NotEmpty(t, persisted.WhatsAppMessageID)
+}
+
+// The provider transaction holds the shadow across the Meta call but never
+// waits for the organization row, so a Coexistence admission can fence the
+// tenant mid-send and then wait for that shadow. The WAMID owner trigger's
+// FOR SHARE NOWAIT then fails the provider transaction; recovery must wait for
+// the fence and still record the provider's WAMID without calling Meta again.
+func TestSendLegacyWhatsAppConversationReplyRecordsWAMIDWhenAdmissionFencesDuringSend(t *testing.T) {
+	fixture := newLegacyReplyFixture(t)
+	inSend := make(chan struct{})
+	release := make(chan struct{})
+	var inSendOnce, releaseOnce sync.Once
+	releaseSend := func() { releaseOnce.Do(func() { close(release) }) }
+	fixture.mock.messageHook = func() {
+		inSendOnce.Do(func() { close(inSend) })
+		<-release
+	}
+	defer releaseSend()
+
+	request := legacyReplyRequest(t, fixture, "Reply sent while an inbound admission fences")
+	var replyErr error
+	replied := make(chan struct{})
+	go func() {
+		defer close(replied)
+		replyErr = fixture.app.SendLegacyWhatsAppConversationReply(request)
+	}()
+	select {
+	case <-inSend:
+	case <-replied:
+		require.Failf(t, "legacy reply finished before calling Meta", "error: %v", replyErr)
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "legacy reply never reached Meta")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	fence := holdLegacyReplyAdmissionFence(ctx, t, fixture)
+	var shadowErr error
+	shadowed := make(chan struct{})
+	go func() {
+		defer close(shadowed)
+		shadowErr = fence.ensureShadow(fixture)
+	}()
+	defer func() {
+		releaseSend()
+		select {
+		case <-shadowed:
+		case <-time.After(10 * time.Second):
+			t.Error("admission shadow lock did not terminate")
+		}
+		_ = fence.tx.Rollback().Error
+		select {
+		case <-replied:
+		case <-time.After(10 * time.Second):
+			t.Error("legacy reply did not terminate after the admission ended")
+		}
+	}()
+	require.Eventually(t, func() bool { return fence.waiting(fixture.app.DB) },
+		10*time.Second, 10*time.Millisecond, "the admission must wait for the shadow held across Meta")
+
+	releaseSend()
+	select {
+	case <-shadowed:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "the provider transaction never released the shadow")
+	}
+	require.NoError(t, shadowErr)
+	// The provider transaction gave up the shadow; its recovery now either
+	// queues behind the admission or has already given up.
+	require.Eventually(t, func() bool {
+		select {
+		case <-replied:
+			return true
+		default:
+		}
+		_, waiting := fence.waiter(fixture.app.DB)
+		return waiting
+	}, 10*time.Second, 10*time.Millisecond, "delivery recovery never reached the admission fence")
+	require.NoError(t, fence.tx.Commit().Error)
+
+	select {
+	case <-replied:
+	case <-time.After(15 * time.Second):
+		require.Fail(t, "legacy reply did not finish after the admission committed")
+	}
+	require.NoError(t, replyErr)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request))
+	assert.Equal(t, 1, fixture.mock.sentMessageCount(), "recovery must not call Meta again")
+	var persisted models.Message
+	require.NoError(t, fixture.app.DB.Where(
+		"organization_id = ? AND inbox_conversation_id = ? AND direction = ?",
+		fixture.organization.ID,
+		fixture.conversation.ID,
+		models.DirectionOutgoing,
+	).First(&persisted).Error)
+	assert.Equal(t, models.MessageStatusSent, persisted.Status)
+	assert.Equal(t, fixture.mock.nextMessageID, persisted.WhatsAppMessageID)
+}
+
+// A reply whose pre-provider transaction queues for a shadow that another
+// reply's provider transaction holds across its Meta call must not hold the
+// organization row meanwhile. PostgreSQL lets a new FOR SHARE overtake a
+// waiting FOR UPDATE, so queued SHARE holders would keep every policy fence in
+// the tenant (each inbound admission) out until those Meta calls return.
+func TestSendLegacyWhatsAppConversationReplyQueuedBehindSendLeavesPolicyFenceAvailable(t *testing.T) {
+	fixture := newLegacyReplyFixture(t)
+	inSend := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	var releaseOnce sync.Once
+	releaseSend := func() { releaseOnce.Do(func() { close(release) }) }
+	fixture.mock.messageHook = func() {
+		if calls.Add(1) == 1 {
+			close(inSend)
+			<-release
+			return
+		}
+		fixture.mock.mu.Lock()
+		fixture.mock.nextMessageID = "wamid.test-second-" + uuid.NewString()[:8]
+		fixture.mock.mu.Unlock()
+	}
+	defer releaseSend()
+
+	first := legacyReplyRequest(t, fixture, "First reply holds the shadow across Meta")
+	var firstErr, secondErr error
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		firstErr = fixture.app.SendLegacyWhatsAppConversationReply(first)
+	}()
+	select {
+	case <-inSend:
+	case <-firstDone:
+		require.Failf(t, "first reply finished before calling Meta", "error: %v", firstErr)
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "first reply never reached Meta")
+	}
+	second := legacyReplyRequest(t, fixture, "Second reply queues behind the first")
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		secondErr = fixture.app.SendLegacyWhatsAppConversationReply(second)
+	}()
+	defer func() {
+		releaseSend()
+		for _, done := range []chan struct{}{firstDone, secondDone} {
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Error("legacy reply did not terminate")
+			}
+		}
+	}()
+	require.Eventually(t, func() bool {
+		var queued int64
+		return fixture.app.DB.Raw(
+			`SELECT count(*) FROM pg_catalog.pg_stat_activity
+			  WHERE datname = pg_catalog.current_database()
+			    AND wait_event_type = 'Lock'
+			    AND query ILIKE '%channel_accounts%'`,
+		).Scan(&queued).Error == nil && queued == 1
+	}, 10*time.Second, 10*time.Millisecond, "the second reply must queue on the shadow held across Meta")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fence := fixture.app.DB.WithContext(ctx).Begin()
+	require.NoError(t, fence.Error)
+	defer func() { _ = fence.Rollback().Error }()
+	require.NoError(t, fence.Exec("SET LOCAL lock_timeout = '1s'").Error)
+	require.NoError(t, database.LockOrganizationPolicyScope(fence, fixture.organization.ID),
+		"the queued reply held the organization row")
+	require.NoError(t, fence.Commit().Error)
+
+	releaseSend()
+	for _, done := range []chan struct{}{firstDone, secondDone} {
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			require.Fail(t, "legacy reply did not finish after Meta returned")
+		}
+	}
+	require.NoError(t, firstErr)
+	require.NoError(t, secondErr)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(first))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(second))
+	assert.Equal(t, 2, fixture.mock.sentMessageCount())
+	var sent int64
+	require.NoError(t, fixture.app.DB.Model(&models.Message{}).Where(
+		"organization_id = ? AND inbox_conversation_id = ? AND direction = ? AND status = ? AND BTRIM(whats_app_message_id) <> ''",
+		fixture.organization.ID,
+		fixture.conversation.ID,
+		models.DirectionOutgoing,
+		models.MessageStatusSent,
+	).Count(&sent).Error)
+	assert.EqualValues(t, 2, sent)
 }

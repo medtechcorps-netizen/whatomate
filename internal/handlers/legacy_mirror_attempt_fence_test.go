@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -150,11 +151,13 @@ func requireLegacyStepWithin(t *testing.T, limit time.Duration, name string, ste
 	}
 }
 
+var errLegacyAttemptFenceRollback = errors.New("roll back the probe transaction")
+
 func TestLegacySharersDoNotQueueBehindAPolicyFenceWaitingOnAnAttemptFence(t *testing.T) {
 	app := newProcessorTestApp(t)
 	organization, account := createProcessorTestOrg(t, app)
 	contact := testutil.CreateTestContactWith(t, app.DB, organization.ID, testutil.WithContactAccount(account.Name))
-	_, err := channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
 		ID: account.ID, OrganizationID: organization.ID, Name: account.Name, Status: account.Status,
 	})
 	require.NoError(t, err)
@@ -182,9 +185,33 @@ func TestLegacySharersDoNotQueueBehindAPolicyFenceWaitingOnAnAttemptFence(t *tes
 	require.NoError(t, database.LockOrganizationAIAttemptScope(attempt, organization.ID))
 	fence, fenced := queueLegacyPolicyFence(ctx, t, app.DB, organization.ID)
 
+	inTransaction := func(step func(tx *gorm.DB) error) func() error {
+		return func() error {
+			err := app.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				if err := step(tx); err != nil {
+					return err
+				}
+				return errLegacyAttemptFenceRollback
+			})
+			if errors.Is(err, errLegacyAttemptFenceRollback) {
+				return nil
+			}
+			return err
+		}
+	}
 	requireLegacyStepWithin(t, 2*time.Second, "outbound mirror", func() error {
 		return app.requireLegacyWhatsAppMessageMirror(ctx, account, outgoing.ID)
 	})
+	requireLegacyStepWithin(t, 2*time.Second, "delivery recovery organization lock", inTransaction(func(tx *gorm.DB) error {
+		return channelapi.LockLegacyMetaOrganization(tx, organization.ID)
+	}))
+	requireLegacyStepWithin(t, 2*time.Second, "strict reply organization and shadow", inTransaction(func(tx *gorm.DB) error {
+		return channelapi.LockLegacyMetaOrganizationAndShadow(tx, organization.ID, shadow.ID)
+	}))
+	requireLegacyStepWithin(t, 2*time.Second, "rename stage", inTransaction(func(tx *gorm.DB) error {
+		_, err := channelapi.StageLegacyMetaWhatsAppAccountRename(tx, organization.ID, account.ID, account.Name, account.Name+" renamed")
+		return err
+	}))
 
 	require.NoError(t, attempt.Commit().Error)
 	select {
