@@ -6108,3 +6108,5 @@ func SeedDefaultWidgetsForOrg(db *gorm.DB, orgID, userID uuid.UUID) error {
 
 	return nil
 }
+
+// Schema guard live check: this draft PR must fail CI and is never merged.
