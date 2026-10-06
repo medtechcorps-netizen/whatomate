@@ -1652,15 +1652,33 @@ func (a *App) ReturnAgentTransfersToQueue(userID, orgID uuid.UUID) int {
 	}
 
 	// Return each transfer to its team queue (or general queue)
+	returned := 0
 	for i := range transfers {
 		transfer := &transfers[i]
 		previousAgentID := transfer.AgentID
-		transfer.AgentID = nil
 
-		if err := a.DB.Save(transfer).Error; err != nil {
-			a.Log.Error("Failed to return transfer to queue", "error", err, "transfer_id", transfer.ID)
+		// Clear only the assignment, and only while the transfer is still this
+		// agent's active one. Saving the whole row loaded above could undo a
+		// concurrent SLA expiry or escalation and repeat its customer notice.
+		result := a.DB.Model(&models.AgentTransfer{}).Where(
+			"id = ? AND organization_id = ? AND status = ? AND agent_id = ?",
+			transfer.ID,
+			orgID,
+			models.TransferStatusActive,
+			userID,
+		).Update("agent_id", nil)
+		if result.Error != nil {
+			a.Log.Error("Failed to return transfer to queue", "error", result.Error, "transfer_id", transfer.ID)
 			continue
 		}
+		if result.RowsAffected != 1 {
+			a.Log.Info("Skipped returning transfer to queue: transfer changed since it was loaded",
+				"transfer_id", transfer.ID,
+			)
+			continue
+		}
+		transfer.AgentID = nil
+		returned++
 
 		// Clear the contact's relationship-manager pointer only if it was
 		// pointing at the agent we just removed. Don't blow away a manually
@@ -1676,8 +1694,8 @@ func (a *App) ReturnAgentTransfersToQueue(userID, orgID uuid.UUID) int {
 
 	a.Log.Info("Returned agent transfers to queue",
 		"user_id", userID,
-		"count", len(transfers),
+		"count", returned,
 	)
 
-	return len(transfers)
+	return returned
 }

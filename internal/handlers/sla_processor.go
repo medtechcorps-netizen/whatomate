@@ -162,14 +162,10 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 			continue
 		}
 
-		// Send auto-close message to customer if configured
-		if settings.SLA.AutoCloseMessage != "" {
-			p.sendSLATextToCustomer(transfer, "SLA auto-close message", settings.SLA.AutoCloseMessage)
-		}
-
 		// Expiry changes the physical-contact AI policy. Serialize it against a
-		// currently running AI provider attempt, but keep the human SLA message
-		// above outside that fence.
+		// currently running AI provider attempt. Under RLS this runs inside the
+		// organization's tenant transaction, so the fence is held until the
+		// whole tick commits; the customer notice below is sent only after that.
 		expireErr := database.WithTenantReadCommitted(
 			p.app.DB,
 			orgID,
@@ -217,6 +213,11 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 
 		// Broadcast update
 		p.broadcastTransferUpdate(transfer, websocket.TypeTransferExpired)
+
+		// Only the tick that committed this expiry tells the customer.
+		if settings.SLA.AutoCloseMessage != "" {
+			p.sendSLATextAfterCommit(transfer, "SLA auto-close message", settings.SLA.AutoCloseMessage)
+		}
 	}
 
 	if closedCount > 0 {
@@ -279,8 +280,19 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 			updates["sla_breached_at"] = now
 		}
 
-		if err := p.app.DB.Model(&transfer).Updates(updates).Error; err != nil {
-			p.app.Log.Error("Failed to escalate transfer", "error", err, "transfer_id", transfer.ID)
+		// Escalate only from the level this tick selected. Every server instance
+		// runs this processor; the losing tick must not notify or warn again.
+		result := p.app.DB.Model(&transfer).Where(
+			"organization_id = ? AND status = ? AND escalation_level = ?",
+			orgID,
+			models.TransferStatusActive,
+			transfer.SLA.EscalationLevel,
+		).Updates(updates)
+		if result.Error != nil {
+			p.app.Log.Error("Failed to escalate transfer", "error", result.Error, "transfer_id", transfer.ID)
+			continue
+		}
+		if result.RowsAffected != 1 {
 			continue
 		}
 
@@ -300,7 +312,7 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 
 		// Send warning message to customer if configured
 		if newLevel == 1 && settings.SLA.WarningMessage != "" {
-			p.sendSLATextToCustomer(transfer, "SLA warning message", settings.SLA.WarningMessage)
+			p.sendSLATextAfterCommit(transfer, "SLA warning message", settings.SLA.WarningMessage)
 		}
 	}
 
@@ -377,24 +389,52 @@ func (p *SLAProcessor) notifyEscalation(transfer models.AgentTransfer, settings 
 	)
 }
 
+// sendSLATextAfterCommit sends an SLA-related text message to the customer
+// once the caller's tenant transaction commits, and not at all if it rolls
+// back. Under RLS that transaction can hold the organization policy fence and
+// contact locks, which the send's own Message insert would wait on until the
+// send timeout.
+func (p *SLAProcessor) sendSLATextAfterCommit(transfer models.AgentTransfer, label, message string) {
+	committed := *p
+	committed.app = p.app.rootApp()
+	p.app.afterTenantCommit(func() {
+		committed.sendSLATextToCustomer(transfer, label, message)
+	})
+}
+
 // sendSLATextToCustomer sends an SLA-related text message to the customer.
+// It refuses to run inside a caller transaction; use sendSLATextAfterCommit.
 func (p *SLAProcessor) sendSLATextToCustomer(transfer models.AgentTransfer, label, message string) {
-	account, err := p.app.resolveWhatsAppAccount(transfer.OrganizationID, transfer.WhatsAppAccount)
-	if err != nil {
-		p.app.Log.Error("Failed to load WhatsApp account for "+label, "error", err)
+	if _, transactional := p.app.DB.Statement.ConnPool.(gorm.TxCommitter); transactional {
+		p.app.Log.Error("Refusing to send "+label+" inside a caller transaction", "transfer_id", transfer.ID)
 		return
 	}
+	root := p.app.rootApp()
 
-	var contact models.Contact
-	if err := p.app.DB.Where("id = ?", transfer.ContactID).First(&contact).Error; err != nil {
-		p.app.Log.Error("Failed to load contact for "+label, "error", err)
+	// Read the recipient in a short tenant scope that commits before the send.
+	var (
+		account *models.WhatsAppAccount
+		contact models.Contact
+	)
+	failure := "Failed to open tenant scope for "
+	if err := root.WithTenantApp(transfer.OrganizationID, func(scoped *App) error {
+		failure = "Failed to load WhatsApp account for "
+		resolved, err := scoped.resolveWhatsAppAccount(transfer.OrganizationID, transfer.WhatsAppAccount)
+		if err != nil {
+			return err
+		}
+		account = resolved
+		failure = "Failed to load contact for "
+		return scoped.DB.Where("id = ?", transfer.ContactID).First(&contact).Error
+	}); err != nil {
+		p.app.Log.Error(failure+label, "error", err)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := p.app.SendOutgoingMessage(ctx, OutgoingMessageRequest{
+	if _, err := root.SendOutgoingMessage(ctx, OutgoingMessageRequest{
 		Account: account,
 		Contact: &contact,
 		Type:    models.MessageTypeText,
