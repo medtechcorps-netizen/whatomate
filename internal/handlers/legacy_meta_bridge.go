@@ -16,9 +16,9 @@ import (
 
 // requireLegacyWhatsAppMessageMirror establishes the normalized WhatsApp
 // account/contact/conversation proof in its own committed transaction before
-// any provider call. Starting from the root pool preserves the bridge's global
-// ChannelAccount -> ContactIdentity -> InboxConversation -> Contact -> Message
-// lock order and keeps a mirror failure on the known-no-provider boundary.
+// any provider call. Starting from the root pool lets the mirror take its lock
+// order (see mirrorLegacyWhatsAppMessageAfterCommit) holding nothing else, and
+// keeps a mirror failure on the known-no-provider boundary.
 func (a *App) requireLegacyWhatsAppMessageMirror(
 	ctx context.Context,
 	account *models.WhatsAppAccount,
@@ -49,18 +49,29 @@ func (a *App) requireLegacyWhatsAppMessageMirror(
 // inbound and repair paths: a failure is logged, never returned. Outbound
 // delivery uses requireLegacyWhatsAppMessageMirror so a provider attempt can
 // never outrun the durable account provenance required by later receipts and
-// reactions. It gives every live legacy bridge call the same lock boundary. Message/contact persistence commits first; the
-// idempotent mirror then owns a fresh short tenant transaction whose global
-// lock order is ChannelAccount -> ContactIdentity -> InboxConversation ->
-// Contact -> Message, followed by the ConversationParticipant write.
+// reactions. It gives every live legacy bridge call the same lock boundary.
+// Message/contact persistence commits first; the idempotent mirror then owns a
+// fresh short tenant transaction. It first owns the policy fence in shared
+// mode, the organization FOR SHARE and the ChannelAccount shadow, taken so that
+// it never waits for one while holding another (channel
+// lockLegacyMetaOrganizationThenShadow), and then locks ContactIdentity ->
+// InboxConversation -> Contact -> Message, followed by the
+// ConversationParticipant write. Joining the fence queues it behind a waiting
+// Coexistence admission (fence, then ChannelAccount) on any account, for a
+// bounded time per acquisition, and not at all while that admission is stuck
+// behind a lock outside the queue, such as this send's own AI attempt fence:
+// the mirror then takes the organization without the key, so the admission
+// cannot hold it in a cycle PostgreSQL does not see. It never holds the
+// organization while queued for a busy shadow, except in the helper's bounded
+// fallback after lockLegacyMetaShadowRounds lost rounds. The one exception to
+// this order is a strict reply's provider phase, which holds the shadow
+// without the organization across Meta (see deliverOutgoingMessage).
 // This is especially important for webhook and async-send paths which may
 // already hold Contact or Message locks in their surrounding transaction.
 //
-// The mirror's ChannelAccount -> organizations lock path can deadlock with a
-// concurrent Coexistence admission, which takes organizations before the
-// ChannelAccount (40P01). Nothing else re-projects an inbound message whose
-// mirror failed until the next startup backfill, so a retryable abort is
-// retried from a fresh transaction; the mirror is idempotent.
+// Nothing else re-projects an inbound message whose mirror failed until the
+// next startup backfill, so a retryable abort is still retried from a fresh
+// transaction; the mirror is idempotent.
 func (a *App) mirrorLegacyWhatsAppMessageAfterCommit(
 	account *models.WhatsAppAccount,
 	messageID uuid.UUID,

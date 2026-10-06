@@ -1,15 +1,19 @@
 package channel
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -53,7 +57,9 @@ type LegacyMetaBackfillStats struct {
 // EnsureLegacyMetaWhatsAppAccount resolves the real read-only ChannelAccount
 // shadow for an established WhatsApp account without manufacturing a contact,
 // conversation, message, or credential. Callers must already be inside the
-// tenant transaction whose organization/account authority they are extending.
+// tenant transaction whose organization/account authority they are extending,
+// and must already own database.LockOrganizationPolicyScope: they then wait for
+// a busy shadow behind their own fence, which is the admission lock order.
 //
 // Identity-review staging uses this narrow entry point because InboundEvent
 // requires a genuine ChannelAccountID even when no physical Contact can yet be
@@ -69,7 +75,7 @@ func EnsureLegacyMetaWhatsAppAccount(
 	if err != nil {
 		return nil, err
 	}
-	return ensureLegacyMetaAccount(db, verified)
+	return ensureLegacyMetaAccountWithin(db, verified, true)
 }
 
 // LegacyMetaWhatsAppAccountID resolves the immutable established WhatsApp
@@ -611,9 +617,507 @@ func verifiedLegacyMetaAccountRefWithLock(
 	return persisted, nil
 }
 
+// lockLegacyMetaShadowRounds bounds the savepointed rounds of
+// lockLegacyMetaOrganizationThenShadow. A round is lost only to a policy fence,
+// an organization update or another shadow owner that made progress, so the
+// bound is reached only under sustained traffic on one tenant; the caller then
+// waits in plain order instead of failing.
+const lockLegacyMetaShadowRounds = 64
+
+var errLegacyMetaPolicyFenceQueued = errors.New("legacy Meta policy fence is queued")
+
+// legacyMetaPolicyFenceQueueWait bounds how long one lock acquisition queues
+// for the policy fence key behind a fence that waits for the key, or holds it
+// and is not blocked, summed over all its rounds. Fences take the key in FIFO
+// order and normally own it and the organization row within milliseconds, so
+// the queue serves them before sharers that arrive later on any account; the
+// bound caps what each acquisition pays while admissions keep arriving. Past it
+// the acquisition takes the organization row without the key ("bypasses"),
+// which a waiting FOR UPDATE does not hold back.
+//
+// Two states of the fence that holds the key change that
+// (legacyMetaPolicyFenceQueueStateSQL):
+//   - Stuck: it waits for a running backend outside the queue, such as an AI
+//     attempt fence that holds the organization FOR KEY SHARE while its
+//     goroutine waits for this mirror or recovery on another connection, a
+//     cycle PostgreSQL cannot detect. Sharers bypass at once.
+//   - Blocked only by members, running transactions that hold the fence key
+//     or went past the queue: those finish within milliseconds and the fence
+//     then gets the row, unless newcomers keep bypassing, because each
+//     bypassing FOR SHARE overtakes the waiting FOR UPDATE and enough
+//     overlapping bypassers keep it out for as long as they overlap. Sharers
+//     queue behind such a fence up to legacyMetaPolicyFenceMemberWait instead,
+//     a bound only for a cycle through a member's own goroutine.
+var legacyMetaPolicyFenceQueueWait = 250 * time.Millisecond
+
+// legacyMetaPolicyFenceMemberWait bounds the queue behind a fence that holds
+// the key and is blocked only by members (see legacyMetaPolicyFenceQueueWait).
+var legacyMetaPolicyFenceMemberWait = time.Second
+
+const (
+	legacyMetaPolicyFencePollInterval = 5 * time.Millisecond
+	// legacyMetaPolicyFenceStateCheckInterval spaces a poller's checks of the
+	// fence state; the first one runs at its first failed try.
+	legacyMetaPolicyFenceStateCheckInterval = 25 * time.Millisecond
+
+	legacyMetaPolicyFenceBypassNamespace = "rereply:legacy_meta_policy_fence_bypass:v1:"
+	// legacyMetaPolicyFenceBypassSetting holds, transaction-locally, the
+	// organization this transaction went past the queue for.
+	legacyMetaPolicyFenceBypassSetting = "rereply.legacy_meta_fence_bypass"
+)
+
+// legacyMetaPolicyFenceStateTTL is how long a process reuses one organization's
+// fence state. The check reads the whole lock table and takes every
+// lock-manager partition lock, so waiting sharers of one tenant share it.
+var legacyMetaPolicyFenceStateTTL = 25 * time.Millisecond
+
+// legacyMetaPolicyFenceBypassKey is held in shared mode by a transaction that
+// took the organization without the policy fence key. No one takes it
+// exclusively, so taking it never waits. It tells fences waiting behind such a
+// transaction apart from locks outside the queue.
+func legacyMetaPolicyFenceBypassKey(organizationID uuid.UUID) string {
+	return legacyMetaPolicyFenceBypassNamespace + organizationID.String()
+}
+
+// legacyMetaPolicyFenceJoin is how an acquisition passed the policy fence queue.
+type legacyMetaPolicyFenceJoin int
+
+const (
+	// legacyMetaPolicyFenceQueued: a fence holds or waits for the key.
+	legacyMetaPolicyFenceQueued legacyMetaPolicyFenceJoin = iota
+	// legacyMetaPolicyFenceJoined: the key is held in shared mode.
+	legacyMetaPolicyFenceJoined
+	// legacyMetaPolicyFenceBypassed: past the queue without the key; the
+	// bypass key is held.
+	legacyMetaPolicyFenceBypassed
+)
+
+// legacyMetaPolicyFenceState is what holds up the fence that holds the key
+// (legacyMetaPolicyFenceQueueStateSQL).
+type legacyMetaPolicyFenceState int
+
+const (
+	// legacyMetaPolicyFenceWaiting: no fence holds the key yet, the holder is
+	// not blocked, or its chain of blockers is too long to tell.
+	legacyMetaPolicyFenceWaiting legacyMetaPolicyFenceState = iota
+	// legacyMetaPolicyFenceMemberBlocked: the holder waits, directly or
+	// through other waiting backends, only for running members.
+	legacyMetaPolicyFenceMemberBlocked
+	// legacyMetaPolicyFenceStuck: the holder waits, directly or through other
+	// waiting backends, for a running backend that is not a member.
+	legacyMetaPolicyFenceStuck
+)
+
+// legacyMetaPolicyFenceDeadlines are one acquisition's queue limits, both
+// counted from its start.
+type legacyMetaPolicyFenceDeadlines struct {
+	queue, member time.Time
+}
+
+func newLegacyMetaPolicyFenceDeadlines() legacyMetaPolicyFenceDeadlines {
+	start := time.Now()
+	return legacyMetaPolicyFenceDeadlines{
+		queue:  start.Add(legacyMetaPolicyFenceQueueWait),
+		member: start.Add(max(legacyMetaPolicyFenceQueueWait, legacyMetaPolicyFenceMemberWait)),
+	}
+}
+
+func (deadlines legacyMetaPolicyFenceDeadlines) limit(state legacyMetaPolicyFenceState) time.Time {
+	if state == legacyMetaPolicyFenceMemberBlocked {
+		return deadlines.member
+	}
+	return deadlines.queue
+}
+
+// legacyMetaPolicyFenceQueueStateSQL classifies what holds up the fences of
+// the organization: the one that holds the key exclusively (at most one does)
+// and those that wait for it. It follows each chain of blockers, up to four
+// deep, through every backend that is itself waiting for a lock, and
+// classifies the backends at the ends of the chains:
+//   - any running backend that is not a member makes the fences stuck: an AI
+//     attempt fence idle in its transaction while its goroutine waits for
+//     this mirror (the only shape a cycle through Go can take), this
+//     transaction itself, or a send that holds a contact across its Meta call
+//     while a member (which joined the key or bypassed) waits for that
+//     contact. Queueing behind those would buy the fences nothing.
+//   - a running member (one that holds the fence key or the bypass key and
+//     waits for no lock) finishes within milliseconds. When the key holder's
+//     chains end only at those, it is blocked only by members. A fence that
+//     waits for the key behind them counts as waiting.
+//
+// So an organization writer queued between the key holder and a stream of
+// sharers (organization settings take the row FOR UPDATE without the key)
+// only passes the wait on to those sharers. pg_locks and pg_blocking_pids read
+// the whole lock table and take every lock-manager partition lock, so
+// legacyMetaPolicyFenceStateOf shares one result per organization and process.
+const legacyMetaPolicyFenceQueueStateSQL = `WITH RECURSIVE keys AS (
+	SELECT pg_catalog.hashtextextended(?, 0) AS fence,
+	       pg_catalog.hashtextextended(?, 0) AS bypass,
+	       (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()) AS database
+), locks AS MATERIALIZED (
+	SELECT l.pid, l.locktype, l.mode, l.granted, l.database, l.objsubid,
+	       (l.classid::int8 << 32) | l.objid::int8 AS key
+	FROM pg_catalog.pg_locks l
+), members AS MATERIALIZED (
+	SELECT DISTINCT locks.pid
+	FROM locks CROSS JOIN keys
+	WHERE locks.locktype = 'advisory' AND locks.objsubid = 1 AND locks.database = keys.database
+	  AND locks.key IN (keys.fence, keys.bypass)
+), lock_waiters AS MATERIALIZED (
+	SELECT DISTINCT locks.pid FROM locks WHERE NOT locks.granted
+), blockers(pid, depth, holder) AS (
+	SELECT blocker.pid, 1, fence.granted
+	FROM locks fence
+	CROSS JOIN keys
+	CROSS JOIN LATERAL pg_catalog.unnest(pg_catalog.pg_blocking_pids(fence.pid)) AS blocker(pid)
+	WHERE fence.locktype = 'advisory' AND fence.objsubid = 1 AND fence.database = keys.database
+	  AND fence.key = keys.fence AND fence.mode = 'ExclusiveLock'
+	UNION
+	SELECT next.pid, blockers.depth + 1, blockers.holder
+	FROM blockers
+	CROSS JOIN LATERAL pg_catalog.unnest(pg_catalog.pg_blocking_pids(blockers.pid)) AS next(pid)
+	WHERE blockers.depth < 4
+	  AND blockers.pid IN (SELECT lock_waiters.pid FROM lock_waiters)
+), running AS (
+	SELECT blockers.pid, blockers.holder, blockers.pid IN (SELECT members.pid FROM members) AS member
+	FROM blockers
+	WHERE blockers.pid NOT IN (SELECT lock_waiters.pid FROM lock_waiters)
+)
+SELECT CASE
+	WHEN EXISTS (SELECT 1 FROM running WHERE NOT running.member) THEN 2
+	WHEN EXISTS (SELECT 1 FROM running WHERE running.member AND running.holder) THEN 1
+	ELSE 0
+END`
+
+type legacyMetaPolicyFenceStateSample struct {
+	state legacyMetaPolicyFenceState
+	at    time.Time
+}
+
+// legacyMetaPolicyFenceStateCache is one organization's last fence state in
+// this process. refresh admits one query at a time; other callers meanwhile
+// use the last sample.
+type legacyMetaPolicyFenceStateCache struct {
+	refresh sync.Mutex
+	sample  atomic.Pointer[legacyMetaPolicyFenceStateSample]
+}
+
+func (cache *legacyMetaPolicyFenceStateCache) current() (legacyMetaPolicyFenceState, bool) {
+	sample := cache.sample.Load()
+	if sample == nil {
+		return legacyMetaPolicyFenceWaiting, false
+	}
+	return sample.state, time.Since(sample.at) < legacyMetaPolicyFenceStateTTL
+}
+
+var (
+	// legacyMetaPolicyFenceStates maps an organization to its
+	// *legacyMetaPolicyFenceStateCache.
+	legacyMetaPolicyFenceStates sync.Map
+	// legacyMetaPolicyFenceStateQueries counts state queries, for tests.
+	legacyMetaPolicyFenceStateQueries atomic.Int64
+)
+
+// legacyMetaPolicyFenceStateOf returns the organization's fence state. A sample
+// younger than legacyMetaPolicyFenceStateTTL is reused; otherwise one caller
+// per organization and process queries the lock table while the others use
+// the last sample. The query fails safe: an error counts as waiting, the short
+// bound, and is cached like any other result.
+func legacyMetaPolicyFenceStateOf(db *gorm.DB, organizationID uuid.UUID) legacyMetaPolicyFenceState {
+	value, _ := legacyMetaPolicyFenceStates.LoadOrStore(organizationID, &legacyMetaPolicyFenceStateCache{})
+	cache := value.(*legacyMetaPolicyFenceStateCache)
+	if state, fresh := cache.current(); fresh {
+		return state
+	}
+	if !cache.refresh.TryLock() {
+		state, _ := cache.current()
+		return state
+	}
+	defer cache.refresh.Unlock()
+	if state, fresh := cache.current(); fresh {
+		return state
+	}
+	legacyMetaPolicyFenceStateQueries.Add(1)
+	state := legacyMetaPolicyFenceWaiting
+	if err := legacyMetaSavepoint(db, "legacy_meta_fence_state", func(tx *gorm.DB) error {
+		return tx.Raw(
+			legacyMetaPolicyFenceQueueStateSQL,
+			database.WhatsAppIdentityReviewContactSelectorFenceKey(organizationID),
+			legacyMetaPolicyFenceBypassKey(organizationID),
+		).Scan(&state).Error
+	}); err != nil {
+		state = legacyMetaPolicyFenceWaiting
+	}
+	cache.sample.Store(&legacyMetaPolicyFenceStateSample{state: state, at: time.Now()})
+	return state
+}
+
+// legacyMetaSavepoint runs fn in a savepoint that it always releases, so a lost
+// round or a fence check leaves no nesting level behind. GORM's nested
+// Transaction never releases its savepoints, and once the transaction takes a
+// row lock every open level becomes a subtransaction with its own XID; past 64
+// of them a backend's subtransaction cache overflows and every snapshot in the
+// cluster pays for it. A rollback to the savepoint releases what fn locked. A
+// caller that is not in a transaction gets one.
+func legacyMetaSavepoint(db *gorm.DB, name string, fn func(tx *gorm.DB) error) error {
+	if _, inTransaction := db.Statement.ConnPool.(gorm.TxCommitter); !inTransaction {
+		return db.Transaction(fn)
+	}
+	if err := db.Exec("SAVEPOINT " + name).Error; err != nil {
+		return err
+	}
+	if err := fn(db); err != nil {
+		if rollbackErr := db.Exec("ROLLBACK TO SAVEPOINT " + name).Error; rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		if releaseErr := db.Exec("RELEASE SAVEPOINT " + name).Error; releaseErr != nil {
+			return errors.Join(err, releaseErr)
+		}
+		return err
+	}
+	return db.Exec("RELEASE SAVEPOINT " + name).Error
+}
+
+// lockLegacyMetaOrganization takes the tenant organization row FOR SHARE. A
+// bridge transaction that locks a legacy ChannelAccount shadow later writes
+// organization-scoped rows that need this row anyway (the platform-compliance
+// write guard takes FOR SHARE and foreign-key checks take FOR KEY SHARE), but
+// acquiring it there, while already owning the shadow, inverts Coexistence
+// admission's database.LockOrganizationPolicyScope -> ChannelAccount order and
+// deadlocks the two. The row lock is compatible with other mirrors, attempt
+// fences (FOR KEY SHARE) and implicit checks, and it does not queue behind a
+// waiting FOR UPDATE; a caller that already owns the policy fence FOR UPDATE
+// re-enters it without waiting.
+func lockLegacyMetaOrganization(db *gorm.DB, organizationID uuid.UUID) error {
+	return lockLegacyMetaOrganizationWith(db, organizationID, "")
+}
+
+func lockLegacyMetaOrganizationWith(db *gorm.DB, organizationID uuid.UUID, lockOptions string) error {
+	var organization struct {
+		ID uuid.UUID `gorm:"column:id"`
+	}
+	result := db.Table("organizations").
+		Clauses(clause.Locking{Strength: "SHARE", Options: lockOptions}).
+		Select("id").
+		Where("id = ?", organizationID).
+		Limit(1).
+		Scan(&organization)
+	if result.Error != nil {
+		return fmt.Errorf("lock legacy Meta organization: %w", result.Error)
+	}
+	if result.RowsAffected != 1 || organization.ID != organizationID {
+		return fmt.Errorf("lock legacy Meta organization: %w", gorm.ErrRecordNotFound)
+	}
+	return nil
+}
+
+// joinLegacyMetaPolicyFence passes the policy fence queue. It takes the fence
+// key in shared mode with try-locks. A try fails while a fence holds the key or
+// waits for it, so a poller stays behind fences without joining PostgreSQL's
+// lock queue, where it could not give up. With wait it polls until the limit
+// that the fence's state sets (legacyMetaPolicyFenceDeadlines.limit); without
+// it, it tries once and reports legacyMetaPolicyFenceQueued while that limit
+// has not passed. Past the limit, or at once while the fence is stuck, it goes
+// past the queue: it takes the bypass key and records the organization in the
+// transaction-local legacyMetaPolicyFenceBypassSetting, so a later acquisition
+// in the same transaction (re-entry) does not queue again. Both revert with a
+// savepoint rollback, together with the organization lock they precede.
+func joinLegacyMetaPolicyFence(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	deadlines legacyMetaPolicyFenceDeadlines,
+	wait bool,
+) (legacyMetaPolicyFenceJoin, error) {
+	key := database.WhatsAppIdentityReviewContactSelectorFenceKey(organizationID)
+	organization := organizationID.String()
+	ctx := db.Statement.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	state := legacyMetaPolicyFenceWaiting
+	var nextStateCheck time.Time
+	for {
+		var outcome int
+		if err := db.Raw(
+			`SELECT CASE
+				WHEN pg_catalog.current_setting(?, true) = ? THEN 2
+				WHEN pg_catalog.pg_try_advisory_xact_lock_shared(pg_catalog.hashtextextended(?, 0)) THEN 1
+				ELSE 0
+			END`,
+			legacyMetaPolicyFenceBypassSetting, organization, key,
+		).Scan(&outcome).Error; err != nil {
+			return legacyMetaPolicyFenceQueued, fmt.Errorf("join legacy Meta policy fence: %w", err)
+		}
+		switch outcome {
+		case 2:
+			return legacyMetaPolicyFenceBypassed, nil
+		case 1:
+			return legacyMetaPolicyFenceJoined, nil
+		}
+		now := time.Now()
+		if !now.Before(nextStateCheck) {
+			state = legacyMetaPolicyFenceStateOf(db, organizationID)
+			nextStateCheck = now.Add(legacyMetaPolicyFenceStateCheckInterval)
+		}
+		limit := deadlines.limit(state)
+		if state == legacyMetaPolicyFenceStuck || !now.Before(limit) {
+			if err := db.Exec(
+				"SELECT pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended(?, 0)), pg_catalog.set_config(?, ?, true)",
+				legacyMetaPolicyFenceBypassKey(organizationID), legacyMetaPolicyFenceBypassSetting, organization,
+			).Error; err != nil {
+				return legacyMetaPolicyFenceQueued, fmt.Errorf("bypass legacy Meta policy fence: %w", err)
+			}
+			return legacyMetaPolicyFenceBypassed, nil
+		}
+		if !wait {
+			return legacyMetaPolicyFenceQueued, nil
+		}
+		timer := time.NewTimer(min(legacyMetaPolicyFencePollInterval, time.Until(limit)))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return legacyMetaPolicyFenceQueued, fmt.Errorf("join legacy Meta policy fence: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// lockLegacyMetaOrganizationShare passes the tenant's policy fence queue
+// (joinLegacyMetaPolicyFence) and then takes the organization row FOR SHARE.
+// database.LockOrganizationPolicyScope takes the same advisory key exclusively
+// before its FOR UPDATE, so a held or waiting fence holds back later sharers on
+// every account. The row lock alone would not: a new FOR SHARE overtakes a
+// waiting FOR UPDATE, and SHARE windows of mirrors on different accounts would
+// overlap without end. The key wait ends at the deadlines' limit; after it the
+// organization row is taken without the key. With nowait, a held or queued
+// fence returns errLegacyMetaPolicyFenceQueued until that limit, and a
+// conflicting row lock returns 55P03, instead of waiting.
+func lockLegacyMetaOrganizationShare(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	deadlines legacyMetaPolicyFenceDeadlines,
+	nowait bool,
+) error {
+	join, err := joinLegacyMetaPolicyFence(db, organizationID, deadlines, !nowait)
+	if err != nil {
+		return err
+	}
+	if join == legacyMetaPolicyFenceQueued {
+		return errLegacyMetaPolicyFenceQueued
+	}
+	return lockLegacyMetaOrganizationWith(db, organizationID, legacyMetaNowaitOption(nowait))
+}
+
+// lockLegacyMetaOrganizationThenShadow ends owning the policy fence key in
+// shared mode (or, past the queue, the bypass key), the organization row (FOR
+// SHARE) and the shadow (FOR UPDATE) without ever waiting for one of them while
+// it holds another, outside the final fallback. Waiting for the shadow while
+// holding the organization would let queued holders on a busy shadow (other
+// mirrors, or a strict reply holding it across a Meta call) keep
+// LockOrganizationPolicyScope out; waiting for the organization while owning
+// the shadow is the admission deadlock. Each round runs in savepoints, so a
+// failed attempt releases what it took:
+//
+//  1. pass the fence queue and wait for the organization, then take the
+//     shadow NOWAIT (the usual case);
+//  2. if the shadow is busy, wait for it holding nothing, then pass the fence
+//     queue and take the organization NOWAIT, so the waiter that inherits the
+//     shadow keeps it;
+//  3. if a conflicting holder (a held or queued policy fence, or an
+//     organization update) blocks step 2, give the shadow back and queue
+//     behind it in the next round.
+//
+// Only a NOWAIT conflict loses a round; a lock_timeout on a blocking step is
+// returned to the caller. After lockLegacyMetaShadowRounds lost rounds the
+// caller passes the fence queue, takes the organization and then waits for the
+// shadow in plain order. That cannot deadlock inside PostgreSQL: a fence that
+// owns the organization FOR UPDATE never coexists with this SHARE, and one
+// still waiting for it does not own the shadow yet. It may hold back the fence
+// for one shadow owner.
+//
+// All waits for the fence key in one call share one set of deadlines, counted
+// from the call's start, because the fence can in turn wait for a lock held by
+// this caller's goroutine on another connection: legacyMetaPolicyFenceQueueWait
+// in general, legacyMetaPolicyFenceMemberWait while the fence holds the key and
+// is blocked only by members. Once the applicable one has passed, step 1 and
+// the fallback try the key once and a queued fence no longer loses step 2 its
+// round, so a call queues at most that long however many rounds a busy shadow
+// costs it. Before it, step 2 gives the shadow back rather than bypass, so a
+// waiter that inherits a shadow never overtakes a fence. A stuck fence is not
+// queued for at all, and a transaction that already went past the queue does
+// not queue again when it re-enters (a strict reply's pre-provider transaction
+// mirrors after taking these locks). Every round's savepoint is released
+// (legacyMetaSavepoint), so lost rounds do not deepen the transaction.
+// lockShadow must lock the same shadow row(s) on every call. A caller that
+// already owns the policy fence does not use this; it waits behind its own
+// fence by design.
+func lockLegacyMetaOrganizationThenShadow(
+	db *gorm.DB,
+	organizationID uuid.UUID,
+	lockShadow func(tx *gorm.DB, nowait bool) error,
+) error {
+	deadlines := newLegacyMetaPolicyFenceDeadlines()
+	for round := 0; round < lockLegacyMetaShadowRounds; round++ {
+		shadowBusy := false
+		err := legacyMetaSavepoint(db, "legacy_meta_round", func(tx *gorm.DB) error {
+			if err := lockLegacyMetaOrganizationShare(tx, organizationID, deadlines, false); err != nil {
+				return err
+			}
+			err := lockShadow(tx, true)
+			shadowBusy = legacyMetaLockNotAvailable(err)
+			return err
+		})
+		if err == nil || !shadowBusy {
+			return err
+		}
+		organizationBusy := false
+		err = legacyMetaSavepoint(db, "legacy_meta_round", func(tx *gorm.DB) error {
+			if err := lockShadow(tx, false); err != nil {
+				return err
+			}
+			err := lockLegacyMetaOrganizationShare(tx, organizationID, deadlines, true)
+			organizationBusy = errors.Is(err, errLegacyMetaPolicyFenceQueued) ||
+				legacyMetaLockNotAvailable(err)
+			return err
+		})
+		if err == nil || !organizationBusy {
+			return err
+		}
+	}
+	if err := lockLegacyMetaOrganizationShare(db, organizationID, deadlines, false); err != nil {
+		return err
+	}
+	return lockShadow(db, false)
+}
+
+func legacyMetaNowaitOption(nowait bool) string {
+	if nowait {
+		return "NOWAIT"
+	}
+	return ""
+}
+
+func legacyMetaLockNotAvailable(err error) bool {
+	var sqlState interface {
+		SQLState() string
+	}
+	return errors.As(err, &sqlState) && sqlState.SQLState() == "55P03"
+}
+
+// ensureLegacyMetaAccount is the mirror and backfill entry point. Its caller
+// does not own the policy fence, so it acquires the organization and shadow
+// with lockLegacyMetaOrganizationThenShadow.
 func ensureLegacyMetaAccount(
 	db *gorm.DB,
 	ref LegacyMetaAccountRef,
+) (*models.ChannelAccount, error) {
+	return ensureLegacyMetaAccountWithin(db, ref, false)
+}
+
+func ensureLegacyMetaAccountWithin(
+	db *gorm.DB,
+	ref LegacyMetaAccountRef,
+	policyFenced bool,
 ) (*models.ChannelAccount, error) {
 	externalID := legacyMetaIDPrefix + "account:" + ref.ID.String()
 	now := time.Now().UTC()
@@ -655,10 +1159,9 @@ func ensureLegacyMetaAccount(
 	// Active-only uniqueness permits another insert beside a soft-deleted
 	// shadow. Resolve retained identity first so revival never manufactures a
 	// competing row, and never choose arbitrarily among historical bindings.
-	lockShadow := func() (models.ChannelAccount, bool, error) {
-		var candidates []models.ChannelAccount
-		if err := db.Unscoped().
-			Clauses(clause.Locking{Strength: "UPDATE"}).
+	shadowRows := func(tx *gorm.DB, lockOptions string) *gorm.DB {
+		return tx.Unscoped().
+			Clauses(clause.Locking{Strength: "UPDATE", Options: lockOptions}).
 			Where(
 				"organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?",
 				ref.OrganizationID,
@@ -666,7 +1169,25 @@ func ensureLegacyMetaAccount(
 				LegacyMetaProvider,
 				externalID,
 			).
-			Order("id").Limit(2).Find(&candidates).Error; err != nil {
+			Order("id").Limit(2)
+	}
+	if policyFenced {
+		// Re-entering the caller's FOR UPDATE fence never waits.
+		if err := lockLegacyMetaOrganization(db, ref.OrganizationID); err != nil {
+			return nil, err
+		}
+	} else if err := lockLegacyMetaOrganizationThenShadow(db, ref.OrganizationID, func(tx *gorm.DB, nowait bool) error {
+		var candidates []models.ChannelAccount
+		if err := shadowRows(tx, legacyMetaNowaitOption(nowait)).Find(&candidates).Error; err != nil {
+			return fmt.Errorf("load legacy Meta channel account: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	lockShadow := func() (models.ChannelAccount, bool, error) {
+		var candidates []models.ChannelAccount
+		if err := shadowRows(db, "").Find(&candidates).Error; err != nil {
 			return models.ChannelAccount{}, false, fmt.Errorf("load legacy Meta channel account: %w", err)
 		}
 		if len(candidates) > 1 {
