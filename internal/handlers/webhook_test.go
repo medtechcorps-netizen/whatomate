@@ -1248,6 +1248,9 @@ func (l *statusTestLogs) lines(level, message string) []string {
 }
 
 func captureStatusTestLogs(app *App) *statusTestLogs {
+	// A previous webhook call's asynchronous DispatchWebhook may still be
+	// reading app.Log; let it finish before the logger is replaced.
+	app.WaitForBackgroundTasks()
 	logs := &statusTestLogs{}
 	app.Log = logf.New(logf.Opts{Writer: logs, Level: logf.DebugLevel})
 	return logs
