@@ -40,6 +40,82 @@ jobs:
           set -euo pipefail
           python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v
 
+  # Stage 1's interim schema freeze (release/deployment/schema_change.py) at
+  # pull-request time. A change the Release plan would refuse with
+  # schema-change-blocked fails here, through the required 'test' check,
+  # before it can merge and leave main unpromotable. A pull request is checked
+  # from its merge base with main to GitHub's merge commit, so only its own
+  # changes count; a push to main is checked against its first parent, so
+  # the job always runs and the aggregator needs no exception.
+  # test_ci_workflows.py runs this script against synthetic repositories.
+  schema-guard:
+    name: schema-guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse guarded database changes
+        run: |
+          set -euo pipefail
+          python3 -B - <<'GUARD'
+          import os, sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path("release/deployment").resolve()))
+          import release_record
+          import schema_change
+          import ship_common as common
+
+          MESSAGE = "guarded database code changed; it cannot be promoted in Part A; split or revert"
+          REPO = Path.cwd()
+
+          def commit(*args):
+              raw = release_record.git_output(REPO, list(args), code="git-failed:schema-guard")
+              return common.require_sha1(raw.decode("ascii", "replace").strip(), "git-failed:schema-guard")
+
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          try:
+              head = commit("rev-parse", "--verify", "HEAD^{commit}")
+              if event == "pull_request":
+                  # The checkout is GitHub's merge of the pull request into
+                  # main; its merge base with main is the main commit it was
+                  # merged onto, so commits already on main never count. It
+                  # names the full ref: a tag origin/main would win the short one.
+                  base = commit("merge-base", "refs/remotes/origin/main", head)
+              elif event == "push":
+                  base = commit("rev-parse", "--verify", head + "^1^{commit}")
+              else:
+                  common.fail("context-invalid:event")
+              reasons = schema_change.check(REPO, base, head)
+          except common.ReleaseError as error:
+              print("schema guard failed closed: %s" % error)
+              sys.exit(1)
+          print("schema guard: %s, %s..%s" % (event, base, head))
+          if not reasons:
+              print("schema guard: clean")
+              sys.exit(0)
+          shown = []
+          for reason in reasons:
+              try:
+                  shown.append(common.require_public_text(reason))
+              except common.ReleaseError:
+                  shown.append("(path withheld)")
+          print(MESSAGE)
+          for line in shown:
+              print("  " + line)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("### Schema guard refused\n\n%s\n\n" % MESSAGE)
+              summary.write("".join("- %s\n" % line for line in shown))
+          sys.exit(1)
+          GUARD
+
   tenant-isolation:
     name: tenant-isolation
     runs-on: ubuntu-24.04
@@ -365,6 +441,7 @@ jobs:
     if: ${{ always() }}
     needs:
       - release-tests
+      - schema-guard
       - tenant-isolation
       - go-race
       - lint

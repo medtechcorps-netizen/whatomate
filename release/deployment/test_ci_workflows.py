@@ -26,6 +26,12 @@ negative cases that break the property and must make the checker fail:
     security runs govulncheck, rejects ambient Trivy suppression files right
     before its scans, and fails on any CRITICAL or HIGH finding in each image
     it builds, with no exception file.
+12. the Test workflow runs Stage 1's schema guard (schema_change.py) on every
+    pull request, from its merge base with main, and on every push to main,
+    from the first parent, right after a full-history checkout, in a job the
+    test aggregator needs. Its embedded script runs against a synthetic
+    repository: it must refuse exactly the guarded changes, judge a pull
+    request only by its own changes, and fail closed on anything unexpected.
 
 The workflows are read with test_ship_workflow's YAML-subset reader plus the
 folded scalars the CI workflows use; when PyYAML happens to be importable the
@@ -34,7 +40,9 @@ parse is cross-checked.
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
+import functools
 import json
 import os
 import re
@@ -46,6 +54,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_ship_support import TempRepo
 from test_ship_workflow import MiniYaml
 
 
@@ -505,6 +514,177 @@ def assert_frontend_audit_policy(sources: dict[str, str]) -> None:
         raise AssertionError("a braces advisory that reaches production is allowed")
 
 
+# The schema guard job: a 10-minute job of exactly two steps, a full-history
+# checkout of the commit under test (GitHub's merge commit on a pull request)
+# and the embedded script, in the shell's default directory and environment.
+SCHEMA_GUARD_TIMEOUT = 10
+SCHEMA_GUARD_CHECKOUT = {"fetch-depth": 0, "persist-credentials": False}
+SCHEMA_GUARD_OPENER = ["set -euo pipefail", "python3 -B - <<'GUARD'"]
+SCHEMA_GUARD_MESSAGE = "guarded database code changed; it cannot be promoted in Part A; split or revert"
+GUARD_HANDLERS = "package handlers\n\nfunc send() {}\n"
+GUARD_MODELS = {"internal/models/models.go": "package models\n\ntype Note struct{}\n"}
+GUARD_REPLY = {"internal/handlers/messages.go": GUARD_HANDLERS + "\nfunc reply() {}\n"}
+# Each scenario names the commit checked out, where origin/main points
+# ("head": that same commit, as on a push run; None: missing), the event, and
+# whether the guard must refuse. Checking out GitHub's merge commit, a pull
+# request is judged against the main commit it was merged onto. The first
+# seven are the ones a broken script most often gets wrong, so a mutant fails
+# after a few runs.
+GUARD_SCENARIOS: dict[str, tuple[str, str | None, str | None, bool]] = {
+    "pull request editing internal/models": ("models", "main", "pull_request", True),
+    "pull request changing handlers only": ("handlers", "main", "pull_request", False),
+    "push to main merging an internal/models edit": ("push-models", "head", "push", True),
+    "workflow_dispatch run": ("handlers", "main", "workflow_dispatch", True),
+    "pull request without origin/main": ("handlers", None, "pull_request", True),
+    "pull request behind a main that moved on with a guarded change": ("handlers", "main-moved", "pull_request", False),
+    "pull request whose guarded commit is not its last": ("models-then-handlers", "main", "pull_request", True),
+    "pull request beside a tag named origin/main at its head": ("models", "main", "pull_request", True),
+    "pull request adding an AutoMigrate call to internal/handlers": ("auto-migrate", "main", "pull_request", True),
+    "pull request changing only a test under internal/database": ("database-test", "main", "pull_request", False),
+    "pull request changing only release/staging": ("staging", "main", "pull_request", False),
+    "pull request equal to main": ("main", "main", "pull_request", False),
+    "pull request adding a non-ASCII path under internal/models": ("non-ascii", "main", "pull_request", True),
+    "clean merge commit onto a main that moved on": ("merge-handlers", "main-moved", "pull_request", False),
+    "guarded merge commit onto a main that moved on": ("merge-models", "main-moved", "pull_request", True),
+    "push to main merging handlers only": ("push-handlers", "head", "push", False),
+    "push of a commit without a parent": ("root", "head", "push", True),
+    "run without an event name": ("handlers", "main", None, True),
+}
+# Scenarios whose checkout also has a tag named origin/main, at this commit:
+# the short name would resolve to the tag instead of the remote branch.
+GUARD_TAGS = {"pull request beside a tag named origin/main at its head": "models"}
+
+
+class GuardFixture:
+    """A synthetic repository with this directory's release modules and the
+    commits the schema guard scenarios check out: pull request branches off
+    main, GitHub-style merge commits, a main that moved on with a guarded
+    change before the guard existed, and a root commit."""
+
+    def __init__(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        atexit.register(self.directory.cleanup)
+        root = Path(self.directory.name)
+        self.summary = root / "step-summary.md"
+        self.repo = repo = TempRepo(root / "repo")
+        modules = {f"release/deployment/{path.name}": path.read_text(encoding="utf-8")
+                   for path in sorted(HERE.glob("*.py")) if not path.name.startswith("test_")}
+        main = repo.commit({
+            **modules,
+            "internal/database/postgres.go": "package database\n",
+            "internal/models/models.go": "package models\n",
+            "internal/handlers/messages.go": GUARD_HANDLERS,
+            "README.md": "readme\n",
+        }, "main")
+
+        def branch(*changes: dict[str, str]) -> str:
+            repo.checkout(main)
+            for files in changes:
+                repo.commit(files, "pull request")
+            return repo.head()
+
+        handlers = branch(GUARD_REPLY)
+        models = branch(GUARD_MODELS)
+        moved = branch({"internal/database/postgres.go": "package database\n\n// landed before the guard\n"})
+        self.commits = {
+            "main": main,
+            "handlers": handlers,
+            "models": models,
+            "auto-migrate": branch({"internal/handlers/messages.go":
+                                    GUARD_HANDLERS + "\nfunc up() { db.AutoMigrate(&models.Note{}) }\n"}),
+            "database-test": branch({"internal/database/postgres_test.go": "package database\n"}),
+            "staging": branch({"release/staging/bootstrap/main.go": "package main\n\nfunc main() { db.AutoMigrate(&Note{}) }\n"}),
+            "models-then-handlers": branch(GUARD_MODELS, GUARD_REPLY),
+            "non-ascii": branch({"internal/models/caf\u00e9.go": "package models\n"}),
+            "main-moved": moved,
+            "merge-handlers": self.merge(moved, handlers),
+            "merge-models": self.merge(moved, models),
+            "push-handlers": self.merge(main, handlers),
+            "push-models": self.merge(main, models),
+            "root": repo.git("commit-tree", "-m", "root", main + "^{tree}").strip(),
+        }
+
+    def merge(self, onto: str, branch: str) -> str:
+        """A merge commit whose first parent is ``onto``, as GitHub makes."""
+        self.repo.checkout(onto)
+        self.repo.git("merge", "--quiet", "--no-ff", "-m", "merge", branch)
+        return self.repo.head()
+
+    def point(self, ref: str, sha: str | None) -> None:
+        if sha is not None:
+            self.repo.git("update-ref", ref, sha)
+        elif self.repo.git("for-each-ref", ref).strip():
+            self.repo.git("update-ref", "-d", ref)
+
+    def run(self, script: str, head: str, main: str | None, event: str | None,
+            tag: str | None = None) -> tuple[int, str, str]:
+        """Run the step's script the way the step does, from the checkout."""
+        sha = self.commits[head]
+        self.repo.checkout(sha)
+        self.point("refs/remotes/origin/main", None if main is None else sha if main == "head" else self.commits[main])
+        self.point("refs/tags/origin/main", None if tag is None else self.commits[tag])
+        self.summary.write_text("", encoding="utf-8")
+        # The release tests themselves run in Actions: none of that run's
+        # GITHUB_* variables (its event, its step summary) may leak in.
+        env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GITHUB_")}
+        env["GITHUB_STEP_SUMMARY"] = str(self.summary)
+        if event is not None:
+            env["GITHUB_EVENT_NAME"] = event
+        result = subprocess.run(
+            [sys.executable, "-B", "-I", "-"], input=script, cwd=self.repo.root, env=env,
+            capture_output=True, text=True, timeout=120,
+        )
+        return result.returncode, result.stdout, self.summary.read_text(encoding="utf-8")
+
+
+@functools.lru_cache(maxsize=None)
+def guard_fixture() -> GuardFixture:
+    return GuardFixture()
+
+
+@functools.lru_cache(maxsize=None)
+def run_guard(script: str, scenario: str) -> tuple[int, str, str]:
+    head, main, event, _refused = GUARD_SCENARIOS[scenario]
+    return guard_fixture().run(script, head, main, event, GUARD_TAGS.get(scenario))
+
+
+def schema_guard_script(sources: dict[str, str]) -> str:
+    docs = parse(sources)
+    steps = [(workflow, job_id, item) for workflow, doc in docs.items()
+             for job_id, job in jobs(doc).items() for item in job.get("steps", [])
+             if "schema_change" in str(item.get("run", ""))]
+    if len(steps) != 1 or steps[0][0] != "test.yml":
+        raise AssertionError(f"expected one Test step running the schema guard, found {len(steps)}")
+    _workflow, job_id, item = steps[0]
+    test_jobs = jobs(docs["test.yml"])
+    job = test_jobs[job_id]
+    if job_id not in needs(test_jobs["test"]):
+        raise AssertionError(f"the schema guard job {job_id} is not in the test aggregator's needs")
+    if "if" in job or job.get("timeout-minutes") != SCHEMA_GUARD_TIMEOUT:
+        raise AssertionError("the schema guard job is conditional or has no 10-minute timeout")
+    steps_run = job.get("steps", [])
+    checkout = steps_run[0] if steps_run else {}
+    # Anything between the two (a git checkout, a reset, a fetch) or another
+    # ref changes which commits the guard compares.
+    if (len(steps_run) != 2 or steps_run[1] is not item
+            or not str(checkout.get("uses", "")).startswith("actions/checkout@")
+            or checkout.get("with") != SCHEMA_GUARD_CHECKOUT or "if" in checkout):
+        raise AssertionError("the schema guard does not run right after a full-history checkout of the commit under test")
+    if any(key in item for key in ("if", "working-directory", "shell", "env", "continue-on-error")):
+        raise AssertionError("the schema guard step is conditional or runs elsewhere or with another environment")
+    lines = run_lines(item)
+    if lines[:2] != SCHEMA_GUARD_OPENER or lines[-1] != "GUARD":
+        raise AssertionError("the schema guard step does not run exactly its embedded script")
+    return heredoc(str(item["run"]), "GUARD")
+
+
+def assert_schema_guard(sources: dict[str, str]) -> None:
+    script = schema_guard_script(sources)
+    for scenario, (_head, _main, _event, refused) in GUARD_SCENARIOS.items():
+        if (run_guard(script, scenario)[0] != 0) != refused:
+            raise AssertionError(f"the schema guard {'passes' if refused else 'refuses'} a {scenario}")
+
+
 CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
     ("required-contexts", assert_required_contexts),
     ("unique-context-names", assert_context_names_unique),
@@ -517,6 +697,8 @@ CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
     ("braces-audit", assert_frontend_audit_policy),
     ("unconditional-jobs", assert_unconditional_jobs),
     ("lint-build-and-scans", assert_lint_build_and_scans),
+    # Last: it runs the guard script, so earlier checks fail a mutant first.
+    ("schema-guard", assert_schema_guard),
 )
 
 
@@ -566,6 +748,25 @@ GMAIL_SCAN = ("      - name: Scan Gmail relay container\n"
               "        with:\n          image-ref: rereply-gmail-relay:ci\n          format: table\n"
               "          exit-code: \"1\"\n          vuln-type: os,library\n          severity: CRITICAL,HIGH\n")
 RELEASE_TESTS_STEP = "      - name: Test the Release workflow, its modules and the CI workflows\n"
+GUARD_STEP = "      - name: Refuse guarded database changes\n"
+GUARD_JOB = "  schema-guard:\n    name: schema-guard\n"
+GUARD_CHECKOUT = ("      contents: read\n    steps:\n      - name: Checkout repository\n"
+                  "        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
+                  "        with:\n          fetch-depth: 0\n")
+GUARD_PR_BASE = 'base = commit("merge-base", "refs/remotes/origin/main", head)'
+GUARD_PUSH_BASE = 'base = commit("rev-parse", "--verify", head + "^1^{commit}")'
+
+
+def without_schema_guard_job() -> dict[str, str]:
+    source = SOURCES["test.yml"]
+    start, end = source.find(GUARD_JOB), source.find("  tenant-isolation:\n")
+    if source.count(GUARD_JOB) != 1 or not 0 <= start < end:
+        raise AssertionError("the schema guard job is not where the mutation expects it")
+    mutated = source[:start] + source[end:]
+    if mutated.count("      - schema-guard\n") != 1:
+        raise AssertionError("the aggregator does not need the schema guard once")
+    return {**SOURCES, "test.yml": mutated.replace("      - schema-guard\n", "", 1)}
+
 
 # Each case breaks one property; the checker must fail on the named check.
 NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
@@ -738,6 +939,49 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     "scan an image built from another Dockerfile": ("lint-build-and-scans", lambda: replaced(
         "test.yml", "docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .",
         "docker build -f docker/meta-relay.Dockerfile -t rereply-gmail-relay:ci .")),
+    # 12. The schema guard. Dropping or skipping its job trips the generic
+    # aggregator and unconditional-job checks first.
+    "drop the schema guard job and its need": ("schema-guard", without_schema_guard_job),
+    "drop the schema guard from the aggregator": ("aggregators", lambda: replaced(
+        "test.yml", "      - schema-guard\n", "")),
+    "run the schema guard only on pull requests": ("unconditional-jobs", lambda: replaced(
+        "test.yml", GUARD_JOB, GUARD_JOB + "    if: github.event_name == 'pull_request'\n")),
+    "make the schema guard step conditional": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_STEP, GUARD_STEP + "        if: ${{ github.event_name == 'pull_request' }}\n")),
+    "tolerate a refusing schema guard": ("schema-guard", lambda: replaced(
+        "test.yml", "python3 -B - <<'GUARD'\n", "python3 -B - <<'GUARD' || true\n")),
+    "drop the schema guard timeout": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_JOB + "    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n",
+        GUARD_JOB + "    runs-on: ubuntu-24.04\n")),
+    "check out a shallow clone for the schema guard": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_CHECKOUT, GUARD_CHECKOUT.replace("          fetch-depth: 0\n", ""))),
+    "check out the pull request base for the schema guard": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_CHECKOUT, GUARD_CHECKOUT + "          ref: ${{ github.event.pull_request.base.sha }}\n")),
+    "move HEAD before the schema guard": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_STEP,
+        "      - name: Compare with main\n        run: git checkout --quiet origin/main\n\n" + GUARD_STEP)),
+    "give the schema guard step an environment": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_STEP, GUARD_STEP + "        env:\n          PYTHONPATH: release/staging\n")),
+    "run the schema guard in another directory": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_STEP, GUARD_STEP + "        working-directory: release\n")),
+    "compare a pull request with main's tip": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_PR_BASE, 'base = commit("rev-parse", "--verify", "refs/remotes/origin/main^{commit}")')),
+    "compare a pull request with whatever origin/main names": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_PR_BASE, 'base = commit("merge-base", "origin/main", head)')),
+    "compare a pull request with its first parent": ("schema-guard", lambda: replaced(
+        "test.yml", GUARD_PR_BASE, GUARD_PUSH_BASE)),
+    "compare a push with itself": ("schema-guard", lambda: replaced("test.yml", GUARD_PUSH_BASE, "base = head")),
+    "check a push like a pull request": ("schema-guard", lambda: replaced(
+        "test.yml", 'if event == "pull_request":', 'if event in ("pull_request", "push"):')),
+    "skip the check": ("schema-guard", lambda: replaced(
+        "test.yml", "reasons = schema_change.check(REPO, base, head)", "reasons = ()")),
+    "pass a refused change": ("schema-guard", lambda: replaced(
+        "test.yml", "          sys.exit(1)\n          GUARD\n", "          sys.exit(0)\n          GUARD\n")),
+    "pass an unknown event": ("schema-guard", lambda: replaced(
+        "test.yml", 'common.fail("context-invalid:event")', "sys.exit(0)")),
+    "pass when git fails": ("schema-guard", lambda: replaced(
+        "test.yml", '"schema guard failed closed: %s" % error)\n              sys.exit(1)\n',
+        '"schema guard failed closed: %s" % error)\n              sys.exit(0)\n')),
 }
 
 
@@ -816,6 +1060,7 @@ class CiWorkflowTests(unittest.TestCase):
             "test.yml", "      - name: Build\n        run: go build -mod=readonly -v ./...\n",
             "      - name: Build\n        run: go build -mod=readonly -v ./...\n\n"
             "      - name: Vet\n        run: go vet -mod=readonly ./...\n"))
+        check_ci_workflows(replaced("test.yml", 'split or revert"', 'split it or revert it"'))
 
     def test_every_negative_case_fails_its_check(self) -> None:
         labels = {label for label, _ in CHECKS}
@@ -848,6 +1093,78 @@ class AggregatorScriptTests(unittest.TestCase):
             with self.subTest(case=name):
                 raw = value if type(value) is str else json.dumps(value)
                 self.assertEqual(run_python(script, env={"NEEDS_JSON": raw}) != 0, expected == 1)
+
+
+class SchemaGuardScriptTests(unittest.TestCase):
+    """The schema guard step's embedded script, run the way the step runs it."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.script = schema_guard_script(SOURCES)
+        cls.commits = guard_fixture().commits
+
+    def run_scenario(self, scenario: str) -> tuple[int, list[str], str]:
+        code, stdout, summary = run_guard(self.script, scenario)
+        return code, stdout.splitlines(), summary
+
+    def assert_clean(self, scenario: str, base: str, head: str) -> None:
+        event = GUARD_SCENARIOS[scenario][2]
+        self.assertEqual(self.run_scenario(scenario), (
+            0, [f"schema guard: {event}, {self.commits[base]}..{self.commits[head]}", "schema guard: clean"], ""))
+
+    def assert_refused(self, scenario: str, base: str, head: str, reasons: list[str]) -> None:
+        event = GUARD_SCENARIOS[scenario][2]
+        self.assertEqual(self.run_scenario(scenario), (1, [
+            f"schema guard: {event}, {self.commits[base]}..{self.commits[head]}",
+            SCHEMA_GUARD_MESSAGE, *(f"  {reason}" for reason in reasons),
+        ], f"### Schema guard refused\n\n{SCHEMA_GUARD_MESSAGE}\n\n" + "".join(f"- {reason}\n" for reason in reasons)))
+
+    def test_every_scenario_has_its_outcome(self) -> None:
+        for scenario, (_head, _main, _event, refused) in GUARD_SCENARIOS.items():
+            with self.subTest(scenario=scenario):
+                self.assertEqual(self.run_scenario(scenario)[0], 1 if refused else 0)
+
+    def test_pull_requests_against_main(self) -> None:
+        self.assert_clean("pull request equal to main", "main", "main")
+        self.assert_clean("pull request changing handlers only", "main", "handlers")
+        self.assert_clean("pull request changing only a test under internal/database", "main", "database-test")
+        self.assert_clean("pull request changing only release/staging", "main", "staging")
+        self.assert_refused("pull request editing internal/models", "main", "models",
+                            ["guarded-tree:internal/models/models.go"])
+        self.assert_refused("pull request adding an AutoMigrate call to internal/handlers", "main", "auto-migrate",
+                            ["migration-call:internal/handlers/messages.go"])
+        self.assert_refused("pull request whose guarded commit is not its last", "main", "models-then-handlers",
+                            ["guarded-tree:internal/models/models.go"])
+        # A tag named origin/main does not move the base off the remote branch.
+        self.assert_refused("pull request beside a tag named origin/main at its head", "main", "models",
+                            ["guarded-tree:internal/models/models.go"])
+
+    def test_only_the_pull_requests_own_changes_count(self) -> None:
+        # main took a guarded change after these pull requests branched off.
+        self.assert_clean("pull request behind a main that moved on with a guarded change", "main", "handlers")
+        self.assert_clean("clean merge commit onto a main that moved on", "main-moved", "merge-handlers")
+        self.assert_refused("guarded merge commit onto a main that moved on", "main-moved", "merge-models",
+                            ["guarded-tree:internal/models/models.go"])
+
+    def test_pushes_to_main_against_the_first_parent(self) -> None:
+        self.assert_clean("push to main merging handlers only", "main", "push-handlers")
+        self.assert_refused("push to main merging an internal/models edit", "main", "push-models",
+                            ["guarded-tree:internal/models/models.go"])
+
+    def test_only_public_reasons_are_printed(self) -> None:
+        self.assert_refused("pull request adding a non-ASCII path under internal/models", "main", "non-ascii",
+                            ["(path withheld)"])
+
+    def test_fails_closed(self) -> None:
+        cases = {
+            "push of a commit without a parent": "git-failed:schema-guard",
+            "pull request without origin/main": "git-failed:schema-guard",
+            "workflow_dispatch run": "context-invalid:event",
+            "run without an event name": "context-invalid:event",
+        }
+        for scenario, code in cases.items():
+            with self.subTest(scenario=scenario):
+                self.assertEqual(self.run_scenario(scenario), (1, [f"schema guard failed closed: {code}"], ""))
 
 
 class FrontendAuditPolicyTests(unittest.TestCase):
