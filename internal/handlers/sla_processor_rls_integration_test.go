@@ -34,6 +34,18 @@ type slaNoticeDelivery struct {
 // transfer's committed state through observer while the request is in flight.
 func slaNoticeProvider(t *testing.T, app *App, observer *gorm.DB) func() []slaNoticeDelivery {
 	t.Helper()
+	return slaNoticeProviderWithHook(t, app, observer, nil)
+}
+
+// slaNoticeProviderWithHook calls beforeResponse with each recipient before
+// recording the send, so a test can hold a send in flight.
+func slaNoticeProviderWithHook(
+	t *testing.T,
+	app *App,
+	observer *gorm.DB,
+	beforeResponse func(to string),
+) func() []slaNoticeDelivery {
+	t.Helper()
 	var (
 		mu         sync.Mutex
 		deliveries []slaNoticeDelivery
@@ -46,6 +58,9 @@ func slaNoticeProvider(t *testing.T, app *App, observer *gorm.DB) func() []slaNo
 			} `json:"text"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if beforeResponse != nil {
+			beforeResponse(payload.To)
+		}
 		delivery := slaNoticeDelivery{To: payload.To, Body: payload.Text.Body}
 		var transfer models.AgentTransfer
 		if err := observer.Where("phone_number = ?", payload.To).First(&transfer).Error; err == nil {
