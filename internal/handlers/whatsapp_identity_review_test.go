@@ -860,8 +860,10 @@ func TestWhatsAppIdentityReviewEffectiveStateSelectsRemainingOpenPrincipal(t *te
 	require.NotEqual(t, first.HoldID, second.HoldID)
 
 	resolver := createWhatsAppIdentityReviewResolver(t, db, organization.ID)
+	// shared carries a different BSUID, so the second principal may be routed
+	// only to its own contact.
 	resolved := decideWhatsAppIdentityReviewForTest(
-		t, app, db, organization.ID, resolver.ID, second.HoldID, shared.ID,
+		t, app, db, organization.ID, resolver.ID, second.HoldID, other.ID,
 	)
 	require.Equal(t, models.WhatsAppIdentityReviewDispositionFutureRouting, resolved.Snapshot.Disposition)
 
