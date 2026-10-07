@@ -34,8 +34,9 @@ every Git checkout. After successful allowlist redeployment, these offline
 commands write new owner-only files beside it and print only a fixed result:
 
 ```powershell
-python -I -S -B release/deployment/stage_fixture.py export-fixture --private-file "$env:USERPROFILE/rereply-staging/state.json" --output "$env:USERPROFILE/rereply-staging/canary-export.json"
-python -I -S -B release/deployment/stage_fixture.py export-target --private-file "$env:USERPROFILE/rereply-staging/state.json" --output "$env:USERPROFILE/rereply-staging/target-export.json"
+$stagingPrivateDir = "$env:USERPROFILE\rereply-staging-state\rereply-staging"
+py -3 -I -S -B release/deployment/stage_fixture.py export-fixture --private-file "$stagingPrivateDir\state.json" --output "$stagingPrivateDir\canary-export.json"
+py -3 -I -S -B release/deployment/stage_fixture.py export-target --private-file "$stagingPrivateDir\state.json" --output "$stagingPrivateDir\target-export.json"
 ```
 
 Target export requires the reviewed committed fingerprints. Fixture export can
@@ -125,9 +126,9 @@ both PostgreSQL bindings, exact ingress and non-secret env values, and the exact
 secret key/type/scope inventory. It compares both expected shape and JSON types,
 rejects duplicate names and environment keys, and narrowly normalizes known
 provider defaults. It does not silently accept new routes, source modes,
-autoscaling, log sinks, domains, image tags or unknown fields. Actual provider
-defaults have not yet been observed; any new shape requires a reviewed fixture
-and narrow normalization change before live use.
+autoscaling, log sinks, domains, image tags or unknown fields. Any previously
+unrecognized provider shape requires a reviewed fixture and narrow normalization
+change before live use.
 
 The image transform changes only the four product digest leaves and preserves
 the graph stub, every environment value and every other spec field. The separate
