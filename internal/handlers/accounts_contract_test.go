@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
@@ -1136,6 +1138,995 @@ func TestUpdateAccountContractChangeValidatesThenResubscribes(t *testing.T) {
 	assert.Equal(t, "Normalized Updated Contract", stored.Name)
 	assert.Equal(t, "v21.0", stored.APIVersion)
 	assert.True(t, appcrypto.IsEncrypted(stored.AccessToken))
+}
+
+// Under RLS the whole request is one tenant transaction. A rename that also
+// changes the account contract must not keep the rename stage's organization
+// lock across the Meta subscription call, or every policy fence in the tenant
+// (each inbound admission) would wait for that call.
+func TestUpdateAccountContractRenameReleasesOrganizationBeforeSubscription(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-old-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	account := &models.WhatsAppAccount{
+		BaseModel:      models.BaseModel{ID: uuid.New()},
+		OrganizationID: org.ID,
+		Name:           "Contract Before " + uuid.NewString()[:8],
+		PhoneID:        "old-phone",
+		BusinessID:     "old-waba",
+		AccessToken:    oldToken,
+		APIVersion:     "v21.0",
+		Status:         "active",
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+		ID: account.ID, OrganizationID: org.ID, Name: account.Name, Status: account.Status,
+	})
+	require.NoError(t, err)
+	app.Config.Database.RLSEnabled = true
+
+	inSubscribe := make(chan struct{})
+	release := make(chan struct{})
+	var inSubscribeOnce, releaseOnce sync.Once
+	releaseSubscribe := func() { releaseOnce.Do(func() { close(release) }) }
+	meta.onSubscribe = func() {
+		inSubscribeOnce.Do(func() { close(inSubscribe) })
+		<-release
+	}
+	defer releaseSubscribe()
+
+	nextName := "Contract After " + uuid.NewString()[:8]
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":         nextName,
+		"phone_id":     phoneID,
+		"business_id":  wabaID,
+		"access_token": "synthetic-updated-token",
+		"api_version":  "v21.0",
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+	handled := make(chan error, 1)
+	go func() { handled <- app.Tenant((*App).UpdateAccount)(req) }()
+	select {
+	case <-inSubscribe:
+	case handlerErr := <-handled:
+		require.Failf(t, "update finished before the Meta subscription", "error: %v", handlerErr)
+	case <-time.After(15 * time.Second):
+		require.Fail(t, "update never reached the Meta subscription")
+	}
+
+	fence := app.DB.Begin()
+	require.NoError(t, fence.Error)
+	defer func() { _ = fence.Rollback().Error }()
+	require.NoError(t, fence.Exec("SET LOCAL lock_timeout = '1s'").Error)
+	require.NoError(t, database.LockOrganizationPolicyScope(fence, org.ID),
+		"the rename held the organization across the Meta subscription")
+	require.NoError(t, fence.Commit().Error)
+
+	releaseSubscribe()
+	select {
+	case handlerErr := <-handled:
+		require.NoError(t, handlerErr)
+	case <-time.After(15 * time.Second):
+		require.Fail(t, "update did not finish after the Meta subscription returned")
+	}
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+	assert.Equal(t, nextName, stored.Name)
+	assert.Equal(t, "active", stored.Status)
+	var storedShadow models.ChannelAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", shadow.ID, org.ID).First(&storedShadow).Error)
+	assert.Equal(t, nextName, storedShadow.Metadata["legacy_account_name"])
+}
+
+// Under RLS a contract change whose subscription status is superseded during
+// the Meta call answers 409 and rolls back the request transaction. The account
+// update committed before the call, so moving the default flags must have
+// committed with it: the previous default may not stay a default as well.
+func TestUpdateAccountSupersededSubscriptionKeepsOneDefaultAccount(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	oldToken, err := appcrypto.Encrypt("synthetic-old-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	previousDefault := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		Name: "Previous Default " + uuid.NewString()[:8], PhoneID: "previous-phone-" + uuid.NewString()[:8], BusinessID: "previous-waba",
+		AccessToken: oldToken, APIVersion: "v21.0", Status: "active",
+		IsDefaultIncoming: true, IsDefaultOutgoing: true,
+	}
+	require.NoError(t, app.DB.Create(previousDefault).Error)
+	account := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		Name: "Becoming Default " + uuid.NewString()[:8], PhoneID: "old-phone-" + uuid.NewString()[:8], BusinessID: "old-waba",
+		AccessToken: oldToken, APIVersion: "v21.0", Status: "active",
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+	_, err = channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+		ID: account.ID, OrganizationID: org.ID, Name: account.Name, Status: account.Status,
+	})
+	require.NoError(t, err)
+	app.Config.Database.RLSEnabled = true
+	meta.onSubscribe = func() {
+		// A concurrent status write supersedes this request's subscription claim.
+		_ = app.DB.Model(&models.WhatsAppAccount{}).
+			Where("id = ? AND organization_id = ?", account.ID, org.ID).
+			Update("status", "subscription_failed").Error
+	}
+
+	nextName := "Now Default " + uuid.NewString()[:8]
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"name":                nextName,
+		"phone_id":            phoneID,
+		"business_id":         wabaID,
+		"access_token":        "synthetic-updated-token",
+		"api_version":         "v21.0",
+		"is_default_incoming": true,
+		"is_default_outgoing": true,
+	})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+	require.NoError(t, app.Tenant((*App).UpdateAccount)(req))
+	require.Equal(t, fasthttp.StatusConflict, testutil.GetResponseStatusCode(req))
+
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+	assert.Equal(t, nextName, stored.Name)
+	assert.NotEqual(t, oldToken, stored.AccessToken)
+	assert.True(t, stored.IsDefaultIncoming)
+	assert.True(t, stored.IsDefaultOutgoing)
+	var incomingDefaults, outgoingDefaults int64
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ? AND is_default_incoming = ?", org.ID, true).Count(&incomingDefaults).Error)
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ? AND is_default_outgoing = ?", org.ID, true).Count(&outgoingDefaults).Error)
+	assert.EqualValues(t, 1, incomingDefaults)
+	assert.EqualValues(t, 1, outgoingDefaults)
+
+	// The committed update keeps its audit row although the request failed.
+	changed := accountAuditFields(t, app, org.ID, account.ID)
+	require.Len(t, changed, 1)
+	assert.Equal(t, nextName, changed[0]["name"])
+	assert.Equal(t, "********", changed[0]["access_token"], "the token change is audited masked")
+	assert.Equal(t, true, changed[0]["is_default_incoming"])
+}
+
+// accountAuditFields returns, per account audit row in creation order, each
+// changed field's new value.
+func accountAuditFields(t *testing.T, app *App, orgID, accountID uuid.UUID) []map[string]any {
+	t.Helper()
+	var audits []models.AuditLog
+	require.NoError(t, app.DB.
+		Where("organization_id = ? AND resource_type = ? AND resource_id = ? AND action = ?",
+			orgID, "account", accountID, models.AuditActionUpdated).
+		Order("created_at").Find(&audits).Error)
+	fields := make([]map[string]any, 0, len(audits))
+	for _, entry := range audits {
+		changed := map[string]any{}
+		for _, change := range entry.Changes {
+			if change, ok := change.(map[string]any); ok {
+				if field, ok := change["field"].(string); ok {
+					changed[field] = change["new_value"]
+				}
+			}
+		}
+		fields = append(fields, changed)
+	}
+	return fields
+}
+
+func createDefaultMoveAccount(t *testing.T, app *App, orgID uuid.UUID, label string, isDefault bool) *models.WhatsAppAccount {
+	t.Helper()
+	token, err := appcrypto.Encrypt("synthetic-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	phoneID, wabaID := contractGraphIDs()
+	account := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		Name: label + " " + uuid.NewString()[:8], PhoneID: phoneID, BusinessID: wabaID,
+		AccessToken: token, APIVersion: "v21.0", Status: "active",
+		IsDefaultIncoming: isDefault, IsDefaultOutgoing: isDefault,
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+	return account
+}
+
+func makeDefaultAccountRequest(t *testing.T, orgID, userID, accountID uuid.UUID) *fastglue.Request {
+	t.Helper()
+	req := testutil.NewJSONRequest(t, map[string]any{
+		"is_default_incoming": true,
+		"is_default_outgoing": true,
+	})
+	testutil.SetAuthContext(req, orgID, userID)
+	testutil.SetPathParam(req, "id", accountID.String())
+	return req
+}
+
+func countDefaultAccounts(t *testing.T, app *App, orgID uuid.UUID) (incoming, outgoing []uuid.UUID) {
+	t.Helper()
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ? AND is_default_incoming = ?", orgID, true).Pluck("id", &incoming).Error)
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+		Where("organization_id = ? AND is_default_outgoing = ?", orgID, true).Pluck("id", &outgoing).Error)
+	return incoming, outgoing
+}
+
+// The default move clears both flags in one UPDATE. Updating the same row a
+// second time in one transaction re-runs its foreign-key check, which takes
+// the organization FOR KEY SHARE and so waits behind an admission's policy
+// fence (organization FOR UPDATE) while the move holds that row. The move
+// must finish while an admission holds its fence.
+func TestUpdateAccountDefaultMoveDoesNotWaitForTheOrganization(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	previous := createDefaultMoveAccount(t, app, org.ID, "Previous Default", true)
+	mover := createDefaultMoveAccount(t, app, org.ID, "Mover", false)
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", mover.ID).
+		Updates(map[string]any{"is_default_incoming": true, "is_default_outgoing": true}).Error)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admission := app.DB.WithContext(ctx).Begin()
+	require.NoError(t, admission.Error)
+	defer func() { _ = admission.Rollback().Error }()
+	require.NoError(t, database.LockOrganizationPolicyScope(admission, org.ID))
+
+	moved := make(chan error, 1)
+	go func() { moved <- app.clearOtherWhatsAppAccountDefaults(org.ID, mover.ID, true, true) }()
+	select {
+	case err := <-moved:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the default move waited for the admission's organization lock")
+	}
+	require.NoError(t, admission.Commit().Error)
+	incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+	assert.Equal(t, []uuid.UUID{mover.ID}, incoming)
+	assert.Equal(t, []uuid.UUID{mover.ID}, outgoing)
+	assert.NotContains(t, incoming, previous.ID)
+}
+
+// The previous incoming and outgoing defaults can be different accounts, and
+// sends hold an account row FOR SHARE across their Meta call. While the clear
+// waits for such a send on one of them, it must not keep the other one locked:
+// an admission on that account would wait behind it while it holds the
+// tenant's policy fence.
+func TestUpdateAccountDefaultClearWaitingForASendKeepsNoOtherAccountLocked(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	incomingDefault := createDefaultMoveAccount(t, app, org.ID, "Incoming Default", false)
+	outgoingDefault := createDefaultMoveAccount(t, app, org.ID, "Outgoing Default", false)
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", incomingDefault.ID).
+		Update("is_default_incoming", true).Error)
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", outgoingDefault.ID).
+		Update("is_default_outgoing", true).Error)
+	mover := createDefaultMoveAccount(t, app, org.ID, "Mover", false)
+	require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", mover.ID).
+		Updates(map[string]any{"is_default_incoming": true, "is_default_outgoing": true}).Error)
+
+	for _, sent := range []*models.WhatsAppAccount{incomingDefault, outgoingDefault} {
+		other := incomingDefault
+		if sent == incomingDefault {
+			other = outgoingDefault
+		}
+		t.Run(sent.Name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			// Reset the flags for this round.
+			require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", incomingDefault.ID).
+				Update("is_default_incoming", true).Error)
+			require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", outgoingDefault.ID).
+				Update("is_default_outgoing", true).Error)
+			send := app.DB.WithContext(ctx).Begin()
+			require.NoError(t, send.Error)
+			defer func() { _ = send.Rollback().Error }()
+			var held []models.WhatsAppAccount
+			require.NoError(t, send.Clauses(clause.Locking{Strength: "SHARE"}).Select("id").
+				Where("id = ?", sent.ID).Find(&held).Error)
+			var sendPID int
+			require.NoError(t, send.Session(&gorm.Session{NewDB: true}).Raw("SELECT pg_backend_pid()").Scan(&sendPID).Error)
+
+			cleared := make(chan error, 1)
+			go func() { cleared <- app.clearOtherWhatsAppAccountDefaults(org.ID, mover.ID, true, true) }()
+			require.Eventually(t, func() bool {
+				var waiting bool
+				return app.DB.Raw(
+					"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid)))",
+					sendPID,
+				).Scan(&waiting).Error == nil && waiting
+			}, 10*time.Second, 5*time.Millisecond, "the clear must wait for the send")
+
+			probe := app.DB.WithContext(ctx).Begin()
+			require.NoError(t, probe.Error)
+			var probed []models.WhatsAppAccount
+			probeErr := probe.Clauses(clause.Locking{Strength: "SHARE", Options: "NOWAIT"}).Select("id").
+				Where("id = ?", other.ID).Find(&probed).Error
+			_ = probe.Rollback().Error
+			require.NoError(t, probeErr, "the clear kept another account locked while it waited for a send")
+
+			require.NoError(t, send.Commit().Error)
+			select {
+			case err := <-cleared:
+				require.NoError(t, err)
+			case <-time.After(10 * time.Second):
+				require.Fail(t, "the clear did not finish after the send")
+			}
+			incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+			assert.Equal(t, []uuid.UUID{mover.ID}, incoming)
+			assert.Equal(t, []uuid.UUID{mover.ID}, outgoing)
+		})
+	}
+}
+
+// Two requests that each make a different account the default commit their own
+// flags first and then clear the others. Unserialized, or clearing regardless
+// of the mover's own flag, they cleared each other and left no default at all.
+// Here both have committed their flags before either clear runs; exactly one
+// default of each kind must survive.
+func TestUpdateAccountConcurrentDefaultMovesLeaveOneDefault(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			previous := createDefaultMoveAccount(t, app, org.ID, "Previous Default", true)
+			first := createDefaultMoveAccount(t, app, org.ID, "First Mover", false)
+			second := createDefaultMoveAccount(t, app, org.ID, "Second Mover", false)
+			app.Config.Database.RLSEnabled = rlsEnabled
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			moves := app.DB.WithContext(ctx).Begin()
+			require.NoError(t, moves.Error)
+			defer func() { _ = moves.Rollback().Error }()
+			require.NoError(t, moves.Exec(
+				"SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
+				whatsappDefaultAccountMoveKey(org.ID),
+			).Error)
+			var movesPID int
+			require.NoError(t, moves.Session(&gorm.Session{NewDB: true}).Raw("SELECT pg_backend_pid()").Scan(&movesPID).Error)
+
+			requests := []*fastglue.Request{
+				makeDefaultAccountRequest(t, org.ID, user.ID, first.ID),
+				makeDefaultAccountRequest(t, org.ID, user.ID, second.ID),
+			}
+			handled := make(chan error, len(requests))
+			for _, req := range requests {
+				go func(req *fastglue.Request) { handled <- app.Tenant((*App).UpdateAccount)(req) }(req)
+			}
+			require.Eventually(t, func() bool {
+				var waiting int64
+				return app.DB.Raw(
+					"SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid))",
+					movesPID,
+				).Scan(&waiting).Error == nil && waiting == int64(len(requests))
+			}, 15*time.Second, 10*time.Millisecond, "both requests must commit their flags and wait to clear the others")
+			require.NoError(t, moves.Commit().Error)
+			for range requests {
+				select {
+				case handlerErr := <-handled:
+					require.NoError(t, handlerErr)
+				case <-time.After(15 * time.Second):
+					require.Fail(t, "a default move did not finish")
+				}
+			}
+			for _, req := range requests {
+				assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+			}
+
+			incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+			require.Len(t, incoming, 1, "exactly one incoming default must survive")
+			require.Len(t, outgoing, 1, "exactly one outgoing default must survive")
+			assert.Equal(t, incoming[0], outgoing[0])
+			assert.NotEqual(t, previous.ID, incoming[0])
+		})
+	}
+}
+
+// failDefaultClearOf makes every UPDATE that clears account's incoming
+// default flag fail until the returned function drops the trigger.
+func failDefaultClearOf(t *testing.T, app *App, accountID uuid.UUID) func() {
+	t.Helper()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	functionName := "fail_default_clear_" + suffix
+	triggerName := functionName + "_trigger"
+	dropped := false
+	drop := func() {
+		if !dropped {
+			require.NoError(t, dropLegacyTestTrigger(app.DB, "whatsapp_accounts", triggerName, functionName))
+			dropped = true
+		}
+	}
+	t.Cleanup(drop)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF OLD.id = '%s'::uuid AND OLD.is_default_incoming AND NOT NEW.is_default_incoming THEN
+				RAISE EXCEPTION 'synthetic default clear failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$`, functionName, accountID)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(
+		"CREATE TRIGGER %s BEFORE UPDATE ON whatsapp_accounts FOR EACH ROW EXECUTE FUNCTION %s()",
+		triggerName, functionName,
+	)).Error)
+	return drop
+}
+
+// A failed clear of the previous default must not report success, and an
+// identical retry must repair it: the clear runs whenever the request sets the
+// flag, not only when the flag changes. With a contract change the request has
+// also subscribed the account; its status must stay committed, or the retry
+// is refused while recovery owns a pending_subscription account.
+func TestUpdateAccountRetryRepairsAFailedDefaultClear(t *testing.T) {
+	for _, contractChange := range []bool{false, true} {
+		for _, rlsEnabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("contract=%v/rls=%v", contractChange, rlsEnabled), func(t *testing.T) {
+				phoneID, wabaID := contractGraphIDs()
+				meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+				app := newWhatsAppContractApp(t, meta)
+				org := testutil.CreateTestOrganization(t, app.DB)
+				user := contractWriter(t, app, org.ID)
+				previous := createDefaultMoveAccount(t, app, org.ID, "Previous Default", true)
+				account := createDefaultMoveAccount(t, app, org.ID, "Next Default", false)
+				app.Config.Database.RLSEnabled = rlsEnabled
+				drop := failDefaultClearOf(t, app, previous.ID)
+
+				body := map[string]any{"is_default_incoming": true, "is_default_outgoing": true}
+				if contractChange {
+					body["phone_id"] = phoneID
+					body["business_id"] = wabaID
+					body["access_token"] = "synthetic-updated-token"
+					body["api_version"] = "v21.0"
+				}
+				put := func() *fastglue.Request {
+					req := testutil.NewJSONRequest(t, body)
+					testutil.SetAuthContext(req, org.ID, user.ID)
+					testutil.SetPathParam(req, "id", account.ID.String())
+					require.NoError(t, app.Tenant((*App).UpdateAccount)(req))
+					return req
+				}
+
+				req := put()
+				require.Equal(t, fasthttp.StatusInternalServerError, testutil.GetResponseStatusCode(req))
+				assert.Contains(t, string(testutil.GetResponseBody(req)), errWhatsAppDefaultAccountClearMessage)
+				incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+				assert.Len(t, incoming, 2, "the update committed; only the clear failed")
+				assert.Len(t, outgoing, 2)
+				var stored models.WhatsAppAccount
+				require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+				audits := accountAuditFields(t, app, org.ID, account.ID)
+				if contractChange {
+					assert.Equal(t, "active", stored.Status, "the subscription status stays committed")
+					require.Len(t, audits, 2, "the update and the subscription status are both audited")
+					assert.Equal(t, "active", audits[1]["status"])
+				} else {
+					assert.Len(t, audits, 1, "the committed update is audited")
+				}
+
+				drop()
+				retry := put()
+				require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(retry), string(testutil.GetResponseBody(retry)))
+				incoming, outgoing = countDefaultAccounts(t, app, org.ID)
+				assert.Equal(t, []uuid.UUID{account.ID}, incoming)
+				assert.Equal(t, []uuid.UUID{account.ID}, outgoing)
+			})
+		}
+	}
+}
+
+// A contract change whose subscription fails leaves the account in recovery,
+// which refuses another credential change. If the default clear failed too, a
+// 500 would invite a retry that is refused, so the request reports both as
+// warnings; saving the account again without credentials repairs the clear.
+func TestUpdateAccountFailedSubscriptionAndDefaultClearAreBothRepairable(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			meta.subscriptionStatus = http.StatusBadGateway
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			previous := createDefaultMoveAccount(t, app, org.ID, "Previous Default", true)
+			account := createDefaultMoveAccount(t, app, org.ID, "Next Default", false)
+			app.Config.Database.RLSEnabled = rlsEnabled
+			drop := failDefaultClearOf(t, app, previous.ID)
+
+			req := testutil.NewJSONRequest(t, map[string]any{
+				"phone_id":            phoneID,
+				"business_id":         wabaID,
+				"access_token":        "synthetic-updated-token",
+				"api_version":         "v21.0",
+				"is_default_incoming": true,
+				"is_default_outgoing": true,
+			})
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetPathParam(req, "id", account.ID.String())
+			require.NoError(t, app.Tenant((*App).UpdateAccount)(req))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+			body := string(testutil.GetResponseBody(req))
+			assert.Contains(t, body, "Webhook subscription failed")
+			assert.Contains(t, body, errWhatsAppDefaultAccountClearWarning)
+			var stored models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+			assert.Equal(t, "subscription_failed", stored.Status)
+			incoming, _ := countDefaultAccounts(t, app, org.ID)
+			assert.Len(t, incoming, 2)
+
+			drop()
+			repair := makeDefaultAccountRequest(t, org.ID, user.ID, account.ID)
+			require.NoError(t, app.Tenant((*App).UpdateAccount)(repair))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(repair), string(testutil.GetResponseBody(repair)))
+			incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+			assert.Equal(t, []uuid.UUID{account.ID}, incoming)
+			assert.Equal(t, []uuid.UUID{account.ID}, outgoing)
+		})
+	}
+}
+
+// CreateAccount makes the new account the default with its subscription
+// status, audited together, and then clears the other accounts. Repeating the
+// create would only collide with the saved account, so a failed clear is a
+// warning, and saving the new account with the default option repairs it.
+func TestCreateAccountDefaultIsAuditedAndAFailedClearIsAWarning(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			previous := createDefaultMoveAccount(t, app, org.ID, "Previous Default", true)
+			app.Config.Database.RLSEnabled = rlsEnabled
+			drop := failDefaultClearOf(t, app, previous.ID)
+
+			create := testutil.NewJSONRequest(t, map[string]any{
+				"name":                "Created Default " + uuid.NewString()[:8],
+				"phone_id":            phoneID,
+				"business_id":         wabaID,
+				"access_token":        "synthetic-created-token",
+				"api_version":         "v21.0",
+				"is_default_incoming": true,
+				"is_default_outgoing": true,
+			})
+			testutil.SetAuthContext(create, org.ID, user.ID)
+			require.NoError(t, app.Tenant((*App).CreateAccount)(create))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(create), string(testutil.GetResponseBody(create)))
+			assert.Contains(t, string(testutil.GetResponseBody(create)), errWhatsAppDefaultAccountClearWarning)
+			var created models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&created).Error)
+			assert.Equal(t, "active", created.Status)
+			assert.True(t, created.IsDefaultIncoming)
+			assert.True(t, created.IsDefaultOutgoing)
+			var creations int64
+			require.NoError(t, app.DB.Model(&models.AuditLog{}).
+				Where("organization_id = ? AND resource_type = ? AND resource_id = ? AND action = ?",
+					org.ID, "account", created.ID, models.AuditActionCreated).
+				Count(&creations).Error)
+			assert.EqualValues(t, 1, creations)
+			updates := accountAuditFields(t, app, org.ID, created.ID)
+			require.Len(t, updates, 1, "the subscription status and the default flags are audited together")
+			assert.Equal(t, "active", updates[0]["status"])
+			assert.Equal(t, true, updates[0]["is_default_incoming"])
+			assert.Equal(t, true, updates[0]["is_default_outgoing"])
+
+			drop()
+			repair := makeDefaultAccountRequest(t, org.ID, user.ID, created.ID)
+			require.NoError(t, app.Tenant((*App).UpdateAccount)(repair))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(repair), string(testutil.GetResponseBody(repair)))
+			incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+			assert.Equal(t, []uuid.UUID{created.ID}, incoming)
+			assert.Equal(t, []uuid.UUID{created.ID}, outgoing)
+		})
+	}
+}
+
+// Random rounds of two to five concurrent default moves, some of them on
+// accounts in a recovery status (the pending update path), must each leave
+// exactly one default of each kind.
+func TestUpdateAccountRandomConcurrentDefaultMovesKeepOneDefault(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			accounts := []*models.WhatsAppAccount{createDefaultMoveAccount(t, app, org.ID, "Mover 0", true)}
+			for index := 1; index < 5; index++ {
+				accounts = append(accounts, createDefaultMoveAccount(t, app, org.ID, fmt.Sprintf("Mover %d", index), false))
+			}
+			require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).
+				Where("id IN ?", []uuid.UUID{accounts[3].ID, accounts[4].ID}).
+				Update("status", "pending_subscription").Error)
+			app.Config.Database.RLSEnabled = rlsEnabled
+
+			random := mathrand.New(mathrand.NewPCG(uint64(len(t.Name())), 227))
+			for round := 0; round < 25; round++ {
+				movers := 2 + random.IntN(4)
+				var group sync.WaitGroup
+				requests := make([]*fastglue.Request, movers)
+				for index := range requests {
+					requests[index] = makeDefaultAccountRequest(t, org.ID, user.ID, accounts[random.IntN(len(accounts))].ID)
+					group.Add(1)
+					go func(req *fastglue.Request) {
+						defer group.Done()
+						assert.NoError(t, app.Tenant((*App).UpdateAccount)(req))
+					}(requests[index])
+				}
+				group.Wait()
+				// Two moves of the same account in one round race on its
+				// updated_at fence; the loser answers 409 and changes nothing.
+				for _, req := range requests {
+					assert.Contains(t, []int{fasthttp.StatusOK, fasthttp.StatusConflict},
+						testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+				}
+				incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+				require.Len(t, incoming, 1, "round %d left %d incoming defaults", round, len(incoming))
+				require.Len(t, outgoing, 1, "round %d left %d outgoing defaults", round, len(outgoing))
+			}
+		})
+	}
+}
+
+// CreateAccount moves the default flags through the same per-organization
+// move key as UpdateAccount, after its row commits. A create and an update
+// that each make their account the default, both committed before either
+// clears, must leave exactly one default of each kind.
+func TestCreateAccountDefaultRacingAnUpdateMoveLeavesOneDefault(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			previous := createDefaultMoveAccount(t, app, org.ID, "Previous Default", true)
+			mover := createDefaultMoveAccount(t, app, org.ID, "Update Mover", false)
+			app.Config.Database.RLSEnabled = rlsEnabled
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			moves := app.DB.WithContext(ctx).Begin()
+			require.NoError(t, moves.Error)
+			defer func() { _ = moves.Rollback().Error }()
+			require.NoError(t, moves.Exec(
+				"SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
+				whatsappDefaultAccountMoveKey(org.ID),
+			).Error)
+			var movesPID int
+			require.NoError(t, moves.Session(&gorm.Session{NewDB: true}).Raw("SELECT pg_backend_pid()").Scan(&movesPID).Error)
+
+			create := testutil.NewJSONRequest(t, map[string]any{
+				"name":                "Created Default " + uuid.NewString()[:8],
+				"phone_id":            phoneID,
+				"business_id":         wabaID,
+				"access_token":        "synthetic-created-token",
+				"api_version":         "v21.0",
+				"is_default_incoming": true,
+				"is_default_outgoing": true,
+			})
+			testutil.SetAuthContext(create, org.ID, user.ID)
+			update := makeDefaultAccountRequest(t, org.ID, user.ID, mover.ID)
+			handled := make(chan error, 2)
+			go func() { handled <- app.Tenant((*App).CreateAccount)(create) }()
+			go func() { handled <- app.Tenant((*App).UpdateAccount)(update) }()
+			require.Eventually(t, func() bool {
+				var waiting int64
+				return app.DB.Raw(
+					"SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid))",
+					movesPID,
+				).Scan(&waiting).Error == nil && waiting == 2
+			}, 15*time.Second, 10*time.Millisecond, "both requests must commit their rows and wait to clear the others")
+			require.NoError(t, moves.Commit().Error)
+			for range 2 {
+				select {
+				case handlerErr := <-handled:
+					require.NoError(t, handlerErr)
+				case <-time.After(15 * time.Second):
+					require.Fail(t, "a default move did not finish")
+				}
+			}
+			assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(create), string(testutil.GetResponseBody(create)))
+			assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(update), string(testutil.GetResponseBody(update)))
+
+			incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+			require.Len(t, incoming, 1, "exactly one incoming default must survive")
+			require.Len(t, outgoing, 1, "exactly one outgoing default must survive")
+			assert.Equal(t, incoming[0], outgoing[0])
+			assert.NotEqual(t, previous.ID, incoming[0])
+		})
+	}
+}
+
+// installPlatformComplianceWriteGuard installs tenant RLS, and with it the
+// platform-compliance write guard (organizations FOR SHARE on every insert),
+// for a synthetic runtime role. The test connection is a superuser, so RLS
+// itself does not apply to it.
+func installPlatformComplianceWriteGuard(t *testing.T, app *App) {
+	t.Helper()
+	runtimeRole := "rereply_guard_" + uuid.NewString()[:8]
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD 'synthetic%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		runtimeRole, uuid.NewString()[:8],
+	)).Error)
+	t.Cleanup(func() {
+		// Best-effort, so a test failure is not hidden by teardown.
+		_ = database.RemoveTenantRLS(app.DB)
+		_ = app.DB.Exec("DROP OWNED BY " + runtimeRole).Error
+		_ = app.DB.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
+	})
+	require.NoError(t, database.ApplyTenantRLS(app.DB, runtimeRole))
+}
+
+// After a contract change's Meta subscription, the status write and its audit
+// row commit in their own transaction. With the platform-compliance write
+// guard the audit INSERT locks the organization, so that transaction must take
+// the organization before the account row too, or it deadlocks with a
+// Coexistence admission (policy fence, organization FOR UPDATE, then the
+// account row FOR SHARE). Here an admission takes its fence while Meta is
+// called; the status write must wait for the organization without having
+// touched the account row.
+func TestUpdateAccountSubscriptionStatusTakesTheOrganizationBeforeTheAccountRow(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			installPlatformComplianceWriteGuard(t, app)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			account := createDefaultMoveAccount(t, app, org.ID, "Resubscribing", false)
+			app.Config.Database.RLSEnabled = rlsEnabled
+
+			inSubscribe := make(chan struct{})
+			release := make(chan struct{})
+			var inSubscribeOnce, releaseOnce sync.Once
+			releaseSubscribe := func() { releaseOnce.Do(func() { close(release) }) }
+			meta.onSubscribe = func() {
+				inSubscribeOnce.Do(func() { close(inSubscribe) })
+				<-release
+			}
+			defer releaseSubscribe()
+
+			req := testutil.NewJSONRequest(t, map[string]any{
+				"phone_id":     phoneID,
+				"business_id":  wabaID,
+				"access_token": "synthetic-rotated-token",
+				"api_version":  "v21.0",
+			})
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetPathParam(req, "id", account.ID.String())
+			var handlerErr error
+			handled := make(chan struct{})
+			go func() {
+				defer close(handled)
+				handlerErr = app.Tenant((*App).UpdateAccount)(req)
+			}()
+			select {
+			case <-inSubscribe:
+			case <-handled:
+				require.Failf(t, "update finished before the Meta subscription", "error: %v", handlerErr)
+			case <-time.After(15 * time.Second):
+				require.Fail(t, "update never reached the Meta subscription")
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			admission := app.DB.WithContext(ctx).Begin()
+			require.NoError(t, admission.Error)
+			defer func() {
+				_ = admission.Rollback().Error
+				releaseSubscribe()
+				select {
+				case <-handled:
+				case <-time.After(15 * time.Second):
+					t.Error("update did not terminate")
+				}
+			}()
+			require.NoError(t, database.LockOrganizationPolicyScope(admission, org.ID))
+			var admissionPID int
+			require.NoError(t, admission.Session(&gorm.Session{NewDB: true}).
+				Raw("SELECT pg_backend_pid()").Scan(&admissionPID).Error)
+			releaseSubscribe()
+			require.Eventually(t, func() bool {
+				var waiting bool
+				return app.DB.Raw(
+					"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid)))",
+					admissionPID,
+				).Scan(&waiting).Error == nil && waiting
+			}, 10*time.Second, 5*time.Millisecond, "the status write must wait for the admission's organization lock")
+
+			var held []models.WhatsAppAccount
+			require.NoError(t, admission.Clauses(clause.Locking{Strength: "SHARE", Options: "NOWAIT"}).
+				Select("id").Where("id = ? AND organization_id = ?", account.ID, org.ID).Find(&held).Error,
+				"the status write locked the account row before the organization")
+			require.NoError(t, admission.Commit().Error)
+			select {
+			case <-handled:
+				require.NoError(t, handlerErr)
+			case <-time.After(15 * time.Second):
+				require.Fail(t, "update did not finish after the admission committed")
+			}
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+			var stored models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+			assert.Equal(t, "active", stored.Status)
+		})
+	}
+}
+
+// An update that does not rename the account still writes its audit row in
+// the commit transaction, and with the platform-compliance write guard that
+// INSERT locks the organization FOR SHARE. Taken after the account row, that
+// inverted a Coexistence admission's order (policy fence, organization FOR
+// UPDATE, then the account row FOR SHARE) and deadlocked. Here an admission
+// holds its fence while the update starts: the update must wait for the
+// organization without having touched the account row, so the admission can
+// still read that row.
+func TestUpdateAccountWithoutRenameTakesTheOrganizationBeforeTheAccountRow(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			installPlatformComplianceWriteGuard(t, app)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			account := createDefaultMoveAccount(t, app, org.ID, "Unrenamed", false)
+			app.Config.Database.RLSEnabled = rlsEnabled
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			admission := app.DB.WithContext(ctx).Begin()
+			require.NoError(t, admission.Error)
+			defer func() { _ = admission.Rollback().Error }()
+			require.NoError(t, database.LockOrganizationPolicyScope(admission, org.ID))
+			var admissionPID int
+			require.NoError(t, admission.Session(&gorm.Session{NewDB: true}).
+				Raw("SELECT pg_backend_pid()").Scan(&admissionPID).Error)
+
+			req := testutil.NewJSONRequest(t, map[string]any{"auto_read_receipt": true})
+			testutil.SetAuthContext(req, org.ID, user.ID)
+			testutil.SetPathParam(req, "id", account.ID.String())
+			var handlerErr error
+			handled := make(chan struct{})
+			go func() {
+				defer close(handled)
+				handlerErr = app.Tenant((*App).UpdateAccount)(req)
+			}()
+			defer func() {
+				_ = admission.Rollback().Error
+				select {
+				case <-handled:
+				case <-time.After(15 * time.Second):
+					t.Error("update did not terminate")
+				}
+			}()
+			require.Eventually(t, func() bool {
+				var waiting bool
+				return app.DB.Raw(
+					"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid)))",
+					admissionPID,
+				).Scan(&waiting).Error == nil && waiting
+			}, 10*time.Second, 5*time.Millisecond, "the update must wait for the admission's organization lock")
+
+			// The admission's next step: the account row, FOR SHARE.
+			var held []models.WhatsAppAccount
+			require.NoError(t, admission.Clauses(clause.Locking{Strength: "SHARE", Options: "NOWAIT"}).
+				Select("id").Where("id = ? AND organization_id = ?", account.ID, org.ID).Find(&held).Error,
+				"the update locked the account row before the organization")
+			require.NoError(t, admission.Commit().Error)
+			select {
+			case <-handled:
+				require.NoError(t, handlerErr)
+			case <-time.After(15 * time.Second):
+				require.Fail(t, "update did not finish after the admission committed")
+			}
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+			var stored models.WhatsAppAccount
+			require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+			assert.True(t, stored.AutoReadReceipt)
+			assert.Len(t, accountAuditFields(t, app, org.ID, account.ID), 1)
+		})
+	}
+}
+
+// Sends hold their account row FOR SHARE across the Meta call. A rename that
+// waits for that row must not hold the policy fence key or the organization
+// meanwhile, or every inbound admission in the tenant would wait for the send.
+func TestUpdateAccountRenameWaitingForASendLeavesPolicyFenceAvailable(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	token, err := appcrypto.Encrypt("synthetic-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	account := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: org.ID,
+		Name: "Sending " + uuid.NewString()[:8], PhoneID: phoneID, BusinessID: wabaID,
+		AccessToken: token, APIVersion: "v21.0", Status: "active",
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+	_, err = channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+		ID: account.ID, OrganizationID: org.ID, Name: account.Name, Status: account.Status,
+	})
+	require.NoError(t, err)
+	app.Config.Database.RLSEnabled = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	send := app.DB.WithContext(ctx).Begin()
+	require.NoError(t, send.Error)
+	defer func() { _ = send.Rollback().Error }()
+	var held models.WhatsAppAccount
+	require.NoError(t, send.Clauses(clause.Locking{Strength: "SHARE"}).
+		Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&held).Error)
+	var sendPID int
+	require.NoError(t, send.Session(&gorm.Session{NewDB: true}).Raw("SELECT pg_backend_pid()").Scan(&sendPID).Error)
+
+	nextName := "Renamed " + uuid.NewString()[:8]
+	req := testutil.NewJSONRequest(t, map[string]any{"name": nextName})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetPathParam(req, "id", account.ID.String())
+	var handlerErr error
+	handled := make(chan struct{})
+	go func() {
+		defer close(handled)
+		handlerErr = app.Tenant((*App).UpdateAccount)(req)
+	}()
+	defer func() {
+		_ = send.Rollback().Error
+		select {
+		case <-handled:
+		case <-time.After(15 * time.Second):
+			t.Error("rename did not terminate")
+		}
+	}()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		return app.DB.Raw(
+			"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid)))",
+			sendPID,
+		).Scan(&waiting).Error == nil && waiting
+	}, 10*time.Second, 10*time.Millisecond, "the rename must wait for the send's account lock")
+
+	fence := app.DB.Begin()
+	require.NoError(t, fence.Error)
+	defer func() { _ = fence.Rollback().Error }()
+	require.NoError(t, fence.Exec("SET LOCAL lock_timeout = '1s'").Error)
+	require.NoError(t, database.LockOrganizationPolicyScope(fence, org.ID),
+		"the rename held the policy fence while it waited for the send")
+	require.NoError(t, fence.Commit().Error)
+
+	require.NoError(t, send.Commit().Error)
+	select {
+	case <-handled:
+		require.NoError(t, handlerErr)
+	case <-time.After(15 * time.Second):
+		require.Fail(t, "rename did not finish after the send committed")
+	}
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+	assert.Equal(t, nextName, stored.Name)
 }
 
 func TestUpdateAccountRejectsSMBCredentialRefreshOutsideEmbeddedSignup(t *testing.T) {

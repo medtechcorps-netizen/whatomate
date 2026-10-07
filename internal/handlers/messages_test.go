@@ -40,6 +40,9 @@ type mockWhatsAppServer struct {
 	errorMessage  string
 	nextMessageID string
 	nextMediaID   string
+	// messageHook, when set, runs after a send is recorded and before its
+	// response is written, so a test can hold the provider call open.
+	messageHook func()
 }
 
 func newMockWhatsAppServer() *mockWhatsAppServer {
@@ -104,11 +107,18 @@ func (m *mockWhatsAppServer) handleMessages(w http.ResponseWriter, r *http.Reque
 
 	m.mu.Lock()
 	m.sentMessages = append(m.sentMessages, body)
+	hook := m.messageHook
+	m.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	m.mu.Lock()
+	messageID := m.nextMessageID
 	m.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"messages": []map[string]string{{"id": m.nextMessageID}},
+		"messages": []map[string]string{{"id": messageID}},
 	})
 }
 

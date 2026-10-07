@@ -227,8 +227,6 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 		AccessToken:            req.AccessToken,
 		AccessTokenExpiresAt:   tokenExpiresAt,
 		APIVersion:             apiVersion,
-		IsDefaultIncoming:      req.IsDefaultIncoming,
-		IsDefaultOutgoing:      req.IsDefaultOutgoing,
 		AutoReadReceipt:        req.AutoReadReceipt,
 		BusinessCallingEnabled: req.BusinessCallingEnabled,
 		Status:                 "pending_subscription",
@@ -247,19 +245,23 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
 
-	// If this is set as default, unset other defaults
-	if req.IsDefaultIncoming {
-		a.DB.Model(&models.WhatsAppAccount{}).
-			Where("organization_id = ? AND is_default_incoming = ?", orgID, true).
-			Update("is_default_incoming", false)
-	}
-	if req.IsDefaultOutgoing {
-		a.DB.Model(&models.WhatsAppAccount{}).
-			Where("organization_id = ? AND is_default_outgoing = ?", orgID, true).
-			Update("is_default_outgoing", false)
-	}
-
-	if err := a.DB.Create(&account).Error; err != nil {
+	// The new row and its audit entry commit first, without the default
+	// flags. The account becomes the default only with its subscription status
+	// (subscribeAndPersistWhatsAppStatus), so the previous default stays
+	// usable while Meta is called; the other accounts lose the flags after
+	// that.
+	if err := a.rootApp().WithCommittedTenantApp(orgID, func(scoped *App) error {
+		if err := scoped.DB.Create(&account).Error; err != nil {
+			return err
+		}
+		if err := audit.LogAudit(
+			scoped.DB, orgID, userID, audit.GetUserName(scoped.DB, userID),
+			"account", account.ID, models.AuditActionCreated, nil, &account,
+		); err != nil {
+			return fmt.Errorf("audit WhatsApp account creation: %w", err)
+		}
+		return nil
+	}); err != nil {
 		a.Log.Error("Failed to create account", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
@@ -267,11 +269,14 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 	subscriptionErr, statusErr := a.subscribeAndPersistWhatsAppStatus(
 		validationCtx,
 		orgID,
+		userID,
 		&account,
 		subscriptionAccount,
 		account.AccessToken,
 		"active",
 		"subscription_failed",
+		req.IsDefaultIncoming,
+		req.IsDefaultOutgoing,
 	)
 	if statusErr != nil {
 		if errors.Is(statusErr, errEmbeddedSignupClaimSuperseded) {
@@ -280,17 +285,24 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 		a.Log.Error("Failed to persist WhatsApp subscription readiness", "error", statusErr, "account_id", account.ID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Account saved, but webhook subscription status could not be recorded", nil, "")
 	}
+	moveErr := a.clearOtherWhatsAppAccountDefaults(orgID, account.ID, req.IsDefaultIncoming, req.IsDefaultOutgoing)
 
 	a.DB.Preload("CreatedBy").Preload("UpdatedBy").
 		Where("id = ? AND organization_id = ?", account.ID, orgID).
 		First(&account)
-	a.logAudit(orgID, userID,
-		"account", account.ID, models.AuditActionCreated, nil, &account)
 
+	// The account is saved either way, and repeating the create would only
+	// collide with it, so a failed clear is a warning: saving the account
+	// again with the default option repairs it.
 	response := accountToResponse(account)
+	var warnings []string
 	if subscriptionErr != nil {
-		response.Warning = "Webhook subscription failed; use the account Subscribe action after checking Meta permissions"
+		warnings = append(warnings, "Webhook subscription failed; use the account Subscribe action after checking Meta permissions")
 	}
+	if moveErr != nil {
+		warnings = append(warnings, errWhatsAppDefaultAccountClearWarning)
+	}
+	response.Warning = strings.Join(warnings, ". ")
 	return r.SendEnvelope(response)
 }
 
@@ -426,7 +438,8 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		if req.Name != "" {
 			updatedName = req.Name
 		}
-		updateErr := a.DB.Transaction(func(tx *gorm.DB) error {
+		var updated models.WhatsAppAccount
+		updateErr := a.commitWhatsAppAccountUpdate(orgID, func(tx *gorm.DB) error {
 			shadowPrepared, err := channelapi.StageLegacyMetaWhatsAppAccountRename(
 				tx,
 				orgID,
@@ -462,15 +475,17 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 				return errWhatsAppAccountUpdateSuperseded
 			}
 			if !shadowPrepared {
-				return channelapi.FinalizeLegacyMetaWhatsAppAccountRename(
+				if err := channelapi.FinalizeLegacyMetaWhatsAppAccountRename(
 					tx,
 					orgID,
 					account.ID,
 					account.Name,
 					updatedName,
-				)
+				); err != nil {
+					return err
+				}
 			}
-			return nil
+			return auditWhatsAppAccountUpdate(tx, orgID, userID, &oldAccount, &updated)
 		})
 		if errors.Is(updateErr, errWhatsAppAccountUpdateSuperseded) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account recovery changed; reload and try again", nil, "")
@@ -482,25 +497,21 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 			a.Log.Error("Failed to update pending WhatsApp account", "error", updateErr, "account_id", account.ID)
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 		}
-		if req.IsDefaultIncoming && !account.IsDefaultIncoming {
-			a.DB.Model(&models.WhatsAppAccount{}).
-				Where("organization_id = ? AND id <> ? AND is_default_incoming = ?", orgID, account.ID, true).
-				Update("is_default_incoming", false)
-		}
-		if req.IsDefaultOutgoing && !account.IsDefaultOutgoing {
-			a.DB.Model(&models.WhatsAppAccount{}).
-				Where("organization_id = ? AND id <> ? AND is_default_outgoing = ?", orgID, account.ID, true).
-				Update("is_default_outgoing", false)
-		}
+		clearErr := a.clearOtherWhatsAppAccountDefaults(
+			orgID,
+			account.ID,
+			req.IsDefaultIncoming,
+			req.IsDefaultOutgoing,
+		)
 		a.InvalidateWhatsAppAccountCache(account.PhoneID)
-		var updated models.WhatsAppAccount
+		if clearErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, errWhatsAppDefaultAccountClearMessage, nil, "")
+		}
 		if err := a.DB.Preload("CreatedBy").Preload("UpdatedBy").
 			Where("id = ? AND organization_id = ?", account.ID, orgID).
 			First(&updated).Error; err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to reload account", nil, "")
 		}
-		a.logAudit(orgID, userID,
-			"account", updated.ID, models.AuditActionUpdated, &oldAccount, &updated)
 		return r.SendEnvelope(accountToResponse(updated))
 	}
 
@@ -599,7 +610,14 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 	if accountContractChanged {
 		updates["status"] = "pending_subscription"
 	}
-	updateErr := a.DB.Transaction(func(tx *gorm.DB) error {
+	var sensitiveChanges []map[string]any
+	if tokenChanged {
+		sensitiveChanges = append(sensitiveChanges, map[string]any{
+			"field": "access_token", "old_value": "********", "new_value": "********",
+		})
+	}
+	var auditedAccount models.WhatsAppAccount
+	stageAndUpdate := func(tx *gorm.DB) error {
 		shadowPrepared, err := channelapi.StageLegacyMetaWhatsAppAccountRename(
 			tx,
 			orgID,
@@ -628,16 +646,19 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 			return errWhatsAppAccountUpdateSuperseded
 		}
 		if !shadowPrepared {
-			return channelapi.FinalizeLegacyMetaWhatsAppAccountRename(
+			if err := channelapi.FinalizeLegacyMetaWhatsAppAccountRename(
 				tx,
 				orgID,
 				account.ID,
 				oldAccount.Name,
 				account.Name,
-			)
+			); err != nil {
+				return err
+			}
 		}
-		return nil
-	})
+		return auditWhatsAppAccountUpdate(tx, orgID, userID, &oldAccount, &auditedAccount, sensitiveChanges...)
+	}
+	updateErr := a.commitWhatsAppAccountUpdate(orgID, stageAndUpdate)
 	if errors.Is(updateErr, errWhatsAppAccountUpdateSuperseded) {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account changed; reload and try again", nil, "")
 	}
@@ -648,16 +669,12 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		a.Log.Error("Failed to update account", "error", updateErr)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 	}
-	if req.IsDefaultIncoming && !oldAccount.IsDefaultIncoming {
-		a.DB.Model(&models.WhatsAppAccount{}).
-			Where("organization_id = ? AND id <> ? AND is_default_incoming = ?", orgID, account.ID, true).
-			Update("is_default_incoming", false)
-	}
-	if req.IsDefaultOutgoing && !oldAccount.IsDefaultOutgoing {
-		a.DB.Model(&models.WhatsAppAccount{}).
-			Where("organization_id = ? AND id <> ? AND is_default_outgoing = ?", orgID, account.ID, true).
-			Update("is_default_outgoing", false)
-	}
+	clearErr := a.clearOtherWhatsAppAccountDefaults(
+		orgID,
+		account.ID,
+		req.IsDefaultIncoming,
+		req.IsDefaultOutgoing,
+	)
 
 	var subscriptionErr error
 	if accountContractChanged {
@@ -665,11 +682,14 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		subscriptionErr, statusErr = a.subscribeAndPersistWhatsAppStatus(
 			subscriptionCtx,
 			orgID,
+			userID,
 			account,
 			subscriptionAccount,
 			expectedSubscriptionAccessTokenCiphertext,
 			"active",
 			"subscription_failed",
+			false,
+			false,
 		)
 		if statusErr != nil {
 			if errors.Is(statusErr, errEmbeddedSignupClaimSuperseded) {
@@ -690,20 +710,142 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		Where("id = ? AND organization_id = ?", account.ID, orgID).
 		First(account)
 
-	var sensitiveChanges []map[string]any
-	if tokenChanged {
-		sensitiveChanges = append(sensitiveChanges, map[string]any{
-			"field": "access_token", "old_value": "********", "new_value": "********",
+	// The update and the subscription's status change are each audited in
+	// their own committed transaction, so a failed clear below cannot roll
+	// either back. An identical retry repairs the clear, unless the
+	// subscription failed too: the account is then in recovery, which refuses
+	// a credential change, and saving it without credentials repairs it.
+	response := accountToResponse(*account)
+	var warnings []string
+	if subscriptionErr != nil {
+		warnings = append(warnings, "Webhook subscription failed; use the account Subscribe action after checking Meta permissions")
+	}
+	if clearErr != nil {
+		if subscriptionErr == nil {
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, errWhatsAppDefaultAccountClearMessage, nil, "")
+		}
+		warnings = append(warnings, errWhatsAppDefaultAccountClearWarning)
+	}
+	response.Warning = strings.Join(warnings, ". ")
+	return r.SendEnvelope(response)
+}
+
+// commitWhatsAppAccountUpdate commits an account update, including its rename
+// stage and its audit row, in its own short tenant transaction. The stage runs
+// first, also when the name is unchanged, and owns the organization FOR SHARE
+// (taken behind the policy fence queue) and the account row, plus the
+// Omnichannel shadow on a rename, until that transaction ends; the audit row's
+// INSERT locks the organization only after the account row. Under RLS this
+// request is one transaction that may still call Meta (up to 30 s) or wait for
+// other rows, so those locks must not stay in it. Nothing earlier in the
+// request holds a lock this transaction needs. Without RLS the update was
+// already committed here.
+func (a *App) commitWhatsAppAccountUpdate(orgID uuid.UUID, update func(tx *gorm.DB) error) error {
+	return a.rootApp().WithCommittedTenantApp(orgID, func(scoped *App) error {
+		return update(scoped.DB)
+	})
+}
+
+// auditWhatsAppAccountUpdate reloads the updated account into updated and
+// records the change in the update's own transaction, so a later failure of
+// the request (a 409 or 500 after the Meta subscription) cannot leave a
+// committed change without its audit row. An audit failure rolls the update
+// back.
+func auditWhatsAppAccountUpdate(
+	tx *gorm.DB,
+	orgID, userID uuid.UUID,
+	old, updated *models.WhatsAppAccount,
+	extraChanges ...map[string]any,
+) error {
+	if err := tx.Where("id = ? AND organization_id = ?", old.ID, orgID).First(updated).Error; err != nil {
+		return fmt.Errorf("reload updated WhatsApp account: %w", err)
+	}
+	if err := audit.LogAudit(
+		tx, orgID, userID, audit.GetUserName(tx, userID),
+		"account", old.ID, models.AuditActionUpdated, old, updated, extraChanges...,
+	); err != nil {
+		return fmt.Errorf("audit WhatsApp account update: %w", err)
+	}
+	return nil
+}
+
+const (
+	errWhatsAppDefaultAccountClearMessage = "Account updated, but the previous default account could not be cleared"
+	errWhatsAppDefaultAccountClearWarning = "The previous default account could not be cleared; save this account again with the default option"
+)
+
+// whatsappDefaultAccountMoveKey serializes default-account moves per
+// organization.
+func whatsappDefaultAccountMoveKey(orgID uuid.UUID) string {
+	return "rereply:whatsapp_default_account_move:v1:" + orgID.String()
+}
+
+// clearOtherWhatsAppAccountDefaults clears the requested default flags on the
+// organization's other accounts, after accountID's flags committed (with
+// UpdateAccount's update, or with CreateAccount's subscription status). It
+// does not join that transaction: sends hold these other account rows FOR
+// SHARE across their Meta call, and waiting for them must not hold the
+// rename's fence locks. Each other account is cleared in its own short
+// committed transaction, so a clear that waits for sends on one account never
+// keeps another cleared account locked (an admission on that account would
+// hold the tenant's policy fence meanwhile). None of these UPDATEs locks the
+// organization: they never set organization_id, and each row is updated once
+// per transaction (a second update re-runs its foreign-key checks).
+//
+// Moves (UpdateAccount and CreateAccount) are serialized per organization by
+// an advisory key that every clear transaction takes first, and an account is
+// cleared only while accountID still holds the flag. Of two concurrent moves,
+// the later clear either clears the earlier account or finds its own flag
+// already cleared by the earlier move, so exactly one default survives. The
+// accounts to clear are read after accountID's flags committed, so a move that
+// commits later reads accountID in turn. That proof needs READ COMMITTED: the
+// UPDATE that runs after the move key wait must see a move that committed
+// meanwhile. The clear is idempotent, so callers run it whenever the request
+// sets the flag, and a retry repairs a failed one.
+func (a *App) clearOtherWhatsAppAccountDefaults(orgID, accountID uuid.UUID, incoming, outgoing bool) error {
+	if !incoming && !outgoing {
+		return nil
+	}
+	clears := func(column string, requested bool) (string, []any) {
+		if !requested {
+			return "false", nil
+		}
+		return column + " AND EXISTS (SELECT 1 FROM whatsapp_accounts AS mover" +
+				" WHERE mover.id = ? AND mover.organization_id = ? AND mover.deleted_at IS NULL AND mover." + column + ")",
+			[]any{accountID, orgID}
+	}
+	incomingClear, incomingArgs := clears("is_default_incoming", incoming)
+	outgoingClear, outgoingArgs := clears("is_default_outgoing", outgoing)
+	clear := func(scoped *App) *gorm.DB {
+		return scoped.DB.Model(&models.WhatsAppAccount{}).
+			Where("organization_id = ? AND id <> ?", orgID, accountID).
+			Where("("+incomingClear+") OR ("+outgoingClear+")", append(append([]any{}, incomingArgs...), outgoingArgs...)...)
+	}
+	var others []uuid.UUID
+	err := a.rootApp().withCommittedTenantReadCommittedApp(orgID, func(scoped *App) error {
+		return clear(scoped).Order("id").Pluck("id", &others).Error
+	})
+	for _, other := range others {
+		if err != nil {
+			break
+		}
+		err = a.rootApp().withCommittedTenantReadCommittedApp(orgID, func(scoped *App) error {
+			if err := scoped.DB.Exec(
+				"SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
+				whatsappDefaultAccountMoveKey(orgID),
+			).Error; err != nil {
+				return err
+			}
+			return clear(scoped).Where("id = ?", other).Updates(map[string]any{
+				"is_default_incoming": gorm.Expr("CASE WHEN "+incomingClear+" THEN false ELSE is_default_incoming END", incomingArgs...),
+				"is_default_outgoing": gorm.Expr("CASE WHEN "+outgoingClear+" THEN false ELSE is_default_outgoing END", outgoingArgs...),
+			}).Error
 		})
 	}
-	a.logAudit(orgID, userID,
-		"account", account.ID, models.AuditActionUpdated, &oldAccount, account, sensitiveChanges...)
-
-	response := accountToResponse(*account)
-	if subscriptionErr != nil {
-		response.Warning = "Webhook subscription failed; use the account Subscribe action after checking Meta permissions"
+	if err != nil {
+		a.Log.Error("Failed to clear the previous default WhatsApp account", "error", err, "account_id", accountID)
 	}
-	return r.SendEnvelope(response)
+	return err
 }
 
 // DeleteAccount deletes a WhatsApp account
@@ -959,14 +1101,22 @@ func (a *App) validateWhatsAppAccountContract(
 // subscribeAndPersistWhatsAppStatus subscribes a row that has already been
 // saved in a non-ready state, then records the true provider outcome. The
 // runtimeAccount contains request-scoped plaintext credentials; account is the
-// encrypted-at-rest model and is never used for the provider call.
+// encrypted-at-rest model and is never used for the provider call. The status
+// and its audit row commit in their own short tenant transaction, as the row
+// they finalize did: under RLS the request is one transaction, and a later
+// failure of the request must not roll the status back to pending_subscription
+// (an identical retry is then refused while recovery owns the account). The
+// same transaction sets the requested default flags (CreateAccount), so they
+// are audited with the status; the caller then clears them on the other
+// accounts.
 func (a *App) subscribeAndPersistWhatsAppStatus(
 	ctx context.Context,
-	orgID uuid.UUID,
+	orgID, userID uuid.UUID,
 	account *models.WhatsAppAccount,
 	runtimeAccount *whatsapp.Account,
 	expectedAccessTokenCiphertext string,
 	successStatus, failureStatus string,
+	defaultIncoming, defaultOutgoing bool,
 ) (subscriptionErr, persistenceErr error) {
 	if a.WhatsApp == nil || runtimeAccount == nil {
 		subscriptionErr = errors.New("WhatsApp webhook subscription is unavailable")
@@ -986,25 +1136,59 @@ func (a *App) subscribeAndPersistWhatsAppStatus(
 	// A manual Create/Update request may be waiting on Meta while the row is
 	// deleted and reclaimed by Embedded Signup. Finalize only the exact durable
 	// provider tuple and encrypted token that this Subscribe call observed.
-	result := a.DB.Model(&models.WhatsAppAccount{}).
-		Where(
-			"id = ? AND organization_id = ? AND status = ? AND access_token = ? AND phone_id = ? AND business_id = ? AND api_version = ?",
-			account.ID,
-			orgID,
-			"pending_subscription",
-			expectedAccessTokenCiphertext,
-			account.PhoneID,
-			account.BusinessID,
-			account.APIVersion,
-		).
-		Update("status", status)
-	if result.Error != nil {
-		return subscriptionErr, result.Error
-	}
-	if result.RowsAffected != 1 {
-		return subscriptionErr, errEmbeddedSignupClaimSuperseded
+	persistenceErr = a.rootApp().WithCommittedTenantApp(orgID, func(scoped *App) error {
+		// The audit INSERT below locks the organization (write guard), so take
+		// it before the account row, as a Coexistence admission does.
+		if err := channelapi.LockLegacyMetaOrganizationAndWhatsAppAccount(scoped.DB, orgID, account.ID); err != nil {
+			return err
+		}
+		var pending models.WhatsAppAccount
+		if err := scoped.DB.Where("id = ? AND organization_id = ?", account.ID, orgID).First(&pending).Error; err != nil {
+			return fmt.Errorf("load WhatsApp account for subscription status: %w", err)
+		}
+		finalize := map[string]any{"status": status}
+		if defaultIncoming {
+			finalize["is_default_incoming"] = true
+		}
+		if defaultOutgoing {
+			finalize["is_default_outgoing"] = true
+		}
+		result := scoped.DB.Model(&models.WhatsAppAccount{}).
+			Where(
+				"id = ? AND organization_id = ? AND status = ? AND access_token = ? AND phone_id = ? AND business_id = ? AND api_version = ?",
+				account.ID,
+				orgID,
+				"pending_subscription",
+				expectedAccessTokenCiphertext,
+				account.PhoneID,
+				account.BusinessID,
+				account.APIVersion,
+			).
+			Updates(finalize)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errEmbeddedSignupClaimSuperseded
+		}
+		var finalized models.WhatsAppAccount
+		if err := scoped.DB.Where("id = ? AND organization_id = ?", account.ID, orgID).First(&finalized).Error; err != nil {
+			return fmt.Errorf("reload subscribed WhatsApp account: %w", err)
+		}
+		if err := audit.LogAudit(
+			scoped.DB, orgID, userID, audit.GetUserName(scoped.DB, userID),
+			"account", account.ID, models.AuditActionUpdated, &pending, &finalized,
+		); err != nil {
+			return fmt.Errorf("audit WhatsApp subscription status: %w", err)
+		}
+		return nil
+	})
+	if persistenceErr != nil {
+		return subscriptionErr, persistenceErr
 	}
 	account.Status = status
+	account.IsDefaultIncoming = account.IsDefaultIncoming || defaultIncoming
+	account.IsDefaultOutgoing = account.IsDefaultOutgoing || defaultOutgoing
 	a.InvalidateWhatsAppAccountCache(account.PhoneID)
 	return subscriptionErr, nil
 }

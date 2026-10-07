@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -244,6 +245,23 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	// merge cannot strand either write on a soft-deleted alias.
 	err := a.outgoingPreProviderTransaction(ctx, organizationID, opts.Async, func(tx *gorm.DB) error {
 		if req.legacyWhatsAppReply != nil {
+			// The pending Message insert below locks the organization row (write
+			// guard and foreign keys) while this transaction owns the shadow, so
+			// own that row before the shadow, as the mirror does, and never queue
+			// for a shadow that another reply holds across Meta while holding the
+			// organization, except in the helper's bounded fallback after
+			// lockLegacyMetaShadowRounds lost rounds. This transaction never calls
+			// Meta. An incomplete policy is rejected below with its usual binding
+			// error.
+			if req.legacyWhatsAppReply.ChannelAccountID != uuid.Nil {
+				if lockErr := channelapi.LockLegacyMetaOrganizationAndShadow(
+					tx,
+					organizationID,
+					req.legacyWhatsAppReply.ChannelAccountID,
+				); lockErr != nil {
+					return lockErr
+				}
+			}
 			// The legacy bridge owns ChannelAccount before Conversation. Establish
 			// that prefix before resolving (and locking) Contact.
 			if lockErr := lockStrictLegacyReplyOrder(
@@ -690,6 +708,13 @@ func (a *App) deliverOutgoingMessage(
 		req.Account.OrganizationID,
 		func(tx *gorm.DB, providerAttempted *bool) error {
 			if req.legacyWhatsAppReply != nil {
+				// Unlike the pre-provider transaction, this one does not take the
+				// organization row: it would then be held across the Meta call and
+				// stall every policy fence in the tenant. Its only later access is
+				// the WAMID owner trigger's FOR SHARE NOWAIT, which cannot wait
+				// inside a lock cycle; if a fence holder makes it fail,
+				// recoverOutgoingDeliveryResult waits for the row and records the
+				// captured provider result instead.
 				if lockErr := lockStrictLegacyReplyOrder(
 					tx,
 					req.Account.OrganizationID,
@@ -1203,6 +1228,20 @@ func (a *App) recoverOutgoingDeliveryResult(
 		ctx,
 		pendingMessage.OrganizationID,
 		func(tx *gorm.DB) error {
+			// Assigning the WAMID makes the message owner trigger take the
+			// organization row FOR SHARE NOWAIT. The provider transaction fails
+			// there whenever a policy fence (for example a Coexistence admission
+			// waiting for the shadow that transaction held across Meta) owns the
+			// row. Wait for it here, before any other lock, so the captured result
+			// is recorded rather than lost to the same NOWAIT. Residual: the wait
+			// is bounded by outgoingDeliveryRecoveryTimeout (10 s), while a fence
+			// holder can itself wait up to the 30 s Meta timeout for a shadow that
+			// another reply holds across Meta. Recovery then times out and the
+			// Meta-accepted reply stays pending without its WAMID, as it did
+			// before this wait existed.
+			if err := channelapi.LockLegacyMetaOrganization(tx, pendingMessage.OrganizationID); err != nil {
+				return err
+			}
 			var message models.Message
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 				Where(
