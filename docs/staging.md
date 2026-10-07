@@ -197,8 +197,11 @@ application listeners remain 8080, 8081, 8082 and 8090. The template declares no
 additional `internal_ports`, because duplicating `http_port` there is rejected.
 Provider readback may omit the empty list, but any nonempty or malformed value
 is refused. See [DigitalOcean's internal routing documentation](https://docs.digitalocean.com/products/app-platform/how-to/manage-internal-routing/).
-The public ingress stays unchanged: only `/_stub/_control` routes to the stub's
-HMAC-protected control API, with the same `/_control` rewrite.
+Only the public `/_stub/_control` prefix routes to the stub's HMAC-protected
+control API. Its rewrite is `/_control/`, including the trailing slash, so the
+remaining endpoint name is separated from the control prefix. For example,
+`/_stub/_control/accounts` must reach `/_control/accounts`, the path signed by
+the control client. See [DigitalOcean's rewrite specification](https://github.com/digitalocean/godo/blob/main/apps.gen.go).
 
 There is no universal environment switch for every tenant AI/SSO feature. The
 fresh synthetic database has those features unconfigured; the kit does not claim
