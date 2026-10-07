@@ -116,7 +116,8 @@ identities; it never provisions a new fixture or discovers IDs by display name.
 exists. Read-only inventory validation requires the exact opaque team hash, the
 single staging app, the two expected Singapore database clusters in the expected
 VPC, PostgreSQL 17, and exactly one app-only firewall rule per cluster. A caller
-must exhaust API pagination before passing inventory to these guards. Detecting
+must exhaust app pagination and read the complete unpaginated database list
+before passing inventory to these guards. Detecting
 a visible production app requires reads; the enforceable invariant is **zero
 writes**, correcting the original plan's literal zero-request assertion.
 
@@ -150,8 +151,13 @@ candidate is still active before rollback.
 
 `stage.py` now has a stage-only inventory client that reuses the unchanged
 production client's bounded requests and one-PUT accounting. Inventory paths
-are explicitly allowlisted; pagination uses constructed URLs, bounded page and
-result counts, stable totals and an exact next-link check. Redirects, unexpected
+are explicitly allowlisted; app pagination uses constructed URLs, bounded page
+and result counts, stable totals and an exact next-link check. Database inventory
+uses a single `GET /v2/databases` and the documented `databases`-only envelope;
+pagination metadata on that endpoint is refused instead of accepting a partial
+inventory. This matches DigitalOcean's [list-cluster operation](https://github.com/digitalocean/openapi/blob/main/specification/resources/databases/databases_list_clusters.yml)
+and [response schema](https://github.com/digitalocean/openapi/blob/main/specification/resources/databases/responses/database_clusters.yml).
+Redirects, unexpected
 URLs and malformed or incomplete inventories fail closed. No firewall mutation
 method is added.
 
