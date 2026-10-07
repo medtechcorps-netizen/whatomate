@@ -42,11 +42,12 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       CANARY_PROFILE: local
-      CANARY_PRIVATE_FILE: ${{ runner.temp }}/canary/private.json
-      CANARY_REPORT_FILE: ${{ runner.temp }}/canary/report.json
       CANARY_STRESS: ${{ inputs.stress && '1' || '0' }}
       CI: true
     steps:
+      - name: Set private local output paths
+        run: |
+          printf 'CANARY_PRIVATE_FILE=%s/canary/private.json\nCANARY_REPORT_FILE=%s/canary/report.json\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
