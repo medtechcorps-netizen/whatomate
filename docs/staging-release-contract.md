@@ -136,7 +136,9 @@ The image transform changes only the four product digest leaves and preserves
 the graph stub, every environment value and every other spec field. The separate
 `bad-image` helper changes the full web/job selectors to the pinned bootstrap
 image. All three failure-drill names are recognized only for `mode=stage`.
-These are transform/validation helpers; no failure drill is runnable yet.
+These are transform/validation helpers. The lifecycle exercises health and
+bad-image drills, while the frontend wrapper intentionally fails the first
+staging check for `e2e-fail`. No live drill has been dispatched from this draft.
 
 The canonical receipt contract includes the previous product image triplet,
 candidate triplet, their independently verified source commits, before/after full spec fingerprints, before/candidate
@@ -192,6 +194,36 @@ masked before use, and only public receipt data is emitted. Required adapters
 are imported lazily; an absent adapter fails closed. Real target fingerprints,
 the adapter implementation and workflow boundary are still merge prerequisites.
 
+## Bound canary report and e2e drill
+
+The canary configuration accepts only `none` or `e2e-fail`; the latter requires
+the staging profile and the normal thirteen-check run. It rejects incompatible
+drills before loading a profile or launching a browser. The serial test wrapper
+fails the first check with a fixed message for the drill; the original thirteen
+scenario assertions and helpers remain unchanged.
+
+After a successful canary step, the workflow runs:
+
+```text
+python3 -I -S -B release/deployment/stage_report.py --private-file "$CANARY_PRIVATE_FILE" --report "$CANARY_REPORT_FILE"
+```
+
+The report step receives public `STAGE_RECEIPT_B64`, `STAGE_RECEIPT_SHA256`,
+`STAGE_CANDIDATE_SHA256`, `GITHUB_RUN_ID` and `CANARY_DRILL` values, with no
+`STAGING_*` credentials. It validates the exact private reporter format, thirteen
+unique named passes, one attempt, no retries, no skipped checks and no extra data.
+It binds the imported fixture to the canonical receipt, run, candidate, app and
+origin, then emits only `{receipt_sha256,run_id,candidate_sha256,origin_sha256,
+checks,passed:13}` in the original ordered check inventory. GitHub step outputs
+are `report_b64`, `report_sha256`, and `passed=true`. Any deliberate drill is
+ineligible even if every assertion unexpectedly passed.
+
+The raw PR7 report has no run identity. The workflow must create fresh private
+state/report paths, refuse an existing report before test execution, and verify
+only after the successful exact canary step using that same imported fixture and
+receipt. The report module alone does not prove test freshness. Its output is
+public; its two input files remain owner-only and are never uploaded.
+
 ## Work remaining for full PR9
 
 1. Implement and independently review real `stage.py` plan/attestation adapters,
@@ -212,10 +244,10 @@ the adapter implementation and workflow boundary are still merge prerequisites.
    first masking before checkout/npm, step-scoped secrets, pinned Playwright,
    `npm ci --ignore-scripts`, and no uploaded private artifacts. Keep stage plan
    gates equivalent to promote. Update semantic workflow checks together.
-5. Add the canonical run/receipt/candidate/origin-bound thirteen-check report,
-   first-check `e2e-fail`, nonexistent-path `health-fail`, bootstrap `bad-image`
-   execution and rollback proofs. Any non-`none` drill must never yield a passing
-   promotion report. The current PR7 verifier is not that bound report.
+5. Wire the implemented report and drill helpers through the workflow freshness
+   boundary above, then test the combined stage/rollback chain. The original PR7
+   verifier remains an unbound local verifier; promotion evidence must use
+   `stage_report.py`. Prove all three drills and rollback on isolated staging.
 6. After review/merge authorization and completed owner setup, verify production
    dry-run and current-latest rollback's no-PUT path, then staging health 6/6,
    canary 13/13 and all three rollback drills. Record exact runs for PR10.
