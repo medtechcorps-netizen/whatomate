@@ -546,7 +546,11 @@ class Setup:
                 if group == "jobs":
                     require(live.get("kind") == "PRE_DEPLOY" and live.get("run_command") == item["run_command"], "staging-job-drift")
                 else:
-                    require(live.get("http_port") == item["http_port"] and live.get("internal_ports", []) == item["internal_ports"] and live.get("protocol", "HTTP") == "HTTP" and
+                    # Main HTTP listeners use the default service-name LAN route.
+                    # Only absent/empty additional ports are equivalent on GET.
+                    internal_ports = live.get("internal_ports", [])
+                    require(type(internal_ports) is list and internal_ports == item["internal_ports"] == [], "staging-service-drift")
+                    require(live.get("http_port") == item["http_port"] and live.get("protocol", "HTTP") == "HTTP" and
                             (live.get("health_check") or {}).get("http_path") == item["health_check"]["http_path"] and not live.get("run_command"), "staging-service-drift")
 
     def app(self, redeploy=False):
