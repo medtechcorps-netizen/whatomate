@@ -224,8 +224,10 @@ def projection(spec, *, private_values=False):
             image = component.get("image")
             require(type(image) is dict, code)
             if "deploy_on_push" in image:
-                deploy_on_push = common.exact_keys(image.pop("deploy_on_push"), {"enabled"}, code)
-                require(deploy_on_push["enabled"] is False, code)
+                deploy_on_push = image.pop("deploy_on_push")
+                # godo omits false, leaving an exact empty disabled object.
+                require(type(deploy_on_push) is dict and set(deploy_on_push) <= {"enabled"} and
+                        deploy_on_push.get("enabled", False) is False, code)
             common.exact_keys(image, {"registry_type", "registry", "repository", "digest"}, code)
             require(image["registry_type"] == "GHCR" and image["registry"] == "ghcr.io", code)
             common.require_digest(image["digest"], code)
@@ -240,6 +242,9 @@ def projection(spec, *, private_values=False):
                 require(type(env) is dict, code)
                 env.setdefault("scope", "RUN_TIME")
                 env.setdefault("type", "GENERAL")
+                # Only absent GENERAL strings have the provider's empty default.
+                # SECRET presence/nonempty checks and explicit null are unchanged.
+                if env["type"] == "GENERAL": env.setdefault("value", "")
                 common.exact_keys(env, {"key", "value", "scope", "type"}, code)
                 key = common.exact_string(env["key"], code)
                 require(key not in seen and env["scope"] == "RUN_TIME" and env["type"] in {"GENERAL", "SECRET"}, code)

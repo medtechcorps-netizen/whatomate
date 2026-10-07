@@ -175,6 +175,51 @@ class ContractTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(common.ReleaseError):
                 stage.validate_spec(value, self.target, self.template, IMAGES)
 
+    def test_doctl_empty_general_and_disabled_image_defaults_preserve_fingerprint(self):
+        value = copy.deepcopy(self.spec)
+        for component in value["services"] + value["jobs"]:
+            component["image"]["deploy_on_push"] = {}
+            for env in component["envs"]:
+                if env["type"] == "GENERAL" and env["value"] == "":
+                    del env["value"]
+                    if component["name"] == "rereply-rls-migrate": del env["type"]
+        stage.validate_spec(value, self.target, self.template, IMAGES)
+        self.assertEqual(stage.spec_fingerprint(value), stage.spec_fingerprint(self.spec))
+        self.assertEqual(stage.projection(value, private_values=True), stage.projection(self.spec, private_values=True))
+
+    def test_empty_general_equivalence_keeps_null_types_and_secret_checks(self):
+        for group in ("services", "jobs"):
+            for omit_type in (False, True):
+                for replacement in (None, False, 0, [], {}, "different"):
+                    value = copy.deepcopy(self.spec)
+                    env = next(item for item in value[group][0]["envs"] if item["type"] == "GENERAL" and item["value"] == "")
+                    env["value"] = replacement
+                    if omit_type: del env["type"]
+                    with self.subTest(group=group, omit_type=omit_type, value=replacement), self.assertRaises(common.ReleaseError):
+                        stage.validate_spec(value, self.target, self.template, IMAGES)
+                value = copy.deepcopy(self.spec)
+                env = next(item for item in value[group][0]["envs"] if item["type"] == "GENERAL" and item["value"])
+                del env["value"]
+                if omit_type: del env["type"]
+                with self.subTest(group=group, missing_nonempty=True, omit_type=omit_type), self.assertRaises(common.ReleaseError):
+                    stage.validate_spec(value, self.target, self.template, IMAGES)
+            for missing in (False, True):
+                value = copy.deepcopy(self.spec)
+                env = next(item for item in value[group][0]["envs"] if item["type"] == "SECRET")
+                if missing: del env["value"]
+                else: env["value"] = None
+                with self.subTest(group=group, secret_missing=missing), self.assertRaises(common.ReleaseError):
+                    stage.validate_spec(value, self.target, self.template, IMAGES)
+
+    def test_disabled_image_equivalence_rejects_other_shapes(self):
+        for group in ("services", "jobs"):
+            for replacement in (None, False, 0, [], "", {"enabled": True}, {"enabled": None},
+                                {"enabled": 0}, {"other": False}, {"enabled": False, "other": False}):
+                value = copy.deepcopy(self.spec)
+                value[group][0]["image"]["deploy_on_push"] = replacement
+                with self.subTest(group=group, value=replacement), self.assertRaises(common.ReleaseError):
+                    stage.validate_spec(value, self.target, self.template, IMAGES)
+
     def test_image_transform_preserves_secrets_and_only_four_digest_leaves(self):
         original = copy.deepcopy(self.spec)
         changed = stage.set_images(original, NEW)
