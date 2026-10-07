@@ -589,8 +589,14 @@ def main(argv=None):
             setup.db(args.operator_ip)
         else:
             setup.app(args.command == "redeploy")
+        app_fingerprint = None
+        if args.command in {"app", "redeploy"}:
+            require(canonical_uuid(setup.state.get("app_id")), "completed-app-identity")
+            app_fingerprint = digest(setup.state["app_id"])
         print("staging-setup: complete")
         print("team_sha256=" + setup.target["team_sha256"])
+        if app_fingerprint:
+            print("app_id_sha256=" + app_fingerprint)
         if setup.state.get("origin_sha256"):
             print("origin_sha256=" + setup.state["origin_sha256"])
         return 0

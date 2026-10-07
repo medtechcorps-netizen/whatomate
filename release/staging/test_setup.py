@@ -256,6 +256,45 @@ class SetupTests(unittest.TestCase):
                 runner.run(["doctl", "anything"])
         self.assertNotIn(SECRET, str(caught.exception))
 
+    def test_successful_app_and_redeploy_print_hashes_without_private_identifiers(self):
+        target = self.base / "target.json"
+        images = self.base / "images.json"
+        target.write_text(json.dumps(self.target))
+        images.write_text(json.dumps(self.images))
+        completed = mock.Mock(target=self.target, state={
+            "app_id": APP, "deployment_id": DEPLOY, "secret": SECRET,
+            "origin_sha256": setup.digest("https://synthetic.ondigitalocean.app"),
+        })
+        for command in ("app", "redeploy"):
+            with self.subTest(command=command):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(Path, "home", return_value=self.base), mock.patch.object(setup, "Setup", return_value=completed), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = setup.main([command, "--target", str(target), "--images", str(images),
+                                         "--private-file", str(self.kit.state_path), "--doctl-config", str(self.config)])
+                self.assertEqual(result, 0)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(stdout.getvalue().splitlines(), [
+                    "staging-setup: complete", "team_sha256=" + self.target["team_sha256"],
+                    "app_id_sha256=" + setup.digest(APP), "origin_sha256=" + completed.state["origin_sha256"],
+                ])
+                for private in (APP, DEPLOY, PG, VK, VPC, SECRET):
+                    self.assertNotIn(private, stdout.getvalue() + stderr.getvalue())
+
+    def test_invalid_completed_app_identity_is_refused_before_success_output(self):
+        target = self.base / "target.json"
+        images = self.base / "images.json"
+        target.write_text(json.dumps(self.target))
+        images.write_text(json.dumps(self.images))
+        completed = mock.Mock(target=self.target, state={"app_id": SECRET})
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(Path, "home", return_value=self.base), mock.patch.object(setup, "Setup", return_value=completed), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = setup.main(["app", "--target", str(target), "--images", str(images),
+                                 "--private-file", str(self.kit.state_path), "--doctl-config", str(self.config)])
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("completed-app-identity", stderr.getvalue())
+        self.assertNotIn(SECRET, stderr.getvalue())
+
     def test_predeploy_success_must_name_the_migration_job(self):
         self.bootstrap()
         original = self.runner.do

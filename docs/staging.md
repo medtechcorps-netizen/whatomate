@@ -117,7 +117,11 @@ expected images, components, ingress, database bindings and commands. Only then
 does it replace each cluster's rules with exactly
 the app and verify the readback. Your PC loses database access at that point.
 
-The public output contains only completion codes and identity hashes. The origin,
+The public output contains only completion codes and identity hashes. Successful
+`app` and `redeploy` print `team_sha256`, `app_id_sha256` and `origin_sha256`.
+PR9's reviewed `ship-target-staging.json` uses the first two fingerprints, mapping
+`team_sha256` to its `team_uuid_sha256` field; raw resource IDs stay private.
+The origin,
 generated synthetic administrator and canary/stub credentials are in the private
 file. Provision the canaries using Part A PR7's REST-only command:
 
