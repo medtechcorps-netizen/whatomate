@@ -246,10 +246,16 @@ receipt/report bindings.
 
 Use a separate deployment PAT in the **ReReply Staging** team with an explicit
 expiry and exactly these scopes: `account:read`, `app:read`, `app:update`,
-`database:read`, `actions:read`, `regions:read`, and `sizes:read`. The final three
-are DigitalOcean's required read dependencies for
+`database:read`, `project:read`, `vpc:read`, `actions:read`, `regions:read`, and
+`sizes:read`. The final three are DigitalOcean's required read dependencies for
 [app updates](https://docs.digitalocean.com/reference/api/scopes/app/update/)
 and [database reads](https://docs.digitalocean.com/reference/api/scopes/database/read/).
+Keep `vpc:read` even though this lane does not call the VPC endpoint: Claude's
+2026-09-30 provider comparison proved that a token without it receives an app
+spec with `vpc` omitted. The existing VPC therefore still needs read permission;
+the lane must refuse an incomplete spec. `project:read` preserves the accepted
+staging plan and is an associated permission for app updates; the earlier
+multi-scope recovery did not isolate whether it was independently necessary.
 The lane reads existing database/firewall metadata and updates the pinned app;
 it does not create resources or change firewalls. After setup and the reviewed
 deployment-token handoff are complete, revoke only the short-lived staging setup
