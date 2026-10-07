@@ -1,0 +1,117 @@
+name: Staging images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - release/staging/bootstrap/**
+      - release/staging/graphstub/**
+      - docker/staging/**
+      - .github/workflows/staging-images.yml
+      - go.mod
+      - go.sum
+
+permissions: {}
+
+concurrency:
+  group: staging-images-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Staging image (${{ matrix.component }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - graph-stub
+          - bootstrap
+    steps:
+      - name: Require main and a fresh run
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+
+      - name: Check out the dispatched source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Buildx and BuildKit
+        run: |
+          set -euo pipefail
+          plugin_dir="$HOME/.docker/cli-plugins"
+          mkdir -p "$plugin_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            https://github.com/docker/buildx/releases/download/v0.36.1/buildx-v0.36.1.linux-amd64 -o "$plugin_dir/docker-buildx"
+          printf '%s  %s\n' 48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778 "$plugin_dir/docker-buildx" | sha256sum --check --strict
+          chmod 0755 "$plugin_dir/docker-buildx"
+          docker buildx create --name staging-images --driver docker-container \
+            --driver-opt image=docker.io/moby/buildkit:buildx-stable-1@sha256:040d34121c27906c4ff9ac152a30d52bf2c5d328d3bb748916bb3d2743c02528 --use
+          docker buildx inspect --bootstrap staging-images
+
+      - name: Name the staging-only image
+        id: identity
+        env:
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          [[ "$COMPONENT" == "graph-stub" || "$COMPONENT" == "bootstrap" ]]
+          image="ghcr.io/medtechcorps-netizen/rereply-staging-$COMPONENT"
+          printf 'image=%s\n' "$image" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s:stage-%s-r%s\n' "$image" "$GITHUB_SHA" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Build without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          file: docker/staging/${{ matrix.component }}.Dockerfile
+          platforms: linux/amd64
+          builder: staging-images
+          load: true
+          pull: true
+          push: false
+          github-token: ""
+          provenance: false
+          sbom: false
+          tags: ${{ steps.identity.outputs.ref }}
+
+      - name: Publish and read the registry digest
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.identity.outputs.image }}
+          IMAGE_REF: ${{ steps.identity.outputs.ref }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE_REF" 2>&1 | tee "$RUNNER_TEMP/staging-push.txt"
+          mapfile -t digests < <(sed -nE 's/^.*digest:[[:space:]]*(sha256:[0-9a-f]{64})([[:space:]].*)?$/\1/p' "$RUNNER_TEMP/staging-push.txt")
+          [[ "${#digests[@]}" -eq 1 ]]
+          digest="${digests[0]}"
+          docker buildx imagetools inspect "$IMAGE@$digest" --raw > "$RUNNER_TEMP/staging-manifest.json"
+          [[ "sha256:$(sha256sum "$RUNNER_TEMP/staging-manifest.json" | awk '{print $1}')" == "$digest" ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Image: %s@%s\nSource: %s\n' "$IMAGE" "$digest" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest the immutable staging image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: ${{ steps.identity.outputs.image }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: false
