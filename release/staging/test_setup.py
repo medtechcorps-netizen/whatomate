@@ -361,6 +361,52 @@ class SetupTests(unittest.TestCase):
                 mutate(actual)
                 with self.assertRaises(setup.Refused): self.kit.verify_spec(actual, expected)
 
+    def test_doctl_omitted_empty_general_values_complete_app_verification(self):
+        self.bootstrap()
+        original = self.runner.do
+        omitted = []
+        def readback(config, *args, **kwargs):
+            result = original(config, *args, **kwargs)
+            if args[:2] in (("apps", "get"), ("apps", "get-deployment")):
+                result = copy.deepcopy(result)
+                for component in result[0]["spec"]["services"] + result[0]["spec"]["jobs"]:
+                    # godo serializes an explicit false as an empty object too.
+                    component["image"]["deploy_on_push"] = {}
+                    for env in component["envs"]:
+                        if env["type"] == "GENERAL" and env["value"] == "":
+                            del env["value"]
+                            omitted.append((component["name"], env["key"]))
+                            if component["name"] == "rereply-rls-migrate": del env["type"]
+                        elif env["type"] == "SECRET":
+                            env["value"] = "EV[1:synthetic-ciphertext]"
+            return result
+        self.runner.do = readback
+        self.kit.app()
+        self.assertTrue(any(name == "omnitech-web" for name, _ in omitted))
+        self.assertTrue(any(name == "rereply-rls-migrate" for name, _ in omitted))
+        self.assertTrue(self.kit.state.get("origin_sha256"))
+        for rules in self.runner.rules.values():
+            self.assertEqual(rules, [{"type": "app", "value": APP}])
+
+    def test_empty_general_equivalence_rejects_null_wrong_type_and_missing_nonempty(self):
+        self.bootstrap()
+        expected = self.kit.build_spec()
+        for group in ("services", "jobs"):
+            for omit_type in (False, True):
+                for value in (None, False, 0, [], {}, "different"):
+                    actual = copy.deepcopy(expected)
+                    env = next(item for item in actual[group][0]["envs"] if item["type"] == "GENERAL" and item["value"] == "")
+                    env["value"] = value
+                    if omit_type: del env["type"]
+                    with self.subTest(group=group, omit_type=omit_type, value=value), self.assertRaisesRegex(setup.Refused, "non-secret-env-drift"):
+                        self.kit.verify_spec(actual, expected)
+                actual = copy.deepcopy(expected)
+                env = next(item for item in actual[group][0]["envs"] if item["type"] == "GENERAL" and item["value"])
+                del env["value"]
+                if omit_type: del env["type"]
+                with self.subTest(group=group, missing_nonempty=True, omit_type=omit_type), self.assertRaisesRegex(setup.Refused, "non-secret-env-drift"):
+                    self.kit.verify_spec(actual, expected)
+
     def test_active_deployment_drift_retains_operator_access(self):
         self.bootstrap()
         original = self.runner.do
