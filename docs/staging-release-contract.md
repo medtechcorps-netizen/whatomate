@@ -1,15 +1,19 @@
-# Staging release contracts — PR9 draft subset
+# Staging release contracts and lifecycle — PR9 draft
 
 This is an offline prerequisite for Part A PR9. It does **not** add `stage` to
 `ship.py`, change `ship.yml`, dispatch a workflow, or grant provider write access.
 Production release files, including `spec_images.py` and `ship_common.py`, are
-unchanged. The pure guards are not an attestation verifier or a deployment proof.
+unchanged. The lifecycle protocol is implemented with synthetic tests, but real
+plan/attestation adapters and workflow integration are still required. The
+guards and callback interfaces are not an attestation verifier or deployment proof.
 
 The dependency stack for this draft is PR237 at `31e7ea1` (staging setup kit)
 plus PR238 at `0ceb26b` (repository canaries), based on main `0c2a57a`. The isolated
 stack tip before PR9 changes is `5f62c5799410a2e86513a3e9762f443abfee0b47`.
 Rebase the additive changes onto main after both dependencies merge; do not
 merge a synthetic dependency stack to bypass their required checks.
+The doctl compatibility fix `2a150c9` is also included as dependency commit
+`a55902f`; it is separate from PR9's contract checkpoint `954ed38`.
 
 ## Owner setup prerequisite
 
@@ -135,7 +139,7 @@ image. All three failure-drill names are recognized only for `mode=stage`.
 These are transform/validation helpers; no failure drill is runnable yet.
 
 The canonical receipt contract includes the previous product image triplet,
-candidate triplet, before/after full spec fingerprints, before/candidate
+candidate triplet, their independently verified source commits, before/after full spec fingerprints, before/candidate
 deployment fingerprints, run, candidate, ingress and app hashes plus drill.
 Private environment values participate in the spec fingerprint but never appear
 in the receipt. Previous staging images may differ from the latest production
@@ -143,16 +147,61 @@ record; rollback must use the prior observed staging state. Receipt hashes bind
 cross-job data; the future executor must verify their provenance and ensure the
 exact candidate is still active before rollback.
 
+## Implemented lifecycle protocol
+
+`stage.py` now has a stage-only inventory client that reuses the unchanged
+production client's bounded requests and one-PUT accounting. Inventory paths
+are explicitly allowlisted; pagination uses constructed URLs, bounded page and
+result counts, stable totals and an exact next-link check. Redirects, unexpected
+URLs and malformed or incomplete inventories fail closed. No firewall mutation
+method is added.
+
+`StageLane` requires three explicit adapters: a plan verifier, a product image
+attestation verifier returning the verified source commit, and a staging support
+image verifier. None has a default or permissive implementation. The product
+verifier must independently resolve/verify the observed prior image set, since
+the previous staging candidate may never have been promoted to production.
+This is still an integration dependency, not permission to substitute a callback
+that returns an input unchanged.
+
+The protocol reads inventory and two stable app/deployment snapshots, rechecks
+inventory and CAS through a fresh one-PUT client, reconciles the exact candidate,
+requires its migration digest, checks all six health endpoints, and confirms
+stability after health. An ambiguous PUT is reconciled with GETs only. A pending
+or unknown deployment cannot cause a blind rollback. A terminal deployment may
+leave the prior deployment ACTIVE while the app spec holds the failed candidate;
+the rollback guard accounts for that provider behavior.
+
+Rollback verifies two ownership observations and CAS, re-verifies the previous
+image provenance, and uses another fresh client with its own one-PUT budget. It
+requires a newly observed rollback deployment and health proof. Cross-job
+rollback additionally checks receipt hash, run, candidate, app, origin, exact
+candidate deployment/spec, prior spec reconstruction and both source/image
+bindings. Deploy and rollback scrub retained client credentials on every exit.
+
+Synthetic tests cover normal deployment, stale CAS, inventory drift, candidate
+and prior attestation failures, ambiguous acceptance, definitive rejection,
+pending timeout, migration failure, private spec preservation, health failure,
+bad-image and health drills, changed rollback ownership, failed rollback and
+receipt-bound e2e rollback. No live deployment has been performed by this draft.
+The `stage.py deploy` and `stage.py rollback` entrypoints pop protected provider
+inputs before constructing a Context or starting a subprocess. They refuse
+production modes, mixed canary secrets, an unconfigured target and a foreign
+workflow/run context before any provider request. Private target identities are
+masked before use, and only public receipt data is emitted. Required adapters
+are imported lazily; an absent adapter fails closed. Real target fingerprints,
+the adapter implementation and workflow boundary are still merge prerequisites.
+
 ## Work remaining for full PR9
 
-1. Implement additive `stage.py` with a bounded, non-redirecting provider client,
-   staging token/target masking before output, full pagination, independent
-   attestation verification, and two stable observations of both app and active
-   deployment. Validate PRE_DEPLOY source digest and runtime topology separately.
-2. Add CAS immediately before the sole PUT, exact deployment reconciliation,
-   six health checks, in-job rollback, and cross-job receipt-bound rollback.
-   Ambiguous PUT outcomes must be reconciled with reads; never retry blindly.
-   Test competing deployment, pinned deployment, provider error and timeout paths.
+1. Implement and independently review real `stage.py` plan/attestation adapters,
+   and review their integration with the bounded, masked command entrypoints.
+   Confirm actual provider shapes against read-only
+   staging observations and extend only narrow, reviewed normalization rules.
+2. Independently review the implemented CAS/reconcile/health/rollback protocol
+   and its adversarial tests. Complete provider-error and competing-deployment
+   coverage as new adapter/API shapes become known; then prove the protocol on
+   the owner-approved isolated staging resources.
 3. Add explicit `PRODUCTION_MODES`/`PUT_MODES` and stage/drill input validation in
    `ship.py`; production rejects stage and every drill before I/O. Add only the
    planned staging names to production's forbidden ambient list. Keep existing

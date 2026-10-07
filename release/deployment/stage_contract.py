@@ -29,7 +29,7 @@ BINDINGS = common.SPEC_BINDINGS
 DRILLS = frozenset({"none", "e2e-fail", "health-fail", "bad-image"})
 PIN_KEYS = {"schema_version", "profile", "team_uuid_sha256", "app_id_sha256"}
 TARGET_KEYS = {"schema_version", "profile", "app_id", "origin", "postgres_id", "valkey_id", "vpc_id", "postgres_name", "graph_stub", "bootstrap", "template_sha256", "template_values"}
-RECEIPT_KEYS = {"schema_version", "profile", "run_id", "candidate_sha256", "ingress_sha256", "app_id_sha256", "drill", "previous_images", "candidate_images", "before_spec_sha256", "after_spec_sha256", "before_deployment_sha256", "candidate_deployment_sha256"}
+RECEIPT_KEYS = {"schema_version", "profile", "run_id", "candidate_sha256", "ingress_sha256", "app_id_sha256", "drill", "previous_images", "candidate_images", "before_spec_sha256", "after_spec_sha256", "before_deployment_sha256", "candidate_deployment_sha256", "previous_source_sha", "candidate_source_sha"}
 
 
 def require(condition, code):
@@ -331,7 +331,9 @@ def validate_receipt(value):
     common.require_run_id(value["run_id"], code)
     require(type(value["run_id"]) is str, code)
     validate_drill("stage", value["drill"])
-    for key in RECEIPT_KEYS - {"schema_version", "profile", "run_id", "drill", "previous_images", "candidate_images"}:
+    for key in ("previous_source_sha", "candidate_source_sha"):
+        common.require_sha1(value[key], code)
+    for key in RECEIPT_KEYS - {"schema_version", "profile", "run_id", "drill", "previous_images", "candidate_images", "previous_source_sha", "candidate_source_sha"}:
         common.require_sha256(value[key], code)
     for key in ("previous_images", "candidate_images"):
         spec_images.require_image_set(value[key], code)

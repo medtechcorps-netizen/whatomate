@@ -37,7 +37,8 @@ def receipt(**changes):
     value = {"schema_version": 1, "profile": "staging", "run_id": "1234567", "candidate_sha256": "7" * 64,
         "ingress_sha256": common.sha256_text(ORIGIN), "app_id_sha256": common.sha256_text(APP), "drill": "none",
         "previous_images": IMAGES.copy(), "candidate_images": NEW.copy(), "before_spec_sha256": "8" * 64,
-        "after_spec_sha256": "9" * 64, "before_deployment_sha256": "a" * 64, "candidate_deployment_sha256": "b" * 64}
+        "after_spec_sha256": "9" * 64, "before_deployment_sha256": "a" * 64, "candidate_deployment_sha256": "b" * 64,
+        "previous_source_sha": "a" * 40, "candidate_source_sha": "b" * 40}
     value.update(changes)
     return value
 
