@@ -5,6 +5,9 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/database"
+
 	"github.com/shridarpatil/whatomate/internal/contactutil"
 	"gorm.io/gorm"
 )
@@ -79,4 +82,17 @@ func postgresErrorCode(err error) string {
 		return sqlState.SQLState()
 	}
 	return ""
+}
+
+// contactSelectorWriteTransaction queues identity/lifecycle changes before
+// taking contact rows. Call it at the outermost write boundary, before any
+// account/contact locks; never acquire this fence inside an already locked
+// canonical-contact callback. See internal/channel/legacy_meta_fence.go.
+func contactSelectorWriteTransaction(db *gorm.DB, organizationID uuid.UUID, write func(*gorm.DB) error) error {
+	return canonicalContactWriteTransaction(db, func(tx *gorm.DB) error {
+		if err := database.LockOrganizationPolicyScope(tx, organizationID); err != nil {
+			return err
+		}
+		return write(tx)
+	})
 }

@@ -78,9 +78,9 @@ func TestLockLegacyMetaOrganizationThenShadowRetriesOnlyNowaitConflicts(t *testi
 
 	var calls []bool
 	err := db.Transaction(func(tx *gorm.DB) error {
-		return lockLegacyMetaOrganizationThenShadow(tx, organization.ID, func(_ *gorm.DB, nowait bool) error {
-			calls = append(calls, nowait)
-			if nowait {
+		return lockLegacyMetaOrganizationThenShadow(tx, organization.ID, func(_ *gorm.DB, wait legacyMetaRowWait) error {
+			calls = append(calls, wait == legacyMetaRowsNowait)
+			if wait == legacyMetaRowsNowait {
 				return busy
 			}
 			return nil
@@ -91,8 +91,8 @@ func TestLockLegacyMetaOrganizationThenShadowRetriesOnlyNowaitConflicts(t *testi
 
 	calls = nil
 	err = db.Transaction(func(tx *gorm.DB) error {
-		return lockLegacyMetaOrganizationThenShadow(tx, organization.ID, func(_ *gorm.DB, nowait bool) error {
-			calls = append(calls, nowait)
+		return lockLegacyMetaOrganizationThenShadow(tx, organization.ID, func(_ *gorm.DB, wait legacyMetaRowWait) error {
+			calls = append(calls, wait == legacyMetaRowsNowait)
 			return busy
 		})
 	})
@@ -134,8 +134,8 @@ func runLegacyMetaLostRounds(t *testing.T, db *gorm.DB, organizationID uuid.UUID
 		if err := tx.Session(&gorm.Session{NewDB: true}).Raw("SELECT pg_backend_pid()").Scan(&mainPID).Error; err != nil {
 			return err
 		}
-		return lockLegacyMetaOrganizationThenShadow(tx, organizationID, func(_ *gorm.DB, nowait bool) error {
-			if nowait {
+		return lockLegacyMetaOrganizationThenShadow(tx, organizationID, func(_ *gorm.DB, wait legacyMetaRowWait) error {
+			if wait == legacyMetaRowsNowait {
 				observed.nowaitCalls++
 				return busy
 			}
@@ -253,9 +253,7 @@ func TestLockLegacyMetaOrganizationThenShadowFallsBackToPlainOrder(t *testing.T)
 // FOR SHARE while it waits for the shadow. A step-2 loss after the deadline
 // comes only from the organization row, never from the queued fence.
 func TestLockLegacyMetaOrganizationThenShadowFallsBackPastAnExpiredQueue(t *testing.T) {
-	previous := legacyMetaPolicyFenceQueueWait
-	legacyMetaPolicyFenceQueueWait = 20 * time.Millisecond
-	defer func() { legacyMetaPolicyFenceQueueWait = previous }()
+	defer SetLegacyMetaPolicyFenceQueueWaitForTest(20 * time.Millisecond)()
 	db := testutil.SetupTestDB(t)
 	organization := testutil.CreateTestOrganization(t, db)
 	fence := db.Begin()

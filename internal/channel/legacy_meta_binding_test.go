@@ -42,7 +42,7 @@ func TestEnsureLegacyMetaWhatsAppAccountRejectsCorruptBindingWithoutRefresh(t *t
 			db := testutil.SetupTestDB(t)
 			organization := createLegacyMetaTestOrganization(t, db, "binding-"+name)
 			account := createLegacyMetaTestAccount(t, db, organization.ID, "Expected-"+uuid.NewString())
-			shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+			shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 			require.NoError(t, err)
 			require.NotNil(t, shadow)
 
@@ -58,7 +58,7 @@ func TestEnsureLegacyMetaWhatsAppAccountRejectsCorruptBindingWithoutRefresh(t *t
 			require.NoError(t, db.First(&before, "id = ?", shadow.ID).Error)
 
 			err = db.Transaction(func(tx *gorm.DB) error {
-				refreshed, refreshErr := channelapi.EnsureLegacyMetaWhatsAppAccount(tx, legacyMetaRef(account))
+				refreshed, refreshErr := ensureFencedLegacyMetaAccountForTest(tx, legacyMetaRef(account))
 				assert.Nil(t, refreshed)
 				var during models.ChannelAccount
 				if err := tx.First(&during, "id = ?", shadow.ID).Error; err != nil {
