@@ -1,19 +1,16 @@
-# Staging release contracts and lifecycle — PR9 draft
+# Staging release contracts and lifecycle (PR9)
 
-This is an offline prerequisite for Part A PR9. It does **not** add `stage` to
-`ship.py`, change `ship.yml`, dispatch a workflow, or grant provider write access.
-Production release files, including `spec_images.py` and `ship_common.py`, are
-unchanged. The lifecycle protocol is implemented with synthetic tests, but real
-plan/attestation adapters and workflow integration are still required. The
-guards and callback interfaces are not an attestation verifier or deployment proof.
+PR9 implements the separate `stage` mode in `ship.yml`, a bounded staging
+lifecycle, real plan/attestation adapters, and receipt-bound CRM reports.
+Production `spec_images.py` remains byte-identical; production accepts only its
+explicit modes and refuses staging credentials or drills before I/O. The full
+release suite and synthetic boundary tests validate the code, not a live
+staging deployment. No workflow is dispatched by importing or testing it.
 
-The dependency stack for this draft is PR237 at `31e7ea1` (staging setup kit)
-plus PR238 at `0ceb26b` (repository canaries), based on main `0c2a57a`. The isolated
-stack tip before PR9 changes is `5f62c5799410a2e86513a3e9762f443abfee0b47`.
-Rebase the additive changes onto main after both dependencies merge; do not
-merge a synthetic dependency stack to bypass their required checks.
-The doctl compatibility fix `2a150c9` is also included as dependency commit
-`a55902f`; it is separate from PR9's contract checkpoint `954ed38`.
+The additive work depends on Part A PR7/PR8. Rebase it onto actual main after
+both dependencies merge; do not merge a synthetic dependency stack to bypass
+required checks. Real owner setup, target fingerprints and the post-merge
+production/staging/drill proofs remain separate gates below.
 
 ## Owner setup prerequisite
 
@@ -68,15 +65,15 @@ full setup JSON into an environment or release artifact.
 The target export contains the app, VPC, PostgreSQL and Valkey IDs, origin, fixed
 staging database name, reviewed staging image/source bindings, canonical template
 hash and only the template's dynamic non-secret values. It contains neither the
-canary logins nor app/database secrets. A future deploy job must independently
-verify staging image attestations and candidate attestations; a stored image
+canary logins nor app/database secrets. The deploy job independently
+verifies staging image attestations and candidate attestations; a stored image
 reference and source SHA are inputs to verification, not proof.
 
 ## Deliberate correction to the seven-secret plan
 
 The original seven e2e values cannot reconstruct PR7's randomly generated two
 non-super users, conversation/contact/sender IDs, Meta identities, namespace and
-stub app secret. This draft defines three e2e inputs instead:
+stub app secret. The workflow uses three e2e inputs instead:
 
 | Input | Source |
 | --- | --- |
@@ -87,9 +84,9 @@ stub app secret. This draft defines three e2e inputs instead:
 The original admin email/password, agent password, Klinik organization ID and
 other organization ID inputs do not enter the e2e job. The two non-super logins
 and exact organization identities are preserved inside the allowlisted export.
-Bootstrap administrator credentials remain owner-setup-only. The future workflow
-must update its explicit secret allowlist, first masking step and semantic tests
-to match this correction; this draft creates no environments or secrets.
+Bootstrap administrator credentials remain owner-setup-only. The workflow
+secret allowlist, first masking step and semantic tests enforce this correction.
+Creating environments and setting real secrets remain owner setup operations.
 
 Import additionally requires public `STAGE_RECEIPT_B64`,
 `STAGE_RECEIPT_SHA256`, `STAGE_CANDIDATE_SHA256` and `GITHUB_RUN_ID` inputs:
@@ -105,7 +102,7 @@ hash and the explicit staging origin, then rejects the production origin hash.
 Receipt run, candidate and pinned app hashes must also match. JSON duplicate
 keys and unexpected keys at every fixture boundary fail closed. The resulting
 file is directly consumable by PR7 with `CANARY_PROFILE=staging` and
-`CANARY_PRIVATE_FILE` pointing to it. A future workflow must supply no ambient
+`CANARY_PRIVATE_FILE` pointing to it. The workflow supplies no ambient
 `CANARY_*` overrides and no credentials on npm/install or unrelated steps.
 
 PR7 re-registers the exact synthetic account in the stub before browser use, so
@@ -146,8 +143,8 @@ deployment fingerprints, run, candidate, ingress and app hashes plus drill.
 Private environment values participate in the spec fingerprint but never appear
 in the receipt. Previous staging images may differ from the latest production
 record; rollback must use the prior observed staging state. Receipt hashes bind
-cross-job data; the future executor must verify their provenance and ensure the
-exact candidate is still active before rollback.
+cross-job data; the executor verifies their provenance and ensures the exact
+candidate is still active before rollback.
 
 ## Implemented lifecycle protocol
 
@@ -163,8 +160,12 @@ attestation verifier returning the verified source commit, and a staging support
 image verifier. None has a default or permissive implementation. The product
 verifier must independently resolve/verify the observed prior image set, since
 the previous staging candidate may never have been promoted to production.
-This is still an integration dependency, not permission to substitute a callback
-that returns an input unchanged.
+`stage_adapters.py` implements these checks using the pinned GitHub CLI. It
+rechecks current CI, candidate freshness, the exact plan/record chain, schema
+and no-downgrade, and Trivy policy/database age. An unknown previous staging
+source is derived only from a cryptographically verified signing certificate,
+then every product digest is verified against that exact source. An unsigned
+registry label, predicate field or caller-provided hint cannot choose the source.
 
 The protocol reads inventory and two stable app/deployment snapshots, rechecks
 inventory and CAS through a fresh one-PUT client, reconciles the exact candidate,
@@ -191,8 +192,9 @@ inputs before constructing a Context or starting a subprocess. They refuse
 production modes, mixed canary secrets, an unconfigured target and a foreign
 workflow/run context before any provider request. Private target identities are
 masked before use, and only public receipt data is emitted. Required adapters
-are imported lazily; an absent adapter fails closed. Real target fingerprints,
-the adapter implementation and workflow boundary are still merge prerequisites.
+are imported lazily; an absent adapter fails closed. The real adapters and
+workflow boundary are implemented and independently reviewed. Real target
+fingerprints and observed provider shapes remain merge prerequisites.
 
 ## Bound canary report and e2e drill
 
@@ -224,38 +226,28 @@ only after the successful exact canary step using that same imported fixture and
 receipt. The report module alone does not prove test freshness. Its output is
 public; its two input files remain owner-only and are never uploaded.
 
-## Work remaining for full PR9
+## Live prerequisites and acceptance
 
-1. Implement and independently review real `stage.py` plan/attestation adapters,
-   and review their integration with the bounded, masked command entrypoints.
-   Confirm actual provider shapes against read-only
-   staging observations and extend only narrow, reviewed normalization rules.
-2. Independently review the implemented CAS/reconcile/health/rollback protocol
-   and its adversarial tests. Complete provider-error and competing-deployment
-   coverage as new adapter/API shapes become known; then prove the protocol on
-   the owner-approved isolated staging resources.
-3. Add explicit `PRODUCTION_MODES`/`PUT_MODES` and stage/drill input validation in
-   `ship.py`; production rejects stage and every drill before I/O. Add only the
-   planned staging names to production's forbidden ambient list. Keep existing
-   production image functions byte-identical and run their unchanged tests.
-4. Add the stage-only jobs to `ship.yml` with the same single `ship-release`
-   serialization, existing production group and separate staging job group,
-   no `uses` in provider-token jobs, credentialless checkout, exact environments,
-   first masking before checkout/npm, step-scoped secrets, pinned Playwright,
-   `npm ci --ignore-scripts`, and no uploaded private artifacts. Keep stage plan
-   gates equivalent to promote. Update semantic workflow checks together.
-5. Wire the implemented report and drill helpers through the workflow freshness
-   boundary above, then test the combined stage/rollback chain. The original PR7
-   verifier remains an unbound local verifier; promotion evidence must use
-   `stage_report.py`. Prove all three drills and rollback on isolated staging.
-6. After review/merge authorization and completed owner setup, verify production
-   dry-run and current-latest rollback's no-PUT path, then staging health 6/6,
-   canary 13/13 and all three rollback drills. Record exact runs for PR10.
+1. Complete owner setup on the isolated staging resources and compare actual
+   read-only provider observations with the exact contract. Extend only narrow,
+   independently reviewed normalization rules when real defaults differ.
+2. Commit only the verified team/app fingerprints and configure the protected
+   staging environments with the minimal exports and scoped credentials.
+   The two null pins intentionally keep deployment unavailable until then.
+3. After required CI, independent review and owner merge authorization, verify
+   production dry-run and current-latest rollback's no-PUT path. Then authorize
+   a normal stage run with health 6/6 and CRM 13/13, plus all three rollback drills.
+   Record exact successful proofs for PR10; synthetic tests are not substitutes.
 
-No release should be dispatched while another Release run is queued, waiting or
-running. A production rollback remains the existing production operation; an
-emergency cancel decision belongs to the operator. This draft has no dispatch
-or rollback command.
+The original PR7 verifier remains an unbound local verifier; promotion evidence
+must use `stage_report.py` after the workflow's fresh-file/test-success boundary.
+No release should be dispatched while another Release run is queued, pending,
+requested, waiting or running. The single `ship-release` group and production's
+`ship-production` group remain unchanged. Stage deploy/rollback use `ship-staging`.
+A production rollback remains the existing production operation; an emergency
+cancel decision belongs to the operator. Whole-run cancellation prevents the
+cross-job rollback from starting and requires read-only reconciliation; it does
+not prove that staging was restored. See [the release runbook](release.md).
 
 ## Offline checks
 

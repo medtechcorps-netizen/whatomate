@@ -82,10 +82,13 @@ class ContractTests(unittest.TestCase):
             stage.stage_origin(ORIGIN, common.sha256_text(ORIGIN))
 
     def test_ambient_presence_and_drill_allowlists(self):
-        for name in common.FORBIDDEN_AMBIENT + ("SHIP_DO_TOKEN", "SHIP_TARGET_JSON", "DOCTL_CONFIG", "DOCTL_CONTEXT"):
+        provider_inputs = {"STAGING_DO_TOKEN", "STAGING_TARGET_JSON"}
+        forbidden = set(common.FORBIDDEN_AMBIENT) - provider_inputs
+        for name in forbidden | {"SHIP_DO_TOKEN", "SHIP_TARGET_JSON", "DOCTL_CONFIG", "DOCTL_CONTEXT"}:
             with self.subTest(name=name), self.assertRaises(common.ReleaseError):
                 stage.validate_environment({name: ""})
         stage.validate_environment({"STAGING_DO_TOKEN": "synthetic", "STAGING_TARGET_JSON": "{}"})
+        stage.validate_environment({name: "" for name in provider_inputs})
         for mode in ("dry-run", "promote", "rollback"):
             stage.validate_drill(mode, "none")
             for drill in stage.DRILLS - {"none"}:

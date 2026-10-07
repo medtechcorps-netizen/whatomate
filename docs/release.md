@@ -9,13 +9,16 @@ Release record, so the next run knows what production should be running.
 Production holds test data only today. The pipeline is still built as if it
 held real data: it refuses rather than guesses.
 
-## The five jobs
+## Release jobs
 
 | Job | What it does | Credentials |
 | --- | --- | --- |
 | `Release plan` | Before approval: inputs, the approval gate, CI for the commit, idle old lanes, the verified record chain, no-downgrade, the schema guard, the commit list. | read-only `GITHUB_TOKEN` |
 | `Release image (web, meta-relay, gmail-relay)` | Builds each image from `docker/release/<component>.Dockerfile` at the commit, pushes it by digest, checks the runtime contract, scans it with Trivy (fresh database), makes the SPDX SBOM. Skipped for rollback. | `packages: write` |
 | `Release attestations` | Attests provenance and SBOM for the three digests, verifies them (bundle and API), proves anonymous pulls, assembles the candidate. Skipped for rollback. | `id-token`, `attestations: write` |
+| `Release staging` | Stage mode only: verifies the separate target and signed images, deploys once, checks health and restores the previous staging version on a deployment/health failure. | staging deploy token and target, this step only |
+| `Release staging CRM checks` | Stage mode only: imports the existing synthetic fixture, runs all 13 checks and emits the receipt-bound report. | three fixture inputs on masking and import/test steps only |
+| `Release staging rollback` | If staging deployed successfully but its CRM checks failed, verifies the receipt and restores that run's previous staging version. | staging deploy token and target, this step only |
 | `Release production (<mode>)` | Waits for the owner's approval of the `production` environment, then verifies, guards, deploys, smoke-tests and, on failure, rolls back. One job, one process, standard-library Python and the pinned `gh`; no `uses:` steps. | the deploy token and target secret, this step only |
 | `Release record` | Writes the attested record `prod-<UTC>-<sha8>` (not for dry-run). | `contents: write`, `attestations: write` |
 
@@ -66,8 +69,8 @@ the production environment, through Review deployments > production >
 Approve and deploy. Claude/Codex never approve, even if asked in chat, and
 never call the pending-deployments API.
 
-The pipeline enforces the environment side of this rule itself. Both the
-plan job and the production job refuse (`approval-gate-misconfigured`)
+The pipeline enforces the environment side of this rule itself. For production
+modes, both the plan job and the production job refuse (`approval-gate-misconfigured`)
 unless the `production` environment has exactly one required-reviewers rule
 whose only reviewer is the user medtechcorps-netizen, "Allow administrators
 to bypass" is off, and deployments are limited to the single branch rule
@@ -92,6 +95,10 @@ owner's click too.
 
 - `dry-run`: everything except the PUT. Probes current production health.
 - `promote`: deploys the commit you dispatched from `main`.
+- `stage`: builds and verifies the same candidate, then deploys only to the
+  separately configured staging team and runs its 13 synthetic CRM checks.
+  The production and record jobs are ineligible. This mode does not yet gate
+  normal promotes; that later Part A PR10 change needs real stage/drill proof.
 - `rollback` with `target_release`: an earlier record tag, or `prod-0000`
   for release #0. The production job reads the live digests and decides:
   - rollback: live equals the latest record, so one PUT to the target;
@@ -108,6 +115,63 @@ source `c482dbbc` and its three digests from the signed 0825df34 phase state.
 It is not a GitHub Release; never create a release or tag named `prod-0000`.
 Rolling back to it verifies those exact digests with the old build workflow's
 signer; any other digest must be signed by `ship.yml`.
+
+## Staging setup and drills
+
+Finish [the staging owner setup](staging.md) and
+[the staging target, fixture and receipt contract](staging-release-contract.md)
+before using `stage`. The committed staging team and app hashes start as `null`
+and refuse all deployments until the real setup has been independently verified.
+Do not substitute test hashes. Only synthetic staging data and credentials are
+permitted. Production's `spec_images.py`, target and owner approval boundary
+remain separate; the production command refuses `stage`, every non-`none` drill,
+and any `STAGING_*` environment input before target/GitHub/provider I/O.
+
+The `staging` environment supplies `STAGING_DO_TOKEN` and `STAGING_TARGET_JSON`
+only to the deploy or rollback process. Those jobs use a credential-less clone,
+the pinned GitHub CLI and standard-library Python; they have no `uses:` steps.
+The `staging-e2e` environment supplies exactly `STAGING_ORIGIN`,
+`STAGING_CANARY_FIXTURE_JSON` and `STAGING_STUB_CONTROL_KEY`. Its first step masks
+those values and their nested strings before checkout or dependency installation.
+The fixture is imported into a fresh private directory; the test refuses an
+existing report, and the report verifier runs only after that exact test succeeds.
+The verifier receives no staging secrets. No browser reports or fixtures are
+uploaded as artifacts. The only public outputs are the validated receipt and
+the report bound to its run, candidate and origin hashes.
+
+Before every stage or drill dispatch, Claude/Codex check `gh run list` and confirm
+there is no Release run queued, pending, requested, waiting or running. The single
+top-level `ship-release` concurrency group is unchanged: starting another run
+can replace an existing pending run. Deploy and rollback share `ship-staging`;
+production retains `ship-production`. An urgent production rollback during a
+stage run follows [emergency rollback step 4](emergency-rollback.md): cancel the
+running Release workflow before proceeding. A cancelled or timed-out stage run
+needs read-only reconciliation; cancellation is not proof of automatic recovery.
+
+The `drill` input defaults to `none`. Any other value is accepted only in `stage`:
+
+- `none`: require all six health probes and exactly 13 single-pass CRM checks.
+- `health-fail`: probe a deliberately missing route and exercise in-job rollback.
+- `bad-image`: use the separately attested staging bootstrap image for web and
+  PRE_DEPLOY, exercising migration/deployment failure and in-job rollback.
+- `e2e-fail`: fail the first CRM check deliberately; the separate rollback job
+  restores the preceding staging candidate. A drill never emits a passing report.
+
+Deployment verifies the candidate's current CI, record-chain/plan binding,
+schema/no-downgrade and Trivy policy/freshness again. Every product digest is
+verified against its source commit; the previous staging version can be a signed
+candidate that was never a production record. Rollback is bound to this run's
+receipt, actual candidate deployment and unchanged spec. Ambiguous provider
+writes are reconciled with reads, never retried blindly. A successful restoration
+after a deployment/health failure exits 2; uncertain ownership or failed recovery
+exits 3 and requires manual reconciliation. A successful cross-job rollback
+does not turn the failed CRM check or original workflow into success.
+
+PR9 remains owner-merge-gated. After merge, the owner authorizes a production
+dry-run, a rollback check targeting the current latest record (which must stop
+with `nothing-to-roll-back` before backup/PUT), then normal staging and each
+drill. Local synthetic tests do not substitute for those real run IDs.
+
 
 ## Guards
 
