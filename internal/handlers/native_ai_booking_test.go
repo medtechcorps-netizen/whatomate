@@ -38,6 +38,9 @@ func nativeBookingFixture(t *testing.T) *nativeBookingTestFixture {
 	require.NoError(t, app.DB.Preload("Service").First(&event, "id = ?", event.ID).Error)
 	var shadow *models.ChannelAccount
 	require.NoError(t, app.DB.Transaction(func(tx *gorm.DB) error {
+		if err := database.LockOrganizationPolicyScope(tx, org.ID); err != nil {
+			return err
+		}
 		var err error
 		shadow, err = channel.EnsureLegacyMetaWhatsAppAccount(tx, channel.LegacyMetaAccountRef{ID: account.ID, OrganizationID: org.ID, Name: account.Name, Status: account.Status})
 		if err != nil {

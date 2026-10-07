@@ -3235,6 +3235,9 @@ func (a *App) hydratePersistedIncomingMedia(
 	var tokenGeneration [sha256.Size]byte
 	currentAccount := *account
 	err := a.WithCommittedTenantApp(work.OrganizationID, func(scoped *App) error {
+		if err := database.LockOrganizationPolicyScope(scoped.DB, work.OrganizationID); err != nil {
+			return err
+		}
 		if err := scoped.prepareWhatsAppMessageAuthority(&currentAccount); err != nil {
 			return err
 		}
@@ -3279,6 +3282,9 @@ func (a *App) hydratePersistedIncomingMedia(
 	var discarded bool
 	var discardReason error
 	err = a.WithCommittedTenantApp(work.OrganizationID, func(scoped *App) error {
+		if err := database.LockOrganizationPolicyScope(scoped.DB, work.OrganizationID); err != nil {
+			return err
+		}
 		if err := scoped.prepareWhatsAppMessageAuthority(&currentAccount); err != nil {
 			return err
 		}
@@ -3670,6 +3676,9 @@ func (a *App) getOrCreateInboundContact(
 	var err error
 	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
 		err = a.DB.Transaction(func(tx *gorm.DB) error {
+			if err := database.LockOrganizationPolicyScope(tx, account.OrganizationID); err != nil {
+				return err
+			}
 			contact, created, createErr := contactutil.GetOrCreateContact(
 				tx,
 				account.OrganizationID,
@@ -3724,15 +3733,14 @@ func (a *App) getOrCreateInboundContact(
 				}
 			}
 
+			// Keep optional identity enrichment under the same fence. Its own
+			// savepoint preserves the contact/activity on a metadata failure.
+			a.scopedApp(tx, account.OrganizationID).updateContactBSUID(canonical, bsuid)
 			result = *canonical
 			isNew = created
 			return nil
 		})
 		if err == nil {
-			// BSUID is optional metadata. Isolate its update behind a
-			// savepoint so a failure cannot roll back the durable contact,
-			// CRM activity, or the inbound message written by the caller.
-			a.updateContactBSUID(&result, bsuid)
 			return &result, isNew, nil
 		}
 		if !isUniqueViolation(err) && !isRetryableCanonicalContactWrite(err) {
