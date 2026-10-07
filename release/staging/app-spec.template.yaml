@@ -1,0 +1,802 @@
+{
+  "name": "rereply-stage",
+  "region": "sgp",
+  "vpc": {
+    "id": "@@vpc_id@@"
+  },
+  "services": [
+    {
+      "name": "omnitech-web",
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-0.5gb",
+      "http_port": 8080,
+      "internal_ports": [
+        8080
+      ],
+      "health_check": {
+        "http_path": "/ready",
+        "initial_delay_seconds": 15
+      },
+      "envs": [
+        {
+          "key": "WHATOMATE_APP__ENVIRONMENT",
+          "value": "staging",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_APP__DEBUG",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DATABASE__RUNTIME_ROLE",
+          "value": "rereply_app",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DATABASE__RLS_ENABLED",
+          "value": "true",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DATABASE__URL",
+          "value": "@@runtime_url@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_REDIS__URL",
+          "value": "@@redis_url@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_APP__ENCRYPTION_KEY",
+          "value": "@@encryption_key@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_JWT__SECRET",
+          "value": "@@jwt@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_DEFAULT_ADMIN__EMAIL",
+          "value": "@@admin_email@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DEFAULT_ADMIN__PASSWORD",
+          "value": "@@admin_password@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__BASE_URL",
+          "value": "http://graph-stub:8090",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__APP_ID",
+          "value": "@@stub_app_id@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__APP_SECRET",
+          "value": "@@stub_app_secret@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__WEBHOOK_VERIFY_TOKEN",
+          "value": "@@webhook_verify@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_LEGACY_WHATSAPP_REPLY__ENABLED",
+          "value": "@@reply_enabled@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_LEGACY_WHATSAPP_REPLY__ALLOWED_ORGANIZATION_IDS",
+          "value": "@@allowlist@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_AI__QWEN_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__AUTH_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__TOKEN_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__API_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__CLIENT_ID",
+          "value": "",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__CLIENT_SECRET",
+          "value": "",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_REGISTRY__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_MESSENGER_ONBOARDING__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_MESSENGER_ONBOARDING__GRAPH_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__AUTHORIZATION_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__TOKEN_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__GRAPH_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_THREADS_MANAGED__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_THREADS_APP_REVIEW__DEVELOPMENT_TESTING_ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_TTS__PIPER_BINARY",
+          "value": "/disabled",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_TTS__PIPER_MODEL",
+          "value": "/disabled",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_TTS__OPUSENC_BINARY",
+          "value": "/disabled",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_COOKIE__SECURE",
+          "value": "true",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_CALLING__RECORDING_ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        }
+      ]
+    },
+    {
+      "name": "meta-relay",
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-0.5gb",
+      "http_port": 8081,
+      "internal_ports": [
+        8081
+      ],
+      "health_check": {
+        "http_path": "/readyz",
+        "initial_delay_seconds": 15
+      },
+      "envs": [
+        {
+          "key": "META_RELAY_ENVIRONMENT",
+          "value": "staging",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "META_RELAY_LISTEN_ADDR",
+          "value": ":8081",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "META_RELAY_REDIS_URL",
+          "value": "@@redis_url@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "META_RELAY_REDIS_PREFIX",
+          "value": "rereply-staging:meta",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "META_RELAY_MESSENGER_APP_SECRET",
+          "value": "@@messenger_secret@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "META_RELAY_MESSENGER_VERIFY_TOKEN",
+          "value": "@@messenger_verify@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "META_RELAY_INSTAGRAM_APP_SECRET",
+          "value": "@@instagram_secret@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "META_RELAY_INSTAGRAM_VERIFY_TOKEN",
+          "value": "@@instagram_verify@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "META_RELAY_GRAPH_API_VERSION",
+          "value": "v25.0",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "META_RELAY_FACEBOOK_GRAPH_BASE_URL",
+          "value": "http://graph-stub:8090",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "META_RELAY_INSTAGRAM_GRAPH_BASE_URL",
+          "value": "http://graph-stub:8090",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "META_RELAY_REGISTRY_ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "META_RELAY_ACCOUNTS_JSON",
+          "value": "[{\"key\":\"staging-inert\",\"channel\":\"messenger\",\"external_account_id\":\"900000000000004\",\"rereply_webhook_url\":\"https://127.0.0.1:9\",\"access_token_env\":\"STAGING_PAGE_TOKEN\",\"rereply_inbound_secret_env\":\"STAGING_PAGE_INBOUND\",\"rereply_outbound_secret_env\":\"STAGING_PAGE_OUTBOUND\"}]",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "STAGING_PAGE_TOKEN",
+          "value": "@@stub_access_token@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "STAGING_PAGE_INBOUND",
+          "value": "@@page_inbound@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "STAGING_PAGE_OUTBOUND",
+          "value": "@@page_outbound@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        }
+      ]
+    },
+    {
+      "name": "gmail-relay",
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-0.5gb",
+      "http_port": 8082,
+      "internal_ports": [
+        8082
+      ],
+      "health_check": {
+        "http_path": "/readyz",
+        "initial_delay_seconds": 15
+      },
+      "envs": [
+        {
+          "key": "GMAIL_RELAY_LISTEN_ADDR",
+          "value": ":8082",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_REDIS_URL",
+          "value": "@@redis_url@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "GMAIL_RELAY_REDIS_PREFIX",
+          "value": "rereply-staging:gmail",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_MAILBOX",
+          "value": "staging@rereply.invalid",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_GOOGLE_CLIENT_ID",
+          "value": "synthetic.invalid",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_GOOGLE_CLIENT_SECRET",
+          "value": "@@gmail_secret@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "GMAIL_RELAY_GOOGLE_REDIRECT_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_GOOGLE_AUTH_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_GOOGLE_TOKEN_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_GMAIL_API_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "GMAIL_RELAY_ENCRYPTION_KEY",
+          "value": "@@gmail_encryption@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "GMAIL_RELAY_SETUP_KEY",
+          "value": "@@gmail_setup@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        }
+      ]
+    },
+    {
+      "name": "graph-stub",
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-0.5gb",
+      "http_port": 8090,
+      "internal_ports": [
+        8090
+      ],
+      "health_check": {
+        "http_path": "/readyz",
+        "initial_delay_seconds": 15
+      },
+      "envs": [
+        {
+          "key": "STUB_ENVIRONMENT",
+          "value": "staging",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "STUB_LISTEN_ADDR",
+          "value": ":8090",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "STUB_CONTROL_KEY",
+          "value": "@@stub_control_key@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "STUB_ACCESS_TOKENS",
+          "value": "@@stub_access_token@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "STUB_APP_ID",
+          "value": "@@stub_app_id@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "STUB_APP_SECRET",
+          "value": "@@stub_app_secret@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "STUB_ACCOUNTS",
+          "value": "@@stub_accounts@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "STUB_CALLBACK_ORIGIN",
+          "value": "http://omnitech-web:8080",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        }
+      ]
+    }
+  ],
+  "jobs": [
+    {
+      "name": "rereply-rls-migrate",
+      "kind": "PRE_DEPLOY",
+      "instance_count": 1,
+      "instance_size_slug": "apps-s-1vcpu-0.5gb",
+      "run_command": "./rereply rls-migrate -config config.toml",
+      "envs": [
+        {
+          "key": "WHATOMATE_APP__ENVIRONMENT",
+          "value": "staging",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_APP__DEBUG",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DATABASE__RUNTIME_ROLE",
+          "value": "rereply_app",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DATABASE__RLS_ENABLED",
+          "value": "true",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DATABASE__URL",
+          "value": "@@runtime_url@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_REDIS__URL",
+          "value": "@@redis_url@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_APP__ENCRYPTION_KEY",
+          "value": "@@encryption_key@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_JWT__SECRET",
+          "value": "@@jwt@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_DEFAULT_ADMIN__EMAIL",
+          "value": "@@admin_email@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DEFAULT_ADMIN__PASSWORD",
+          "value": "@@admin_password@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__BASE_URL",
+          "value": "http://graph-stub:8090",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__APP_ID",
+          "value": "@@stub_app_id@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__APP_SECRET",
+          "value": "@@stub_app_secret@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_WHATSAPP__WEBHOOK_VERIFY_TOKEN",
+          "value": "@@webhook_verify@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        },
+        {
+          "key": "WHATOMATE_LEGACY_WHATSAPP_REPLY__ENABLED",
+          "value": "@@reply_enabled@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_LEGACY_WHATSAPP_REPLY__ALLOWED_ORGANIZATION_IDS",
+          "value": "@@allowlist@@",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_AI__QWEN_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__AUTH_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__TOKEN_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__API_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__CLIENT_ID",
+          "value": "",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_GOOGLE_SEARCH_CONSOLE__CLIENT_SECRET",
+          "value": "",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_REGISTRY__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_MESSENGER_ONBOARDING__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_MESSENGER_ONBOARDING__GRAPH_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__AUTHORIZATION_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__TOKEN_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_META_INSTAGRAM_ONBOARDING__GRAPH_BASE_URL",
+          "value": "http://127.0.0.1:9",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_THREADS_MANAGED__ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_THREADS_APP_REVIEW__DEVELOPMENT_TESTING_ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_TTS__PIPER_BINARY",
+          "value": "/disabled",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_TTS__PIPER_MODEL",
+          "value": "/disabled",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_TTS__OPUSENC_BINARY",
+          "value": "/disabled",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_COOKIE__SECURE",
+          "value": "true",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_CALLING__RECORDING_ENABLED",
+          "value": "false",
+          "scope": "RUN_TIME",
+          "type": "GENERAL"
+        },
+        {
+          "key": "WHATOMATE_DATABASE__MIGRATION_URL",
+          "value": "@@migration_url@@",
+          "scope": "RUN_TIME",
+          "type": "SECRET"
+        }
+      ]
+    }
+  ],
+  "databases": [
+    {
+      "name": "staging-runtime",
+      "engine": "PG",
+      "version": "17",
+      "production": true,
+      "cluster_name": "@@pg_name@@",
+      "db_name": "rereply",
+      "db_user": "rereply_app"
+    },
+    {
+      "name": "staging-owner",
+      "engine": "PG",
+      "version": "17",
+      "production": true,
+      "cluster_name": "@@pg_name@@",
+      "db_name": "rereply",
+      "db_user": "doadmin"
+    }
+  ],
+  "ingress": {
+    "rules": [
+      {
+        "match": {
+          "path": {
+            "prefix": "/_stub/_control"
+          }
+        },
+        "component": {
+          "name": "graph-stub",
+          "rewrite": "/_control"
+        }
+      },
+      {
+        "match": {
+          "path": {
+            "prefix": "/meta-relay"
+          }
+        },
+        "component": {
+          "name": "meta-relay",
+          "preserve_path_prefix": false
+        }
+      },
+      {
+        "match": {
+          "path": {
+            "prefix": "/gmail-relay"
+          }
+        },
+        "component": {
+          "name": "gmail-relay",
+          "preserve_path_prefix": false
+        }
+      },
+      {
+        "match": {
+          "path": {
+            "prefix": "/"
+          }
+        },
+        "component": {
+          "name": "omnitech-web",
+          "preserve_path_prefix": false
+        }
+      }
+    ]
+  }
+}

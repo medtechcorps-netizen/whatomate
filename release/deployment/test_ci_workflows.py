@@ -101,7 +101,10 @@ RACE_TEST = '-- -mod=readonly -race -p 1 -timeout 150m -coverprofile=coverage.ou
 ACTIONLINT_INSTALL = "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7"
 # Exactly the test discovery the release tests job runs. A new release test
 # directory is added here and to the job together.
-RELEASE_TEST_COMMANDS = ("python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v",)
+RELEASE_TEST_COMMANDS = (
+    "python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v",
+    "python3 -B -m unittest discover -s release/staging -p 'test_*.py' -v",
+)
 GOLANGCI_LINT = {"version": "v2.11.4"}
 GO_BUILD = "go build -mod=readonly -v ./..."
 GOVULNCHECK = ("go install golang.org/x/vuln/cmd/govulncheck@v1.7.0", "GOFLAGS=-mod=readonly govulncheck ./...")
@@ -825,7 +828,7 @@ def assert_staging_bootstrap(sources: dict[str, str]) -> None:
 # in this list.
 STAGING_REFERENCE = re.compile(r"release/staging|graph-stub|graphstub")
 STAGING_REFERENCE_WORKFLOWS = ("ship.yml", "test.yml", "e2e-tests.yml")
-STAGING_REFERENCE_JOBS = {("test.yml", STAGING_BOOTSTRAP_JOB)}
+STAGING_REFERENCE_JOBS = {("test.yml", STAGING_BOOTSTRAP_JOB), ("test.yml", "release-tests")}
 
 
 def text_nodes(value: Any) -> list[str]:
@@ -847,6 +850,13 @@ def release_dockerfiles() -> dict[str, str]:
 
 def assert_staging_placement(sources: dict[str, str], dockerfiles: dict[str, str] | None = None) -> None:
     docs = parse(sources)
+    # The release-tests exception permits only offline unittest discovery, not
+    # building/running a staging server in an ordinary release-image CI job.
+    release_job = jobs(docs["test.yml"])["release-tests"]
+    for text in text_nodes(release_job):
+        for line in text.splitlines():
+            if STAGING_REFERENCE.search(line) and line.strip() != RELEASE_TEST_COMMANDS[1]:
+                raise AssertionError("release-tests may reference only staging unittest discovery")
     for workflow in STAGING_REFERENCE_WORKFLOWS:
         doc = dict(docs[workflow])
         doc["jobs"] = {job_id: job for job_id, job in jobs(doc).items()
@@ -1061,6 +1071,8 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     # 7. The release tests.
     "remove the release/deployment discover command": ("release-tests", lambda: replaced(
         "test.yml", "          python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v\n", "")),
+    "remove the release/staging discover command": ("release-tests", lambda: replaced(
+        "test.yml", "          " + RELEASE_TEST_COMMANDS[1] + "\n", "")),
     "retarget the release tests": ("release-tests", lambda: replaced(
         "test.yml", "discover -s release/deployment -p", "discover -s release/canary -p")),
     "make the release tests conditional": ("release-tests", lambda: replaced(
@@ -1493,6 +1505,12 @@ class StagingPlacementTests(unittest.TestCase):
     def test_the_staging_bootstrap_job_may_reference_staging_code(self) -> None:
         job = jobs(parse(SOURCES)["test.yml"])[STAGING_BOOTSTRAP_JOB]
         self.assertTrue(any(STAGING_REFERENCE.search(text) for text in text_nodes(job)))
+
+    def test_release_tests_cannot_use_the_discovery_exception_to_start_staging(self) -> None:
+        changed = replaced("test.yml", "          " + RELEASE_TEST_COMMANDS[1] + "\n",
+                           "          " + RELEASE_TEST_COMMANDS[1] + "\n          go run ./release/staging/graphstub\n")
+        with self.assertRaisesRegex(AssertionError, "only staging unittest discovery"):
+            assert_staging_placement(changed)
 
 
 class StagingBootstrapJobTests(unittest.TestCase):
