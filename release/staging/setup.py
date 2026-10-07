@@ -501,8 +501,11 @@ class Setup:
             require(component["name"] not in result, "duplicate-component")
             envs = component.get("envs", [])
             require(len({item["key"] for item in envs}) == len(envs), "duplicate-env")
+            # doctl omits zero-value strings while serializing its typed AppSpec.
+            # Only an absent GENERAL value means empty; explicit null stays null.
             result[component["name"]] = sorted((item["key"], item.get("scope", "RUN_TIME"), item.get("type", "GENERAL"),
-                                               None if item.get("type") == "SECRET" else item.get("value")) for item in envs)
+                                               None if item.get("type") == "SECRET" else
+                                               item.get("value", "") if item.get("type", "GENERAL") == "GENERAL" else item.get("value")) for item in envs)
         return result
 
     def verify_spec(self, actual, expected):
