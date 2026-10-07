@@ -429,15 +429,31 @@ class CLITests(unittest.TestCase):
             self.assertEqual(common.sha256_bytes(base64.b64decode(outputs["receipt_b64"])), outputs["receipt_sha256"])
 
     def test_unconfigured_or_mixed_context_never_constructs_adapter(self):
-        for changes in ({}, {"SHIP_MODE": "promote"}, {"SHIP_DO_TOKEN": ""}, {"STAGING_CANARY_FIXTURE_JSON": "synthetic-private-value"}):
-            env = self.environment(); env.update(changes); logs = io.StringIO()
-            adapters = mock.Mock(side_effect=AssertionError("adapter must not be constructed"))
-            with self.subTest(changes=list(changes)):
-                self.assertEqual(stage.main(["deploy"], env, stage.ship.Deps(stdout=logs), adapter_factory=adapters), stage.ship.EXIT_REFUSED)
-                adapters.assert_not_called()
-                self.assertNotIn("synthetic-private-value", logs.getvalue())
-                self.assertNotIn("STAGING_DO_TOKEN", env)
-                self.assertNotIn("STAGING_TARGET_JSON", env)
+        production, template, pins, _ = data()
+        cases = [({}, {key: None}) for key in ("team_uuid_sha256", "app_id_sha256")]
+        cases.append(({}, {"team_uuid_sha256": None, "app_id_sha256": None}))
+        cases.extend((changes, {}) for changes in (
+            {"SHIP_MODE": "promote"}, {"SHIP_DO_TOKEN": ""},
+            {"STAGING_CANARY_FIXTURE_JSON": "synthetic-private-value"}))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            production_file, pins_file, template_file = (root / name for name in ("production.json", "pins.json", "template.json"))
+            for path, value in ((production_file, production), (template_file, template)):
+                path.write_bytes(common.canonical_file_bytes(value))
+            for changes, pin_changes in cases:
+                # Refusal must not depend on the real committed target failing
+                # to match these synthetic identities. Other cases use valid pins.
+                pins_file.write_bytes(common.canonical_file_bytes({**pins, **pin_changes}))
+                env = self.environment(); env.update(changes); logs = io.StringIO()
+                adapters = mock.Mock(side_effect=AssertionError("adapter must not be constructed"))
+                deps = stage.ship.Deps(stdout=logs, target_path=production_file, clock=lambda: dt.datetime(2026, 10, 7, 12, 1, tzinfo=dt.timezone.utc))
+                with self.subTest(changes=list(changes), null_pins=list(pin_changes)), mock.patch.object(stage, "StageClient") as client:
+                    self.assertEqual(stage.main(["deploy"], env, deps, adapter_factory=adapters,
+                                               pins_path=pins_file, template_path=template_file), stage.ship.EXIT_REFUSED)
+                    adapters.assert_not_called(); client.assert_not_called()
+                    self.assertNotIn("synthetic-private-value", logs.getvalue())
+                    self.assertNotIn("STAGING_DO_TOKEN", env)
+                    self.assertNotIn("STAGING_TARGET_JSON", env)
 
     def test_rollback_candidate_and_drill_mismatch_refuse_before_adapters_or_provider(self):
         production, template, pins, _ = data()
