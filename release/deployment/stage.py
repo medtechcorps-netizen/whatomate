@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Additive staging lifecycle. Deliberately not wired to ship.yml yet.
+"""Staging lifecycle invoked by ship.yml's stage mode.
 
 The executor requires explicit attestation-verifier and plan-verifier adapters.
 There is no permissive/default verifier. Provider clients have one PUT each;
