@@ -347,7 +347,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(envs[name][key], listen)
         self.assertEqual([rule for rule in spec["ingress"]["rules"] if rule["component"]["name"] == "graph-stub"],
                          [{"match": {"path": {"prefix": "/_stub/_control"}},
-                           "component": {"name": "graph-stub", "rewrite": "/_control"}}])
+                           "component": {"name": "graph-stub", "rewrite": "/_control/"}}])
         control = next(env for env in services["graph-stub"]["envs"] if env["key"] == "STUB_CONTROL_KEY")
         self.assertEqual(control["type"], "SECRET")
         self.kit.verify_spec(spec, spec)
