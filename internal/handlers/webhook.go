@@ -580,7 +580,7 @@ func (a *App) WebhookHandler(r *fastglue.Request) error {
 				// so a sender without "from" (WhatsApp username user) resolves
 				// to their own contact rather than an empty-phone one.
 				profileName := ""
-				inbound := msg.IncomingTextMessage
+				inbound := msg.IncomingTextMessage.withPhoneOnlyContactEvidence(change.Value.Contacts)
 				for i := range change.Value.Contacts {
 					contact := &change.Value.Contacts[i]
 					if (msg.From != "" && contact.WaID == msg.From) ||

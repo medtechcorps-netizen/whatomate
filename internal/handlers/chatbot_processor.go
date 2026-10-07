@@ -144,8 +144,9 @@ type IncomingTextMessage struct {
 	// (WhatsApp username users identified by BSUID). They are unexported, so
 	// they are never serialized into the durable continuation payload, which
 	// keeps Meta's original from/from_user_id fields unchanged.
-	senderWaID     string
-	senderUsername string
+	senderWaID              string
+	senderUsername          string
+	phoneOnlySenderConflict bool
 }
 
 // withWebhookSenderContact attaches the matching value.contacts[] identity to
@@ -156,6 +157,9 @@ func (m IncomingTextMessage) withWebhookSenderContact(contact *CoexistenceWebhoo
 		return m
 	}
 	m.senderUsername = strings.TrimSpace(contact.Profile.Username)
+	if m.FromUserID == "" && ((contact.WaID != "" && contact.WaID != m.From) || contact.UserID != "" || contact.ParentUserID != "") {
+		m.phoneOnlySenderConflict = true
+	}
 	if normalizeCoexistencePhone(m.From) == "" {
 		m.senderWaID = strings.TrimSpace(contact.WaID)
 	}
@@ -206,6 +210,7 @@ type incomingMessageAdmissionPolicy struct {
 	IdentityReviewReason       string
 	IdentityReviewRouteMode    string
 	IdentityReviewSelectorHash string
+	PhoneOnlyProof             string
 }
 
 // Message identity never comes from the mutable WhatsAppAccount display name.
@@ -3095,7 +3100,7 @@ func (a *App) persistIncomingMessageForAccountWithAdmission(
 	if message == nil {
 		return nil, false, errors.New("incoming message did not resolve a durable winner")
 	}
-	if !duplicate && (suppressAutomaticAI || (admission != nil && admission.IdentityReviewHoldID != uuid.Nil)) {
+	if !duplicate && (suppressAutomaticAI || (admission != nil && (admission.IdentityReviewHoldID != uuid.Nil || admission.PhoneOnlyProof != ""))) {
 		if err := applyIncomingMessageAdmissionPolicy(
 			a.DB,
 			account.OrganizationID,
@@ -3171,6 +3176,12 @@ func applyIncomingMessageAdmissionPolicy(
 		return errors.New("incoming AI suppression identity is incomplete")
 	}
 	metadata := cloneMessageMetadata(message.Metadata)
+	if admission != nil && admission.PhoneOnlyProof != "" {
+		if _, valid := decodeCoexistencePhoneAdmissionProof(admission.PhoneOnlyProof); !valid || admission.IdentityReviewHoldID != uuid.Nil {
+			return errors.New("incoming phone-only admission proof is invalid")
+		}
+		metadata[coexistencePhoneAdmissionKey] = admission.PhoneOnlyProof
+	}
 	if suppressAutomaticAI {
 		// Suppression is monotonic per WAMID. A later Resume or identity decision
 		// affects only future provider attempts and never clears this fact.

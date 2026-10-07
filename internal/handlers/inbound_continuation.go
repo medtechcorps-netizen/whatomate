@@ -1851,6 +1851,9 @@ func (a *App) ensureInboundContinuationJobForMessage(
 		"message_id":      message.ID.String(),
 		"message":         rawMessage,
 	}
+	if proof, ok := message.Metadata[coexistencePhoneAdmissionKey].(string); ok {
+		payload[coexistencePhoneAdmissionKey] = proof
+	}
 	job := models.ScheduledJob{
 		BaseModel:      models.BaseModel{ID: uuid.New()},
 		OrganizationID: account.OrganizationID,
