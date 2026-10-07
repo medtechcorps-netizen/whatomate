@@ -162,6 +162,12 @@ credentials and refuses known production domains.
 Create GitHub environments `staging` and `staging-e2e`, restricted to `main`.
 PR9/10 will consume these; this kit does not create or populate them.
 
+The table below records the original planned secret names. It is not yet a
+complete import contract: PR7 also generates a private fixture descriptor and
+two independent non-superuser logins. PR9 must provide a minimal fixture exporter
+and importer and update this table before the E2E secrets are populated. Never
+copy the complete setup state into GitHub; it contains database credentials.
+
 | Environment | Planned values |
 |---|---|
 | `staging` | `STAGING_DO_TOKEN`, `STAGING_TARGET_JSON` |
