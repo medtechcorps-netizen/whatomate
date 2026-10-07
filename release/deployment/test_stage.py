@@ -163,6 +163,28 @@ class LifecycleTests(unittest.TestCase):
         for private in (APP, PG, VK, VPC, ORIGIN, OLD_ID): self.assertNotIn(private.encode(), raw)
         lane.scrub(); self.assertTrue(all(client.scrubbed for client in world.clients))
 
+    def test_omitted_service_ports_deploy_once_with_compatible_private_receipt(self):
+        world = World()
+        baseline = copy.deepcopy(world.spec)
+        for component in baseline["services"] + baseline["jobs"]:
+            for env in component["envs"]:
+                if env["type"] == "SECRET": env["value"] = "EV[synthetic-encrypted-value]"
+        world.spec = copy.deepcopy(baseline)
+        for component in world.spec["services"]: del component["internal_ports"]
+        world.deployments[OLD_ID] = world.deployment(OLD_ID, world.spec, "ACTIVE")
+        outcome = world.deploy()
+        self.assertEqual(outcome.status, "deployed")
+        self.assertEqual(len(world.writes), 1)
+        self.assertEqual([client.puts for client in world.clients], [0, 1])
+        self.assertEqual(len(world.probes), 6)
+        self.assertTrue(all("internal_ports" not in component for component in world.writes[0]["services"]))
+        self.assertEqual(outcome.receipt["before_spec_sha256"], contract.spec_fingerprint(baseline))
+        restored_defaults = copy.deepcopy(world.spec)
+        for component in restored_defaults["services"]: component["internal_ports"] = []
+        self.assertEqual(outcome.receipt["after_spec_sha256"], contract.spec_fingerprint(restored_defaults))
+        self.assertEqual(common.loads_strict(contract.receipt_bytes(outcome.receipt)), outcome.receipt)
+        self.assertTrue(all(client.scrubbed for client in world.clients))
+
     def test_plan_and_each_attestation_failure_make_zero_puts(self):
         for flag in ("fail_plan", "fail_candidate_attestation", "fail_previous_attestation"):
             world = World(); setattr(world, flag, True)

@@ -232,6 +232,10 @@ def projection(spec, *, private_values=False):
             require(image["registry_type"] == "GHCR" and image["registry"] == "ghcr.io", code)
             common.require_digest(image["digest"], code)
             if group == "services":
+                # Default service-name LAN routing needs no additional ports.
+                # Normalize only the provider's absent/empty-list equivalent.
+                ports = component.pop("internal_ports", [])
+                require(type(ports) is list and ports == [], code)
                 require(component.pop("protocol", "HTTP") == "HTTP", code)
                 if component.get("run_command") == "":
                     del component["run_command"]

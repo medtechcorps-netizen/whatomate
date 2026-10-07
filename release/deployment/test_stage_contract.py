@@ -175,6 +175,52 @@ class ContractTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(common.ReleaseError):
                 stage.validate_spec(value, self.target, self.template, IMAGES)
 
+    def test_absent_service_ports_preserve_private_projection_and_fingerprint(self):
+        baseline = copy.deepcopy(self.spec)
+        for component in baseline["services"] + baseline["jobs"]:
+            for env in component["envs"]:
+                if env["type"] == "SECRET": env["value"] = "EV[synthetic-encrypted-value]"
+        for index in range(len(baseline["services"])):
+            value = copy.deepcopy(baseline)
+            del value["services"][index]["internal_ports"]
+            stage.validate_spec(value, self.target, self.template, IMAGES)
+            self.assertEqual(stage.projection(value, private_values=True), stage.projection(baseline, private_values=True))
+            self.assertEqual(stage.spec_fingerprint(value), stage.spec_fingerprint(baseline))
+        value = copy.deepcopy(baseline)
+        for component in value["services"]: del component["internal_ports"]
+        before = copy.deepcopy(value)
+        stage.validate_spec(value, self.target, self.template, IMAGES)
+        self.assertEqual(stage.spec_fingerprint(value), stage.spec_fingerprint(baseline))
+        self.assertEqual(value, before)
+        # An omitted port list must not hide any other component/ingress drift.
+        for mutate in (lambda s: s["services"][0].update(http_port=80),
+                       lambda s: s["ingress"]["rules"][0]["component"].update(rewrite="/")):
+            changed = copy.deepcopy(value); mutate(changed)
+            with self.assertRaises(common.ReleaseError):
+                stage.validate_spec(changed, self.target, self.template, IMAGES)
+
+    def test_service_port_normalization_refuses_nonempty_types_and_template_regression(self):
+        for index, component in enumerate(self.spec["services"]):
+            for ports in (None, False, 0, "", "[]", {}, (), [component["http_port"]], [9999]):
+                value = copy.deepcopy(self.spec)
+                value["services"][index]["internal_ports"] = ports
+                with self.subTest(service=component["name"], ports=ports), self.assertRaises(common.ReleaseError):
+                    stage.validate_spec(value, self.target, self.template, IMAGES)
+            template = copy.deepcopy(self.template)
+            template["services"][index]["internal_ports"] = [component["http_port"]]
+            value = stage.expected_spec(self.target, template, IMAGES)
+            with self.assertRaises(common.ReleaseError):
+                stage.validate_spec(value, self.target, template, IMAGES)
+
+    def test_job_ports_receive_no_normalization_exception(self):
+        for ports in ([], None, False, 0, "[]", {}, [8080]):
+            value = copy.deepcopy(self.spec)
+            value["jobs"][0]["internal_ports"] = ports
+            self.assertEqual(stage.projection(value)["jobs"][0]["internal_ports"], ports)
+            self.assertNotEqual(stage.spec_fingerprint(value), stage.spec_fingerprint(self.spec))
+            with self.subTest(ports=ports), self.assertRaises(common.ReleaseError):
+                stage.validate_spec(value, self.target, self.template, IMAGES)
+
     def test_doctl_empty_general_and_disabled_image_defaults_preserve_fingerprint(self):
         value = copy.deepcopy(self.spec)
         for component in value["services"] + value["jobs"]:
