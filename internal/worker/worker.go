@@ -153,6 +153,9 @@ func (w *Worker) HandleRecipientJob(ctx context.Context, job *queue.RecipientJob
 	var contact *models.Contact
 	terminal := false
 	if err := w.campaignCanonicalContactTransaction(ctx, job.OrganizationID, func(tx *gorm.DB, _ *bool) error {
+		if err := database.LockOrganizationPolicyScope(tx, job.OrganizationID); err != nil {
+			return err
+		}
 		if err := tx.
 			Where("id = ? AND organization_id = ?", job.CampaignID, job.OrganizationID).
 			Preload("Template", "organization_id = ?", job.OrganizationID).

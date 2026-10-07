@@ -283,7 +283,7 @@ func assertDeferredLegacyMirrorQueuesBehindAdmissionFence(
 
 	// An earlier admission already committed the shadow and its Message; only
 	// its deferred mirror is still pending.
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(observer, ref)
+	shadow, err := ensureFencedLegacyMetaAccountForTest(observer, ref)
 	require.NoError(t, err)
 	if existingConversation {
 		earlier := createIncoming("already mirrored")
@@ -346,7 +346,7 @@ func assertDeferredLegacyMirrorQueuesBehindAdmissionFence(
 		First(&probed).Error,
 		"the deferred mirror owned the shadow while waiting in %q", waitingQuery)
 	require.NoError(t, admission.Exec("SET LOCAL lock_timeout = '10s'").Error)
-	_, err = channelapi.EnsureLegacyMetaWhatsAppAccount(admission, ref)
+	_, err = ensureFencedLegacyMetaAccountForTest(admission, ref)
 	require.NoError(t, err)
 	require.NoError(t, admission.Commit().Error)
 	select {

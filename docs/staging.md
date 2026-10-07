@@ -183,12 +183,22 @@ PR7 may be developed in parallel; do not run its command until it is merged.
 | Component | Connection and external behavior |
 |---|---|
 | Web | `app.environment=staging`, RLS on, runtime PostgreSQL URL, TLS Valkey, synthetic encryption/JWT/admin credentials |
-| WhatsApp | Graph calls go to `http://graph-stub:8090`; credentials and account IDs are synthetic |
+| WhatsApp | Graph calls go to `http://graph-stub`; credentials and account IDs are synthetic |
 | Meta relay | Staging environment; Facebook and Instagram Graph bases point to the stub; registry off; one inert synthetic static mapping points to loopback port 9 because the relay refuses an empty mapping |
 | Gmail relay | TLS Valkey, synthetic mailbox/OAuth placeholders; auth/token/API bases point to `http://127.0.0.1:9` |
 | Other integrations | Managed Messenger, Instagram, Threads and Threads review gates off; configurable Qwen/Search Console/Meta onboarding URLs point to port 9; no real client keys |
 | Voice | Piper/model/encoder paths disabled; calling recording disabled |
-| Graph stub | Internal port 8090; only public `/_stub/_control/...` routes to the stub, rewritten to its HMAC-protected `/_control/...` API; Graph routes stay internal |
+| Graph stub | HTTP listener 8090; only public `/_stub/_control/...` routes to the stub, rewritten to its HMAC-protected `/_control/...` API; Graph routes stay internal |
+
+Internal requests use App Platform's default service-name LAN routes:
+`http://graph-stub` for Graph calls and `http://omnitech-web` for stub callbacks.
+These routes use port 80 and forward to each service's main `http_port`; the
+application listeners remain 8080, 8081, 8082 and 8090. The template declares no
+additional `internal_ports`, because duplicating `http_port` there is rejected.
+Provider readback may omit the empty list, but any nonempty or malformed value
+is refused. See [DigitalOcean's internal routing documentation](https://docs.digitalocean.com/products/app-platform/how-to/manage-internal-routing/).
+The public ingress stays unchanged: only `/_stub/_control` routes to the stub's
+HMAC-protected control API, with the same `/_control` rewrite.
 
 There is no universal environment switch for every tenant AI/SSO feature. The
 fresh synthetic database has those features unconfigured; the kit does not claim
