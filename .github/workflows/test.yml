@@ -39,6 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v
+          python3 -B -m unittest discover -s release/staging -p 'test_*.py' -v
 
   # Stage 1's interim schema freeze (release/deployment/schema_change.py) at
   # pull-request time. A change the Release plan would refuse with
