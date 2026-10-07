@@ -1,0 +1,5 @@
+{
+  "source_sha": "REPLACE_WITH_SUCCESSFUL_STAGING_IMAGES_SOURCE_SHA",
+  "graph-stub": "ghcr.io/medtechcorps-netizen/rereply-staging-graph-stub@sha256:REPLACE",
+  "bootstrap": "ghcr.io/medtechcorps-netizen/rereply-staging-bootstrap@sha256:REPLACE"
+}
