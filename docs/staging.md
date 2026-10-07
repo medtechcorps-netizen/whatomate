@@ -196,26 +196,65 @@ network-level egress isolation. Do not configure real integrations or enable AI,
 SSO, TTS or calling in this instance. The internal stub accepts only synthetic
 credentials and refuses known production domains.
 
-## Later staging pipeline setup
+## Staging pipeline setup
 
 Create GitHub environments `staging` and `staging-e2e`, restricted to `main`.
-PR9/10 will consume these; this kit does not create or populate them.
+The staging workflow consumes the following environment secrets; this kit does
+not create or populate them.
 
-The table below records the original planned secret names. It is not yet a
-complete import contract: PR7 also generates a private fixture descriptor and
-two independent non-superuser logins. PR9 must provide a minimal fixture exporter
-and importer and update this table before the E2E secrets are populated. Never
-copy the complete setup state into GitHub; it contains database credentials.
+| Environment | Secret | Source |
+|---|---|---|
+| `staging` | `STAGING_DO_TOKEN` | Separate expiring staging deployment token |
+| `staging` | `STAGING_TARGET_JSON` | Exact contents of `target-export.json` |
+| `staging-e2e` | `STAGING_ORIGIN` | Verified canonical `canary.origin` from successful setup |
+| `staging-e2e` | `STAGING_STUB_CONTROL_KEY` | Existing private `canary.stub_control_key` |
+| `staging-e2e` | `STAGING_CANARY_FIXTURE_JSON` | Exact contents of `canary-export.json` |
 
-| Environment | Planned values |
-|---|---|
-| `staging` | `STAGING_DO_TOKEN`, `STAGING_TARGET_JSON` |
-| `staging-e2e` | `STAGING_ORIGIN`, `STAGING_ADMIN_EMAIL`, `STAGING_ADMIN_PASSWORD`, `STAGING_AGENT_PASSWORD`, `STAGING_KLINIK_ORG_ID`, `STAGING_OTHER_ORG_ID`, `STAGING_STUB_CONTROL_KEY` |
+After fixture provisioning and successful allowlist redeployment, run the offline
+exporters in a fresh shell without `CANARY_*` or application configuration
+overrides. Use the existing owner-only setup directory outside the checkout:
 
-Keep all values private. Create a separate expiring staging deploy token with
-only the scopes needed by that later lane, then revoke the short-lived setup
-token and remove its context from the dedicated config. Nothing here installs a
-production token or changes the production release approval policy.
+```powershell
+$stagingPrivateDir = "$env:USERPROFILE\rereply-staging-state\rereply-staging"
+py -3 -I -S -B release/deployment/stage_fixture.py export-fixture --private-file "$stagingPrivateDir\state.json" --output "$stagingPrivateDir\canary-export.json"
+py -3 -I -S -B release/deployment/stage_fixture.py export-target --private-file "$stagingPrivateDir\state.json" --output "$stagingPrivateDir\target-export.json"
+```
+
+Both commands require completed setup with the saved allowlist applied, refuse
+existing outputs, and write new owner-only files beside the state. They neither
+contact a provider nor set GitHub secrets. Target export additionally requires
+the independently reviewed real team/app fingerprints committed in
+`release/deployment/ship-target-staging.json`; null placeholders remain blocked.
+
+The fixture export preserves the two non-superuser logins, exact fixture
+identities, namespace, origin and synthetic stub app secret. It excludes the
+bootstrap administrator, database/Valkey credentials and unrelated setup state.
+The target export contains reviewed resource/image/template bindings without
+canary logins or app/database secrets. Never upload the full state file, copy it
+into a GitHub secret, or publish either export as an artifact. Bootstrap admin
+credentials and separate organization/password inputs are not E2E secrets.
+
+The E2E job masks its three inputs before checkout and runs
+`stage_fixture.py import-fixture --output "$RUNNER_TEMP/rereply-staging/canary.json"`.
+The importer binds them to the deployment receipt, candidate, run, pinned app and
+origin before writing a fresh private directory. The workflow then removes the
+three `STAGING_*` variables and passes the imported file to the CRM canary. CI
+reuses the saved fixture; it does not provision one. Provider credentials are
+confined to staging deploy/rollback steps and never enter the E2E job. See the
+[staging release contract](staging-release-contract.md) for exact schemas and
+receipt/report bindings.
+
+Use a separate deployment PAT in the **ReReply Staging** team with an explicit
+expiry and exactly these scopes: `account:read`, `app:read`, `app:update`,
+`database:read`, `actions:read`, `regions:read`, and `sizes:read`. The final three
+are DigitalOcean's required read dependencies for
+[app updates](https://docs.digitalocean.com/reference/api/scopes/app/update/)
+and [database reads](https://docs.digitalocean.com/reference/api/scopes/database/read/).
+The lane reads existing database/firewall metadata and updates the pinned app;
+it does not create resources or change firewalls. After setup and the reviewed
+deployment-token handoff are complete, revoke only the short-lived staging setup
+token and remove its dedicated context. Keep existing production DO/GitHub
+tokens unchanged; production release approval remains in force.
 
 ## Failure and reset
 
