@@ -368,7 +368,9 @@ class ProviderClientTests(unittest.TestCase):
                 self.calls.append(request.get_method()); return Response(request.full_url, {"app": {"id": APP}})
         opener = Opener()
         client = stage.StageClient(target, "synthetic-staging-token-long-enough", expected_app_id_sha256=pins["app_id_sha256"], allow_put=True, opener=opener)
-        for path in (f"/v2/apps/{PG}", f"/v2/databases/{PG}", "/v2/apps?page=11&per_page=200", "https://foreign.invalid", "/v2/account?token=x"):
+        for path in (f"/v2/apps/{PG}", f"/v2/databases/{PG}", "/v2/apps?page=11&per_page=200",
+                     "/v2/databases?page=1&per_page=200", "/v2/databases?tag_name=partial",
+                     "https://foreign.invalid", "/v2/account?token=x"):
             with self.subTest(path=path), self.assertRaises(common.ReleaseError): client._get(path, "test")
         self.assertEqual(opener.calls, [])
         client.put_app_once({})
@@ -385,9 +387,79 @@ class ProviderClientTests(unittest.TestCase):
         client._get = get
         self.assertEqual(len(client._inventory_pages("apps")), 201)
         self.assertEqual(calls[-1], "/v2/apps?page=2&per_page=200")
-        for broken in ({"apps": [], "meta": {"total": 1}}, {"apps": [{}], "meta": {"total": 2}, "links": {"pages": {"next": "https://foreign.invalid"}}}):
+        for broken in ({"apps": []}, {"apps": None, "meta": {"total": 0}},
+                       {"apps": [], "meta": {"total": True}}, {"apps": [], "meta": {"total": -1}},
+                       {"apps": [], "meta": {"total": 1}}, {"apps": [], "meta": {"total": 0}, "links": None},
+                       {"apps": [{}], "meta": {"total": 2}, "links": {"pages": {"next": "https://foreign.invalid"}}}):
             client._get = lambda *args, **kwargs: broken
             with self.assertRaises(common.ReleaseError): client._inventory_pages("apps")
+        calls.clear()
+        pages[1]["meta"]["total"] = 200
+        client._get = get
+        with self.assertRaisesRegex(common.ReleaseError, "provider-invalid:stage-pagination-drift"):
+            client._inventory_pages("apps")
+        self.assertEqual(len(calls), 2)
+
+    def inventory_client(self, inventory, database_response):
+        _, _, pins, target = data()
+        calls = []
+        responses = {
+            "/v2/account": {"account": inventory["account"]},
+            "/v2/apps?page=1&per_page=200": {"apps": inventory["apps"], "meta": {"total": len(inventory["apps"])}},
+            "/v2/databases": database_response,
+            **{f"/v2/databases/{identity}/firewall": {"rules": rules} for identity, rules in inventory["firewalls"].items()},
+        }
+        class Opener:
+            def open(self, request, timeout):
+                assert request.get_method() == "GET" and request.data is None
+                assert request.full_url.startswith(common.API_ORIGIN)
+                path = request.full_url.removeprefix(common.API_ORIGIN)
+                calls.append(path)
+                return Response(request.full_url, responses[path])
+        return stage.StageClient(target, "synthetic-staging-token-long-enough",
+            expected_app_id_sha256=pins["app_id_sha256"], allow_put=False, opener=Opener()), calls
+
+    def test_documented_unpaginated_database_envelope_completes_exact_inventory(self):
+        world = World(); inventory = world.inventory()
+        client, calls = self.inventory_client(inventory, {"databases": inventory["clusters"]})
+        observed = client.inventory()
+        self.assertEqual(observed, inventory)
+        contract.validate_inventory(**observed, target=world.target, pins=world.pins, production=world.production)
+        self.assertEqual(calls, ["/v2/account", "/v2/apps?page=1&per_page=200", "/v2/databases",
+            f"/v2/databases/{PG}/firewall", f"/v2/databases/{VK}/firewall"])
+        self.assertFalse(client.mutation_attempted)
+        self.assertEqual(client.put_count(), 0)
+
+    def test_database_envelope_refuses_malformed_or_pagination_shapes_without_followup(self):
+        inventory = World().inventory()
+        for response in (None, [], {}, {"databases": None}, {"databases": {}},
+                         {"databases": inventory["clusters"], "meta": {"total": 2}},
+                         {"databases": inventory["clusters"], "links": {}},
+                         {"databases": inventory["clusters"], "links": {"pages": {"next": "https://foreign.invalid"}}}):
+            with self.subTest(response=response):
+                client, calls = self.inventory_client(inventory, response)
+                with self.assertRaisesRegex(common.ReleaseError, "provider-invalid:stage-databases"):
+                    client.inventory()
+                self.assertEqual(calls, ["/v2/account", "/v2/apps?page=1&per_page=200", "/v2/databases"])
+                self.assertFalse(client.mutation_attempted)
+
+    def test_unpaginated_transport_retains_exact_cluster_and_firewall_validation(self):
+        for mutate in (lambda v: v["clusters"].clear(), lambda v: v["clusters"].append(v["clusters"][0]),
+                       lambda v: v["clusters"].__setitem__(1, copy.deepcopy(v["clusters"][0])),
+                       lambda v: v["clusters"][1].update(id=APP), lambda v: v["clusters"][0].update(version="18"),
+                       lambda v: v["clusters"][1].update(private_network_uuid=PG),
+                       lambda v: v["clusters"][1].update(engine="redis"),
+                       lambda v: v["account"]["team"].update(uuid="foreign"),
+                       lambda v: v["firewalls"][VK].append({"type": "ip_addr", "value": "192.0.2.1"})):
+            with self.subTest(mutate=mutate):
+                world = World(); inventory = world.inventory(); mutate(inventory)
+                client, calls = self.inventory_client(inventory, {"databases": inventory["clusters"]})
+                observed = client.inventory()
+                with self.assertRaises(common.ReleaseError):
+                    contract.validate_inventory(**observed, target=world.target, pins=world.pins, production=world.production)
+                self.assertEqual(len(calls), 5)
+                self.assertFalse(client.mutation_attempted)
+                self.assertEqual(client.put_count(), 0)
 
 
 class CLITests(unittest.TestCase):

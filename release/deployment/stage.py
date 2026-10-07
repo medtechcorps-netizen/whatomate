@@ -40,18 +40,17 @@ class StageClient(do_app.DOAppClient):
         self.valkey_id = common.require_uuid(target["valkey_id"], "target-invalid:staging-valkey")
 
     def _url(self, path):
-        allowed = {self.app_path, "/v2/account"}
+        allowed = {self.app_path, "/v2/account", "/v2/databases"}
         for cluster in (self.postgres_cluster_id, self.valkey_id):
             allowed.add(f"/v2/databases/{cluster}/firewall")
-        for collection in ("apps", "databases"):
-            allowed.update(f"/v2/{collection}?page={page}&per_page={PAGE_SIZE}" for page in range(1, MAX_PAGES + 1))
+        allowed.update(f"/v2/apps?page={page}&per_page={PAGE_SIZE}" for page in range(1, MAX_PAGES + 1))
         deployment_prefix = self.app_path + "/deployments/"
         require(type(path) is str and (path in allowed or
             (path.startswith(deployment_prefix) and common.UUID_RE.fullmatch(path[len(deployment_prefix):]))), "provider-invalid:stage-path")
         return common.API_ORIGIN + path
 
     def _inventory_pages(self, collection):
-        require(collection in {"apps", "databases"}, "internal-error:stage-collection")
+        require(collection == "apps", "internal-error:stage-collection")
         result, total = [], None
         for page in range(1, MAX_PAGES + 1):
             path = f"/v2/{collection}?page={page}&per_page={PAGE_SIZE}"
@@ -73,11 +72,20 @@ class StageClient(do_app.DOAppClient):
             require(next_link == expected and len(values) == PAGE_SIZE and len(result) < total, "provider-invalid:stage-pagination")
         common.fail("provider-invalid:stage-pagination-limit")
 
+    def _database_inventory(self):
+        # DigitalOcean lists all clusters in one unpaginated databases envelope.
+        # Do not silently accept a future paginated/partial response shape.
+        code = "provider-invalid:stage-databases"
+        value = self._get("/v2/databases", "stage-databases", decimals=True)
+        common.exact_keys(value, {"databases"}, code)
+        require(type(value["databases"]) is list, code)
+        return value["databases"]
+
     def inventory(self):
         account = self._get("/v2/account", "stage-account")
         require(type(account) is dict and type(account.get("account")) is dict, "provider-invalid:stage-account")
         apps = self._inventory_pages("apps")
-        clusters = self._inventory_pages("databases")
+        clusters = self._database_inventory()
         firewalls = {}
         for cluster in (self.postgres_cluster_id, self.valkey_id):
             value = self._get(f"/v2/databases/{cluster}/firewall", "stage-firewall")
