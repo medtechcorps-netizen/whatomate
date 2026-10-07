@@ -16,8 +16,8 @@ held real data: it refuses rather than guesses.
 | `Release plan` | Before approval: inputs, the approval gate, CI for the commit, idle old lanes, the verified record chain, no-downgrade, the schema guard, the commit list. | read-only `GITHUB_TOKEN` |
 | `Release image (web, meta-relay, gmail-relay)` | Builds each image from `docker/release/<component>.Dockerfile` at the commit, pushes it by digest, checks the runtime contract, scans it with Trivy (fresh database), makes the SPDX SBOM. Skipped for rollback. | `packages: write` |
 | `Release attestations` | Attests provenance and SBOM for the three digests, verifies them (bundle and API), proves anonymous pulls, assembles the candidate. Skipped for rollback. | `id-token`, `attestations: write` |
-| `Release staging` | Stage mode only: verifies the separate target and signed images, deploys once, checks health and restores the previous staging version on a deployment/health failure. | staging deploy token and target, this step only |
-| `Release staging CRM checks` | Stage mode only: imports the existing synthetic fixture, runs all 13 checks and emits the receipt-bound report. | three fixture inputs on masking and import/test steps only |
+| `Release staging` | Stage and normal promote: verifies the separate target and signed images, deploys once, checks health and restores the previous staging version on a deployment/health failure. | staging deploy token and target, this step only |
+| `Release staging CRM checks` | Stage and normal promote: imports the existing synthetic fixture, runs all 13 checks and emits the receipt-bound report. | three fixture inputs on masking and import/test steps only |
 | `Release staging rollback` | If staging deployed successfully but its CRM checks failed, verifies the receipt and restores that run's previous staging version. | staging deploy token and target, this step only |
 | `Release production (<mode>)` | Waits for the owner's approval of the `production` environment, then verifies, guards, deploys, smoke-tests and, on failure, rolls back. One job, one process, standard-library Python and the pinned `gh`; no `uses:` steps. | the deploy token and target secret, this step only |
 | `Release record` | Writes the attested record `prod-<UTC>-<sha8>` (not for dry-run). | `contents: write`, `attestations: write` |
@@ -52,7 +52,9 @@ Steps:
    number of changed spec leaves, "environment/topology fingerprints
    unchanged, VPC bound", the backup age and the current health. A dry-run
    makes no PUT and writes no record.
-5. Run the workflow again with mode `promote`, read the plan, and the owner
+5. Run the workflow again with mode `promote`. Staging deploys that candidate,
+   passes its health probes and all 13 CRM checks, then production becomes
+   eligible for owner review. Read the plan and bound staging report; the owner
    approves. Production deploys, the six health probes must pass in the same
    job, and the record job writes `prod-<UTC>-<sha8>`.
 6. After a promote, spend three minutes on a manual check: a Klinik WhatsApp
@@ -94,11 +96,14 @@ owner's click too.
 ## Modes
 
 - `dry-run`: everything except the PUT. Probes current production health.
-- `promote`: deploys the commit you dispatched from `main`.
+- `promote`: first deploys and tests the candidate in staging, then deploys the
+  same three digests to production after owner approval and evidence validation.
 - `stage`: builds and verifies the same candidate, then deploys only to the
   separately configured staging team and runs its 13 synthetic CRM checks.
-  The production and record jobs are ineligible. This mode does not yet gate
-  normal promotes; that later Part A PR10 change needs real stage/drill proof.
+  The production and record jobs are ineligible.
+- `promote-without-staging`: urgent owner-dispatched bypass when staging is down.
+  Staging jobs must be skipped. All production plan, schema, approval, backup,
+  attestation and health gates remain. See the break-glass limits below.
 - `rollback` with `target_release`: an earlier record tag, or `prod-0000`
   for release #0. The production job reads the live digests and decides:
   - rollback: live equals the latest record, so one PUT to the target;
@@ -167,10 +172,47 @@ after a deployment/health failure exits 2; uncertain ownership or failed recover
 exits 3 and requires manual reconciliation. A successful cross-job rollback
 does not turn the failed CRM check or original workflow into success.
 
-PR9 remains owner-merge-gated. After merge, the owner authorizes a production
+PR9 remains owner-merge-gated. After its merge, the owner authorizes a production
 dry-run, a rollback check targeting the current latest record (which must stop
 with `nothing-to-roll-back` before backup/PUT), then normal staging and each
 drill. Local synthetic tests do not substitute for those real run IDs.
+
+## Promotion gate and break-glass (Part A PR10)
+
+Normal promotes require plan, attest, deploy-staging and e2e-staging all to
+succeed. Before production makes any DigitalOcean request, it checks the
+canonical report and receipt hashes; this run and candidate; the candidate
+source and three digests; the pinned staging app; matching nonproduction origin
+hashes; the exact ordered 13 checks, 13 passes, and `drill=none`. Missing, stale
+or mismatched evidence refuses the promote. No raw staging origin, fixture or
+provider credential enters production. Dry-run and rollback never consult
+staging evidence and require staging jobs to be skipped.
+
+`promote-without-staging` is only for a staging outage that blocks an urgent fix.
+The owner must dispatch it; the plan and production command reject another
+GitHub actor. It still requires the owner's production approval. A red CAUTION
+banner appears in plan/candidate/production summaries, and release notes state
+`staging: bypassed`. It immediately follows the normal promote code path and
+records kind `promote`; the attested manifest schema and record-chain rules do
+not gain a bypass field or kind. An unchanged schema is mandatory, including
+for this emergency mode. A bypass is not permission to skip a failing product
+test or a production guard.
+
+**PR10 must not merge until all four real PR9 proofs below are recorded and
+reviewed.** They are pending; no live run IDs have been invented or substituted
+with local tests.
+
+| Required PR9 proof | Expected evidence | Actual run |
+| --- | --- | --- |
+| Normal stage | Health 6/6 and CRM 13/13, bound report | Pending |
+| `e2e-fail` | CRM failure and separate rollback restoring staging | Pending |
+| `health-fail` | Failed health gate and verified in-job restoration | Pending |
+| `bad-image` | PRE_DEPLOY failure and verified in-job restoration | Pending |
+
+After the owner reviews those proofs and authorizes PR10's merge, the owner
+authorizes the production dry-run and current-latest rollback no-PUT check,
+then approves the first normal promote that passed staging. Until then, this
+local PR10 preparation is not an authorization to dispatch or promote.
 
 
 ## Guards

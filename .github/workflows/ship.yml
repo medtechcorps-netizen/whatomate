@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: dry-run (no PUT), promote, rollback, or stage
+        description: dry-run, promote, rollback, stage, or urgent owner-only promote-without-staging
         required: true
         type: choice
         default: dry-run
@@ -21,6 +21,7 @@ on:
           - promote
           - rollback
           - stage
+          - promote-without-staging
       drill:
         description: Staging-only failure rehearsal
         required: true
@@ -125,7 +126,7 @@ jobs:
   images:
     name: Release image (${{ matrix.component }})
     needs: plan
-    if: ${{ contains(fromJSON('["dry-run","promote","stage"]'), inputs.mode) }}
+    if: ${{ contains(fromJSON('["dry-run","promote","stage","promote-without-staging"]'), inputs.mode) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -409,7 +410,7 @@ jobs:
     needs:
       - plan
       - images
-    if: ${{ contains(fromJSON('["dry-run","promote","stage"]'), inputs.mode) }}
+    if: ${{ contains(fromJSON('["dry-run","promote","stage","promote-without-staging"]'), inputs.mode) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -551,6 +552,8 @@ jobs:
 
       - name: Assemble the candidate
         id: candidate
+        env:
+          SHIP_MODE: ${{ inputs.mode }}
         run: /usr/bin/python3 -I -S -B release/deployment/ship.py candidate --stage assemble
 
   deploy-staging:
@@ -558,7 +561,7 @@ jobs:
     needs:
       - plan
       - attest
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && inputs.mode == 'stage' && needs.plan.result == 'success' && needs.attest.result == 'success' }}
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && contains(fromJSON('["stage","promote"]'), inputs.mode) && needs.plan.result == 'success' && needs.attest.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     environment: staging
@@ -617,7 +620,7 @@ jobs:
           STAGING_DO_TOKEN: ${{ secrets.STAGING_DO_TOKEN }}
           STAGING_TARGET_JSON: ${{ secrets.STAGING_TARGET_JSON }}
           GH_TOKEN: ${{ github.token }}
-          SHIP_MODE: ${{ inputs.mode }}
+          SHIP_MODE: stage
           SHIP_DRILL: ${{ inputs.drill }}
           SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
           PLAN_LATEST_RELEASE: ${{ needs.plan.outputs.latest_release }}
@@ -631,7 +634,7 @@ jobs:
     needs:
       - attest
       - deploy-staging
-    if: ${{ !cancelled() && inputs.mode == 'stage' && needs.attest.result == 'success' && needs.deploy-staging.result == 'success' }}
+    if: ${{ !cancelled() && contains(fromJSON('["stage","promote"]'), inputs.mode) && needs.attest.result == 'success' && needs.deploy-staging.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: staging-e2e
@@ -725,7 +728,7 @@ jobs:
       - attest
       - deploy-staging
       - e2e-staging
-    if: ${{ !cancelled() && inputs.mode == 'stage' && needs.deploy-staging.result == 'success' && contains(fromJSON('["failure","cancelled"]'), needs.e2e-staging.result) }}
+    if: ${{ !cancelled() && contains(fromJSON('["stage","promote"]'), inputs.mode) && needs.deploy-staging.result == 'success' && contains(fromJSON('["failure","cancelled"]'), needs.e2e-staging.result) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     environment: staging
@@ -779,7 +782,7 @@ jobs:
           STAGING_DO_TOKEN: ${{ secrets.STAGING_DO_TOKEN }}
           STAGING_TARGET_JSON: ${{ secrets.STAGING_TARGET_JSON }}
           GH_TOKEN: ${{ github.token }}
-          SHIP_MODE: ${{ inputs.mode }}
+          SHIP_MODE: stage
           SHIP_DRILL: ${{ inputs.drill }}
           SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
           PLAN_LATEST_RELEASE: ${{ needs.plan.outputs.latest_release }}
@@ -795,7 +798,9 @@ jobs:
     needs:
       - plan
       - attest
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && contains(fromJSON('["dry-run","promote","rollback"]'), inputs.mode) && needs.plan.result == 'success' && ((inputs.mode == 'rollback' && needs.attest.result == 'skipped') || (contains(fromJSON('["dry-run","promote"]'), inputs.mode) && needs.attest.result == 'success')) }}
+      - deploy-staging
+      - e2e-staging
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.plan.result == 'success' && ((inputs.mode == 'promote' && needs.attest.result == 'success' && needs.deploy-staging.result == 'success' && needs.e2e-staging.result == 'success') || (contains(fromJSON('["dry-run","promote-without-staging"]'), inputs.mode) && needs.attest.result == 'success' && needs.deploy-staging.result == 'skipped' && needs.e2e-staging.result == 'skipped') || (inputs.mode == 'rollback' && needs.attest.result == 'skipped' && needs.deploy-staging.result == 'skipped' && needs.e2e-staging.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     # Above the worst-case deploy + rollback path (ship.py
     # production_worst_case_seconds, checked by test_ship_workflow).
@@ -877,13 +882,17 @@ jobs:
           PLAN_TARGET_MANIFEST_SHA256: ${{ needs.plan.outputs.target_manifest_sha256 }}
           CANDIDATE_B64: ${{ needs.attest.outputs.candidate_b64 }}
           CANDIDATE_SHA256: ${{ needs.attest.outputs.candidate_sha256 }}
+          STAGE_RECEIPT_B64: ${{ needs.deploy-staging.outputs.receipt_b64 }}
+          STAGE_RECEIPT_SHA256: ${{ needs.deploy-staging.outputs.receipt_sha256 }}
+          STAGE_REPORT_B64: ${{ needs.e2e-staging.outputs.report_b64 }}
+          STAGE_REPORT_SHA256: ${{ needs.e2e-staging.outputs.report_sha256 }}
         run: /usr/bin/python3 -I -S -B release/deployment/ship.py production
 
   record:
     name: Release record
     needs:
       - production
-    if: ${{ !cancelled() && needs.production.result == 'success' && contains(fromJSON('["promote","rollback"]'), inputs.mode) }}
+    if: ${{ !cancelled() && needs.production.result == 'success' && contains(fromJSON('["promote","rollback","promote-without-staging"]'), inputs.mode) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -918,6 +927,7 @@ jobs:
         id: manifest
         env:
           GH_TOKEN: ${{ github.token }}
+          SHIP_MODE: ${{ inputs.mode }}
           REC_RELEASE: ${{ needs.production.outputs.release }}
           REC_KIND: ${{ needs.production.outputs.kind }}
           REC_SHA: ${{ needs.production.outputs.sha }}
@@ -943,9 +953,11 @@ jobs:
       - name: Publish the release record
         env:
           GH_TOKEN: ${{ github.token }}
+          SHIP_MODE: ${{ inputs.mode }}
         run: /usr/bin/python3 -I -S -B release/deployment/ship.py record --stage publish
 
       - name: Verify the published record
         env:
           GH_TOKEN: ${{ github.token }}
+          SHIP_MODE: ${{ inputs.mode }}
         run: /usr/bin/python3 -I -S -B release/deployment/ship.py record --stage verify

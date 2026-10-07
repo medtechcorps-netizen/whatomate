@@ -2,6 +2,7 @@
 
 import ast
 import json
+import itertools
 import re
 import subprocess
 import sys
@@ -36,15 +37,17 @@ def condition(job, mode, *, results=None, cancelled=False, ref="refs/heads/main"
 
 class StageWorkflowTests(unittest.TestCase):
     def test_mode_truth_table_and_unknown_mode_fail_closed(self):
-        for mode in ("dry-run", "promote", "rollback", "stage", "unknown", ""):
+        for mode in ("dry-run", "promote", "rollback", "stage", "promote-without-staging", "unknown", ""):
             results = {name: "success" for name in JOBS}
+            if mode in {"dry-run", "rollback", "promote-without-staging"}:
+                results.update({"deploy-staging": "skipped", "e2e-staging": "skipped"})
             if mode == "rollback": results["attest"] = "skipped"
             expected = {
-                "images": mode in {"dry-run", "promote", "stage"},
-                "attest": mode in {"dry-run", "promote", "stage"},
-                "production": mode in {"dry-run", "promote", "rollback"},
-                "record": mode in {"promote", "rollback"},
-                "deploy-staging": mode == "stage", "e2e-staging": mode == "stage", "staging-rollback": False,
+                "images": mode in {"dry-run", "promote", "stage", "promote-without-staging"},
+                "attest": mode in {"dry-run", "promote", "stage", "promote-without-staging"},
+                "production": mode in {"dry-run", "promote", "rollback", "promote-without-staging"},
+                "record": mode in {"promote", "rollback", "promote-without-staging"},
+                "deploy-staging": mode in {"stage", "promote"}, "e2e-staging": mode in {"stage", "promote"}, "staging-rollback": False,
             }
             for job, allowed in expected.items():
                 with self.subTest(mode=mode, job=job):
@@ -56,7 +59,8 @@ class StageWorkflowTests(unittest.TestCase):
         for status in ("failure", "cancelled", "skipped", "success"):
             results["e2e-staging"] = status
             self.assertEqual(condition("staging-rollback", "stage", results=results), status in {"failure", "cancelled"})
-            self.assertFalse(condition("staging-rollback", "promote", results=results))
+            self.assertEqual(condition("staging-rollback", "promote", results=results), status in {"failure", "cancelled"})
+            self.assertFalse(condition("staging-rollback", "promote-without-staging", results=results))
             self.assertFalse(condition("staging-rollback", "stage", results=results, cancelled=True))
         results["e2e-staging"] = "failure"
         for status in ("failure", "cancelled", "skipped"):
@@ -68,6 +72,18 @@ class StageWorkflowTests(unittest.TestCase):
             self.assertFalse(condition(job, mode, results=results, ref="refs/heads/other"))
             self.assertFalse(condition(job, mode, results={**results, "plan": "failure"}))
             self.assertFalse(condition(job, mode, results={**results, "attest": "failure"}))
+
+    def test_production_result_combinations_never_bypass_staging_by_accident(self):
+        names = ("plan", "attest", "deploy-staging", "e2e-staging")
+        for mode in ("dry-run", "promote", "rollback", "stage", "promote-without-staging", "unknown"):
+            for values in itertools.product(("success", "skipped", "failure", "cancelled"), repeat=4):
+                plan, attest, deploy, e2e = values
+                expected = plan == "success" and (
+                    (mode == "promote" and attest == deploy == e2e == "success") or
+                    (mode in {"dry-run", "promote-without-staging"} and attest == "success" and deploy == e2e == "skipped") or
+                    (mode == "rollback" and attest == deploy == e2e == "skipped"))
+                with self.subTest(mode=mode, results=values):
+                    self.assertEqual(condition("production", mode, results=dict(zip(names, values))), expected)
 
     def test_drill_input_and_step_scopes_are_exact(self):
         self.assertEqual(JOBS["e2e-staging"]["container"], {
@@ -88,6 +104,7 @@ class StageWorkflowTests(unittest.TestCase):
             self.assertFalse(any("uses" in item for item in steps(job)))
             secret_steps = [item for item in steps(job) if any("secrets." in str(v) for v in item.get("env", {}).values())]
             self.assertEqual(len(secret_steps), 1)
+            self.assertEqual(secret_steps[0]["env"]["SHIP_MODE"], "stage")
             self.assertEqual({key for key, value in secret_steps[0]["env"].items() if "secrets." in str(value)}, {"STAGING_DO_TOKEN", "STAGING_TARGET_JSON"})
 
     def test_fixture_and_report_freshness_precede_browser_requests(self):

@@ -279,7 +279,7 @@ class TriggerAndTopLevelTests(unittest.TestCase):
         inputs = DOC["on"]["workflow_dispatch"]["inputs"]
         self.assertEqual(set(inputs), {"mode", "target_release", "drill"})
         self.assertEqual({key: inputs["mode"][key] for key in ("required", "type", "default", "options")},
-                         {"required": True, "type": "choice", "default": "dry-run", "options": ["dry-run", "promote", "rollback", "stage"]})
+                         {"required": True, "type": "choice", "default": "dry-run", "options": ["dry-run", "promote", "rollback", "stage", "promote-without-staging"]})
         self.assertEqual({key: inputs["target_release"][key] for key in ("required", "type", "default")},
                          {"required": False, "type": "string", "default": ""})
         for trigger in ("push", "pull_request", "pull_request_target", "schedule", "workflow_run", "workflow_call"):
@@ -358,19 +358,20 @@ class JobShapeTests(unittest.TestCase):
         self.assertNotIn("needs", JOBS["plan"])
         self.assertNotIn("if", JOBS["plan"])
         self.assertEqual(JOBS["images"]["needs"], "plan")
-        self.assertEqual(JOBS["images"]["if"], "${{ contains(fromJSON('[\"dry-run\",\"promote\",\"stage\"]'), inputs.mode) }}")
+        self.assertEqual(JOBS["images"]["if"], "${{ contains(fromJSON('[\"dry-run\",\"promote\",\"stage\",\"promote-without-staging\"]'), inputs.mode) }}")
         self.assertEqual(JOBS["attest"]["needs"], ["plan", "images"])
-        self.assertEqual(JOBS["attest"]["if"], "${{ contains(fromJSON('[\"dry-run\",\"promote\",\"stage\"]'), inputs.mode) }}")
-        self.assertEqual(JOBS["production"]["needs"], ["plan", "attest"])
+        self.assertEqual(JOBS["attest"]["if"], "${{ contains(fromJSON('[\"dry-run\",\"promote\",\"stage\",\"promote-without-staging\"]'), inputs.mode) }}")
+        self.assertEqual(JOBS["production"]["needs"], ["plan", "attest", "deploy-staging", "e2e-staging"])
         self.assertEqual(
             JOBS["production"]["if"],
-            "${{ !cancelled() && github.ref == 'refs/heads/main' && contains(fromJSON('[\"dry-run\",\"promote\",\"rollback\"]'), inputs.mode) && needs.plan.result == 'success' && "
-            "((inputs.mode == 'rollback' && needs.attest.result == 'skipped') || "
-            "(contains(fromJSON('[\"dry-run\",\"promote\"]'), inputs.mode) && needs.attest.result == 'success')) }}",
+            "${{ !cancelled() && github.ref == 'refs/heads/main' && needs.plan.result == 'success' && "
+            "((inputs.mode == 'promote' && needs.attest.result == 'success' && needs.deploy-staging.result == 'success' && needs.e2e-staging.result == 'success') || "
+            "(contains(fromJSON('[\"dry-run\",\"promote-without-staging\"]'), inputs.mode) && needs.attest.result == 'success' && needs.deploy-staging.result == 'skipped' && needs.e2e-staging.result == 'skipped') || "
+            "(inputs.mode == 'rollback' && needs.attest.result == 'skipped' && needs.deploy-staging.result == 'skipped' && needs.e2e-staging.result == 'skipped')) }}",
         )
         self.assertEqual(JOBS["record"]["needs"], ["production"])
         self.assertEqual(JOBS["record"]["if"],
-                         "${{ !cancelled() && needs.production.result == 'success' && contains(fromJSON('[\"promote\",\"rollback\"]'), inputs.mode) }}")
+                         "${{ !cancelled() && needs.production.result == 'success' && contains(fromJSON('[\"promote\",\"rollback\",\"promote-without-staging\"]'), inputs.mode) }}")
 
     def test_environment_and_job_concurrency_are_separated(self) -> None:
         environments = {"production": "production", "deploy-staging": "staging", "staging-rollback": "staging", "e2e-staging": "staging-e2e"}

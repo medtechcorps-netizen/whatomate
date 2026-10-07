@@ -894,6 +894,7 @@ def context_env(sha: str, temp: Path) -> dict[str, str]:
     runner_temp.mkdir(parents=True, exist_ok=True)
     env = {
         "GITHUB_REPOSITORY": REPO,
+        "GITHUB_ACTOR": common.APPROVER_LOGIN,
         "GITHUB_REF": "refs/heads/main",
         "GITHUB_REF_PROTECTED": "true",
         "GITHUB_EVENT_NAME": "workflow_dispatch",
@@ -941,6 +942,26 @@ def candidate_b64(images: Mapping[str, str], sha: str, built_at: dt.datetime, *,
     return base64.b64encode(raw).decode("ascii"), hashlib.sha256(raw).hexdigest()
 
 
+def staging_evidence(candidate: Mapping[str, Any], candidate_hash: str, *, previous_sha: str) -> dict[str, str]:
+    """Synthetic successful same-run stage outputs; no real fixture or identifiers."""
+    from stage_report import CHECKS
+    receipt = {
+        "schema_version": 1, "profile": "staging", "run_id": RUN_ID, "candidate_sha256": candidate_hash,
+        "ingress_sha256": "f" * 64, "app_id_sha256": "e" * 64, "drill": "none",
+        "previous_images": dict(LIVE), "candidate_images": dict(candidate["images"]),
+        "before_spec_sha256": "1" * 64, "after_spec_sha256": "2" * 64,
+        "before_deployment_sha256": "3" * 64, "candidate_deployment_sha256": "4" * 64,
+        "previous_source_sha": previous_sha, "candidate_source_sha": candidate["sha"],
+    }
+    raw = canonical(receipt)
+    receipt_hash = hashlib.sha256(raw).hexdigest()
+    report = {"receipt_sha256": receipt_hash, "run_id": RUN_ID, "candidate_sha256": candidate_hash,
+              "origin_sha256": "f" * 64, "checks": list(CHECKS), "passed": 13}
+    report_raw = canonical(report)
+    return {"STAGE_RECEIPT_B64": base64.b64encode(raw).decode(), "STAGE_RECEIPT_SHA256": receipt_hash,
+            "STAGE_REPORT_B64": base64.b64encode(report_raw).decode(), "STAGE_REPORT_SHA256": hashlib.sha256(report_raw).hexdigest()}
+
+
 def scan_private(text: str, extra: Iterable[str] = ()) -> list[str]:
     """Return every private marker found in text, ignoring ::add-mask:: lines."""
     findings: list[str] = []
@@ -977,6 +998,8 @@ class Harness:
         self.clock_value = NOW
         target = temp / "ship-target.json"
         target.write_bytes(canonical(make_target()))
+        staging_pins = temp / "ship-target-staging.json"
+        staging_pins.write_bytes(canonical({"schema_version": 1, "profile": "staging", "team_uuid_sha256": "d" * 64, "app_id_sha256": "e" * 64}))
         self.bootstrap = bootstrap_record(bootstrap_sha)
         bootstrap_path = temp / "ship-bootstrap-record.json"
         bootstrap_raw = canonical(self.bootstrap)
@@ -984,7 +1007,7 @@ class Harness:
         self.bootstrap_sha256 = hashlib.sha256(bootstrap_raw).hexdigest()
         policy = temp / "ship.trivyignore"
         policy.write_bytes(b"# no exceptions\n")
-        self.paths = {"target": target, "bootstrap": bootstrap_path, "policy": policy}
+        self.paths = {"target": target, "bootstrap": bootstrap_path, "policy": policy, "staging_pins": staging_pins}
         self.gh.attest_legacy_images(LIVE, bootstrap_sha)
         self.gh.ci_green(head)
         self.poll_limit = 8
@@ -999,6 +1022,7 @@ class Harness:
             stdout=self.stdout,
             repo_dir=self.repo.root,
             target_path=self.paths["target"],
+            staging_pins_path=self.paths["staging_pins"],
             bootstrap_path=self.paths["bootstrap"],
             bootstrap_sha256=self.bootstrap_sha256,
             trivy_policy_path=self.paths["policy"],
@@ -1010,6 +1034,8 @@ class Harness:
 
     def production_env(self, mode: str = "promote", *, target_release: str = "", images: Mapping[str, str] = NEW,
                        built_at: dt.datetime | None = None) -> None:
+        for name in ("STAGE_RECEIPT_B64", "STAGE_RECEIPT_SHA256", "STAGE_REPORT_B64", "STAGE_REPORT_SHA256"):
+            self.env.pop(name, None)
         self.env.update({
             "SHIP_DO_TOKEN": DO_TOKEN,
             "SHIP_TARGET_JSON": json.dumps({"schema_version": 1, "app_id": APP_ID, "postgres_cluster_id": PG_ID}),
@@ -1027,6 +1053,8 @@ class Harness:
             self.env["CANDIDATE_B64"] = encoded
             self.env["CANDIDATE_SHA256"] = digest_value
             self.gh.attest_ship_images(images, self.head)
+            if mode == "promote":
+                self.env.update(staging_evidence(json.loads(base64.b64decode(encoded)), digest_value, previous_sha=self.bootstrap["sha"]))
 
     def run(self, *argv: str) -> int:
         return self.ship.main(list(argv), self.env, self.deps())
