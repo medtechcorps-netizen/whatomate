@@ -892,7 +892,7 @@ func TestStagedIdentityReviewQueueExposesOnlyOpenHoldReceipts(t *testing.T) {
 	require.NoError(t, db.Model(&models.Contact{}).Where("organization_id = ? AND id = ?", organization.ID, direct.ID).
 		Update("bs_uid", "queue-direct-principal").Error)
 
-	channelAccount, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, channelapi.LegacyMetaAccountRef{
+	channelAccount, err := ensureFencedLegacyMetaAccountForTest(db, channelapi.LegacyMetaAccountRef{
 		ID: account.ID, OrganizationID: organization.ID, Name: account.Name, Status: account.Status,
 	})
 	require.NoError(t, err)

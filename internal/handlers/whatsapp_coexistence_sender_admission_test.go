@@ -804,7 +804,7 @@ func stageCoexistenceReceiptAsBeforeThisChange(
 		if err := database.LockOrganizationPolicyScope(scoped.DB, account.OrganizationID); err != nil {
 			return err
 		}
-		channelAccount, err := channelapi.EnsureLegacyMetaWhatsAppAccount(scoped.DB, channelapi.LegacyMetaAccountRef{
+		channelAccount, err := ensureFencedLegacyMetaAccountForTest(scoped.DB, channelapi.LegacyMetaAccountRef{
 			ID: account.ID, OrganizationID: account.OrganizationID, Name: account.Name, Status: account.Status,
 		})
 		if err != nil {

@@ -1163,7 +1163,7 @@ func TestUpdateAccountContractRenameReleasesOrganizationBeforeSubscription(t *te
 		Status:         "active",
 	}
 	require.NoError(t, app.DB.Create(account).Error)
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+	shadow, err := ensureFencedLegacyMetaAccountForTest(app.DB, channelapi.LegacyMetaAccountRef{
 		ID: account.ID, OrganizationID: org.ID, Name: account.Name, Status: account.Status,
 	})
 	require.NoError(t, err)
@@ -1249,7 +1249,7 @@ func TestUpdateAccountSupersededSubscriptionKeepsOneDefaultAccount(t *testing.T)
 		AccessToken: oldToken, APIVersion: "v21.0", Status: "active",
 	}
 	require.NoError(t, app.DB.Create(account).Error)
-	_, err = channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+	_, err = ensureFencedLegacyMetaAccountForTest(app.DB, channelapi.LegacyMetaAccountRef{
 		ID: account.ID, OrganizationID: org.ID, Name: account.Name, Status: account.Status,
 	})
 	require.NoError(t, err)
@@ -1980,71 +1980,89 @@ func TestUpdateAccountSubscriptionStatusTakesTheOrganizationBeforeTheAccountRow(
 // holds its fence while the update starts: the update must wait for the
 // organization without having touched the account row, so the admission can
 // still read that row.
-func TestUpdateAccountWithoutRenameTakesTheOrganizationBeforeTheAccountRow(t *testing.T) {
-	for _, rlsEnabled := range []bool{false, true} {
-		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
-			phoneID, wabaID := contractGraphIDs()
-			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
-			app := newWhatsAppContractApp(t, meta)
-			installPlatformComplianceWriteGuard(t, app)
-			org := testutil.CreateTestOrganization(t, app.DB)
-			user := contractWriter(t, app, org.ID)
-			account := createDefaultMoveAccount(t, app, org.ID, "Unrenamed", false)
-			app.Config.Database.RLSEnabled = rlsEnabled
+func TestAccountUpdateAndDeleteTakeOrganizationBeforeAccountRow(t *testing.T) {
+	for _, deleting := range []bool{false, true} {
+		for _, rlsEnabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("delete=%v/rls=%v", deleting, rlsEnabled), func(t *testing.T) {
+				phoneID, wabaID := contractGraphIDs()
+				meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+				app := newWhatsAppContractApp(t, meta)
+				installPlatformComplianceWriteGuard(t, app)
+				org := testutil.CreateTestOrganization(t, app.DB)
+				user := integrationTestUser(t, app, org.ID, "accounts:read", "accounts:write", "accounts:delete")
+				account := createDefaultMoveAccount(t, app, org.ID, "Unrenamed", false)
+				app.Config.Database.RLSEnabled = rlsEnabled
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			admission := app.DB.WithContext(ctx).Begin()
-			require.NoError(t, admission.Error)
-			defer func() { _ = admission.Rollback().Error }()
-			require.NoError(t, database.LockOrganizationPolicyScope(admission, org.ID))
-			var admissionPID int
-			require.NoError(t, admission.Session(&gorm.Session{NewDB: true}).
-				Raw("SELECT pg_backend_pid()").Scan(&admissionPID).Error)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				admission := app.DB.WithContext(ctx).Begin()
+				require.NoError(t, admission.Error)
+				defer func() { _ = admission.Rollback().Error }()
+				require.NoError(t, database.LockOrganizationPolicyScope(admission, org.ID))
+				var admissionPID int
+				require.NoError(t, admission.Session(&gorm.Session{NewDB: true}).
+					Raw("SELECT pg_backend_pid()").Scan(&admissionPID).Error)
 
-			req := testutil.NewJSONRequest(t, map[string]any{"auto_read_receipt": true})
-			testutil.SetAuthContext(req, org.ID, user.ID)
-			testutil.SetPathParam(req, "id", account.ID.String())
-			var handlerErr error
-			handled := make(chan struct{})
-			go func() {
-				defer close(handled)
-				handlerErr = app.Tenant((*App).UpdateAccount)(req)
-			}()
-			defer func() {
-				_ = admission.Rollback().Error
+				req := testutil.NewJSONRequest(t, map[string]any{"auto_read_receipt": true})
+				testutil.SetAuthContext(req, org.ID, user.ID)
+				testutil.SetPathParam(req, "id", account.ID.String())
+				var handlerErr error
+				handled := make(chan struct{})
+				go func() {
+					defer close(handled)
+					if deleting {
+						handlerErr = app.Tenant((*App).DeleteAccount)(req)
+					} else {
+						handlerErr = app.Tenant((*App).UpdateAccount)(req)
+					}
+				}()
+				defer func() {
+					_ = admission.Rollback().Error
+					select {
+					case <-handled:
+					case <-time.After(15 * time.Second):
+						t.Error("update did not terminate")
+					}
+				}()
+				require.Eventually(t, func() bool {
+					var waiting bool
+					return app.DB.Raw(
+						"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid)))",
+						admissionPID,
+					).Scan(&waiting).Error == nil && waiting
+				}, 10*time.Second, 5*time.Millisecond, "the update must wait for the admission's organization lock")
+
+				// The admission's next step: the account row, FOR SHARE.
+				var held []models.WhatsAppAccount
+				require.NoError(t, admission.Clauses(clause.Locking{Strength: "SHARE", Options: "NOWAIT"}).
+					Select("id").Where("id = ? AND organization_id = ?", account.ID, org.ID).Find(&held).Error,
+					"the update locked the account row before the organization")
+				require.NoError(t, admission.Commit().Error)
 				select {
 				case <-handled:
+					require.NoError(t, handlerErr)
 				case <-time.After(15 * time.Second):
-					t.Error("update did not terminate")
+					require.Fail(t, "update did not finish after the admission committed")
 				}
-			}()
-			require.Eventually(t, func() bool {
-				var waiting bool
-				return app.DB.Raw(
-					"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE ? = ANY(pg_catalog.pg_blocking_pids(pid)))",
-					admissionPID,
-				).Scan(&waiting).Error == nil && waiting
-			}, 10*time.Second, 5*time.Millisecond, "the update must wait for the admission's organization lock")
-
-			// The admission's next step: the account row, FOR SHARE.
-			var held []models.WhatsAppAccount
-			require.NoError(t, admission.Clauses(clause.Locking{Strength: "SHARE", Options: "NOWAIT"}).
-				Select("id").Where("id = ? AND organization_id = ?", account.ID, org.ID).Find(&held).Error,
-				"the update locked the account row before the organization")
-			require.NoError(t, admission.Commit().Error)
-			select {
-			case <-handled:
-				require.NoError(t, handlerErr)
-			case <-time.After(15 * time.Second):
-				require.Fail(t, "update did not finish after the admission committed")
-			}
-			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
-			var stored models.WhatsAppAccount
-			require.NoError(t, app.DB.Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
-			assert.True(t, stored.AutoReadReceipt)
-			assert.Len(t, accountAuditFields(t, app, org.ID, account.ID), 1)
-		})
+				require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+				var stored models.WhatsAppAccount
+				require.NoError(t, app.DB.Unscoped().Where("id = ? AND organization_id = ?", account.ID, org.ID).First(&stored).Error)
+				if deleting {
+					assert.True(t, stored.DeletedAt.Valid)
+				} else {
+					assert.True(t, stored.AutoReadReceipt)
+				}
+				if deleting {
+					var audits int64
+					require.NoError(t, app.DB.Model(&models.AuditLog{}).Where(
+						"organization_id = ? AND resource_type = ? AND resource_id = ? AND action = ?",
+						org.ID, "account", account.ID, models.AuditActionDeleted).Count(&audits).Error)
+					assert.EqualValues(t, 1, audits)
+				} else {
+					assert.Len(t, accountAuditFields(t, app, org.ID, account.ID), 1)
+				}
+			})
+		}
 	}
 }
 
@@ -2065,7 +2083,7 @@ func TestUpdateAccountRenameWaitingForASendLeavesPolicyFenceAvailable(t *testing
 		AccessToken: token, APIVersion: "v21.0", Status: "active",
 	}
 	require.NoError(t, app.DB.Create(account).Error)
-	_, err = channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+	shadow, err := ensureFencedLegacyMetaAccountForTest(app.DB, channelapi.LegacyMetaAccountRef{
 		ID: account.ID, OrganizationID: org.ID, Name: account.Name, Status: account.Status,
 	})
 	require.NoError(t, err)
@@ -2114,6 +2132,12 @@ func TestUpdateAccountRenameWaitingForASendLeavesPolicyFenceAvailable(t *testing
 	require.NoError(t, fence.Exec("SET LOCAL lock_timeout = '1s'").Error)
 	require.NoError(t, database.LockOrganizationPolicyScope(fence, org.ID),
 		"the rename held the policy fence while it waited for the send")
+	// Admission must also be able to lock this same shadow while the rename
+	// waits on the native account. Holding only the fence was insufficient.
+	var available models.ChannelAccount
+	require.NoError(t, fence.Clauses(clause.Locking{Strength: "UPDATE", Options: "NOWAIT"}).
+		Where("id = ?", shadow.ID).First(&available).Error,
+		"rename held the shadow while waiting for a send's account row")
 	require.NoError(t, fence.Commit().Error)
 
 	require.NoError(t, send.Commit().Error)

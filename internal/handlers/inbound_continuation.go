@@ -445,6 +445,9 @@ func (p *InboundContinuationProcessor) processClaimed(
 	// in a short committed phase. Authority/contact/message locks must be
 	// released before the provider scope and its independent action ledger.
 	scopeErr := p.app.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+		if err := database.LockOrganizationPolicyScope(scoped.DB, organizationID); err != nil {
+			return err
+		}
 		var loadErr error
 		work, loadErr = loadInboundContinuationWork(scoped, organizationID, job)
 		return loadErr

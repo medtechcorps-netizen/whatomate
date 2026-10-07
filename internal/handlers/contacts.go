@@ -2481,7 +2481,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 			}
 			updates["deleted_at"] = nil
 			activityKey := "contact-restored:" + existingContact.ID.String() + ":" + uuid.NewString()
-			if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+			if err := contactSelectorWriteTransaction(a.DB, orgID, func(tx *gorm.DB) error {
 				if err := tx.Unscoped().Model(&existingContact).Updates(updates).Error; err != nil {
 					return err
 				}
@@ -2536,7 +2536,7 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 		contact.Metadata = models.JSONB(req.Metadata)
 	}
 
-	if err := canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+	if err := contactSelectorWriteTransaction(a.DB, orgID, func(tx *gorm.DB) error {
 		if err := tx.Create(&contact).Error; err != nil {
 			return err
 		}
@@ -2726,7 +2726,7 @@ func (a *App) DeleteContact(r *fastglue.Request) error {
 	}
 
 	var contact models.Contact
-	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
+	err = contactSelectorWriteTransaction(a.DB, orgID, func(tx *gorm.DB) error {
 		if loadErr := tx.Where("id = ? AND organization_id = ?", contactID, orgID).
 			First(&contact).Error; loadErr != nil {
 			return loadErr
