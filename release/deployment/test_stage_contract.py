@@ -51,10 +51,20 @@ class ContractTests(unittest.TestCase):
     def check_target(self, value=None):
         return stage.validate_target(self.target if value is None else value, self.pins, self.production, self.template)
 
-    def test_committed_target_is_explicitly_unconfigured(self):
+    def test_committed_target_matches_reviewed_real_fingerprints(self):
         pins = common.loads_strict((Path(__file__).parent / "ship-target-staging.json").read_bytes())
-        with self.assertRaisesRegex(common.ReleaseError, "staging-unconfigured"):
-            stage.validate_pins(pins, self.production)
+        self.assertEqual(pins, {
+            "schema_version": 1, "profile": "staging",
+            "team_uuid_sha256": "52504532a5370edb19ebf6d5795e89529f8d121f329f02e1c753bd595f110bdc",
+            "app_id_sha256": "e28d3cb303f0dc455d83f5457dfbb81345cd00cf16f7aba32faefe2729025c56",
+        })
+        self.assertEqual(stage.validate_pins(pins, self.production), pins)
+
+    def test_explicit_unconfigured_pins_are_refused(self):
+        for missing in ({"team_uuid_sha256"}, {"app_id_sha256"}, {"team_uuid_sha256", "app_id_sha256"}):
+            pins = {**self.pins, **dict.fromkeys(missing)}
+            with self.subTest(missing=sorted(missing)), self.assertRaisesRegex(common.ReleaseError, "staging-unconfigured"):
+                stage.validate_pins(pins, self.production)
 
     def test_target_exact_shape_and_local_identity(self):
         self.assertEqual(self.check_target(), self.target)
