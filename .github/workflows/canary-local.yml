@@ -1,0 +1,97 @@
+name: Local CRM Canary (advisory)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stress:
+        description: 'Run 120 passes per check and 80 late-layout probes'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canary-local-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  canary-local:
+    name: canary-local-advisory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    services:
+      postgres:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CANARY_PROFILE: local
+      CANARY_STRESS: ${{ inputs.stress && '1' || '0' }}
+      CI: true
+    steps:
+      - name: Set private local output paths
+        run: |
+          printf 'CANARY_PRIVATE_FILE=%s/canary/private.json\nCANARY_REPORT_FILE=%s/canary/report.json\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.6'
+          cache: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+        working-directory: frontend
+      - name: Verify profile, report, port and version contracts
+        run: npm run test:canary:unit
+        working-directory: frontend
+      - name: Configure disposable local database roles and private files
+        run: node frontend/e2e/canary/local-stack.mjs configure
+      - name: Bootstrap production-equivalent tenant RLS with synthetic data
+        # The wrapper executes go run ./release/staging/bootstrap with an
+        # environment that refuses/scrubs ambient application/relay overrides.
+        run: node frontend/e2e/canary/local-stack.mjs bootstrap
+      - name: Build the product and isolated stub
+        run: |
+          set -euo pipefail
+          (cd frontend && npm run build)
+          cp -r frontend/dist/. internal/frontend/dist/
+          go build -mod=readonly -o "$RUNNER_TEMP/canary/rereply" ./cmd/whatomate
+          go build -mod=readonly -o "$RUNNER_TEMP/canary/graph-stub" ./release/staging/graphstub/cmd/graph-stub
+      - name: Start local backend and stub
+        run: node frontend/e2e/canary/local-stack.mjs start
+      - name: Install pinned Chromium
+        run: npx playwright install chromium --with-deps
+        working-directory: frontend
+      - name: Provision synthetic fixture through the product and stub APIs
+        run: npm run canary:provision
+        working-directory: frontend
+      - name: Run CRM canary
+        run: npm run test:canary
+        working-directory: frontend
+      - name: Require exact passed-check inventory
+        run: npm run test:canary:verify -- "$CANARY_REPORT_FILE"
+        working-directory: frontend
+      # No environment, secrets, production access or uploaded artifacts. The
+      # old production driver remains until Part A PR11. This job is advisory.
