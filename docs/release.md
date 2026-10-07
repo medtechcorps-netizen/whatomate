@@ -120,8 +120,10 @@ signer; any other digest must be signed by `ship.yml`.
 
 Finish [the staging owner setup](staging.md) and
 [the staging target, fixture and receipt contract](staging-release-contract.md)
-before using `stage`. The committed staging team and app hashes start as `null`
-and refuse all deployments until the real setup has been independently verified.
+before using `stage`. The committed staging team and app hashes now identify the
+independently reviewed real staging resources. Fixture completion, protected
+environment configuration and live workflow proofs remain required. Null pins
+continue to refuse deployment.
 Do not substitute test hashes. Only synthetic staging data and credentials are
 permitted. Production's `spec_images.py`, target and owner approval boundary
 remain separate; the production command refuses `stage`, every non-`none` drill,

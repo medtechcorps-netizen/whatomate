@@ -7,10 +7,9 @@ explicit modes and refuses staging credentials or drills before I/O. The full
 release suite and synthetic boundary tests validate the code, not a live
 staging deployment. No workflow is dispatched by importing or testing it.
 
-The additive work depends on Part A PR7/PR8. Rebase it onto actual main after
-both dependencies merge; do not merge a synthetic dependency stack to bypass
-required checks. Real owner setup, target fingerprints and the post-merge
-production/staging/drill proofs remain separate gates below.
+The additive work is based on actual main with Part A PR7/PR8 merged. The real
+team/app fingerprints have independent review and are committed. Remaining owner
+setup and the post-merge production/staging/drill proofs are separate gates below.
 
 ## Owner setup prerequisite
 
@@ -22,10 +21,10 @@ is SHA-256 of the canonical saved app ID. Neither raw identifier belongs in Git.
 
 `release/deployment/ship-target-staging.json` contains exactly four keys:
 `schema_version`, `profile`, `team_uuid_sha256`, and `app_id_sha256`. Both hash
-values are intentionally `null` until that setup is completed and verified.
-Validation refuses this unconfigured state. No synthetic hash makes deployment
-eligible. PR9 cannot be finalized or merged until the real fingerprints and the
-remaining execution checks have independent review.
+values now identify independently reviewed real staging resources. Validation
+continues to refuse an unconfigured `null` value or a mismatched identity. Fixture
+completion, protected environment inputs and the remaining execution checks still
+require verification before PR9 is finalized and owner-approved for merge.
 
 ## Private exports
 
@@ -194,8 +193,9 @@ production modes, mixed canary secrets, an unconfigured target and a foreign
 workflow/run context before any provider request. Private target identities are
 masked before use, and only public receipt data is emitted. Required adapters
 are imported lazily; an absent adapter fails closed. The real adapters and
-workflow boundary are implemented and independently reviewed. Real target
-fingerprints and observed provider shapes remain merge prerequisites.
+workflow boundary are implemented and independently reviewed. Reviewed real target
+fingerprints are committed; full post-setup provider observations remain a merge
+prerequisite.
 
 ## Bound canary report and e2e drill
 
@@ -232,9 +232,9 @@ public; its two input files remain owner-only and are never uploaded.
 1. Complete owner setup on the isolated staging resources and compare actual
    read-only provider observations with the exact contract. Extend only narrow,
    independently reviewed normalization rules when real defaults differ.
-2. Commit only the verified team/app fingerprints and configure the protected
-   staging environments with the minimal exports and scoped credentials.
-   The two null pins intentionally keep deployment unavailable until then.
+2. Configure the protected staging environments with the minimal exports and
+   scoped credentials after setup verification. The reviewed real team/app
+   fingerprints are committed; null or mismatched pins remain refused.
 3. After required CI, independent review and owner merge authorization, verify
    production dry-run and current-latest rollback's no-PUT path. Then authorize
    a normal stage run with health 6/6 and CRM 13/13, plus all three rollback drills.
