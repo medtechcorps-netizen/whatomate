@@ -4,6 +4,8 @@ import copy
 import io
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -92,7 +94,7 @@ class SetupTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.config = self.base / "doctl.yaml"
-        self.config.write_text('access-token: ""\nauth-contexts:\n  rereply-staging: synthetic-staging-token\ncurrent-context: rereply-staging\n')
+        self.config.write_text('access-token: ""\nauth-contexts:\n  rereply-staging: synthetic-staging-token\ncontext: rereply-staging\n')
         self.target = {"schema_version": 1, "team_sha256": setup.digest("opaque-staging-team-identity"), "postgres_id": PG, "valkey_id": VK, "vpc_id": VPC}
         self.images = {"source_sha": SOURCE, "graph-stub": "ghcr.io/medtechcorps-netizen/rereply-staging-graph-stub@sha256:" + "c" * 64,
                        "bootstrap": "ghcr.io/medtechcorps-netizen/rereply-staging-bootstrap@sha256:" + "d" * 64}
@@ -120,9 +122,9 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(self.runner.calls, [])
 
     def test_other_context_and_global_token_are_refused(self):
-        self.config.write_text("auth-contexts:\n  rereply-staging: token\n  production: another-token\ncurrent-context: rereply-staging\n")
+        self.config.write_text("auth-contexts:\n  rereply-staging: token\n  production: another-token\ncontext: rereply-staging\n")
         self.assert_refused_without_writes("staging-config-contexts")
-        self.config.write_text("access-token: synthetic-token\nauth-contexts:\n  rereply-staging: token\ncurrent-context: rereply-staging\n")
+        self.config.write_text("access-token: synthetic-token\nauth-contexts:\n  rereply-staging: token\ncontext: rereply-staging\n")
         self.assert_refused_without_writes("global-token")
 
     def test_dirty_and_stale_main_are_refused(self):
@@ -390,8 +392,200 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(self.runner.writes, [])
 
 
+# Representative output of doctl auth init/switch v1.164: all command defaults
+# coexist with a root `context` selector. Every value here is synthetic.
+DOCTL_DEFAULTS = """1-click:
+  list:
+    type: ""
+access-token: ""
+api-url: ""
+apps:
+  create:
+    spec: ""
+    wait: false
+  logs:
+    follow: false
+auth:
+  init:
+    token-validation-server: https://cloud.digitalocean.com
+auth-contexts:
+    default: "true"
+    rereply-staging: synthetic-staging-token
+compute:
+  droplet:
+    create:
+      enable-monitoring: false
+      image: ""
+context: rereply-staging
+databases:
+  connection:
+    private: false
+    user: doadmin
+http-retry-max: 5
+interactive: false
+output: text
+trace: false
+verbose: false
+"""
+
+
+class ConfigNormalizationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name) / "rereply-staging"
+        self.directory.mkdir(mode=0o700)
+        self.config = self.directory / "doctl.yaml"
+        self.config.write_text(DOCTL_DEFAULTS)
+        self.config.chmod(0o600)
+        self.runner = FakeRunner()
+        self.team_hash = setup.digest(self.runner.team["uuid"])
+        self.environment = mock.patch.dict(os.environ, {key: value for key, value in os.environ.items() if key not in setup.AMBIENT}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def normalize(self):
+        setup.normalize_doctl_config(self.config, self.team_hash, self.runner)
+
+    def assert_preserved(self, reason):
+        original = self.config.read_bytes()
+        with self.assertRaisesRegex(setup.Refused, reason): self.normalize()
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(list(self.directory.iterdir()), [self.config])
+        self.assertEqual(self.runner.writes, [])
+        self.assertEqual(self.runner.containers, [])
+
+    def test_defaults_are_discarded_before_the_only_provider_read(self):
+        with self.assertRaisesRegex(setup.Refused, "staging-config-shape"):
+            setup.check_doctl_config(self.config)
+        original = self.runner.do
+
+        def account(config, *args, **kwargs):
+            self.assertEqual(args, ("account", "get"))
+            self.assertNotEqual(config, self.config)
+            setup.check_doctl_config(config)
+            self.assertNotIn("compute:", config.read_text())
+            self.assertIn("api-url: https://api.digitalocean.com", config.read_text())
+            self.assertEqual(self.config.read_text(), DOCTL_DEFAULTS)
+            return original(config, *args, **kwargs)
+
+        self.runner.do = account
+        self.normalize()
+        expected = ('access-token: ""\napi-url: https://api.digitalocean.com\nauth-contexts:\n'
+                    '  rereply-staging: synthetic-staging-token\ncontext: rereply-staging\n')
+        self.assertEqual(self.config.read_text(), expected)
+        self.assertEqual([call for call in self.runner.calls if call[0] != "powershell.exe"], [["account", "get"]])
+        self.assertEqual(list(self.directory.iterdir()), [self.config])
+        self.runner.do = original
+        self.normalize()  # Minimal output is stable and still identity-checked.
+        self.assertEqual(self.config.read_text(), expected)
+
+    def test_explicit_switch_and_real_context_key_are_required(self):
+        for before, after, code in (
+            ("context: rereply-staging", "context: default", "staging-config-contexts"),
+            ("context: rereply-staging", "current-context: rereply-staging", "staging-config-context-key"),
+            ("context: rereply-staging", "context: another-team", "staging-config-contexts"),
+        ):
+            with self.subTest(after=after):
+                self.config.write_text(DOCTL_DEFAULTS.replace(before, after))
+                self.assert_preserved(code)
+
+    def test_ambiguous_or_foreign_authentication_is_rejected_without_account_read(self):
+        for before, after, code in (
+            ('access-token: ""', 'access-token: foreign-global-token', "staging-config-global-token"),
+            ('api-url: ""', 'api-url: https://foreign.invalid', "staging-config-api"),
+            ('api-url: ""', 'api-url: ""\napi-url: https://api.digitalocean.com', "staging-config-duplicate"),
+            ('context: rereply-staging', 'context: rereply-staging\ncontext: default', "staging-config-duplicate"),
+            ('    rereply-staging: synthetic-staging-token', '    rereply-staging: synthetic-staging-token\n    production: another-token', "staging-config-contexts"),
+            ('    default: "true"', '    default: another-token', "staging-config-contexts"),
+            ('    rereply-staging: synthetic-staging-token', '    rereply-staging: one\n    rereply-staging: two', "staging-config-duplicate"),
+            ('    rereply-staging: synthetic-staging-token', '    rereply-staging: *alias', "staging-config-shape"),
+            ('auth-contexts:', 'auth-contexts: {rereply-staging: synthetic}', "staging-config-shape"),
+        ):
+            with self.subTest(code=code, after=after):
+                self.config.write_text(DOCTL_DEFAULTS.replace(before, after))
+                self.assert_preserved(code)
+        self.assertNotIn(["account", "get"], self.runner.calls)
+
+    def test_every_ambient_override_is_rejected_before_provider_read(self):
+        for key in setup.AMBIENT:
+            with self.subTest(key=key), mock.patch.dict(os.environ, {key: ""}):
+                self.assert_preserved("ambient-digitalocean-credential")
+        self.assertEqual(self.runner.calls, [])
+
+    def test_foreign_token_team_leaves_original_unchanged(self):
+        for field, value in (("uuid", "foreign-team"), ("name", "Production")):
+            with self.subTest(field=field):
+                original = self.runner.team.copy()
+                self.runner.team[field] = value
+                self.assert_preserved("wrong-staging-team")
+                self.runner.team = original
+
+    def test_concurrent_config_change_is_not_overwritten(self):
+        original = self.runner.do
+        replacement = DOCTL_DEFAULTS + "# user changed this during the account read\n"
+
+        def changed(config, *args, **kwargs):
+            self.config.write_text(replacement)
+            return original(config, *args, **kwargs)
+
+        self.runner.do = changed
+        with self.assertRaisesRegex(setup.Refused, "staging-config-changed"): self.normalize()
+        self.assertEqual(self.config.read_text(), replacement)
+        self.assertEqual(list(self.directory.iterdir()), [self.config])
+
+    def test_cli_success_and_failure_do_not_print_tokens_or_team_identifiers(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                self.config.write_text(DOCTL_DEFAULTS)
+                self.runner.team["name"] = "ReReply Staging" if valid else "Production"
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(setup, "Runner", return_value=self.runner), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    result = setup.main(["normalize-config", "--doctl-config", str(self.config), "--team-sha256", self.team_hash])
+                self.assertEqual(result, 0 if valid else 1)
+                for private in ("synthetic-staging-token", self.runner.team["uuid"], str(self.config)):
+                    self.assertNotIn(private, out.getvalue() + err.getvalue())
+                if valid: self.assertEqual(out.getvalue(), "staging-config: normalized\n")
+                else: self.assertIn("wrong-staging-team", err.getvalue())
+
+    @unittest.skipUnless(shutil.which("doctl"), "optional real doctl configuration compatibility")
+    def test_real_doctl_switch_output_and_normalized_context_selection(self):
+        # auth switch/list are local-only in doctl; no API call uses this token.
+        # Generate the full installed-doctl output instead of relying solely on
+        # our small representative fixture. Never load the user's config.
+        self.config.write_text('access-token: ""\nauth-contexts:\n  rereply-staging: synthetic-staging-token\ncontext: default\n')
+        args = [shutil.which("doctl"), "--config", str(self.config)]
+        subprocess.run([*args, "auth", "switch", "--context", "rereply-staging"], capture_output=True, check=True)
+        expanded = self.config.read_text()
+        self.assertIn("apps:", expanded)
+        self.assertIn("context: rereply-staging", expanded)
+        self.normalize()
+        result = subprocess.run([*args, "auth", "list", "--output", "json"], capture_output=True, check=True)
+        contexts = json.loads(result.stdout)
+        selected = [item["name"] for item in contexts if item["current"]]
+        self.assertEqual(selected, ["rereply-staging"])
+
+
 @unittest.skipUnless(os.name == "nt", "Windows ACL behavior")
 class WindowsPrivateStateTests(unittest.TestCase):
+    def test_normalization_preserves_private_acl_and_refuses_extra_reader(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "rereply-staging"
+            runner = setup.Runner()
+            setup.private_directory(directory, runner)
+            config = directory / "doctl.yaml"
+            config.write_text(DOCTL_DEFAULTS)
+            team = {"name": "ReReply Staging", "uuid": "synthetic-staging-team"}
+            with mock.patch.object(runner, "do", return_value=[{"status": "active", "team": team}]), mock.patch.dict(os.environ, {key: value for key, value in os.environ.items() if key not in setup.AMBIENT}, clear=True):
+                setup.normalize_doctl_config(config, setup.digest(team["uuid"]), runner)
+            setup.check_private_state(config, runner)
+            before = config.read_bytes()
+            runner.run(["icacls", str(config), "/grant", "*S-1-1-0:(R)"])
+            with mock.patch.object(runner, "do") as provider, mock.patch.dict(os.environ, {key: value for key, value in os.environ.items() if key not in setup.AMBIENT}, clear=True):
+                with self.assertRaises(setup.Refused): setup.normalize_doctl_config(config, setup.digest(team["uuid"]), runner)
+                provider.assert_not_called()
+            self.assertEqual(config.read_bytes(), before)
+
     def test_replaces_explicit_directory_grants_and_refuses_file_grants(self):
         # Synthetic temporary files only. Exercise real Windows ACLs rather than
         # asserting that an expected PowerShell command string was constructed.

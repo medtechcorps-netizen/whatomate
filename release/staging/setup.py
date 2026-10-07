@@ -164,38 +164,103 @@ def save_private(path, value):
             os.unlink(temporary)
 
 
-def check_doctl_config(path):
-    """Accept doctl's single-context YAML shape, never interpret general YAML."""
-    require(path.is_file() and not path.is_symlink(), "staging-config-missing")
-    raw = path.read_text(encoding="utf-8")
-    require(len(raw) < 65536, "staging-config-shape")
-    contexts = []
-    section = False
-    current = None
+def parse_doctl_config(raw, *, allow_defaults=False):
+    """Extract a strict scalar auth block, never execute doctl's command defaults.
+
+    doctl v1.164 auth init/switch serializes every command default and uses the
+    top-level `context` key. Normalization discards those defaults before any
+    API call; ordinary setup accepts only the resulting minimal configuration.
+    """
+    require(len(raw) < 65536 and not re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", raw), "staging-config-shape")
+    seen, contexts = set(), {}
+    section, current = None, None
     for line in raw.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if line == "auth-contexts:":
-            require(not section, "staging-config-shape")
-            section = True
-            continue
+        require("\t" not in line, "staging-config-shape")
         if line[0].isspace():
-            require(section, "staging-config-shape")
-            match = re.fullmatch(r"[ ]{2,4}([a-zA-Z0-9_-]+):[ ]*(\S+)[ ]*", line)
-            require(match is not None, "staging-config-shape")
-            contexts.append(match.group(1))
+            require(section is not None, "staging-config-shape")
+            if section == "auth-contexts":
+                match = re.fullmatch(r"[ ]{2,4}([a-zA-Z0-9_-]+):[ ]*([a-zA-Z0-9_-]+|\"[a-zA-Z0-9_-]+\"|'[a-zA-Z0-9_-]+')[ ]*", line)
+                require(match is not None, "staging-config-shape")
+                name, token = match.groups()
+                require(name not in contexts, "staging-config-duplicate")
+                contexts[name] = token.strip('"').strip("'")
+            else:
+                require(allow_defaults and section not in {"context", "access-token", "api-url"}, "staging-config-shape")
             continue
-        section = False
-        key, sep, value = line.partition(":")
-        require(sep and key in {"access-token", "current-context", "api-url"}, "staging-config-shape")
-        value = value.strip().strip('"').strip("'")
-        if key == "current-context":
+        match = re.fullmatch(r"([a-z0-9][a-z0-9_-]*):[ ]*(.*)", line)
+        require(match is not None, "staging-config-shape")
+        key, value = match.groups()
+        require(key not in seen, "staging-config-duplicate")
+        seen.add(key)
+        section = key
+        if key == "auth-contexts":
+            require(not value, "staging-config-shape")
+            continue
+        # Reject the former invented key, even in normalization: doctl ignores
+        # it, so it must never provide apparent authority for another context.
+        require(key != "current-context", "staging-config-context-key")
+        if key not in {"access-token", "context", "api-url"}:
+            require(allow_defaults, "staging-config-shape")
+            continue
+        if value.startswith(('"', "'")):
+            require(len(value) >= 2 and value[-1] == value[0], "staging-config-shape")
+            value = value[1:-1]
+        require(not any(char in value for char in ('"', "'", "\\", "#")), "staging-config-shape")
+        if key == "context":
             current = value
         elif key == "access-token":
             require(value == "", "staging-config-global-token")
         else:
             require(value in {"", "https://api.digitalocean.com"}, "staging-config-api")
-    require(contexts == [CONTEXT] and current == CONTEXT, "staging-config-contexts")
+    # v1.164 auth switch adds default=true to its display map and writes that
+    # map back. It is not a credential: the global token must still be empty,
+    # and default must not be selected. Never allow any other second context.
+    if allow_defaults and contexts.get("default") == "true":
+        del contexts["default"]
+    require(list(contexts) == [CONTEXT] and current == CONTEXT, "staging-config-contexts")
+    return contexts[CONTEXT]
+
+
+def check_doctl_config(path):
+    require(path.is_file() and not path.is_symlink(), "staging-config-missing")
+    parse_doctl_config(path.read_text(encoding="utf-8"))
+
+
+def normalize_doctl_config(path, team_sha256, runner):
+    """Owner-invoked local rewrite; account identity is the only provider read."""
+    require(not any(name in os.environ for name in AMBIENT), "ambient-digitalocean-credential")
+    path = private_path(path)
+    require(path.name == "doctl.yaml", "staging-config-filename")
+    require(isinstance(team_sha256, str) and SHA.fullmatch(team_sha256), "staging-team-hash")
+    require(path.is_file(), "staging-config-missing")
+    check_private_state(path, runner)
+    original = path.read_bytes()
+    token = parse_doctl_config(original.decode("utf-8"), allow_defaults=True)
+    normalized = ('access-token: ""\napi-url: https://api.digitalocean.com\n'
+                  'auth-contexts:\n  ' + CONTEXT + ': ' + token + '\ncontext: ' + CONTEXT + '\n').encode()
+    fd, name = tempfile.mkstemp(prefix=".staging-doctl-", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(normalized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        check_private_state(temporary, runner)
+        check_doctl_config(temporary)
+        # Only this minimal file reaches doctl. Original command defaults,
+        # alternate endpoints, tracing or config overrides are never consumed.
+        account = one(runner.do(temporary, "account", "get"))
+        team = account.get("team", {})
+        require(account.get("status") == "active" and team.get("name") == "ReReply Staging" and
+                isinstance(team.get("uuid"), str) and digest(team["uuid"]) == team_sha256, "wrong-staging-team")
+        check_private_state(path, runner)
+        require(path.read_bytes() == original, "staging-config-changed")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 class Runner:
@@ -573,14 +638,21 @@ class Setup:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("db", "app", "redeploy"))
+    parser.add_argument("command", choices=("normalize-config", "db", "app", "redeploy"))
     parser.add_argument("--doctl-config", type=Path, default=Path.home() / "rereply-staging/doctl.yaml")
-    parser.add_argument("--target", type=Path, required=True)
-    parser.add_argument("--images", type=Path, required=True)
-    parser.add_argument("--private-file", type=Path, required=True)
+    parser.add_argument("--team-sha256")
+    parser.add_argument("--target", type=Path)
+    parser.add_argument("--images", type=Path)
+    parser.add_argument("--private-file", type=Path)
     parser.add_argument("--operator-ip")
     args = parser.parse_args(argv)
     try:
+        if args.command == "normalize-config":
+            require(not any((args.target, args.images, args.private_file, args.operator_ip)), "normalization-arguments")
+            normalize_doctl_config(args.doctl_config, args.team_sha256, Runner())
+            print("staging-config: normalized")
+            return 0
+        require(args.target and args.images and args.private_file and args.team_sha256 is None, "setup-arguments")
         state = private_path(args.private_file)
         setup = Setup(Runner(), private_path(args.doctl_config), object_json(args.target.read_bytes()), object_json(args.images.read_bytes()), state)
         setup.preflight()

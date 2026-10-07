@@ -33,13 +33,18 @@ No provisioning happens when these files are merged or their unit tests run.
 
    ```powershell
    doctl --config "$env:USERPROFILE\rereply-staging\doctl.yaml" auth init --context rereply-staging
+   doctl --config "$env:USERPROFILE\rereply-staging\doctl.yaml" auth switch --context rereply-staging
    ```
 
    Create the dedicated directory with access restricted to your own Windows
    user before initializing doctl; keep both the directory and config file
    private. Enter the token at doctl's prompt. The file must contain only the
-   `rereply-staging` auth context, selected as `current-context`; an ambient
-   DigitalOcean token/context or a global `access-token` is refused. The setup
+   `rereply-staging` auth context, selected by the real doctl `context` key;
+   doctl ignores `current-context`. `auth init` can leave `context: default`,
+   so the explicit `auth switch` is required. Both commands also serialize
+   command defaults into the config; normalize them as described below before
+   any setup command. An ambient DigitalOcean token/context, another endpoint,
+   multiple auth contexts or a nonempty global `access-token` is refused. The setup
    token needs account/inventory reads, database connection credentials,
    staging app create/update and database firewall update permissions. It is
    separate from the later staging deployment token. Do not alter the personal
@@ -51,6 +56,40 @@ No provisioning happens when these files are merged or their unit tests run.
    saving its hash. The private state pins this first identity for every later
    command; Part A PR9 will pin the reviewed team hash in its deployment target.
    The kit also refuses a credential that can see the production app or cluster.
+
+5. From the reviewed checkout, normalize **only this dedicated staging config**
+   using the team hash confirmed above. This command performs one read-only
+   account lookup and a local atomic config replacement; it creates no provider
+   resources and needs no image publication or database. It can therefore run
+   before provisioning. Replace the hash placeholder; it is not a credential.
+
+   ```powershell
+   py -3 release/staging/setup.py normalize-config --doctl-config "$env:USERPROFILE\rereply-staging\doctl.yaml" --team-sha256 CONFIRMED_STAGING_TEAM_SHA256
+   ```
+
+   The file must be named `doctl.yaml` in an owner-only directory named
+   `rereply-staging`, outside every checkout. The normalizer checks the directory
+   and file ACLs, requires the selected single staging context, and discards all
+   command defaults. The exact `auth-contexts.default: "true"` display sentinel
+   that doctl 1.164's switch can serialize is discarded only with an empty global
+   token and the staging context selected; any second credential is refused.
+   It verifies the expected active **ReReply Staging** team
+   using a protected temporary minimal config and the fixed official API endpoint,
+   then atomically replaces the original after checking for changes detected
+   during validation. Do not run `auth init`, `auth switch`, or another writer
+   concurrently: the comparison is not an atomic compare-and-swap against an
+   uncooperative writer. Refusal does not replace the original and removes the
+   temporary file. Output
+   contains only a fixed completion/refusal code, never a token or account data.
+   Do not use it on a personal/production config. Do not hand-edit guards or copy
+   tokens to a second file. Running `auth init` or `auth switch` again expands the
+   file, so rerun normalization afterwards. Ordinary `db`, `app` and `redeploy`
+   continue to reject expanded command-default files.
+
+   Keep this auth/config directory separate from the first bootstrap's **empty**
+   state directory, for example `C:\private\rereply-staging\state.json` below.
+   Putting `doctl.yaml` or the external JSON inputs in the state directory makes
+   the first `db` command refuse it as nonempty.
 
 ## Publish staging images
 
