@@ -51,21 +51,9 @@ func (a *App) requireLegacyWhatsAppMessageMirror(
 // never outrun the durable account provenance required by later receipts and
 // reactions. It gives every live legacy bridge call the same lock boundary.
 // Message/contact persistence commits first; the idempotent mirror then owns a
-// fresh short tenant transaction. It first owns the policy fence in shared
-// mode, the organization FOR SHARE and the ChannelAccount shadow, taken so that
-// it never waits for one while holding another (channel
-// lockLegacyMetaOrganizationThenShadow), and then locks ContactIdentity ->
-// InboxConversation -> Contact -> Message, followed by the
-// ConversationParticipant write. Joining the fence queues it behind a waiting
-// Coexistence admission (fence, then ChannelAccount) on any account, for a
-// bounded time per acquisition, and not at all while that admission is stuck
-// behind a lock outside the queue, such as this send's own AI attempt fence:
-// the mirror then takes the organization without the key, so the admission
-// cannot hold it in a cycle PostgreSQL does not see. It never holds the
-// organization while queued for a busy shadow, except in the helper's bounded
-// fallback after lockLegacyMetaShadowRounds lost rounds. The one exception to
-// this order is a strict reply's provider phase, which holds the shadow
-// without the organization across Meta (see deliverOutgoingMessage).
+// fresh short tenant transaction following internal/channel/legacy_meta_fence.go.
+// A strict reply's provider phase holds the shadow without the organization
+// across Meta (see deliverOutgoingMessage).
 // This is especially important for webhook and async-send paths which may
 // already hold Contact or Message locks in their surrounding transaction.
 //

@@ -445,6 +445,9 @@ func (p *InboundContinuationProcessor) processClaimed(
 	// in a short committed phase. Authority/contact/message locks must be
 	// released before the provider scope and its independent action ledger.
 	scopeErr := p.app.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+		if err := database.LockOrganizationPolicyScope(scoped.DB, organizationID); err != nil {
+			return err
+		}
 		var loadErr error
 		work, loadErr = loadInboundContinuationWork(scoped, organizationID, job)
 		return loadErr
@@ -1850,6 +1853,9 @@ func (a *App) ensureInboundContinuationJobForMessage(
 		"wamid":           inbound.ID,
 		"message_id":      message.ID.String(),
 		"message":         rawMessage,
+	}
+	if proof, ok := message.Metadata[coexistencePhoneAdmissionKey].(string); ok {
+		payload[coexistencePhoneAdmissionKey] = proof
 	}
 	job := models.ScheduledJob{
 		BaseModel:      models.BaseModel{ID: uuid.New()},

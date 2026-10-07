@@ -1256,6 +1256,14 @@ func (a *App) persistAuthenticatedIncomingMessageBeforeAck(
 		if admissionErr != nil {
 			return admissionErr
 		}
+		phonePolicy, phoneErr := scoped.admitCoexistencePhoneOnlySender(account, claim, admission, message, profileName, webhookBodySHA256)
+		if phoneErr != nil {
+			return phoneErr
+		}
+		if phonePolicy != nil {
+			work, duplicate, phoneErr = scoped.persistIncomingMessageForAccountWithAdmission(phoneNumberID, message, profileName, account, phonePolicy)
+			return phoneErr
+		}
 		if admission.Blocked {
 			// A sender with no identity question (nobody in the tenant matches
 			// any of its selectors, or the only match is the phone this number

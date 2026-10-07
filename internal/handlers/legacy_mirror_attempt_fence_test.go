@@ -157,7 +157,7 @@ func TestLegacySharersDoNotQueueBehindAPolicyFenceWaitingOnAnAttemptFence(t *tes
 	app := newProcessorTestApp(t)
 	organization, account := createProcessorTestOrg(t, app)
 	contact := testutil.CreateTestContactWith(t, app.DB, organization.ID, testutil.WithContactAccount(account.Name))
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(app.DB, channelapi.LegacyMetaAccountRef{
+	shadow, err := ensureFencedLegacyMetaAccountForTest(app.DB, channelapi.LegacyMetaAccountRef{
 		ID: account.ID, OrganizationID: organization.ID, Name: account.Name, Status: account.Status,
 	})
 	require.NoError(t, err)

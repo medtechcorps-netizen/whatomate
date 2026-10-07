@@ -732,7 +732,8 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 
 // commitWhatsAppAccountUpdate commits an account update, including its rename
 // stage and its audit row, in its own short tenant transaction. The stage runs
-// first, also when the name is unchanged, and owns the organization FOR SHARE
+// first (see internal/channel/legacy_meta_fence.go), also when the name is
+// unchanged, and owns the organization FOR SHARE
 // (taken behind the policy fence queue) and the account row, plus the
 // Omnichannel shadow on a rename, until that transaction ends; the audit row's
 // INSERT locks the organization only after the account row. Under RLS this
@@ -866,19 +867,31 @@ func (a *App) DeleteAccount(r *fastglue.Request) error {
 		return nil
 	}
 
-	deleteResult := a.DB.
-		Where(
+	// Account deletion and its audit use the same organization-before-row
+	// protocol as updates. Keep the locks in a short committed transaction.
+	var deleted int64
+	err = a.rootApp().WithCommittedTenantApp(orgID, func(scoped *App) error {
+		if err := channelapi.LockLegacyMetaOrganizationAndWhatsAppAccount(scoped.DB, orgID, account.ID); err != nil {
+			return err
+		}
+		result := scoped.DB.Where(
 			"id = ? AND organization_id = ? AND status NOT IN ?",
-			account.ID,
-			orgID,
-			[]string{"pending_registration", "pending_subscription"},
-		).
-		Delete(&models.WhatsAppAccount{})
-	if deleteResult.Error != nil {
-		a.Log.Error("Failed to delete account", "error", deleteResult.Error)
+			account.ID, orgID, []string{"pending_registration", "pending_subscription"},
+		).Delete(&models.WhatsAppAccount{})
+		if result.Error != nil {
+			return result.Error
+		}
+		deleted = result.RowsAffected
+		if deleted == 1 {
+			scoped.logAudit(orgID, userID, "account", id, models.AuditActionDeleted, account, nil)
+		}
+		return nil
+	})
+	if err != nil {
+		a.Log.Error("Failed to delete account", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to delete account", nil, "")
 	}
-	if deleteResult.RowsAffected != 1 {
+	if deleted != 1 {
 		return r.SendErrorEnvelope(
 			fasthttp.StatusConflict,
 			"Finish WhatsApp registration and subscription recovery before deleting this account",
@@ -889,9 +902,6 @@ func (a *App) DeleteAccount(r *fastglue.Request) error {
 
 	// Invalidate cache
 	a.InvalidateWhatsAppAccountCache(account.PhoneID)
-
-	a.logAudit(orgID, userID,
-		"account", id, models.AuditActionDeleted, account, nil)
 
 	return r.SendEnvelope(map[string]string{"message": "Account deleted successfully"})
 }

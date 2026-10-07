@@ -156,6 +156,7 @@ func TestLoadConfigAcceptsBareGraphOriginsOutsideProduction(t *testing.T) {
 
 func TestLoadConfigAcceptsDialableGraphOriginHosts(t *testing.T) {
 	for _, value := range []string{
+		"http://graph-stub",
 		"http://graph_stub:18090",
 		"https://Graph-Stub.example.test",
 		"https://graph-stub.example.test:1",
