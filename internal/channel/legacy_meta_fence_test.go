@@ -46,6 +46,13 @@ func TestLegacyMetaPolicyFenceBusyRefreshDiscardsExpiredSample(t *testing.T) {
 }
 
 func TestLegacyMetaLockHelpersRequireTransactionAndEnsureRequiresFence(t *testing.T) {
+	require.Error(t, LockLegacyMetaOrganization(nil, uuid.New()))
+	require.Error(t, LockLegacyMetaOrganizationAndShadow(nil, uuid.New(), uuid.New()))
+	require.Error(t, LockLegacyMetaOrganizationAndWhatsAppAccount(nil, uuid.New(), uuid.New()))
+	_, nilEnsureErr := EnsureLegacyMetaWhatsAppAccount(nil, LegacyMetaAccountRef{ID: uuid.New(), OrganizationID: uuid.New()})
+	require.Error(t, nilEnsureErr)
+	_, nilRenameErr := StageLegacyMetaWhatsAppAccountRename(nil, uuid.New(), uuid.New(), "before", "after")
+	require.Error(t, nilRenameErr)
 	db := testutil.SetupTestDB(t)
 	org := testutil.CreateTestOrganization(t, db)
 	account := testutil.CreateTestWhatsAppAccount(t, db, org.ID)
