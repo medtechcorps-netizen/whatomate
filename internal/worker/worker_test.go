@@ -93,7 +93,7 @@ func TestRetryableCampaignContactWriteIncludesWrappedSelectorContention(t *testi
 	assert.True(t, retryableCampaignContactWrite(err))
 }
 
-func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testing.T) {
+func TestHandleRecipientSelectorFenceQueuesBeforeContactAndRetriesFreshTransaction(t *testing.T) {
 	w := testWorker(t)
 	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
 	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
@@ -117,6 +117,7 @@ func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testi
 
 	firstFailure := make(chan campaignContactAttempt, 1)
 	var firstFailureReported atomic.Bool
+	var attempts atomic.Int32
 	var attemptXIDs []string
 	w.getOrCreateCampaignContact = func(
 		tx *gorm.DB,
@@ -127,6 +128,7 @@ func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testi
 		if err := tx.Raw("SELECT pg_catalog.pg_current_xact_id()::text").Scan(&xid).Error; err != nil {
 			return nil, false, err
 		}
+		attempts.Add(1)
 		contact, created, err := contactutil.GetOrCreateContact(
 			tx,
 			organizationID,
@@ -134,7 +136,11 @@ func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testi
 			profileName,
 		)
 		attemptXIDs = append(attemptXIDs, xid)
-		if err != nil && firstFailureReported.CompareAndSwap(false, true) {
+		if err == nil && firstFailureReported.CompareAndSwap(false, true) {
+			// The outer fence prevents the former selector-trigger collision.
+			// Exercise the remaining retry contract with a real PostgreSQL
+			// error after restoration, poisoning this transaction before retry.
+			err = tx.Exec(`DO $$ BEGIN RAISE EXCEPTION 'synthetic campaign contention' USING ERRCODE = '55P03'; END $$`).Error
 			firstFailure <- campaignContactAttempt{xid: xid, err: err}
 		}
 		return contact, created, err
@@ -173,24 +179,51 @@ func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testi
 	go func() {
 		result <- w.HandleRecipientJob(ctx, campaignRecipientJob(organization, campaign, recipient))
 	}()
+	consumed := false
+	defer func() {
+		// Release before test fixture cleanup, even when an assertion fails.
+		if holderOpen {
+			_ = holder.Rollback().Error
+			holderOpen = false
+		}
+		cancel()
+		if !consumed {
+			select {
+			case <-result:
+			case <-time.After(5 * time.Second):
+				t.Error("campaign contact worker did not stop after fence release")
+			}
+		}
+	}()
+
+	require.Eventually(t, func() bool {
+		var queued bool
+		return w.DB.Raw(`SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks
+       WHERE locktype = 'advisory' AND mode = 'ExclusiveLock' AND NOT granted
+       AND database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
+       AND (classid::int8 << 32) | objid::int8 = hashtextextended(?, 0))`,
+			database.WhatsAppIdentityReviewContactSelectorFenceKey(organization.ID)).Scan(&queued).Error == nil && queued
+	}, 5*time.Second, 5*time.Millisecond, "campaign contact writer must queue before its NOWAIT trigger")
+	assert.Zero(t, attempts.Load(), "contact selection must wait for the outer fence")
+	assert.Zero(t, providerRequests.Load(), "provider must not run while contact selection is fenced")
+	require.NoError(t, holder.Rollback().Error)
+	holderOpen = false
 
 	var collision campaignContactAttempt
 	select {
 	case collision = <-firstFailure:
 	case <-ctx.Done():
-		t.Fatalf("campaign contact write did not reach the held selector fence: %v", ctx.Err())
+		t.Fatalf("campaign contact write did not exercise PostgreSQL retry: %v", ctx.Err())
 	}
 	require.Equal(t, "55P03", campaignContactErrorSQLState(collision.err))
 	var collisionPGError *pgconn.PgError
 	require.ErrorAs(t, collision.err, &collisionPGError)
 	require.Equal(t, "55P03", collisionPGError.Code)
 	require.NotEmpty(t, collision.xid)
-	assert.Zero(t, providerRequests.Load(), "provider must not run before the contact transaction commits")
-	require.NoError(t, holder.Rollback().Error)
-	holderOpen = false
 
 	select {
 	case err := <-result:
+		consumed = true
 		require.NoError(t, err)
 	case <-ctx.Done():
 		t.Fatalf("campaign contact retry did not finish after selector fence release: %v", ctx.Err())
@@ -227,18 +260,10 @@ func TestHandleRecipientSelectorFenceReleaseRetriesWithFreshTransaction(t *testi
 	assert.Equal(t, "wamid.selector-release", storedRecipient.WhatsAppMessageID)
 }
 
-func TestHandleRecipientSelectorFenceExhaustionLeavesJobPending(t *testing.T) {
+func TestHandleRecipientContactContentionExhaustionLeavesJobPending(t *testing.T) {
 	w := testWorker(t)
 	organization, account, _, campaign, recipient := createTestCampaignData(t, w)
 	require.NoError(t, w.DB.Model(account).Update("api_version", "v21.0").Error)
-
-	holder := holdCampaignContactSelectorFence(t, w.DB, organization.ID)
-	holderOpen := true
-	t.Cleanup(func() {
-		if holderOpen {
-			_ = holder.Rollback().Error
-		}
-	})
 
 	var attempts atomic.Int32
 	var attemptResults []campaignContactAttempt
@@ -253,6 +278,11 @@ func TestHandleRecipientSelectorFenceExhaustionLeavesJobPending(t *testing.T) {
 			return nil, false, err
 		}
 		contact, created, err := contactutil.GetOrCreateContact(tx, organizationID, phoneNumber, profileName)
+		if err == nil {
+			// A real PostgreSQL error after insertion proves every failed
+			// attempt rolls its contact back, independent of fence queueing.
+			err = tx.Exec(`DO $$ BEGIN RAISE EXCEPTION 'synthetic campaign contention' USING ERRCODE = '55P03'; END $$`).Error
+		}
 		attemptResults = append(attemptResults, campaignContactAttempt{xid: xid, err: err})
 		return contact, created, err
 	}
@@ -274,8 +304,6 @@ func TestHandleRecipientSelectorFenceExhaustionLeavesJobPending(t *testing.T) {
 	require.Error(t, handlerErr)
 	assert.Equal(t, "55P03", campaignContactErrorSQLState(handlerErr))
 	assert.True(t, retryableCampaignContactWrite(handlerErr))
-	require.NoError(t, holder.Rollback().Error)
-	holderOpen = false
 
 	assert.Equal(t, int32(campaignCanonicalContactAttempts), attempts.Load())
 	require.Len(t, attemptResults, campaignCanonicalContactAttempts)
@@ -288,7 +316,7 @@ func TestHandleRecipientSelectorFenceExhaustionLeavesJobPending(t *testing.T) {
 		assert.False(t, xids[attempt.xid], "each retry must use a distinct top-level transaction")
 		xids[attempt.xid] = true
 	}
-	assert.Zero(t, providerRequests.Load(), "provider must not run while contact selection is fenced")
+	assert.Zero(t, providerRequests.Load(), "provider must not run after contact retries are exhausted")
 
 	var storedRecipient models.BulkMessageRecipient
 	require.NoError(t, w.DB.First(&storedRecipient, recipient.ID).Error)
@@ -710,11 +738,12 @@ func TestWorker_HandleRecipientJob_DisconnectedAccountDoesNotCallGraph(t *testin
 
 func TestWorker_HandleRecipientJob_CampaignNotFound(t *testing.T) {
 	w := testWorker(t)
+	organization := testutil.CreateTestOrganization(t, w.DB)
 
 	job := &queue.RecipientJob{
 		CampaignID:     uuid.New(), // Non-existent campaign
 		RecipientID:    uuid.New(),
-		OrganizationID: uuid.New(),
+		OrganizationID: organization.ID,
 		PhoneNumber:    "1234567890",
 		RecipientName:  "Test",
 		EnqueuedAt:     time.Now().UTC(),

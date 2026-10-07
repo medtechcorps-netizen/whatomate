@@ -443,7 +443,10 @@ func TestCoexistenceSenderWithIdentityEvidenceStaysHeld(t *testing.T) {
 				Update("phone_number", coexistenceAdmissionTestPhone()).Error)
 			return coexistenceAdmissionMessage(t, "wamid.held-"+uuid.NewString(), "", s.bsuid, "held")
 		}},
-		{name: "missing_bsuid_phone_only", arrange: func(t *testing.T, s setup) IncomingTextMessage {
+		{name: "missing_bsuid_existing_phone_owner", arrange: func(t *testing.T, s setup) IncomingTextMessage {
+			// Fresh phone-only senders have their own admission proof tests;
+			// an existing phone owner still cannot be adopted by that fallback.
+			createContact(t, s, s.phone, "", nil)
 			return coexistenceAdmissionMessage(t, "wamid.held-"+uuid.NewString(), s.phone, "", "held")
 		}},
 		{name: "non_phone_from_value", arrange: func(t *testing.T, s setup) IncomingTextMessage {
@@ -804,7 +807,7 @@ func stageCoexistenceReceiptAsBeforeThisChange(
 		if err := database.LockOrganizationPolicyScope(scoped.DB, account.OrganizationID); err != nil {
 			return err
 		}
-		channelAccount, err := channelapi.EnsureLegacyMetaWhatsAppAccount(scoped.DB, channelapi.LegacyMetaAccountRef{
+		channelAccount, err := ensureFencedLegacyMetaAccountForTest(scoped.DB, channelapi.LegacyMetaAccountRef{
 			ID: account.ID, OrganizationID: account.OrganizationID, Name: account.Name, Status: account.Status,
 		})
 		if err != nil {
