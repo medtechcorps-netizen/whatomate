@@ -73,7 +73,6 @@ import (
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/handlers"
-	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/zerodha/logf"
 	"gorm.io/gorm"
 )
@@ -595,11 +594,6 @@ func readPublicSchema(db *gorm.DB) (publicSchema, error) {
 func bootstrap(owner *gorm.DB, cfg *config.Config, logger logf.Logger) error {
 	// 1. Production still carries the pre-graph legacy table, and the strict
 	// verifier's protected-relation inventory requires it.
-	if err := inMigrationSession(owner, func(session *gorm.DB) error {
-		return session.AutoMigrate(&models.ChatbotFlowStep{})
-	}); err != nil {
-		return fmt.Errorf("legacy chatbot_flow_steps: %w", err)
-	}
 	// 2. Schema, indexes and seeds, with the synthetic administrator.
 	if err := database.RunMigrationWithProgress(owner, &cfg.DefaultAdmin); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
