@@ -312,7 +312,7 @@ func TestControlAccounts(t *testing.T) {
 }
 
 // TestControlInboundMatchesTheCanaryEnvelope checks the inbound payload has
-// the shape frontend/canary-driver/runner.mjs signs today, is signed with the
+// the shape frontend/e2e/canary/scenario.ts signs, is signed with the
 // app secret, and that the product's answer is reported back.
 func TestControlInboundMatchesTheCanaryEnvelope(t *testing.T) {
 	h := newHarness(t, nil)

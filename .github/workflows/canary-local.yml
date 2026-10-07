@@ -94,4 +94,4 @@ jobs:
         run: npm run test:canary:verify -- "$CANARY_REPORT_FILE"
         working-directory: frontend
       # No environment, secrets, production access or uploaded artifacts. The
-      # old production driver remains until Part A PR11. This job is advisory.
+      # original assertion provenance remains pinned. This job is advisory.

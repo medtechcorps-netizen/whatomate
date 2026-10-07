@@ -1,6 +1,6 @@
 // @ts-nocheck
-// The selectors, assertions, helpers and execution order come from the retained
-// production driver. Only profile validation and transport change: injection and
+// The selectors, assertions, helpers and execution order come from the historical
+// production runner. Only profile validation and transport change: injection and
 // outbound evidence use the isolated Graph stub. contract.test.mjs pins the port.
 import { createHmac, randomBytes } from 'node:crypto'
 import { canonicalOrigin, loadProfile } from './profiles.ts'

@@ -1,4 +1,4 @@
-// Ported verbatim from the retained driver; contract.test.mjs detects drift.
+// Historical assertion bytes are pinned by source-provenance.json and the contract test.
 export const UI_CHECKS = Object.freeze([
   "klinik_whatsapp_outbound",
   "klinik_whatsapp_inbound",

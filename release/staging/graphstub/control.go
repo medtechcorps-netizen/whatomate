@@ -291,7 +291,7 @@ type inboundRequest struct {
 var inboundTypes = map[string]bool{"text": true, "image": true, "document": true, "audio": true, "video": true}
 
 // controlInbound delivers one signed inbound customer message to the product,
-// shaped like the payload the CRM canary signs (frontend/canary-driver), and
+// shaped like the payload frontend/e2e/canary/scenario.ts signs, and
 // answers with the product's HTTP status once the delivery completes.
 func (s *Server) controlInbound(c *call, body []byte) {
 	var request inboundRequest
