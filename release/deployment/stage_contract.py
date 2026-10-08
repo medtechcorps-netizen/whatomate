@@ -181,8 +181,12 @@ def expected_spec(target, template, images):
     values = {"vpc_id": target["vpc_id"], "pg_name": target["postgres_name"],
               "admin_email": target["template_values"]["admin_email"],
               "stub_app_id": target["template_values"]["stub_app_id"],
-              # Preserve setup.py's serialization of this GENERAL value.
-              "stub_accounts": json.dumps(target["template_values"]["stub_accounts"]),
+              # Canonical target exports sort nested object keys. Rebuild the
+              # validated fields in setup.py's order so this GENERAL string
+              # remains byte-identical after export/reload; actual specs stay strict.
+              "stub_accounts": json.dumps([
+                  {key: account[key] for key in ("business_account_id", "phone_number_id", "display_phone_number")}
+                  for account in target["template_values"]["stub_accounts"]]),
               "allowlist": target["template_values"]["canary_organization"], "reply_enabled": "true"}
     def fill(item):
         if type(item) is dict:

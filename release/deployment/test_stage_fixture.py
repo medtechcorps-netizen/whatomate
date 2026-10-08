@@ -3,6 +3,7 @@ import base64
 import contextlib
 import copy
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ from unittest import mock
 import ship_common as common
 import stage_contract as stage
 import stage_fixture as bridge
-from test_stage_contract import APP, PG, VK, VPC, ORG, ORIGIN, TEAM, data, receipt
+from test_stage_contract import APP, PG, VK, VPC, ORG, ORIGIN, TEAM, IMAGES, data, receipt
 
 NAMESPACE = "rereply-staging-synthetic123"
 CONTROL = "synthetic-control-key-never-print-long-enough"
@@ -156,6 +157,73 @@ class FixtureTests(unittest.TestCase):
             self.assertNotIn(secret, raw)
         with self.assertRaises(common.ReleaseError):
             bridge.export_target(setup_state(), {**self.pins, "app_id_sha256": None}, self.production, self.template)
+
+    def test_setup_spec_matches_canonical_target_export_and_every_account_key_order(self):
+        sys.path.insert(0, str(stage.ROOT / "release/staging"))
+        import setup
+        state = setup_state()
+        state["secrets"] = {key: UNEXPORTED for key in setup.SECRET_NAMES}
+        state["product"] = {"images": IMAGES.copy()}
+        kit = setup.Setup.__new__(setup.Setup)  # Pure renderer: no config, private file or provider.
+        kit.state, kit.target, kit.images = state, state["target"], state["images"]
+        kit.template = self.template
+        kit.clusters = {"postgres_id": {"name": "rereply-staging-pg"}}
+        with mock.patch("socket.create_connection", side_effect=AssertionError("network forbidden")):
+            actual = kit.build_spec()
+            exported = bridge.export_target(state, self.pins, self.production, self.template)
+            loaded = common.loads_strict(common.canonical_file_bytes(exported))
+        before, fingerprint = copy.deepcopy(actual), stage.spec_fingerprint(actual)
+        original = exported["template_values"]["stub_accounts"][0]
+        self.assertNotEqual(list(original), list(loaded["template_values"]["stub_accounts"][0]))
+        for keys in itertools.permutations(original):
+            target = copy.deepcopy(loaded)
+            target["template_values"]["stub_accounts"][0] = {key: original[key] for key in keys}
+            with self.subTest(order=keys):
+                stage.validate_target(target, self.pins, self.production, self.template)
+                stage.validate_spec(actual, target, self.template, IMAGES)
+        self.assertEqual(actual, before)
+        self.assertEqual(stage.spec_fingerprint(actual), fingerprint)
+
+    def test_stub_account_target_fields_and_types_remain_exact_after_export(self):
+        target = common.loads_strict(common.canonical_file_bytes(
+            bridge.export_target(setup_state(), self.pins, self.production, self.template)))
+        mutations = (
+            lambda a: a.pop("phone_number_id"), lambda a: a.update(extra="unexpected"),
+            lambda a: a.update(phone_number_id=900000000000002),
+            lambda a: a.update(business_account_id=None),
+            lambda a: a.update(display_phone_number="not-a-staging-number"),
+        )
+        for mutate in mutations:
+            changed = copy.deepcopy(target); mutate(changed["template_values"]["stub_accounts"][0])
+            with self.subTest(mutate=mutate), self.assertRaises(common.ReleaseError):
+                stage.validate_target(changed, self.pins, self.production, self.template)
+        raw = common.canonical_file_bytes(target).replace(b'"business_account_id":', b'"business_account_id":"900000000000003","business_account_id":', 1)
+        with self.assertRaises(common.ReleaseError): common.loads_strict(raw)
+
+    def test_actual_stub_json_and_other_general_values_keep_strict_comparison(self):
+        target = common.loads_strict(common.canonical_file_bytes(
+            bridge.export_target(setup_state(), self.pins, self.production, self.template)))
+        spec = stage.expected_spec(target, self.template, IMAGES)
+        def env(value, component, key):
+            return next(item for service in value["services"] if service["name"] == component
+                        for item in service["envs"] if item["key"] == key)
+        original = env(spec, "graph-stub", "STUB_ACCOUNTS")["value"]
+        account = json.loads(original)[0]
+        values = ("not-json", "null", "[]", "{}", None, False, 1,
+                  original + " ", json.dumps([account], sort_keys=True),
+                  json.dumps([account], separators=(",", ":")),
+                  original.replace('"phone_number_id":', '"phone_number_id": "900000000000099", "phone_number_id":'),
+                  json.dumps([{**account, "phone_number_id": "900000000000099"}]),
+                  json.dumps([{**account, "phone_number_id": 900000000000002}]),
+                  json.dumps([{**account, "unexpected": "value"}]))
+        for value in values:
+            actual = copy.deepcopy(spec)
+            env(actual, "graph-stub", "STUB_ACCOUNTS")["value"] = value
+            with self.subTest(value=value), self.assertRaises(common.ReleaseError):
+                stage.validate_spec(actual, target, self.template, IMAGES)
+        actual = copy.deepcopy(spec)
+        env(actual, "meta-relay", "META_RELAY_ACCOUNTS_JSON")["value"] += " "
+        with self.assertRaises(common.ReleaseError): stage.validate_spec(actual, target, self.template, IMAGES)
 
     def test_bad_image_and_health_drills_cannot_start_browser_fixture(self):
         for drill in ("health-fail", "bad-image"):
