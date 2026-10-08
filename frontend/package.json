@@ -17,7 +17,7 @@
     "test:report": "playwright show-report",
     "canary:provision": "node --experimental-strip-types e2e/canary/provision.ts",
     "test:canary": "playwright test --config=playwright.canary.config.ts",
-    "test:canary:unit": "node --experimental-strip-types --test e2e/canary/contract.test.mjs",
+    "test:canary:unit": "node --experimental-strip-types --test e2e/canary/contract.test.mjs e2e/canary/stage-drill.test.mjs e2e/canary/provision.test.mjs",
     "test:canary:verify": "node --experimental-strip-types e2e/canary/verify-report.mjs"
   },
   "dependencies": {

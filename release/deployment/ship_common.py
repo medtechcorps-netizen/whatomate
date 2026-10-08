@@ -49,6 +49,8 @@ BOOTSTRAP_TAG = "prod-0000"
 # production-app-contract.json security.forbidden_ambient_environment, plus the
 # DigitalOcean CLI's own token variable.
 FORBIDDEN_AMBIENT = (
+    "STAGING_DO_TOKEN",
+    "STAGING_TARGET_JSON",
     "DIGITALOCEAN_ACCESS_TOKEN",
     "DIGITALOCEAN_TOKEN",
     "DO_ACCESS_TOKEN",
