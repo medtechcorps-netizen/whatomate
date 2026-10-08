@@ -18,6 +18,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
+	"github.com/shridarpatil/whatomate/internal/callingaudio"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
@@ -777,6 +778,7 @@ func runServer(args []string) {
 	if cfg.Storage.Type == "s3" {
 		app.ObjectStore = s3Client
 	}
+	app.AudioStore = callingaudio.New(cfg.Calling.AudioDir, app.ObjectStore)
 
 	// Initialize shared assignment engine (used by both chat and call transfers)
 	assigner := assignment.New(db, rdb, lo)
@@ -784,6 +786,7 @@ func runServer(args []string) {
 
 	// Initialize CallManager (per-org calling_enabled DB setting controls access)
 	app.CallManager = calling.NewManager(&cfg.Calling, s3Client, db, rdb, waClient, wsHub, assigner, httpClient, cfg.App.EncryptionKey, lo)
+	app.CallManager.SetAudioStore(app.AudioStore)
 	app.S3Client = s3Client
 	lo.Info("Call manager initialized")
 

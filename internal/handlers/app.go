@@ -14,6 +14,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/access"
 	"github.com/shridarpatil/whatomate/internal/assignment"
 	"github.com/shridarpatil/whatomate/internal/calling"
+	"github.com/shridarpatil/whatomate/internal/callingaudio"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
@@ -49,6 +50,8 @@ type App struct {
 	CallManager *calling.Manager
 	// TTS generates audio from text for IVR greetings (nil when not configured)
 	TTS *tts.PiperTTS
+	// AudioStore persists and resolves tenant-scoped IVR, hold and ringback audio.
+	AudioStore *callingaudio.Store
 	// S3Client for serving call recording presigned URLs (nil when not configured)
 	S3Client *storage.S3Client
 	// ObjectStore persists tenant media independently of any app replica.
