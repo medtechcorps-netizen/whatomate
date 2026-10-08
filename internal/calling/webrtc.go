@@ -25,7 +25,7 @@ func (m *Manager) negotiateWebRTC(session *CallSession, account *models.WhatsApp
 	waAccount := account.ToWAAccount()
 
 	// Create peer connection with Opus codec
-	pc, err := m.createPeerConnection()
+	pc, err := m.createPeerConnection(ctx)
 	if err != nil {
 		m.log.Error("Failed to create peer connection", "error", err, "call_id", session.ID)
 		m.rejectCall(ctx, session, account)
@@ -221,14 +221,17 @@ func createOpusTrack(pc *webrtc.PeerConnection, streamID string) (*webrtc.TrackL
 }
 
 // createPeerConnection creates a new WebRTC peer connection with Opus codec support
-func (m *Manager) createPeerConnection() (*webrtc.PeerConnection, error) {
-	now := time.Now()
-	iceServers := make([]webrtc.ICEServer, 0, len(m.config.ICEServers))
-	for _, s := range m.config.ICEServers {
+func (m *Manager) createPeerConnection(ctx context.Context) (*webrtc.PeerConnection, error) {
+	resolved, err := m.ResolveICEConfiguration(ctx)
+	if err != nil {
+		return nil, err
+	}
+	iceServers := make([]webrtc.ICEServer, 0, len(resolved.Servers))
+	for _, s := range resolved.Servers {
 		ice := webrtc.ICEServer{URLs: s.URLs}
-		if username, credential := s.ResolveCredentials(now); username != "" {
-			ice.Username = username
-			ice.Credential = credential
+		if s.Username != "" {
+			ice.Username = s.Username
+			ice.Credential = s.Credential
 			ice.CredentialType = webrtc.ICECredentialTypePassword
 		}
 		iceServers = append(iceServers, ice)

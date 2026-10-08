@@ -141,6 +141,16 @@ udp_port_max = 10100          # WebRTC UDP port range end
 # public_ip = "1.2.3.4"      # Public IP for NAT mapping (required on AWS/cloud)
 # relay_only = true           # Force all media through TURN relay (no direct UDP needed)
 
+# Cloudflare TURN credential renewal (optional; deployment-wide calling transport).
+# Use instead of calling.ice_servers. Supply the API token through a runtime-only
+# secret WHATOMATE_CALLING__CLOUDFLARE_TURN__API_TOKEN, never frontend config.
+# Key ID env: WHATOMATE_CALLING__CLOUDFLARE_TURN__KEY_ID
+# Credentials last 24h and are refreshed on demand for new peers after at most 1h.
+# Existing calls are not renegotiated; no scheduler or daily deployment is needed.
+# [calling.cloudflare_turn]
+# key_id = "your-32-character-lowercase-hex-turn-key-id"
+# api_token = "" # Set through the backend runtime secret environment instead.
+
 # ICE servers for WebRTC NAT traversal
 # Configure STUN, TURN, or both. Only what you configure is used.
 # - STUN only: works when direct UDP is not blocked by firewall

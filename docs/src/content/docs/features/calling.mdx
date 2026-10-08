@@ -258,6 +258,53 @@ Filter logs by status, direction, account, or IVR flow.
 
 ## Configuration
 
+### Renewable Cloudflare TURN credentials
+
+Cloudflare TURN can obtain temporary relay credentials automatically for new
+calls. Configure the backend runtime secrets:
+
+```text
+WHATOMATE_CALLING__RELAY_ONLY=true
+WHATOMATE_CALLING__CLOUDFLARE_TURN__KEY_ID=<TURN key ID>
+WHATOMATE_CALLING__CLOUDFLARE_TURN__API_TOKEN=<TURN key API token>
+```
+
+Remove `calling.ice_servers` when using this mode. The provider is deployment-wide
+and applies to calling-enabled organizations using the shared call manager. Keep
+the API token in backend runtime secret storage; it is not a TURN password and
+must never be sent to a browser. Object-storage credentials for audio are separate.
+
+The backend obtains 24-hour credentials from Cloudflare's official HTTPS endpoint,
+selects `turns:turn.cloudflare.com:443?transport=tcp`, and caches a bundle for at
+most one hour. Every new server peer and authenticated browser ICE request checks
+freshness. Concurrent refreshes share one bounded request. If a stale bundle
+cannot be refreshed, new call setup fails explicitly; it does not silently use
+expired credentials or an empty ICE list. The browser fetches again for each call,
+and the ICE endpoint uses `Cache-Control: no-store`. No scheduler or daily restart
+is needed. Leaving both Cloudflare settings unset preserves static/coturn behavior.
+
+Existing calls are **not renegotiated** when credentials refresh. Cloudflare can
+disconnect a TURN allocation when its original credentials expire, so this
+feature does not support indefinite calls. A new call receives approximately
+23–24 hours of remaining lifetime, ending at the bundle's `expires_at`; it is
+not guaranteed 24 hours from call start. This version does not enforce the
+displayed `max_call_duration` setting; duration enforcement is a separate change.
+For provider details, see Cloudflare's
+[credential generation documentation](https://developers.cloudflare.com/realtime/turn/generate-credentials/)
+and [TURN FAQ](https://developers.cloudflare.com/realtime/turn/faq/) (maximum
+credential lifetime: 48 hours).
+
+The native Go client identifies itself as `ReReply-TURN/1.0`, verifies TLS, and
+does not follow redirects. Provider access must be checked in an approved
+deployment before enabling this feature in production. A provider/WAF rejection
+must be resolved with Cloudflare; the client does not bypass those controls.
+
+Rolling back to an older application binary also requires a compatible static
+or coturn ICE configuration. Older binaries ignore the new provider fields;
+leaving only those fields and relay-only mode enabled does not supply a relay.
+
+### Static calling configuration
+
 Add to your `config.toml`:
 
 ```toml
