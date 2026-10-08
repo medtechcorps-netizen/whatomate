@@ -174,10 +174,15 @@ after a deployment/health failure exits 2; uncertain ownership or failed recover
 exits 3 and requires manual reconciliation. A successful cross-job rollback
 does not turn the failed CRM check or original workflow into success.
 
-PR9 remains owner-merge-gated. After its merge, the owner authorizes a production
-dry-run, a rollback check targeting the current latest record (which must stop
-with `nothing-to-roll-back` before backup/PUT), then normal staging and each
-drill. Local synthetic tests do not substitute for those real run IDs.
+PR9's owner-approved merge and protected production dry-run do not authorize
+rollback. A current-latest rollback stops with `nothing-to-roll-back` before
+backup/PUT when live images equal that record, but can PUT a restoration when
+stable live images match no verified record. A prior dry-run cannot guarantee
+the later outcome. Before dispatch, evaluate the latest record and live state
+afresh and obtain separate authorization for conditional restoration, or use a
+separately reviewed no-PUT mechanism. The required proof remains an actual
+`nothing-to-roll-back` result. Normal staging and each drill also require owner
+authorization; local synthetic tests do not substitute for their real run IDs.
 
 ## Promotion gate and break-glass (Part A PR10)
 
@@ -212,9 +217,9 @@ with local tests.
 | `bad-image` | PRE_DEPLOY failure and verified in-job restoration | Pending |
 
 After the owner reviews those proofs and authorizes PR10's merge, the owner
-authorizes the production dry-run and current-latest rollback no-PUT check,
-then approves the first normal promote that passed staging. Until then, this
-local PR10 preparation is not an authorization to dispatch or promote.
+authorizes its protected production dry-run. Resolve the rollback check under
+the separate scope above, then obtain approval for the first normal promote
+that passed staging. This PR10 preparation does not authorize dispatch or promote.
 
 
 ## Guards
