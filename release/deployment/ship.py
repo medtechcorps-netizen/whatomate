@@ -49,7 +49,11 @@ import trivy_policy
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 TARGET_PATH = HERE / "ship-target.json"
-MODES = ("dry-run", "promote", "rollback")
+MODES = ("dry-run", "promote", "rollback", "stage")
+PRODUCTION_MODES = frozenset({"dry-run", "promote", "rollback"})
+PUT_MODES = frozenset({"promote", "rollback"})
+CANDIDATE_MODES = frozenset({"dry-run", "promote", "stage"})
+DRILLS = frozenset({"none", "e2e-fail", "health-fail", "bad-image"})
 CI_WORKFLOWS = ("test.yml", "e2e-tests.yml")
 DOCKERFILES = {component: f"docker/release/{component}.Dockerfile" for component in common.COMPONENTS}
 # release/exact-sources.json .release.components (the runtime contract).
@@ -208,6 +212,9 @@ def parse_mode(env: Mapping[str, str]) -> tuple[str, str]:
     mode = env.get("SHIP_MODE")
     if mode not in MODES:
         common.fail("input-invalid:mode")
+    drill = env.get("SHIP_DRILL", "none")
+    if drill not in DRILLS or (mode in PRODUCTION_MODES and drill != "none"):
+        common.fail("input-invalid:stage-drill")
     target = env.get("SHIP_TARGET_RELEASE", "")
     if type(target) is not str:
         common.fail("input-invalid:target-release")
@@ -313,13 +320,14 @@ def cmd_plan(ctx: Context) -> int:
     sha = control["sha"]
     mode, target_release = parse_mode(ctx.env)
     active_exceptions = None
-    if mode != "rollback":
+    if mode in CANDIDATE_MODES:
         active_exceptions = trivy_policy.check(ctx.deps.trivy_policy_path, ctx.now().date())
     gh = ctx.gh()
     # The owner-only approval rule must be enforced by the environment
     # before anyone is asked to approve (production re-checks it).
-    release_record.require_approval_gate(gh)
-    if mode != "rollback":
+    if mode in PRODUCTION_MODES:
+        release_record.require_approval_gate(gh)
+    if mode in CANDIDATE_MODES:
         require_ci_green(gh, sha)
     require_old_lanes_idle(gh, ctx.repo_dir)
     bootstrap = ctx.bootstrap()
@@ -331,8 +339,11 @@ def cmd_plan(ctx: Context) -> int:
         f"- Mode: {mode}",
         f"- Commit: {sha}",
         f"- Latest record: {latest.release} ({latest.kind}, commit {latest.sha})",
-        "- Approval gate: environment production requires the owner's review (admin bypass off, main only)",
     ]
+    if mode in PRODUCTION_MODES:
+        lines.append("- Approval gate: environment production requires the owner's review (admin bypass off, main only)")
+    else:
+        lines.append("- Staging only: separate staging environments; no production deployment or record")
     outputs = {
         "latest_release": latest.release,
         "latest_manifest_sha256": latest.manifest_sha256,
@@ -340,7 +351,7 @@ def cmd_plan(ctx: Context) -> int:
         "target_release": "",
         "target_manifest_sha256": "",
     }
-    if mode != "rollback":
+    if mode in CANDIDATE_MODES:
         release_record.require_no_downgrade(ctx.repo_dir, latest.sha, sha)
         schema_change.guard(ctx.repo_dir, latest.sha, sha)
         count, commits = first_parent_commits(out, ctx.repo_dir, latest.sha, sha)
@@ -357,7 +368,10 @@ def cmd_plan(ctx: Context) -> int:
         ]
         if count > len(commits):
             lines.append(f"- ... and {count - len(commits)} more")
-        lines += ["", "The production job deploys only if live digests equal the latest record."]
+        if mode in PRODUCTION_MODES:
+            lines += ["", "The production job deploys only if live digests equal the latest record."]
+        else:
+            lines += ["", "Staging verifies the configured target, deployment receipt and all thirteen canary checks."]
     else:
         target, intermediates = release_record.rollback_plan(chain, target_release)
         schema_change.guard(ctx.repo_dir, target.sha, latest.sha)
@@ -375,11 +389,13 @@ def cmd_plan(ctx: Context) -> int:
             "record only) or restore (target is the latest record and live matches no record; one "
             "PUT back to the latest record).",
         ]
-    lines += ["", APPROVAL_BANNER]
+    if mode in PRODUCTION_MODES:
+        lines += ["", APPROVAL_BANNER]
     out.set_outputs(outputs)
     out.summary(lines)
     out.text(f"plan ok: {mode} at {sha}; latest record {latest.release}")
-    out.text(APPROVAL_BANNER)
+    if mode in PRODUCTION_MODES:
+        out.text(APPROVAL_BANNER)
     return EXIT_OK
 
 
@@ -1019,8 +1035,11 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     out = ctx.out
     deps = ctx.deps
     # P0 context, ambient credentials and target identity, before any I/O.
+    mode, target_release = parse_mode(env)
+    if mode not in PRODUCTION_MODES:
+        common.fail("input-invalid:production-mode")
     control = common.validate_context(env)
-    if any(name in env for name in common.FORBIDDEN_AMBIENT):
+    if any(name in env for name in common.FORBIDDEN_AMBIENT) or any(name.startswith("STAGING_") for name in env):
         common.fail("context-invalid:forbidden-ambient-credential")
     if not token:
         common.fail("target-invalid:token")
@@ -1033,7 +1052,6 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         common.fail("app-identity-mismatch")
     sha = control["sha"]
     # P1 inputs.
-    mode, target_release = parse_mode(env)
     if mode == "rollback":
         if target_release != env.get("PLAN_TARGET_RELEASE"):
             common.fail("latest-changed-since-plan:target")
@@ -1056,7 +1074,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     # P4 desired images.
     candidate: dict[str, Any] | None = None
     target_entry: release_record.Entry | None = None
-    if mode != "rollback":
+    if mode in {"dry-run", "promote"}:
         candidate = decode_candidate(env, control, ctx.now())
         desired_images = dict(candidate["images"])
         if set(desired_images.values()) & set(bootstrap["images"].values()):
@@ -1077,7 +1095,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         secret["postgres_cluster_id"],
         token,
         expected_app_id_sha256=target["app_id_sha256"],
-        allow_put=mode != "dry-run",
+        allow_put=mode in PUT_MODES,
         opener=deps.opener,
     )
     run.clients.append(client)
@@ -1091,7 +1109,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     out.add_mask(origin)
     live_images = spec_images.extract_image_digests(before.spec)
     # P6 drift.
-    if mode != "rollback":
+    if mode in {"dry-run", "promote"}:
         if live_images != latest.images:
             common.fail("drift")
         case = mode

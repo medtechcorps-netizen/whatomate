@@ -26,6 +26,21 @@ export class ProductAPI {
   }
 }
 
+export async function markFixtureConversationRead(api, conversationID) {
+  const { messages } = await api.call('GET', `/api/conversations/${conversationID}/messages?limit=100`)
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  if (!Array.isArray(messages) || messages.length === 0 || messages.some(record =>
+    !record || typeof record !== 'object' || Array.isArray(record) ||
+    !record.message || typeof record.message !== 'object' || Array.isArray(record.message) ||
+    typeof record.message.id !== 'string' || !uuid.test(record.message.id))) {
+    throw new Error('Synthetic transcript is empty or malformed')
+  }
+  // InboxMessageResponse wraps each message. The API orders these records by
+  // COALESCE(ingested_at, created_at) DESC, id DESC; retain that database order
+  // rather than losing sub-millisecond precision by sorting with Date.parse.
+  await api.call('POST', `/api/conversations/${conversationID}/read`, { last_visible_message_id: messages[0].message.id })
+}
+
 export async function provision(profile = loadProfile()) {
   const context = await request.newContext({ baseURL: profile.origin, timeout: 45000, ignoreHTTPSErrors: false })
   try {
@@ -109,10 +124,7 @@ export async function provision(profile = loadProfile()) {
       const userAPI = new ProductAPI(userContext, me.organization_id)
       await userAPI.call('POST', '/api/auth/login', klinikLogin)
       for (const fixture of Object.values(conversations)) {
-        const { messages } = await userAPI.call('GET', `/api/conversations/${fixture.conversation_id}/messages?limit=100`)
-        if (!messages?.length) throw new Error('Synthetic transcript is empty')
-        const latest = [...messages].sort((a, b) => Date.parse(b.ingested_at || b.created_at) - Date.parse(a.ingested_at || a.created_at))[0]
-        await userAPI.call('POST', `/api/conversations/${fixture.conversation_id}/read`, { last_visible_message_id: latest.id })
+        await markFixtureConversationRead(userAPI, fixture.conversation_id)
       }
     } finally { await userContext.dispose() }
     const fixture = { descriptor: { schema_version: 1, product_origin: profile.origin, fixture_namespace: profile.namespace,

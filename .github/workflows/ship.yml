@@ -2,16 +2,17 @@ name: Release
 
 run-name: Release ${{ inputs.mode }} ${{ inputs.target_release }}
 
-# One-click promote-by-digest (Stage 1). plan -> images -> attest ->
-# production -> record. Only the production job sees the deploy token, and
-# only after the owner approves the production environment in the GitHub UI.
+# Promote-by-digest and the separate synthetic staging lane. Production's
+# deploy token is released only after the owner approves in the GitHub UI.
+# Staging provider tokens are confined to its deploy/rollback steps; the CRM
+# test job receives only the minimal synthetic fixture inputs.
 # docs/release.md is the runbook; docs/emergency-rollback.md is the
 # owner-run console fallback.
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: dry-run (no PUT), promote, or rollback
+        description: dry-run (no PUT), promote, rollback, or stage
         required: true
         type: choice
         default: dry-run
@@ -19,6 +20,17 @@ on:
           - dry-run
           - promote
           - rollback
+          - stage
+      drill:
+        description: Staging-only failure rehearsal
+        required: true
+        type: choice
+        default: none
+        options:
+          - none
+          - e2e-fail
+          - health-fail
+          - bad-image
       target_release:
         description: Rollback only, a record tag such as prod-20261004T101500Z-0123abcd or prod-0000
         required: false
@@ -106,13 +118,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SHIP_MODE: ${{ inputs.mode }}
+          SHIP_DRILL: ${{ inputs.drill }}
           SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
         run: /usr/bin/python3 -I -S -B release/deployment/ship.py plan
 
   images:
     name: Release image (${{ matrix.component }})
     needs: plan
-    if: ${{ inputs.mode != 'rollback' }}
+    if: ${{ contains(fromJSON('["dry-run","promote","stage"]'), inputs.mode) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -396,7 +409,7 @@ jobs:
     needs:
       - plan
       - images
-    if: ${{ inputs.mode != 'rollback' }}
+    if: ${{ contains(fromJSON('["dry-run","promote","stage"]'), inputs.mode) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -540,12 +553,249 @@ jobs:
         id: candidate
         run: /usr/bin/python3 -I -S -B release/deployment/ship.py candidate --stage assemble
 
+  deploy-staging:
+    name: Release staging
+    needs:
+      - plan
+      - attest
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && inputs.mode == 'stage' && needs.plan.result == 'success' && needs.attest.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: staging
+    concurrency:
+      group: ship-staging
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    outputs:
+      receipt_b64: ${{ steps.stage.outputs.receipt_b64 }}
+      receipt_sha256: ${{ steps.stage.outputs.receipt_sha256 }}
+    # No uses steps can run beside the provider token.
+    steps:
+      - name: Refuse re-runs
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT_NAME: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT_NAME" == "github-hosted" ]]
+          [[ "${RUNNER_DEBUG:-}" != "1" ]]
+
+      - name: Fetch the dispatched commit without credentials
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none --no-checkout --single-branch --branch main --no-tags \
+            "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_WORKSPACE/src"
+          git -C "$GITHUB_WORKSPACE/src" checkout --quiet --detach "$GITHUB_SHA"
+          [[ "$(git -C "$GITHUB_WORKSPACE/src" rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -z "$(git -C "$GITHUB_WORKSPACE/src" status --porcelain)" ]]
+
+      - name: Install pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ship-tools"
+          install -d -m 0755 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          printf '%s  %s\n' "$PINNED_GH_SHA256" "$RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          read -r gh_name gh_word gh_version _ < <("$tools_dir/gh" --version)
+          [[ "$gh_name $gh_word $gh_version" == "gh version $PINNED_GH_VERSION" ]]
+          printf 'SHIP_GH_BIN=%s\n' "$tools_dir/gh" >> "$GITHUB_ENV"
+
+      - name: Verify and deploy staging
+        id: stage
+        working-directory: src
+        env:
+          STAGING_DO_TOKEN: ${{ secrets.STAGING_DO_TOKEN }}
+          STAGING_TARGET_JSON: ${{ secrets.STAGING_TARGET_JSON }}
+          GH_TOKEN: ${{ github.token }}
+          SHIP_MODE: ${{ inputs.mode }}
+          SHIP_DRILL: ${{ inputs.drill }}
+          SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
+          PLAN_LATEST_RELEASE: ${{ needs.plan.outputs.latest_release }}
+          PLAN_LATEST_MANIFEST_SHA256: ${{ needs.plan.outputs.latest_manifest_sha256 }}
+          CANDIDATE_B64: ${{ needs.attest.outputs.candidate_b64 }}
+          CANDIDATE_SHA256: ${{ needs.attest.outputs.candidate_sha256 }}
+        run: /usr/bin/python3 -I -S -B release/deployment/stage.py deploy
+
+  e2e-staging:
+    name: Release staging CRM checks
+    needs:
+      - attest
+      - deploy-staging
+    if: ${{ !cancelled() && inputs.mode == 'stage' && needs.attest.result == 'success' && needs.deploy-staging.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: staging-e2e
+    container:
+      image: mcr.microsoft.com/playwright:v1.57.0-noble@sha256:8fb7af3bb488c51364d6554876a8eddf377736608327dbdf4177b4901faf7bc9
+    permissions:
+      contents: read
+    outputs:
+      report_b64: ${{ steps.report.outputs.report_b64 }}
+      report_sha256: ${{ steps.report.outputs.report_sha256 }}
+      passed: ${{ steps.report.outputs.passed }}
+    steps:
+      - name: Mask staging fixture before all other steps
+        env:
+          STAGING_ORIGIN: ${{ secrets.STAGING_ORIGIN }}
+          STAGING_CANARY_FIXTURE_JSON: ${{ secrets.STAGING_CANARY_FIXTURE_JSON }}
+          STAGING_STUB_CONTROL_KEY: ${{ secrets.STAGING_STUB_CONTROL_KEY }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT_NAME: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import json, os, sys
+          try:
+              names = ('STAGING_ORIGIN', 'STAGING_CANARY_FIXTURE_JSON', 'STAGING_STUB_CONTROL_KEY')
+              values = [os.environ[name] for name in names]
+              if not all(values): raise ValueError()
+              def mask(value):
+                  if isinstance(value, str) and value:
+                      print('::add-mask::' + value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+                  elif isinstance(value, dict):
+                      for child in value.values(): mask(child)
+                  elif isinstance(value, list):
+                      for child in value: mask(child)
+              for value in values: mask(value)
+              mask(json.loads(values[1]))
+          except Exception:
+              print('stage-fixture: refused', file=sys.stderr)
+              sys.exit(1)
+          PY
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT_NAME" == "github-hosted" ]]
+          [[ "${RUNNER_DEBUG:-}" != "1" ]]
+
+      - name: Check out the dispatched commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install frontend dependencies without lifecycle scripts
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+
+      - name: Import fixture and run staging CRM checks
+        id: canary
+        env:
+          STAGING_ORIGIN: ${{ secrets.STAGING_ORIGIN }}
+          STAGING_CANARY_FIXTURE_JSON: ${{ secrets.STAGING_CANARY_FIXTURE_JSON }}
+          STAGING_STUB_CONTROL_KEY: ${{ secrets.STAGING_STUB_CONTROL_KEY }}
+          STAGE_RECEIPT_B64: ${{ needs.deploy-staging.outputs.receipt_b64 }}
+          STAGE_RECEIPT_SHA256: ${{ needs.deploy-staging.outputs.receipt_sha256 }}
+          STAGE_CANDIDATE_SHA256: ${{ needs.attest.outputs.candidate_sha256 }}
+          SHIP_DRILL: ${{ inputs.drill }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -S -B release/deployment/stage_fixture.py import-fixture --output "$RUNNER_TEMP/rereply-staging/canary.json"
+          unset STAGING_ORIGIN STAGING_CANARY_FIXTURE_JSON STAGING_STUB_CONTROL_KEY
+          export CANARY_PROFILE=staging
+          export CANARY_PRIVATE_FILE="$RUNNER_TEMP/rereply-staging/canary.json"
+          export CANARY_REPORT_FILE="$RUNNER_TEMP/rereply-staging/report.json"
+          [[ ! -e "$CANARY_REPORT_FILE" && ! -L "$CANARY_REPORT_FILE" ]]
+          export CANARY_DRILL="$SHIP_DRILL"
+          npm --prefix frontend run test:canary
+
+      - name: Verify the bound staging report
+        id: report
+        env:
+          STAGE_RECEIPT_B64: ${{ needs.deploy-staging.outputs.receipt_b64 }}
+          STAGE_RECEIPT_SHA256: ${{ needs.deploy-staging.outputs.receipt_sha256 }}
+          STAGE_CANDIDATE_SHA256: ${{ needs.attest.outputs.candidate_sha256 }}
+          CANARY_DRILL: ${{ inputs.drill }}
+        run: /usr/bin/python3 -I -S -B release/deployment/stage_report.py --private-file "$RUNNER_TEMP/rereply-staging/canary.json" --report "$RUNNER_TEMP/rereply-staging/report.json"
+
+  staging-rollback:
+    name: Release staging rollback
+    needs:
+      - plan
+      - attest
+      - deploy-staging
+      - e2e-staging
+    if: ${{ !cancelled() && inputs.mode == 'stage' && needs.deploy-staging.result == 'success' && contains(fromJSON('["failure","cancelled"]'), needs.e2e-staging.result) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: staging
+    concurrency:
+      group: ship-staging
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      attestations: read
+      contents: read
+    steps:
+      - name: Refuse re-runs
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUNNER_ENVIRONMENT_NAME: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ATTEMPT" == "1" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$RUNNER_ENVIRONMENT_NAME" == "github-hosted" ]]
+          [[ "${RUNNER_DEBUG:-}" != "1" ]]
+
+      - name: Fetch the dispatched commit without credentials
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none --no-checkout --single-branch --branch main --no-tags \
+            "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_WORKSPACE/src"
+          git -C "$GITHUB_WORKSPACE/src" checkout --quiet --detach "$GITHUB_SHA"
+          [[ "$(git -C "$GITHUB_WORKSPACE/src" rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -z "$(git -C "$GITHUB_WORKSPACE/src" status --porcelain)" ]]
+
+      - name: Install pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/ship-tools"
+          install -d -m 0755 "$tools_dir"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            "$PINNED_GH_URL" -o "$RUNNER_TEMP/gh.tar.gz"
+          printf '%s  %s\n' "$PINNED_GH_SHA256" "$RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools_dir/gh"
+          read -r gh_name gh_word gh_version _ < <("$tools_dir/gh" --version)
+          [[ "$gh_name $gh_word $gh_version" == "gh version $PINNED_GH_VERSION" ]]
+          printf 'SHIP_GH_BIN=%s\n' "$tools_dir/gh" >> "$GITHUB_ENV"
+
+      - name: Restore the previous staging candidate
+        working-directory: src
+        env:
+          STAGING_DO_TOKEN: ${{ secrets.STAGING_DO_TOKEN }}
+          STAGING_TARGET_JSON: ${{ secrets.STAGING_TARGET_JSON }}
+          GH_TOKEN: ${{ github.token }}
+          SHIP_MODE: ${{ inputs.mode }}
+          SHIP_DRILL: ${{ inputs.drill }}
+          SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
+          PLAN_LATEST_RELEASE: ${{ needs.plan.outputs.latest_release }}
+          PLAN_LATEST_MANIFEST_SHA256: ${{ needs.plan.outputs.latest_manifest_sha256 }}
+          CANDIDATE_B64: ${{ needs.attest.outputs.candidate_b64 }}
+          CANDIDATE_SHA256: ${{ needs.attest.outputs.candidate_sha256 }}
+          STAGE_RECEIPT_B64: ${{ needs.deploy-staging.outputs.receipt_b64 }}
+          STAGE_RECEIPT_SHA256: ${{ needs.deploy-staging.outputs.receipt_sha256 }}
+        run: /usr/bin/python3 -I -S -B release/deployment/stage.py rollback
+
   production:
     name: Release production (${{ inputs.mode }})
     needs:
       - plan
       - attest
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.plan.result == 'success' && ((inputs.mode == 'rollback' && needs.attest.result == 'skipped') || (inputs.mode != 'rollback' && needs.attest.result == 'success')) }}
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && contains(fromJSON('["dry-run","promote","rollback"]'), inputs.mode) && needs.plan.result == 'success' && ((inputs.mode == 'rollback' && needs.attest.result == 'skipped') || (contains(fromJSON('["dry-run","promote"]'), inputs.mode) && needs.attest.result == 'success')) }}
     runs-on: ubuntu-24.04
     # Above the worst-case deploy + rollback path (ship.py
     # production_worst_case_seconds, checked by test_ship_workflow).
@@ -619,6 +869,7 @@ jobs:
           SHIP_TARGET_JSON: ${{ secrets.PRODUCTION_TARGET_JSON }}
           GH_TOKEN: ${{ github.token }}
           SHIP_MODE: ${{ inputs.mode }}
+          SHIP_DRILL: ${{ inputs.drill }}
           SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
           PLAN_LATEST_RELEASE: ${{ needs.plan.outputs.latest_release }}
           PLAN_LATEST_MANIFEST_SHA256: ${{ needs.plan.outputs.latest_manifest_sha256 }}
@@ -632,7 +883,7 @@ jobs:
     name: Release record
     needs:
       - production
-    if: ${{ !cancelled() && needs.production.result == 'success' && inputs.mode != 'dry-run' }}
+    if: ${{ !cancelled() && needs.production.result == 'success' && contains(fromJSON('["promote","rollback"]'), inputs.mode) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

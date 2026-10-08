@@ -40,8 +40,8 @@ negative cases that break the property and must make the checker fail:
     created is refused; every step runs unconditionally and fails closed;
 14. no release image and no workflow that builds or tests one references the
     staging code (release/staging, the graph stub): the Dockerfiles under
-    docker/ outside docker/staging/, ship.yml, e2e-tests.yml, and every Test
-    job except staging-bootstrap.
+    docker/ outside docker/staging/, the production/build/record jobs in
+    ship.yml, e2e-tests.yml, and every Test job except staging-bootstrap.
 
 The workflows are read with test_ship_workflow's YAML-subset reader plus the
 folded scalars the CI workflows use; when PyYAML happens to be importable the
@@ -89,7 +89,12 @@ CI_PREFIXES = {"test.yml": "test", "e2e-tests.yml": "e2e"}
 CI_TRIGGERS = {"push": {"branches": ["main"]}, "pull_request": {"branches": ["main"]}}
 FORBIDDEN_TRIGGERS = ("pull_request_target", "workflow_run")
 # Every job that names a deployment environment, and the environment it names.
-ENVIRONMENTS = {("ship.yml", "production"): "production"}
+ENVIRONMENTS = {
+    ("ship.yml", "production"): "production",
+    ("ship.yml", "deploy-staging"): "staging",
+    ("ship.yml", "staging-rollback"): "staging",
+    ("ship.yml", "e2e-staging"): "staging-e2e",
+}
 SECRET_WORKFLOWS = {"ship.yml"}
 PG17_IMAGE = "postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449"
 POSTGRES_JOBS = (("test.yml", "tenant-isolation"), ("test.yml", "go-race"), ("test.yml", "staging-bootstrap"),
@@ -828,7 +833,10 @@ def assert_staging_bootstrap(sources: dict[str, str]) -> None:
 # in this list.
 STAGING_REFERENCE = re.compile(r"release/staging|graph-stub|graphstub")
 STAGING_REFERENCE_WORKFLOWS = ("ship.yml", "test.yml", "e2e-tests.yml")
-STAGING_REFERENCE_JOBS = {("test.yml", STAGING_BOOTSTRAP_JOB), ("test.yml", "release-tests")}
+STAGING_REFERENCE_JOBS = {
+    ("test.yml", STAGING_BOOTSTRAP_JOB), ("test.yml", "release-tests"),
+    ("ship.yml", "deploy-staging"), ("ship.yml", "e2e-staging"), ("ship.yml", "staging-rollback"),
+}
 
 
 def text_nodes(value: Any) -> list[str]:
@@ -1065,6 +1073,8 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "ship.yml", "    environment: production\n", "    environment:\n      name: staging\n")),
     "give another Release job an environment": ("environments-and-secrets", lambda: replaced(
         "ship.yml", "    name: Release record\n", "    name: Release record\n    environment: production\n")),
+    "give staging CRM checks the production environment": ("environments-and-secrets", lambda: replaced(
+        "ship.yml", "    environment: staging-e2e\n", "    environment: production\n")),
     # 6. actionlint.
     "lint only one workflow": ("workflow-lint", lambda: replaced(
         "test.yml", "          actionlint\n", "          actionlint .github/workflows/test.yml\n")),

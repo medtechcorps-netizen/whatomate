@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/stretchr/testify/require"
@@ -92,7 +93,29 @@ func ensurePlatformComplianceTestContract(t *testing.T, db *gorm.DB) {
 		require.NoError(t, db.Exec("DROP OWNED BY "+runtimeRole).Error)
 		require.NoError(t, db.Exec("DROP ROLE IF EXISTS "+runtimeRole).Error)
 	})
-	require.NoError(t, database.ApplyTenantRLS(db, runtimeRole))
+	require.NoError(t, retryPlatformComplianceTestContract(
+		func() error { return database.ApplyTenantRLS(db, runtimeRole) },
+		func(nextAttempt int) {
+			t.Logf("Retrying complete fixture RLS installation after SQLSTATE 40P01 (attempt %d/3)", nextAttempt)
+		},
+	))
+}
+
+// Repeated fixture installation can deadlock with auto-ANALYZE between catalog
+// ACL updates and table DDL. PostgreSQL rolls the installer transaction back.
+// Retry the complete installer using the same role, never a statement in the
+// aborted transaction or the subsequent compliance creator/test scenario.
+// Production installer behavior and every RLS contract check remain unchanged.
+func retryPlatformComplianceTestContract(apply func() error, retryLog func(int)) error {
+	for attempt := 1; ; attempt++ {
+		err := apply()
+		var postgresErr *pgconn.PgError
+		if err == nil || attempt == 3 || !errors.As(err, &postgresErr) ||
+			postgresErr == nil || postgresErr.Code != "40P01" {
+			return err
+		}
+		retryLog(attempt + 1)
+	}
 }
 
 func assertPlatformComplianceOrganizationGuardEnabled(t *testing.T, db *gorm.DB) {
