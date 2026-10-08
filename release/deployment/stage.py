@@ -29,6 +29,7 @@ import stage_contract as contract
 require = contract.require
 PAGE_SIZE = 200
 MAX_PAGES = 10
+HEALTH_DRILL_EVIDENCE = "stage-drill: health-fail: intentional failure observed; staging restored"
 
 
 class StageClient(do_app.DOAppClient):
@@ -108,12 +109,20 @@ class Outcome:
     # Never contain a provider body, raw ID, ingress, token, or spec.
     status: str
     receipt: dict | None = None
+    health_drill_completed: bool = False
 
 
 class DeploymentFailure(common.ReleaseError):
     def __init__(self, code, candidate_id=None):
         super().__init__(code)
         self.candidate_id = candidate_id
+
+
+class IntentionalHealthFailure(common.ReleaseError):
+    """Only the completed deliberate probe raises this credential-free signal."""
+
+    def __init__(self):
+        super().__init__("smoke-failed:stage-drill")
 
 
 class StageLane:
@@ -186,7 +195,7 @@ class StageLane:
             # The probe executes, but cannot accidentally turn a drill green if
             # a catch-all route unexpectedly returns 200 for the missing path.
             self.request(self.target["origin"] + "/_stage_drill_intentionally_missing")
-            common.fail("smoke-failed:stage-drill")
+            raise IntentionalHealthFailure()
         for _, path, expected in smoke.HEALTH:
             status, headers, body = self.request(self.target["origin"] + path)
             require(status == expected and not any(key.lower() == "location" for key in headers) and
@@ -343,7 +352,9 @@ class StageLane:
                 # manual reconciliation condition, never a blind rollback PUT.
                 raise
             self.rollback_owned(desired, before, candidate_id, previous_source=previous_source)
-            return Outcome("failed-rolled-back")
+            return Outcome("failed-rolled-back", health_drill_completed=(
+                drill == "health-fail" and type(error) is IntentionalHealthFailure and
+                error.code == "smoke-failed:stage-drill"))
         value = {"schema_version": 1, "profile": "staging", "run_id": run_id, "candidate_sha256": candidate_sha256,
             "ingress_sha256": common.sha256_text(self.target["origin"]), "app_id_sha256": self.pins["app_id_sha256"], "drill": drill,
             "previous_images": before.images, "candidate_images": candidate["images"],
@@ -464,6 +475,9 @@ def main(argv=None, env=None, deps=None, *, adapter_factory=None, pins_path=None
             out.set_outputs({"receipt_b64": base64.b64encode(raw).decode("ascii"), "receipt_sha256": common.sha256_bytes(raw)})
             out.emit(outcome.receipt)
         out.text("stage: " + outcome.status)
+        if (arguments.command == "deploy" and drill == "health-fail" and
+                outcome.status == "failed-rolled-back" and outcome.health_drill_completed is True):
+            out.text(HEALTH_DRILL_EVIDENCE)
         return ship.EXIT_OK if outcome.status in {"deployed", "rolled-back"} else ship.EXIT_ROLLED_BACK
     except (Exception, KeyboardInterrupt):
         attempted = lane is not None and any(client.mutation_attempted for client in lane.clients)
