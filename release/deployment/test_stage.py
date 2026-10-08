@@ -545,26 +545,150 @@ class CLITests(unittest.TestCase):
             "RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_RUN_ID": "1234567",
             "CANDIDATE_B64": base64.b64encode(common.canonical_file_bytes(value)).decode(), "CANDIDATE_SHA256": common.sha256_bytes(common.canonical_file_bytes(value))}
 
-    def world_cli(self, world, drill, *, request=None):
-        logs = io.StringIO()
+    def world_cli(self, world, drill, *, request=None, stdout=None, command="deploy", receipt=None):
+        logs = stdout if stdout is not None else io.StringIO()
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             production_file, pins_file, template_file = (root / name for name in ("production.json", "pins.json", "template.json"))
             for path, value in ((production_file, world.production), (pins_file, world.pins), (template_file, world.template)):
                 path.write_bytes(common.canonical_file_bytes(value))
             env = self.environment(); env["SHIP_DRILL"] = drill
+            if receipt is not None:
+                raw = contract.receipt_bytes(receipt)
+                env.update(STAGE_RECEIPT_B64=base64.b64encode(raw).decode(), STAGE_RECEIPT_SHA256=common.sha256_bytes(raw))
             deps = stage.ship.Deps(stdout=logs, target_path=production_file,
                 clock=lambda: dt.datetime(2026, 10, 7, 12, 1, tzinfo=dt.timezone.utc),
                 https_request=request or world.request, sleeper=lambda _: None, poll_limit=3)
             adapters = lambda *_: SimpleNamespace(verify_products=world.verify_products,
                 verify_staging=lambda binding: binding["source_sha"], verify_plan=lambda *_: True)
             with mock.patch.object(stage, "StageClient", side_effect=lambda *_, allow_put, **__: world.factory(allow_put=allow_put)):
-                result = stage.main(["deploy"], env, deps, adapter_factory=adapters,
+                result = stage.main([command], env, deps, adapter_factory=adapters,
                     pins_path=pins_file, template_path=template_file)
         ordinary = "\n".join(line for line in logs.getvalue().splitlines() if not line.startswith("::add-mask::"))
         for private in ("synthetic-provider-token-never-log", "synthetic-private-body", APP, PG, VK, VPC, ORIGIN):
             self.assertNotIn(private, ordinary)
         return result, ordinary
+
+    def test_failure_checkpoints_keep_candidate_and_rollback_write_counts(self):
+        cases = (
+            ("rejected", "candidate-put-reconcile", "provider-rejected", 0, 1),
+            ("get", "candidate-put-reconcile", "provider-get-failed", 1, 1),
+            ("guard", "candidate-put-reconcile", "reconcile-failed:stage-spec-drift", 1, 1),
+            ("rollback-guard", "rollback-ownership", "rollback-precondition-failed:stage-drift", 1, 1),
+            ("rollback-health", "rollback-health", "smoke-failed:stage-health", 2, 2),
+        )
+        for case, checkpoint, code, writes, attempts in cases:
+            world = World()
+            if case == "rejected": world.put_outcome = "rejected"
+            if case in {"get", "guard"}:
+                def changed(value):
+                    if value.writes:
+                        if case == "get": common.fail("provider-get-failed")
+                        value.spec["services"][0]["health_check"]["initial_delay_seconds"] = 999
+                world.app_hook = changed
+            def request(url):
+                if case == "rollback-guard": world.spec["services"][0]["envs"][0]["value"] = "foreign-change"
+                return 503, {}, b"synthetic-private-body"
+            with self.subTest(case=case):
+                result, logs = self.world_cli(world, "none", request=request)
+                self.assertEqual(result, stage.ship.EXIT_MANUAL)
+                self.assertEqual(logs.splitlines(), [
+                    "stage: failed after an attempted mutation; reconcile with reads before any retry",
+                    f"stage-diagnostic: checkpoint={checkpoint}; code={code}"])
+                self.assertEqual(len(world.writes), writes)
+                self.assertEqual(sum(client.puts for client in world.clients), attempts)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+
+    def test_unknown_exception_details_and_untrusted_checkpoint_never_print(self):
+        secret = "privateSentinelUnmasked0123456789"
+        class PrivateException(Exception):
+            def __str__(self): raise AssertionError("must not stringify exceptions")
+        cases = (
+            (common.ReleaseError("provider-invalid:" + secret), "provider-invalid"),
+            (RuntimeError(secret + ORIGIN + APP), "internal-error"),
+            (PrivateException(), "internal-error"),
+            (KeyboardInterrupt(secret), "internal-error:interrupted"),
+        )
+        for error, expected in cases:
+            world = World()
+            def refuse(value):
+                if value.writes: raise error
+            world.app_hook = refuse
+            with self.subTest(code=expected):
+                result, logs = self.world_cli(world, "none")
+                self.assertEqual(result, stage.ship.EXIT_MANUAL)
+                self.assertIn("checkpoint=candidate-put-reconcile; code=" + expected, logs)
+                self.assertNotIn(secret, logs)
+                self.assertEqual(len(world.writes), 1)
+                self.assertEqual(sum(client.puts for client in world.clients), 1)
+        output = io.StringIO()
+        stage.report_failure(common.Output(stdout=output), RuntimeError(secret), secret, False)
+        self.assertEqual(output.getvalue().splitlines()[-1], "stage-diagnostic: checkpoint=unknown; code=internal-error")
+        self.assertNotIn(secret, output.getvalue())
+
+    def test_receipt_output_failures_are_after_deploy_and_do_not_retry_or_rollback(self):
+        for method, checkpoint, error, code in (
+            ("set_outputs", "receipt-outputs", OSError("synthetic-private-body"), "internal-error"),
+            ("emit", "receipt-emit", common.ReleaseError("output-unsafe:value"), "output-unsafe:value"),
+        ):
+            world = World()
+            with self.subTest(method=method), mock.patch.object(common.Output, method, side_effect=error) as failed:
+                result, logs = self.world_cli(world, "none")
+            failed.assert_called_once()
+            self.assertEqual(result, stage.ship.EXIT_MANUAL)
+            self.assertIn(f"checkpoint={checkpoint}; code={code}", logs)
+            self.assertEqual(len(world.writes), 1)
+            self.assertEqual(sum(client.puts for client in world.clients), 1)
+            self.assertEqual(len(world.probes), 6)
+            self.assertEqual(contract.image_set(world.spec), NEW)
+
+    def test_broken_output_preserves_refusal_or_manual_without_raw_fallback(self):
+        for after_write in (False, True):
+            world = World()
+            class Broken(io.StringIO):
+                def write(self, value):
+                    if not after_write or world.writes: raise OSError("synthetic-private-body")
+                    return super().write(value)
+            with self.subTest(after_write=after_write):
+                result, logs = self.world_cli(world, "none", stdout=Broken())
+                self.assertEqual(result, stage.ship.EXIT_MANUAL if after_write else stage.ship.EXIT_REFUSED)
+                self.assertEqual(len(world.writes), int(after_write))
+                self.assertEqual(sum(client.puts for client in world.clients), int(after_write))
+                self.assertEqual(logs, "")
+        world = World(); world.put_outcome = "rejected"
+        original = common.Output.text
+        def guarded(out, line):
+            if line.startswith("stage-diagnostic:"): common.fail("output-unsafe:text")
+            return original(out, line)
+        with mock.patch.object(common.Output, "text", guarded):
+            result, logs = self.world_cli(world, "none")
+        self.assertEqual(result, stage.ship.EXIT_MANUAL)
+        self.assertEqual(logs, "stage: failed after an attempted mutation; reconcile with reads before any retry")
+        self.assertEqual(sum(client.puts for client in world.clients), 1)
+
+    def test_success_and_completed_in_job_rollback_keep_existing_output(self):
+        for failure in (False, True):
+            world = World(); world.health_failure = failure
+            with self.subTest(health_failure=failure):
+                result, logs = self.world_cli(world, "none")
+                self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK if failure else stage.ship.EXIT_OK)
+                self.assertNotIn("stage-diagnostic:", logs)
+                self.assertEqual(len(world.writes), 2 if failure else 1)
+                if failure: self.assertEqual(logs, "stage: failed-rolled-back")
+                else:
+                    lines = logs.splitlines()
+                    contract.validate_receipt(json.loads(lines[0]))
+                    self.assertEqual(lines[1:], ["stage: deployed"])
+
+    def test_cross_job_rollback_failure_reports_owned_phase_without_extra_put(self):
+        world = World(); receipt = world.deploy().receipt
+        result, logs = self.world_cli(world, "none", command="rollback", receipt=receipt,
+            request=lambda _: (503, {}, b"synthetic-private-body"))
+        self.assertEqual(result, stage.ship.EXIT_MANUAL)
+        self.assertIn("checkpoint=rollback-health; code=smoke-failed:stage-health", logs)
+        self.assertEqual(len(world.writes), 2)  # One earlier deploy plus exactly one cross-job restore.
+        self.assertEqual(sum(client.puts for client in world.clients), 2)
+        self.assertEqual(contract.image_set(world.spec), IMAGES)
 
     def test_health_drill_cli_marker_requires_exact_trigger_and_completed_restoration(self):
         for case in ("404", "200", "transport", "transport-exception", "same-code", "rollback-health", "none", "e2e-fail", "bad-image"):
