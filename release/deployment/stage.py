@@ -30,6 +30,71 @@ require = contract.require
 PAGE_SIZE = 200
 MAX_PAGES = 10
 HEALTH_DRILL_EVIDENCE = "stage-drill: health-fail: intentional failure observed; staging restored"
+FAILURE_CHECKPOINTS = frozenset({
+    "preflight", "adapter-initialization", "lane-initialization", "lane",
+    "deploy-preflight", "rollback-preflight", "candidate-pre-put-cas",
+    "candidate-put-reconcile", "candidate-final-state", "candidate-health", "candidate-after-health",
+    "receipt-validation", "receipt-sanitize", "receipt-serialization", "receipt-outputs", "receipt-emit", "status-output",
+    "rollback-ownership", "rollback-prior-attestations", "rollback-pre-put-cas",
+    "rollback-put-reconcile", "rollback-final-state", "rollback-health", "rollback-after-health",
+})
+# ReleaseError checks syntax and the reason prefix, not whether its full detail
+# is a source constant. Only these complete codes may enter a public diagnostic.
+FAILURE_CODES = frozenset({
+    "provider-rejected", "provider-get-failed", "provider-ambiguous",
+    "provider-invalid:response-url", "provider-invalid:status", "provider-invalid:content-type",
+    "provider-invalid:size", "provider-invalid:json", "provider-invalid:app", "provider-invalid:deployment",
+    "provider-invalid:deployment-identity", "provider-invalid:stage-transition", "provider-invalid:stage-deployment",
+    "provider-invalid:stage-updated", "cas-changed:active-not-stable", "cas-changed:deployment-pending",
+    "cas-changed:stage-pinned", "cas-changed:stage-deployment", "cas-changed:stage-live-active",
+    "cas-changed:stage-double-read", "cas-changed:stage-before-put", "topology-differs:stage-origin",
+    "topology-differs:staging-spec", "topology-differs:staging-template",
+    "reconcile-failed:stage-spec-drift", "reconcile-failed:stage-old-inflight", "reconcile-failed:stage-multiple-inflight",
+    "reconcile-failed:stage-candidate-changed", "reconcile-failed:stage-deployment-identity",
+    "reconcile-failed:stage-deployment-spec", "reconcile-failed:stage-active-spec", "reconcile-timeout:stage-candidate",
+    "deployment-error:stage-terminal", "post-deploy-guard:stage-migration",
+    "post-deploy-guard:stage-bad-image-unexpected-success", "post-deploy-guard:stage-final-state",
+    "post-deploy-guard:stage-after-health", "post-deploy-guard:migration-inventory",
+    "post-deploy-guard:migration-digest", "post-deploy-guard:migration-failed", "post-deploy-guard:migration-progress",
+    "rollback-precondition-failed:stage-drift", "rollback-precondition-failed:stage-active",
+    "rollback-precondition-failed:stage-candidate", "rollback-precondition-failed:stage-observation-changed",
+    "rollback-precondition-failed:stage-cas", "rollback-failed:stage-final-state", "rollback-failed:stage-after-health",
+    "smoke-failed:stage-health", "smoke-failed:stage-drill", "smoke-failed:dns", "smoke-failed:deadline",
+    "smoke-failed:non-public-address", "smoke-failed:redirect", "smoke-failed:length",
+    "output-unsafe:key", "output-unsafe:value", "output-unsafe:type", "output-unsafe:text",
+    "output-unsafe:mask", "output-unsafe:output-key", "output-unsafe:output-value",
+    "internal-error:invalid-reason-code", "internal-error:unknown-reason-code",
+})
+
+
+def failure_code(error):
+    if isinstance(error, KeyboardInterrupt):
+        return "internal-error:interrupted"
+    if isinstance(error, common.ReleaseError):
+        code = error.code
+        if type(code) is str:
+            if code in FAILURE_CODES:
+                return code
+            reason = code.split(":", 1)[0]
+            if reason in common.REASONS:
+                return reason
+    return "internal-error"
+
+
+def report_failure(out, error, checkpoint, attempted):
+    # Diagnostics cannot replace the selected exit status, even if Output's
+    # privacy guard refuses a line or stdout is unavailable. No raw fallback.
+    for diagnostic in (False, True):
+        try:
+            if diagnostic:
+                phase = checkpoint if type(checkpoint) is str and checkpoint in FAILURE_CHECKPOINTS else "unknown"
+                line = f"stage-diagnostic: checkpoint={phase}; code={failure_code(error)}"
+            else:
+                line = ("stage: failed after an attempted mutation; reconcile with reads before any retry" if attempted else
+                        "stage: refused before mutation")
+            out.text(line)
+        except (Exception, KeyboardInterrupt):
+            pass
 
 
 class StageClient(do_app.DOAppClient):
@@ -141,6 +206,7 @@ class StageLane:
         self.request, self.sleeper, self.monotonic = request, sleeper, monotonic
         self.poll_limit, self.poll_seconds, self.deadline_seconds = poll_limit, poll_seconds, deadline_seconds
         self.clients = []
+        self.checkpoint = "preflight"
 
     def client(self, allow_put):
         client = self.factory(allow_put=allow_put)
@@ -274,6 +340,7 @@ class StageLane:
 
     def rollback_owned(self, desired, before, candidate_id, *, previous_source):
         """Two ownership reads allow terminal failure with old ACTIVE + new spec."""
+        self.checkpoint = "rollback-ownership"
         reader = self.client(False)
         self.inventory(reader)
         wanted = contract.spec_fingerprint(desired)
@@ -289,8 +356,10 @@ class StageLane:
                     failed.get("phase") in {"ACTIVE", "ERROR", "CANCELED"}, "rollback-precondition-failed:stage-candidate")
             observations.append((active, common.exact_string(app.get("updated_at"), "provider-invalid:stage-updated"), failed.get("phase")))
         require(observations[0] == observations[1], "rollback-precondition-failed:stage-observation-changed")
+        self.checkpoint = "rollback-prior-attestations"
         self.verify_product_images(before.images, previous_source)
         # CAS immediately before rollback's fresh one-PUT capability is used.
+        self.checkpoint = "rollback-pre-put-cas"
         writer = self.client(True)
         self.inventory(writer)
         app = self.app(writer)
@@ -301,10 +370,14 @@ class StageLane:
         # deployment must be observed even if its images equal an older ACTIVE.
         live_before = Snapshot(copy.deepcopy(desired), {}, observations[-1][0],
             common.sha256_text(observations[-1][1]), wanted)
+        self.checkpoint = "rollback-put-reconcile"
         result_id = self.put_reconcile(writer, before.spec, live_before, excluded={candidate_id, before.deployment_id})
+        self.checkpoint = "rollback-final-state"
         after = self.stable(writer)
         require(after.deployment_id == result_id and after.spec_sha256 == before.spec_sha256, "rollback-failed:stage-final-state")
+        self.checkpoint = "rollback-health"
         self.health()
+        self.checkpoint = "rollback-after-health"
         require(self.stable(writer) == after, "rollback-failed:stage-after-health")
         return Outcome("rolled-back")
 
@@ -315,6 +388,7 @@ class StageLane:
             self.scrub()
 
     def _deploy(self, candidate, *, candidate_sha256, run_id, drill):
+        self.checkpoint = "deploy-preflight"
         contract.validate_drill("stage", drill)
         common.require_run_id(run_id, "input-invalid:stage-run")
         require(type(run_id) is str, "input-invalid:stage-run")
@@ -332,17 +406,22 @@ class StageLane:
         desired = contract.set_images(before.spec, candidate["images"])
         if drill == "bad-image":
             desired = contract.bad_image_spec(desired, self.target, mode="stage", drill=drill)
+        self.checkpoint = "candidate-pre-put-cas"
         writer = self.client(True)
         self.inventory(writer)
         require(self.stable(writer) == before, "cas-changed:stage-before-put")
         candidate_id = None
         try:
+            self.checkpoint = "candidate-put-reconcile"
             candidate_id = self.put_reconcile(writer, desired, before)
             if drill == "bad-image":
                 raise DeploymentFailure("post-deploy-guard:stage-bad-image-unexpected-success", candidate_id)
+            self.checkpoint = "candidate-final-state"
             after = self.stable(writer)
             require(after.deployment_id == candidate_id and after.spec_sha256 == contract.spec_fingerprint(desired), "post-deploy-guard:stage-final-state")
+            self.checkpoint = "candidate-health"
             self.health(drill)
+            self.checkpoint = "candidate-after-health"
             final = self.stable(writer)
             require(final == after, "post-deploy-guard:stage-after-health")
         except common.ReleaseError as error:
@@ -355,6 +434,7 @@ class StageLane:
             return Outcome("failed-rolled-back", health_drill_completed=(
                 drill == "health-fail" and type(error) is IntentionalHealthFailure and
                 error.code == "smoke-failed:stage-drill"))
+        self.checkpoint = "receipt-validation"
         value = {"schema_version": 1, "profile": "staging", "run_id": run_id, "candidate_sha256": candidate_sha256,
             "ingress_sha256": common.sha256_text(self.target["origin"]), "app_id_sha256": self.pins["app_id_sha256"], "drill": drill,
             "previous_images": before.images, "candidate_images": candidate["images"],
@@ -371,6 +451,7 @@ class StageLane:
             self.scrub()
 
     def _rollback(self, receipt_b64, receipt_sha256, *, run_id, candidate_sha256):
+        self.checkpoint = "rollback-preflight"
         receipt = contract.decode_receipt(receipt_b64, receipt_sha256, run_id=run_id,
             candidate_sha256=candidate_sha256, origin=self.target["origin"],
             production_origin_sha256=self.production["default_ingress_sha256"], app_id_sha256=self.pins["app_id_sha256"])
@@ -424,6 +505,7 @@ def main(argv=None, env=None, deps=None, *, adapter_factory=None, pins_path=None
     out = common.Output(stdout=dependencies.stdout or sys.stdout,
         output_path=environment.get("GITHUB_OUTPUT"), summary_path=environment.get("GITHUB_STEP_SUMMARY"))
     lane = None
+    checkpoint = "preflight"
     installed = threading.current_thread() is threading.main_thread()
     previous_handler = signal.signal(signal.SIGTERM, ship._interrupt) if installed else None
     try:
@@ -458,30 +540,40 @@ def main(argv=None, env=None, deps=None, *, adapter_factory=None, pins_path=None
             # missing module fails closed; there is no permissive fallback.
             from stage_adapters import make_adapters
             adapter_factory = make_adapters
+        checkpoint = "adapter-initialization"
         adapters = adapter_factory(ctx, control)
+        checkpoint = "lane-initialization"
         lane = StageLane(target=target, pins=pins, production=production, template=template, env=environment,
             client_factory=lambda *, allow_put: StageClient(target, token,
                 expected_app_id_sha256=pins["app_id_sha256"], allow_put=allow_put, opener=dependencies.opener),
             verify_products=adapters.verify_products, verify_staging=adapters.verify_staging, verify_plan=adapters.verify_plan,
             request=dependencies.https_request, sleeper=dependencies.sleeper, poll_limit=dependencies.poll_limit)
+        checkpoint = "lane"
         if arguments.command == "deploy":
             outcome = lane.deploy(candidate, candidate_sha256=candidate_hash, run_id=control["run_id"], drill=drill)
         else:
             outcome = lane.rollback(environment.get("STAGE_RECEIPT_B64"), environment.get("STAGE_RECEIPT_SHA256"),
                 run_id=control["run_id"], candidate_sha256=candidate_hash)
         if outcome.status == "deployed":
+            checkpoint = "receipt-sanitize"
             common.sanitize_public(outcome.receipt, private=out.private)
+            checkpoint = "receipt-serialization"
             raw = contract.receipt_bytes(outcome.receipt)
+            checkpoint = "receipt-outputs"
             out.set_outputs({"receipt_b64": base64.b64encode(raw).decode("ascii"), "receipt_sha256": common.sha256_bytes(raw)})
+            checkpoint = "receipt-emit"
             out.emit(outcome.receipt)
+        checkpoint = "status-output"
         out.text("stage: " + outcome.status)
         if (arguments.command == "deploy" and drill == "health-fail" and
                 outcome.status == "failed-rolled-back" and outcome.health_drill_completed is True):
             out.text(HEALTH_DRILL_EVIDENCE)
         return ship.EXIT_OK if outcome.status in {"deployed", "rolled-back"} else ship.EXIT_ROLLED_BACK
-    except (Exception, KeyboardInterrupt):
+    except (Exception, KeyboardInterrupt) as error:
         attempted = lane is not None and any(client.mutation_attempted for client in lane.clients)
-        out.text("stage: failed after an attempted mutation; reconcile with reads before any retry" if attempted else "stage: refused before mutation")
+        if checkpoint == "lane" and lane is not None:
+            checkpoint = lane.checkpoint
+        report_failure(out, error, checkpoint, attempted)
         return ship.EXIT_MANUAL if attempted else ship.EXIT_REFUSED
     finally:
         if installed: signal.signal(signal.SIGTERM, previous_handler)
