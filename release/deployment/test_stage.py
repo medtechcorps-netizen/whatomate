@@ -313,11 +313,84 @@ class LifecycleTests(unittest.TestCase):
         for drill in ("health-fail", "bad-image"):
             world = World(); original = copy.deepcopy(world.spec)
             with self.subTest(drill=drill):
-                self.assertEqual(world.deploy(drill=drill).status, "failed-rolled-back")
+                outcome = world.deploy(drill=drill)
+                self.assertEqual(outcome.status, "failed-rolled-back")
+                self.assertIs(outcome.health_drill_completed, drill == "health-fail")
                 self.assertEqual(len(world.writes), 2)
                 self.assertEqual(world.spec, original)
                 if drill == "health-fail": self.assertTrue(any("intentionally_missing" in url for url in world.probes))
                 else: self.assertTrue(world.writes[0]["jobs"][0]["image"]["repository"].endswith("staging-bootstrap"))
+
+    def test_health_drill_evidence_requires_completed_probe_and_verified_restoration(self):
+        for status in (404, 200):
+            world = World(); original = copy.deepcopy(world.spec)
+            def request(url):
+                result = world.request(url)
+                return (status, {}, b"synthetic-private-probe-body") if "intentionally_missing" in url else result
+            with self.subTest(status=status):
+                outcome = world.deploy(world.lane(request=request), drill="health-fail")
+                self.assertEqual(outcome.status, "failed-rolled-back")
+                self.assertIs(outcome.health_drill_completed, True)
+                self.assertIsNone(outcome.receipt)
+                self.assertEqual(world.spec, original)
+                self.assertEqual(len(world.writes), 2)
+                self.assertNotEqual(world.active, OLD_ID)
+                self.assertEqual(len(world.probes), 7)  # Deliberate probe + restored health6.
+                self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing")
+                self.assertTrue(all(client.scrubbed and client.puts <= 1 for client in world.clients))
+
+    def test_pre_health_and_transport_errors_cannot_claim_intentional_health_evidence(self):
+        for failure in ("terminal", "migration", "final-state", "transport", "same-code"):
+            world = World(); original = copy.deepcopy(world.spec); lane = world.lane()
+            if failure == "terminal": world.put_outcome = "terminal"
+            elif failure == "migration":
+                def fail_migration(value):
+                    if len(value.writes) == 1: value.deployments[value.active]["jobs"][0]["phase"] = "FAILED"
+                world.app_hook = fail_migration
+            elif failure == "final-state":
+                stable, count = lane.stable, 0
+                def wrong_candidate(client):
+                    nonlocal count
+                    value = stable(client); count += 1
+                    # Fail the post-PUT identity guard, leaving real provider
+                    # state intact so the existing rollback can still verify it.
+                    return stage.Snapshot(value.spec, value.images, OLD_ID, value.updated_sha256, value.spec_sha256) if count == 3 else value
+                lane.stable = wrong_candidate
+            else:
+                def failed_probe(url):
+                    if "intentionally_missing" in url:
+                        world.probes.append(url)
+                        common.fail("smoke-failed:stage-drill" if failure == "same-code" else "smoke-failed:transport")
+                    return world.request(url)
+                lane.request = failed_probe
+            with self.subTest(failure=failure):
+                outcome = world.deploy(lane, drill="health-fail")
+                self.assertEqual(outcome.status, "failed-rolled-back")
+                self.assertIs(outcome.health_drill_completed, False)
+                self.assertEqual(world.spec, original)
+                self.assertEqual(len(world.writes), 2)
+                self.assertEqual(any("intentionally_missing" in url for url in world.probes), failure in {"transport", "same-code"})
+
+    def test_intentional_health_failure_cannot_claim_evidence_when_restoration_fails(self):
+        for failure in ("cas", "reject", "health", "after-health"):
+            world = World()
+            if failure in {"cas", "reject"}:
+                def before_rollback(_):
+                    if len(world.clients) == 4:
+                        if failure == "cas": world.updated = "2026-10-07T13:00:00Z"
+                        else: world.put_outcome = "rejected"
+                world.inventory_hook = before_rollback
+            def request(url):
+                result = world.request(url)
+                if len(world.writes) == 2:
+                    if failure == "health": return 503, {}, b"synthetic-private-body"
+                    if failure == "after-health": world.updated = "2026-10-07T14:00:00Z"
+                return result
+            with self.subTest(failure=failure), self.assertRaises(common.ReleaseError):
+                world.deploy(world.lane(request=request), drill="health-fail")
+            self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing")
+            self.assertEqual(len(world.writes), 1 if failure in {"cas", "reject"} else 2)
+            self.assertTrue(all(client.scrubbed and client.puts <= 1 for client in world.clients))
 
     def test_cross_job_e2e_failure_uses_bound_receipt_and_fresh_capability(self):
         world = World(); original = copy.deepcopy(world.spec)
@@ -471,6 +544,128 @@ class CLITests(unittest.TestCase):
             "GITHUB_WORKFLOW_REF": common.SHIP_WORKFLOW_REF, "GITHUB_WORKFLOW_SHA": NEW_SOURCE, "GITHUB_SHA": NEW_SOURCE,
             "RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_RUN_ID": "1234567",
             "CANDIDATE_B64": base64.b64encode(common.canonical_file_bytes(value)).decode(), "CANDIDATE_SHA256": common.sha256_bytes(common.canonical_file_bytes(value))}
+
+    def world_cli(self, world, drill, *, request=None):
+        logs = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            production_file, pins_file, template_file = (root / name for name in ("production.json", "pins.json", "template.json"))
+            for path, value in ((production_file, world.production), (pins_file, world.pins), (template_file, world.template)):
+                path.write_bytes(common.canonical_file_bytes(value))
+            env = self.environment(); env["SHIP_DRILL"] = drill
+            deps = stage.ship.Deps(stdout=logs, target_path=production_file,
+                clock=lambda: dt.datetime(2026, 10, 7, 12, 1, tzinfo=dt.timezone.utc),
+                https_request=request or world.request, sleeper=lambda _: None, poll_limit=3)
+            adapters = lambda *_: SimpleNamespace(verify_products=world.verify_products,
+                verify_staging=lambda binding: binding["source_sha"], verify_plan=lambda *_: True)
+            with mock.patch.object(stage, "StageClient", side_effect=lambda *_, allow_put, **__: world.factory(allow_put=allow_put)):
+                result = stage.main(["deploy"], env, deps, adapter_factory=adapters,
+                    pins_path=pins_file, template_path=template_file)
+        ordinary = "\n".join(line for line in logs.getvalue().splitlines() if not line.startswith("::add-mask::"))
+        for private in ("synthetic-provider-token-never-log", "synthetic-private-body", APP, PG, VK, VPC, ORIGIN):
+            self.assertNotIn(private, ordinary)
+        return result, ordinary
+
+    def test_health_drill_cli_marker_requires_exact_trigger_and_completed_restoration(self):
+        for case in ("404", "200", "transport", "transport-exception", "same-code", "rollback-health", "none", "e2e-fail", "bad-image"):
+            world = World()
+            def request(url):
+                if "intentionally_missing" in url:
+                    if case == "transport-exception": raise TimeoutError("synthetic-private-body")
+                    if case in {"transport", "same-code"}:
+                        common.fail("smoke-failed:stage-drill" if case == "same-code" else "synthetic-private-body")
+                    world.probes.append(url)
+                    return (200 if case == "200" else 404), {}, b"synthetic-private-body"
+                if case == "rollback-health" and len(world.writes) == 2:
+                    return 503, {}, b"synthetic-private-body"
+                return world.request(url)
+            drill = case if case in {"none", "e2e-fail", "bad-image"} else "health-fail"
+            with self.subTest(case=case):
+                result, logs = self.world_cli(world, drill, request=request)
+                self.assertEqual(logs.count(stage.HEALTH_DRILL_EVIDENCE), 1 if case in {"404", "200"} else 0)
+                expected = stage.ship.EXIT_OK if case in {"none", "e2e-fail"} else stage.ship.EXIT_MANUAL if case in {"rollback-health", "transport-exception"} else stage.ship.EXIT_ROLLED_BACK
+                self.assertEqual(result, expected)
+                if case in {"404", "200"}:
+                    self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back", stage.HEALTH_DRILL_EVIDENCE])
+                    self.assertEqual(len(world.writes), 2)
+
+    def template_cli(self, command, *, template_bytes=None, target_changes=None, formatted_identity=None):
+        production, template, pins, target = data()
+        target.update(target_changes or {})
+        logs = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            production_file, pins_file = root / "production.json", root / "pins.json"
+            for name, path, value in (("production", production_file, production), ("pins", pins_file, pins)):
+                raw = (json.dumps(value, indent=2) + "\n").encode() if formatted_identity == name else common.canonical_file_bytes(value)
+                path.write_bytes(raw)
+            template_file = None
+            if template_bytes is not None:
+                template_file = root / "template.json"
+                template_file.write_bytes(template_bytes)
+            env = self.environment(); env["STAGING_TARGET_JSON"] = json.dumps(target)
+            receipt = synthetic_receipt(candidate_sha256=env["CANDIDATE_SHA256"])
+            raw = contract.receipt_bytes(receipt)
+            env.update(STAGE_RECEIPT_B64=base64.b64encode(raw).decode(), STAGE_RECEIPT_SHA256=common.sha256_bytes(raw))
+            adapters = mock.Mock(return_value=SimpleNamespace(
+                verify_products=lambda *args: OLD_SOURCE, verify_staging=lambda *args: OLD_SOURCE,
+                verify_plan=lambda *args: True))
+            fake_lane = SimpleNamespace(clients=[], scrub=lambda: None,
+                deploy=mock.Mock(return_value=stage.Outcome("deployed", receipt)),
+                rollback=mock.Mock(return_value=stage.Outcome("rolled-back")))
+            deps = stage.ship.Deps(repo_dir=contract.ROOT, stdout=logs, target_path=production_file,
+                clock=lambda: dt.datetime(2026, 10, 7, 12, 1, tzinfo=dt.timezone.utc))
+            with mock.patch.object(stage, "StageLane", return_value=fake_lane) as lane, mock.patch.object(stage, "StageClient") as client:
+                result = stage.main([command], env, deps, adapter_factory=adapters,
+                    pins_path=pins_file, template_path=template_file)
+                client.assert_not_called()
+            return result, adapters, lane, fake_lane, logs.getvalue()
+
+    def test_cli_loads_committed_formatted_template_for_deploy_and_rollback(self):
+        # Use the actual default repository path, plus its exact LF checkout
+        # representation, rather than reserializing it into a canonical fixture.
+        raw = contract.TEMPLATE_PATH.read_bytes().replace(b"\r\n", b"\n")
+        template = common.loads_strict(raw)
+        self.assertNotEqual(raw, common.canonical_file_bytes(template))
+        for command in ("deploy", "rollback"):
+            for content in (None, raw):
+                with self.subTest(command=command, repository_path=content is None):
+                    result, adapters, lane, fake_lane, _ = self.template_cli(command, template_bytes=content)
+                    self.assertEqual(result, stage.ship.EXIT_OK)
+                    adapters.assert_called_once()
+                    lane.assert_called_once()
+                    self.assertEqual(lane.call_args.kwargs["template"], template)
+                    getattr(fake_lane, command).assert_called_once()
+
+    def test_cli_rejects_invalid_or_unbound_formatted_template_before_effects(self):
+        _, template, _, _ = data()
+        changed = copy.deepcopy(template); changed["region"] = "foreign-region"
+        duplicate = '{"region":' + json.dumps(template["region"]) + ',' + json.dumps(template)[1:]
+        cases = (
+            # Both duplicate values agree, so permissive JSON parsing would
+            # preserve the expected hash and wrongly reach the adapter.
+            (duplicate.encode(), None),
+            (b'{"number":1.5}', None),
+            (b'{"number":NaN}', None),
+            (b'{"broken":', None),
+            ((json.dumps(changed, indent=2) + "\n").encode(), None),
+            (None, {"template_sha256": "0" * 64}),
+        )
+        for command in ("deploy", "rollback"):
+            for index, (content, target_changes) in enumerate(cases):
+                with self.subTest(command=command, case=index):
+                    result, adapters, lane, _, logs = self.template_cli(command,
+                        template_bytes=content, target_changes=target_changes)
+                    self.assertEqual(result, stage.ship.EXIT_REFUSED)
+                    adapters.assert_not_called(); lane.assert_not_called()
+                    self.assertIn("stage: refused before mutation", logs)
+
+    def test_cli_keeps_identity_files_canonical(self):
+        for name in ("production", "pins"):
+            with self.subTest(name=name):
+                result, adapters, lane, _, _ = self.template_cli("deploy", formatted_identity=name)
+                self.assertEqual(result, stage.ship.EXIT_REFUSED)
+                adapters.assert_not_called(); lane.assert_not_called()
 
     def test_cli_pops_provider_secrets_before_adapter_and_masks_private_values(self):
         production, template, pins, target = data()
