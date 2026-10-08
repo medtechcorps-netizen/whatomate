@@ -428,7 +428,9 @@ def main(argv=None, env=None, deps=None, *, adapter_factory=None, pins_path=None
         target = common.loads_strict(target_raw, code="target-invalid:staging-target")
         production = common.load_json(dependencies.target_path, "target-invalid:production")
         pins = common.load_json(pins_path or dependencies.repo_dir / "release/deployment/ship-target-staging.json", "target-invalid:staging-pins")
-        template = common.load_json(template_path or dependencies.repo_dir / "release/staging/app-spec.template.yaml", "target-invalid:staging-template")
+        # The public template is formatted JSON; validate_target binds its
+        # parsed contents to the export's canonical hash below.
+        template = common.load_json(template_path or dependencies.repo_dir / "release/staging/app-spec.template.yaml", "target-invalid:staging-template", canonical=False)
         contract.validate_target(target, pins, production, template)
         _mask_target(out, target)
         ctx = ship.Context(environment, dependencies, out)

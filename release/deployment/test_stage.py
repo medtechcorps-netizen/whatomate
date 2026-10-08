@@ -472,6 +472,84 @@ class CLITests(unittest.TestCase):
             "RUNNER_ENVIRONMENT": "github-hosted", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_RUN_ID": "1234567",
             "CANDIDATE_B64": base64.b64encode(common.canonical_file_bytes(value)).decode(), "CANDIDATE_SHA256": common.sha256_bytes(common.canonical_file_bytes(value))}
 
+    def template_cli(self, command, *, template_bytes=None, target_changes=None, formatted_identity=None):
+        production, template, pins, target = data()
+        target.update(target_changes or {})
+        logs = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            production_file, pins_file = root / "production.json", root / "pins.json"
+            for name, path, value in (("production", production_file, production), ("pins", pins_file, pins)):
+                raw = (json.dumps(value, indent=2) + "\n").encode() if formatted_identity == name else common.canonical_file_bytes(value)
+                path.write_bytes(raw)
+            template_file = None
+            if template_bytes is not None:
+                template_file = root / "template.json"
+                template_file.write_bytes(template_bytes)
+            env = self.environment(); env["STAGING_TARGET_JSON"] = json.dumps(target)
+            receipt = synthetic_receipt(candidate_sha256=env["CANDIDATE_SHA256"])
+            raw = contract.receipt_bytes(receipt)
+            env.update(STAGE_RECEIPT_B64=base64.b64encode(raw).decode(), STAGE_RECEIPT_SHA256=common.sha256_bytes(raw))
+            adapters = mock.Mock(return_value=SimpleNamespace(
+                verify_products=lambda *args: OLD_SOURCE, verify_staging=lambda *args: OLD_SOURCE,
+                verify_plan=lambda *args: True))
+            fake_lane = SimpleNamespace(clients=[], scrub=lambda: None,
+                deploy=mock.Mock(return_value=stage.Outcome("deployed", receipt)),
+                rollback=mock.Mock(return_value=stage.Outcome("rolled-back")))
+            deps = stage.ship.Deps(repo_dir=contract.ROOT, stdout=logs, target_path=production_file,
+                clock=lambda: dt.datetime(2026, 10, 7, 12, 1, tzinfo=dt.timezone.utc))
+            with mock.patch.object(stage, "StageLane", return_value=fake_lane) as lane, mock.patch.object(stage, "StageClient") as client:
+                result = stage.main([command], env, deps, adapter_factory=adapters,
+                    pins_path=pins_file, template_path=template_file)
+                client.assert_not_called()
+            return result, adapters, lane, fake_lane, logs.getvalue()
+
+    def test_cli_loads_committed_formatted_template_for_deploy_and_rollback(self):
+        # Use the actual default repository path, plus its exact LF checkout
+        # representation, rather than reserializing it into a canonical fixture.
+        raw = contract.TEMPLATE_PATH.read_bytes().replace(b"\r\n", b"\n")
+        template = common.loads_strict(raw)
+        self.assertNotEqual(raw, common.canonical_file_bytes(template))
+        for command in ("deploy", "rollback"):
+            for content in (None, raw):
+                with self.subTest(command=command, repository_path=content is None):
+                    result, adapters, lane, fake_lane, _ = self.template_cli(command, template_bytes=content)
+                    self.assertEqual(result, stage.ship.EXIT_OK)
+                    adapters.assert_called_once()
+                    lane.assert_called_once()
+                    self.assertEqual(lane.call_args.kwargs["template"], template)
+                    getattr(fake_lane, command).assert_called_once()
+
+    def test_cli_rejects_invalid_or_unbound_formatted_template_before_effects(self):
+        _, template, _, _ = data()
+        changed = copy.deepcopy(template); changed["region"] = "foreign-region"
+        duplicate = '{"region":' + json.dumps(template["region"]) + ',' + json.dumps(template)[1:]
+        cases = (
+            # Both duplicate values agree, so permissive JSON parsing would
+            # preserve the expected hash and wrongly reach the adapter.
+            (duplicate.encode(), None),
+            (b'{"number":1.5}', None),
+            (b'{"number":NaN}', None),
+            (b'{"broken":', None),
+            ((json.dumps(changed, indent=2) + "\n").encode(), None),
+            (None, {"template_sha256": "0" * 64}),
+        )
+        for command in ("deploy", "rollback"):
+            for index, (content, target_changes) in enumerate(cases):
+                with self.subTest(command=command, case=index):
+                    result, adapters, lane, _, logs = self.template_cli(command,
+                        template_bytes=content, target_changes=target_changes)
+                    self.assertEqual(result, stage.ship.EXIT_REFUSED)
+                    adapters.assert_not_called(); lane.assert_not_called()
+                    self.assertIn("stage: refused before mutation", logs)
+
+    def test_cli_keeps_identity_files_canonical(self):
+        for name in ("production", "pins"):
+            with self.subTest(name=name):
+                result, adapters, lane, _, _ = self.template_cli("deploy", formatted_identity=name)
+                self.assertEqual(result, stage.ship.EXIT_REFUSED)
+                adapters.assert_not_called(); lane.assert_not_called()
+
     def test_cli_pops_provider_secrets_before_adapter_and_masks_private_values(self):
         production, template, pins, target = data()
         logs = io.StringIO()
