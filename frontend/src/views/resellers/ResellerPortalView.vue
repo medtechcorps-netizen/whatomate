@@ -877,7 +877,7 @@ function formatNumber(value?: number) {
 </script>
 
 <template>
-  <div class="min-h-full bg-[#08090a] light:bg-gray-50 text-white light:text-gray-900">
+  <div class="h-full overflow-y-auto bg-[#08090a] light:bg-gray-50 text-white light:text-gray-900">
     <header class="border-b border-white/[0.08] light:border-gray-200 bg-[#0b0c0e]/95 light:bg-white/95">
       <div class="flex min-h-20 items-center gap-4 px-6 py-4">
         <div class="flex h-11 w-11 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10">
@@ -1019,7 +1019,7 @@ function formatNumber(value?: number) {
           </TabsList>
 
           <TabsContent value="portfolio" class="mt-4">
-            <div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+            <div class="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_360px]">
               <Card class="border-white/[0.08] bg-[#0d0f11] light:border-gray-200 light:bg-white">
                 <CardHeader class="flex-row items-center justify-between space-y-0">
                   <div>
