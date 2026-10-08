@@ -41,7 +41,7 @@ func (m *Manager) InitiateOutgoingCall(
 	}
 
 	// 2. Create agent PeerConnection
-	agentPC, err := m.createPeerConnection()
+	agentPC, err := m.createPeerConnection(context.Background())
 	if err != nil {
 		return uuid.Nil, "", fmt.Errorf("failed to create agent PC: %w", err)
 	}
@@ -126,7 +126,7 @@ func (m *Manager) InitiateOutgoingCall(
 	}
 
 	// 7. Create WhatsApp PeerConnection
-	waPC, err := m.createPeerConnection()
+	waPC, err := m.createPeerConnection(context.Background())
 	if err != nil {
 		_ = agentPC.Close()
 		return uuid.Nil, "", fmt.Errorf("failed to create WA PC: %w", err)
