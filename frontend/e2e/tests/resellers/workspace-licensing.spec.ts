@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 
 const organization = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -421,6 +421,173 @@ async function mockPartnerPortfolio(
     },
   }
 }
+
+// Visibility alone does not detect content clipped by the application's fixed
+// overflow-hidden shell. Read geometry without scrolling or focusing a locator.
+async function exposedGeometry(locator: Locator) {
+  const geometry = await locator.evaluate((element) => {
+    const rect = element.getBoundingClientRect()
+    const clip = { left: 0, top: 0, right: innerWidth, bottom: innerHeight }
+    const identity = (node: Element | null) => node ? {
+      tag: node.tagName,
+      id: node.id,
+      testId: node.getAttribute('data-testid'),
+      label: node.getAttribute('aria-label'),
+      className: node.getAttribute('class'),
+    } : null
+    const clippingAncestors = []
+    for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent)
+      const bounds = parent.getBoundingClientRect()
+      const left = bounds.left + parent.clientLeft
+      const top = bounds.top + parent.clientTop
+      if (/(auto|scroll|hidden|clip|overlay)/.test(`${style.overflowX} ${style.overflowY}`)) {
+        clippingAncestors.push({
+          ...identity(parent),
+          overflowX: style.overflowX,
+          overflowY: style.overflowY,
+          left, top,
+          right: left + parent.clientWidth,
+          bottom: top + parent.clientHeight,
+          scrollLeft: parent.scrollLeft,
+          scrollTop: parent.scrollTop,
+          clientWidth: parent.clientWidth,
+          clientHeight: parent.clientHeight,
+          scrollWidth: parent.scrollWidth,
+          scrollHeight: parent.scrollHeight,
+        })
+      }
+      if (/(auto|scroll|hidden|clip|overlay)/.test(style.overflowX)) {
+        clip.left = Math.max(clip.left, left)
+        clip.right = Math.min(clip.right, left + parent.clientWidth)
+      }
+      if (/(auto|scroll|hidden|clip|overlay)/.test(style.overflowY)) {
+        clip.top = Math.max(clip.top, top)
+        clip.bottom = Math.min(clip.bottom, top + parent.clientHeight)
+      }
+    }
+    const outsideX = rect.left < clip.left - 1 || rect.right > clip.right + 1
+    const outsideY = rect.top < clip.top - 1 || rect.bottom > clip.bottom + 1
+    const center = { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 }
+    const hit = document.elementFromPoint(center.x, center.y)
+    return {
+      exposed: rect.width > 0 && rect.height > 0 && !outsideX && !outsideY &&
+        !!hit && (element.contains(hit) || hit.contains(element)),
+      outsideX,
+      outsideY,
+      rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height },
+      clip,
+      element: identity(element),
+      activeElement: identity(document.activeElement),
+      focused: element === document.activeElement,
+      centerHit: identity(hit),
+      clippingAncestors,
+      deltaX: outsideX ? (rect.left < clip.left ? -240 : 240) : 0,
+      deltaY: outsideY ? (rect.top < clip.top ? -180 : 180) : 0,
+      // A visible point in the same content column lets vertical wheel events
+      // bubble normally; horizontal events land inside the table's viewport.
+      x: Math.min(innerWidth - 20, Math.max(clip.left + 10, Math.min(center.x, clip.right - 10))),
+      y: Math.min(innerHeight - 20, Math.max(20, Math.min(Math.max(center.y, clip.top + 10), clip.bottom - 10))),
+    }
+  })
+  if (geometry.focused && !geometry.exposed) {
+    console.info('Clipped focused portfolio control:', JSON.stringify(geometry))
+  }
+  return geometry
+}
+
+async function revealWithWheel(page: Page, locator: Locator) {
+  await expect.poll(async () => {
+    const geometry = await exposedGeometry(locator)
+    if (!geometry.exposed) {
+      await page.mouse.move(geometry.x, geometry.y)
+      // Resolve vertical clipping first so horizontal wheel reaches the table.
+      await page.mouse.wheel(geometry.outsideY ? 0 : geometry.deltaX, geometry.deltaY)
+    }
+    return geometry
+  }, { timeout: 5000, intervals: [80, 120] }).toMatchObject({ exposed: true })
+}
+
+test.describe('Partner Console portfolio scrolling', () => {
+  for (const viewport of [
+    { name: 'normal desktop', width: 1440, height: 900 },
+    { name: 'short desktop', width: 1280, height: 600 },
+    { name: 'wide short desktop', width: 1536, height: 600 },
+  ]) {
+    for (const role of [
+      { name: 'owner', user: platformOwner, action: 'Manage', canDelete: true },
+      { name: 'partner administrator', user: resellerAdmin, action: 'View', canDelete: false },
+    ]) {
+      test.describe(`${viewport.name}, ${role.name}`, () => {
+        test.use({ viewport: { width: viewport.width, height: viewport.height } })
+
+        async function openPortfolio(page: Page) {
+          const unexpectedAPI: string[] = []
+          // Installed first so the existing mocks handle known endpoints and
+          // every unmatched API request is blocked before reaching any backend.
+          await page.route(/\/api\//, async (route) => {
+            unexpectedAPI.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`)
+            await route.abort()
+          })
+          const organizations = Array.from({ length: 10 }, (_, index) => workspaceFixture(index + 1))
+          const state = await mockPartnerPortfolio(
+            page, [growthPlan], role.user, growthPlan.prices[1].id,
+            'manual', 'active', organizations,
+          )
+          await page.goto('/resellers')
+          await expect(page.getByTestId('workspace-license-row')).toHaveCount(10)
+          return { unexpectedAPI, organizations, state }
+        }
+
+        test('wheel exposes all ten workspaces, row controls and pagination', async ({ page }) => {
+          const { unexpectedAPI, organizations, state } = await openPortfolio(page)
+          for (const organization of organizations) {
+            const row = page.getByTestId('workspace-license-row').filter({ hasText: organization.name })
+            await revealWithWheel(page, row.getByText(organization.name, { exact: true }))
+            await revealWithWheel(page, row.getByRole('button', { name: role.action, exact: true }))
+            if (role.canDelete) {
+              await revealWithWheel(page, row.getByRole('button', { name: `Delete ${organization.name}`, exact: true }))
+            }
+          }
+          const pagination = page.getByTestId('workspace-pagination')
+          await revealWithWheel(page, pagination.getByRole('button', { name: 'Previous workspace page' }))
+          await revealWithWheel(page, pagination.getByRole('button', { name: 'Next workspace page' }))
+          await expect(pagination).toContainText('Showing 1–10 of 10 workspaces')
+          expect(state.deletedOrganizationId()).toBe('')
+          expect(state.assignment()).toBeNull()
+          expect(unexpectedAPI).toEqual([])
+        })
+
+        test('Tab keeps every workspace action fully inside the clipping viewport', async ({ page }) => {
+          const { unexpectedAPI, organizations, state } = await openPortfolio(page)
+          const expected = organizations.flatMap((organization) => [
+            `${organization.name}:workspace-license-select`,
+            ...(role.canDelete ? [`${organization.name}:workspace-delete-row`] : []),
+          ])
+          const reached = new Set<string>()
+          // Tab starts from the document, including normal application chrome.
+          // No focus(), click(), or scrollIntoView() can rescue a clipped row.
+          for (let index = 0; index < 140 && reached.size < expected.length; index += 1) {
+            await page.keyboard.press('Tab')
+            const focused = page.locator(':focus')
+            const identity = await focused.evaluate((element) => {
+              const row = element.closest('[data-testid="workspace-license-row"]')
+              if (!row) return null
+              return `${row.querySelector('td p')?.textContent?.trim()}:${element.getAttribute('data-testid')}`
+            })
+            if (!identity || !expected.includes(identity)) continue
+            await expect.poll(() => exposedGeometry(focused)).toMatchObject({ exposed: true })
+            reached.add(identity)
+          }
+          expect([...reached].sort()).toEqual([...expected].sort())
+          expect(state.deletedOrganizationId()).toBe('')
+          expect(state.assignment()).toBeNull()
+          expect(unexpectedAPI).toEqual([])
+        })
+      })
+    }
+  }
+})
 
 test.describe('Partner Console workspace licensing', () => {
   test('platform owner assigns a private trialing plan by exact manual price identity', async ({
