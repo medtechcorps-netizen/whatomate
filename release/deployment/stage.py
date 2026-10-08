@@ -55,6 +55,8 @@ FAILURE_CODES = frozenset({
     "deployment-error:stage-terminal", "post-deploy-guard:stage-migration",
     "post-deploy-guard:stage-bad-image-unexpected-success", "post-deploy-guard:stage-final-state",
     "post-deploy-guard:stage-after-health", "post-deploy-guard:migration-inventory",
+    "post-deploy-guard:stage-settle-timeout", "rollback-precondition-failed:stage-settle-timeout",
+    "rollback-failed:stage-settle-timeout",
     "post-deploy-guard:migration-digest", "post-deploy-guard:migration-failed", "post-deploy-guard:migration-progress",
     "rollback-precondition-failed:stage-drift", "rollback-precondition-failed:stage-active",
     "rollback-precondition-failed:stage-candidate", "rollback-precondition-failed:stage-observation-changed",
@@ -81,7 +83,7 @@ def failure_code(error):
     return "internal-error"
 
 
-def report_failure(out, error, checkpoint, attempted):
+def report_failure(out, error, checkpoint, attempted, original_failure=None):
     # Diagnostics cannot replace the selected exit status, even if Output's
     # privacy guard refuses a line or stdout is unavailable. No raw fallback.
     for diagnostic in (False, True):
@@ -93,6 +95,15 @@ def report_failure(out, error, checkpoint, attempted):
                 line = ("stage: failed after an attempted mutation; reconcile with reads before any retry" if attempted else
                         "stage: refused before mutation")
             out.text(line)
+        except (Exception, KeyboardInterrupt):
+            pass
+    if type(original_failure) is tuple and len(original_failure) == 2:
+        try:
+            phase, code = original_failure
+            phase = phase if type(phase) is str and phase in FAILURE_CHECKPOINTS else "unknown"
+            code = code if type(code) is str and (code in FAILURE_CODES or code in common.REASONS or
+                code == "internal-error:interrupted") else "internal-error"
+            out.text(f"stage-original-failure: checkpoint={phase}; code={code}")
         except (Exception, KeyboardInterrupt):
             pass
 
@@ -207,6 +218,7 @@ class StageLane:
         self.poll_limit, self.poll_seconds, self.deadline_seconds = poll_limit, poll_seconds, deadline_seconds
         self.clients = []
         self.checkpoint = "preflight"
+        self.original_failure = None
 
     def client(self, allow_put):
         client = self.factory(allow_put=allow_put)
@@ -255,6 +267,48 @@ class StageLane:
         before, after = self.observe(client), self.observe(client)
         require(before == after, "cas-changed:stage-double-read")
         return after
+
+    @staticmethod
+    def same_owned_state(left, right):
+        # Exclude only provider metadata time, never identity or full SECRET spec.
+        return (left.deployment_id == right.deployment_id and left.images == right.images and
+            left.spec_sha256 == right.spec_sha256 and
+            common.canonical_payload_bytes(left.spec) == common.canonical_payload_bytes(right.spec))
+
+    def _settle_timestamp_pair(self, read, same_material, changed_code, timeout_code):
+        """GET-only: retry timestamp-only movement, with an equal pair required.
+
+        Validation/provider errors and material movement fail immediately. This
+        never replaces stable() or either strict write-time CAS comparison.
+        """
+        deadline = self.monotonic() + min(self.deadline_seconds, do_app.SETTLE_DEADLINE_SECONDS)
+        reference = None
+        for attempt in range(self.poll_limit):
+            if self.monotonic() >= deadline:
+                break
+            left, right = read(), read()
+            if reference is None:
+                reference = left
+            require(same_material(reference, left) and same_material(reference, right), changed_code)
+            if self.monotonic() >= deadline:
+                break
+            if left == right:
+                return right
+            if attempt + 1 < self.poll_limit:
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    break
+                self.sleeper(min(self.poll_seconds, remaining))
+        common.fail(timeout_code)
+
+    def settled_owned(self, client, deployment_id, spec_sha256, *, rollback=False):
+        code = "rollback-failed:stage-final-state" if rollback else "post-deploy-guard:stage-final-state"
+        def read():
+            value = self.observe(client)
+            require(value.deployment_id == deployment_id and value.spec_sha256 == spec_sha256, code)
+            return value
+        return self._settle_timestamp_pair(read, self.same_owned_state, code,
+            "rollback-failed:stage-settle-timeout" if rollback else "post-deploy-guard:stage-settle-timeout")
 
     def health(self, drill="none"):
         if drill == "health-fail":
@@ -344,8 +398,7 @@ class StageLane:
         reader = self.client(False)
         self.inventory(reader)
         wanted = contract.spec_fingerprint(desired)
-        observations = []
-        for _ in range(2):
+        def ownership():
             app = self.app(reader)
             do_app.no_transition(app)
             require(contract.spec_fingerprint(app.get("spec")) == wanted, "rollback-precondition-failed:stage-drift")
@@ -354,8 +407,12 @@ class StageLane:
             failed = do_app.deployment_object(reader.get_deployment(candidate_id))
             require(failed.get("id") == candidate_id and contract.spec_fingerprint(failed.get("spec")) == wanted and
                     failed.get("phase") in {"ACTIVE", "ERROR", "CANCELED"}, "rollback-precondition-failed:stage-candidate")
-            observations.append((active, common.exact_string(app.get("updated_at"), "provider-invalid:stage-updated"), failed.get("phase")))
-        require(observations[0] == observations[1], "rollback-precondition-failed:stage-observation-changed")
+            return (active, common.exact_string(app.get("updated_at"), "provider-invalid:stage-updated"),
+                failed.get("phase"), common.canonical_payload_bytes(app["spec"]),
+                common.canonical_payload_bytes(failed["spec"]))
+        observed = self._settle_timestamp_pair(ownership,
+            lambda left, right: left[:1] + left[2:] == right[:1] + right[2:],
+            "rollback-precondition-failed:stage-observation-changed", "rollback-precondition-failed:stage-settle-timeout")
         self.checkpoint = "rollback-prior-attestations"
         self.verify_product_images(before.images, previous_source)
         # CAS immediately before rollback's fresh one-PUT capability is used.
@@ -364,24 +421,24 @@ class StageLane:
         self.inventory(writer)
         app = self.app(writer)
         do_app.no_transition(app)
-        require(contract.spec_fingerprint(app.get("spec")) == wanted and do_app.active_id(app) == observations[-1][0] and
-                app.get("updated_at") == observations[-1][1], "rollback-precondition-failed:stage-cas")
+        require(contract.spec_fingerprint(app.get("spec")) == wanted and do_app.active_id(app) == observed[0] and
+                app.get("updated_at") == observed[1], "rollback-precondition-failed:stage-cas")
         # Exclude both the old ACTIVE ID and failed candidate; a fresh rollback
         # deployment must be observed even if its images equal an older ACTIVE.
-        live_before = Snapshot(copy.deepcopy(desired), {}, observations[-1][0],
-            common.sha256_text(observations[-1][1]), wanted)
+        live_before = Snapshot(copy.deepcopy(desired), {}, observed[0], common.sha256_text(observed[1]), wanted)
         self.checkpoint = "rollback-put-reconcile"
         result_id = self.put_reconcile(writer, before.spec, live_before, excluded={candidate_id, before.deployment_id})
         self.checkpoint = "rollback-final-state"
-        after = self.stable(writer)
-        require(after.deployment_id == result_id and after.spec_sha256 == before.spec_sha256, "rollback-failed:stage-final-state")
+        after = self.settled_owned(writer, result_id, before.spec_sha256, rollback=True)
         self.checkpoint = "rollback-health"
         self.health()
         self.checkpoint = "rollback-after-health"
-        require(self.stable(writer) == after, "rollback-failed:stage-after-health")
+        final = self.settled_owned(writer, result_id, before.spec_sha256, rollback=True)
+        require(self.same_owned_state(final, after), "rollback-failed:stage-after-health")
         return Outcome("rolled-back")
 
     def deploy(self, candidate, *, candidate_sha256, run_id, drill="none"):
+        self.original_failure = None
         try:
             return self._deploy(candidate, candidate_sha256=candidate_sha256, run_id=run_id, drill=drill)
         finally:
@@ -417,19 +474,19 @@ class StageLane:
             if drill == "bad-image":
                 raise DeploymentFailure("post-deploy-guard:stage-bad-image-unexpected-success", candidate_id)
             self.checkpoint = "candidate-final-state"
-            after = self.stable(writer)
-            require(after.deployment_id == candidate_id and after.spec_sha256 == contract.spec_fingerprint(desired), "post-deploy-guard:stage-final-state")
+            after = self.settled_owned(writer, candidate_id, contract.spec_fingerprint(desired))
             self.checkpoint = "candidate-health"
             self.health(drill)
             self.checkpoint = "candidate-after-health"
-            final = self.stable(writer)
-            require(final == after, "post-deploy-guard:stage-after-health")
+            final = self.settled_owned(writer, candidate_id, after.spec_sha256)
+            require(self.same_owned_state(final, after), "post-deploy-guard:stage-after-health")
         except common.ReleaseError as error:
             candidate_id = getattr(error, "candidate_id", None) or candidate_id
             if candidate_id is None:
                 # Unknown ownership (including a still-pending timeout) is a
                 # manual reconciliation condition, never a blind rollback PUT.
                 raise
+            self.original_failure = (self.checkpoint, failure_code(error))
             self.rollback_owned(desired, before, candidate_id, previous_source=previous_source)
             return Outcome("failed-rolled-back", health_drill_completed=(
                 drill == "health-fail" and type(error) is IntentionalHealthFailure and
@@ -445,6 +502,7 @@ class StageLane:
         return Outcome("deployed", value)
 
     def rollback(self, receipt_b64, receipt_sha256, *, run_id, candidate_sha256):
+        self.original_failure = None
         try:
             return self._rollback(receipt_b64, receipt_sha256, run_id=run_id, candidate_sha256=candidate_sha256)
         finally:
@@ -573,7 +631,8 @@ def main(argv=None, env=None, deps=None, *, adapter_factory=None, pins_path=None
         attempted = lane is not None and any(client.mutation_attempted for client in lane.clients)
         if checkpoint == "lane" and lane is not None:
             checkpoint = lane.checkpoint
-        report_failure(out, error, checkpoint, attempted)
+        report_failure(out, error, checkpoint, attempted,
+            getattr(lane, "original_failure", None) if lane is not None else None)
         return ship.EXIT_MANUAL if attempted else ship.EXIT_REFUSED
     finally:
         if installed: signal.signal(signal.SIGTERM, previous_handler)
