@@ -36,7 +36,7 @@ FAILURE_CHECKPOINTS = frozenset({
     "deploy-preflight", "rollback-preflight", "candidate-pre-put-cas",
     "candidate-put-reconcile", "candidate-final-state", "candidate-health", "candidate-after-health",
     "receipt-validation", "receipt-sanitize", "receipt-serialization", "receipt-outputs", "receipt-emit", "status-output",
-    "rollback-ownership", "rollback-prior-attestations", "rollback-pre-put-cas",
+    "rollback-ownership", "rollback-prior-attestations", "rollback-pre-put-settle", "rollback-pre-put-cas",
     "rollback-put-reconcile", "rollback-final-state", "rollback-health", "rollback-after-health",
 })
 # ReleaseError checks syntax and the reason prefix, not whether its full detail
@@ -63,7 +63,9 @@ FAILURE_CODES = frozenset({
     "post-deploy-guard:migration-digest", "post-deploy-guard:migration-failed", "post-deploy-guard:migration-progress",
     "rollback-precondition-failed:stage-drift", "rollback-precondition-failed:stage-active",
     "rollback-precondition-failed:stage-candidate", "rollback-precondition-failed:stage-observation-changed",
-    "rollback-precondition-failed:stage-cas", "rollback-failed:stage-final-state", "rollback-failed:stage-after-health",
+    "rollback-precondition-failed:stage-cas", "rollback-precondition-failed:stage-cas-spec",
+    "rollback-precondition-failed:stage-cas-active", "rollback-precondition-failed:stage-cas-updated",
+    "rollback-failed:stage-final-state", "rollback-failed:stage-after-health",
     "smoke-failed:stage-health", "smoke-failed:stage-drill", "smoke-failed:dns", "smoke-failed:deadline",
     "smoke-failed:non-public-address", "smoke-failed:redirect", "smoke-failed:length",
     "output-unsafe:key", "output-unsafe:value", "output-unsafe:type", "output-unsafe:text",
@@ -485,21 +487,33 @@ class StageLane:
             return (active, common.exact_string(app.get("updated_at"), "provider-invalid:stage-updated"),
                 failed.get("phase"), common.canonical_payload_bytes(app["spec"]),
                 common.canonical_payload_bytes(failed["spec"]), clone_spec)
-        observed = self._settle_timestamp_pair(ownership,
-            lambda left, right: left[:1] + left[2:] == right[:1] + right[2:],
+        def same_material(left, right):
+            return left[:1] + left[2:] == right[:1] + right[2:]
+        reference = self._settle_timestamp_pair(ownership, same_material,
             "rollback-precondition-failed:stage-observation-changed", "rollback-precondition-failed:stage-settle-timeout")
         self.checkpoint = "rollback-prior-attestations"
         self.verify_product_images(before.images, previous_source)
-        # CAS immediately before rollback's fresh one-PUT capability is used.
-        self.checkpoint = "rollback-pre-put-cas"
+        self.checkpoint = "rollback-pre-put-settle"
         writer = self.client(True)
         self.inventory(writer)
+        def fresh_ownership():
+            value = ownership(writer)
+            # Attestations and inventory can outlast provider metadata updates.
+            # Refresh only time; the original owned material remains authoritative.
+            require(same_material(reference, value), "rollback-precondition-failed:stage-observation-changed")
+            return value
+        observed = self._settle_timestamp_pair(fresh_ownership, same_material,
+            "rollback-precondition-failed:stage-observation-changed", "rollback-precondition-failed:stage-settle-timeout")
+        # The equal pair does not authorize later timestamp or material movement.
+        self.checkpoint = "rollback-pre-put-cas"
         if previous_clone_id is not None:
             require(ownership(writer) == observed, "rollback-precondition-failed:stage-cas")
         app = self.app(writer)
         do_app.no_transition(app)
-        require(contract.spec_fingerprint(app.get("spec")) == wanted and do_app.active_id(app) == observed[0] and
-                app.get("updated_at") == observed[1], "rollback-precondition-failed:stage-cas")
+        require(contract.spec_fingerprint(app.get("spec")) == wanted and
+                common.canonical_payload_bytes(app["spec"]) == observed[3], "rollback-precondition-failed:stage-cas-spec")
+        require(do_app.active_id(app) == observed[0], "rollback-precondition-failed:stage-cas-active")
+        require(app.get("updated_at") == observed[1], "rollback-precondition-failed:stage-cas-updated")
         if previous_clone_id is not None:
             self.clone_summaries(app, {"id": previous_clone_id, "phase": "ACTIVE"}, before)
         # Exclude both the old ACTIVE ID and failed candidate; a fresh rollback
