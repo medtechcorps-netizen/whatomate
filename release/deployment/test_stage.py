@@ -16,6 +16,7 @@ import stage
 import stage_contract as contract
 from test_stage_contract import APP, PG, VK, VPC, ORIGIN, TEAM, IMAGES, NEW, data
 from test_stage_contract import receipt as synthetic_receipt
+from test_ship_smoke import FakeSocket, FakeContext, addresses
 
 OLD_ID = "77777777-7777-4777-8777-777777777777"
 OLD_SOURCE, NEW_SOURCE = "a" * 40, "b" * 40
@@ -84,7 +85,7 @@ class World:
         if self.health_failure:
             self.health_failure = False
             return 503, {}, b"synthetic failure"
-        if path == "/_stage_drill_intentionally_missing": return 404, {}, b""
+        if path == "/_stage_drill_intentionally_missing.txt": return 404, {}, b""
         statuses = {path: status for _, path, status in stage.smoke.HEALTH}
         return statuses[path], {}, b""
 
@@ -488,7 +489,7 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(len(world.writes), 2)
                 self.assertNotEqual(world.active, OLD_ID)
                 self.assertEqual(len(world.probes), 7)  # Deliberate probe + restored health6.
-                self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing")
+                self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing.txt")
                 self.assertTrue(all(client.scrubbed and client.puts <= 1 for client in world.clients))
 
     def test_pre_health_and_transport_errors_cannot_claim_intentional_health_evidence(self):
@@ -539,7 +540,7 @@ class LifecycleTests(unittest.TestCase):
                 return result
             with self.subTest(failure=failure), self.assertRaises(common.ReleaseError):
                 world.deploy(world.lane(request=request), drill="health-fail")
-            self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing")
+            self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing.txt")
             self.assertEqual(len(world.writes), 1 if failure in {"cas", "reject"} else 2)
             self.assertTrue(all(client.scrubbed and client.puts <= 1 for client in world.clients))
 
@@ -846,7 +847,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(logs, "stage: failed after an attempted mutation; reconcile with reads before any retry")
         self.assertEqual(sum(client.puts for client in world.clients), 1)
 
-    def test_success_and_completed_in_job_rollback_keep_existing_output(self):
+    def test_success_and_completed_in_job_rollback_preserve_status_and_safe_cause(self):
         for failure in (False, True):
             world = World(); world.health_failure = failure
             with self.subTest(health_failure=failure):
@@ -854,7 +855,8 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK if failure else stage.ship.EXIT_OK)
                 self.assertNotIn("stage-diagnostic:", logs)
                 self.assertEqual(len(world.writes), 2 if failure else 1)
-                if failure: self.assertEqual(logs, "stage: failed-rolled-back")
+                if failure: self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+                    "stage-original-failure: checkpoint=candidate-health; code=smoke-failed:stage-health"])
                 else:
                     lines = logs.splitlines()
                     contract.validate_receipt(json.loads(lines[0]))
@@ -890,8 +892,80 @@ class CLITests(unittest.TestCase):
                 expected = stage.ship.EXIT_OK if case in {"none", "e2e-fail"} else stage.ship.EXIT_MANUAL if case in {"rollback-health", "transport-exception"} else stage.ship.EXIT_ROLLED_BACK
                 self.assertEqual(result, expected)
                 if case in {"404", "200"}:
-                    self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back", stage.HEALTH_DRILL_EVIDENCE])
+                    self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+                        "stage-original-failure: checkpoint=candidate-health; code=smoke-failed:stage-drill",
+                        stage.HEALTH_DRILL_EVIDENCE])
                     self.assertEqual(len(world.writes), 2)
+
+    def test_health_drill_real_transport_avoids_spa_body_and_retains_size_guard(self):
+        old_path = "/_stage_drill_intentionally_missing"
+        static_path = old_path + ".txt"
+        sockets = []
+
+        def transport(url, *, oversized_static=False, static_status=404):
+            path = url.removeprefix(ORIGIN)
+            if path == old_path or (path == static_path and oversized_static):
+                status, body = 200, b"x" * 5000  # Extensionless frontend index exceeds the unchanged 4096 cap.
+            elif path == static_path:
+                status, body = static_status, b"404 page not found\n"
+            else:
+                status, body = {path: status for _, path, status in stage.smoke.HEALTH}[path], b""
+            response = f"HTTP/1.1 {status} Synthetic\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+            sock = FakeSocket(response); sockets.append(sock)
+            return stage.smoke.secure_https_request(url, getaddrinfo=addresses("93.184.216.34"),
+                create_connection=lambda *_, **__: sock, context_factory=lambda: FakeContext(sock))
+
+        self.assertEqual(stage.smoke.MAX_HEALTH_BODY_BYTES, 4096)
+        with self.assertRaisesRegex(common.ReleaseError, "^smoke-failed:length$"):
+            transport(ORIGIN + old_path)
+        self.assertTrue(sockets[-1].sent.startswith(f"GET {old_path} HTTP/1.1\r\n".encode()))
+        for status, oversized in ((404, False), (200, False), (200, True)):
+            world = World(); sockets.clear()
+            before = contract.spec_fingerprint(world.spec)
+            def request(url):
+                world.probes.append(url)
+                return transport(url, oversized_static=oversized, static_status=status)
+            with self.subTest(status=status, oversized=oversized):
+                result, logs = self.world_cli(world, "health-fail", request=request)
+                self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK)
+                cause = "smoke-failed:length" if oversized else "smoke-failed:stage-drill"
+                self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+                    f"stage-original-failure: checkpoint=candidate-health; code={cause}"] +
+                    ([] if oversized else [stage.HEALTH_DRILL_EVIDENCE]))
+                self.assertEqual(len(world.writes), 2)
+                self.assertEqual(sum(client.puts for client in world.clients), 2)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                self.assertEqual(contract.spec_fingerprint(world.spec), before)
+                self.assertEqual(world.probes, [ORIGIN + static_path] + [ORIGIN + path for _, path, _ in stage.smoke.HEALTH])
+                self.assertEqual(len(sockets), 7)
+                self.assertTrue(sockets[0].sent.startswith(f"GET {static_path} HTTP/1.1\r\n".encode()))
+                self.assertTrue(all(sock.closed and b"Authorization:" not in sock.sent for sock in sockets))
+
+    def test_completed_rollback_original_cause_is_private_and_output_is_best_effort(self):
+        secret = "unmaskedSuccessfulRollbackSecret0123456789"
+        for drill in ("none", "health-fail"):
+            for error in (None, OSError(secret), common.ReleaseError("output-unsafe:" + secret), KeyboardInterrupt(secret)):
+                world = World()
+                def request(url):
+                    if drill == "none" and len(world.writes) == 1:
+                        common.fail("smoke-failed:" + secret + ORIGIN + APP)
+                    return world.request(url)
+                original = common.Output.text
+                def output(out, line):
+                    if error is not None and line.startswith("stage-original-failure:"): raise error
+                    return original(out, line)
+                with self.subTest(drill=drill, output_error=type(error).__name__), mock.patch.object(common.Output, "text", output):
+                    result, logs = self.world_cli(world, drill, request=request)
+                self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK)
+                cause = "smoke-failed:stage-drill" if drill == "health-fail" else "smoke-failed"
+                self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back"] +
+                    ([f"stage-original-failure: checkpoint=candidate-health; code={cause}"] if error is None else []) +
+                    ([stage.HEALTH_DRILL_EVIDENCE] if drill == "health-fail" else []))
+                self.assertNotIn(secret, logs)
+                self.assertEqual(len(world.writes), 2)
+                self.assertEqual(sum(client.puts for client in world.clients), 2)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                self.assertEqual(contract.image_set(world.spec), IMAGES)
 
     def template_cli(self, command, *, template_bytes=None, target_changes=None, formatted_identity=None):
         production, template, pins, target = data()
