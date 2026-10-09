@@ -141,7 +141,242 @@ class FakeClient:
         return response
 
 
+class ProviderCloneWorld(World):
+    """One failed candidate followed by a provider clone, without an extra PUT."""
+    CLONE = "99999999-9999-4999-8999-999999999999"
+
+    def __init__(self, phases=("DEPLOYING", "ACTIVE")):
+        super().__init__()
+        self.prior = copy.deepcopy(self.spec)
+        self.clone_phases, self.clone_reads = phases, 0
+        self.failed_id = None
+        self.clone_hook, self.snapshot_hook = None, None
+        self.omit_put_hint = False
+        self.candidate_first = False
+        self.candidate_polls = 0
+
+    def factory(self, *, allow_put):
+        client = ProviderCloneClient(self, allow_put)
+        self.clients.append(client)
+        return client
+
+
+class ProviderCloneClient(FakeClient):
+    def put_app_once(self, spec):
+        response = super().put_app_once(spec)
+        world = self.world
+        if len(world.writes) == 1:
+            world.failed_id = response["app"]["pending_deployment"]["id"]
+            world.deployments[world.failed_id]["jobs"][0]["phase"] = "FAILED"
+            clone = world.deployment(world.CLONE, world.prior, world.clone_phases[0])
+            clone["cloned_from"] = OLD_ID
+            world.deployments[world.CLONE] = clone
+            if world.omit_put_hint:
+                response["app"]["pending_deployment"] = None
+        return response
+
+    def get_app(self):
+        world = self.world
+        if len(world.writes) == 1:
+            if world.candidate_first and world.candidate_polls == 0:
+                world.candidate_polls += 1
+                world.deployments[world.failed_id]["phase"] = "DEPLOYING"
+                world.pending = {"id": world.failed_id, "phase": "DEPLOYING"}
+                return super().get_app()
+            if world.candidate_first and world.candidate_polls == 1:
+                world.candidate_polls += 1
+                world.deployments[world.failed_id]["phase"] = "ERROR"
+            phase = world.clone_phases[min(world.clone_reads, len(world.clone_phases) - 1)]
+            world.clone_reads += 1
+            world.deployments[world.CLONE]["phase"] = phase
+            world.active = world.CLONE if phase == "ACTIVE" else OLD_ID
+            world.pending = None if phase == "ACTIVE" else {"id": world.CLONE, "phase": phase}
+            world.updated = "2026-10-07T12:02:00Z"
+            if world.clone_hook:
+                world.clone_hook(world)
+        response = super().get_app()
+        if len(world.writes) == 1:
+            for key in ("active_deployment", "pending_deployment", "in_progress_deployment"):
+                if (response["app"].get(key) or {}).get("id") == world.CLONE:
+                    response["app"][key] = copy.deepcopy(world.deployments[world.CLONE])
+            if world.snapshot_hook:
+                world.snapshot_hook(response["app"])
+        return response
+
+    def get_deployment(self, identity):
+        if identity not in self.world.deployments:
+            common.fail("provider-get-failed")
+        return super().get_deployment(identity)
+
+
 class LifecycleTests(unittest.TestCase):
+    def test_provider_previous_clone_settles_then_restores_full_prior_spec(self):
+        for phases in (("ACTIVE",), ("DEPLOYING", "ACTIVE"),
+                       ("PENDING_BUILD", "BUILDING", "PENDING_DEPLOY", "DEPLOYING", "ACTIVE")):
+            world = ProviderCloneWorld(phases); lane = world.lane(poll_limit=6)
+            with self.subTest(phases=phases):
+                result = world.deploy(lane, drill="bad-image")
+                self.assertEqual(result.status, "failed-rolled-back")
+                self.assertEqual(world.spec, world.prior)
+                self.assertEqual(world.writes[1], world.prior)
+                self.assertNotEqual(world.writes[0]["services"][0]["image"], world.prior["services"][0]["image"])
+                self.assertEqual(len(world.writes), 2)
+                self.assertEqual(sum(c.puts for c in world.clients), 2)
+                self.assertTrue(all(c.puts <= 1 and c.scrubbed for c in world.clients))
+                self.assertEqual(len(world.probes), 6)
+                self.assertNotIn(world.active, (OLD_ID, world.failed_id, world.CLONE))
+                self.assertEqual(lane.original_failure,
+                    ("candidate-put-reconcile", "deployment-error:stage-terminal"))
+        world = ProviderCloneWorld(); world.omit_put_hint = world.candidate_first = True
+        self.assertEqual(world.deploy(world.lane(poll_limit=4), drill="bad-image").status, "failed-rolled-back")
+        self.assertEqual(world.candidate_polls, 2)  # The failed ID can be pinned by the first poll.
+        self.assertEqual(world.writes[1], world.prior)
+        self.assertEqual(len(world.writes), 2)
+        self.assertEqual(len(world.probes), 6)
+
+    def test_provider_clone_rejects_conflicting_app_summaries(self):
+        for key in ("active_deployment", "pending_deployment", "in_progress_deployment"):
+            for field in ("phase", "lineage", "missing-spec", "secret"):
+                world = ProviderCloneWorld(("ACTIVE",) if key == "active_deployment" else ("DEPLOYING",))
+                def conflict(app):
+                    if key == "in_progress_deployment":
+                        app[key] = copy.deepcopy(app["pending_deployment"])
+                    summary = app[key]
+                    if field == "phase": summary["phase"] = "ERROR"
+                    elif field == "lineage": summary["cloned_from"] = PG
+                    elif field == "missing-spec": summary.pop("spec")
+                    else: next(e for s in summary["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                world.snapshot_hook = conflict
+                with self.subTest(key=key, field=field), self.assertRaises(common.ReleaseError):
+                    world.deploy(drill="bad-image")
+                self.assertEqual(len(world.writes), 1)
+                self.assertEqual(len(world.clients), 2)
+                self.assertEqual(world.probes, [])
+
+        for boundary in ("reader", "writer", "final-cas"):
+            for field in ("phase", "lineage", "secret"):
+                world = ProviderCloneWorld(("ACTIVE",)); writer_reads = []
+                def late_conflict(app):
+                    if len(world.clients) == 4: writer_reads.append(1)
+                    if ((boundary == "reader" and len(world.clients) == 3) or
+                        (boundary == "writer" and len(world.clients) == 4) or
+                        (boundary == "final-cas" and len(writer_reads) == 2)):
+                        summary = app["active_deployment"]
+                        if field == "phase": summary["phase"] = "ERROR"
+                        elif field == "lineage": summary["cloned_from"] = PG
+                        else: next(e for s in summary["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                world.snapshot_hook = late_conflict
+                with self.subTest(boundary=boundary, field=field), self.assertRaises(common.ReleaseError):
+                    world.deploy(drill="bad-image")
+                self.assertEqual(len(world.writes), 1)
+                self.assertEqual(world.probes, [])
+
+    def test_provider_clone_refuses_lineage_full_spec_and_candidate_drift(self):
+        mutations = {
+            "missing-lineage": lambda w: w.deployments[w.CLONE].pop("cloned_from", None),
+            "foreign-lineage": lambda w: w.deployments[w.CLONE].update(cloned_from=PG),
+            "clone-identity": lambda w: w.deployments[w.CLONE].update(id=PG),
+            "selector": lambda w: w.deployments[w.CLONE]["spec"]["services"][0]["image"].update(repository="foreign"),
+            "general": lambda w: next(e for s in w.deployments[w.CLONE]["spec"]["services"] for e in s["envs"] if e["type"] == "GENERAL").update(value="foreign"),
+            "secret": lambda w: next(e for s in w.deployments[w.CLONE]["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET").update(value="EV[foreign]"),
+            "candidate-spec": lambda w: w.deployments[w.failed_id].update(spec=copy.deepcopy(w.prior)),
+            "candidate-not-failed": lambda w: w.deployments[w.failed_id].update(phase="DEPLOYING"),
+            "candidate-canceled": lambda w: w.deployments[w.failed_id].update(phase="CANCELED"),
+            "clone-migration": lambda w: w.deployments[w.CLONE]["jobs"][0].update(phase="FAILED"),
+        }
+        for name, change in mutations.items():
+            world = ProviderCloneWorld(("ACTIVE",)); world.clone_hook = change
+            with self.subTest(name=name), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertEqual(len(world.writes), 1)
+            self.assertEqual(len(world.clients), 2)
+            self.assertEqual(world.probes, [])
+            self.assertTrue(all(c.scrubbed and c.puts <= 1 for c in world.clients))
+
+    def test_provider_clone_does_not_adopt_unknown_multiple_or_changed_inflight(self):
+        mutations = {
+            "unknown": lambda app: app.update(pending_deployment={"id": PG}),
+            "multiple": lambda app: app.update(in_progress_deployment={"id": PG}),
+            "old": lambda app: app.update(pending_deployment={"id": OLD_ID}),
+            "malformed": lambda app: app.update(pending_deployment={"id": None}),
+            "pinned": lambda app: app.update(pinned_deployment={"id": PG}),
+            "ingress": lambda app: app.update(default_ingress="https://foreign.example"),
+            "foreign-active": lambda app: app.update(active_deployment={"id": PG, "phase": "ACTIVE"}),
+        }
+        for name, change in mutations.items():
+            world = ProviderCloneWorld(("DEPLOYING",)); world.snapshot_hook = change
+            with self.subTest(name=name), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertEqual(len(world.writes), 1)
+            self.assertEqual(world.probes, [])
+        world = ProviderCloneWorld(("ACTIVE",)); world.omit_put_hint = True
+        with self.assertRaisesRegex(common.ReleaseError, "stage-deployment-spec"):
+            world.deploy(drill="bad-image")
+        self.assertEqual(len(world.writes), 1)  # Never discover the failed ID by guessing/history.
+        world = ProviderCloneWorld(("DEPLOYING",))
+        def changed(app):
+            if world.clone_reads == 2:
+                app["pending_deployment"] = {"id": PG}
+        world.snapshot_hook = changed
+        with self.assertRaisesRegex(common.ReleaseError, "stage-previous-clone-changed"):
+            world.deploy(drill="bad-image")
+        self.assertEqual(len(world.writes), 1)
+
+    def test_provider_clone_wait_has_count_deadline_and_phase_guards(self):
+        for phases in (("ERROR",), ("CANCELED",), ("SUPERSEDED",), ("UNKNOWN",), ("DEPLOYING", "BUILDING")):
+            world = ProviderCloneWorld(phases)
+            with self.subTest(phases=phases), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertLessEqual(world.clone_reads, 2)
+            self.assertEqual(len(world.writes), 1)
+        world = ProviderCloneWorld(("DEPLOYING",))
+        with self.assertRaisesRegex(common.ReleaseError, "reconcile-timeout:stage-previous-clone"):
+            world.deploy(drill="bad-image")
+        self.assertEqual(world.clone_reads, 3)
+        self.assertEqual(len(world.clients), 2)
+        clock = [0]; sleeps = []
+        def now(): clock[0] += 1; return clock[0]
+        world = ProviderCloneWorld(("DEPLOYING",))
+        lane = world.lane(poll_limit=90, poll_seconds=1, deadline_seconds=3,
+                          monotonic=now, sleeper=sleeps.append)
+        with self.assertRaisesRegex(common.ReleaseError, "reconcile-timeout:stage-previous-clone"):
+            world.deploy(lane, drill="bad-image")
+        self.assertEqual(world.clone_reads, 1)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(len(world.writes), 1)
+        clock[0] = 0
+        world = ProviderCloneWorld(("ACTIVE",))
+        with self.assertRaisesRegex(common.ReleaseError, "reconcile-timeout:stage-previous-clone"):
+            world.deploy(world.lane(monotonic=now, deadline_seconds=1), drill="bad-image")
+        self.assertEqual(world.clone_reads, 1)  # Expiry after reads cannot grant rollback authority.
+        self.assertEqual(len(world.writes), 1)
+        self.assertEqual(world.probes, [])
+
+    def test_provider_clone_ownership_and_final_cas_refuse_later_drift(self):
+        for client_count in (3, 4):
+            for field in ("lineage", "secret", "candidate", "migration"):
+                world = ProviderCloneWorld(("ACTIVE",))
+                def drift(value):
+                    if len(world.clients) == client_count:
+                        if field == "lineage": world.deployments[world.CLONE]["cloned_from"] = PG
+                        elif field == "candidate": world.deployments[world.failed_id]["phase"] = "ACTIVE"
+                        elif field == "migration": world.deployments[world.CLONE]["jobs"][0]["phase"] = "FAILED"
+                        else: next(e for s in world.deployments[world.CLONE]["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                world.inventory_hook = drift
+                with self.subTest(client_count=client_count, field=field), self.assertRaises(common.ReleaseError):
+                    world.deploy(drill="bad-image")
+                self.assertEqual(len(world.writes), 1)
+                self.assertEqual(world.probes, [])
+        world = ProviderCloneWorld(("ACTIVE",)); reads = []
+        def app_cas(app):
+            if len(world.clients) == 4:
+                reads.append(1)
+                if len(reads) == 2: app["updated_at"] = "2026-10-07T13:00:00Z"
+        world.snapshot_hook = app_cas
+        with self.assertRaisesRegex(common.ReleaseError, "rollback-precondition-failed:stage-cas"):
+            world.deploy(drill="bad-image")
+        self.assertEqual(len(world.writes), 1)
+
     def test_local_identity_and_ambient_refuse_before_client_creation(self):
         world = World()
         for change in ({"target": {**world.target, "app_id": PG}}, {"env": {"SHIP_DO_TOKEN": ""}}):
@@ -688,6 +923,16 @@ class ProviderClientTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_provider_clone_cli_restores_without_receipt_or_health_drill_claim(self):
+        world = ProviderCloneWorld()
+        result, logs = self.world_cli(world, "bad-image")
+        self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK)
+        self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+            "stage-original-failure: checkpoint=candidate-put-reconcile; code=deployment-error:stage-terminal"])
+        self.assertEqual(world.spec, world.prior)
+        self.assertEqual(len(world.writes), 2)
+        self.assertEqual(len(world.probes), 6)
+
     def environment(self):
         value = candidate()
         return {"STAGING_DO_TOKEN": "synthetic-provider-token-never-log", "STAGING_TARGET_JSON": json.dumps(data()[3]),
