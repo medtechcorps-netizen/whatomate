@@ -367,14 +367,14 @@ class LifecycleTests(unittest.TestCase):
                     world.deploy(drill="bad-image")
                 self.assertEqual(len(world.writes), 1)
                 self.assertEqual(world.probes, [])
-        world = ProviderCloneWorld(("ACTIVE",)); reads = []
+        world = ProviderCloneWorld(("ACTIVE",)); lane = world.lane(); reads = []
         def app_cas(app):
-            if len(world.clients) == 4:
+            if lane.checkpoint == "rollback-pre-put-cas":
                 reads.append(1)
                 if len(reads) == 2: app["updated_at"] = "2026-10-07T13:00:00Z"
         world.snapshot_hook = app_cas
         with self.assertRaisesRegex(common.ReleaseError, "rollback-precondition-failed:stage-cas"):
-            world.deploy(drill="bad-image")
+            world.deploy(lane, drill="bad-image")
         self.assertEqual(len(world.writes), 1)
 
     def test_local_identity_and_ambient_refuse_before_client_creation(self):
@@ -668,18 +668,123 @@ class LifecycleTests(unittest.TestCase):
 
     def test_rollback_cas_change_or_failure_cannot_create_a_retry_loop(self):
         for mode in ("cas", "reject"):
-            world = World(); world.health_failure = True
+            world = World(); world.health_failure = True; lane = world.lane()
             def before_rollback_inventory(value):
                 # Reader and initial writer have already been allocated. The
                 # fourth client is the fresh rollback writer.
-                if len(world.clients) == 4:
-                    if mode == "cas": world.updated = "2026-10-07T13:00:00Z"
-                    else: world.put_outcome = "rejected"
+                if len(world.clients) == 4 and mode == "reject": world.put_outcome = "rejected"
             world.inventory_hook = before_rollback_inventory
-            with self.subTest(mode=mode), self.assertRaises(common.ReleaseError): world.deploy()
+            def final_drift(value):
+                if mode == "cas" and lane.checkpoint == "rollback-pre-put-cas": value.updated = "2026-10-07T13:00:00Z"
+            world.app_hook = final_drift
+            with self.subTest(mode=mode), self.assertRaises(common.ReleaseError): world.deploy(lane)
             self.assertEqual(len(world.writes), 1)
             self.assertTrue(all(client.puts <= 1 for client in world.clients))
             self.assertTrue(all(client.scrubbed for client in world.clients))
+
+    def test_rollback_refreshes_timestamp_after_attestation_and_writer_inventory(self):
+        for gap in ("attestation", "inventory"):
+            for kind in ("health", "terminal", "clone"):
+                world = ProviderCloneWorld(("ACTIVE",)) if kind == "clone" else World()
+                prior = copy.deepcopy(world.spec); changed = []; fresh_reads = []
+                def change():
+                    changed.append(1)
+                    world.updated = "2026-10-07T13:00:00Z"
+                def verify(images, source):
+                    result = world.verify_products(images, source)
+                    if gap == "attestation" and lane.checkpoint == "rollback-prior-attestations": change()
+                    return result
+                lane = world.lane(verify_products=verify)
+                def inventory(_):
+                    if gap == "inventory" and len(world.clients) == 4: change()
+                world.inventory_hook = inventory
+                def read(value):
+                    if kind == "clone" and changed: value.updated = "2026-10-07T13:00:00Z"
+                    if lane.checkpoint == "rollback-pre-put-settle": fresh_reads.append(value.updated)
+                world.app_hook = read
+                with self.subTest(gap=gap, kind=kind):
+                    outcome = world.deploy(lane, drill="health-fail" if kind == "health" else "bad-image")
+                    self.assertEqual(outcome.status, "failed-rolled-back")
+                    self.assertEqual(outcome.health_drill_completed, kind == "health")
+                    self.assertEqual(changed, [1]); self.assertEqual(fresh_reads, ["2026-10-07T13:00:00Z"] * 2)
+                    self.assertEqual(world.writes[1], prior)
+                    self.assertEqual(len(world.writes), 2)
+                    self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+
+    def test_rollback_refresh_never_adopts_gap_material_drift(self):
+        for gap in ("attestation", "inventory"):
+            for drift in ("spec", "raw-spec", "active", "phase"):
+                world = World(); fresh_reads = []
+                def change():
+                    if drift == "spec":
+                        next(e for service in world.spec["services"] for e in service["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                    elif drift == "raw-spec":
+                        world.spec["services"][0].pop("internal_ports")
+                    elif drift == "active": world.active = OLD_ID
+                    else: world.deployments[world.active]["phase"] = "ERROR"
+                def verify(images, source):
+                    result = world.verify_products(images, source)
+                    if gap == "attestation" and lane.checkpoint == "rollback-prior-attestations": change()
+                    return result
+                lane = world.lane(verify_products=verify)
+                def inventory(_):
+                    if gap == "inventory" and len(world.clients) == 4: change()
+                world.inventory_hook = inventory
+                def read(_):
+                    if lane.checkpoint == "rollback-pre-put-settle": fresh_reads.append(1)
+                world.app_hook = read
+                with self.subTest(gap=gap, drift=drift), self.assertRaises(common.ReleaseError):
+                    world.deploy(lane, drill="health-fail")
+                self.assertEqual(len(fresh_reads), 1)
+                self.assertEqual(len(world.writes), 1)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+
+    def test_rollback_strict_final_cas_rejects_changes_after_fresh_pair(self):
+        for drift in ("spec", "raw-spec", "active", "updated"):
+            world = World(); lane = world.lane(); fresh_reads = []
+            def read(value):
+                if lane.checkpoint == "rollback-pre-put-settle": fresh_reads.append(1)
+                if lane.checkpoint == "rollback-pre-put-cas":
+                    if drift == "spec": value.spec["services"][0]["envs"][0]["value"] = "foreign"
+                    elif drift == "raw-spec": value.spec["services"][0].pop("internal_ports")
+                    elif drift == "active": value.active = OLD_ID
+                    else: value.updated = "2026-10-07T14:00:00Z"
+            world.app_hook = read
+            code = "spec" if drift == "raw-spec" else drift
+            with self.subTest(drift=drift), self.assertRaisesRegex(common.ReleaseError, "stage-cas-" + code):
+                world.deploy(lane, drill="health-fail")
+            self.assertEqual(fresh_reads, [1, 1]); self.assertEqual(len(world.writes), 1)
+            self.assertEqual(lane.checkpoint, "rollback-pre-put-cas")
+
+    def test_rollback_fresh_pair_churn_and_read_failures_are_bounded(self):
+        for failure in ("count", "clock", "provider"):
+            world = World(); clock = [0]; reads = []; sleeps = []
+            lane = world.lane(monotonic=lambda: clock[0], sleeper=sleeps.append)
+            def read(value):
+                if lane.checkpoint == "rollback-pre-put-settle":
+                    reads.append(1)
+                    if failure == "provider": common.fail("provider-get-failed")
+                    value.updated = "metadata-" + str(len(reads))
+                    if failure == "clock": clock[0] += 150
+            world.app_hook = read
+            code = "provider-get-failed" if failure == "provider" else "stage-settle-timeout"
+            with self.subTest(failure=failure), self.assertRaisesRegex(common.ReleaseError, code):
+                world.deploy(lane, drill="health-fail")
+            self.assertEqual(len(reads), 6 if failure == "count" else 2 if failure == "clock" else 1)
+            self.assertEqual(len(sleeps), 2 if failure == "count" else 0)
+            self.assertEqual(len(world.writes), 1)
+
+    def test_rollback_fresh_writer_inventory_refuses_before_refresh_or_put(self):
+        world = World(); lane = world.lane(); reads = []
+        def inventory(value):
+            if len(world.clients) == 4: value["firewalls"][PG][0]["value"] = PG
+        world.inventory_hook = inventory
+        def read(_):
+            if lane.checkpoint == "rollback-pre-put-settle": reads.append(1)
+        world.app_hook = read
+        with self.assertRaisesRegex(common.ReleaseError, "staging-firewall"):
+            world.deploy(lane, drill="health-fail")
+        self.assertEqual(reads, []); self.assertEqual(len(world.writes), 1)
 
     def test_foreign_deployment_during_rollback_health_is_not_reported_restored(self):
         world = World(); world.health_failure = True
@@ -763,18 +868,20 @@ class LifecycleTests(unittest.TestCase):
             world = World()
             if failure in {"cas", "reject"}:
                 def before_rollback(_):
-                    if len(world.clients) == 4:
-                        if failure == "cas": world.updated = "2026-10-07T13:00:00Z"
-                        else: world.put_outcome = "rejected"
+                    if len(world.clients) == 4 and failure == "reject": world.put_outcome = "rejected"
                 world.inventory_hook = before_rollback
+                def final_drift(value):
+                    if failure == "cas" and lane.checkpoint == "rollback-pre-put-cas": value.updated = "2026-10-07T13:00:00Z"
+                world.app_hook = final_drift
             def request(url):
                 result = world.request(url)
                 if len(world.writes) == 2:
                     if failure == "health": return 503, {}, b"synthetic-private-body"
                     if failure == "after-health": world.spec["services"][0]["envs"][0]["value"] = "foreign-change"
                 return result
+            lane = world.lane(request=request)
             with self.subTest(failure=failure), self.assertRaises(common.ReleaseError):
-                world.deploy(world.lane(request=request), drill="health-fail")
+                world.deploy(lane, drill="health-fail")
             self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing.txt")
             self.assertEqual(len(world.writes), 1 if failure in {"cas", "reject"} else 2)
             self.assertTrue(all(client.scrubbed and client.puts <= 1 for client in world.clients))
