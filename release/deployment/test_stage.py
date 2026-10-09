@@ -234,6 +234,158 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(world.writes), 1)
         self.assertEqual(sum(client.puts for client in world.clients), 1)
 
+    def test_owned_timestamp_pairs_settle_without_additional_puts(self):
+        phases = ("candidate-final-state", "candidate-after-health", "rollback-ownership",
+                  "rollback-final-state", "rollback-after-health")
+        for phase in phases:
+            for drill in (("none", "bad-image") if phase == "rollback-ownership" else ("none",)):
+                world = World(); original = copy.deepcopy(world.spec); lane = world.lane()
+                world.health_failure = phase.startswith("rollback") and drill == "none"
+                seen = []
+                def timestamp(value):
+                    if lane.checkpoint == phase:
+                        seen.append(value.updated)
+                        if len(seen) == 2: value.updated = "2026-10-07T12:01:00Z"
+                world.app_hook = timestamp
+                with self.subTest(phase=phase, drill=drill):
+                    result = world.deploy(lane, drill=drill)
+                    restored = phase.startswith("rollback")
+                    self.assertEqual(result.status, "failed-rolled-back" if restored else "deployed")
+                    self.assertGreaterEqual(len(seen), 4)  # A new equal pair, not a single good read.
+                    self.assertEqual(len(world.writes), 2 if restored else 1)
+                    self.assertEqual(sum(c.puts for c in world.clients), len(world.writes))
+                    self.assertTrue(all(c.puts <= 1 and c.scrubbed for c in world.clients))
+                    if restored: self.assertEqual(world.spec, original)
+                    else: contract.validate_receipt(result.receipt)
+
+    def test_cross_job_rollback_settles_owned_timestamp_pair(self):
+        world = World(); original = copy.deepcopy(world.spec)
+        receipt = world.deploy(drill="e2e-fail").receipt
+        raw = contract.receipt_bytes(receipt); lane = world.lane(); calls = []
+        def timestamp(value):
+            if lane.checkpoint == "rollback-ownership":
+                calls.append(1)
+                if len(calls) == 2: value.updated = "2026-10-07T12:01:00Z"
+        world.app_hook = timestamp
+        result = lane.rollback(base64.b64encode(raw).decode(), common.sha256_bytes(raw),
+            run_id=receipt["run_id"], candidate_sha256=receipt["candidate_sha256"])
+        self.assertEqual(result.status, "rolled-back")
+        self.assertEqual(world.spec, original)
+        self.assertEqual(len(world.writes), 2)
+        self.assertEqual(calls, [1] * 4)
+        self.assertEqual(len(world.probes), 12)
+
+    def test_settling_refuses_material_provider_or_validation_change_without_retry(self):
+        modes = ("identity", "general", "secret", "images", "phase", "ingress", "pending", "pinned", "migration", "provider")
+        foreign = "99999999-9999-4999-8999-999999999999"
+        for mode in modes:
+            world = World(); lane = world.lane(); client = lane.client(False)
+            before = contract.spec_fingerprint(world.spec)
+            original = client.get_app; calls = []
+            def response():
+                value = original(); calls.append(1)
+                if len(calls) == 2:
+                    if mode == "identity":
+                        world.deployments[foreign] = world.deployment(foreign, world.spec, "ACTIVE")
+                        value["app"]["active_deployment"]["id"] = foreign
+                    elif mode in {"general", "secret"}:
+                        env = next(e for c in value["app"]["spec"]["services"] for e in c["envs"]
+                                   if e["type"] == ("SECRET" if mode == "secret" else "GENERAL"))
+                        env["value"] = "EV[foreign-secret]" if mode == "secret" else "foreign-change"
+                    elif mode == "images": value["app"]["spec"] = contract.set_images(world.spec, NEW)
+                    elif mode == "phase": world.deployments[OLD_ID]["phase"] = "ERROR"
+                    elif mode == "ingress": value["app"]["default_ingress"] = "https://foreign.example"
+                    elif mode == "pending": value["app"]["pending_deployment"] = {"id": foreign}
+                    elif mode == "pinned": value["app"]["pinned_deployment"] = {"id": foreign}
+                    elif mode == "migration": world.deployments[OLD_ID]["jobs"][0]["phase"] = "FAILED"
+                    else: common.fail("provider-get-failed")
+                return value
+            client.get_app = response
+            with self.subTest(mode=mode), self.assertRaises(common.ReleaseError):
+                lane.settled_owned(client, OLD_ID, before)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(world.writes, [])
+
+    def test_timestamp_settling_has_count_and_production_wall_clock_caps(self):
+        for bound in ("count", "clock"):
+            world = World(); clock = [0]; sleeps = []
+            lane = world.lane(monotonic=lambda: clock[0], sleeper=sleeps.append)
+            client = lane.client(False); before = contract.spec_fingerprint(world.spec)
+            def churn(value):
+                value.updated = "metadata-" + str(value.get_count)
+                if bound == "clock": clock[0] += 150
+            world.app_hook = churn
+            with self.subTest(bound=bound), self.assertRaisesRegex(common.ReleaseError, "stage-settle-timeout"):
+                lane.settled_owned(client, OLD_ID, before)
+            self.assertEqual(world.get_count, 6 if bound == "count" else 2)
+            self.assertEqual(len(sleeps), 2 if bound == "count" else 0)
+            self.assertEqual(world.writes, [])
+
+    def test_timestamp_churn_never_creates_extra_candidate_or_rollback_attempts(self):
+        for phase in ("candidate-final-state", "rollback-ownership", "rollback-final-state"):
+            world = World(); lane = world.lane(); world.health_failure = phase.startswith("rollback")
+            def churn(value):
+                if lane.checkpoint == phase: value.updated = "metadata-" + str(value.get_count)
+            world.app_hook = churn
+            with self.subTest(phase=phase):
+                if phase == "candidate-final-state":
+                    result = world.deploy(lane)
+                    self.assertEqual(result.status, "failed-rolled-back")
+                    self.assertEqual(lane.original_failure, (phase, "post-deploy-guard:stage-settle-timeout"))
+                else:
+                    with self.assertRaisesRegex(common.ReleaseError, "stage-settle-timeout"): world.deploy(lane)
+                self.assertEqual(len(world.writes), 1 if phase == "rollback-ownership" else 2)
+                self.assertEqual(sum(c.puts for c in world.clients), len(world.writes))
+                self.assertTrue(all(c.puts <= 1 and c.scrubbed for c in world.clients))
+
+    def test_failed_settling_read_and_deadline_after_put_never_retry_candidate(self):
+        for fault in ("provider", "deadline"):
+            world = World(); clock = [0]; lane = world.lane(monotonic=lambda: clock[0])
+            calls = []
+            def fail(value):
+                if lane.checkpoint == "candidate-final-state":
+                    calls.append(1)
+                    if fault == "provider": common.fail("provider-get-failed")
+                    clock[0] += 150
+            world.app_hook = fail
+            with self.subTest(fault=fault):
+                result = world.deploy(lane)
+                self.assertEqual(result.status, "failed-rolled-back")
+                self.assertEqual(len(calls), 1 if fault == "provider" else 2)
+                self.assertEqual(len(world.writes), 2)  # One candidate and one verified restore.
+                self.assertEqual(sum(c.puts for c in world.clients), 2)
+                self.assertEqual(lane.original_failure, ("candidate-final-state",
+                    "provider-get-failed" if fault == "provider" else "post-deploy-guard:stage-settle-timeout"))
+
+    def test_each_public_operation_clears_previous_failure_provenance(self):
+        world = World(); lane = world.lane(); world.health_failure = True
+        self.assertEqual(world.deploy(lane).status, "failed-rolled-back")
+        self.assertIsNotNone(lane.original_failure)
+        world.fail_plan = True
+        with self.assertRaises(common.ReleaseError): world.deploy(lane)
+        self.assertIsNone(lane.original_failure)
+        lane.original_failure = ("candidate-health", "smoke-failed:stage-health")
+        with self.assertRaises(common.ReleaseError):
+            lane.rollback("invalid", "0" * 64, run_id="1234567", candidate_sha256="0" * 64)
+        self.assertIsNone(lane.original_failure)
+        self.assertEqual(len(world.writes), 2)
+
+    def test_rollback_ownership_never_settles_phase_or_active_identity_changes(self):
+        for changed in ("phase", "active"):
+            world = World(); lane = world.lane(); calls = []
+            def drift(value):
+                if lane.checkpoint == "rollback-ownership":
+                    calls.append(1)
+                    if len(calls) == 2:
+                        failed = next(identity for identity in value.deployments if identity != OLD_ID)
+                        if changed == "phase": value.deployments[failed]["phase"] = "ACTIVE"
+                        else: value.active = failed
+            world.app_hook = drift
+            with self.subTest(changed=changed), self.assertRaisesRegex(common.ReleaseError, "stage-observation-changed"):
+                world.deploy(lane, drill="bad-image")
+            self.assertEqual(calls, [1, 1])
+            self.assertEqual(len(world.writes), 1)
+
     def test_definitive_rejection_does_not_trigger_rollback(self):
         world = World(); world.put_outcome = "rejected"
         with self.assertRaisesRegex(common.ReleaseError, "provider-rejected"): world.deploy()
@@ -348,14 +500,13 @@ class LifecycleTests(unittest.TestCase):
                     if len(value.writes) == 1: value.deployments[value.active]["jobs"][0]["phase"] = "FAILED"
                 world.app_hook = fail_migration
             elif failure == "final-state":
-                stable, count = lane.stable, 0
+                observe = lane.observe
                 def wrong_candidate(client):
-                    nonlocal count
-                    value = stable(client); count += 1
+                    value = observe(client)
                     # Fail the post-PUT identity guard, leaving real provider
                     # state intact so the existing rollback can still verify it.
-                    return stage.Snapshot(value.spec, value.images, OLD_ID, value.updated_sha256, value.spec_sha256) if count == 3 else value
-                lane.stable = wrong_candidate
+                    return stage.Snapshot(value.spec, value.images, OLD_ID, value.updated_sha256, value.spec_sha256) if lane.checkpoint == "candidate-final-state" else value
+                lane.observe = wrong_candidate
             else:
                 def failed_probe(url):
                     if "intentionally_missing" in url:
@@ -384,7 +535,7 @@ class LifecycleTests(unittest.TestCase):
                 result = world.request(url)
                 if len(world.writes) == 2:
                     if failure == "health": return 503, {}, b"synthetic-private-body"
-                    if failure == "after-health": world.updated = "2026-10-07T14:00:00Z"
+                    if failure == "after-health": world.spec["services"][0]["envs"][0]["value"] = "foreign-change"
                 return result
             with self.subTest(failure=failure), self.assertRaises(common.ReleaseError):
                 world.deploy(world.lane(request=request), drill="health-fail")
@@ -592,9 +743,12 @@ class CLITests(unittest.TestCase):
             with self.subTest(case=case):
                 result, logs = self.world_cli(world, "none", request=request)
                 self.assertEqual(result, stage.ship.EXIT_MANUAL)
-                self.assertEqual(logs.splitlines(), [
+                expected = [
                     "stage: failed after an attempted mutation; reconcile with reads before any retry",
-                    f"stage-diagnostic: checkpoint={checkpoint}; code={code}"])
+                    f"stage-diagnostic: checkpoint={checkpoint}; code={code}"]
+                if case.startswith("rollback"):
+                    expected.append("stage-original-failure: checkpoint=candidate-health; code=smoke-failed:stage-health")
+                self.assertEqual(logs.splitlines(), expected)
                 self.assertEqual(len(world.writes), writes)
                 self.assertEqual(sum(client.puts for client in world.clients), attempts)
                 self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
@@ -624,6 +778,32 @@ class CLITests(unittest.TestCase):
         output = io.StringIO()
         stage.report_failure(common.Output(stdout=output), RuntimeError(secret), secret, False)
         self.assertEqual(output.getvalue().splitlines()[-1], "stage-diagnostic: checkpoint=unknown; code=internal-error")
+        self.assertNotIn(secret, output.getvalue())
+
+    def test_original_failure_and_rollback_failure_are_both_safe_and_best_effort(self):
+        secret = "unmaskedOriginalFailureSecret0123456789"
+        for broken in (False, True):
+            world = World()
+            def request(_): common.fail("smoke-failed:" + secret)
+            def drift(value):
+                if len(world.clients) == 3: value["account"]["status"] = "suspended"
+            world.inventory_hook = drift
+            original = common.Output.text
+            def output(out, line):
+                if broken and line.startswith("stage-original-failure:"): raise OSError(secret)
+                return original(out, line)
+            with self.subTest(broken_output=broken), mock.patch.object(common.Output, "text", output):
+                result, logs = self.world_cli(world, "none", request=request)
+            self.assertEqual(result, stage.ship.EXIT_MANUAL)
+            self.assertIn("stage-diagnostic: checkpoint=rollback-ownership", logs)
+            self.assertEqual("stage-original-failure: checkpoint=candidate-health; code=smoke-failed" in logs, not broken)
+            self.assertNotIn(secret, logs)
+            self.assertEqual(len(world.writes), 1)
+            self.assertTrue(all(c.puts <= 1 and c.scrubbed for c in world.clients))
+        output = io.StringIO()
+        stage.report_failure(common.Output(stdout=output), RuntimeError(secret), "rollback-ownership", True,
+            original_failure=(secret, secret))
+        self.assertIn("stage-original-failure: checkpoint=unknown; code=internal-error", output.getvalue())
         self.assertNotIn(secret, output.getvalue())
 
     def test_receipt_output_failures_are_after_deploy_and_do_not_retry_or_rollback(self):
