@@ -97,6 +97,10 @@ def report_failure(out, error, checkpoint, attempted, original_failure=None):
             out.text(line)
         except (Exception, KeyboardInterrupt):
             pass
+    report_original_failure(out, original_failure)
+
+
+def report_original_failure(out, original_failure):
     if type(original_failure) is tuple and len(original_failure) == 2:
         try:
             phase, code = original_failure
@@ -312,9 +316,9 @@ class StageLane:
 
     def health(self, drill="none"):
         if drill == "health-fail":
-            # The probe executes, but cannot accidentally turn a drill green if
-            # a catch-all route unexpectedly returns 200 for the missing path.
-            self.request(self.target["origin"] + "/_stage_drill_intentionally_missing")
+            # A missing static-style path avoids the extensionless SPA fallback
+            # and its oversized index body. A bounded 200 still cannot pass the drill.
+            self.request(self.target["origin"] + "/_stage_drill_intentionally_missing.txt")
             raise IntentionalHealthFailure()
         for _, path, expected in smoke.HEALTH:
             status, headers, body = self.request(self.target["origin"] + path)
@@ -623,6 +627,8 @@ def main(argv=None, env=None, deps=None, *, adapter_factory=None, pins_path=None
             out.emit(outcome.receipt)
         checkpoint = "status-output"
         out.text("stage: " + outcome.status)
+        if arguments.command == "deploy" and outcome.status == "failed-rolled-back":
+            report_original_failure(out, lane.original_failure)
         if (arguments.command == "deploy" and drill == "health-fail" and
                 outcome.status == "failed-rolled-back" and outcome.health_drill_completed is True):
             out.text(HEALTH_DRILL_EVIDENCE)

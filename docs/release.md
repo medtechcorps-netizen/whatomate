@@ -158,7 +158,7 @@ needs read-only reconciliation; cancellation is not proof of automatic recovery.
 The `drill` input defaults to `none`. Any other value is accepted only in `stage`:
 
 - `none`: require all six health probes and exactly 13 single-pass CRM checks.
-- `health-fail`: probe a deliberately missing route and exercise in-job rollback.
+- `health-fail`: probe `/_stage_drill_intentionally_missing.txt` (a missing static path that bypasses the SPA fallback) and exercise in-job rollback.
 - `bad-image`: use the separately attested staging bootstrap image for web and
   PRE_DEPLOY, exercising migration/deployment failure and in-job rollback.
 - `e2e-fail`: fail the first CRM check deliberately; the separate rollback job
