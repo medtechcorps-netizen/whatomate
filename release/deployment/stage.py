@@ -356,6 +356,34 @@ class StageLane:
                         contract.spec_fingerprint(summary.get("spec")) == before.spec_sha256 and
                         (key != "active_deployment" or summary["phase"] == "ACTIVE"), code)
 
+    def clone_active(self, client, app, clone, before, inflight):
+        # This is read-only settling after the candidate and clone are bound.
+        # It never supplies ACTIVE ownership to rollback or a write-time CAS.
+        code = "reconcile-failed:stage-previous-clone-changed"
+        active = app.get("active_deployment")
+        if active is None:
+            require(set(inflight) == {clone["id"]}, code)
+            return None
+        require(type(active) is dict and active.get("id") in {before.deployment_id, clone["id"]}, code)
+        if active.get("phase") == "ACTIVE":
+            require(active["id"] != clone["id"] or clone["phase"] == "ACTIVE", code)
+            if "spec" in active:
+                require(contract.spec_fingerprint(active["spec"]) == before.spec_sha256, code)
+            return active["id"]
+        # The prior deployment can be marked SUPERSEDED before the owned clone
+        # becomes ACTIVE. Require its full spec and an agreeing direct read;
+        # no other non-ACTIVE summary, including the clone itself, is accepted.
+        require(active["id"] == before.deployment_id and active.get("phase") == "SUPERSEDED" and
+                set(inflight) == {clone["id"]} and
+                contract.spec_fingerprint(active.get("spec")) == before.spec_sha256, code)
+        prior = do_app.deployment_object(client.get_deployment(before.deployment_id))
+        require(prior.get("id") == before.deployment_id and prior.get("phase") == "SUPERSEDED" and
+                contract.spec_fingerprint(prior.get("spec")) == before.spec_sha256 and
+                prior.get("cloned_from") == active.get("cloned_from"), code)
+        if prior.get("cloned_from") is not None:
+            common.require_uuid(prior["cloned_from"], code)
+        return None
+
     def reconcile(self, client, desired, before, *, candidate_id=None, excluded=()):
         wanted = contract.spec_fingerprint(desired)
         deadline = self.monotonic() + self.deadline_seconds
@@ -399,10 +427,7 @@ class StageLane:
                     phase = CLONE_PHASES.index(clone["phase"])
                     require(phase >= clone_phase, "reconcile-failed:stage-previous-clone-changed")
                     previous_clone_id, clone_phase = observed, phase
-                    active = do_app.active_id(app)
-                    require(active in {before.deployment_id, previous_clone_id} and
-                            (active != previous_clone_id or clone["phase"] == "ACTIVE"),
-                            "reconcile-failed:stage-previous-clone-changed")
+                    active = self.clone_active(client, app, clone, before, inflight)
                     if self.monotonic() >= deadline:
                         break
                     if clone["phase"] == "ACTIVE" and active == previous_clone_id and not inflight:

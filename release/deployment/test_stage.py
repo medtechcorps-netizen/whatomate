@@ -210,6 +210,111 @@ class ProviderCloneClient(FakeClient):
 
 
 class LifecycleTests(unittest.TestCase):
+    @staticmethod
+    def clone_active_transition(world, app, shape):
+        if shape == "omitted":
+            app.pop("active_deployment")
+        elif shape == "null":
+            app["active_deployment"] = None
+        else:
+            world.deployments[OLD_ID]["phase"] = "SUPERSEDED"
+            app["active_deployment"] = copy.deepcopy(world.deployments[OLD_ID])
+
+    def test_provider_clone_active_transition_waits_before_owned_rollback(self):
+        for shape in ("omitted", "null", "superseded"):
+            for inflight_key in ("pending_deployment", "in_progress_deployment"):
+                for discover_candidate in (False, True):
+                    world = ProviderCloneWorld()
+                    world.omit_put_hint = world.candidate_first = discover_candidate
+                    def transition(app):
+                        if world.deployments[world.CLONE]["phase"] == "DEPLOYING":
+                            self.clone_active_transition(world, app, shape)
+                            if inflight_key == "in_progress_deployment":
+                                app[inflight_key], app["pending_deployment"] = app["pending_deployment"], None
+                    world.snapshot_hook = transition
+                    lane = world.lane(poll_limit=5)
+                    owned = lane.rollback_owned
+                    def rollback(desired, before, identity, **kwargs):
+                        self.assertEqual(world.clone_reads, 2)
+                        self.assertEqual(world.active, world.CLONE)
+                        self.assertEqual(identity, world.failed_id)
+                        self.assertEqual(kwargs["previous_clone_id"], world.CLONE)
+                        return owned(desired, before, identity, **kwargs)
+                    with self.subTest(shape=shape, inflight=inflight_key, discovery=discover_candidate), \
+                            mock.patch.object(lane, "rollback_owned", side_effect=rollback) as restore:
+                        result = world.deploy(lane, drill="bad-image")
+                    restore.assert_called_once()
+                    self.assertEqual(result.status, "failed-rolled-back")
+                    self.assertIsNone(result.receipt)
+                    self.assertFalse(result.health_drill_completed)
+                    self.assertEqual(world.writes[1], world.prior)
+                    self.assertEqual(world.spec, world.prior)
+                    self.assertEqual(len(world.writes), 2)
+                    self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                    self.assertEqual(len(world.probes), 6)
+                    self.assertEqual(lane.original_failure,
+                        ("candidate-put-reconcile", "deployment-error:stage-terminal"))
+
+    def test_provider_clone_active_transition_refuses_contradictory_summaries(self):
+        cases = ("empty", "list", "string", "boolean", "foreign", "prior-error", "prior-deploying",
+            "missing-phase", "missing-spec", "summary-secret", "summary-selector", "direct-phase",
+            "direct-id", "direct-secret", "lineage", "malformed-lineage", "clone-not-active", "clone-premature-active")
+        for case in cases:
+            world = ProviderCloneWorld()
+            def conflict(app):
+                self.clone_active_transition(world, app, "superseded")
+                summary, prior = app["active_deployment"], world.deployments[OLD_ID]
+                if case == "empty": app["active_deployment"] = {}
+                elif case == "list": app["active_deployment"] = []
+                elif case == "string": app["active_deployment"] = "foreign"
+                elif case == "boolean": app["active_deployment"] = False
+                elif case == "foreign": summary["id"] = PG
+                elif case == "prior-error": summary["phase"] = "ERROR"
+                elif case == "prior-deploying": summary["phase"] = "DEPLOYING"
+                elif case == "missing-phase": summary.pop("phase")
+                elif case == "missing-spec": summary.pop("spec")
+                elif case == "summary-selector": summary["spec"]["services"][0]["image"]["repository"] = "foreign"
+                elif case == "direct-phase": prior["phase"] = "ACTIVE"
+                elif case == "direct-id": prior["id"] = PG
+                elif case == "lineage": summary["cloned_from"] = PG
+                elif case == "malformed-lineage": summary["cloned_from"] = prior["cloned_from"] = False
+                elif case.startswith("clone-"):
+                    app["active_deployment"] = copy.deepcopy(world.deployments[world.CLONE])
+                    if case == "clone-premature-active": app["active_deployment"]["phase"] = "ACTIVE"
+                else:
+                    spec = summary["spec"] if case == "summary-secret" else prior["spec"]
+                    next(e for s in spec["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+            world.snapshot_hook = conflict
+            with self.subTest(case=case), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertEqual(world.clone_reads, 1)
+            self.assertEqual(len(world.writes), 1)
+            self.assertEqual(len(world.clients), 2)
+            self.assertEqual(world.probes, [])
+
+    def test_provider_clone_active_transition_requires_owned_inflight_and_has_bounds(self):
+        for shape in ("omitted", "null", "superseded"):
+            for condition in ("no-inflight", "count", "deadline"):
+                world = ProviderCloneWorld(("DEPLOYING",))
+                def transition(app):
+                    self.clone_active_transition(world, app, shape)
+                    if condition == "no-inflight": app["pending_deployment"] = None
+                world.snapshot_hook = transition
+                clock, sleeps = [0], []
+                def now(): clock[0] += 1; return clock[0]
+                lane = world.lane(**(dict(poll_limit=90, poll_seconds=1, deadline_seconds=3,
+                    monotonic=now, sleeper=sleeps.append) if condition == "deadline" else {}))
+                code = "reconcile-timeout:stage-previous-clone" if condition != "no-inflight" else ".*"
+                with self.subTest(shape=shape, condition=condition), self.assertRaisesRegex(common.ReleaseError, code):
+                    world.deploy(lane, drill="bad-image")
+                # Without an in-flight clone, the existing failed-candidate
+                # path may perform an ownership read, but cannot restore.
+                self.assertEqual(world.clone_reads, {"count": 3, "deadline": 1, "no-inflight": 2}[condition])
+                self.assertEqual(len(world.writes), 1)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                self.assertEqual(world.probes, [])
+                if condition == "deadline": self.assertEqual(sleeps, [1])
+
     def test_provider_previous_clone_settles_then_restores_full_prior_spec(self):
         for phases in (("ACTIVE",), ("DEPLOYING", "ACTIVE"),
                        ("PENDING_BUILD", "BUILDING", "PENDING_DEPLOY", "DEPLOYING", "ACTIVE")):
