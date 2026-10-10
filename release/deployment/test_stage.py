@@ -16,6 +16,7 @@ import stage
 import stage_contract as contract
 from test_stage_contract import APP, PG, VK, VPC, ORIGIN, TEAM, IMAGES, NEW, data
 from test_stage_contract import receipt as synthetic_receipt
+from test_ship_smoke import FakeSocket, FakeContext, addresses
 
 OLD_ID = "77777777-7777-4777-8777-777777777777"
 OLD_SOURCE, NEW_SOURCE = "a" * 40, "b" * 40
@@ -84,7 +85,7 @@ class World:
         if self.health_failure:
             self.health_failure = False
             return 503, {}, b"synthetic failure"
-        if path == "/_stage_drill_intentionally_missing": return 404, {}, b""
+        if path == "/_stage_drill_intentionally_missing.txt": return 404, {}, b""
         statuses = {path: status for _, path, status in stage.smoke.HEALTH}
         return statuses[path], {}, b""
 
@@ -140,7 +141,347 @@ class FakeClient:
         return response
 
 
+class ProviderCloneWorld(World):
+    """One failed candidate followed by a provider clone, without an extra PUT."""
+    CLONE = "99999999-9999-4999-8999-999999999999"
+
+    def __init__(self, phases=("DEPLOYING", "ACTIVE")):
+        super().__init__()
+        self.prior = copy.deepcopy(self.spec)
+        self.clone_phases, self.clone_reads = phases, 0
+        self.failed_id = None
+        self.clone_hook, self.snapshot_hook = None, None
+        self.omit_put_hint = False
+        self.candidate_first = False
+        self.candidate_polls = 0
+
+    def factory(self, *, allow_put):
+        client = ProviderCloneClient(self, allow_put)
+        self.clients.append(client)
+        return client
+
+
+class ProviderCloneClient(FakeClient):
+    def put_app_once(self, spec):
+        response = super().put_app_once(spec)
+        world = self.world
+        if len(world.writes) == 1:
+            world.failed_id = response["app"]["pending_deployment"]["id"]
+            world.deployments[world.failed_id]["jobs"][0]["phase"] = "FAILED"
+            clone = world.deployment(world.CLONE, world.prior, world.clone_phases[0])
+            clone["cloned_from"] = OLD_ID
+            world.deployments[world.CLONE] = clone
+            if world.omit_put_hint:
+                response["app"]["pending_deployment"] = None
+        return response
+
+    def get_app(self):
+        world = self.world
+        if len(world.writes) == 1:
+            if world.candidate_first and world.candidate_polls == 0:
+                world.candidate_polls += 1
+                world.deployments[world.failed_id]["phase"] = "DEPLOYING"
+                world.pending = {"id": world.failed_id, "phase": "DEPLOYING"}
+                return super().get_app()
+            if world.candidate_first and world.candidate_polls == 1:
+                world.candidate_polls += 1
+                world.deployments[world.failed_id]["phase"] = "ERROR"
+            phase = world.clone_phases[min(world.clone_reads, len(world.clone_phases) - 1)]
+            world.clone_reads += 1
+            world.deployments[world.CLONE]["phase"] = phase
+            world.active = world.CLONE if phase == "ACTIVE" else OLD_ID
+            world.pending = None if phase == "ACTIVE" else {"id": world.CLONE, "phase": phase}
+            world.updated = "2026-10-07T12:02:00Z"
+            if world.clone_hook:
+                world.clone_hook(world)
+        response = super().get_app()
+        if len(world.writes) == 1:
+            for key in ("active_deployment", "pending_deployment", "in_progress_deployment"):
+                if (response["app"].get(key) or {}).get("id") == world.CLONE:
+                    response["app"][key] = copy.deepcopy(world.deployments[world.CLONE])
+            if world.snapshot_hook:
+                world.snapshot_hook(response["app"])
+        return response
+
+    def get_deployment(self, identity):
+        if identity not in self.world.deployments:
+            common.fail("provider-get-failed")
+        return super().get_deployment(identity)
+
+
 class LifecycleTests(unittest.TestCase):
+    @staticmethod
+    def clone_active_transition(world, app, shape):
+        if shape == "omitted":
+            app.pop("active_deployment")
+        elif shape == "null":
+            app["active_deployment"] = None
+        else:
+            world.deployments[OLD_ID]["phase"] = "SUPERSEDED"
+            app["active_deployment"] = copy.deepcopy(world.deployments[OLD_ID])
+
+    def test_provider_clone_active_transition_waits_before_owned_rollback(self):
+        for shape in ("omitted", "null", "superseded"):
+            for inflight_key in ("pending_deployment", "in_progress_deployment"):
+                for discover_candidate in (False, True):
+                    world = ProviderCloneWorld()
+                    world.omit_put_hint = world.candidate_first = discover_candidate
+                    def transition(app):
+                        if world.deployments[world.CLONE]["phase"] == "DEPLOYING":
+                            self.clone_active_transition(world, app, shape)
+                            if inflight_key == "in_progress_deployment":
+                                app[inflight_key], app["pending_deployment"] = app["pending_deployment"], None
+                    world.snapshot_hook = transition
+                    lane = world.lane(poll_limit=5)
+                    owned = lane.rollback_owned
+                    def rollback(desired, before, identity, **kwargs):
+                        self.assertEqual(world.clone_reads, 2)
+                        self.assertEqual(world.active, world.CLONE)
+                        self.assertEqual(identity, world.failed_id)
+                        self.assertEqual(kwargs["previous_clone_id"], world.CLONE)
+                        return owned(desired, before, identity, **kwargs)
+                    with self.subTest(shape=shape, inflight=inflight_key, discovery=discover_candidate), \
+                            mock.patch.object(lane, "rollback_owned", side_effect=rollback) as restore:
+                        result = world.deploy(lane, drill="bad-image")
+                    restore.assert_called_once()
+                    self.assertEqual(result.status, "failed-rolled-back")
+                    self.assertIsNone(result.receipt)
+                    self.assertFalse(result.health_drill_completed)
+                    self.assertEqual(world.writes[1], world.prior)
+                    self.assertEqual(world.spec, world.prior)
+                    self.assertEqual(len(world.writes), 2)
+                    self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                    self.assertEqual(len(world.probes), 6)
+                    self.assertEqual(lane.original_failure,
+                        ("candidate-put-reconcile", "deployment-error:stage-terminal"))
+
+    def test_provider_clone_active_transition_refuses_contradictory_summaries(self):
+        cases = ("empty", "list", "string", "boolean", "foreign", "prior-error", "prior-deploying",
+            "missing-phase", "missing-spec", "summary-secret", "summary-selector", "direct-phase",
+            "direct-id", "direct-secret", "lineage", "malformed-lineage", "clone-not-active", "clone-premature-active")
+        for case in cases:
+            world = ProviderCloneWorld()
+            def conflict(app):
+                self.clone_active_transition(world, app, "superseded")
+                summary, prior = app["active_deployment"], world.deployments[OLD_ID]
+                if case == "empty": app["active_deployment"] = {}
+                elif case == "list": app["active_deployment"] = []
+                elif case == "string": app["active_deployment"] = "foreign"
+                elif case == "boolean": app["active_deployment"] = False
+                elif case == "foreign": summary["id"] = PG
+                elif case == "prior-error": summary["phase"] = "ERROR"
+                elif case == "prior-deploying": summary["phase"] = "DEPLOYING"
+                elif case == "missing-phase": summary.pop("phase")
+                elif case == "missing-spec": summary.pop("spec")
+                elif case == "summary-selector": summary["spec"]["services"][0]["image"]["repository"] = "foreign"
+                elif case == "direct-phase": prior["phase"] = "ACTIVE"
+                elif case == "direct-id": prior["id"] = PG
+                elif case == "lineage": summary["cloned_from"] = PG
+                elif case == "malformed-lineage": summary["cloned_from"] = prior["cloned_from"] = False
+                elif case.startswith("clone-"):
+                    app["active_deployment"] = copy.deepcopy(world.deployments[world.CLONE])
+                    if case == "clone-premature-active": app["active_deployment"]["phase"] = "ACTIVE"
+                else:
+                    spec = summary["spec"] if case == "summary-secret" else prior["spec"]
+                    next(e for s in spec["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+            world.snapshot_hook = conflict
+            with self.subTest(case=case), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertEqual(world.clone_reads, 1)
+            self.assertEqual(len(world.writes), 1)
+            self.assertEqual(len(world.clients), 2)
+            self.assertEqual(world.probes, [])
+
+    def test_provider_clone_active_transition_requires_owned_inflight_and_has_bounds(self):
+        for shape in ("omitted", "null", "superseded"):
+            for condition in ("no-inflight", "count", "deadline"):
+                world = ProviderCloneWorld(("DEPLOYING",))
+                def transition(app):
+                    self.clone_active_transition(world, app, shape)
+                    if condition == "no-inflight": app["pending_deployment"] = None
+                world.snapshot_hook = transition
+                clock, sleeps = [0], []
+                def now(): clock[0] += 1; return clock[0]
+                lane = world.lane(**(dict(poll_limit=90, poll_seconds=1, deadline_seconds=3,
+                    monotonic=now, sleeper=sleeps.append) if condition == "deadline" else {}))
+                code = "reconcile-timeout:stage-previous-clone" if condition != "no-inflight" else ".*"
+                with self.subTest(shape=shape, condition=condition), self.assertRaisesRegex(common.ReleaseError, code):
+                    world.deploy(lane, drill="bad-image")
+                # Without an in-flight clone, the existing failed-candidate
+                # path may perform an ownership read, but cannot restore.
+                self.assertEqual(world.clone_reads, {"count": 3, "deadline": 1, "no-inflight": 2}[condition])
+                self.assertEqual(len(world.writes), 1)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                self.assertEqual(world.probes, [])
+                if condition == "deadline": self.assertEqual(sleeps, [1])
+
+    def test_provider_previous_clone_settles_then_restores_full_prior_spec(self):
+        for phases in (("ACTIVE",), ("DEPLOYING", "ACTIVE"),
+                       ("PENDING_BUILD", "BUILDING", "PENDING_DEPLOY", "DEPLOYING", "ACTIVE")):
+            world = ProviderCloneWorld(phases); lane = world.lane(poll_limit=6)
+            with self.subTest(phases=phases):
+                result = world.deploy(lane, drill="bad-image")
+                self.assertEqual(result.status, "failed-rolled-back")
+                self.assertEqual(world.spec, world.prior)
+                self.assertEqual(world.writes[1], world.prior)
+                self.assertNotEqual(world.writes[0]["services"][0]["image"], world.prior["services"][0]["image"])
+                self.assertEqual(len(world.writes), 2)
+                self.assertEqual(sum(c.puts for c in world.clients), 2)
+                self.assertTrue(all(c.puts <= 1 and c.scrubbed for c in world.clients))
+                self.assertEqual(len(world.probes), 6)
+                self.assertNotIn(world.active, (OLD_ID, world.failed_id, world.CLONE))
+                self.assertEqual(lane.original_failure,
+                    ("candidate-put-reconcile", "deployment-error:stage-terminal"))
+        world = ProviderCloneWorld(); world.omit_put_hint = world.candidate_first = True
+        self.assertEqual(world.deploy(world.lane(poll_limit=4), drill="bad-image").status, "failed-rolled-back")
+        self.assertEqual(world.candidate_polls, 2)  # The failed ID can be pinned by the first poll.
+        self.assertEqual(world.writes[1], world.prior)
+        self.assertEqual(len(world.writes), 2)
+        self.assertEqual(len(world.probes), 6)
+
+    def test_provider_clone_rejects_conflicting_app_summaries(self):
+        for key in ("active_deployment", "pending_deployment", "in_progress_deployment"):
+            for field in ("phase", "lineage", "missing-spec", "secret"):
+                world = ProviderCloneWorld(("ACTIVE",) if key == "active_deployment" else ("DEPLOYING",))
+                def conflict(app):
+                    if key == "in_progress_deployment":
+                        app[key] = copy.deepcopy(app["pending_deployment"])
+                    summary = app[key]
+                    if field == "phase": summary["phase"] = "ERROR"
+                    elif field == "lineage": summary["cloned_from"] = PG
+                    elif field == "missing-spec": summary.pop("spec")
+                    else: next(e for s in summary["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                world.snapshot_hook = conflict
+                with self.subTest(key=key, field=field), self.assertRaises(common.ReleaseError):
+                    world.deploy(drill="bad-image")
+                self.assertEqual(len(world.writes), 1)
+                self.assertEqual(len(world.clients), 2)
+                self.assertEqual(world.probes, [])
+
+        for boundary in ("reader", "writer", "final-cas"):
+            for field in ("phase", "lineage", "secret"):
+                world = ProviderCloneWorld(("ACTIVE",)); writer_reads = []
+                def late_conflict(app):
+                    if len(world.clients) == 4: writer_reads.append(1)
+                    if ((boundary == "reader" and len(world.clients) == 3) or
+                        (boundary == "writer" and len(world.clients) == 4) or
+                        (boundary == "final-cas" and len(writer_reads) == 2)):
+                        summary = app["active_deployment"]
+                        if field == "phase": summary["phase"] = "ERROR"
+                        elif field == "lineage": summary["cloned_from"] = PG
+                        else: next(e for s in summary["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                world.snapshot_hook = late_conflict
+                with self.subTest(boundary=boundary, field=field), self.assertRaises(common.ReleaseError):
+                    world.deploy(drill="bad-image")
+                self.assertEqual(len(world.writes), 1)
+                self.assertEqual(world.probes, [])
+
+    def test_provider_clone_refuses_lineage_full_spec_and_candidate_drift(self):
+        mutations = {
+            "missing-lineage": lambda w: w.deployments[w.CLONE].pop("cloned_from", None),
+            "foreign-lineage": lambda w: w.deployments[w.CLONE].update(cloned_from=PG),
+            "clone-identity": lambda w: w.deployments[w.CLONE].update(id=PG),
+            "selector": lambda w: w.deployments[w.CLONE]["spec"]["services"][0]["image"].update(repository="foreign"),
+            "general": lambda w: next(e for s in w.deployments[w.CLONE]["spec"]["services"] for e in s["envs"] if e["type"] == "GENERAL").update(value="foreign"),
+            "secret": lambda w: next(e for s in w.deployments[w.CLONE]["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET").update(value="EV[foreign]"),
+            "candidate-spec": lambda w: w.deployments[w.failed_id].update(spec=copy.deepcopy(w.prior)),
+            "candidate-not-failed": lambda w: w.deployments[w.failed_id].update(phase="DEPLOYING"),
+            "candidate-canceled": lambda w: w.deployments[w.failed_id].update(phase="CANCELED"),
+            "clone-migration": lambda w: w.deployments[w.CLONE]["jobs"][0].update(phase="FAILED"),
+        }
+        for name, change in mutations.items():
+            world = ProviderCloneWorld(("ACTIVE",)); world.clone_hook = change
+            with self.subTest(name=name), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertEqual(len(world.writes), 1)
+            self.assertEqual(len(world.clients), 2)
+            self.assertEqual(world.probes, [])
+            self.assertTrue(all(c.scrubbed and c.puts <= 1 for c in world.clients))
+
+    def test_provider_clone_does_not_adopt_unknown_multiple_or_changed_inflight(self):
+        mutations = {
+            "unknown": lambda app: app.update(pending_deployment={"id": PG}),
+            "multiple": lambda app: app.update(in_progress_deployment={"id": PG}),
+            "old": lambda app: app.update(pending_deployment={"id": OLD_ID}),
+            "malformed": lambda app: app.update(pending_deployment={"id": None}),
+            "pinned": lambda app: app.update(pinned_deployment={"id": PG}),
+            "ingress": lambda app: app.update(default_ingress="https://foreign.example"),
+            "foreign-active": lambda app: app.update(active_deployment={"id": PG, "phase": "ACTIVE"}),
+        }
+        for name, change in mutations.items():
+            world = ProviderCloneWorld(("DEPLOYING",)); world.snapshot_hook = change
+            with self.subTest(name=name), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertEqual(len(world.writes), 1)
+            self.assertEqual(world.probes, [])
+        world = ProviderCloneWorld(("ACTIVE",)); world.omit_put_hint = True
+        with self.assertRaisesRegex(common.ReleaseError, "stage-deployment-spec"):
+            world.deploy(drill="bad-image")
+        self.assertEqual(len(world.writes), 1)  # Never discover the failed ID by guessing/history.
+        world = ProviderCloneWorld(("DEPLOYING",))
+        def changed(app):
+            if world.clone_reads == 2:
+                app["pending_deployment"] = {"id": PG}
+        world.snapshot_hook = changed
+        with self.assertRaisesRegex(common.ReleaseError, "stage-previous-clone-changed"):
+            world.deploy(drill="bad-image")
+        self.assertEqual(len(world.writes), 1)
+
+    def test_provider_clone_wait_has_count_deadline_and_phase_guards(self):
+        for phases in (("ERROR",), ("CANCELED",), ("SUPERSEDED",), ("UNKNOWN",), ("DEPLOYING", "BUILDING")):
+            world = ProviderCloneWorld(phases)
+            with self.subTest(phases=phases), self.assertRaises(common.ReleaseError):
+                world.deploy(drill="bad-image")
+            self.assertLessEqual(world.clone_reads, 2)
+            self.assertEqual(len(world.writes), 1)
+        world = ProviderCloneWorld(("DEPLOYING",))
+        with self.assertRaisesRegex(common.ReleaseError, "reconcile-timeout:stage-previous-clone"):
+            world.deploy(drill="bad-image")
+        self.assertEqual(world.clone_reads, 3)
+        self.assertEqual(len(world.clients), 2)
+        clock = [0]; sleeps = []
+        def now(): clock[0] += 1; return clock[0]
+        world = ProviderCloneWorld(("DEPLOYING",))
+        lane = world.lane(poll_limit=90, poll_seconds=1, deadline_seconds=3,
+                          monotonic=now, sleeper=sleeps.append)
+        with self.assertRaisesRegex(common.ReleaseError, "reconcile-timeout:stage-previous-clone"):
+            world.deploy(lane, drill="bad-image")
+        self.assertEqual(world.clone_reads, 1)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(len(world.writes), 1)
+        clock[0] = 0
+        world = ProviderCloneWorld(("ACTIVE",))
+        with self.assertRaisesRegex(common.ReleaseError, "reconcile-timeout:stage-previous-clone"):
+            world.deploy(world.lane(monotonic=now, deadline_seconds=1), drill="bad-image")
+        self.assertEqual(world.clone_reads, 1)  # Expiry after reads cannot grant rollback authority.
+        self.assertEqual(len(world.writes), 1)
+        self.assertEqual(world.probes, [])
+
+    def test_provider_clone_ownership_and_final_cas_refuse_later_drift(self):
+        for client_count in (3, 4):
+            for field in ("lineage", "secret", "candidate", "migration"):
+                world = ProviderCloneWorld(("ACTIVE",))
+                def drift(value):
+                    if len(world.clients) == client_count:
+                        if field == "lineage": world.deployments[world.CLONE]["cloned_from"] = PG
+                        elif field == "candidate": world.deployments[world.failed_id]["phase"] = "ACTIVE"
+                        elif field == "migration": world.deployments[world.CLONE]["jobs"][0]["phase"] = "FAILED"
+                        else: next(e for s in world.deployments[world.CLONE]["spec"]["services"] for e in s["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                world.inventory_hook = drift
+                with self.subTest(client_count=client_count, field=field), self.assertRaises(common.ReleaseError):
+                    world.deploy(drill="bad-image")
+                self.assertEqual(len(world.writes), 1)
+                self.assertEqual(world.probes, [])
+        world = ProviderCloneWorld(("ACTIVE",)); lane = world.lane(); reads = []
+        def app_cas(app):
+            if lane.checkpoint == "rollback-pre-put-cas":
+                reads.append(1)
+                if len(reads) == 2: app["updated_at"] = "2026-10-07T13:00:00Z"
+        world.snapshot_hook = app_cas
+        with self.assertRaisesRegex(common.ReleaseError, "rollback-precondition-failed:stage-cas"):
+            world.deploy(lane, drill="bad-image")
+        self.assertEqual(len(world.writes), 1)
+
     def test_local_identity_and_ambient_refuse_before_client_creation(self):
         world = World()
         for change in ({"target": {**world.target, "app_id": PG}}, {"env": {"SHIP_DO_TOKEN": ""}}):
@@ -432,18 +773,123 @@ class LifecycleTests(unittest.TestCase):
 
     def test_rollback_cas_change_or_failure_cannot_create_a_retry_loop(self):
         for mode in ("cas", "reject"):
-            world = World(); world.health_failure = True
+            world = World(); world.health_failure = True; lane = world.lane()
             def before_rollback_inventory(value):
                 # Reader and initial writer have already been allocated. The
                 # fourth client is the fresh rollback writer.
-                if len(world.clients) == 4:
-                    if mode == "cas": world.updated = "2026-10-07T13:00:00Z"
-                    else: world.put_outcome = "rejected"
+                if len(world.clients) == 4 and mode == "reject": world.put_outcome = "rejected"
             world.inventory_hook = before_rollback_inventory
-            with self.subTest(mode=mode), self.assertRaises(common.ReleaseError): world.deploy()
+            def final_drift(value):
+                if mode == "cas" and lane.checkpoint == "rollback-pre-put-cas": value.updated = "2026-10-07T13:00:00Z"
+            world.app_hook = final_drift
+            with self.subTest(mode=mode), self.assertRaises(common.ReleaseError): world.deploy(lane)
             self.assertEqual(len(world.writes), 1)
             self.assertTrue(all(client.puts <= 1 for client in world.clients))
             self.assertTrue(all(client.scrubbed for client in world.clients))
+
+    def test_rollback_refreshes_timestamp_after_attestation_and_writer_inventory(self):
+        for gap in ("attestation", "inventory"):
+            for kind in ("health", "terminal", "clone"):
+                world = ProviderCloneWorld(("ACTIVE",)) if kind == "clone" else World()
+                prior = copy.deepcopy(world.spec); changed = []; fresh_reads = []
+                def change():
+                    changed.append(1)
+                    world.updated = "2026-10-07T13:00:00Z"
+                def verify(images, source):
+                    result = world.verify_products(images, source)
+                    if gap == "attestation" and lane.checkpoint == "rollback-prior-attestations": change()
+                    return result
+                lane = world.lane(verify_products=verify)
+                def inventory(_):
+                    if gap == "inventory" and len(world.clients) == 4: change()
+                world.inventory_hook = inventory
+                def read(value):
+                    if kind == "clone" and changed: value.updated = "2026-10-07T13:00:00Z"
+                    if lane.checkpoint == "rollback-pre-put-settle": fresh_reads.append(value.updated)
+                world.app_hook = read
+                with self.subTest(gap=gap, kind=kind):
+                    outcome = world.deploy(lane, drill="health-fail" if kind == "health" else "bad-image")
+                    self.assertEqual(outcome.status, "failed-rolled-back")
+                    self.assertEqual(outcome.health_drill_completed, kind == "health")
+                    self.assertEqual(changed, [1]); self.assertEqual(fresh_reads, ["2026-10-07T13:00:00Z"] * 2)
+                    self.assertEqual(world.writes[1], prior)
+                    self.assertEqual(len(world.writes), 2)
+                    self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+
+    def test_rollback_refresh_never_adopts_gap_material_drift(self):
+        for gap in ("attestation", "inventory"):
+            for drift in ("spec", "raw-spec", "active", "phase"):
+                world = World(); fresh_reads = []
+                def change():
+                    if drift == "spec":
+                        next(e for service in world.spec["services"] for e in service["envs"] if e["type"] == "SECRET")["value"] = "EV[foreign]"
+                    elif drift == "raw-spec":
+                        world.spec["services"][0].pop("internal_ports")
+                    elif drift == "active": world.active = OLD_ID
+                    else: world.deployments[world.active]["phase"] = "ERROR"
+                def verify(images, source):
+                    result = world.verify_products(images, source)
+                    if gap == "attestation" and lane.checkpoint == "rollback-prior-attestations": change()
+                    return result
+                lane = world.lane(verify_products=verify)
+                def inventory(_):
+                    if gap == "inventory" and len(world.clients) == 4: change()
+                world.inventory_hook = inventory
+                def read(_):
+                    if lane.checkpoint == "rollback-pre-put-settle": fresh_reads.append(1)
+                world.app_hook = read
+                with self.subTest(gap=gap, drift=drift), self.assertRaises(common.ReleaseError):
+                    world.deploy(lane, drill="health-fail")
+                self.assertEqual(len(fresh_reads), 1)
+                self.assertEqual(len(world.writes), 1)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+
+    def test_rollback_strict_final_cas_rejects_changes_after_fresh_pair(self):
+        for drift in ("spec", "raw-spec", "active", "updated"):
+            world = World(); lane = world.lane(); fresh_reads = []
+            def read(value):
+                if lane.checkpoint == "rollback-pre-put-settle": fresh_reads.append(1)
+                if lane.checkpoint == "rollback-pre-put-cas":
+                    if drift == "spec": value.spec["services"][0]["envs"][0]["value"] = "foreign"
+                    elif drift == "raw-spec": value.spec["services"][0].pop("internal_ports")
+                    elif drift == "active": value.active = OLD_ID
+                    else: value.updated = "2026-10-07T14:00:00Z"
+            world.app_hook = read
+            code = "spec" if drift == "raw-spec" else drift
+            with self.subTest(drift=drift), self.assertRaisesRegex(common.ReleaseError, "stage-cas-" + code):
+                world.deploy(lane, drill="health-fail")
+            self.assertEqual(fresh_reads, [1, 1]); self.assertEqual(len(world.writes), 1)
+            self.assertEqual(lane.checkpoint, "rollback-pre-put-cas")
+
+    def test_rollback_fresh_pair_churn_and_read_failures_are_bounded(self):
+        for failure in ("count", "clock", "provider"):
+            world = World(); clock = [0]; reads = []; sleeps = []
+            lane = world.lane(monotonic=lambda: clock[0], sleeper=sleeps.append)
+            def read(value):
+                if lane.checkpoint == "rollback-pre-put-settle":
+                    reads.append(1)
+                    if failure == "provider": common.fail("provider-get-failed")
+                    value.updated = "metadata-" + str(len(reads))
+                    if failure == "clock": clock[0] += 150
+            world.app_hook = read
+            code = "provider-get-failed" if failure == "provider" else "stage-settle-timeout"
+            with self.subTest(failure=failure), self.assertRaisesRegex(common.ReleaseError, code):
+                world.deploy(lane, drill="health-fail")
+            self.assertEqual(len(reads), 6 if failure == "count" else 2 if failure == "clock" else 1)
+            self.assertEqual(len(sleeps), 2 if failure == "count" else 0)
+            self.assertEqual(len(world.writes), 1)
+
+    def test_rollback_fresh_writer_inventory_refuses_before_refresh_or_put(self):
+        world = World(); lane = world.lane(); reads = []
+        def inventory(value):
+            if len(world.clients) == 4: value["firewalls"][PG][0]["value"] = PG
+        world.inventory_hook = inventory
+        def read(_):
+            if lane.checkpoint == "rollback-pre-put-settle": reads.append(1)
+        world.app_hook = read
+        with self.assertRaisesRegex(common.ReleaseError, "staging-firewall"):
+            world.deploy(lane, drill="health-fail")
+        self.assertEqual(reads, []); self.assertEqual(len(world.writes), 1)
 
     def test_foreign_deployment_during_rollback_health_is_not_reported_restored(self):
         world = World(); world.health_failure = True
@@ -488,7 +934,7 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(len(world.writes), 2)
                 self.assertNotEqual(world.active, OLD_ID)
                 self.assertEqual(len(world.probes), 7)  # Deliberate probe + restored health6.
-                self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing")
+                self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing.txt")
                 self.assertTrue(all(client.scrubbed and client.puts <= 1 for client in world.clients))
 
     def test_pre_health_and_transport_errors_cannot_claim_intentional_health_evidence(self):
@@ -527,19 +973,21 @@ class LifecycleTests(unittest.TestCase):
             world = World()
             if failure in {"cas", "reject"}:
                 def before_rollback(_):
-                    if len(world.clients) == 4:
-                        if failure == "cas": world.updated = "2026-10-07T13:00:00Z"
-                        else: world.put_outcome = "rejected"
+                    if len(world.clients) == 4 and failure == "reject": world.put_outcome = "rejected"
                 world.inventory_hook = before_rollback
+                def final_drift(value):
+                    if failure == "cas" and lane.checkpoint == "rollback-pre-put-cas": value.updated = "2026-10-07T13:00:00Z"
+                world.app_hook = final_drift
             def request(url):
                 result = world.request(url)
                 if len(world.writes) == 2:
                     if failure == "health": return 503, {}, b"synthetic-private-body"
                     if failure == "after-health": world.spec["services"][0]["envs"][0]["value"] = "foreign-change"
                 return result
+            lane = world.lane(request=request)
             with self.subTest(failure=failure), self.assertRaises(common.ReleaseError):
-                world.deploy(world.lane(request=request), drill="health-fail")
-            self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing")
+                world.deploy(lane, drill="health-fail")
+            self.assertEqual(world.probes[0], ORIGIN + "/_stage_drill_intentionally_missing.txt")
             self.assertEqual(len(world.writes), 1 if failure in {"cas", "reject"} else 2)
             self.assertTrue(all(client.scrubbed and client.puts <= 1 for client in world.clients))
 
@@ -687,6 +1135,16 @@ class ProviderClientTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_provider_clone_cli_restores_without_receipt_or_health_drill_claim(self):
+        world = ProviderCloneWorld()
+        result, logs = self.world_cli(world, "bad-image")
+        self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK)
+        self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+            "stage-original-failure: checkpoint=candidate-put-reconcile; code=deployment-error:stage-terminal"])
+        self.assertEqual(world.spec, world.prior)
+        self.assertEqual(len(world.writes), 2)
+        self.assertEqual(len(world.probes), 6)
+
     def environment(self):
         value = candidate()
         return {"STAGING_DO_TOKEN": "synthetic-provider-token-never-log", "STAGING_TARGET_JSON": json.dumps(data()[3]),
@@ -846,7 +1304,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(logs, "stage: failed after an attempted mutation; reconcile with reads before any retry")
         self.assertEqual(sum(client.puts for client in world.clients), 1)
 
-    def test_success_and_completed_in_job_rollback_keep_existing_output(self):
+    def test_success_and_completed_in_job_rollback_preserve_status_and_safe_cause(self):
         for failure in (False, True):
             world = World(); world.health_failure = failure
             with self.subTest(health_failure=failure):
@@ -854,7 +1312,8 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK if failure else stage.ship.EXIT_OK)
                 self.assertNotIn("stage-diagnostic:", logs)
                 self.assertEqual(len(world.writes), 2 if failure else 1)
-                if failure: self.assertEqual(logs, "stage: failed-rolled-back")
+                if failure: self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+                    "stage-original-failure: checkpoint=candidate-health; code=smoke-failed:stage-health"])
                 else:
                     lines = logs.splitlines()
                     contract.validate_receipt(json.loads(lines[0]))
@@ -890,8 +1349,80 @@ class CLITests(unittest.TestCase):
                 expected = stage.ship.EXIT_OK if case in {"none", "e2e-fail"} else stage.ship.EXIT_MANUAL if case in {"rollback-health", "transport-exception"} else stage.ship.EXIT_ROLLED_BACK
                 self.assertEqual(result, expected)
                 if case in {"404", "200"}:
-                    self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back", stage.HEALTH_DRILL_EVIDENCE])
+                    self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+                        "stage-original-failure: checkpoint=candidate-health; code=smoke-failed:stage-drill",
+                        stage.HEALTH_DRILL_EVIDENCE])
                     self.assertEqual(len(world.writes), 2)
+
+    def test_health_drill_real_transport_avoids_spa_body_and_retains_size_guard(self):
+        old_path = "/_stage_drill_intentionally_missing"
+        static_path = old_path + ".txt"
+        sockets = []
+
+        def transport(url, *, oversized_static=False, static_status=404):
+            path = url.removeprefix(ORIGIN)
+            if path == old_path or (path == static_path and oversized_static):
+                status, body = 200, b"x" * 5000  # Extensionless frontend index exceeds the unchanged 4096 cap.
+            elif path == static_path:
+                status, body = static_status, b"404 page not found\n"
+            else:
+                status, body = {path: status for _, path, status in stage.smoke.HEALTH}[path], b""
+            response = f"HTTP/1.1 {status} Synthetic\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+            sock = FakeSocket(response); sockets.append(sock)
+            return stage.smoke.secure_https_request(url, getaddrinfo=addresses("93.184.216.34"),
+                create_connection=lambda *_, **__: sock, context_factory=lambda: FakeContext(sock))
+
+        self.assertEqual(stage.smoke.MAX_HEALTH_BODY_BYTES, 4096)
+        with self.assertRaisesRegex(common.ReleaseError, "^smoke-failed:length$"):
+            transport(ORIGIN + old_path)
+        self.assertTrue(sockets[-1].sent.startswith(f"GET {old_path} HTTP/1.1\r\n".encode()))
+        for status, oversized in ((404, False), (200, False), (200, True)):
+            world = World(); sockets.clear()
+            before = contract.spec_fingerprint(world.spec)
+            def request(url):
+                world.probes.append(url)
+                return transport(url, oversized_static=oversized, static_status=status)
+            with self.subTest(status=status, oversized=oversized):
+                result, logs = self.world_cli(world, "health-fail", request=request)
+                self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK)
+                cause = "smoke-failed:length" if oversized else "smoke-failed:stage-drill"
+                self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back",
+                    f"stage-original-failure: checkpoint=candidate-health; code={cause}"] +
+                    ([] if oversized else [stage.HEALTH_DRILL_EVIDENCE]))
+                self.assertEqual(len(world.writes), 2)
+                self.assertEqual(sum(client.puts for client in world.clients), 2)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                self.assertEqual(contract.spec_fingerprint(world.spec), before)
+                self.assertEqual(world.probes, [ORIGIN + static_path] + [ORIGIN + path for _, path, _ in stage.smoke.HEALTH])
+                self.assertEqual(len(sockets), 7)
+                self.assertTrue(sockets[0].sent.startswith(f"GET {static_path} HTTP/1.1\r\n".encode()))
+                self.assertTrue(all(sock.closed and b"Authorization:" not in sock.sent for sock in sockets))
+
+    def test_completed_rollback_original_cause_is_private_and_output_is_best_effort(self):
+        secret = "unmaskedSuccessfulRollbackSecret0123456789"
+        for drill in ("none", "health-fail"):
+            for error in (None, OSError(secret), common.ReleaseError("output-unsafe:" + secret), KeyboardInterrupt(secret)):
+                world = World()
+                def request(url):
+                    if drill == "none" and len(world.writes) == 1:
+                        common.fail("smoke-failed:" + secret + ORIGIN + APP)
+                    return world.request(url)
+                original = common.Output.text
+                def output(out, line):
+                    if error is not None and line.startswith("stage-original-failure:"): raise error
+                    return original(out, line)
+                with self.subTest(drill=drill, output_error=type(error).__name__), mock.patch.object(common.Output, "text", output):
+                    result, logs = self.world_cli(world, drill, request=request)
+                self.assertEqual(result, stage.ship.EXIT_ROLLED_BACK)
+                cause = "smoke-failed:stage-drill" if drill == "health-fail" else "smoke-failed"
+                self.assertEqual(logs.splitlines(), ["stage: failed-rolled-back"] +
+                    ([f"stage-original-failure: checkpoint=candidate-health; code={cause}"] if error is None else []) +
+                    ([stage.HEALTH_DRILL_EVIDENCE] if drill == "health-fail" else []))
+                self.assertNotIn(secret, logs)
+                self.assertEqual(len(world.writes), 2)
+                self.assertEqual(sum(client.puts for client in world.clients), 2)
+                self.assertTrue(all(client.puts <= 1 and client.scrubbed for client in world.clients))
+                self.assertEqual(contract.image_set(world.spec), IMAGES)
 
     def template_cli(self, command, *, template_bytes=None, target_changes=None, formatted_identity=None):
         production, template, pins, target = data()

@@ -29,13 +29,14 @@ import stage_contract as contract
 require = contract.require
 PAGE_SIZE = 200
 MAX_PAGES = 10
+CLONE_PHASES = ("PENDING_BUILD", "BUILDING", "PENDING_DEPLOY", "DEPLOYING", "ACTIVE")
 HEALTH_DRILL_EVIDENCE = "stage-drill: health-fail: intentional failure observed; staging restored"
 FAILURE_CHECKPOINTS = frozenset({
     "preflight", "adapter-initialization", "lane-initialization", "lane",
     "deploy-preflight", "rollback-preflight", "candidate-pre-put-cas",
     "candidate-put-reconcile", "candidate-final-state", "candidate-health", "candidate-after-health",
     "receipt-validation", "receipt-sanitize", "receipt-serialization", "receipt-outputs", "receipt-emit", "status-output",
-    "rollback-ownership", "rollback-prior-attestations", "rollback-pre-put-cas",
+    "rollback-ownership", "rollback-prior-attestations", "rollback-pre-put-settle", "rollback-pre-put-cas",
     "rollback-put-reconcile", "rollback-final-state", "rollback-health", "rollback-after-health",
 })
 # ReleaseError checks syntax and the reason prefix, not whether its full detail
@@ -51,6 +52,8 @@ FAILURE_CODES = frozenset({
     "topology-differs:staging-spec", "topology-differs:staging-template",
     "reconcile-failed:stage-spec-drift", "reconcile-failed:stage-old-inflight", "reconcile-failed:stage-multiple-inflight",
     "reconcile-failed:stage-candidate-changed", "reconcile-failed:stage-deployment-identity",
+    "reconcile-failed:stage-previous-clone", "reconcile-failed:stage-previous-clone-changed",
+    "reconcile-timeout:stage-previous-clone",
     "reconcile-failed:stage-deployment-spec", "reconcile-failed:stage-active-spec", "reconcile-timeout:stage-candidate",
     "deployment-error:stage-terminal", "post-deploy-guard:stage-migration",
     "post-deploy-guard:stage-bad-image-unexpected-success", "post-deploy-guard:stage-final-state",
@@ -60,7 +63,9 @@ FAILURE_CODES = frozenset({
     "post-deploy-guard:migration-digest", "post-deploy-guard:migration-failed", "post-deploy-guard:migration-progress",
     "rollback-precondition-failed:stage-drift", "rollback-precondition-failed:stage-active",
     "rollback-precondition-failed:stage-candidate", "rollback-precondition-failed:stage-observation-changed",
-    "rollback-precondition-failed:stage-cas", "rollback-failed:stage-final-state", "rollback-failed:stage-after-health",
+    "rollback-precondition-failed:stage-cas", "rollback-precondition-failed:stage-cas-spec",
+    "rollback-precondition-failed:stage-cas-active", "rollback-precondition-failed:stage-cas-updated",
+    "rollback-failed:stage-final-state", "rollback-failed:stage-after-health",
     "smoke-failed:stage-health", "smoke-failed:stage-drill", "smoke-failed:dns", "smoke-failed:deadline",
     "smoke-failed:non-public-address", "smoke-failed:redirect", "smoke-failed:length",
     "output-unsafe:key", "output-unsafe:value", "output-unsafe:type", "output-unsafe:text",
@@ -97,6 +102,10 @@ def report_failure(out, error, checkpoint, attempted, original_failure=None):
             out.text(line)
         except (Exception, KeyboardInterrupt):
             pass
+    report_original_failure(out, original_failure)
+
+
+def report_original_failure(out, original_failure):
     if type(original_failure) is tuple and len(original_failure) == 2:
         try:
             phase, code = original_failure
@@ -189,9 +198,10 @@ class Outcome:
 
 
 class DeploymentFailure(common.ReleaseError):
-    def __init__(self, code, candidate_id=None):
+    def __init__(self, code, candidate_id=None, previous_clone_id=None):
         super().__init__(code)
         self.candidate_id = candidate_id
+        self.previous_clone_id = previous_clone_id
 
 
 class IntentionalHealthFailure(common.ReleaseError):
@@ -312,20 +322,76 @@ class StageLane:
 
     def health(self, drill="none"):
         if drill == "health-fail":
-            # The probe executes, but cannot accidentally turn a drill green if
-            # a catch-all route unexpectedly returns 200 for the missing path.
-            self.request(self.target["origin"] + "/_stage_drill_intentionally_missing")
+            # A missing static-style path avoids the extensionless SPA fallback
+            # and its oversized index body. A bounded 200 still cannot pass the drill.
+            self.request(self.target["origin"] + "/_stage_drill_intentionally_missing.txt")
             raise IntentionalHealthFailure()
         for _, path, expected in smoke.HEALTH:
             status, headers, body = self.request(self.target["origin"] + path)
             require(status == expected and not any(key.lower() == "location" for key in headers) and
                     type(body) is bytes and len(body) <= smoke.MAX_HEALTH_BODY_BYTES, "smoke-failed:stage-health")
 
+    def previous_clone(self, client, identity, before, candidate_id):
+        """Verify lineage and the full prior private spec, never image equality alone."""
+        code = "reconcile-failed:stage-previous-clone"
+        common.require_uuid(identity, code)
+        require(identity not in {before.deployment_id, candidate_id}, code)
+        clone = do_app.deployment_object(client.get_deployment(identity))
+        require(clone.get("id") == identity and clone.get("cloned_from") == before.deployment_id and
+                contract.spec_fingerprint(clone.get("spec")) == before.spec_sha256 and
+                clone.get("phase") in CLONE_PHASES, code)
+        if clone["phase"] == "ACTIVE":
+            do_app.migration_succeeded(clone, job_name=common.PRE_DEPLOY_JOB, web_digest=before.images["web"])
+        return clone
+
+    @staticmethod
+    def clone_summaries(app, clone, before):
+        # A matching ID cannot override contradictory app-embedded evidence.
+        code = "reconcile-failed:stage-previous-clone"
+        for key in ("active_deployment", "pending_deployment", "in_progress_deployment"):
+            summary = app.get(key)
+            if type(summary) is dict and summary.get("id") == clone["id"]:
+                require(summary.get("phase") == clone["phase"] and
+                        summary.get("cloned_from") == before.deployment_id and
+                        contract.spec_fingerprint(summary.get("spec")) == before.spec_sha256 and
+                        (key != "active_deployment" or summary["phase"] == "ACTIVE"), code)
+
+    def clone_active(self, client, app, clone, before, inflight):
+        # This is read-only settling after the candidate and clone are bound.
+        # It never supplies ACTIVE ownership to rollback or a write-time CAS.
+        code = "reconcile-failed:stage-previous-clone-changed"
+        active = app.get("active_deployment")
+        if active is None:
+            require(set(inflight) == {clone["id"]}, code)
+            return None
+        require(type(active) is dict and active.get("id") in {before.deployment_id, clone["id"]}, code)
+        if active.get("phase") == "ACTIVE":
+            require(active["id"] != clone["id"] or clone["phase"] == "ACTIVE", code)
+            if "spec" in active:
+                require(contract.spec_fingerprint(active["spec"]) == before.spec_sha256, code)
+            return active["id"]
+        # The prior deployment can be marked SUPERSEDED before the owned clone
+        # becomes ACTIVE. Require its full spec and an agreeing direct read;
+        # no other non-ACTIVE summary, including the clone itself, is accepted.
+        require(active["id"] == before.deployment_id and active.get("phase") == "SUPERSEDED" and
+                set(inflight) == {clone["id"]} and
+                contract.spec_fingerprint(active.get("spec")) == before.spec_sha256, code)
+        prior = do_app.deployment_object(client.get_deployment(before.deployment_id))
+        require(prior.get("id") == before.deployment_id and prior.get("phase") == "SUPERSEDED" and
+                contract.spec_fingerprint(prior.get("spec")) == before.spec_sha256 and
+                prior.get("cloned_from") == active.get("cloned_from"), code)
+        if prior.get("cloned_from") is not None:
+            common.require_uuid(prior["cloned_from"], code)
+        return None
+
     def reconcile(self, client, desired, before, *, candidate_id=None, excluded=()):
         wanted = contract.spec_fingerprint(desired)
         deadline = self.monotonic() + self.deadline_seconds
         excluded = set(excluded) | {before.deployment_id}
+        previous_clone_id, clone_phase = None, -1
         for attempt in range(self.poll_limit):
+            if previous_clone_id is not None and self.monotonic() >= deadline:
+                break
             app = self.app(client)
             app_fingerprint = contract.spec_fingerprint(app.get("spec"))
             require(app_fingerprint in {wanted, before.spec_sha256}, "reconcile-failed:stage-spec-drift")
@@ -341,12 +407,38 @@ class StageLane:
             observed = inflight[0] if inflight else (app.get("active_deployment") or {}).get("id")
             if observed and observed not in excluded:
                 common.require_uuid(observed, "provider-invalid:stage-deployment")
-                require(candidate_id is None or candidate_id == observed, "reconcile-failed:stage-candidate-changed")
-                candidate_id = observed
+                if candidate_id is None:
+                    candidate_id = observed
             if candidate_id:
                 deployment = do_app.deployment_object(client.get_deployment(candidate_id))
                 require(deployment.get("id") == candidate_id, "reconcile-failed:stage-deployment-identity")
                 require(contract.spec_fingerprint(deployment.get("spec")) == wanted, "reconcile-failed:stage-deployment-spec")
+                changed = observed and observed not in excluded and observed != candidate_id
+                if changed or previous_clone_id is not None:
+                    # DigitalOcean may launch a clone of the previous ACTIVE
+                    # deployment after this exact candidate fails. Keep the
+                    # failed candidate pinned; the clone is never its replacement.
+                    require(deployment.get("phase") == "ERROR" and app_fingerprint == wanted,
+                            "reconcile-failed:stage-candidate-changed")
+                    require(changed and (previous_clone_id is None or previous_clone_id == observed),
+                            "reconcile-failed:stage-previous-clone-changed")
+                    clone = self.previous_clone(client, observed, before, candidate_id)
+                    self.clone_summaries(app, clone, before)
+                    phase = CLONE_PHASES.index(clone["phase"])
+                    require(phase >= clone_phase, "reconcile-failed:stage-previous-clone-changed")
+                    previous_clone_id, clone_phase = observed, phase
+                    active = self.clone_active(client, app, clone, before, inflight)
+                    if self.monotonic() >= deadline:
+                        break
+                    if clone["phase"] == "ACTIVE" and active == previous_clone_id and not inflight:
+                        do_app.no_transition(app)
+                        raise DeploymentFailure("deployment-error:stage-terminal", candidate_id, previous_clone_id)
+                    # Only this fully bound clone may settle with reads. All
+                    # foreign/inconsistent IDs, specs and phases refused above.
+                    if attempt + 1 == self.poll_limit:
+                        break
+                    self.sleeper(min(self.poll_seconds, max(0, deadline - self.monotonic())))
+                    continue
                 if deployment.get("phase") in {"ERROR", "CANCELED"}:
                     raise DeploymentFailure("deployment-error:stage-terminal", candidate_id)
                 active = app.get("active_deployment") or {}
@@ -362,6 +454,8 @@ class StageLane:
             if attempt + 1 == self.poll_limit or self.monotonic() >= deadline:
                 break
             self.sleeper(self.poll_seconds)
+        if previous_clone_id is not None:
+            common.fail("reconcile-timeout:stage-previous-clone")
         raise DeploymentFailure("reconcile-timeout:stage-candidate", candidate_id)
 
     def put_reconcile(self, client, desired, before, *, excluded=()):
@@ -392,37 +486,61 @@ class StageLane:
             # A malformed successful response is ambiguous too; reads only.
         return self.reconcile(client, desired, before, candidate_id=candidate, excluded=excluded)
 
-    def rollback_owned(self, desired, before, candidate_id, *, previous_source):
+    def rollback_owned(self, desired, before, candidate_id, *, previous_source, previous_clone_id=None):
         """Two ownership reads allow terminal failure with old ACTIVE + new spec."""
         self.checkpoint = "rollback-ownership"
         reader = self.client(False)
         self.inventory(reader)
         wanted = contract.spec_fingerprint(desired)
-        def ownership():
-            app = self.app(reader)
+        def ownership(client=reader):
+            app = self.app(client)
             do_app.no_transition(app)
             require(contract.spec_fingerprint(app.get("spec")) == wanted, "rollback-precondition-failed:stage-drift")
             active = do_app.active_id(app)
-            require(candidate_id is not None and active in {before.deployment_id, candidate_id}, "rollback-precondition-failed:stage-active")
-            failed = do_app.deployment_object(reader.get_deployment(candidate_id))
+            require(candidate_id is not None and active in {before.deployment_id, candidate_id, previous_clone_id}, "rollback-precondition-failed:stage-active")
+            failed = do_app.deployment_object(client.get_deployment(candidate_id))
             require(failed.get("id") == candidate_id and contract.spec_fingerprint(failed.get("spec")) == wanted and
                     failed.get("phase") in {"ACTIVE", "ERROR", "CANCELED"}, "rollback-precondition-failed:stage-candidate")
+            clone_spec = None
+            if previous_clone_id is not None:
+                require(active == previous_clone_id and failed.get("phase") == "ERROR",
+                        "rollback-precondition-failed:stage-active")
+                clone = self.previous_clone(client, active, before, candidate_id)
+                require(clone["phase"] == "ACTIVE", "rollback-precondition-failed:stage-active")
+                self.clone_summaries(app, clone, before)
+                clone_spec = common.canonical_payload_bytes(clone["spec"])
             return (active, common.exact_string(app.get("updated_at"), "provider-invalid:stage-updated"),
                 failed.get("phase"), common.canonical_payload_bytes(app["spec"]),
-                common.canonical_payload_bytes(failed["spec"]))
-        observed = self._settle_timestamp_pair(ownership,
-            lambda left, right: left[:1] + left[2:] == right[:1] + right[2:],
+                common.canonical_payload_bytes(failed["spec"]), clone_spec)
+        def same_material(left, right):
+            return left[:1] + left[2:] == right[:1] + right[2:]
+        reference = self._settle_timestamp_pair(ownership, same_material,
             "rollback-precondition-failed:stage-observation-changed", "rollback-precondition-failed:stage-settle-timeout")
         self.checkpoint = "rollback-prior-attestations"
         self.verify_product_images(before.images, previous_source)
-        # CAS immediately before rollback's fresh one-PUT capability is used.
-        self.checkpoint = "rollback-pre-put-cas"
+        self.checkpoint = "rollback-pre-put-settle"
         writer = self.client(True)
         self.inventory(writer)
+        def fresh_ownership():
+            value = ownership(writer)
+            # Attestations and inventory can outlast provider metadata updates.
+            # Refresh only time; the original owned material remains authoritative.
+            require(same_material(reference, value), "rollback-precondition-failed:stage-observation-changed")
+            return value
+        observed = self._settle_timestamp_pair(fresh_ownership, same_material,
+            "rollback-precondition-failed:stage-observation-changed", "rollback-precondition-failed:stage-settle-timeout")
+        # The equal pair does not authorize later timestamp or material movement.
+        self.checkpoint = "rollback-pre-put-cas"
+        if previous_clone_id is not None:
+            require(ownership(writer) == observed, "rollback-precondition-failed:stage-cas")
         app = self.app(writer)
         do_app.no_transition(app)
-        require(contract.spec_fingerprint(app.get("spec")) == wanted and do_app.active_id(app) == observed[0] and
-                app.get("updated_at") == observed[1], "rollback-precondition-failed:stage-cas")
+        require(contract.spec_fingerprint(app.get("spec")) == wanted and
+                common.canonical_payload_bytes(app["spec"]) == observed[3], "rollback-precondition-failed:stage-cas-spec")
+        require(do_app.active_id(app) == observed[0], "rollback-precondition-failed:stage-cas-active")
+        require(app.get("updated_at") == observed[1], "rollback-precondition-failed:stage-cas-updated")
+        if previous_clone_id is not None:
+            self.clone_summaries(app, {"id": previous_clone_id, "phase": "ACTIVE"}, before)
         # Exclude both the old ACTIVE ID and failed candidate; a fresh rollback
         # deployment must be observed even if its images equal an older ACTIVE.
         live_before = Snapshot(copy.deepcopy(desired), {}, observed[0], common.sha256_text(observed[1]), wanted)
@@ -487,7 +605,8 @@ class StageLane:
                 # manual reconciliation condition, never a blind rollback PUT.
                 raise
             self.original_failure = (self.checkpoint, failure_code(error))
-            self.rollback_owned(desired, before, candidate_id, previous_source=previous_source)
+            self.rollback_owned(desired, before, candidate_id, previous_source=previous_source,
+                previous_clone_id=getattr(error, "previous_clone_id", None))
             return Outcome("failed-rolled-back", health_drill_completed=(
                 drill == "health-fail" and type(error) is IntentionalHealthFailure and
                 error.code == "smoke-failed:stage-drill"))
@@ -623,6 +742,8 @@ def main(argv=None, env=None, deps=None, *, adapter_factory=None, pins_path=None
             out.emit(outcome.receipt)
         checkpoint = "status-output"
         out.text("stage: " + outcome.status)
+        if arguments.command == "deploy" and outcome.status == "failed-rolled-back":
+            report_original_failure(out, lane.original_failure)
         if (arguments.command == "deploy" and drill == "health-fail" and
                 outcome.status == "failed-rolled-back" and outcome.health_drill_completed is True):
             out.text(HEALTH_DRILL_EVIDENCE)
