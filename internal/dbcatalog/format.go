@@ -141,7 +141,7 @@ func validateCatalogMode(c Catalog, identityOnly bool) error {
 		if o.Missing && len(o.Attributes) != 0 {
 			return refuse("catalog-format")
 		}
-		if !o.Missing && len(o.Attributes) != len(attributes[o.Kind]) && !(identityOnly && len(o.Attributes) == 0) {
+		if !o.Missing && len(o.Attributes) != len(attributes[o.Kind]) && (!identityOnly || len(o.Attributes) != 0) {
 			return refuse("catalog-format")
 		}
 	}
@@ -339,11 +339,12 @@ func writePublic(w io.Writer, s Snapshot, c Catalog, mode string) error {
 		}
 	}
 	var output []byte
-	if mode == "sha256" {
+	switch mode {
+	case "sha256":
 		output = []byte(s.SHA256 + "\n")
-	} else if mode == "json" {
+	case "json":
 		output, err = json.MarshalIndent(s, "", "  ")
-	} else {
+	default:
 		var differences []Difference
 		differences, err = Compare(s, c)
 		if err == nil {
