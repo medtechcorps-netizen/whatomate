@@ -497,7 +497,7 @@ func (m *Manager) ConnectAgentToTransfer(transferID, agentID uuid.UUID, sdpOffer
 	})
 
 	// Create PeerConnection for agent (reuses same codec config)
-	agentPC, err := m.createPeerConnection()
+	agentPC, err := m.createPeerConnection(context.Background())
 	if err != nil {
 		return "", fmt.Errorf("failed to create agent peer connection: %w", err)
 	}

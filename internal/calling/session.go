@@ -154,8 +154,10 @@ type Manager struct {
 	assigner *assignment.Assigner
 	// httpClient is the application's shared client. Production injects the
 	// SSRF-safe transport; callback execution fails closed when it is absent.
-	httpClient    *http.Client
-	encryptionKey string
+	httpClient      *http.Client
+	encryptionKey   string
+	iceProviderOnce sync.Once
+	iceProvider     *cloudflareTURNProvider
 }
 
 // NewManager creates a new call session manager
