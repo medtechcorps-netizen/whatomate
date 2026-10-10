@@ -56,6 +56,8 @@ func main() {
 		runWorker(os.Args[2:])
 	case "rls-migrate":
 		runRLSMigration(os.Args[2:])
+	case "catalog-snapshot":
+		runCatalogSnapshot(os.Args[2:])
 	case "seed-klinik-relive-sales":
 		runKlinikReliveSalesSeed(os.Args[2:])
 	case "bootstrap-platform-compliance":
@@ -81,6 +83,7 @@ Commands:
   server    Start the API server (with optional embedded workers)
   worker    Start background workers only (no API server)
   rls-migrate  Run schema migrations and install PostgreSQL tenant RLS
+  catalog-snapshot  Compare database structure in a read-only transaction
   seed-klinik-relive-sales  Safely validate or apply Klinik Relive sales fixtures
   bootstrap-platform-compliance  Validate or apply platform compliance tenant markers
   version   Show version information
