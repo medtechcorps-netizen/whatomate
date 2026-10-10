@@ -83,6 +83,29 @@ class CommandTests(unittest.TestCase):
         self.assertIsNotNone(seen[0].poll())
         self.assertTrue(seen[0].stdout.closed and seen[0].stderr.closed)
 
+    def test_bounded_input_and_simultaneous_output(self):
+        data = b"x" * runtime.MIB
+        result = self.call("import os,sys; os.write(1,b'o'*4096); os.write(2,b'e'*4096); data=sys.stdin.buffer.read(); raise SystemExit(0 if data==b'x'*1048576 else 3)", input_bytes=data)
+        self.assertEqual((result.returncode, len(result.stdout), len(result.stderr)), (0, 4096, 4096))
+        for value in ("secret", bytearray(b"x"), b"x" * (runtime.MIB + 1)):
+            with self.subTest(kind=type(value).__name__), mock.patch.object(runtime.subprocess, "Popen") as spawn:
+                with self.assertRaises(proof.EvidenceError):
+                    self.call("pass", input_bytes=value)
+                spawn.assert_not_called()
+
+    def test_blocked_input_and_early_close_fail_closed(self):
+        for script in ("import time; time.sleep(30)", "import os; os.close(0)"):
+            seen = []
+            real = subprocess.Popen
+            def record(*args, **kwargs):
+                child = real(*args, **kwargs)
+                seen.append(child)
+                return child
+            with self.subTest(script=script), mock.patch.object(runtime.subprocess, "Popen", side_effect=record):
+                with self.assertRaisesRegex(proof.InfrastructureFailure, "^capture$"):
+                    self.call(script, timeout=0.2, input_bytes=b"x" * runtime.MIB)
+            self.assertIsNotNone(seen[0].poll())
+
 
 class DockerTests(unittest.TestCase):
     def setUp(self):

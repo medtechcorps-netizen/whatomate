@@ -50,7 +50,7 @@ class Capture:
 
 def bounded_command(
     argv: Sequence[str], *, env: Mapping[str, str], timeout: float,
-    stdout_limit: int, stderr_limit: int = MIB,
+    stdout_limit: int, stderr_limit: int = MIB, input_bytes: bytes | None = None,
 ) -> Capture:
     """Drain both pipes concurrently; cap bytes while reading, deadline and reap.
 
@@ -66,9 +66,10 @@ def bounded_command(
     _need(all(type(k) is str and type(v) is str and k and "=" not in k and not any(c in k + v for c in "\0\r\n") for k, v in env.items()))
     _need(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= MAX_SECONDS)
     _need(all(type(n) is int and 0 <= n <= MAX_STREAM for n in (stdout_limit, stderr_limit)))
+    _need(input_bytes is None or (type(input_bytes) is bytes and len(input_bytes) <= MIB))
     deadline = time.monotonic() + timeout
     try:
-        proc = subprocess.Popen(list(argv), env=dict(env), stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(list(argv), env=dict(env), stdin=subprocess.DEVNULL if input_bytes is None else subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 shell=False, start_new_session=os.name == "posix")
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -99,6 +100,27 @@ def bounded_command(
 
     threads = [threading.Thread(target=drain, args=(i, cap), daemon=True)
                for i, cap in enumerate((stdout_limit, stderr_limit))]
+
+    def feed() -> None:
+        try:
+            view = memoryview(input_bytes)
+            while view:
+                written = proc.stdin.write(view[:65536])
+                if not written:
+                    raise OSError()
+                view = view[written:]
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            failed.set()
+        finally:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                failed.set()
+
+    if input_bytes is not None:
+        threads.append(threading.Thread(target=feed, daemon=True))
+        streams = (*streams, proc.stdin)
 
     def kill() -> None:
         try:

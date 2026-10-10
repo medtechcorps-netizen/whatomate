@@ -188,6 +188,9 @@ stdout and stderr concurrently with separate byte limits, imposes a deadline,
 and reaps its child process. A completed nonzero exit is captured as evidence;
 it is not automatically a compatibility verdict. Process or capture failures
 raise fixed infrastructure errors without exposing arguments or stream data.
+Optional standard input is limited to 1 MiB and written concurrently under the
+same deadline; a blocked or incomplete write refuses the capture. Without an
+input value, standard input remains disconnected.
 On POSIX, capture failure kills the private process group. On Windows, only
 the direct child is killed; container cleanup remains the runner's separate
 responsibility.
@@ -204,8 +207,67 @@ existing read-only job token in memory. It does not retrieve credentials.
 The focused transport tests include real local Python child processes, while
 Docker and GitHub are mocked. They establish the transport behavior, not a
 live registry pull, a current signed release, or release compatibility. No
-SQL collector, container lifecycle, sweep, workflow or publication is added by
-this foundation.
+container lifecycle, workflow or publication is added by this foundation.
+
+## Synthetic API adapter
+
+`sweep.py` performs the six API cases against a caller-owned synthetic stack.
+It accepts only an explicit loopback origin or a Docker alias belonging to the
+run's namespace, uses the existing cookie/CSRF and signed Graph-stub protocols,
+and refuses redirects. The caller must establish network ownership, provision
+the synthetic workspace/account and authorize its legacy reply path first.
+The adapter does not provision accounts or retrieve credentials.
+
+Each write uses generated synthetic values and retains validated record IDs in
+memory for reads across server replacement. Readback checks the expected values
+and workspace/account/conversation bindings for contacts, inbound and outbound
+messages, a local draft template, an inert start-to-end flow, and chatbot
+settings. Only the greeting message is patched; chatbot and AI automation must
+remain disabled. Outbound evidence must match one successful Graph-stub send.
+An explicit journal baseline may discard older retained history. Measured
+operations require contiguous entries from the next sequence number, including
+when the baseline cursor is zero; a baseline is not complete worker history.
+
+Requests, response sizes and total time are bounded. POST/PUT operations are
+never retried, and an ambiguous or failed case prevents further use of that
+adapter. Results expose six booleans only after complete readback; missing
+evidence cannot become favorable partial proof. Focused tests use fake HTTP
+responses and verify payloads against current handlers. They do not establish
+that two real server versions can complete these cases. Worker observation,
+provisioning and container isolation remain runner responsibilities.
+
+## Synthetic PostgreSQL collector
+
+`postgres.py` collects table digests, DDL probe markers and complete log windows
+inside an explicitly bound, task-owned PostgreSQL 17 container. It has no DSN
+input. Container identity, label, image and network isolation are checked;
+host mounts and published ports are refused. SQL reaches fixed database
+`compat` through bounded standard input to `psql` inside that container.
+
+The synthetic administrator observes all rows, including rows hidden by FORCE
+RLS, while the migration owner remains a non-superuser and the separate runtime
+role retains its restricted privileges. Observation never disables RLS.
+One read-only repeatable-read snapshot inventories every public stored table,
+partition and materialized view, including empty relations; foreign tables
+refuse. Deterministic row encoding preserves nulls, duplicate rows and arbitrary
+text. Forward comparison projects the original columns, while D0 and N-1
+captures include all current columns. Missing or changed original columns,
+incomplete output and exceeded bounds refuse.
+
+A fixed administrator-owned probe outside `public` records DDL events. Its
+markers are transactional and can roll back; they do not replace independent
+statement logs and table digests. Phase boundaries use exact observer records,
+zero remaining client sessions, unchanged container/probe bindings and an
+append-only log prefix. Every byte between the boundaries is passed to the
+existing strict parser. Foreign, unattributed, malformed or partial records
+are not filtered away to make a phase pass.
+
+Disposable PG17 validation covers actual inventory/row capture, FORCE RLS,
+column projection, empty windows, a rolled-back UPDATE, DDL markers and the
+fixed read-only `25006` control. The fixture was removed afterward. This is
+collector validation, not a full release compatibility experiment. Catalog
+normalization remains the existing Go command's responsibility; the collector
+does not invent a second catalog hash or claim production-overlay coverage.
 
 ## Remaining runner and workflow work
 
