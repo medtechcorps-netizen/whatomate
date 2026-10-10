@@ -2,8 +2,31 @@
 
 These are the existing 13 CRM canary checks, in their original execution order,
 with the original selectors, assertions, timeouts and late-layout probes. The
-contract test compares the port to `frontend/canary-driver/runner.mjs`. That
-production driver stays intact until Part A PR11.
+contract test compares the port to the non-executable `source-provenance.json`
+manifest. Part A PR11 removes the retired production service and its Dockerfile;
+the current checks do not load or require that service's source files.
+
+The manifest was generated from Git commit
+`313d7b8bcdfc5070bc2af7dbd72d839b49b1ec8e`, original blob
+`0d2bf73f4ec9a41ea30a70680633e30fb68a4d71`. It records the complete original
+file's SHA-256, check inventories, exact constant declarations and SHA-256 hashes
+of all thirteen scenario methods, the denial helper and twenty-three shared
+helpers. The one reviewed webhook transport substitution is reversed before
+hashing, as in the original port test. Missing or changed assertions fail the
+contract. The manifest contains no executable service code or fixture secrets.
+Do not regenerate it from the current port to make a failure pass; any change
+to the baseline requires review against the immutable historical Git source.
+
+Playwright equality covers the package manifest and lock root, the installed test
+package, both browser-library lock entries and, once PR9 is present, the exact
+version and immutable digest of the `e2e-staging` container. Shared `pg` and
+Playwright packages remain required by regular E2E and these checks.
+
+Source retirement does not invalidate old fixture credentials. Before merging
+the retirement change, separately confirm the owner's driver destruction and
+fixture credential rotation. Deleting provider resources, registry packages or
+secret custody copies is not evidence of credential rotation. Dropping any
+driver ledger schema from production is outside Part A.
 
 The transport is synthetic: the Graph stub delivers signed inbound webhooks,
 accepts outbound Graph requests, and proves both through its authenticated

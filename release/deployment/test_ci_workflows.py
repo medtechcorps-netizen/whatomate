@@ -25,7 +25,7 @@ negative cases that break the property and must make the checker fail:
 11. lint runs the pinned golangci-lint, build builds every package, and
     security runs govulncheck, rejects ambient Trivy suppression files right
     before its scans, and fails on any CRITICAL or HIGH finding in each image
-    it builds, with no exception file.
+    it builds from the release Dockerfiles, using exactly ship.trivyignore.
 12. the Test workflow runs Stage 1's schema guard (schema_change.py) on every
     pull request, from its merge base with main, and on every push to main,
     from the first parent, right after a full-history checkout, in a job the
@@ -120,14 +120,15 @@ AMBIENT_TRIVY_POLICY = [
     "done",
 ]
 # Each image the security job builds and scans, with its Dockerfile, and the
-# scan settings every one of them gets. Scanning other images or applying an
-# exception file is a reviewed edit of these lines.
+# scan settings every one of them gets. A different Dockerfile or suppression
+# source requires a reviewed change, matching Release's exact ignorefile.
 SCANNED_IMAGES = {
-    "rereply:ci": "docker/Dockerfile",
-    "rereply-meta-relay:ci": "docker/meta-relay.Dockerfile",
-    "rereply-gmail-relay:ci": "docker/gmail-relay.Dockerfile",
+    "rereply:ci": "docker/release/web.Dockerfile",
+    "rereply-meta-relay:ci": "docker/release/meta-relay.Dockerfile",
+    "rereply-gmail-relay:ci": "docker/release/gmail-relay.Dockerfile",
 }
-TRIVY_SCAN = {"format": "table", "exit-code": "1", "vuln-type": "os,library", "severity": "CRITICAL,HIGH"}
+TRIVY_SCAN = {"format": "table", "exit-code": "1", "vuln-type": "os,library", "severity": "CRITICAL,HIGH",
+              "trivyignores": "release/deployment/ship.trivyignore"}
 # #213: GHSA-vfj7-8cjw-p6xm, reviewed to 2026-12-31. A renewal or a new
 # exception is a reviewed edit of this line.
 BRACES_EXCEPTION = ("braces", "stack-exhaustion denial of service", "2026-12-31")
@@ -477,6 +478,10 @@ def assert_lint_build_and_scans(sources: dict[str, str]) -> None:
         scanned[image] = built.get(image)
     if scanned != SCANNED_IMAGES:
         raise AssertionError(f"the security job does not scan exactly the images it builds: {sorted(scanned.items())}")
+    release_scans = [str(step.get("run", "")) for step in jobs(parse(sources)["ship.yml"])["images"]["steps"]]
+    ignorefiles = re.findall(r"--ignorefile[ \t]+([^\s\\]+)", "\n".join(release_scans))
+    if ignorefiles != [TRIVY_SCAN["trivyignores"]]:
+        raise AssertionError("CI and Release do not use the same exact reviewed exception file")
 
 
 AUDIT_LOCK = {"packages": {
@@ -944,7 +949,8 @@ jobs:
 AGGREGATOR_STEP = "      - name: Require every Test job to succeed\n"
 GMAIL_SCAN = ("      - name: Scan Gmail relay container\n"
               "        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0\n"
-              "        with:\n          image-ref: rereply-gmail-relay:ci\n          format: table\n"
+              "        with:\n          image-ref: rereply-gmail-relay:ci\n"
+              "          trivyignores: release/deployment/ship.trivyignore\n          format: table\n"
               "          exit-code: \"1\"\n          vuln-type: os,library\n          severity: CRITICAL,HIGH\n")
 RELEASE_TESTS_STEP = "      - name: Test the Release workflow, its modules and the CI workflows\n"
 GUARD_STEP = "      - name: Refuse guarded database changes\n"
@@ -1148,14 +1154,23 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace('exit-code: "1"', 'exit-code: "0"'))),
     "scan for CRITICAL only": ("lint-build-and-scans", lambda: replaced(
         "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace("severity: CRITICAL,HIGH", "severity: CRITICAL"))),
-    "give a scan an exception file": ("lint-build-and-scans", lambda: replaced(
-        "test.yml", GMAIL_SCAN, GMAIL_SCAN + "          trivyignores: release/deployment/ship.trivyignore\n")),
+    "remove the reviewed release exception file": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace("          trivyignores: release/deployment/ship.trivyignore\n", ""))),
+    "give a scan another exception file": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace("release/deployment/ship.trivyignore", ".trivyignore"))),
+    "add another exception file": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace("release/deployment/ship.trivyignore", "release/deployment/ship.trivyignore,extra.ignore"))),
     "make a scan conditional": ("lint-build-and-scans", lambda: replaced(
         "test.yml", GMAIL_SCAN, GMAIL_SCAN.replace("        uses: ", "        if: ${{ false }}\n        uses: "))),
     "drop a scan": ("lint-build-and-scans", lambda: replaced("test.yml", GMAIL_SCAN, "")),
     "scan an image built from another Dockerfile": ("lint-build-and-scans", lambda: replaced(
-        "test.yml", "docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .",
-        "docker build -f docker/meta-relay.Dockerfile -t rereply-gmail-relay:ci .")),
+        "test.yml", "docker build -f docker/release/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .",
+        "docker build -f docker/release/meta-relay.Dockerfile -t rereply-gmail-relay:ci .")),
+    "return a scan to a development Dockerfile": ("lint-build-and-scans", lambda: replaced(
+        "test.yml", "docker build -f docker/release/web.Dockerfile -t rereply:ci .",
+        "docker build -f docker/Dockerfile -t rereply:ci .")),
+    "give Release a different exception file": ("lint-build-and-scans", lambda: replaced(
+        "ship.yml", "--ignorefile release/deployment/ship.trivyignore", "--ignorefile another.ignore")),
     # 12. The schema guard. Dropping or skipping its job trips the generic
     # aggregator and unconditional-job checks first.
     "drop the schema guard job and its need": ("schema-guard", without_schema_guard_job),
@@ -1294,6 +1309,22 @@ class ParserTests(unittest.TestCase):
 class CiWorkflowTests(unittest.TestCase):
     def test_checked_in_workflows_pass_every_check(self) -> None:
         check_ci_workflows(SOURCES)
+
+    def test_every_release_image_scan_requires_the_same_explicit_ignorefile(self) -> None:
+        for image in SCANNED_IMAGES:
+            with self.subTest(image=image):
+                anchor = f"          image-ref: {image}\n          trivyignores: release/deployment/ship.trivyignore\n"
+                for replacement in (f"          image-ref: {image}\n",
+                                    anchor.replace("ship.trivyignore", "another.ignore"),
+                                    anchor.replace("ship.trivyignore", "ship.trivyignore,extra.ignore")):
+                    with self.assertRaises(AssertionError):
+                        assert_lint_build_and_scans(replaced("test.yml", anchor, replacement))
+
+    def test_retired_driver_has_no_files_or_active_workflow_references(self) -> None:
+        for path in ("frontend/canary-driver", "docker/crm-canary-driver.Dockerfile"):
+            self.assertFalse((ROOT / path).exists(), path)
+            for name, source in SOURCES.items():
+                self.assertNotIn(path, source, name)
 
     def test_required_contexts_and_e2e_shard_names(self) -> None:
         docs = parse(SOURCES)

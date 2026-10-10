@@ -633,17 +633,14 @@ jobs:
         working-directory: frontend
         run: npx --no-install vitest run src
 
-      - name: Test CRM canary driver protocol
-        run: node --test frontend/canary-driver/driver.test.mjs
-
       - name: Build production container
-        run: docker build -f docker/Dockerfile -t rereply:ci .
+        run: docker build -f docker/release/web.Dockerfile -t rereply:ci .
 
       - name: Build Meta relay container
-        run: docker build -f docker/meta-relay.Dockerfile -t rereply-meta-relay:ci .
+        run: docker build -f docker/release/meta-relay.Dockerfile -t rereply-meta-relay:ci .
 
       - name: Build Gmail relay container
-        run: docker build -f docker/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .
+        run: docker build -f docker/release/gmail-relay.Dockerfile -t rereply-gmail-relay:ci .
 
       - name: Reject ambient Trivy suppression policy
         run: |
@@ -656,6 +653,7 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply:ci
+          trivyignores: release/deployment/ship.trivyignore
           format: table
           exit-code: "1"
           vuln-type: os,library
@@ -665,6 +663,7 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply-meta-relay:ci
+          trivyignores: release/deployment/ship.trivyignore
           format: table
           exit-code: "1"
           vuln-type: os,library
@@ -674,6 +673,7 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         with:
           image-ref: rereply-gmail-relay:ci
+          trivyignores: release/deployment/ship.trivyignore
           format: table
           exit-code: "1"
           vuln-type: os,library

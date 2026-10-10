@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash, createHmac } from 'node:crypto'
-import { readFileSync, existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
@@ -14,6 +14,11 @@ import { verifyReport } from './verify-report.mjs'
 import { assertPrivateLocation, assertPrivateOutput, atomicWritePrivate, checkoutRoot, childEnvironment, refuseAmbient, secureWindowsPath, validateReportPath } from './private-files.mjs'
 
 const file = path => readFileSync(new URL(path, import.meta.url), 'utf8')
+// Captured from the immutable Git blob named in the manifest, never generated
+// from the current port. This retains the original byte-level proof after the
+// retired production service is removed, with no runtime/history dependency.
+const provenance = JSON.parse(file('./source-provenance.json'))
+const hash = value => createHash('sha256').update(value).digest('hex')
 const local = { profile: 'local', origin: 'http://127.0.0.1:8080', namespace: 'rereply-local-unit', stubOrigin: 'http://127.0.0.1:8090' }
 test('profile refuses production and noncanonical addresses before any I/O', () => {
   assert.doesNotThrow(() => validateProfile(local))
@@ -30,29 +35,56 @@ test('staging requires HTTPS and the exact setup origin hash and stub prefix', (
   assert.doesNotThrow(() => validateProfile(staging))
   for (const change of [{ originHash: undefined }, { originHash: '0'.repeat(64) }, { origin: 'https://another.example.test' }, { stubOrigin: 'https://another.example.test/_stub' }, { stubOrigin: origin + '/_control' }]) assert.throws(() => validateProfile({ ...staging, ...change }))
 })
-test('check names, execution order, timeouts and late-layout constants match retained driver', () => {
-  const source = file('../../canary-driver/runner.mjs')
+test('check names, execution order, timeouts and late-layout constants match historical provenance', () => {
+  assert.equal(provenance.schema_version, 1)
+  assert.equal(provenance.source.repository, 'medtechcorps-netizen/whatomate')
+  assert.equal(provenance.source.commit, '313d7b8bcdfc5070bc2af7dbd72d839b49b1ec8e')
+  assert.equal(provenance.source.git_blob_sha1, '0d2bf73f4ec9a41ea30a70680633e30fb68a4d71')
+  assert.equal(provenance.source.sha256, '8193c95335e1f4a7b5df34d98bb3693211d815602b4b82a7e544f9975fc2ba7b')
   for (const [name, expected] of Object.entries({ UI_CHECKS, CHECK_EXECUTION_ORDER })) {
-    const array = source.match(new RegExp(`(?:export )?const ${name} = Object.freeze\\((\\[[\\s\\S]*?\\])\\);`))[1]
-    assert.deepEqual(JSON.parse(array.replace(/,\s*]/, ']')), expected)
+    assert.deepEqual(provenance.checks[name], expected)
   }
   const checks = file('./checks.ts')
-  for (const name of ['DEFAULT_TIMEOUT_MS', 'DRIVER_EXECUTION_TIMEOUT_MS', 'DEADLINE_CLEANUP_GRACE_MS', 'BOTTOM_TOLERANCE_PX', 'LATE_LAYOUT_VIEWPORT', 'LATE_LAYOUT_NARROW_VIEWPORT', 'LATE_LAYOUT_SETTLE_MS', 'LATE_LAYOUT_FRAME_SETTLE_MS', 'NATIVE_SELECTION_SETTLE_TIMEOUT_MS']) {
+  const constants = ['DEFAULT_TIMEOUT_MS', 'DRIVER_EXECUTION_TIMEOUT_MS', 'DEADLINE_CLEANUP_GRACE_MS', 'BOTTOM_TOLERANCE_PX', 'LATE_LAYOUT_VIEWPORT', 'LATE_LAYOUT_NARROW_VIEWPORT', 'LATE_LAYOUT_SETTLE_MS', 'LATE_LAYOUT_FRAME_SETTLE_MS', 'NATIVE_SELECTION_SETTLE_TIMEOUT_MS']
+  assert.deepEqual(Object.keys(provenance.constants), constants)
+  for (const name of constants) {
     const pattern = new RegExp(`const ${name} = [\\s\\S]*?;`)
-    assert.equal(checks.match(pattern)[0], source.match(pattern)[0], name)
+    const match = checks.match(pattern)
+    assert.ok(match, `missing original constant: ${name}`)
+    assert.equal(match[0], provenance.constants[name], name)
   }
 })
-test('all 13 scenario methods retain the original assertions byte-for-byte', () => {
-  const original = file('../../canary-driver/runner.mjs')
-  const port = file('./scenario.ts').replaceAll('await this.deliverWebhook(', 'await sendWebhook(')
+function verifyScenarioProvenance(source) {
+  const port = source.replaceAll('await this.deliverWebhook(', 'await sendWebhook(')
+  assert.deepEqual(Object.keys(provenance.methods_sha256), [...UI_CHECKS, 'requireDenied'])
   for (const name of [...UI_CHECKS, 'requireDenied']) {
     const pattern = new RegExp(`  async ${name}\\([^]*?(?=\\n  async |\\n}\\n)`)
-    assert.equal(port.match(pattern)?.[0], original.match(pattern)?.[0], name)
+    const match = port.match(pattern)
+    assert.ok(match, `missing original method: ${name}`)
+    assert.equal(hash(match[0]), provenance.methods_sha256[name], name)
   }
   // The large layout, identity and polling helpers are equally significant.
-  for (const name of ['legacyChannelAccountName', 'validateConversation', 'metaTextMessage', 'pageFetch', 'validateLiveFixtureConversation', 'validateRefreshedServiceWindow', 'loadLiveFixtureConversation', 'login', 'documentCount', 'selectOmnichannelConversation', 'selectNativeContact', 'scrollMetrics', 'scrollToBottom', 'metricsAtBottom', 'requireAtBottom', 'requireNativeSelectionAtBottom', 'setScrollAnchoring', 'requireLateLayoutPreservesLatest', 'waitForApiMessage', 'waitForApiMessageBody', 'messageIDs', 'attentionCount', 'pollValue']) {
+  const names = ['legacyChannelAccountName', 'validateConversation', 'metaTextMessage', 'pageFetch', 'validateLiveFixtureConversation', 'validateRefreshedServiceWindow', 'loadLiveFixtureConversation', 'login', 'documentCount', 'selectOmnichannelConversation', 'selectNativeContact', 'scrollMetrics', 'scrollToBottom', 'metricsAtBottom', 'requireAtBottom', 'requireNativeSelectionAtBottom', 'setScrollAnchoring', 'requireLateLayoutPreservesLatest', 'waitForApiMessage', 'waitForApiMessageBody', 'messageIDs', 'attentionCount', 'pollValue']
+  assert.deepEqual(Object.keys(provenance.helpers_sha256), names)
+  for (const name of names) {
     const pattern = new RegExp(`(?:export )?(?:async )?function ${name}\\([^]*?(?=\\n(?:export |async )?function |\\nexport class |$)`)
-    assert.equal(port.match(pattern)?.[0], original.match(pattern)?.[0], name)
+    const match = port.match(pattern)
+    assert.ok(match, `missing original helper: ${name}`)
+    assert.equal(hash(match[0]), provenance.helpers_sha256[name], name)
+  }
+}
+test('all 13 scenario methods retain the original assertion bytes', () => {
+  verifyScenarioProvenance(file('./scenario.ts'))
+})
+test('historical provenance refuses changed assertions and missing helpers', () => {
+  const source = file('./scenario.ts')
+  for (const changed of [
+    source.replace('  async klinik_whatsapp_outbound(', '  async renamed_outbound('),
+    source.replace('function scrollMetrics(', 'function missingScrollMetrics('),
+    source.replace('  async requireDenied(', '  async requireDenied( /* altered assertion */ '),
+  ]) {
+    assert.notEqual(changed, source)
+    assert.throws(() => verifyScenarioProvenance(changed))
   }
 })
 test('Playwright package, lock roots, installed package and container pins agree exactly', () => {
@@ -62,13 +94,16 @@ test('Playwright package, lock roots, installed package and container pins agree
   assert.equal(lock.packages[''].devDependencies['@playwright/test'], version)
   assert.equal(lock.packages['node_modules/@playwright/test'].version, version)
   assert.equal(JSON.parse(file('../../node_modules/@playwright/test/package.json')).version, version)
-  const driver = new URL('../../../docker/crm-canary-driver.Dockerfile', import.meta.url)
-  if (existsSync(driver)) assert.match(readFileSync(driver, 'utf8'), new RegExp(`mcr\\.microsoft\\.com/playwright:v${version.replaceAll('.', '\\.')}[-@]`))
-  // PR9 adds the e2e-staging job container. Once present it joins the pin
-  // contract; the retained driver Dockerfile is removed only in PR11.
+  assert.equal(lock.packages['node_modules/playwright'].version, version)
+  assert.equal(lock.packages['node_modules/playwright-core'].version, version)
+  // PR9 adds e2e-staging. Its exact version and immutable digest must join this
+  // contract when that branch lands; PR11 also works before that dependency.
   const ship = file('../../../.github/workflows/ship.yml')
   const staging = ship.match(/^  e2e-staging:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:|(?![\s\S]))/m)
-  if (staging) assert.match(staging[0], new RegExp(`mcr\\.microsoft\\.com/playwright:v${version.replaceAll('.', '\\.')}[-@]`))
+  if (staging) {
+    const images = staging[0].match(/^      image: .+$/gm) || []
+    assert.deepEqual(images, [`      image: mcr.microsoft.com/playwright:v${version}-noble@sha256:8fb7af3bb488c51364d6554876a8eddf377736608327dbdf4177b4901faf7bc9`])
+  }
 })
 function report() { return { suites: [{ specs: UI_CHECKS.map(title => ({ title, tests: [{ expectedStatus: 'passed', status: 'expected', results: [{ status: 'passed', retry: 0 }] }] })) }], errors: [] } }
 test('report verifier requires exactly 13 named single-attempt passes', () => {
