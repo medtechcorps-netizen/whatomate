@@ -13,6 +13,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/assignment"
+	"github.com/shridarpatil/whatomate/internal/callingaudio"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/flowgraph"
@@ -142,16 +143,17 @@ type IVRContext struct {
 
 // Manager manages active call sessions
 type Manager struct {
-	sessions map[string]*CallSession
-	mu       sync.RWMutex
-	log      logf.Logger
-	whatsapp *whatsapp.Client
-	db       *gorm.DB
-	wsHub    *websocket.Hub
-	config   *config.CallingConfig
-	s3       *storage.S3Client // nil when recording is disabled
-	redis    *redis.Client
-	assigner *assignment.Assigner
+	sessions   map[string]*CallSession
+	mu         sync.RWMutex
+	log        logf.Logger
+	whatsapp   *whatsapp.Client
+	db         *gorm.DB
+	wsHub      *websocket.Hub
+	config     *config.CallingConfig
+	s3         *storage.S3Client // nil when recording is disabled
+	audioStore *callingaudio.Store
+	redis      *redis.Client
+	assigner   *assignment.Assigner
 	// httpClient is the application's shared client. Production injects the
 	// SSRF-safe transport; callback execution fails closed when it is absent.
 	httpClient    *http.Client
@@ -187,6 +189,7 @@ func NewManager(cfg *config.CallingConfig, s3Client *storage.S3Client, db *gorm.
 		wsHub:         wsHub,
 		config:        cfg,
 		s3:            s3Client,
+		audioStore:    callingaudio.New(cfg.AudioDir, nil),
 		assigner:      assigner,
 		httpClient:    httpClient,
 		encryptionKey: encryptionKey,
@@ -372,6 +375,9 @@ type orgCallingSettings struct {
 	MaskPhoneNumbers    bool
 	HoldMusicFile       string
 	RingbackFile        string
+	holdMusicReference  string
+	ringbackReference   string
+	ringbackUnavailable bool
 }
 
 // transferRingFile returns the audio file the caller should hear while a
@@ -380,6 +386,9 @@ type orgCallingSettings struct {
 // falls back to HoldMusicFile when no ringback asset is configured for
 // the org. Empty string ⇒ silence.
 func (s orgCallingSettings) transferRingFile() string {
+	if s.ringbackUnavailable {
+		return ""
+	}
 	if s.RingbackFile != "" {
 		return s.RingbackFile
 	}
@@ -389,7 +398,9 @@ func (s orgCallingSettings) transferRingFile() string {
 // getOrgCallingSettings returns cached org-level calling overrides,
 // falling back to global config defaults for any missing values.
 func (m *Manager) getOrgCallingSettings(orgID uuid.UUID) orgCallingSettings {
-	return m.getOrgCallingSettingsCached(orgID)
+	settings := m.getOrgCallingSettingsCached(orgID)
+	m.resolveOrgAudio(orgID, &settings)
+	return settings
 }
 
 // getOrgRingback returns the ringback file path for a session's organization.
