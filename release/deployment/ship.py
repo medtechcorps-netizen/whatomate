@@ -49,7 +49,12 @@ import trivy_policy
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
 TARGET_PATH = HERE / "ship-target.json"
-MODES = ("dry-run", "promote", "rollback")
+BYPASS_MODE = "promote-without-staging"
+MODES = ("dry-run", "promote", "rollback", "stage", BYPASS_MODE)
+PRODUCTION_MODES = frozenset({"dry-run", "promote", "rollback", BYPASS_MODE})
+PUT_MODES = frozenset({"promote", "rollback", BYPASS_MODE})
+CANDIDATE_MODES = frozenset({"dry-run", "promote", "stage", BYPASS_MODE})
+DRILLS = frozenset({"none", "e2e-fail", "health-fail", "bad-image"})
 CI_WORKFLOWS = ("test.yml", "e2e-tests.yml")
 DOCKERFILES = {component: f"docker/release/{component}.Dockerfile" for component in common.COMPONENTS}
 # release/exact-sources.json .release.components (the runtime contract).
@@ -85,6 +90,7 @@ APPROVAL_BANNER = (
     "Approval rule: only the owner (medtechcorps-netizen, in person, in the GitHub UI) "
     "approves the production environment. Claude/Codex never approve, even if asked in chat."
 )
+BYPASS_BANNER = ("> [!CAUTION]", "> **STAGING BYPASSED: urgent owner-dispatched promote; staging: bypassed.**")
 MANUAL_LINE = "MANUAL INTERVENTION: production state is uncertain; follow docs/emergency-rollback.md"
 # The production job's timeout-minutes in ship.yml; a test keeps it above
 # production_worst_case_seconds() plus a margin.
@@ -116,6 +122,7 @@ class Deps:
         stdout: Any | None = None,
         repo_dir: Path | None = None,
         target_path: Path | None = None,
+        staging_pins_path: Path | None = None,
         bootstrap_path: Path | None = None,
         bootstrap_sha256: str | None = None,
         trivy_policy_path: Path | None = None,
@@ -132,6 +139,7 @@ class Deps:
         self.stdout = stdout
         self.repo_dir = repo_dir or REPO_ROOT
         self.target_path = target_path or TARGET_PATH
+        self.staging_pins_path = staging_pins_path or HERE / "ship-target-staging.json"
         self.bootstrap_path = bootstrap_path or release_record.BOOTSTRAP_PATH
         self.bootstrap_sha256 = bootstrap_sha256 or release_record.BOOTSTRAP_SHA256
         self.trivy_policy_path = trivy_policy_path or trivy_policy.POLICY_PATH
@@ -208,6 +216,11 @@ def parse_mode(env: Mapping[str, str]) -> tuple[str, str]:
     mode = env.get("SHIP_MODE")
     if mode not in MODES:
         common.fail("input-invalid:mode")
+    if mode == BYPASS_MODE and env.get("GITHUB_ACTOR") != common.APPROVER_LOGIN:
+        common.fail("input-invalid:staging-bypass-owner")
+    drill = env.get("SHIP_DRILL", "none")
+    if drill not in DRILLS or (mode in PRODUCTION_MODES and drill != "none"):
+        common.fail("input-invalid:stage-drill")
     target = env.get("SHIP_TARGET_RELEASE", "")
     if type(target) is not str:
         common.fail("input-invalid:target-release")
@@ -313,13 +326,14 @@ def cmd_plan(ctx: Context) -> int:
     sha = control["sha"]
     mode, target_release = parse_mode(ctx.env)
     active_exceptions = None
-    if mode != "rollback":
+    if mode in CANDIDATE_MODES:
         active_exceptions = trivy_policy.check(ctx.deps.trivy_policy_path, ctx.now().date())
     gh = ctx.gh()
     # The owner-only approval rule must be enforced by the environment
     # before anyone is asked to approve (production re-checks it).
-    release_record.require_approval_gate(gh)
-    if mode != "rollback":
+    if mode in PRODUCTION_MODES:
+        release_record.require_approval_gate(gh)
+    if mode in CANDIDATE_MODES:
         require_ci_green(gh, sha)
     require_old_lanes_idle(gh, ctx.repo_dir)
     bootstrap = ctx.bootstrap()
@@ -331,8 +345,11 @@ def cmd_plan(ctx: Context) -> int:
         f"- Mode: {mode}",
         f"- Commit: {sha}",
         f"- Latest record: {latest.release} ({latest.kind}, commit {latest.sha})",
-        "- Approval gate: environment production requires the owner's review (admin bypass off, main only)",
     ]
+    if mode in PRODUCTION_MODES:
+        lines.append("- Approval gate: environment production requires the owner's review (admin bypass off, main only)")
+    else:
+        lines.append("- Staging only: separate staging environments; no production deployment or record")
     outputs = {
         "latest_release": latest.release,
         "latest_manifest_sha256": latest.manifest_sha256,
@@ -340,7 +357,7 @@ def cmd_plan(ctx: Context) -> int:
         "target_release": "",
         "target_manifest_sha256": "",
     }
-    if mode != "rollback":
+    if mode in CANDIDATE_MODES:
         release_record.require_no_downgrade(ctx.repo_dir, latest.sha, sha)
         schema_change.guard(ctx.repo_dir, latest.sha, sha)
         count, commits = first_parent_commits(out, ctx.repo_dir, latest.sha, sha)
@@ -357,7 +374,10 @@ def cmd_plan(ctx: Context) -> int:
         ]
         if count > len(commits):
             lines.append(f"- ... and {count - len(commits)} more")
-        lines += ["", "The production job deploys only if live digests equal the latest record."]
+        if mode in PRODUCTION_MODES:
+            lines += ["", "The production job deploys only if live digests equal the latest record."]
+        else:
+            lines += ["", "Staging verifies the configured target, deployment receipt and all thirteen canary checks."]
     else:
         target, intermediates = release_record.rollback_plan(chain, target_release)
         schema_change.guard(ctx.repo_dir, target.sha, latest.sha)
@@ -375,11 +395,20 @@ def cmd_plan(ctx: Context) -> int:
             "record only) or restore (target is the latest record and live matches no record; one "
             "PUT back to the latest record).",
         ]
-    lines += ["", APPROVAL_BANNER]
+    if mode in PRODUCTION_MODES:
+        lines += ["", APPROVAL_BANNER]
+    if mode == BYPASS_MODE:
+        lines += ["", *BYPASS_BANNER]
+    elif mode == "promote":
+        lines += ["", "Production additionally requires this run's bound thirteen-check staging report."]
     out.set_outputs(outputs)
     out.summary(lines)
     out.text(f"plan ok: {mode} at {sha}; latest record {latest.release}")
-    out.text(APPROVAL_BANNER)
+    if mode in PRODUCTION_MODES:
+        out.text(APPROVAL_BANNER)
+    if mode == BYPASS_MODE:
+        for line in BYPASS_BANNER:
+            out.text(line)
     return EXIT_OK
 
 
@@ -859,6 +888,8 @@ def cmd_candidate(ctx: Context, stage: str) -> int:
             ]
         )
         ctx.out.text("candidate assembled")
+        if ctx.env.get("SHIP_MODE") == BYPASS_MODE:
+            ctx.out.summary(["", *BYPASS_BANNER])
     else:
         common.fail("input-invalid:stage")
     return EXIT_OK
@@ -1019,8 +1050,13 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     out = ctx.out
     deps = ctx.deps
     # P0 context, ambient credentials and target identity, before any I/O.
+    dispatched_mode, target_release = parse_mode(env)
+    # Break-glass uses the existing promote path and manifest kind throughout.
+    mode = "promote" if dispatched_mode == BYPASS_MODE else dispatched_mode
+    if dispatched_mode not in PRODUCTION_MODES:
+        common.fail("input-invalid:production-mode")
     control = common.validate_context(env)
-    if any(name in env for name in common.FORBIDDEN_AMBIENT):
+    if any(name in env for name in common.FORBIDDEN_AMBIENT) or any(name.startswith("STAGING_") for name in env):
         common.fail("context-invalid:forbidden-ambient-credential")
     if not token:
         common.fail("target-invalid:token")
@@ -1032,8 +1068,13 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     if common.sha256_text(secret["app_id"]) != target["app_id_sha256"]:
         common.fail("app-identity-mismatch")
     sha = control["sha"]
+    if dispatched_mode == "promote":
+        # These are public same-run outputs, never staging provider credentials.
+        # Validate them before GitHub or DigitalOcean access in this command.
+        import stage_evidence
+        stage_evidence.verify(env, control=control, candidate=decode_candidate(env, control, ctx.now()),
+            pins=common.load_json(deps.staging_pins_path, "target-invalid:staging-pins"), production=target)
     # P1 inputs.
-    mode, target_release = parse_mode(env)
     if mode == "rollback":
         if target_release != env.get("PLAN_TARGET_RELEASE"):
             common.fail("latest-changed-since-plan:target")
@@ -1056,7 +1097,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     # P4 desired images.
     candidate: dict[str, Any] | None = None
     target_entry: release_record.Entry | None = None
-    if mode != "rollback":
+    if mode in {"dry-run", "promote"}:
         candidate = decode_candidate(env, control, ctx.now())
         desired_images = dict(candidate["images"])
         if set(desired_images.values()) & set(bootstrap["images"].values()):
@@ -1077,7 +1118,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         secret["postgres_cluster_id"],
         token,
         expected_app_id_sha256=target["app_id_sha256"],
-        allow_put=mode != "dry-run",
+        allow_put=mode in PUT_MODES,
         opener=deps.opener,
     )
     run.clients.append(client)
@@ -1091,7 +1132,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     out.add_mask(origin)
     live_images = spec_images.extract_image_digests(before.spec)
     # P6 drift.
-    if mode != "rollback":
+    if mode in {"dry-run", "promote"}:
         if live_images != latest.images:
             common.fail("drift")
         case = mode
@@ -1150,6 +1191,8 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     )
     out.summary(["## Release production", "", f"- Mode: {mode} ({case})", f"- Commit: {sha}", *diff_lines,
                  f"- Changed spec leaves: {len(changed)}; environment/topology fingerprints unchanged, VPC bound"])
+    if dispatched_mode == BYPASS_MODE:
+        out.summary(["", *BYPASS_BANNER])
     # P9 dry-run: everything except the PUT.
     if mode == "dry-run":
         health = ctx.health(origin)
@@ -1487,7 +1530,7 @@ def _load_local_manifest(ctx: Context) -> tuple[bytes, dict[str, Any], Path]:
     return raw, manifest, path
 
 
-def render_notes(manifest: Mapping[str, Any]) -> list[str]:
+def render_notes(manifest: Mapping[str, Any], *, mode: str = "") -> list[str]:
     lines = [
         f"Release record {manifest['release']} ({manifest['kind']}).",
         "",
@@ -1502,6 +1545,8 @@ def render_notes(manifest: Mapping[str, Any]) -> list[str]:
         lines.append(f"- Rolled back from: {manifest['rolled_back_from']}")
     if manifest["reconciled"]:
         lines.append("- Reconciled: production already ran these digests; no PUT")
+    if mode == BYPASS_MODE:
+        lines += ["", *BYPASS_BANNER]
     return lines
 
 
@@ -1529,7 +1574,7 @@ def cmd_record(ctx: Context, stage: str) -> int:
             out.text(f"record {tag} is already published")
             return EXIT_OK
         notes = path.parent / "notes.md"
-        lines = [common.require_public_text(line) for line in render_notes(manifest)]
+        lines = [common.require_public_text(line) for line in render_notes(manifest, mode=ctx.env.get("SHIP_MODE", ""))]
         notes.write_bytes(("\n".join(lines) + "\n").encode("ascii"))
         if state == "new":
             gh.run(
@@ -1570,7 +1615,7 @@ def cmd_record(ctx: Context, stage: str) -> int:
         if last_error is not None:
             raise last_error
         out.text(f"record {tag} verified: attested, tag bound to {manifest['sha']}, latest in the chain")
-        out.summary(["## Release record", "", *render_notes(manifest), ""])
+        out.summary(["## Release record", "", *render_notes(manifest, mode=ctx.env.get("SHIP_MODE", "")), ""])
     else:
         common.fail("input-invalid:stage")
     return EXIT_OK

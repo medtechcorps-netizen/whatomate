@@ -1434,6 +1434,8 @@ func (a *App) outgoingCanonicalTransaction(
 // self-deadlock. A nested transaction gives retryable canonical-contact writes
 // a savepoint, while the provider phase is scheduled separately after the
 // outer request commits.
+// Contact creation in this phase takes the policy fence before contact rows;
+// the shared bridge protocol is documented in channel/legacy_meta_fence.go.
 func (a *App) outgoingPreProviderTransaction(
 	ctx context.Context,
 	organizationID uuid.UUID,
@@ -2188,6 +2190,9 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 			orgID,
 			true,
 			func(tx *gorm.DB) error {
+				if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
+					return err
+				}
 				var resolveErr error
 				contact, created, resolveErr = contactutil.GetOrCreateContact(
 					tx,

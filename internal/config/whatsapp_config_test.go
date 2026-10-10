@@ -19,6 +19,7 @@ func TestValidateWhatsAppConfigPinsProductionGraphOrigin(t *testing.T) {
 		"https://graph.facebook.com?token=secret",
 		"https://graph.example.test",
 		"http://pilot-whatsapp-graph-sink:8083",
+		"http://graph-stub",
 		" https://graph.facebook.com ",
 	} {
 		t.Run(candidate, func(t *testing.T) {
@@ -31,13 +32,12 @@ func TestValidateWhatsAppConfigPinsProductionGraphOrigin(t *testing.T) {
 }
 
 func TestValidateWhatsAppConfigAllowsStagingTestOrigin(t *testing.T) {
-	require.NoError(t, validateWhatsAppConfig(
-		WhatsAppConfig{
-			BaseURL:    "http://staging-whatsapp-graph-sink:8083",
-			APIVersion: "v21.0",
-		},
-		"staging",
-	))
+	for _, origin := range []string{"http://staging-whatsapp-graph-sink:8083", "http://graph-stub"} {
+		require.NoError(t, validateWhatsAppConfig(
+			WhatsAppConfig{BaseURL: origin, APIVersion: "v21.0"},
+			"staging",
+		))
+	}
 }
 
 func TestValidateWhatsAppConfigRejectsNonOriginValues(t *testing.T) {

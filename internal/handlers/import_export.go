@@ -38,9 +38,9 @@ type ImportConfig struct {
 	BeforeCreate    func(db *gorm.DB, orgID uuid.UUID, record map[string]any) error
 }
 
-func importRecordWrite(db *gorm.DB, model any, write func(*gorm.DB) error) error {
+func importRecordWrite(db *gorm.DB, organizationID uuid.UUID, model any, write func(*gorm.DB) error) error {
 	if _, isContact := model.(*models.Contact); isContact {
-		return canonicalContactWriteTransaction(db, write)
+		return contactSelectorWriteTransaction(db, organizationID, write)
 	}
 	return write(db)
 }
@@ -568,7 +568,7 @@ func (a *App) ImportData(r *fastglue.Request) error {
 					delete(recordMap, "organization_id")
 					delete(recordMap, config.UniqueColumn)
 					if len(recordMap) > 0 {
-						if err := importRecordWrite(a.DB, config.Model, func(tx *gorm.DB) error {
+						if err := importRecordWrite(a.DB, orgID, config.Model, func(tx *gorm.DB) error {
 							return tx.Model(existing).Updates(recordMap).Error
 						}); err != nil {
 							errors++
@@ -624,7 +624,7 @@ func (a *App) ImportData(r *fastglue.Request) error {
 
 		// Use GORM to create the populated struct - this handles PostgreSQL properly
 		newRecord := newRecordVal.Addr().Interface()
-		if err := importRecordWrite(a.DB, config.Model, func(tx *gorm.DB) error {
+		if err := importRecordWrite(a.DB, orgID, config.Model, func(tx *gorm.DB) error {
 			return tx.Create(newRecord).Error
 		}); err != nil {
 			errors++

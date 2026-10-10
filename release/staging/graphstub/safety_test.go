@@ -19,7 +19,7 @@ func validEnv() map[string]string {
 		"STUB_ACCESS_TOKENS":   testToken + ", " + testToken2,
 		"STUB_APP_ID":          testAppID,
 		"STUB_APP_SECRET":      testAppSecret,
-		"STUB_CALLBACK_ORIGIN": "http://omnitech-web:8080/",
+		"STUB_CALLBACK_ORIGIN": "http://omnitech-web/",
 	}
 }
 
@@ -36,7 +36,7 @@ func TestConfigFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConfigFromEnv: %v", err)
 	}
-	if config.ListenAddr != DefaultListenAddr || config.CallbackOrigin != "http://omnitech-web:8080" ||
+	if config.ListenAddr != DefaultListenAddr || config.CallbackOrigin != "http://omnitech-web" ||
 		len(config.AccessTokens) != 2 || config.Accounts[0].VerifiedName != "Graph Stub Business" ||
 		strings.Join(config.StatusSequence, ",") != "sent,delivered,read" || config.StatusInterval != time.Second {
 		t.Fatalf("config %+v", config)
@@ -166,6 +166,25 @@ func TestHostRefusals(t *testing.T) {
 	}
 	if status, _ := h.graph(http.MethodGet, v+"/"+testPhone, testToken, nil); status != http.StatusOK {
 		t.Fatalf("the stub's own host was refused: %d", status)
+	}
+}
+
+func TestServiceNameCallbackUsesDefaultHTTPPortAndKeepsOriginFence(t *testing.T) {
+	client, err := newWebhookClient("http://omnitech-web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.close()
+	if port := effectivePort(client.origin); port != "80" {
+		t.Fatalf("service-name route port = %q", port)
+	}
+	if target := client.target("https://other.example.test:8443/hook?workspace=1"); target != "http://omnitech-web/hook?workspace=1" {
+		t.Fatalf("callback escaped service-name origin: %q", target)
+	}
+	for _, address := range []string{"omnitech-web:8080", "other-service:80", "127.0.0.1:80"} {
+		if _, err := client.transport.DialContext(context.Background(), "tcp", address); !errors.Is(err, errDialRefused) {
+			t.Fatalf("off-origin dial %q: %v", address, err)
+		}
 	}
 }
 

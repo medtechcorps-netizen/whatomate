@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 docker.io/library/golang:1.26.6-alpine@sha256:1a9c10cf505a9e6b1e96ea77ebdbfe79a0f10380181faf88bc3b51d7e4315fae AS builder
+FROM --platform=linux/amd64 docker.io/library/golang:1.26.9-alpine@sha256:cdfd4fe2da6b225d8b40c6b7a105736e548e83ff56d5d8f9394446eeb5eb84e0 AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64

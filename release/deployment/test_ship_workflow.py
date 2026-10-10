@@ -277,9 +277,9 @@ class TriggerAndTopLevelTests(unittest.TestCase):
         self.assertEqual(DOC["run-name"], "Release ${{ inputs.mode }} ${{ inputs.target_release }}")
         self.assertEqual(set(DOC["on"]), {"workflow_dispatch"})
         inputs = DOC["on"]["workflow_dispatch"]["inputs"]
-        self.assertEqual(set(inputs), {"mode", "target_release"})
+        self.assertEqual(set(inputs), {"mode", "target_release", "drill"})
         self.assertEqual({key: inputs["mode"][key] for key in ("required", "type", "default", "options")},
-                         {"required": True, "type": "choice", "default": "dry-run", "options": ["dry-run", "promote", "rollback"]})
+                         {"required": True, "type": "choice", "default": "dry-run", "options": ["dry-run", "promote", "rollback", "stage", "promote-without-staging"]})
         self.assertEqual({key: inputs["target_release"][key] for key in ("required", "type", "default")},
                          {"required": False, "type": "string", "default": ""})
         for trigger in ("push", "pull_request", "pull_request_target", "schedule", "workflow_run", "workflow_call"):
@@ -320,7 +320,7 @@ class TriggerAndTopLevelTests(unittest.TestCase):
 
 class JobShapeTests(unittest.TestCase):
     def test_job_set_names_and_runners(self) -> None:
-        self.assertEqual(list(JOBS), ["plan", "images", "attest", "production", "record"])
+        self.assertEqual(list(JOBS), ["plan", "images", "attest", "deploy-staging", "e2e-staging", "staging-rollback", "production", "record"])
         required_contexts = {"test", "lint", "build", "security", "e2e", "tenant-isolation"}
         for name, job in JOBS.items():
             with self.subTest(job=name):
@@ -345,6 +345,9 @@ class JobShapeTests(unittest.TestCase):
             "attest": {"attestations": "write", "contents": "read", "id-token": "write"},
             "production": {"actions": "read", "attestations": "read", "contents": "read"},
             "record": {"attestations": "write", "contents": "write", "id-token": "write"},
+            "deploy-staging": {"actions": "read", "attestations": "read", "contents": "read"},
+            "staging-rollback": {"actions": "read", "attestations": "read", "contents": "read"},
+            "e2e-staging": {"contents": "read"},
         }
         for name, permissions in expected.items():
             with self.subTest(job=name):
@@ -355,40 +358,48 @@ class JobShapeTests(unittest.TestCase):
         self.assertNotIn("needs", JOBS["plan"])
         self.assertNotIn("if", JOBS["plan"])
         self.assertEqual(JOBS["images"]["needs"], "plan")
-        self.assertEqual(JOBS["images"]["if"], "${{ inputs.mode != 'rollback' }}")
+        self.assertEqual(JOBS["images"]["if"], "${{ contains(fromJSON('[\"dry-run\",\"promote\",\"stage\",\"promote-without-staging\"]'), inputs.mode) }}")
         self.assertEqual(JOBS["attest"]["needs"], ["plan", "images"])
-        self.assertEqual(JOBS["attest"]["if"], "${{ inputs.mode != 'rollback' }}")
-        self.assertEqual(JOBS["production"]["needs"], ["plan", "attest"])
+        self.assertEqual(JOBS["attest"]["if"], "${{ contains(fromJSON('[\"dry-run\",\"promote\",\"stage\",\"promote-without-staging\"]'), inputs.mode) }}")
+        self.assertEqual(JOBS["production"]["needs"], ["plan", "attest", "deploy-staging", "e2e-staging"])
         self.assertEqual(
             JOBS["production"]["if"],
             "${{ !cancelled() && github.ref == 'refs/heads/main' && needs.plan.result == 'success' && "
-            "((inputs.mode == 'rollback' && needs.attest.result == 'skipped') || "
-            "(inputs.mode != 'rollback' && needs.attest.result == 'success')) }}",
+            "((inputs.mode == 'promote' && needs.attest.result == 'success' && needs.deploy-staging.result == 'success' && needs.e2e-staging.result == 'success') || "
+            "(contains(fromJSON('[\"dry-run\",\"promote-without-staging\"]'), inputs.mode) && needs.attest.result == 'success' && needs.deploy-staging.result == 'skipped' && needs.e2e-staging.result == 'skipped') || "
+            "(inputs.mode == 'rollback' && needs.attest.result == 'skipped' && needs.deploy-staging.result == 'skipped' && needs.e2e-staging.result == 'skipped')) }}",
         )
         self.assertEqual(JOBS["record"]["needs"], ["production"])
         self.assertEqual(JOBS["record"]["if"],
-                         "${{ !cancelled() && needs.production.result == 'success' && inputs.mode != 'dry-run' }}")
+                         "${{ !cancelled() && needs.production.result == 'success' && contains(fromJSON('[\"promote\",\"rollback\",\"promote-without-staging\"]'), inputs.mode) }}")
 
-    def test_environment_and_job_concurrency_only_on_production(self) -> None:
+    def test_environment_and_job_concurrency_are_separated(self) -> None:
+        environments = {"production": "production", "deploy-staging": "staging", "staging-rollback": "staging", "e2e-staging": "staging-e2e"}
         for name, job in JOBS.items():
             with self.subTest(job=name):
-                if name == "production":
-                    self.assertEqual(job["environment"], "production")
-                    self.assertEqual(job["concurrency"], {"group": "ship-production", "cancel-in-progress": False})
+                self.assertEqual(job.get("environment"), environments.get(name))
+                if name in {"production", "deploy-staging", "staging-rollback"}:
+                    group = "ship-production" if name == "production" else "ship-staging"
+                    self.assertEqual(job["concurrency"], {"group": group, "cancel-in-progress": False})
                 else:
-                    self.assertNotIn("environment", job)
                     self.assertNotIn("concurrency", job)
         self.assertEqual(SOURCE.count("environment: production"), 1)
 
-    def test_exactly_two_secrets_both_in_the_production_ship_step(self) -> None:
-        self.assertEqual(len(re.findall(r"secrets\.", SOURCE)), 2)
+    def test_production_secrets_stay_in_the_production_ship_step(self) -> None:
         self.assertNotIn("secrets: inherit", SOURCE)
         env = step("production", "Verify, guard, deploy, smoke and roll back")["env"]
         self.assertEqual(env["SHIP_DO_TOKEN"], "${{ secrets.DO_PRODUCTION_DEPLOY_TOKEN }}")
         self.assertEqual(env["SHIP_TARGET_JSON"], "${{ secrets.PRODUCTION_TARGET_JSON }}")
+        for job, item in all_steps():
+            for key, value in item.get("env", {}).items():
+                if "secrets.DO_PRODUCTION_DEPLOY_TOKEN" in str(value) or "secrets.PRODUCTION_TARGET_JSON" in str(value):
+                    self.assertEqual(job, "production")
+                    self.assertEqual(item["name"], "Verify, guard, deploy, smoke and roll back")
+                if "secrets.STAGING_" in str(value):
+                    self.assertIn(job, {"deploy-staging", "e2e-staging", "staging-rollback"})
 
     def test_attempt_guard_in_every_job_but_record(self) -> None:
-        for name in ("plan", "images", "attest", "production"):
+        for name in ("plan", "images", "attest", "production", "deploy-staging", "staging-rollback"):
             with self.subTest(job=name):
                 first = steps(name)[0]
                 self.assertEqual(first["name"], "Refuse re-runs")
@@ -453,18 +464,28 @@ class StepContentTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", walk_keys(DOC))
         self.assertNotIn("continue-on-error", SOURCE)
 
-    def test_python_steps_run_isolated_ship_stages(self) -> None:
+    def test_python_steps_run_isolated_reviewed_stages(self) -> None:
         pattern = re.compile(r"^/usr/bin/python3 -I -S -B release/deployment/ship\.py (plan|production|trivy-policy|"
                              r"image --stage (pins|contract|trivy-db|record) --component \"\$COMPONENT\"|"
                              r"candidate --stage (read|verify|assemble)|record --stage (manifest|publish|verify))$")
+        stage_commands = {
+            "/usr/bin/python3 -I -S -B release/deployment/stage.py deploy",
+            "/usr/bin/python3 -I -S -B release/deployment/stage.py rollback",
+            "/usr/bin/python3 -I -S -B - <<'PY'",
+            '/usr/bin/python3 -I -S -B release/deployment/stage_fixture.py import-fixture --output "$RUNNER_TEMP/rereply-staging/canary.json"',
+            '/usr/bin/python3 -I -S -B release/deployment/stage_report.py --private-file "$RUNNER_TEMP/rereply-staging/canary.json" --report "$RUNNER_TEMP/rereply-staging/report.json"',
+        }
         for job, item in all_steps():
             for line in item.get("run", "").splitlines():
                 if "python" in line:
                     with self.subTest(job=job, line=line):
-                        self.assertRegex(line.strip(), pattern)
+                        if job in {"deploy-staging", "e2e-staging", "staging-rollback"}:
+                            self.assertIn(line.strip(), stage_commands)
+                        else:
+                            self.assertRegex(line.strip(), pattern)
 
     def test_gh_install_is_identical_and_pinned(self) -> None:
-        bodies = {job: step(job, "Install pinned GitHub CLI")["run"] for job in ("plan", "attest", "production", "record")}
+        bodies = {job: step(job, "Install pinned GitHub CLI")["run"] for job in ("plan", "attest", "production", "record", "deploy-staging", "staging-rollback")}
         self.assertEqual(len(set(bodies.values())), 1)
         body = bodies["plan"]
         self.assertIn('sha256sum --check --strict', body)

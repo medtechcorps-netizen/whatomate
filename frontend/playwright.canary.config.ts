@@ -2,7 +2,9 @@ import { defineConfig } from '@playwright/test'
 import { dirname, join } from 'node:path'
 import { loadProfile } from './e2e/canary/profiles'
 import { createPrivateResultsDirectory, validateReportPath } from './e2e/canary/private-files.mjs'
+import { canaryDrill } from './e2e/canary/stage-drill.mjs'
 
+canaryDrill() // Refuse non-staging drills before profile/file/browser setup.
 const profile = loadProfile() // Refuse before Playwright launches anything.
 const report = process.env.CANARY_REPORT_FILE || join(dirname(profile.privateFile), 'canary-report.json')
 process.env.CANARY_REPORT_FILE = validateReportPath(profile.privateFile, report)

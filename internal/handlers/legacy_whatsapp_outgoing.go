@@ -135,16 +135,11 @@ func legacyReplyStringJSONValue(value models.JSONB, key string) string {
 	return strings.TrimSpace(result)
 }
 
-// lockStrictLegacyReplyOrder locks the legacy bridge's row prefix
-// (ChannelAccount -> ContactIdentity -> InboxConversation) before the send
-// path resolves (and therefore locks) its canonical Contact. Mirrors take
-// ContactIdentity -> InboxConversation -> Contact -> Message in the same order
-// once they own the shadow, then write the ConversationParticipant. Strict
-// replies must never take any part of that prefix in the opposite order.
-// Before this, the pre-provider transaction owns the organization and the
-// shadow through channelapi.LockLegacyMetaOrganizationAndShadow, as mirrors
-// do; the provider transaction deliberately takes no organization lock (see
-// deliverOutgoingMessage).
+// lockStrictLegacyReplyOrder takes the bridge prefix before resolving the
+// canonical contact; see internal/channel/legacy_meta_fence.go for the global
+// order. The pre-provider transaction already owns organization and shadow via
+// LockLegacyMetaOrganizationAndShadow. The provider phase deliberately takes
+// no organization lock (see deliverOutgoingMessage).
 func lockStrictLegacyReplyOrder(
 	tx *gorm.DB,
 	organizationID uuid.UUID,

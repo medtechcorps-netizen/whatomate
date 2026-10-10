@@ -105,7 +105,7 @@ func TestChannelAIBookingNativeUpdateIsBookingOnly(t *testing.T) {
 	fixture := newChannelAccountConcurrencyFixture(t, true)
 	native := testutil.CreateTestWhatsAppAccount(t, fixture.App.DB, fixture.Organization.ID)
 	require.NoError(t, fixture.App.DB.Transaction(func(tx *gorm.DB) error {
-		shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(tx, channelapi.LegacyMetaAccountRef{
+		shadow, err := ensureFencedLegacyMetaAccountForTest(tx, channelapi.LegacyMetaAccountRef{
 			ID: native.ID, OrganizationID: native.OrganizationID, Name: native.Name, Status: native.Status,
 		})
 		if err == nil {
@@ -147,7 +147,7 @@ func TestChannelAIBookingUpdateRejectsShadowDeletedWhileWaiting(t *testing.T) {
 	fixture := newChannelAccountConcurrencyFixture(t, true)
 	db := fixture.App.DB
 	native := testutil.CreateTestWhatsAppAccount(t, db, fixture.Organization.ID)
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, channelapi.LegacyMetaAccountRef{
+	shadow, err := ensureFencedLegacyMetaAccountForTest(db, channelapi.LegacyMetaAccountRef{
 		ID: native.ID, OrganizationID: native.OrganizationID, Name: native.Name, Status: native.Status,
 	})
 	require.NoError(t, err)
@@ -188,7 +188,7 @@ func TestChannelAIBookingUpdateRejectsShadowDeletedWhileWaiting(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("booking update did not settle after the exact shadow deletion")
 	}
-	revived, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, channelapi.LegacyMetaAccountRef{
+	revived, err := ensureFencedLegacyMetaAccountForTest(db, channelapi.LegacyMetaAccountRef{
 		ID: native.ID, OrganizationID: native.OrganizationID, Name: native.Name, Status: native.Status,
 	})
 	require.NoError(t, err)

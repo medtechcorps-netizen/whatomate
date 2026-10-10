@@ -325,6 +325,66 @@ class SetupTests(unittest.TestCase):
         actual["databases"].reverse()
         self.kit.verify_spec(actual, expected)
 
+    def test_template_uses_default_lan_routes_without_duplicate_listener_ports(self):
+        self.bootstrap()
+        spec = self.kit.build_spec()
+        services = {item["name"]: item for item in spec["services"]}
+        self.assertEqual({name: item["http_port"] for name, item in services.items()},
+                         {"omnitech-web": 8080, "meta-relay": 8081, "gmail-relay": 8082, "graph-stub": 8090})
+        for item in services.values():
+            self.assertEqual(item["internal_ports"], [])
+            self.assertNotIn(item["http_port"], item["internal_ports"])
+        envs = {item["name"]: {env["key"]: env["value"] for env in item["envs"]}
+                for item in spec["services"] + spec["jobs"]}
+        for name in ("omnitech-web", "rereply-rls-migrate"):
+            self.assertEqual(envs[name]["WHATOMATE_WHATSAPP__BASE_URL"], "http://graph-stub")
+        for key in ("META_RELAY_FACEBOOK_GRAPH_BASE_URL", "META_RELAY_INSTAGRAM_GRAPH_BASE_URL"):
+            self.assertEqual(envs["meta-relay"][key], "http://graph-stub")
+        self.assertEqual(envs["graph-stub"]["STUB_CALLBACK_ORIGIN"], "http://omnitech-web")
+        for name, key, listen in (("meta-relay", "META_RELAY_LISTEN_ADDR", ":8081"),
+                                  ("gmail-relay", "GMAIL_RELAY_LISTEN_ADDR", ":8082"),
+                                  ("graph-stub", "STUB_LISTEN_ADDR", ":8090")):
+            self.assertEqual(envs[name][key], listen)
+        self.assertEqual([rule for rule in spec["ingress"]["rules"] if rule["component"]["name"] == "graph-stub"],
+                         [{"match": {"path": {"prefix": "/_stub/_control"}},
+                           "component": {"name": "graph-stub", "rewrite": "/_control/"}}])
+        control = next(env for env in services["graph-stub"]["envs"] if env["key"] == "STUB_CONTROL_KEY")
+        self.assertEqual(control["type"], "SECRET")
+        self.kit.verify_spec(spec, spec)
+
+    def test_absent_additional_ports_complete_app_verification(self):
+        self.bootstrap()
+        original = self.runner.do
+        def readback(config, *args, **kwargs):
+            result = original(config, *args, **kwargs)
+            if args[:2] in (("apps", "get"), ("apps", "get-deployment")):
+                result = copy.deepcopy(result)
+                for component in result[0]["spec"]["services"]:
+                    del component["internal_ports"]
+            return result
+        self.runner.do = readback
+        self.kit.app()
+        self.assertFalse(self.kit.state.get("pending_operation"))
+        self.assertTrue(self.kit.state.get("origin_sha256"))
+        for rules in self.runner.rules.values():
+            self.assertEqual(rules, [{"type": "app", "value": APP}])
+
+    def test_nonempty_or_malformed_additional_ports_are_refused(self):
+        self.bootstrap()
+        expected = self.kit.build_spec()
+        for index, service in enumerate(expected["services"]):
+            for value in (None, False, 0, "", "[]", {}, [service["http_port"]], [9999]):
+                actual = copy.deepcopy(expected)
+                actual["services"][index]["internal_ports"] = value
+                with self.subTest(service=service["name"], value=value), self.assertRaisesRegex(setup.Refused, "staging-service-drift"):
+                    self.kit.verify_spec(actual, expected)
+            # A template regression must not turn a duplicated main listener
+            # into an accepted topology merely by copying it into expected.
+            duplicate = copy.deepcopy(expected)
+            duplicate["services"][index]["internal_ports"] = [service["http_port"]]
+            with self.assertRaisesRegex(setup.Refused, "staging-service-drift"):
+                self.kit.verify_spec(duplicate, duplicate)
+
     def test_adversarial_provider_topology_is_refused(self):
         self.bootstrap()
         expected = self.kit.build_spec()
@@ -360,6 +420,52 @@ class SetupTests(unittest.TestCase):
                 actual = copy.deepcopy(expected)
                 mutate(actual)
                 with self.assertRaises(setup.Refused): self.kit.verify_spec(actual, expected)
+
+    def test_doctl_omitted_empty_general_values_complete_app_verification(self):
+        self.bootstrap()
+        original = self.runner.do
+        omitted = []
+        def readback(config, *args, **kwargs):
+            result = original(config, *args, **kwargs)
+            if args[:2] in (("apps", "get"), ("apps", "get-deployment")):
+                result = copy.deepcopy(result)
+                for component in result[0]["spec"]["services"] + result[0]["spec"]["jobs"]:
+                    # godo serializes an explicit false as an empty object too.
+                    component["image"]["deploy_on_push"] = {}
+                    for env in component["envs"]:
+                        if env["type"] == "GENERAL" and env["value"] == "":
+                            del env["value"]
+                            omitted.append((component["name"], env["key"]))
+                            if component["name"] == "rereply-rls-migrate": del env["type"]
+                        elif env["type"] == "SECRET":
+                            env["value"] = "EV[1:synthetic-ciphertext]"
+            return result
+        self.runner.do = readback
+        self.kit.app()
+        self.assertTrue(any(name == "omnitech-web" for name, _ in omitted))
+        self.assertTrue(any(name == "rereply-rls-migrate" for name, _ in omitted))
+        self.assertTrue(self.kit.state.get("origin_sha256"))
+        for rules in self.runner.rules.values():
+            self.assertEqual(rules, [{"type": "app", "value": APP}])
+
+    def test_empty_general_equivalence_rejects_null_wrong_type_and_missing_nonempty(self):
+        self.bootstrap()
+        expected = self.kit.build_spec()
+        for group in ("services", "jobs"):
+            for omit_type in (False, True):
+                for value in (None, False, 0, [], {}, "different"):
+                    actual = copy.deepcopy(expected)
+                    env = next(item for item in actual[group][0]["envs"] if item["type"] == "GENERAL" and item["value"] == "")
+                    env["value"] = value
+                    if omit_type: del env["type"]
+                    with self.subTest(group=group, omit_type=omit_type, value=value), self.assertRaisesRegex(setup.Refused, "non-secret-env-drift"):
+                        self.kit.verify_spec(actual, expected)
+                actual = copy.deepcopy(expected)
+                env = next(item for item in actual[group][0]["envs"] if item["type"] == "GENERAL" and item["value"])
+                del env["value"]
+                if omit_type: del env["type"]
+                with self.subTest(group=group, missing_nonempty=True, omit_type=omit_type), self.assertRaisesRegex(setup.Refused, "non-secret-env-drift"):
+                    self.kit.verify_spec(actual, expected)
 
     def test_active_deployment_drift_retains_operator_access(self):
         self.bootstrap()

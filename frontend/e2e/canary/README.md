@@ -105,8 +105,12 @@ can supply local values; staging still checks the setup file's origin hash.
 
 Provision only once per fresh namespace. On partial failure, inspect the private
 logs and use a new synthetic namespace; the tool does not delete data to retry.
-Existing fixtures are reused for check and stress runs. Credentials and fixture
-descriptors are never written to GitHub outputs, secrets or artifacts.
+Existing fixtures are reused for check and stress runs. For staging releases,
+the owner installs the allowlisted fixture export as `STAGING_CANARY_FIXTURE_JSON`
+alongside `STAGING_ORIGIN` and `STAGING_STUB_CONTROL_KEY`, as described in the
+[staging release contract](../../../docs/staging-release-contract.md). The full
+setup state stays private; credentials and fixture descriptors never enter
+GitHub outputs or uploaded artifacts.
 
 ## Stress proof and reports
 

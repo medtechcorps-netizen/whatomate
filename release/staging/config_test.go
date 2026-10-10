@@ -55,7 +55,7 @@ func TestTemplateUsesRealConfigurationReaders(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if cfg.App.Environment != "staging" || cfg.WhatsApp.BaseURL != "http://graph-stub:8090" ||
+				if cfg.App.Environment != "staging" || cfg.WhatsApp.BaseURL != "http://graph-stub" ||
 					cfg.AI.QwenBaseURL != "http://127.0.0.1:9" || cfg.GoogleSearchConsole.AuthURL != "http://127.0.0.1:9" ||
 					cfg.MetaMessenger.Enabled || cfg.MetaInstagram.Enabled || cfg.ThreadsManaged.Enabled ||
 					cfg.MetaRegistry.Enabled || cfg.LegacyWhatsAppReply.Enabled {
@@ -66,8 +66,8 @@ func TestTemplateUsesRealConfigurationReaders(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if cfg.Environment != "staging" || cfg.FacebookGraphBaseURL != "http://graph-stub:8090" ||
-					cfg.InstagramGraphBaseURL != "http://graph-stub:8090" || cfg.RegistryEnabled {
+				if cfg.Environment != "staging" || cfg.FacebookGraphBaseURL != "http://graph-stub" ||
+					cfg.InstagramGraphBaseURL != "http://graph-stub" || cfg.RegistryEnabled {
 					t.Fatal("Meta relay template is not isolated")
 				}
 			case "gmail-relay":
@@ -85,7 +85,7 @@ func TestTemplateUsesRealConfigurationReaders(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if cfg.Environment != "staging" || cfg.CallbackOrigin != "http://omnitech-web:8080" {
+				if cfg.Environment != "staging" || cfg.CallbackOrigin != "http://omnitech-web" {
 					t.Fatal("stub template is not isolated")
 				}
 			default:

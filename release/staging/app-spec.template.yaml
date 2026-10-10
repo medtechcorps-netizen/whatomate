@@ -10,9 +10,7 @@
       "instance_count": 1,
       "instance_size_slug": "apps-s-1vcpu-0.5gb",
       "http_port": 8080,
-      "internal_ports": [
-        8080
-      ],
+      "internal_ports": [],
       "health_check": {
         "http_path": "/ready",
         "initial_delay_seconds": 15
@@ -80,7 +78,7 @@
         },
         {
           "key": "WHATOMATE_WHATSAPP__BASE_URL",
-          "value": "http://graph-stub:8090",
+          "value": "http://graph-stub",
           "scope": "RUN_TIME",
           "type": "GENERAL"
         },
@@ -241,9 +239,7 @@
       "instance_count": 1,
       "instance_size_slug": "apps-s-1vcpu-0.5gb",
       "http_port": 8081,
-      "internal_ports": [
-        8081
-      ],
+      "internal_ports": [],
       "health_check": {
         "http_path": "/readyz",
         "initial_delay_seconds": 15
@@ -305,13 +301,13 @@
         },
         {
           "key": "META_RELAY_FACEBOOK_GRAPH_BASE_URL",
-          "value": "http://graph-stub:8090",
+          "value": "http://graph-stub",
           "scope": "RUN_TIME",
           "type": "GENERAL"
         },
         {
           "key": "META_RELAY_INSTAGRAM_GRAPH_BASE_URL",
-          "value": "http://graph-stub:8090",
+          "value": "http://graph-stub",
           "scope": "RUN_TIME",
           "type": "GENERAL"
         },
@@ -352,9 +348,7 @@
       "instance_count": 1,
       "instance_size_slug": "apps-s-1vcpu-0.5gb",
       "http_port": 8082,
-      "internal_ports": [
-        8082
-      ],
+      "internal_ports": [],
       "health_check": {
         "http_path": "/readyz",
         "initial_delay_seconds": 15
@@ -439,9 +433,7 @@
       "instance_count": 1,
       "instance_size_slug": "apps-s-1vcpu-0.5gb",
       "http_port": 8090,
-      "internal_ports": [
-        8090
-      ],
+      "internal_ports": [],
       "health_check": {
         "http_path": "/readyz",
         "initial_delay_seconds": 15
@@ -491,7 +483,7 @@
         },
         {
           "key": "STUB_CALLBACK_ORIGIN",
-          "value": "http://omnitech-web:8080",
+          "value": "http://omnitech-web",
           "scope": "RUN_TIME",
           "type": "GENERAL"
         }
@@ -568,7 +560,7 @@
         },
         {
           "key": "WHATOMATE_WHATSAPP__BASE_URL",
-          "value": "http://graph-stub:8090",
+          "value": "http://graph-stub",
           "scope": "RUN_TIME",
           "type": "GENERAL"
         },
@@ -761,7 +753,7 @@
         },
         "component": {
           "name": "graph-stub",
-          "rewrite": "/_control"
+          "rewrite": "/_control/"
         }
       },
       {

@@ -501,8 +501,11 @@ class Setup:
             require(component["name"] not in result, "duplicate-component")
             envs = component.get("envs", [])
             require(len({item["key"] for item in envs}) == len(envs), "duplicate-env")
+            # doctl omits zero-value strings while serializing its typed AppSpec.
+            # Only an absent GENERAL value means empty; explicit null stays null.
             result[component["name"]] = sorted((item["key"], item.get("scope", "RUN_TIME"), item.get("type", "GENERAL"),
-                                               None if item.get("type") == "SECRET" else item.get("value")) for item in envs)
+                                               None if item.get("type") == "SECRET" else
+                                               item.get("value", "") if item.get("type", "GENERAL") == "GENERAL" else item.get("value")) for item in envs)
         return result
 
     def verify_spec(self, actual, expected):
@@ -543,7 +546,11 @@ class Setup:
                 if group == "jobs":
                     require(live.get("kind") == "PRE_DEPLOY" and live.get("run_command") == item["run_command"], "staging-job-drift")
                 else:
-                    require(live.get("http_port") == item["http_port"] and live.get("internal_ports", []) == item["internal_ports"] and live.get("protocol", "HTTP") == "HTTP" and
+                    # Main HTTP listeners use the default service-name LAN route.
+                    # Only absent/empty additional ports are equivalent on GET.
+                    internal_ports = live.get("internal_ports", [])
+                    require(type(internal_ports) is list and internal_ports == item["internal_ports"] == [], "staging-service-drift")
+                    require(live.get("http_port") == item["http_port"] and live.get("protocol", "HTTP") == "HTTP" and
                             (live.get("health_check") or {}).get("http_path") == item["health_check"]["http_path"] and not live.get("run_command"), "staging-service-drift")
 
     def app(self, redeploy=False):

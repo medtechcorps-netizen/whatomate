@@ -183,12 +183,25 @@ PR7 may be developed in parallel; do not run its command until it is merged.
 | Component | Connection and external behavior |
 |---|---|
 | Web | `app.environment=staging`, RLS on, runtime PostgreSQL URL, TLS Valkey, synthetic encryption/JWT/admin credentials |
-| WhatsApp | Graph calls go to `http://graph-stub:8090`; credentials and account IDs are synthetic |
+| WhatsApp | Graph calls go to `http://graph-stub`; credentials and account IDs are synthetic |
 | Meta relay | Staging environment; Facebook and Instagram Graph bases point to the stub; registry off; one inert synthetic static mapping points to loopback port 9 because the relay refuses an empty mapping |
 | Gmail relay | TLS Valkey, synthetic mailbox/OAuth placeholders; auth/token/API bases point to `http://127.0.0.1:9` |
 | Other integrations | Managed Messenger, Instagram, Threads and Threads review gates off; configurable Qwen/Search Console/Meta onboarding URLs point to port 9; no real client keys |
 | Voice | Piper/model/encoder paths disabled; calling recording disabled |
-| Graph stub | Internal port 8090; only public `/_stub/_control/...` routes to the stub, rewritten to its HMAC-protected `/_control/...` API; Graph routes stay internal |
+| Graph stub | HTTP listener 8090; only public `/_stub/_control/...` routes to the stub, rewritten to its HMAC-protected `/_control/...` API; Graph routes stay internal |
+
+Internal requests use App Platform's default service-name LAN routes:
+`http://graph-stub` for Graph calls and `http://omnitech-web` for stub callbacks.
+These routes use port 80 and forward to each service's main `http_port`; the
+application listeners remain 8080, 8081, 8082 and 8090. The template declares no
+additional `internal_ports`, because duplicating `http_port` there is rejected.
+Provider readback may omit the empty list, but any nonempty or malformed value
+is refused. See [DigitalOcean's internal routing documentation](https://docs.digitalocean.com/products/app-platform/how-to/manage-internal-routing/).
+Only the public `/_stub/_control` prefix routes to the stub's HMAC-protected
+control API. Its rewrite is `/_control/`, including the trailing slash, so the
+remaining endpoint name is separated from the control prefix. For example,
+`/_stub/_control/accounts` must reach `/_control/accounts`, the path signed by
+the control client. See [DigitalOcean's rewrite specification](https://github.com/digitalocean/godo/blob/main/apps.gen.go).
 
 There is no universal environment switch for every tenant AI/SSO feature. The
 fresh synthetic database has those features unconfigured; the kit does not claim
@@ -196,26 +209,71 @@ network-level egress isolation. Do not configure real integrations or enable AI,
 SSO, TTS or calling in this instance. The internal stub accepts only synthetic
 credentials and refuses known production domains.
 
-## Later staging pipeline setup
+## Staging pipeline setup
 
 Create GitHub environments `staging` and `staging-e2e`, restricted to `main`.
-PR9/10 will consume these; this kit does not create or populate them.
+The staging workflow consumes the following environment secrets; this kit does
+not create or populate them.
 
-The table below records the original planned secret names. It is not yet a
-complete import contract: PR7 also generates a private fixture descriptor and
-two independent non-superuser logins. PR9 must provide a minimal fixture exporter
-and importer and update this table before the E2E secrets are populated. Never
-copy the complete setup state into GitHub; it contains database credentials.
+| Environment | Secret | Source |
+|---|---|---|
+| `staging` | `STAGING_DO_TOKEN` | Separate expiring staging deployment token |
+| `staging` | `STAGING_TARGET_JSON` | Exact contents of `target-export.json` |
+| `staging-e2e` | `STAGING_ORIGIN` | Verified canonical `canary.origin` from successful setup |
+| `staging-e2e` | `STAGING_STUB_CONTROL_KEY` | Existing private `canary.stub_control_key` |
+| `staging-e2e` | `STAGING_CANARY_FIXTURE_JSON` | Exact contents of `canary-export.json` |
 
-| Environment | Planned values |
-|---|---|
-| `staging` | `STAGING_DO_TOKEN`, `STAGING_TARGET_JSON` |
-| `staging-e2e` | `STAGING_ORIGIN`, `STAGING_ADMIN_EMAIL`, `STAGING_ADMIN_PASSWORD`, `STAGING_AGENT_PASSWORD`, `STAGING_KLINIK_ORG_ID`, `STAGING_OTHER_ORG_ID`, `STAGING_STUB_CONTROL_KEY` |
+After fixture provisioning and successful allowlist redeployment, run the offline
+exporters in a fresh shell without `CANARY_*` or application configuration
+overrides. Use the existing owner-only setup directory outside the checkout:
 
-Keep all values private. Create a separate expiring staging deploy token with
-only the scopes needed by that later lane, then revoke the short-lived setup
-token and remove its context from the dedicated config. Nothing here installs a
-production token or changes the production release approval policy.
+```powershell
+$stagingPrivateDir = "$env:USERPROFILE\rereply-staging-state\rereply-staging"
+py -3 -I -S -B release/deployment/stage_fixture.py export-fixture --private-file "$stagingPrivateDir\state.json" --output "$stagingPrivateDir\canary-export.json"
+py -3 -I -S -B release/deployment/stage_fixture.py export-target --private-file "$stagingPrivateDir\state.json" --output "$stagingPrivateDir\target-export.json"
+```
+
+Both commands require completed setup with the saved allowlist applied, refuse
+existing outputs, and write new owner-only files beside the state. They neither
+contact a provider nor set GitHub secrets. Target export additionally requires
+the independently reviewed real team/app fingerprints committed in
+`release/deployment/ship-target-staging.json`; null placeholders remain blocked.
+
+The fixture export preserves the two non-superuser logins, exact fixture
+identities, namespace, origin and synthetic stub app secret. It excludes the
+bootstrap administrator, database/Valkey credentials and unrelated setup state.
+The target export contains reviewed resource/image/template bindings without
+canary logins or app/database secrets. Never upload the full state file, copy it
+into a GitHub secret, or publish either export as an artifact. Bootstrap admin
+credentials and separate organization/password inputs are not E2E secrets.
+
+The E2E job masks its three inputs before checkout and runs
+`stage_fixture.py import-fixture --output "$RUNNER_TEMP/rereply-staging/canary.json"`.
+The importer binds them to the deployment receipt, candidate, run, pinned app and
+origin before writing a fresh private directory. The workflow then removes the
+three `STAGING_*` variables and passes the imported file to the CRM canary. CI
+reuses the saved fixture; it does not provision one. Provider credentials are
+confined to staging deploy/rollback steps and never enter the E2E job. See the
+[staging release contract](staging-release-contract.md) for exact schemas and
+receipt/report bindings.
+
+Use a separate deployment PAT in the **ReReply Staging** team with an explicit
+expiry and exactly these scopes: `account:read`, `app:read`, `app:update`,
+`database:read`, `project:read`, `vpc:read`, `actions:read`, `regions:read`, and
+`sizes:read`. The final three are DigitalOcean's required read dependencies for
+[app updates](https://docs.digitalocean.com/reference/api/scopes/app/update/)
+and [database reads](https://docs.digitalocean.com/reference/api/scopes/database/read/).
+Keep `vpc:read` even though this lane does not call the VPC endpoint: Claude's
+2026-09-30 provider comparison proved that a token without it receives an app
+spec with `vpc` omitted. The existing VPC therefore still needs read permission;
+the lane must refuse an incomplete spec. `project:read` preserves the accepted
+staging plan and is an associated permission for app updates; the earlier
+multi-scope recovery did not isolate whether it was independently necessary.
+The lane reads existing database/firewall metadata and updates the pinned app;
+it does not create resources or change firewalls. After setup and the reviewed
+deployment-token handoff are complete, revoke only the short-lived staging setup
+token and remove its dedicated context. Keep existing production DO/GitHub
+tokens unchanged; production release approval remains in force.
 
 ## Failure and reset
 
@@ -261,14 +319,145 @@ reviewed recovery after all postconditions and the private origin/allowlist stat
 are established. A failed or uncertain deployment is not proof that an earlier
 create/update did nothing. Do not rerun `app` against an already-created app.
 
-For an intentional staging reset, first stop staging releases. In the staging
-team only, destroy the staging app if recreating it, add your IP to both clusters,
-and drop/recreate the empty `rereply` database under doadmin. Archive the old
-private state, run `db` and `app` with a new private file in a fresh empty
-directory named `rereply-staging` outside all Git checkouts, provision synthetic
-fixtures, then redeploy. Never perform these steps on production. A new app has
-a new identity/origin; refresh the later pipeline target only through its reviewed
-configuration path.
+### Reset the synthetic database while retaining the app
+
+`release/staging/reset.py` provides the retained-app reset recipe. This is an
+owner-operated destructive maintenance procedure, not routine release recovery.
+It keeps the app ID, origin, clusters, VPC, verified setup image set and coherent
+credentials. The existing `setup.py db/app/redeploy` interfaces and guards are
+unchanged. The adapter does not delete an app/database, archive or restore the
+app, create roles, flush Valkey, rotate credentials, or change GitHub settings.
+
+The initial supported state is a healthy, fully provisioned app on the **saved
+verified production-record image baseline**. An app left on another staging
+candidate is refused; this command never silently adopts or downgrades it.
+Any separately needed restoration must be reviewed first. The checkout must be
+clean current `main`, its required Test/E2E workflows successful, and its support
+images attested and schema-compatible. No live reset rehearsal is implied by
+the synthetic tests.
+
+Before starting, the owner establishes an exclusive maintenance window covering
+all Release dispatches/reruns/approvals, direct canary/provision commands, setup,
+and console writers. Keep it until fresh exports and the staging proof handoff
+are complete. The adapter checks Release idleness and owns a local lock, but
+neither is a universal lock on those other callers. `pending_operation` blocks
+ordinary setup and exports; direct frontend canaries and already-exported hosted
+inputs do not consult it.
+
+Use the existing owner-only files outside every Git checkout. Each file's parent
+must be named `rereply-staging`. Choose one fresh UUID for the operation and keep
+it for every phase; never choose a new ID merely to retry a failed phase:
+
+```powershell
+$resetID = [guid]::NewGuid().ToString()
+$resetArgs = @('--doctl-config', $doctlConfig, '--target', $targetFile,
+  '--images', $imagesFile, '--private-file', $privateFile, '--reset-id', $resetID)
+py -3 release/staging/reset.py prepare @resetArgs --confirm-maintenance-window
+```
+
+`prepare` checks exact staging pins, inventory, baseline topology/images, stable
+app/active specs including SECRET values, migration and six health endpoints.
+It creates private `reset-<UUID>-original.json`, `reset-<UUID>-working.json` and
+`reset-<UUID>.json` beside the canonical state, then marks the canonical state
+pending. The original backup is never overwritten. The working copy keeps the
+old *applied* allowlist for the existing redeploy before-spec check, while clearing
+the old fixture/organization and choosing a new synthetic namespace.
+
+The following are **explicit owner steps**, outside the adapter:
+
+1. In the staging team, archive this same app using its complete unchanged spec
+   plus `maintenance.archive: true` (and `enabled: true` if serialized). Wait for
+   the provider to finish stopping its consumers/jobs. Confirm that no owned
+   application/relay process or DB writer can restart during recreation. An
+   offline page alone does not prove quiescence. Do not add an offline URL or
+   change any other spec leaf; unknown archive shapes are refused.
+2. Confirm that only disposable synthetic data is present. Recreate only the
+   database named `rereply` under the existing `doadmin` in the exact retained
+   staging PostgreSQL cluster, preserving `doadmin`/`rereply_app` and credentials.
+   The bootstrap still independently enforces its empty-schema, role, membership
+   and ownership checks. There is no generated SQL destruction command here.
+3. Review the dedicated staging Valkey consumer scope while consumers are stopped.
+   PostgreSQL recreation does not clear queued work or sessions: campaign streams
+   (`whatomate:campaigns`), web refresh/session/cache data, and fixed relay prefixes
+   (`rereply:meta-relay:` and `rereply:gmail-relay:`, including its `queue:` suffix)
+   are not limited to the canary namespace. Establish that the exact owned scope
+   is empty, or perform a separately authorized scoped cleanup. Do not flush a
+   shared logical DB or infer authority for `FLUSHALL`. The confirmation below is
+   an operator assertion; the adapter does not enumerate every consumer/key.
+4. Temporarily make each cluster's trusted-source list exactly the pinned
+   operator IP, never an empty list. The adapter re-reads both lists and privately
+   re-reads DB/Valkey credentials; changed credentials require separate review.
+
+```powershell
+py -3 release/staging/reset.py db @resetArgs --operator-ip $operatorIP `
+  --confirm-quiesced --confirm-empty-database --confirm-owned-valkey-clean
+```
+
+This phase verifies the retained archived app's exact identity and full spec,
+then runs the same attested bootstrap and selected web `rls-migrate` verifier as
+ordinary `db`, with private configuration only on stdin. A partial bootstrap or
+unknown subprocess result remains pending and must not be repeated.
+
+While the app is still archived, replace **both** cluster trusted-source lists
+with exactly this retained app (remove the temporary operator IP). This restores
+the app's DB/Valkey connectivity before its migration starts; operator-only
+firewalls would prevent PRE_DEPLOY from succeeding. The redeploy adapter checks
+these exact app-only lists before issuing an update.
+
+Restore the **same app** through the console using its exact saved baseline spec
+with the maintenance object removed. Wait for its migration and ACTIVE state.
+No other config/image/credential changes are accepted. Then run these phases
+once in order, checking each exit code before continuing:
+
+```powershell
+py -3 release/staging/reset.py redeploy @resetArgs
+py -3 release/staging/reset.py provision @resetArgs
+py -3 release/staging/reset.py redeploy @resetArgs
+py -3 release/staging/reset.py verify @resetArgs
+py -3 release/staging/reset.py finalize @resetArgs
+```
+
+The first redeploy uses unchanged `Setup.app` to disable the old allowlist and
+reverify app-only firewalls. A reset-specific wrapper compares the full private
+spec and owned deployment again immediately before the single update call. Only
+the first redeploy permits the owner's restore to have changed the deployment
+ID; the second must still own the exact deployment observed after the first.
+Provision invokes the existing API fixture command
+once against the working file and fresh namespace; it discovers the new
+bootstrap organization and refuses reuse of the old organization. A partial
+provisioning failure is not resumable by replay. The second redeploy applies only
+the new organization's allowlist, verifies migration/health and closes both
+firewalls to the retained app.
+
+`verify` refuses an existing report, invokes the normal staging canary once with
+an explicit working-file path and no drill, and requires all 13 unique checks to
+pass once with zero retries. Its private journal binds that invocation to the
+source, working fixture hash, namespace, origin and report hash. The raw reporter
+file alone does not authenticate those bindings, and this local reset check is
+not a hosted stage receipt or a promotion proof. Finalization rechecks source,
+state, stable spec/migration, six health endpoints and app-only firewalls before
+atomically publishing the new canonical private state. The final pending journal
+records the exact intended state before publication.
+
+After finalization, create fresh minimal fixture/target exports and update the
+changed handoff values using the existing reviewed export procedure above. The
+target's `canary_organization` changes; retaining app/origin/control-key identity
+does not make the old fixture export usable. Keep the maintenance window until
+that handoff and a fresh stage verification are ready. Old reports/receipts remain
+historical records; this local operation does not cryptographically revoke them.
+
+On **any** failure, retain all private files and the original backup. Do not
+clear a pending marker, delete a lock after an unknown outcome, invoke an
+already-consumed phase, overwrite a report, or run ordinary setup against the
+working file. Reconcile exact app/deployment/spec/firewall state, bootstrap or
+fixture partial effects, and the journal's intended payload read-only first.
+Only a separately reviewed recovery may settle that operation. Even a final
+publication failure can mean the new state was already written; never replay
+remote mutations to repair a local acknowledgement.
+
+DigitalOcean documents archive/restore as a complete same-app spec update; the
+adapter only recognizes the documented archive flag and does not automate it.
+See [archive and restore](https://docs.digitalocean.com/products/app-platform/how-to/archive-restore/).
 
 Reference: [DigitalOcean app specification](https://docs.digitalocean.com/products/app-platform/reference/app-spec/),
 [internal routing](https://docs.digitalocean.com/products/app-platform/how-to/manage-internal-routing/),

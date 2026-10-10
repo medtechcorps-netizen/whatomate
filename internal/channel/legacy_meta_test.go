@@ -30,7 +30,7 @@ func TestEnsureLegacyMetaWhatsAppAccountCreatesOnlyCredentialFreeAccountShadow(t
 	otherOrganization := createLegacyMetaTestOrganization(t, db, "account-only-other")
 	account := createLegacyMetaTestAccount(t, db, organization.ID, "Identity Review")
 
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 	require.NoError(t, err)
 	require.NotNil(t, shadow)
 	assert.Equal(t, organization.ID, shadow.OrganizationID)
@@ -39,7 +39,7 @@ func TestEnsureLegacyMetaWhatsAppAccountCreatesOnlyCredentialFreeAccountShadow(t
 	assert.Equal(t, false, shadow.Config["outbound_enabled"])
 	assert.Equal(t, true, shadow.Config["legacy_read_only"])
 
-	replayed, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	replayed, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 	require.NoError(t, err)
 	assert.Equal(t, shadow.ID, replayed.ID)
 
@@ -57,7 +57,7 @@ func TestEnsureLegacyMetaWhatsAppAccountCreatesOnlyCredentialFreeAccountShadow(t
 
 	wrongTenant := legacyMetaRef(account)
 	wrongTenant.OrganizationID = otherOrganization.ID
-	_, err = channelapi.EnsureLegacyMetaWhatsAppAccount(db, wrongTenant)
+	_, err = ensureFencedLegacyMetaAccountForTest(db, wrongTenant)
 	require.Error(t, err)
 }
 
@@ -309,7 +309,7 @@ func TestLegacyMetaAccountRenameStageQueuesBehindAdmissionFence(t *testing.T) {
 	org := createLegacyMetaTestOrganization(t, db, "rename-fence")
 	suffix := uuid.NewString()[:8]
 	account := createLegacyMetaTestAccount(t, db, org.ID, "Before Fence "+suffix)
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 	require.NoError(t, err)
 	nextName := "After Fence " + suffix
 
@@ -558,7 +558,7 @@ func TestLegacyMetaAIBookingMirrorPreservesOnlyCurrentLiveRoute(t *testing.T) {
 		t.Run(mutation, func(t *testing.T) {
 			org := createLegacyMetaTestOrganization(t, db, "ai-booking-"+mutation)
 			native := createLegacyMetaTestAccount(t, db, org.ID, "Native "+mutation)
-			shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(native))
+			shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(native))
 			require.NoError(t, err)
 			require.Equal(t, false, shadow.Config[models.ChannelConfigAIBookingEnabled])
 			revision := uuid.NewString()
@@ -597,7 +597,7 @@ func TestLegacyMetaAIBookingMirrorPreservesOnlyCurrentLiveRoute(t *testing.T) {
 				ref.PhoneID = "forged-phone"
 				ref.BusinessID = "forged-business"
 			}
-			refreshed, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, ref)
+			refreshed, err := ensureFencedLegacyMetaAccountForTest(db, ref)
 			require.NoError(t, err)
 			require.NotContains(t, refreshed.Config, "arbitrary_untrusted")
 			require.Equal(t, false, refreshed.Config["outbound_enabled"])
@@ -634,7 +634,7 @@ func TestLegacyMetaAIBookingMirrorPreservesOnlyCurrentLiveRoute(t *testing.T) {
 		t.Run("ambiguous-"+shape, func(t *testing.T) {
 			org := createLegacyMetaTestOrganization(t, db, "ambiguous-"+shape)
 			native := createLegacyMetaTestAccount(t, db, org.ID, "Ambiguous "+shape)
-			retained, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(native))
+			retained, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(native))
 			require.NoError(t, err)
 			require.NoError(t, db.Delete(retained).Error)
 			replacement := *retained
@@ -650,7 +650,7 @@ func TestLegacyMetaAIBookingMirrorPreservesOnlyCurrentLiveRoute(t *testing.T) {
 			require.NoError(t, query().Find(&before).Error)
 			require.Len(t, before, 2)
 			err = db.Transaction(func(tx *gorm.DB) error {
-				_, err := channelapi.EnsureLegacyMetaWhatsAppAccount(tx, legacyMetaRef(native))
+				_, err := ensureFencedLegacyMetaAccountForTest(tx, legacyMetaRef(native))
 				return err
 			})
 			require.ErrorIs(t, err, channelapi.ErrLegacyMetaBridgeConflict)
@@ -666,7 +666,7 @@ func TestLegacyMetaAIBookingMirrorPreservesOnlyCurrentLiveRoute(t *testing.T) {
 			var retainedID uuid.UUID
 			var oldRevision string
 			if lifecycle == "revive" {
-				retained, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(native))
+				retained, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(native))
 				require.NoError(t, err)
 				retainedID, oldRevision = retained.ID, uuid.NewString()
 				retained.Config[models.ChannelConfigAIBookingEnabled] = true
@@ -681,7 +681,7 @@ func TestLegacyMetaAIBookingMirrorPreservesOnlyCurrentLiveRoute(t *testing.T) {
 			holder := db.WithContext(ctx).Begin()
 			require.NoError(t, holder.Error)
 			defer holder.Rollback()
-			first, err := channelapi.EnsureLegacyMetaWhatsAppAccount(holder, legacyMetaRef(native))
+			first, err := ensureFencedLegacyMetaAccountForTest(holder, legacyMetaRef(native))
 			require.NoError(t, err)
 			var holderPID int
 			require.NoError(t, holder.Session(&gorm.Session{NewDB: true}).Raw("SELECT pg_backend_pid()").Scan(&holderPID).Error)
@@ -702,7 +702,7 @@ func TestLegacyMetaAIBookingMirrorPreservesOnlyCurrentLiveRoute(t *testing.T) {
 					}
 					started <- pid
 					var err error
-					second, err = channelapi.EnsureLegacyMetaWhatsAppAccount(tx, legacyMetaRef(native))
+					second, err = ensureFencedLegacyMetaAccountForTest(tx, legacyMetaRef(native))
 					return err
 				})
 				done <- outcome{shadow: second, err: err}
@@ -966,7 +966,7 @@ func lockLegacyMetaPolicyFenceWithin(
 func TestLegacyMetaMirrorsQueuedOnBusyShadowLeavePolicyFenceAvailable(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	org, account, pending := legacyMetaFenceFixture(t, db, "busy-shadow", 2, 1)
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -980,9 +980,19 @@ func TestLegacyMetaMirrorsQueuedOnBusyShadowLeavePolicyFenceAvailable(t *testing
 		First(&owned).Error)
 
 	mirrored := make(chan error, len(pending))
+	var mirrorPIDs []int
 	for _, stream := range pending {
+		tx := db.WithContext(ctx).Begin()
+		require.NoError(t, tx.Error)
+		var pid int
+		require.NoError(t, tx.Raw("SELECT pg_backend_pid()").Scan(&pid).Error)
+		mirrorPIDs = append(mirrorPIDs, pid)
 		go func(messageID uuid.UUID) {
-			_, mirrorErr := channelapi.MirrorLegacyWhatsAppMessage(db.WithContext(ctx), legacyMetaRef(account), messageID)
+			defer func() { _ = tx.Rollback().Error }()
+			_, mirrorErr := channelapi.MirrorLegacyWhatsAppMessage(tx, legacyMetaRef(account), messageID)
+			if mirrorErr == nil {
+				mirrorErr = tx.Commit().Error
+			}
 			mirrored <- mirrorErr
 		}(stream[0])
 	}
@@ -1004,7 +1014,8 @@ func TestLegacyMetaMirrorsQueuedOnBusyShadowLeavePolicyFenceAvailable(t *testing
 			`SELECT count(*) FROM pg_catalog.pg_stat_activity
 			  WHERE datname = pg_catalog.current_database()
 			    AND wait_event_type = 'Lock'
-			    AND query ILIKE '%channel_accounts%'`,
+			    AND query ILIKE '%channel_accounts%'
+      AND pid IN ?`, mirrorPIDs,
 		).Scan(&queued).Error == nil && queued == int64(len(pending))
 	}, 10*time.Second, 10*time.Millisecond, "both mirrors must queue on the busy shadow")
 
@@ -1283,7 +1294,7 @@ func TestLegacyMetaSharersOnABusyShadowQueueForAWaitingFenceOncePerCall(t *testi
 	defer channelapi.SetLegacyMetaPolicyFenceQueueWaitForTest(bound)()
 	db := testutil.SetupTestDB(t)
 	org, account, pending := legacyMetaFenceFixture(t, db, "convoy", 4, 1)
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -1367,7 +1378,7 @@ func TestLegacyMetaSharersOnABusyShadowSkipAFenceStuckBehindAnAttemptFence(t *te
 	defer channelapi.SetLegacyMetaPolicyFenceQueueWaitForTest(time.Minute)()
 	db := testutil.SetupTestDB(t)
 	org, account, pending := legacyMetaFenceFixture(t, db, "stuck-fence", 4, 1)
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -1643,7 +1654,7 @@ func TestLegacyMetaPolicyFenceKeepsAcquiringUnderManyCrossAccountMirrorStreams(t
 // bypass. Read as stuck, every mirror would bypass at once, and under steady
 // traffic the writer and the admission would never get the row.
 func TestLegacyMetaMirrorQueuesBehindAFenceThatWaitsForAWriterBlockedByAMember(t *testing.T) {
-	defer channelapi.SetLegacyMetaPolicyFenceMemberWaitForTest(20 * time.Second)()
+	channelapi.ForgetLegacyMetaPolicyFenceStatesForTest()
 	db := testutil.SetupTestDB(t)
 	org := createLegacyMetaTestOrganization(t, db, "org-writer")
 	first, firstPending := legacyMetaFenceAccount(t, db, org, "writer-first", 1, 1)
@@ -1936,7 +1947,7 @@ func TestLegacyMetaReentryAfterGoingPastAWaitingFenceDoesNotQueueAgain(t *testin
 	defer channelapi.SetLegacyMetaPolicyFenceQueueWaitForTest(bound)()
 	db := testutil.SetupTestDB(t)
 	org, account, pending := legacyMetaFenceFixture(t, db, "reentry", 1, 1)
-	shadow, err := channelapi.EnsureLegacyMetaWhatsAppAccount(db, legacyMetaRef(account))
+	shadow, err := ensureFencedLegacyMetaAccountForTest(db, legacyMetaRef(account))
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

@@ -21,7 +21,8 @@ func SetLegacyMetaPolicyFenceMemberWaitForTest(wait time.Duration) func() {
 }
 
 // ForgetLegacyMetaPolicyFenceStatesForTest drops the process cache of fence
-// states, so the next check reads the lock table.
+// states, so the next check reads the lock table. State-sensitive tests must
+// call this after establishing their blocker chain and before measuring it.
 func ForgetLegacyMetaPolicyFenceStatesForTest() {
 	legacyMetaPolicyFenceStates.Clear()
 }
