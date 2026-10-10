@@ -205,16 +205,36 @@ not gain a bypass field or kind. An unchanged schema is mandatory, including
 for this emergency mode. A bypass is not permission to skip a failing product
 test or a production guard.
 
-**PR10 must not merge until all four real PR9 proofs below are recorded and
-reviewed.** They are pending; no live run IDs have been invented or substituted
-with local tests.
+**PR10 requires all four real PR9 proofs to be recorded and reviewed before
+owner-authorized merge.** The following operational proofs were independently
+accepted on common source `8c3e022c78a025f9a51c80628cb059a921d4b8d8`, each on
+attempt 1. Production and record jobs were skipped in all four runs.
 
-| Required PR9 proof | Expected evidence | Actual run |
+| Required PR9 proof | Accepted outcome | Actual run |
 | --- | --- | --- |
-| Normal stage | Health 6/6 and CRM 13/13, bound report | Pending |
-| `e2e-fail` | CRM failure and separate rollback restoring staging | Pending |
-| `health-fail` | Failed health gate and verified in-job restoration | Pending |
-| `bad-image` | PRE_DEPLOY failure and verified in-job restoration | Pending |
+| Normal stage | Health 6/6, CRM 13/13 with retry 0 and successful bound-report verifier; workflow succeeded | [38008410104](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38008410104) |
+| `e2e-fail` | Intentional first CRM failure, 12 skipped; separate receipt-bound rollback restored the full prior staging spec and health 6/6 | [38002083135](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38002083135) |
+| `health-fail` | Typed intentional health failure; in-job restoration exited 2 with full prior spec and health 6/6 restored | [38004334377](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38004334377) |
+| `bad-image` | PRE_DEPLOY failed with the planned missing executable; in-job restoration exited 2 with full prior spec and health 6/6 restored | [38005896362](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38005896362) |
+
+The three failure-drill workflows remain failed by design; verified restoration
+qualifies their proofs. Normal run `38008410104` passed all 13 checks and its
+bound-report verifier, but GitHub withheld the `report_b64` job output because
+the masker included the public origin checksum. PR10 excludes only the validated
+top-level `origin_sha256` from recursive masking; the raw fixture, actual origin,
+control key and all canary strings remain masked. The correction passed 436
+deployment tests and independent review. **After PR10's owner-authorized merge
+and exact merged-main CI, a fresh hosted `stage` / `none` run must verify receipt
+and report output transport before the first production promote.** The historical
+operational proof and local tests do not establish that transport result.
+
+Delivered staging assets from normal run `38008410104` also passed all 12
+portfolio scrolling cases without retries: wheel and Tab access to 10 synthetic
+workspace rows and their controls for owner and partner administrator at
+1440x900, 1280x600 and 1536x600. APIs were mocked; this proves delivered frontend
+geometry, not backend authorization or real customer data behavior. Provider
+state was identical before and after, and the following six health probes passed.
+This result does not establish a production deployment of the UI fix.
 
 After the owner reviews those proofs and authorizes PR10's merge, the owner
 authorizes its protected production dry-run. Resolve the rollback check under

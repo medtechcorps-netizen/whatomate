@@ -657,7 +657,7 @@ jobs:
         run: |
           set -euo pipefail
           /usr/bin/python3 -I -S -B - <<'PY'
-          import json, os, sys
+          import hashlib, json, os, re, sys
           try:
               names = ('STAGING_ORIGIN', 'STAGING_CANARY_FIXTURE_JSON', 'STAGING_STUB_CONTROL_KEY')
               values = [os.environ[name] for name in names]
@@ -670,7 +670,23 @@ jobs:
                   elif isinstance(value, list):
                       for child in value: mask(child)
               for value in values: mask(value)
-              mask(json.loads(values[1]))
+              def unique_object(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result: raise ValueError()
+                      result[key] = value
+                  return result
+              def invalid_constant(value): raise ValueError()
+              fixture = json.loads(values[1], object_pairs_hook=unique_object, parse_constant=invalid_constant)
+              if type(fixture) is not dict or set(fixture) != {'schema_version', 'origin_sha256', 'canary'}: raise ValueError()
+              if type(fixture['schema_version']) is not int or fixture['schema_version'] != 1: raise ValueError()
+              if type(fixture['canary']) is not dict or fixture['canary'].get('origin') != values[0]: raise ValueError()
+              digest = fixture['origin_sha256']
+              if type(digest) is not str or re.fullmatch('[0-9a-f]{64}', digest) is None: raise ValueError()
+              if digest != hashlib.sha256(values[0].encode('utf-8')).hexdigest(): raise ValueError()
+              # The validated top-level checksum is public receipt/report data.
+              # Mask every canary string, including any nested hash-shaped value.
+              mask(fixture['canary'])
           except Exception:
               print('stage-fixture: refused', file=sys.stderr)
               sys.exit(1)
