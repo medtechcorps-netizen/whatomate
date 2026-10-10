@@ -469,6 +469,7 @@ jobs:
           # -timeout 150m caps each package's test binary. One slow package on a
           # shared runner has hit the old 60m cap; the job's 360-minute limit
           # stays the outer ceiling for the whole race+coverage suite.
+          # The catalog template tests run in the required tenant-isolation job.
           package_output="$(go list -mod=readonly ./...)"
           [[ -n "$package_output" ]]
           mapfile -t packages < <(printf '%s\n' "$package_output")
@@ -476,7 +477,7 @@ jobs:
           gotestsum \
             --format testname \
             --hide-summary=skipped \
-            -- -mod=readonly -race -p 1 -timeout 150m -coverprofile=coverage.out "${packages[@]}"
+            -- -mod=readonly -race -p 1 -timeout 150m -skip '^TestTenantRLS_Catalog' -coverprofile=coverage.out "${packages[@]}"
           git diff --exit-code -- go.mod go.sum
 
       - name: Display coverage

@@ -102,7 +102,7 @@ POSTGRES_JOBS = (("test.yml", "tenant-isolation"), ("test.yml", "go-race"), ("te
 PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
 DIGEST_IMAGE = re.compile(r"[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}")
 TENANT_TEST = "go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'"
-RACE_TEST = '-- -mod=readonly -race -p 1 -timeout 150m -coverprofile=coverage.out "${packages[@]}"'
+RACE_TEST = "-- -mod=readonly -race -p 1 -timeout 150m -skip '^TestTenantRLS_Catalog' -coverprofile=coverage.out \"${packages[@]}\""
 ACTIONLINT_INSTALL = "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7"
 # Exactly the test discovery the release tests job runs. A new release test
 # directory is added here and to the job together.
@@ -1064,6 +1064,10 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "test.yml", "go test -mod=readonly -v -timeout 45m ./internal/database", "go test -mod=readonly -v ./internal/database")),
     "shorten the go-race package timeout": ("concurrency-and-timeouts", lambda: replaced(
         "test.yml", "-race -p 1 -timeout 150m ", "-race -p 1 -timeout 60m ")),
+    "broaden the catalog-only race exclusion": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "-skip '^TestTenantRLS_Catalog'", "-skip '^TestTenantRLS_'")),
+    "skip catalog tests in tenant-isolation": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", TENANT_TEST, TENANT_TEST + " -skip '^TestTenantRLS_Catalog'")),
     # 5. Environments and secrets.
     "add an environment outside ship.yml": ("environments-and-secrets", lambda: replaced(
         "test.yml", "  lint:\n    name: lint\n", "  lint:\n    name: lint\n    environment: production\n")),
