@@ -3,8 +3,8 @@
 `release/compat/proof.py` is a pure standard-library evidence evaluator. It has
 no Docker, GitHub, filesystem, network or database operations. Its synthetic
 tests exercise proof rules; they do **not** establish compatibility of a release.
-The compatibility runner, workflow, signatures, release preview and real runs
-are still unimplemented.
+The full compatibility experiment, workflow, result attestation, release preview
+and real runs are still unimplemented.
 
 ## Result and failure contract
 
@@ -180,6 +180,32 @@ or errors per log; table/marker inventories are also bounded. The evaluator
 accepts five such migration/control windows. An explicitly complete empty
 window is valid under mod-only logging, but does not replace successful
 execution evidence or the mandatory independently observed control failure.
+
+## Bounded runtime foundation
+
+`runtime.py` supplies a small CLI foundation for the future runner. It drains
+stdout and stderr concurrently with separate byte limits, imposes a deadline,
+and reaps its child process. A completed nonzero exit is captured as evidence;
+it is not automatically a compatibility verdict. Process or capture failures
+raise fixed infrastructure errors without exposing arguments or stream data.
+On POSIX, capture failure kills the private process group. On Windows, only
+the direct child is killed; container cleanup remains the runner's separate
+responsibility.
+
+The Docker interface supports only digest-pinned PostgreSQL, Redis and verified
+previous-web pulls/inspection for Linux AMD64. It uses a fresh empty config and
+the default local context. The GitHub interface reuses the existing release
+record, chain, exact certificate and image attestation validators. It bounds
+read-only output and creates manifest files only in fresh scratch directories;
+it cannot publish releases or overwrite/delete earlier evidence. Its caller
+supplies reviewed executable paths, an explicit minimal environment and the
+existing read-only job token in memory. It does not retrieve credentials.
+
+The focused transport tests include real local Python child processes, while
+Docker and GitHub are mocked. They establish the transport behavior, not a
+live registry pull, a current signed release, or release compatibility. No
+SQL collector, container lifecycle, sweep, workflow or publication is added by
+this foundation.
 
 ## Remaining runner and workflow work
 
