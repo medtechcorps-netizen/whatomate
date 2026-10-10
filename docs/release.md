@@ -256,7 +256,14 @@ identifiers or values.
 | `record-chain-invalid` | A `prod-*` release, tag or manifest is malformed, unattested or does not link. | Investigate; never edit records by hand. |
 | `latest-changed-since-plan` | The latest record (or the rollback target) changed between plan and approval. | Dispatch a new run. |
 | `downgrade-refused` | The commit does not descend from the latest record's commit. | Ship a newer `main`, or use rollback mode. |
-| `schema-change-blocked` | A schema, model, seed or migration change since the latest record (interim freeze). | Revert it, or wait for Stage 2. |
+| `schema-change-blocked` | The classifier refused the released-source comparison. | Read the fixed reasons and preview; revert or make the required reviewed change. |
+| `migration-path-changed` | A protected migration function or phase declaration changed. | Keep the verify-only migration path unchanged until its separately reviewed replacement. |
+| `data-step-edited-without-rev` | A seed-reconciler closure changed without its revision increasing. | Regenerate the registry, review the closure and bump that step revision. |
+| `catalog-changed` | Active catalog metadata differs in this conservative classifier. | Keep the active golden unchanged; dormant shape metadata is separate. |
+| `classifier-invalid` | Required classifier metadata or ancestry is missing, malformed or unsupported. | Repair the public source contract; do not bypass the guard. |
+| `registry-introduction-changed` | A seed closure file differs between the released base and the first registry introduction. | Separate the baseline registry introduction from product edits. |
+| `data-step-removed` | An existing registry entry disappeared. | Preserve history and follow the reviewed registry evolution contract. |
+| `data-step-invalid-rev` | A registry revision regressed. | Restore monotonic step revisions. |
 | `trivy-exception-invalid` | `release/deployment/ship.trivyignore` has an expired or malformed entry. | Reviewed PR to renew or remove it. |
 | `candidate-stale` | The images were built more than 24 h before the production job started. | Dispatch again. |
 | `attestation-unverified` | A digest or record does not verify with the expected signer. | Investigate; never bypass. |
@@ -317,36 +324,86 @@ CVE-2026-12345 exp:2026-12-31
 The expiry is at most 90 days ahead. An expired entry fails every run until a
 reviewed PR removes or renews it. Secrets can never be excepted.
 
-## Interim schema freeze
+## Catalog and data classifier
 
-Until Stage 2 adds steady-state migrations, any non-test change under
-`internal/database/` or `internal/models/`, the chatbot flow migration file,
-the rls-migrate and startup-contract functions in `cmd/whatomate/main.go`,
-`BackfillLegacyWhatsAppInbox`, or a newly added migration or DDL call in Go
-blocks promotion (`schema-change-blocked`). Reverting the change unblocks
-promotion. Stage 2 lifts the freeze.
+The classifier compares the latest signed record's source with the candidate.
+While that base lacks `internal/dbcatalog/golden/catalog.json`, the Stage 1
+freeze still refuses non-test changes under `internal/database/` and
+`internal/models/`. Shipping a golden only at the head does not lift that rule.
+Once the base carries the golden, changes in those trees can be allowed when
+`catalog.json`, `history.json` and `global_tables.json` remain byte-identical
+and the migration helper closure contract is valid. Without that contract the
+broad database/model freeze remains.
+Changes under `internal/dbcatalog/shape/` are class `none`, with a public summary;
+they do not authorize changes to the active production catalog.
 
-The `schema-guard` job of the `Test` workflow runs the same check on every
-pull request, so such a change fails the required `test` check before it can
-merge instead of leaving `main` unpromotable. It compares GitHub's merge
-commit with its merge base on `main`, so only the pull request's own changes
-count, and each push to `main` with its first parent. Split or revert a
-refused pull request. The check cannot see product code that rewrites
-existing rows: such a pull request merges only when the owner says so, with a
-data-change note in its description.
+The chatbot migration file, existing startup/RLS functions, migration
+coordinator/session/verification functions and `compiledRLSMigrationPhase`
+remain protected. The test-only `registry/migration_path.json` also binds
+resolved startup/migration helper dependencies. Its first introduction requires
+all listed source files to match the released base byte-for-byte; later hashes,
+roots and file lists must remain unchanged. This closes the gap where an
+unchanged named guard calls an edited helper. CI regenerates the contract;
+preview does not independently recompute its Go closure. Introduction from an
+older pre-catalog record may fail when the closure includes newly added catalog
+files; activation waits for the released catalog-bearing base. Changes to these
+migration contracts are `migration-path-changed`. Outside the unfrozen database/model trees, added
+migration calls remain refused. A dormant exemption is limited to an exact
+`{file, func}` entry in `internal/dbcatalog/dormant_entrypoints.json`, with
+exactly one non-test call site resolved in the same package or through the
+defining package's import alias. Shadowed or unrelated same-name references
+refuse as `classifier-invalid:dormant-entrypoints`; it is not a path-wide
+waiver. Production
+PRE_DEPLOY remains verify-only.
 
-Two edge cases need care. A pull request that reverts a guarded change
-already on `main` is refused too, because the revert edits the same guarded
-paths. That can only happen if a guarded change reaches `main` despite the
-check (a miss, or a rule added later). To merge the revert, the owner turns
-off admin enforcement in `main`'s branch protection, merges it, turns
-enforcement back on straight away and records both steps in the revert's
-description. And a rebase merge is checked on its last commit only: a pull
-request that adds a guarded edit in one commit and removes it in a later one
-passes, but once rebase-merged its last commit edits the guarded path, so
-merge such a pull request with a merge commit or squash it. Either way the
-push run on `main` for that commit is red, so that commit cannot be promoted
-and promotion waits for the next merge.
+When the base has no data registry, the classifier finds X: the earliest
+first-parent transition in `base..head` adding `data_steps.json`. Every
+seed-reconciler closure file at X must match the base byte-for-byte. This
+prevents introducing the registry alongside a bundled seed edit. Comparisons
+after X use X's registry and the generated declaration hashes. A changed
+seed-reconciler closure requires an increased revision; a revision increase,
+new entry or changed `seeds.json` is class `data` (dormant). Changed
+`baseline-pre-ledger` metadata changes are class `none` (bootstrap-only), but
+that classification never overrides the migration closure guard: an overlapping
+migration-contract change remains blocked until the separately reviewed
+compatibility-gated replacement. This does not certify old backfill edits as
+safe. Summaries
+identify affected steps and seed differences. Same-head registry tests must
+recompute the generated hashes and seed definitions: preview does not execute
+Go type analysis or prove stale JSON correct. An unrelated method in a reached
+file can leave the generated closure hash unchanged after X; before X the
+whole-file introduction check still applies.
+
+The classifier derives apply-engine availability from validated head history.
+Active golden changes are `catalog-changed` in this conservative slice, even
+when a future history entry advertises an engine; the flag alone does not
+implement safe expansion. A dormant data classification does not execute data
+steps or set a release record's `db_change` flag. Future expand/apply behavior
+requires its own implementation and tests. Registry deletion/reintroduction,
+malformed metadata and revision regression fail closed.
+
+Rollback uses an explicit mode and requires equal active golden identity at
+target and latest. A pre-golden target means the pinned baseline v0, not any
+arbitrary catalog with version zero. Dormant data is ignored for this equality
+comparison. Signed record-chain, rollback-span, backup, live-drift, approval,
+health and strict CAS checks remain in force; a classifier allowance is not a
+rollback outcome or deployment approval.
+
+Run the same preview against the latest record for later Go changes:
+
+```sh
+python3 release/deployment/schema_change.py preview --base <latest-record-sha> --head <head-sha>
+```
+
+The `schema-guard` job of `Test` retains the same blocking-reason contract. It
+compares each pull request's merge result with its merge base, and a push to
+`main` with its first parent. Release plan and production repeat the check
+against signed release sources before provider I/O. A green PR comparison does
+not replace the cumulative released-source preview. Use a normal merge or
+squash for a history that adds and later reverts a guarded edit; a rebase may
+leave the final pushed commit with a different first-parent comparison. The
+classifier does not detect every product path that writes rows: existing
+review and data-change notes still apply.
 
 ## Secrets and token
 

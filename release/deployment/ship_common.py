@@ -112,7 +112,8 @@ REASONS = frozenset(
         "provider-invalid", "provider-rejected", "reconcile-failed",
         "reconcile-timeout", "record-chain-invalid", "record-invalid",
         "rollback-failed", "rollback-precondition-failed",
-        "rollback-target-invalid", "schema-change-blocked",
+        "rollback-target-invalid", "schema-change-blocked", "catalog-changed",
+        "data-step-edited-without-rev", "migration-path-changed",
         "second-mutation-blocked", "smoke-failed", "target-invalid",
         "topology-differs", "trivy-exception-invalid", "vpc-missing-or-differs",
     }

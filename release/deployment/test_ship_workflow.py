@@ -636,7 +636,8 @@ class RepositoryFileTests(unittest.TestCase):
         self.assertIn("Claude/Codex never approve", release)
         self.assertIn("Approve and deploy", release)
         for code in ("approval-gate-misconfigured", "approval-missing", "ci-not-green", "old-lane-active", "record-chain-invalid", "latest-changed-since-plan",
-                     "downgrade-refused", "schema-change-blocked", "trivy-exception-invalid", "candidate-stale",
+                     "downgrade-refused", "schema-change-blocked", "migration-path-changed",
+                     "data-step-edited-without-rev", "catalog-changed", "trivy-exception-invalid", "candidate-stale",
                      "attestation-unverified", "app-identity-mismatch", "vpc-missing-or-differs", "topology-differs",
                      "forbidden-image-field", "drift", "backup-stale", "cas-changed", "provider-rejected",
                      "deployment-error", "smoke-failed", "rollback-precondition-failed"):

@@ -113,6 +113,12 @@ class ReasonCodeTests(unittest.TestCase):
         self.assertEqual(str(common.ReleaseError("not-a-known-reason")), "internal-error:unknown-reason-code")
         self.assertEqual(str(common.ReleaseError("drift " + support.APP_ID)), "internal-error:invalid-reason-code")
 
+    def test_classifier_reason_codes_are_fixed_public_prefixes(self) -> None:
+        for code in ("migration-path-changed", "data-step-edited-without-rev", "catalog-changed"):
+            with self.subTest(code=code):
+                self.assertIn(code, common.REASONS)
+                self.assertEqual(common.ReleaseError(code + ":synthetic").reason, code)
+
     def test_every_literal_reason_in_the_new_modules_is_known(self) -> None:
         pattern = common.CODE_RE
         calls = {"fail", "ReleaseError", "AmbiguousMutation", "PostDeployGuard", "TerminalDeployment",

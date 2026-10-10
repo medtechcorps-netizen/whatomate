@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import release_record
@@ -146,6 +147,18 @@ class PlanTests(StageCase):
         self.assertEqual(self.plan(), ship.EXIT_REFUSED)
         self.assertIn("schema-change-blocked", self.h.text())
         self.assertIn("guarded-tree:internal/database/new.go", self.h.summary())
+
+    def test_classifier_modes_run_in_plan_before_provider_io(self) -> None:
+        for mode, target in (("promote", ""), ("dry-run", ""), ("rollback", "prod-0000")):
+            with self.subTest(mode=mode):
+                blocked = ship.schema_change.SchemaChangeBlocked(["migration-path-changed:synthetic"])
+                with mock.patch.object(ship.schema_change, "guard", side_effect=blocked) as guard:
+                    self.assertEqual(self.plan(mode, target), ship.EXIT_REFUSED, self.h.text())
+                self.assertEqual(guard.call_count, 1)
+                self.assertEqual(guard.call_args.kwargs.get("mode", "forward"),
+                                 "rollback" if mode == "rollback" else "forward")
+                self.assertEqual(self.h.do.requests, [])
+                self.assertEqual(self.h.https.calls, [])
 
     def test_invalid_trivy_exceptions_stop_the_plan(self) -> None:
         self.h.paths["policy"].write_bytes(b"CVE-2026-1 exp:2026-01-01\n")

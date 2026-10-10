@@ -1,0 +1,28 @@
+{
+  "name": "pre-golden model freeze",
+  "base_files": {
+    "cmd/whatomate/main.go": "package main\n\nfunc runRLSMigration() {\n\tprintln(1)\n}\n\nfunc other() {\n\tprintln(2)\n}\n",
+    "internal/database/postgres.go": "package database\n\nconst compiledRLSMigrationPhase = rlsMigrationPhaseUI\n\nfunc RunRLSMigrationCoordinator() {\n\tprintln(1)\n}\n\nfunc runRLSMigrationCoordinatorForPhase() {\n\tprintln(1)\n}\n\nfunc withMigrationSession() {\n\tprintln(1)\n}\n\nfunc decideRLSMigrationAction() {\n\tprintln(1)\n}\n\nfunc classifyLegacyRLSCatalog() {\n\tprintln(1)\n}\n\nfunc verifyFutureRLSPostcondition() {\n\tprintln(1)\n}\n",
+    "internal/database/seed.go": "package database\n\nfunc SeedOne() {\n\tprintln(1)\n}\n\nfunc Unrelated() {\n\tprintln(2)\n}\n",
+    "internal/database/platform_compliance.go": "package database\n\nfunc detectPlatformComplianceIdentityReviewTriggerProfile() {\n\tprintln(1)\n}\n",
+    "internal/database/tenant.go": "package database\n\nfunc VerifyTenantRLS() {\n\tprintln(1)\n}\n",
+    "internal/models/models.go": "package models\n",
+    "internal/handlers/messages.go": "package handlers\n\nfunc send() {\n\tprintln(1)\n}\n",
+    "README.md": "synthetic\n",
+    "go.mod": "module github.com/shridarpatil/whatomate\n\ngo 1.26.0\n"
+  },
+  "commits": [
+    {
+      "files": {
+        "internal/models/new.go": "package models\n"
+      }
+    }
+  ],
+  "mode": "forward",
+  "expected": {
+    "blocked": true,
+    "reason_prefixes": [
+      "guarded-tree:"
+    ]
+  }
+}
