@@ -1,0 +1,1187 @@
+{
+  "version": 0,
+  "permissions": [
+    {
+      "resource": "users",
+      "action": "read",
+      "description": "View users"
+    },
+    {
+      "resource": "users",
+      "action": "write",
+      "description": "Create and edit users"
+    },
+    {
+      "resource": "users",
+      "action": "delete",
+      "description": "Delete users"
+    },
+    {
+      "resource": "teams",
+      "action": "read",
+      "description": "View teams"
+    },
+    {
+      "resource": "teams",
+      "action": "write",
+      "description": "Create and edit teams"
+    },
+    {
+      "resource": "teams",
+      "action": "delete",
+      "description": "Delete teams"
+    },
+    {
+      "resource": "roles",
+      "action": "read",
+      "description": "View roles"
+    },
+    {
+      "resource": "roles",
+      "action": "write",
+      "description": "Create and edit roles"
+    },
+    {
+      "resource": "roles",
+      "action": "delete",
+      "description": "Delete roles"
+    },
+    {
+      "resource": "settings.general",
+      "action": "read",
+      "description": "View general settings"
+    },
+    {
+      "resource": "settings.general",
+      "action": "write",
+      "description": "Edit general settings"
+    },
+    {
+      "resource": "settings.chatbot",
+      "action": "read",
+      "description": "View chatbot settings"
+    },
+    {
+      "resource": "settings.chatbot",
+      "action": "write",
+      "description": "Edit chatbot settings"
+    },
+    {
+      "resource": "settings.sso",
+      "action": "read",
+      "description": "View SSO settings"
+    },
+    {
+      "resource": "settings.sso",
+      "action": "write",
+      "description": "Edit SSO settings"
+    },
+    {
+      "resource": "settings.calling",
+      "action": "read",
+      "description": "View calling settings"
+    },
+    {
+      "resource": "settings.calling",
+      "action": "write",
+      "description": "Edit calling settings"
+    },
+    {
+      "resource": "settings.integrations",
+      "action": "read",
+      "description": "View provider integrations"
+    },
+    {
+      "resource": "settings.integrations",
+      "action": "write",
+      "description": "Configure provider integrations"
+    },
+    {
+      "resource": "accounts",
+      "action": "read",
+      "description": "View WhatsApp accounts"
+    },
+    {
+      "resource": "accounts",
+      "action": "write",
+      "description": "Create and edit WhatsApp accounts"
+    },
+    {
+      "resource": "accounts",
+      "action": "delete",
+      "description": "Delete WhatsApp accounts"
+    },
+    {
+      "resource": "templates",
+      "action": "read",
+      "description": "View message templates"
+    },
+    {
+      "resource": "templates",
+      "action": "write",
+      "description": "Create and edit templates"
+    },
+    {
+      "resource": "templates",
+      "action": "delete",
+      "description": "Delete templates"
+    },
+    {
+      "resource": "templates",
+      "action": "sync",
+      "description": "Sync templates with Meta"
+    },
+    {
+      "resource": "flows.whatsapp",
+      "action": "read",
+      "description": "View WhatsApp flows"
+    },
+    {
+      "resource": "flows.whatsapp",
+      "action": "write",
+      "description": "Create and edit WhatsApp flows"
+    },
+    {
+      "resource": "flows.whatsapp",
+      "action": "delete",
+      "description": "Delete WhatsApp flows"
+    },
+    {
+      "resource": "flows.chatbot",
+      "action": "read",
+      "description": "View chatbot flows"
+    },
+    {
+      "resource": "flows.chatbot",
+      "action": "write",
+      "description": "Create and edit chatbot flows"
+    },
+    {
+      "resource": "flows.chatbot",
+      "action": "delete",
+      "description": "Delete chatbot flows"
+    },
+    {
+      "resource": "campaigns",
+      "action": "read",
+      "description": "View campaigns"
+    },
+    {
+      "resource": "campaigns",
+      "action": "write",
+      "description": "Create and edit campaigns"
+    },
+    {
+      "resource": "campaigns",
+      "action": "delete",
+      "description": "Delete campaigns"
+    },
+    {
+      "resource": "campaigns",
+      "action": "execute",
+      "description": "Execute campaigns"
+    },
+    {
+      "resource": "chatbot.keywords",
+      "action": "read",
+      "description": "View keyword rules"
+    },
+    {
+      "resource": "chatbot.keywords",
+      "action": "write",
+      "description": "Create and edit keyword rules"
+    },
+    {
+      "resource": "chatbot.keywords",
+      "action": "delete",
+      "description": "Delete keyword rules"
+    },
+    {
+      "resource": "chatbot.ai",
+      "action": "read",
+      "description": "View AI contexts"
+    },
+    {
+      "resource": "chatbot.ai",
+      "action": "write",
+      "description": "Create and edit AI contexts"
+    },
+    {
+      "resource": "chatbot.ai",
+      "action": "delete",
+      "description": "Delete AI contexts"
+    },
+    {
+      "resource": "chat",
+      "action": "read",
+      "description": "View chat conversations"
+    },
+    {
+      "resource": "chat",
+      "action": "write",
+      "description": "Send messages"
+    },
+    {
+      "resource": "chat.assign",
+      "action": "write",
+      "description": "Assign conversations to agents"
+    },
+    {
+      "resource": "contacts",
+      "action": "read",
+      "description": "View contacts"
+    },
+    {
+      "resource": "contacts",
+      "action": "write",
+      "description": "Create and edit contacts"
+    },
+    {
+      "resource": "contacts",
+      "action": "delete",
+      "description": "Delete contacts"
+    },
+    {
+      "resource": "contacts",
+      "action": "import",
+      "description": "Import contacts"
+    },
+    {
+      "resource": "contacts",
+      "action": "export",
+      "description": "Export contacts"
+    },
+    {
+      "resource": "contacts.identity_review",
+      "action": "write",
+      "description": "Resolve WhatsApp identity ownership reviews"
+    },
+    {
+      "resource": "tags",
+      "action": "read",
+      "description": "View tags"
+    },
+    {
+      "resource": "tags",
+      "action": "write",
+      "description": "Create and edit tags"
+    },
+    {
+      "resource": "tags",
+      "action": "delete",
+      "description": "Delete tags"
+    },
+    {
+      "resource": "analytics",
+      "action": "read",
+      "description": "View analytics dashboard"
+    },
+    {
+      "resource": "analytics",
+      "action": "write",
+      "description": "Create and edit dashboard widgets"
+    },
+    {
+      "resource": "analytics",
+      "action": "delete",
+      "description": "Delete dashboard widgets"
+    },
+    {
+      "resource": "analytics.agents",
+      "action": "read",
+      "description": "View agent analytics"
+    },
+    {
+      "resource": "transfers",
+      "action": "read",
+      "description": "View agent transfers"
+    },
+    {
+      "resource": "transfers",
+      "action": "write",
+      "description": "Create transfers"
+    },
+    {
+      "resource": "transfers",
+      "action": "pickup",
+      "description": "Pickup transfers from queue"
+    },
+    {
+      "resource": "webhooks",
+      "action": "read",
+      "description": "View webhooks"
+    },
+    {
+      "resource": "webhooks",
+      "action": "write",
+      "description": "Create and edit webhooks"
+    },
+    {
+      "resource": "webhooks",
+      "action": "delete",
+      "description": "Delete webhooks"
+    },
+    {
+      "resource": "api_keys",
+      "action": "read",
+      "description": "View API keys"
+    },
+    {
+      "resource": "api_keys",
+      "action": "write",
+      "description": "Create API keys"
+    },
+    {
+      "resource": "api_keys",
+      "action": "delete",
+      "description": "Delete API keys"
+    },
+    {
+      "resource": "canned_responses",
+      "action": "read",
+      "description": "View canned responses"
+    },
+    {
+      "resource": "canned_responses",
+      "action": "write",
+      "description": "Create and edit canned responses"
+    },
+    {
+      "resource": "canned_responses",
+      "action": "delete",
+      "description": "Delete canned responses"
+    },
+    {
+      "resource": "custom_actions",
+      "action": "read",
+      "description": "View custom actions"
+    },
+    {
+      "resource": "custom_actions",
+      "action": "write",
+      "description": "Create and edit custom actions"
+    },
+    {
+      "resource": "custom_actions",
+      "action": "delete",
+      "description": "Delete custom actions"
+    },
+    {
+      "resource": "organizations",
+      "action": "read",
+      "description": "View organizations"
+    },
+    {
+      "resource": "organizations",
+      "action": "write",
+      "description": "Create organizations"
+    },
+    {
+      "resource": "organizations",
+      "action": "delete",
+      "description": "Delete organizations"
+    },
+    {
+      "resource": "organizations",
+      "action": "assign",
+      "description": "Manage organization members"
+    },
+    {
+      "resource": "call_logs",
+      "action": "read",
+      "description": "View call logs"
+    },
+    {
+      "resource": "ivr_flows",
+      "action": "read",
+      "description": "View IVR flows"
+    },
+    {
+      "resource": "ivr_flows",
+      "action": "write",
+      "description": "Create and edit IVR flows"
+    },
+    {
+      "resource": "ivr_flows",
+      "action": "delete",
+      "description": "Delete IVR flows"
+    },
+    {
+      "resource": "call_transfers",
+      "action": "read",
+      "description": "View call transfers"
+    },
+    {
+      "resource": "call_transfers",
+      "action": "write",
+      "description": "Accept and manage call transfers"
+    },
+    {
+      "resource": "outgoing_calls",
+      "action": "read",
+      "description": "View outgoing call status"
+    },
+    {
+      "resource": "outgoing_calls",
+      "action": "write",
+      "description": "Initiate outgoing calls"
+    },
+    {
+      "resource": "audit_logs",
+      "action": "read",
+      "description": "View audit logs"
+    },
+    {
+      "resource": "billing",
+      "action": "read",
+      "description": "View subscription and invoices"
+    },
+    {
+      "resource": "billing",
+      "action": "write",
+      "description": "Manage subscription and billing profile"
+    },
+    {
+      "resource": "entitlements",
+      "action": "read",
+      "description": "View effective feature entitlements"
+    },
+    {
+      "resource": "entitlements",
+      "action": "write",
+      "description": "Manage entitlement overrides"
+    },
+    {
+      "resource": "onboarding",
+      "action": "read",
+      "description": "View workspace onboarding"
+    },
+    {
+      "resource": "onboarding",
+      "action": "write",
+      "description": "Complete workspace onboarding"
+    },
+    {
+      "resource": "workspace_templates",
+      "action": "read",
+      "description": "View workspace templates"
+    },
+    {
+      "resource": "workspace_templates",
+      "action": "write",
+      "description": "Create and apply workspace templates"
+    },
+    {
+      "resource": "privacy.settings",
+      "action": "read",
+      "description": "View privacy and retention settings"
+    },
+    {
+      "resource": "privacy.settings",
+      "action": "write",
+      "description": "Manage privacy and retention settings"
+    },
+    {
+      "resource": "privacy.consents",
+      "action": "read",
+      "description": "View consent evidence"
+    },
+    {
+      "resource": "privacy.consents",
+      "action": "write",
+      "description": "Record consent evidence"
+    },
+    {
+      "resource": "privacy.requests",
+      "action": "read",
+      "description": "View privacy requests"
+    },
+    {
+      "resource": "privacy.requests",
+      "action": "write",
+      "description": "Process privacy requests"
+    },
+    {
+      "resource": "privacy.requests",
+      "action": "execute",
+      "description": "Reserved for approved privacy fulfillment workers"
+    },
+    {
+      "resource": "privacy.incidents",
+      "action": "read",
+      "description": "View privacy incidents"
+    },
+    {
+      "resource": "privacy.incidents",
+      "action": "write",
+      "description": "Manage privacy incidents"
+    },
+    {
+      "resource": "support",
+      "action": "read",
+      "description": "View support cases and tenant health"
+    },
+    {
+      "resource": "support",
+      "action": "write",
+      "description": "Create and update support cases"
+    },
+    {
+      "resource": "operations",
+      "action": "read",
+      "description": "View recovery and delivery operations"
+    },
+    {
+      "resource": "operations",
+      "action": "execute",
+      "description": "Reserved for approved recovery workers"
+    },
+    {
+      "resource": "crm.pipelines",
+      "action": "read",
+      "description": "View CRM pipelines"
+    },
+    {
+      "resource": "crm.pipelines",
+      "action": "write",
+      "description": "Manage CRM pipelines and stages"
+    },
+    {
+      "resource": "crm.pipelines",
+      "action": "delete",
+      "description": "Delete CRM pipelines and stages"
+    },
+    {
+      "resource": "crm.leads",
+      "action": "read",
+      "description": "View CRM leads"
+    },
+    {
+      "resource": "crm.leads",
+      "action": "write",
+      "description": "Create, edit, and move CRM leads"
+    },
+    {
+      "resource": "crm.leads",
+      "action": "delete",
+      "description": "Archive CRM leads"
+    },
+    {
+      "resource": "crm.automations",
+      "action": "read",
+      "description": "View CRM automation policies and runs"
+    },
+    {
+      "resource": "crm.automations",
+      "action": "write",
+      "description": "Create and edit CRM automation policies"
+    },
+    {
+      "resource": "crm.automations",
+      "action": "delete",
+      "description": "Archive CRM automation policies"
+    },
+    {
+      "resource": "crm.automations",
+      "action": "execute",
+      "description": "Preview, activate, and pause CRM automation policies"
+    },
+    {
+      "resource": "tasks",
+      "action": "read",
+      "description": "View follow-up tasks"
+    },
+    {
+      "resource": "tasks",
+      "action": "write",
+      "description": "Create and complete follow-up tasks"
+    },
+    {
+      "resource": "tasks",
+      "action": "delete",
+      "description": "Cancel follow-up tasks"
+    },
+    {
+      "resource": "bookings",
+      "action": "read",
+      "description": "View bookings and classes"
+    },
+    {
+      "resource": "bookings",
+      "action": "write",
+      "description": "Create and transition bookings"
+    },
+    {
+      "resource": "bookings",
+      "action": "delete",
+      "description": "Cancel booking records"
+    },
+    {
+      "resource": "booking.settings",
+      "action": "read",
+      "description": "View services, resources, and availability"
+    },
+    {
+      "resource": "booking.settings",
+      "action": "write",
+      "description": "Manage services, resources, and availability"
+    },
+    {
+      "resource": "booking.settings",
+      "action": "delete",
+      "description": "Delete unused inactive services and resources"
+    },
+    {
+      "resource": "packages",
+      "action": "read",
+      "description": "View packages"
+    },
+    {
+      "resource": "packages",
+      "action": "write",
+      "description": "Manage packages and customer purchases"
+    },
+    {
+      "resource": "packages",
+      "action": "delete",
+      "description": "Retire packages"
+    },
+    {
+      "resource": "credits",
+      "action": "read",
+      "description": "View package credit balances"
+    },
+    {
+      "resource": "credits",
+      "action": "execute",
+      "description": "Adjust or redeem package credits"
+    },
+    {
+      "resource": "payments",
+      "action": "read",
+      "description": "View invoices and payments"
+    },
+    {
+      "resource": "payments",
+      "action": "write",
+      "description": "Create invoices and payment intents"
+    },
+    {
+      "resource": "payments.refunds",
+      "action": "execute",
+      "description": "Issue payment refunds"
+    },
+    {
+      "resource": "copilot",
+      "action": "read",
+      "description": "View AI Copilot runs"
+    },
+    {
+      "resource": "copilot",
+      "action": "execute",
+      "description": "Generate and approve Copilot suggestions"
+    },
+    {
+      "resource": "channel_accounts",
+      "action": "read",
+      "description": "View channel connections"
+    },
+    {
+      "resource": "channel_accounts",
+      "action": "write",
+      "description": "Connect and configure channels"
+    },
+    {
+      "resource": "channel_accounts",
+      "action": "delete",
+      "description": "Disconnect channels"
+    },
+    {
+      "resource": "conversations",
+      "action": "read",
+      "description": "View omnichannel conversations"
+    },
+    {
+      "resource": "conversations",
+      "action": "write",
+      "description": "Reply to and manage omnichannel conversations"
+    }
+  ],
+  "system_role_permissions": {
+    "admin": [
+      "users:read",
+      "users:write",
+      "users:delete",
+      "teams:read",
+      "teams:write",
+      "teams:delete",
+      "roles:read",
+      "roles:write",
+      "roles:delete",
+      "settings.general:read",
+      "settings.general:write",
+      "settings.chatbot:read",
+      "settings.chatbot:write",
+      "settings.sso:read",
+      "settings.sso:write",
+      "settings.calling:read",
+      "settings.calling:write",
+      "settings.integrations:read",
+      "settings.integrations:write",
+      "accounts:read",
+      "accounts:write",
+      "accounts:delete",
+      "templates:read",
+      "templates:write",
+      "templates:delete",
+      "templates:sync",
+      "flows.whatsapp:read",
+      "flows.whatsapp:write",
+      "flows.whatsapp:delete",
+      "flows.chatbot:read",
+      "flows.chatbot:write",
+      "flows.chatbot:delete",
+      "campaigns:read",
+      "campaigns:write",
+      "campaigns:delete",
+      "campaigns:execute",
+      "chatbot.keywords:read",
+      "chatbot.keywords:write",
+      "chatbot.keywords:delete",
+      "chatbot.ai:read",
+      "chatbot.ai:write",
+      "chatbot.ai:delete",
+      "chat:read",
+      "chat:write",
+      "chat.assign:write",
+      "contacts:read",
+      "contacts:write",
+      "contacts:delete",
+      "contacts:import",
+      "contacts:export",
+      "contacts.identity_review:write",
+      "tags:read",
+      "tags:write",
+      "tags:delete",
+      "analytics:read",
+      "analytics:write",
+      "analytics:delete",
+      "analytics.agents:read",
+      "transfers:read",
+      "transfers:write",
+      "transfers:pickup",
+      "webhooks:read",
+      "webhooks:write",
+      "webhooks:delete",
+      "api_keys:read",
+      "api_keys:write",
+      "api_keys:delete",
+      "canned_responses:read",
+      "canned_responses:write",
+      "canned_responses:delete",
+      "custom_actions:read",
+      "custom_actions:write",
+      "custom_actions:delete",
+      "organizations:read",
+      "organizations:write",
+      "organizations:delete",
+      "organizations:assign",
+      "call_logs:read",
+      "ivr_flows:read",
+      "ivr_flows:write",
+      "ivr_flows:delete",
+      "call_transfers:read",
+      "call_transfers:write",
+      "outgoing_calls:read",
+      "outgoing_calls:write",
+      "audit_logs:read",
+      "billing:read",
+      "billing:write",
+      "entitlements:read",
+      "entitlements:write",
+      "onboarding:read",
+      "onboarding:write",
+      "workspace_templates:read",
+      "workspace_templates:write",
+      "privacy.settings:read",
+      "privacy.settings:write",
+      "privacy.consents:read",
+      "privacy.consents:write",
+      "privacy.requests:read",
+      "privacy.requests:write",
+      "privacy.requests:execute",
+      "privacy.incidents:read",
+      "privacy.incidents:write",
+      "support:read",
+      "support:write",
+      "operations:read",
+      "operations:execute",
+      "crm.pipelines:read",
+      "crm.pipelines:write",
+      "crm.pipelines:delete",
+      "crm.leads:read",
+      "crm.leads:write",
+      "crm.leads:delete",
+      "crm.automations:read",
+      "crm.automations:write",
+      "crm.automations:delete",
+      "crm.automations:execute",
+      "tasks:read",
+      "tasks:write",
+      "tasks:delete",
+      "bookings:read",
+      "bookings:write",
+      "bookings:delete",
+      "booking.settings:read",
+      "booking.settings:write",
+      "booking.settings:delete",
+      "packages:read",
+      "packages:write",
+      "packages:delete",
+      "credits:read",
+      "credits:execute",
+      "payments:read",
+      "payments:write",
+      "payments.refunds:execute",
+      "copilot:read",
+      "copilot:execute",
+      "channel_accounts:read",
+      "channel_accounts:write",
+      "channel_accounts:delete",
+      "conversations:read",
+      "conversations:write"
+    ],
+    "agent": [
+      "accounts:read",
+      "chat:read",
+      "chat:write",
+      "contacts:read",
+      "tags:read",
+      "analytics.agents:read",
+      "transfers:read",
+      "transfers:write",
+      "transfers:pickup",
+      "canned_responses:read",
+      "call_transfers:read",
+      "call_transfers:write",
+      "outgoing_calls:read",
+      "outgoing_calls:write",
+      "crm.pipelines:read",
+      "crm.leads:read",
+      "crm.leads:write",
+      "crm.automations:read",
+      "tasks:read",
+      "tasks:write",
+      "bookings:read",
+      "bookings:write",
+      "booking.settings:read",
+      "packages:read",
+      "credits:read",
+      "payments:read",
+      "copilot:read",
+      "copilot:execute",
+      "channel_accounts:read",
+      "conversations:read",
+      "conversations:write"
+    ],
+    "manager": [
+      "teams:read",
+      "settings.general:read",
+      "settings.chatbot:read",
+      "settings.chatbot:write",
+      "accounts:read",
+      "accounts:write",
+      "accounts:delete",
+      "templates:read",
+      "templates:write",
+      "templates:delete",
+      "templates:sync",
+      "flows.whatsapp:read",
+      "flows.whatsapp:write",
+      "flows.whatsapp:delete",
+      "flows.chatbot:read",
+      "flows.chatbot:write",
+      "flows.chatbot:delete",
+      "campaigns:read",
+      "campaigns:write",
+      "campaigns:delete",
+      "campaigns:execute",
+      "chatbot.keywords:read",
+      "chatbot.keywords:write",
+      "chatbot.keywords:delete",
+      "chatbot.ai:read",
+      "chatbot.ai:write",
+      "chatbot.ai:delete",
+      "chat:read",
+      "chat:write",
+      "chat.assign:write",
+      "contacts:read",
+      "contacts:write",
+      "contacts:delete",
+      "contacts:import",
+      "contacts:export",
+      "tags:read",
+      "tags:write",
+      "tags:delete",
+      "analytics:read",
+      "analytics.agents:read",
+      "transfers:read",
+      "transfers:write",
+      "transfers:pickup",
+      "canned_responses:read",
+      "canned_responses:write",
+      "canned_responses:delete",
+      "organizations:read",
+      "call_logs:read",
+      "ivr_flows:read",
+      "ivr_flows:write",
+      "ivr_flows:delete",
+      "call_transfers:read",
+      "call_transfers:write",
+      "outgoing_calls:read",
+      "outgoing_calls:write",
+      "billing:read",
+      "entitlements:read",
+      "onboarding:read",
+      "onboarding:write",
+      "workspace_templates:read",
+      "privacy.consents:read",
+      "privacy.consents:write",
+      "crm.pipelines:read",
+      "crm.pipelines:write",
+      "crm.leads:read",
+      "crm.leads:write",
+      "crm.leads:delete",
+      "crm.automations:read",
+      "crm.automations:write",
+      "crm.automations:delete",
+      "crm.automations:execute",
+      "tasks:read",
+      "tasks:write",
+      "tasks:delete",
+      "bookings:read",
+      "bookings:write",
+      "bookings:delete",
+      "booking.settings:read",
+      "booking.settings:write",
+      "booking.settings:delete",
+      "packages:read",
+      "packages:write",
+      "packages:delete",
+      "credits:read",
+      "payments:read",
+      "payments:write",
+      "copilot:read",
+      "copilot:execute",
+      "channel_accounts:read",
+      "channel_accounts:write",
+      "conversations:read",
+      "conversations:write"
+    ]
+  },
+  "system_role_definitions": [
+    {
+      "Description": "Full system access",
+      "IsDefault": false,
+      "Name": "admin"
+    },
+    {
+      "Description": "Manage chatbot, campaigns, and team operations",
+      "IsDefault": false,
+      "Name": "manager"
+    },
+    {
+      "Description": "Handle customer conversations",
+      "IsDefault": true,
+      "Name": "agent"
+    }
+  ],
+  "catalog_constants": {
+    "PlatformResellerSlug": "platform-direct",
+    "reReplyCatalogScopeKey": "platform",
+    "reReplyCatalogSeedVersion": 1,
+    "reReplyCatalogSeedVersionKey": "rereply_catalog_seed_version",
+    "reReplyGrowthPlanCode": "rereply-growth",
+    "reReplyGrowthPriceCode": "rereply-growth-myr-month-2026-v1",
+    "reReplyLegacyGrowthMonthlyPrice": "rereply-growth-myr-month",
+    "reReplyStarterPlanCode": "rereply-starter",
+    "reReplyStarterPriceCode": "rereply-starter-myr-month-2026-v1"
+  },
+  "product_catalog": [
+    {
+      "Code": "rereply-starter",
+      "Description": "An always-on WhatsApp front desk with chatbot, campaigns, templates and customer conversations.",
+      "DisplayOrder": 10,
+      "EntitlementState": {
+        "bookings.enabled": false,
+        "commerce.enabled": false,
+        "copilot.enabled": false,
+        "crm.enabled": false,
+        "omnichannel.enabled": false,
+        "threads.public_engagement.enabled": false
+      },
+      "Name": "ReReply Starter",
+      "PriceCode": "rereply-starter-myr-month-2026-v1",
+      "TrialDays": 14,
+      "UnitAmountMinor": 30000
+    },
+    {
+      "Code": "rereply-growth",
+      "Description": "One customer journey across shared inbox, CRM, automations, bookings, commerce and reviewed AI.",
+      "DisplayOrder": 20,
+      "EntitlementState": {
+        "bookings.enabled": true,
+        "commerce.enabled": true,
+        "copilot.enabled": true,
+        "crm.enabled": true,
+        "omnichannel.enabled": true,
+        "threads.public_engagement.enabled": false
+      },
+      "Name": "ReReply Growth",
+      "PriceCode": "rereply-growth-myr-month-2026-v1",
+      "TrialDays": 14,
+      "UnitAmountMinor": 60000
+    }
+  ],
+  "widget_defaults": [
+    {
+      "Color": "blue",
+      "Config": null,
+      "DataSource": "messages",
+      "Description": "Total number of messages sent and received",
+      "DisplayOrder": 1,
+      "DisplayType": "number",
+      "GridH": 3,
+      "GridW": 3,
+      "GridX": 0,
+      "GridY": 0,
+      "IsDefault": true,
+      "IsShared": true,
+      "Metric": "count",
+      "Name": "Total Messages",
+      "ShowChange": true,
+      "Size": "small"
+    },
+    {
+      "Color": "green",
+      "Config": null,
+      "DataSource": "contacts",
+      "Description": "Number of contacts with recent activity",
+      "DisplayOrder": 2,
+      "DisplayType": "number",
+      "GridH": 3,
+      "GridW": 3,
+      "GridX": 3,
+      "GridY": 0,
+      "IsDefault": true,
+      "IsShared": true,
+      "Metric": "count",
+      "Name": "Active Contacts",
+      "ShowChange": true,
+      "Size": "small"
+    },
+    {
+      "Color": "purple",
+      "Config": null,
+      "DataSource": "sessions",
+      "Description": "Active chatbot conversation sessions",
+      "DisplayOrder": 3,
+      "DisplayType": "number",
+      "GridH": 3,
+      "GridW": 3,
+      "GridX": 6,
+      "GridY": 0,
+      "IsDefault": true,
+      "IsShared": true,
+      "Metric": "count",
+      "Name": "Chatbot Sessions",
+      "ShowChange": true,
+      "Size": "small"
+    },
+    {
+      "Color": "orange",
+      "Config": null,
+      "DataSource": "campaigns",
+      "Description": "Number of bulk message campaigns",
+      "DisplayOrder": 4,
+      "DisplayType": "number",
+      "GridH": 3,
+      "GridW": 3,
+      "GridX": 9,
+      "GridY": 0,
+      "IsDefault": true,
+      "IsShared": true,
+      "Metric": "count",
+      "Name": "Total Campaigns",
+      "ShowChange": true,
+      "Size": "small"
+    },
+    {
+      "Color": "",
+      "Config": null,
+      "DataSource": "messages",
+      "Description": "Latest conversations from your contacts",
+      "DisplayOrder": 5,
+      "DisplayType": "table",
+      "GridH": 8,
+      "GridW": 6,
+      "GridX": 0,
+      "GridY": 3,
+      "IsDefault": true,
+      "IsShared": true,
+      "Metric": "count",
+      "Name": "Recent Messages",
+      "ShowChange": false,
+      "Size": "small"
+    },
+    {
+      "Color": "",
+      "Config": {
+        "shortcuts": [
+          "chat",
+          "campaigns",
+          "templates",
+          "chatbot"
+        ]
+      },
+      "DataSource": "shortcuts",
+      "Description": "Common tasks and shortcuts",
+      "DisplayOrder": 6,
+      "DisplayType": "shortcuts",
+      "GridH": 8,
+      "GridW": 6,
+      "GridX": 6,
+      "GridY": 3,
+      "IsDefault": true,
+      "IsShared": true,
+      "Metric": "count",
+      "Name": "Quick Actions",
+      "ShowChange": false,
+      "Size": "small"
+    }
+  ],
+  "widget_runtime_identities": {
+    "BaseModel.ID": "new UUID at execution; excluded from static seeds",
+    "OrganizationID": "organization argument",
+    "UserID": "user argument pointer"
+  },
+  "manager_policy": {
+    "retired_permissions": {
+      "custom_actions:delete": {},
+      "custom_actions:read": {},
+      "custom_actions:write": {},
+      "privacy.requests:read": {},
+      "privacy.requests:write": {},
+      "privacy.settings:read": {},
+      "privacy.settings:write": {},
+      "settings.general:write": {},
+      "support:read": {},
+      "support:write": {},
+      "webhooks:delete": {},
+      "webhooks:read": {},
+      "webhooks:write": {}
+    },
+    "version": 1,
+    "version_key": "system_manager_settings_policy_version"
+  }
+}
