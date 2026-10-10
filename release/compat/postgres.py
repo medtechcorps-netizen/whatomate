@@ -1,7 +1,9 @@
 """Synthetic-only PostgreSQL observations; no experiment lifecycle or verdict.
 
-There is no DSN input. SQL runs via psql on loopback *inside* an explicitly
-bound task-owned PG17 container. The synthetic cluster administrator observes
+There is no DSN input. SQL runs via psql on a fixed Unix socket *inside* an
+explicitly bound task-owned PG17 container. No password is transported; this
+requires the synthetic cluster's local trust rule, while host SCRAM remains
+unchanged. The synthetic cluster administrator observes
 all rows without changing owner/runtime privileges or FORCE RLS. Raw row/SQL
 bytes and object names are private working data, never a public artifact.
 Catalog hashing remains the existing Go catalog command's responsibility;
@@ -25,6 +27,7 @@ import runtime
 
 MAX_ROWS = 1_000_000
 MAX_COLUMNS = 1600
+SOCKET_DIRECTORY = "/var/run/postgresql"
 LABEL = "codex.compat"
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,62}\Z")
@@ -227,7 +230,8 @@ class SyntheticPostgres:
         need(len(raw) <= runtime.MIB)
         result = self._call(['exec', '-i', '--env', 'PGAPPNAME=compat-observer', '--env', 'PGCLIENTENCODING=UTF8',
                              '--env', 'PGOPTIONS=-c default_transaction_read_only=' + ('on' if readonly else 'off'),
-                             self.container, 'psql', '-X', '-qAt', '-h', '127.0.0.1', '-U', 'postgres', '-d', 'compat',
+                             self.container, 'psql', '-X', '-w', '-qAt', '-h', SOCKET_DIRECTORY,
+                             '-p', '5432', '-U', 'postgres', '-d', 'compat',
                              '-v', 'ON_ERROR_STOP=1'], input_bytes=raw)
         if result.returncode != 0:
             raise proof.InfrastructureFailure('capture')

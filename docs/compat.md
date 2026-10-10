@@ -243,6 +243,10 @@ inside an explicitly bound, task-owned PostgreSQL 17 container. It has no DSN
 input. Container identity, label, image and network isolation are checked;
 host mounts and published ports are refused. SQL reaches fixed database
 `compat` through bounded standard input to `psql` inside that container.
+The observer uses the fixed `/var/run/postgresql` Unix socket with password
+prompting disabled. Only this disposable cluster uses local trust; application
+TCP connections retain SCRAM authentication. No password is passed to the
+collector and a failed socket connection has no TCP or password fallback.
 
 The synthetic administrator observes all rows, including rows hidden by FORCE
 RLS, while the migration owner remains a non-superuser and the separate runtime
@@ -269,10 +273,37 @@ collector validation, not a full release compatibility experiment. Catalog
 normalization remains the existing Go command's responsibility; the collector
 does not invent a second catalog hash or claim production-overlay coverage.
 
+## Owned synthetic services
+
+`stack.py` owns a disposable internal network and three services: the pinned
+PostgreSQL 17 and Redis images, and the existing Graph stub built from the
+bound source. Images must already exist; this module does not build or pull.
+Graph image labels bind the expected source and recipe locally. They do not
+replace separate build validation or image attestation.
+
+Containers use tmpfs storage, a read-only root filesystem, explicit resource
+limits and no published host ports or host mounts. The PostgreSQL observer's
+fixed socket directory is pinned in the server configuration. Generated
+fixture secrets remain private; public evidence contains only resource and
+operation metadata. Process-running checks are not readiness checks.
+
+Creation is attempted once. Cleanup uses recorded full IDs and freshly checks
+ownership, configuration, network membership and start identity before acting.
+An unknown command outcome or foreign network attachment refuses further
+actions. Cleanup confirms each resource's absence and does not prune or adopt
+resources by name. The mocked tests cover these boundaries and composition
+with the socket collector; live integration is still pending.
+
+There is no web service or in-network controller in this module. Those need
+separate reviewed ownership and transport integration. The existing internal
+network must not silently gain a host port or Docker socket to make a caller
+reachable. Meta-relay integration remains separate from this three-service
+foundation.
+
 ## Remaining runner and workflow work
 
 The later PR8 runner must resolve and verify the previous record/image,
-validate source and classifier bindings, create the internal Docker network,
+validate source and classifier bindings, integrate the owned services,
 prepare the PG17 synthetic cluster, collect the complete observations above,
 and publish/attest the result. It must keep infrastructure failures distinct
 from semantic compatibility results. No workflow or runner is added here.

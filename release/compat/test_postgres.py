@@ -124,7 +124,11 @@ class CollectorTests(unittest.TestCase):
         sql_calls = [c for c in self.fake.calls if c[0][5:7] == ['exec', '-i']]
         self.assertEqual(len(sql_calls), 1)
         argv, options = sql_calls[0]
-        self.assertIn('127.0.0.1', argv)
+        self.assertEqual(argv[argv.index('-h') + 1], '/var/run/postgresql')
+        self.assertEqual(argv[argv.index('-p') + 1], '5432')
+        self.assertIn('-w', argv)
+        self.assertNotIn('127.0.0.1', argv)
+        self.assertFalse(any('PGPASSWORD' in arg or 'PGPASSFILE' in arg for arg in argv))
         self.assertIn('compat', argv)
         self.assertNotIn('PGHOST', options['env'])
         self.assertNotIn('DOCKER_HOST', options['env'])
@@ -145,6 +149,16 @@ class CollectorTests(unittest.TestCase):
         self.assertNotEqual(self.db.capture_tables().public(), empty)
         self.fake.rows = [['row', 'fixture', ['a\nb\t\u0085\u2028雪']]]
         self.assertTrue(self.db.capture_tables().public()['complete'])
+
+    def test_socket_auth_failure_has_no_password_or_tcp_fallback(self):
+        self.fake.fail_sql = True
+        with self.assertRaisesRegex(proof.InfrastructureFailure, '^capture$') as caught:
+            self.db.capture_tables()
+        calls = [argv for argv, _ in self.fake.calls if argv[5:7] == ['exec', '-i']]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][calls[0].index('-h') + 1], pg.SOCKET_DIRECTORY)
+        self.assertFalse(any('PGPASSWORD' in arg or 'PGPASSFILE' in arg for arg in calls[0]))
+        self.assertNotIn('private', str(caught.exception))
 
     def test_empty_tables_and_distinct_identifier_encoding(self):
         self.fake.inventory.append(['empty', 'r', []])
