@@ -62,6 +62,7 @@ class ModeBoundaryTests(unittest.TestCase):
             for drill in ship.DRILLS | {"unknown", ""}:
                 with self.subTest(mode=mode, drill=drill):
                     env = {"SHIP_MODE": mode, "SHIP_DRILL": drill,
+                           "GITHUB_ACTOR": common.APPROVER_LOGIN,
                            "SHIP_TARGET_RELEASE": "prod-0000" if mode == "rollback" else ""}
                     allowed = drill in ship.DRILLS and (mode == "stage" or drill == "none")
                     if allowed:
@@ -74,8 +75,8 @@ class ModeBoundaryTests(unittest.TestCase):
     def test_forbidden_ambient_addition_is_exact(self):
         self.assertIn("STAGING_DO_TOKEN", common.FORBIDDEN_AMBIENT)
         self.assertIn("STAGING_TARGET_JSON", common.FORBIDDEN_AMBIENT)
-        self.assertEqual(ship.PUT_MODES, {"promote", "rollback"})
-        self.assertEqual(ship.PRODUCTION_MODES, {"dry-run", "promote", "rollback"})
+        self.assertEqual(ship.PUT_MODES, {"promote", "rollback", ship.BYPASS_MODE})
+        self.assertEqual(ship.PRODUCTION_MODES, {"dry-run", "promote", "rollback", ship.BYPASS_MODE})
 
 
 if __name__ == "__main__":
