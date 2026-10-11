@@ -33,9 +33,31 @@ def environment(event="push", ref="refs/heads/main", attempt="1"):
 def snapshot(ctx):
     old = {"release": TAG, "manifest_sha256": "1" * 64, "sha": OLD, "web_digest": DIGEST}
     latest = dict(old) if ctx.target is None else {"release": LATEST_TAG, "manifest_sha256": "2" * 64, "sha": LATEST, "web_digest": "sha256:" + "e" * 64}
-    return {"version": 2, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
+    return {"version": 3, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
             "requested_rollback_target": ctx.target, "latest": latest, "selected": old,
+            "database_base": {"mode": "legacy-source-only", "source_sha": latest["sha"],
+                              "origin": None, "catalog": None},
+            "selected_web_source_sha": OLD,
             "preview": {"kind": "none", "dormant": False, "blocked": False}}
+
+
+def resolved(ctx, *, blocked=False):
+    """Synthetic projection for CLI wiring tests; not authentication evidence."""
+    r, p = cli.record_resolver, cli.record_resolver.policy
+    snap = snapshot(ctx)
+    def selection(name, index):
+        row = snap[name]
+        images = tuple((key, row["web_digest"] if key == "web" else "sha256:" + "8" * 64)
+                       for key in cli.common.COMPONENTS)
+        return r.ReleaseSelection(index, row["release"], row["sha"], row["manifest_sha256"],
+            images, row["sha"], p.legacy_reader0(row["sha"]), None)
+    latest = selection("latest", 1)
+    selected = latest if ctx.target is None else selection("selected", 0)
+    chain = r.ResolvedChain(None, None, (), latest, selected)
+    classification = cli.schema_change.PolicyClassification("none", False,
+        ("synthetic-block",) if blocked else (), (), (), ())
+    return r.ForwardResolution(chain, p.legacy_reader0(ctx.sha), classification,
+        b"synthetic", "0" * 64, selected.actual_web_source_sha, latest.record_sha, None, None)
 
 
 def result(ctx):
@@ -98,39 +120,25 @@ class SnapshotTests(unittest.TestCase):
 
     def test_single_chain_freezes_latest_and_explicit_selection(self):
         env = environment("workflow_dispatch"); env["COMPAT_ROLLBACK_TARGET"] = TAG
-        ctx = cli.context(env)
-        old = SimpleNamespace(release=TAG, sha=OLD, images={"web": DIGEST}, manifest_sha256="1" * 64)
-        latest = SimpleNamespace(release=LATEST_TAG, sha=LATEST, images={"web": "sha256:" + "e" * 64}, manifest_sha256="2" * 64)
-        chain = cli.records.Chain((old, latest)); client = SimpleNamespace(work_dir=Path("/private"))
-        source = mock.Mock()
-        with mock.patch.object(cli.images, "_verification_transport", return_value=contextlib.nullcontext()), \
-             mock.patch.object(cli.images, "_Source", return_value=source), \
-             mock.patch.object(cli.records, "load_bootstrap", return_value="bootstrap"), \
-             mock.patch.object(cli.records, "resolve_chain", return_value=chain) as resolve, \
-             mock.patch.object(cli.records, "verify_images") as verify, \
-             mock.patch.object(cli.schema_change, "classify", return_value=SimpleNamespace(kind="data", dormant=True, reasons=())) as classify:
-            value = cli.preview(Path("/repo"), ctx, client)
-        self.assertEqual(resolve.call_count, 1)
-        self.assertEqual(verify.call_args_list, [mock.call(client, latest.images, LATEST, "bootstrap"),
-                                                mock.call(client, old.images, OLD, "bootstrap")])
-        classify.assert_called_once_with(Path("/repo"), LATEST, SHA, mode="forward")
+        ctx = cli.context(env); resolution = resolved(ctx)
+        client = object(); deadline = cli.images._Deadline(); binary = Path("/git")
+        with mock.patch.object(cli.record_resolver, "resolve_forward", return_value=resolution) as resolve:
+            value = cli.preview(Path("/repo"), ctx, client, git_binary=binary, deadline=deadline)
+        resolve.assert_called_once_with(client, Path("/repo"), binary, SHA, selected_tag=TAG)
         self.assertEqual(value["latest"]["sha"], LATEST)
         self.assertEqual(value["selected"]["sha"], OLD)
-        self.assertEqual(value["version"], 2)
+        self.assertEqual(value["version"], 3)
         self.assertEqual(value["selected"]["manifest_sha256"], "1" * 64)
-        self.assertEqual(value["latest"]["manifest_sha256"], "2" * 64)
+        self.assertEqual(value["database_base"]["source_sha"], LATEST)
+        self.assertEqual(value["selected_web_source_sha"], OLD)
+        self.assertTrue(value["preview"]["blocked"])  # Dedicated target proof is not the normal lane.
 
     def test_unknown_target_or_signature_failure_has_no_snapshot(self):
         env = environment("workflow_dispatch"); env["COMPAT_ROLLBACK_TARGET"] = TAG
         ctx = cli.context(env)
-        latest = SimpleNamespace(release=LATEST_TAG, sha=LATEST, images={"web": DIGEST})
-        client = SimpleNamespace(work_dir=Path("/private"))
-        with mock.patch.object(cli.images, "_verification_transport", return_value=contextlib.nullcontext()), \
-             mock.patch.object(cli.images, "_Source"), mock.patch.object(cli.records, "load_bootstrap"), \
-             mock.patch.object(cli.records, "resolve_chain", return_value=cli.records.Chain((latest,))), \
-             mock.patch.object(cli.records, "verify_images") as verify:
-            with self.assertRaises(cli.proof.EvidenceError): cli.preview(Path("/repo"), ctx, client)
-            verify.assert_not_called()
+        with mock.patch.object(cli.record_resolver, "resolve_forward", side_effect=cli.common.ReleaseError("synthetic")):
+            with self.assertRaises(cli.common.ReleaseError):
+                cli.preview(Path("/repo"), ctx, object(), git_binary=Path("/git"), deadline=cli.images._Deadline())
 
 
 class RunTests(unittest.TestCase):
@@ -139,14 +147,16 @@ class RunTests(unittest.TestCase):
         self.snap = snapshot(self.ctx)
         self.raw = cli.proof.result_bytes(result(self.ctx))
 
-    def test_selected_tag_sha_and_locations_pass_to_real_verifier(self):
-        client = object()
+    def test_fresh_full_resolution_and_same_deadline_pass_to_engine(self):
+        client = object(); resolution = resolved(self.ctx); deadline = cli.images._Deadline()
         options = dict(docker_binary="/docker", config_dir=Path("/config"),
                        image_work_dir=Path("/images"), buildx_binary=Path("/buildx"))
-        with mock.patch.object(cli.compat, "run_experiment", return_value=self.raw) as run:
-            self.assertEqual(cli.execute(Path("/repo"), self.ctx, client, self.snap, **options), self.raw)
-        run.assert_called_once_with(Path("/repo"), SHA, self.ctx.run_id, 2, client, **options,
-            rollback_target=TAG, expected_previous_sha=OLD)
+        with mock.patch.object(cli.record_resolver, "resolve_forward", return_value=resolution) as resolve, \
+             mock.patch.object(cli.compat, "_run_resolved_experiment", return_value=self.raw, create=True) as run:
+            self.assertEqual(cli.execute(Path("/repo"), self.ctx, client, self.snap,
+                git_binary=Path("/git"), deadline=deadline, **options), self.raw)
+        resolve.assert_called_once_with(client, Path("/repo"), Path("/git"), SHA)
+        run.assert_called_once_with(Path("/repo"), resolution, self.ctx.run_id, 2, deadline=deadline, **options)
 
     def test_result_bindings_noncanonical_and_extra_fields_refuse(self):
         mutations = [lambda v: v.update(sha=OLD), lambda v: v.update(run_attempt=1),
@@ -172,7 +182,8 @@ class RunTests(unittest.TestCase):
         with mock.patch.object(cli.compat, "run_experiment") as run:
             with self.assertRaises(cli.proof.EvidenceError):
                 cli.execute(Path("/repo"), self.ctx, object(), self.snap, docker_binary="/docker",
-                    config_dir=Path("/config"), image_work_dir=Path("/images"), buildx_binary=Path("/buildx"))
+                    config_dir=Path("/config"), image_work_dir=Path("/images"), buildx_binary=Path("/buildx"),
+                    git_binary=Path("/git"), deadline=cli.images._Deadline())
         run.assert_not_called()
 
 
@@ -184,24 +195,17 @@ class FileAndEntryTests(unittest.TestCase):
                 repo.mkdir(); runner.mkdir()
                 env = environment("pull_request", "refs/pull/267/merge", "2")
                 env["RUNNER_TEMP"] = str(runner)
-                ctx = cli.context(env)
-                entry = SimpleNamespace(release=TAG, sha=OLD, images={"web": DIGEST}, manifest_sha256="1" * 64)
-                client = SimpleNamespace(work_dir=runner / "private-chain")
-                source = mock.Mock()
-                client_environments = []
-                def client_for(work, actual_env):
-                    client_environments.append(dict(actual_env))
+                ctx = cli.context(env); resolution = resolved(ctx, blocked=blocked); client = object()
+                client_environments = []; deadlines = []
+                def client_for(work, actual_env, deadline):
+                    client_environments.append(dict(actual_env)); deadlines.append(deadline)
+                    self.assertLessEqual(deadline.remaining(), 240)
                     return client
                 with mock.patch.dict(cli.os.environ, env, clear=True), \
                      mock.patch.object(Path, "cwd", return_value=repo), \
+                     mock.patch.object(cli, "_git_binary", return_value=Path("/git")), \
                      mock.patch.object(cli, "_client", side_effect=client_for) as make_client, \
-                     mock.patch.object(cli.images, "_verification_transport", return_value=contextlib.nullcontext()), \
-                     mock.patch.object(cli.images, "_Source", return_value=source) as make_source, \
-                     mock.patch.object(cli.records, "load_bootstrap", return_value="bootstrap"), \
-                     mock.patch.object(cli.records, "resolve_chain", return_value=cli.records.Chain((entry,))) as resolve, \
-                     mock.patch.object(cli.records, "verify_images") as verify, \
-                     mock.patch.object(cli.schema_change, "classify", return_value=SimpleNamespace(
-                         kind="none", dormant=False, reasons=("synthetic-block",) if blocked else ())), \
+                     mock.patch.object(cli.record_resolver, "resolve_forward", return_value=resolution) as resolve, \
                      contextlib.redirect_stdout(io.StringIO()) as stdout, \
                      contextlib.redirect_stderr(io.StringIO()) as stderr:
                     status = cli.main(["preview"])
@@ -213,24 +217,27 @@ class FileAndEntryTests(unittest.TestCase):
                 make_client.assert_called_once()
                 self.assertEqual(make_client.call_args.args[0], work)
                 self.assertEqual(client_environments, [env])
-                make_source.assert_called_once_with(repo, SHA, mock.ANY)
-                self.assertEqual(source.clean.call_count, 2)
-                resolve.assert_called_once_with(client, repo, bootstrap="bootstrap", work_dir=client.work_dir)
-                verify.assert_called_once_with(client, entry.images, OLD, "bootstrap")
+                self.assertIs(make_client.call_args.args[2], deadlines[0])
+                resolve.assert_called_once_with(client, repo, Path("/git"), SHA, selected_tag=None)
 
-    def test_client_version_setup_is_five_seconds_and_restores_transport(self):
+    def test_client_version_setup_is_inside_shared_deadline_and_five_seconds(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
             for name in ("gh-config", "gh-work"):
                 (root / name).mkdir()
             binary = root / "gh"; binary.touch()
             env = {"COMPAT_GH_BIN": str(binary), "GH_TOKEN": "synthetic-not-a-credential"}
+            deadline = cli.images._Deadline()
             with mock.patch.object(cli.runtime, "bounded_command",
                  return_value=cli.runtime.Capture(0, b"gh version 2.98.0 (2026-10-08)\n", b"")) as capture:
-                client = cli._client(root, env)
-                self.assertIs(client.capture, capture)
+                client = cli._client(root, env, deadline)
+                self.assertIs(type(client), cli.record_transport.ReleaseGh)
+                self.assertIs(client.budget.clock, deadline.clock)
+                self.assertEqual(client.budget.commands, 1)
+                self.assertLessEqual(client.budget._deadline, deadline.end)
                 self.assertEqual(capture.call_args.args[0], [str(binary), "--version"])
                 self.assertEqual(capture.call_args.kwargs["timeout"], 5)
+                client.budget.close()
 
     def test_fresh_private_directories_and_create_only_bounded_public_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -288,6 +295,7 @@ class FileAndEntryTests(unittest.TestCase):
                  mock.patch.object(cli.images, "_READY_FOR_EXECUTION", True), \
                  mock.patch.object(cli, "_read_public", return_value=cli.canonical(snapshot(ctx))), \
                  mock.patch.object(cli, "_scratch", return_value=root), mock.patch.object(cli, "_client"), \
+                 mock.patch.object(cli, "_git_binary", return_value=Path("/synthetic-git")), \
                  mock.patch.object(cli, "execute", side_effect=cli.proof.InfrastructureFailure("private-token-should-not-print")), \
                  mock.patch.object(cli, "_write_public") as write, contextlib.redirect_stderr(io.StringIO()) as stderr:
                 self.assertEqual(cli.main(["run"]), 1)
@@ -318,7 +326,8 @@ class FileAndEntryTests(unittest.TestCase):
                 with mock.patch.dict(cli.os.environ, env, clear=True), \
                      mock.patch.object(cli, "_read_public", return_value=cli.canonical(snapshot(ctx))), \
                      mock.patch.object(cli, "_scratch", return_value=root), mock.patch.object(cli, "_client"), \
-                     mock.patch.object(cli, "execute", side_effect=error), \
+                     mock.patch.object(cli, "_git_binary", return_value=Path("/synthetic-git")), \
+                 mock.patch.object(cli, "execute", side_effect=error), \
                      mock.patch.object(cli, "_write_public") as write, \
                      mock.patch.object(cli, "_mark_complete") as mark, \
                      contextlib.redirect_stderr(io.StringIO()) as stderr:
@@ -360,12 +369,14 @@ class EvidenceContextTests(unittest.TestCase):
                 value["reversible"] = False
             raw = cli.proof.result_bytes(value)
             bound = cli.evidence_context(raw, self.snap, self.ctx)
-            self.assertEqual(bound, {"version": 1, "repository": cli.common.REPOSITORY,
+            self.assertEqual(bound, {"version": 2, "repository": cli.common.REPOSITORY,
                 "workflow_path": ".github/workflows/compat.yml", "workflow_sha": SHA,
                 "event": "push", "ref": "refs/heads/main", "sha": SHA,
                 "run_id": self.ctx.run_id, "run_attempt": 2, "requested_rollback_target": None,
                 "latest": self.snap["latest"], "selected": self.snap["selected"],
-                "preview": self.snap["preview"], "result_sha256": hashlib.sha256(raw).hexdigest()})
+                "preview": self.snap["preview"], "database_base": self.snap["database_base"],
+                "selected_web_source_sha": self.snap["selected_web_source_sha"],
+                "result_sha256": hashlib.sha256(raw).hexdigest()})
             encoded = cli.canonical(bound)
             self.assertLess(len(encoded), 4096)
             self.assertEqual(cli.validate_evidence(encoded, raw, self.snap, self.ctx), bound)
@@ -403,7 +414,7 @@ class EvidenceContextTests(unittest.TestCase):
     def test_strict_context_bytes_and_digest_do_not_accept_equivalent_or_foreign_input(self):
         raw = cli.canonical(cli.evidence_context(self.raw, self.snap, self.ctx))
         cases = [b" " + raw, raw[:-1], raw + b" " * 4096, b"\xff", b'{"version":1,"version":1}',
-                 b'{"value":NaN}', b'{"value":Infinity}', b'[]\n', raw.replace(b'"version":1', b'"version":1.0')]
+                 b'{"value":NaN}', b'{"value":Infinity}', b'[]\n', raw.replace(b'"version":2', b'"version":2.0')]
         for case in cases:
             with self.subTest(raw=case[:32]), self.assertRaises((cli.proof.EvidenceError, cli.common.ReleaseError)):
                 cli.validate_evidence(case, self.raw, self.snap, self.ctx)
@@ -419,7 +430,7 @@ class EvidenceContextTests(unittest.TestCase):
             snap = copy.deepcopy(self.snap); mutate(snap)
             with self.assertRaises(cli.proof.EvidenceError): cli.validate_snapshot(snap, self.ctx)
 
-    def test_normal_classification_mismatch_refuses_but_explicit_target_has_distinct_base(self):
+    def test_normal_classification_mismatch_and_explicit_target_refuse(self):
         value = result(self.ctx); value["classification"] = {"kind": "data", "dormant": True}
         with self.assertRaises(cli.proof.EvidenceError):
             cli.evidence_context(cli.proof.result_bytes(value), self.snap, self.ctx)
@@ -427,13 +438,8 @@ class EvidenceContextTests(unittest.TestCase):
             env = environment("workflow_dispatch"); env["COMPAT_ROLLBACK_TARGET"] = target
             ctx = cli.context(env); snap = snapshot(ctx); snap["selected"]["release"] = target
             value = result(ctx); value["previous_release"] = target
-            value["classification"] = {"kind": "data", "dormant": True}
-            raw = cli.proof.result_bytes(value)
-            bound = cli.evidence_context(raw, snap, ctx)
-            self.assertEqual(bound["requested_rollback_target"], target)
-            self.assertEqual(bound["preview"], {"kind": "none", "dormant": False, "blocked": False})
-            self.assertNotEqual(bound["latest"], bound["selected"])
-            self.assertEqual(cli.validate_evidence(cli.canonical(bound), raw, snap, ctx), bound)
+            with self.assertRaisesRegex(cli.proof.EvidenceError, "cli-target-proof-unsupported"):
+                cli.evidence_context(cli.proof.result_bytes(value), snap, ctx)
 
     def test_events_and_attempts_are_independently_rebound_without_new_capabilities(self):
         for event, ref in (("push", "refs/heads/main"), ("pull_request", "refs/pull/268/merge"),
@@ -656,6 +662,7 @@ class DiagnosticTests(unittest.TestCase):
             with mock.patch.dict(cli.os.environ, env, clear=True), \
                  mock.patch.object(cli, "_read_public", return_value=cli.canonical(snapshot(ctx))), \
                  mock.patch.object(cli, "_scratch", return_value=root), mock.patch.object(cli, "_client"), \
+                 mock.patch.object(cli, "_git_binary", return_value=Path("/synthetic-git")), \
                  mock.patch.object(cli, "execute", side_effect=fail), \
                  mock.patch.object(cli, "_write_public") as write, mock.patch.object(cli, "_mark_complete") as mark, \
                  contextlib.redirect_stderr(io.StringIO()) as stderr, contextlib.redirect_stdout(io.StringIO()) as stdout:
@@ -712,6 +719,7 @@ class BuildDiagnosticTests(unittest.TestCase):
                 with mock.patch.dict(cli.os.environ,env,clear=True), \
                      mock.patch.object(cli,'_read_public',return_value=cli.canonical(snapshot(ctx))), \
                      mock.patch.object(cli,'_scratch',return_value=root),mock.patch.object(cli,'_client'), \
+                     mock.patch.object(cli,'_git_binary',return_value=Path('/synthetic-git')), \
                      mock.patch.object(cli,'execute',side_effect=outer), \
                      mock.patch.object(cli,'_write_public') as write,mock.patch.object(cli,'_mark_complete') as mark, \
                      contextlib.redirect_stderr(io.StringIO()) as stderr,contextlib.redirect_stdout(io.StringIO()) as stdout:

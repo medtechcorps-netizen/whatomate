@@ -1,8 +1,8 @@
 """Hosted compatibility entry points using the reviewed experiment adapter.
 
-The preview freezes latest and selected release identities from one verified
-chain. The run re-verifies the selected immutable tag and constrains its SHA;
-it never resolves a second moving latest. Only small canonical public files
+The preview freezes release identities and the retained database origin from
+one verified chain. The run repeats that complete source operation and refuses
+any difference before building images. Only small canonical public files
 leave private scratch. This file does not create or enable a workflow.
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,6 +22,9 @@ import images
 import proof
 import runtime
 import schema_change
+import compat_evidence
+import record_resolver
+import record_transport
 
 common, records = runtime.common, runtime.release_record
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -92,14 +96,36 @@ def regular_path(path, *, directory=False):
 
 
 def _identity(entry):
+    need(type(entry) is record_resolver.ReleaseSelection, "cli-snapshot-identity")
     return {"release": entry.release, "manifest_sha256": entry.manifest_sha256,
-            "sha": entry.sha, "web_digest": entry.images["web"]}
+            "sha": entry.record_sha, "web_digest": dict(entry.images)["web"]}
+
+
+def _resolved_snapshot(resolution, ctx):
+    """Project immutable source data; the caller must run the concrete resolver."""
+    need(type(resolution) is record_resolver.ForwardResolution
+         and resolution.candidate.sha == ctx.sha, "cli-snapshot-context")
+    latest, selected = resolution.resolved.latest, resolution.resolved.selected
+    live = latest.live
+    base = {"mode": "legacy-source-only" if live is None else "retained-live-v2",
+            "source_sha": resolution.database_base_source,
+            "origin": None if live is None else {"release": live.origin_release,
+                       "manifest_sha256": live.origin_manifest_sha256},
+            "catalog": None if live is None else live.catalog._asdict()}
+    classification = resolution.classification
+    value = {"version": 3, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
+             "requested_rollback_target": ctx.target, "latest": _identity(latest), "selected": _identity(selected),
+             "database_base": base, "selected_web_source_sha": resolution.previous_web_source_sha,
+             "preview": {"kind": classification.kind, "dormant": classification.dormant,
+                         "blocked": bool(classification.reasons) or ctx.target is not None}}
+    return validate_snapshot(value, ctx)
 
 
 def validate_snapshot(value, ctx):
     need(type(value) is dict and set(value) == {"version", "sha", "run_id", "run_attempt",
-         "requested_rollback_target", "latest", "selected", "preview"}, "cli-snapshot-invalid")
-    need(type(value["version"]) is int and value["version"] == 2
+         "requested_rollback_target", "latest", "selected", "preview", "database_base",
+         "selected_web_source_sha"}, "cli-snapshot-invalid")
+    need(type(value["version"]) is int and value["version"] == 3
          and value["sha"] == ctx.sha and type(value["run_id"]) is int and value["run_id"] == ctx.run_id
          and type(value["run_attempt"]) is int and value["run_attempt"] == ctx.attempt
          and value["requested_rollback_target"] == ctx.target, "cli-snapshot-context")
@@ -117,6 +143,13 @@ def validate_snapshot(value, ctx):
         need(value["selected"] == value["latest"], "cli-snapshot-selection")
     else:
         need(value["selected"]["release"] == ctx.target, "cli-snapshot-selection")
+    try:
+        compat_evidence._database_base_dict(value["database_base"],
+            compat_evidence.ReleaseIdentity(**value["latest"]))
+    except compat_evidence.CompatRefusal:
+        raise proof.EvidenceError("cli-snapshot-base") from None
+    need(type(value["selected_web_source_sha"]) is str and _SHA.fullmatch(value["selected_web_source_sha"]),
+         "cli-snapshot-source")
     preview = value["preview"]
     need(type(preview) is dict and set(preview) == {"kind", "dormant", "blocked"}
          and preview["kind"] in {"none", "data"}
@@ -125,29 +158,13 @@ def validate_snapshot(value, ctx):
     return value
 
 
-def preview(repo, ctx, client):
-    """Use the existing trust algorithms once; do not duplicate signer policy."""
-    deadline = images._Deadline()
-    deadline.end = min(deadline.end, deadline.now() + 240)
-    with images._verification_transport(client, deadline):
-        source = images._Source(repo, ctx.sha, deadline)
-        source.clean()
-        bootstrap = records.load_bootstrap()
-        chain = records.resolve_chain(client, repo, bootstrap=bootstrap, work_dir=client.work_dir)
-        index = None if ctx.target is None else chain.find(ctx.target)
-        need(ctx.target is None or index is not None, "cli-target-missing")
-        latest = chain.latest
-        selected = latest if index is None else chain.entries[index]
-        records.verify_images(client, latest.images, latest.sha, bootstrap)
-        if selected.release != latest.release:
-            records.verify_images(client, selected.images, selected.sha, bootstrap)
-        classification = schema_change.classify(repo, latest.sha, ctx.sha, mode="forward")
-        source.clean()
-    value = {"version": 2, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
-             "requested_rollback_target": ctx.target, "latest": _identity(latest), "selected": _identity(selected),
-             "preview": {"kind": classification.kind, "dormant": classification.dormant,
-                         "blocked": bool(classification.reasons)}}
-    return validate_snapshot(value, ctx)
+def preview(repo, ctx, client, *, git_binary, deadline):
+    """One closed authenticated source operation inside the caller's clock."""
+    need(type(deadline) is images._Deadline, "cli-deadline-invalid")
+    deadline.remaining()
+    resolution = record_resolver.resolve_forward(client, repo, git_binary, ctx.sha, selected_tag=ctx.target)
+    deadline.remaining()
+    return _resolved_snapshot(resolution, ctx)
 
 
 def validate_result(raw, snapshot, ctx):
@@ -173,11 +190,14 @@ def evidence_context(result, snapshot, ctx):
     Its digest covers the unchanged canonical result schema, including LF.
     """
     validate_result(result, snapshot, ctx)
-    return {"version": 1, "repository": common.REPOSITORY, "workflow_path": _WORKFLOW_PATH,
+    need(ctx.target is None, "cli-target-proof-unsupported")
+    return {"version": 2, "repository": common.REPOSITORY, "workflow_path": _WORKFLOW_PATH,
             "workflow_sha": ctx.sha, "event": ctx.event, "ref": ctx.ref, "sha": ctx.sha,
             "run_id": ctx.run_id, "run_attempt": ctx.attempt,
             "requested_rollback_target": ctx.target, "latest": snapshot["latest"],
             "selected": snapshot["selected"], "preview": snapshot["preview"],
+            "database_base": snapshot["database_base"],
+            "selected_web_source_sha": snapshot["selected_web_source_sha"],
             "result_sha256": hashlib.sha256(result).hexdigest()}
 
 
@@ -197,13 +217,19 @@ def accepted(value):
         and all(value["old_server_ok"].values())
 
 
-def execute(repo, ctx, client, snapshot, *, docker_binary, config_dir, image_work_dir, buildx_binary):
+def execute(repo, ctx, client, snapshot, *, git_binary, deadline,
+            docker_binary, config_dir, image_work_dir, buildx_binary):
     validate_snapshot(snapshot, ctx)
+    need(ctx.target is None, "cli-target-proof-unsupported")
     need(snapshot["preview"]["blocked"] is False, "cli-preview-blocked")
-    selected = snapshot["selected"]
-    raw = compat.run_experiment(repo, ctx.sha, ctx.run_id, ctx.attempt, client,
+    need(type(deadline) is images._Deadline, "cli-deadline-invalid")
+    deadline.remaining()
+    resolution = record_resolver.resolve_forward(client, repo, git_binary, ctx.sha)
+    need(canonical(_resolved_snapshot(resolution, ctx)) == canonical(snapshot), "cli-resolution-changed")
+    deadline.remaining()
+    raw = compat._run_resolved_experiment(repo, resolution, ctx.run_id, ctx.attempt, deadline=deadline,
         docker_binary=docker_binary, config_dir=config_dir, image_work_dir=image_work_dir,
-        buildx_binary=buildx_binary, rollback_target=selected["release"], expected_previous_sha=selected["sha"])
+        buildx_binary=buildx_binary)
     validate_result(raw, snapshot, ctx)
     return raw  # An actual false result is valid evidence, not a passing gate.
 
@@ -264,22 +290,29 @@ def _scratch(repo, ctx, phase, env):
     return work
 
 
-def _client(work, env):
+def _git_binary(env):
+    value = env.get("COMPAT_GIT_BIN") or shutil.which("git")
+    need(type(value) is str and value, "cli-git-unavailable")
+    return regular_path(Path(value))
+
+
+def _client(work, env, deadline):
+    need(type(deadline) is images._Deadline, "cli-deadline-invalid")
     token = env.get("GH_TOKEN")
     need(type(token) is str and 0 < len(token) <= 8192 and not any(c in token for c in "\r\n\0"),
          "cli-token-unavailable")
     binary = regular_path(Path(env.get("COMPAT_GH_BIN", "")))
-    def version_capture(argv, **options):
-        need(argv == [str(binary), "--version"], "cli-constructor-command-invalid")
-        options["timeout"] = min(options["timeout"], 5)
+    def bounded_capture(argv, **options):
+        if argv == [str(binary), "--version"]:
+            options["timeout"] = min(options["timeout"], 5)
         return runtime.bounded_command(argv, **options)
-    client = runtime.ReadOnlyGh(str(binary), token, expected_version="2.98.0",
-        config_dir=work / "gh-config", work_dir=work / "gh-work",
-        base_env=common.scrubbed_env(base=env), capture=version_capture)
-    # Construction is bounded setup, before the experiment's shared clock.
-    # Its verification scope requires the normal untouched transport identity.
-    client.capture = runtime.bounded_command
-    return client
+    budget = record_transport.OperationBudget(deadline.end, capture=bounded_capture, clock=deadline.clock)
+    try:
+        return record_transport.ReleaseGh(binary, token, work / "gh-config", work / "gh-work",
+            budget=budget, base_env=common.scrubbed_env(base=env))
+    except Exception:
+        budget.close()
+        raise
 
 
 # Only fixed reviewed error identifiers may leave the experiment. Unknown
@@ -363,6 +396,8 @@ _DIAGNOSTIC_EVIDENCE_CODES = _PUBLIC_FAILURE_CODES | frozenset({
     "cli-preview-blocked", "cli-public-bound", "cli-public-exists", "cli-output-path-invalid",
     "cli-scratch-overlap", "cli-already-attempted", "cli-token-unavailable", "cli-constructor-command-invalid",
     "cli-command-invalid", "cli-experiment-disabled", "cli-snapshot-noncanonical", "cli-upstream-failed",
+    "cli-snapshot-base", "cli-snapshot-source", "cli-resolution-changed", "cli-deadline-invalid",
+    "cli-git-unavailable", "cli-target-proof-unsupported",
 })
 _DIAGNOSTIC_RELEASE_CODES = frozenset({
     "gh-failed:binary", "gh-failed:token", "gh-failed:repository", "gh-failed:version",
@@ -462,8 +497,12 @@ def main(argv=None):
         repo = regular_path(Path.cwd().resolve(), directory=True)
         root = regular_path(Path(os.environ.get("RUNNER_TEMP", "")), directory=True)
         if command == "preview":
+            deadline = images._Deadline()
+            deadline.end = min(deadline.end, deadline.now() + 240)
             work = _scratch(repo, ctx, "preview", os.environ)
-            value = preview(repo, ctx, _client(work, os.environ))
+            git_binary = _git_binary(os.environ)
+            value = preview(repo, ctx, _client(work, os.environ, deadline),
+                git_binary=git_binary, deadline=deadline)
             _write_public(work / "public" / "resolution.json", canonical(value))
             return 1 if value["preview"]["blocked"] else 0
         raw = _read_public(root / "compat-input" / "resolution.json")
@@ -486,10 +525,15 @@ def main(argv=None):
             _write_evidence(work / "public", result, context_raw, snapshot, ctx)
             _mark_complete(os.environ)
             return 0 if command == "validate-evidence" or accepted(value) else 1
+        need(ctx.target is None, "cli-target-proof-unsupported")
+        need(snapshot["preview"]["blocked"] is False, "cli-preview-blocked")
+        deadline = images._Deadline()
         work = _scratch(repo, ctx, "run", os.environ)
         docker = regular_path(Path(os.environ.get("COMPAT_DOCKER_BIN", "")))
         plugin = regular_path(Path(os.environ.get("COMPAT_BUILDX_BIN", "")))
-        result = execute(repo, ctx, _client(work, os.environ), snapshot, docker_binary=str(docker),
+        git_binary = _git_binary(os.environ)
+        result = execute(repo, ctx, _client(work, os.environ, deadline), snapshot,
+            git_binary=git_binary, deadline=deadline, docker_binary=str(docker),
             config_dir=work / "docker-config", image_work_dir=work / "images", buildx_binary=plugin)
         _write_public(work / "public" / "compat-result.json", result)
         return 0
@@ -509,6 +553,9 @@ _DIAGNOSTIC_PHASES = tuple((function.__code__, phase) for function, phase in (
     (regular_path, "cli-path"), (_read_public, "cli-read"), (_write_public, "cli-write"),
     (_mark_complete, "cli-complete"), (validate_snapshot, "cli-snapshot"), (validate_result, "cli-result"),
     (preview, "preview"), (execute, "execute"),
+    (_resolved_snapshot, "cli-snapshot"), (_git_binary, "cli-path"),
+    (record_resolver.resolve_forward, "release-verify"), (record_resolver._resolve, "release-verify"),
+    (record_transport.ReleaseGh.__init__, "release-client"),
     (runtime.verified_previous, "release-verify"), (runtime.ReadOnlyGh.__init__, "release-client"),
     (runtime.ReadOnlyGh._run, "release-transport"), (runtime.ReadOnlyGh.download_manifest, "release-download"),
     (runtime.ReadOnlyGh.verify_file, "release-record-attestation"),
@@ -516,13 +563,16 @@ _DIAGNOSTIC_PHASES = tuple((function.__code__, phase) for function, phase in (
     (records.resolve_chain, "release-chain"), (records.load_bootstrap, "release-bootstrap"),
     (records.verify_images, "release-images"), (schema_change.classify, "classification"),
     (compat.catalog.CatalogContract.__init__, "catalog-contract"),
+    (compat.catalog.CatalogContract.from_resolution.__func__, "catalog-contract"),
     (compat.catalog.OwnedCatalog.observe, "catalog-observe"),
     (images._Source.clean, "source-clean"), (images._Source.inventory, "source-inventory"),
     (images._Source.blobs, "source-export"), (images._admit, "image-admission"),
+    (images._admit_resolved, "image-admission"), (images._admit_core, "image-admission"),
     (images._build_environment, "build-environment"), (images._build_capture, "image-build"),
     (images._LinuxBuilder.start, "builder-start"), (images._LinuxBuilder.close, "builder-cleanup"),
     (images._role_inspect, "image-inspect"), (runtime.Docker.pull, "docker-pull"),
     (runtime.Docker.inspect, "docker-inspect"), (compat.run_experiment, "experiment-entry"),
+    (compat._run_resolved_experiment, "experiment-entry"),
     (compat._Engine.run, "experiment"), (compat._Engine._measure, "measurement"),
     (compat._Engine._server, "server"), (compat._Engine._old_server, "old-server"),
     (compat._Engine._migration, "migration"), (compat._Engine._settle, "journal-settle"),

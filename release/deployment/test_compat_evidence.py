@@ -363,12 +363,13 @@ class PairBoundaryTests(unittest.TestCase):
         try:
             spec.loader.exec_module(producer)
             ctx = producer.Context(SHA, 100, 1, None, "push", evidence.REF)
-            snap = {"version": 2, "sha": SHA, "run_id": 100, "run_attempt": 1,
+            snap = {"version": 3, "sha": SHA, "run_id": 100, "run_attempt": 1,
                 "requested_rollback_target": None, "latest": asdict(LATEST), "selected": asdict(LATEST),
+                "database_base": asdict(database_base()), "selected_web_source_sha": LATEST.sha,
                 "preview": {"kind": "none", "dormant": False, "blocked": False}}
-            # The current producer remains context1. Preserve its exact audit
-            # contract; this preparation does not activate context2 callers.
-            for original in (pair(version=1), pair(server_false="read", version=1), pair(migration_false="rw", version=1)):
+            # The migrated producer emits the same context2 bytes consumed by
+            # policy, including actual negatives; signatures remain external.
+            for original in (pair(), pair(server_false="read"), pair(migration_false="rw")):
                 raw = producer.canonical(producer.evidence_context(original.result, snap, ctx))
                 self.assertEqual(raw, original.context)
                 rebound = pack(original.result, raw)
