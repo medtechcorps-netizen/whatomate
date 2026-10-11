@@ -85,7 +85,12 @@ class DockerWorld:
             image = self.images[reference]
             cfg = copy.deepcopy(image["Config"])
             env = self.mapping(cfg.get("Env") or [])
-            env.update(self.mapping(flags.get("--env", [])))
+            for item in flags.get("--env", []):
+                if "=" in item:
+                    key, value = item.split("=", 1)
+                else:
+                    key, value = item, options["env"][item]
+                env[key] = value
             cfg.update(Image=reference, User=flags.get("--user", [cfg.get("User", "")])[0],
                        Cmd=command, Labels=self.mapping(flags["--label"]),
                        Env=[k + "=" + v for k, v in env.items()])
@@ -144,6 +149,34 @@ class StackTests(unittest.TestCase):
         self.world = DockerWorld()
         self.stack = s.OwnedStack("docker", Path(self.tmp.name), SOURCE, s.GraphImage(GRAPH, SOURCE),
                                  token=TOKEN, capture=self.world.capture)
+
+    def test_generated_service_secrets_are_confined_to_one_create_child_environment(self):
+        self.stack.start()
+        secrets = (self.stack.fixture_inputs.postgres_password, self.stack.fixture_inputs.graph_control_key,
+                   self.stack.fixture_inputs.graph_access_token, self.stack.fixture_inputs.graph_app_secret)
+        for args, options in self.world.calls:
+            self.assertFalse(any(value in " ".join(args) for value in secrets))
+            if args[:2] == ["container", "create"]:
+                flags, _ = self.world.flags(args, 2)
+                names = flags.get("--env", [])
+                self.assertTrue(all("=" not in name for name in names))
+                self.assertEqual(set(options["env"]) & s._SERVICE_ENV, set(names))
+            else:
+                self.assertFalse(set(options["env"]) & s._SERVICE_ENV)
+        self.assertFalse(set(self.stack.env) & s._SERVICE_ENV)
+        self.assertFalse(any(value in json.dumps(self.stack.evidence()) for value in secrets))
+        self.stack.cleanup()
+
+    def test_private_environment_refuses_unknown_or_unbound_keys_before_capture(self):
+        for args, values in ((["image", "inspect", GRAPH], {"POSTGRES_PASSWORD": "synthetic"}),
+                             (["container", "create", "--env", "PATH"], {"PATH": "private"}),
+                             (["container", "create", "--env", "POSTGRES_PASSWORD"], {}),
+                             (["container", "create"], {"POSTGRES_PASSWORD": "synthetic"}),
+                             (["container", "create", "--env", "POSTGRES_PASSWORD", "--env", "POSTGRES_PASSWORD"],
+                              {"POSTGRES_PASSWORD": "synthetic"})):
+            with self.assertRaises(s.proof.EvidenceError):
+                self.stack._call(args, private_env=values)
+        self.assertFalse(self.world.calls)
 
     def test_owned_three_services_and_exact_cleanup_ids(self):
         handles = self.stack.start()

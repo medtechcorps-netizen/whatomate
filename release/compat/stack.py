@@ -37,6 +37,9 @@ _TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 _IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _ROLES = ("pg", "redis", "graph")
 _GRAPH_DEFAULT_PATH = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SERVICE_ENV = frozenset({"POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD", "POSTGRES_INITDB_ARGS",
+                          "STUB_ENVIRONMENT", "STUB_CONTROL_KEY", "STUB_ACCESS_TOKENS", "STUB_APP_ID",
+                          "STUB_APP_SECRET", "STUB_CALLBACK_ORIGIN", "STUB_LISTEN_ADDR"})
 _PG_COMMAND = ["postgres", "-c", "unix_socket_directories=/var/run/postgresql",
                "-c", "autovacuum=off", "-c", "log_statement=mod",
                "-c", "log_min_error_statement=error", "-c", "log_error_verbosity=verbose",
@@ -145,10 +148,22 @@ class OwnedStack:
                 "cleanup_attempted": self._cleanup_attempted,
                 "complete_compatibility_proof": False}
 
-    def _call(self, args):
+    def _call(self, args, *, private_env=None):
+        # Docker's name-only --env form obtains these generated values from
+        # this one child process. They never enter argv, a file, or self.env.
+        env = dict(self.env)
+        if private_env is not None:
+            need(type(private_env) is dict and set(private_env) <= _SERVICE_ENV
+                 and all(type(v) is str and 0 < len(v) <= 256 and "\x00" not in v
+                         for v in private_env.values()), "stack-private-environment-invalid")
+            need(args[:2] == ["container", "create"], "stack-private-environment-invalid")
+            names = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--env"]
+            need(len(names) == len(set(names)) and set(names) == set(private_env),
+                 "stack-private-environment-invalid")
+            env.update(private_env)
         try:
             value = self.capture([self.binary, "--config", str(self.config), "--context", "default", *args],
-                                 env=dict(self.env), timeout=90,
+                                 env=env, timeout=90,
                                  stdout_limit=runtime.MIB, stderr_limit=runtime.MIB)
         except proof.InfrastructureFailure:
             raise
@@ -164,12 +179,12 @@ class OwnedStack:
             raise proof.InfrastructureFailure("container")
         return value.stdout
 
-    def _mutation(self, args, operation, role, expected_id=None):
+    def _mutation(self, args, operation, role, expected_id=None, *, private_env=None):
         need(not self._ambiguous and not self._closed, "stack-outcome-unknown")
         event = {"operation": operation, "role": role, "id": expected_id, "outcome": "unknown"}
         self._events.append(event)
         self._ambiguous = True
-        value = self._call(args)
+        value = self._call(args, private_env=private_env)
         if value.returncode != 0:
             raise proof.InfrastructureFailure("container")
         try:
@@ -339,9 +354,10 @@ class OwnedStack:
                 args += ["--label", key + "=" + value]
             for key, value in spec["tmpfs"].items():
                 args += ["--tmpfs", key + ":" + value]
-            for key, value in spec["overrides"].items():
-                args += ["--env", key + "=" + value]
-            self._ids[role] = self._mutation(args + [spec["image"], *spec["command"]], "create", role)
+            for key in spec["overrides"]:
+                args += ["--env", key]
+            self._ids[role] = self._mutation(args + [spec["image"], *spec["command"]], "create", role,
+                                             private_env=spec["overrides"])
             self._container_check(role, running=False)
             self._mutation(["container", "start", self._ids[role]], "start", role, self._ids[role])
             row = self._container_check(role, running=True)
