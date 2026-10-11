@@ -65,6 +65,12 @@ class World(test_catalog.World):
                 else:
                     log = test_postgres.line(application, "LOG", "statement: " + a._UPDATE)
                     result = a.runtime.Capture(0, b"1\nCOMPAT_ADVISORY_ACTOR_FINISHED\n", b"")
+                # REL_17_11 command.c: quit consumes no argument, then
+                # HandleSlashCmds warns for the unconsumed 0 on stderr.
+                # This source-derived model is not a real psql invocation.
+                if b"\\quit 0\n" in raw:
+                    result = a.runtime.Capture(result.returncode, result.stdout,
+                        result.stderr + b'\\quit: extra argument "0" ignored\n')
                 if self.log_mutation:
                     log = self.log_mutation(application, log)
                 self.sql.stderr += log
@@ -102,9 +108,11 @@ class AdvisoryTests(unittest.TestCase):
         self.owner = self.manager.owner
         return a.OwnedSwallowedUpdate(observed, test_processes.INPUTS)
 
-    def refused(self, actor):
-        with self.assertRaises(a.proof.EvidenceError):
+    def refused(self, actor, code=None):
+        with self.assertRaises(a.proof.EvidenceError) as raised:
             actor.collect()
+        if code is not None:
+            self.assertEqual(str(raised.exception), code)
         count = len(self.world.calls)
         with self.assertRaisesRegex(a.proof.EvidenceError, "advisory-already-attempted"):
             actor.collect()
@@ -112,9 +120,34 @@ class AdvisoryTests(unittest.TestCase):
         self.assertTrue(self.manager._protocol_failed)
         self.assertTrue(self.catalog._failed)
 
-    def test_exact_actor_hashes_match_accepted_specification(self):
-        self.assertEqual(a.postgres.sha(a._ACTOR.encode()), "cf67bf5c47c5632da951cb0fb8c3d1b2119746aa844c70f5a5aef8e2678eaa07")
+    def test_fixed_update_and_corrected_argument_free_actor_hashes(self):
+        self.assertEqual(a.postgres.sha(a._ACTOR.encode()), "5aa17473d9b1b64ab50b64ea6b1e4c0c8d95e98e844f3dbb3a773b37d6757b3e")
         self.assertEqual(a.postgres.sha(a._UPDATE.encode()), "abc599a7aeb21a7a7cbdfdca05775a94dc3e31f94ba73d4a619d87dfb493a69a")
+        # PostgreSQL 17 documents \q / \quit without an exit-code argument.
+        self.assertEqual(a._ACTOR.splitlines(), [r"\set ON_ERROR_STOP off", a._UPDATE,
+            r"\echo COMPAT_ADVISORY_ACTOR_FINISHED", r"\quit"])
+
+    def test_former_quit_argument_warning_is_refused_without_relaxing_stderr(self):
+        old = a._ACTOR.replace("\\quit\n", "\\quit 0\n")
+        self.assertEqual(a.postgres.sha(old.encode()), "cf67bf5c47c5632da951cb0fb8c3d1b2119746aa844c70f5a5aef8e2678eaa07")
+        with mock.patch.object(a, "_ACTOR", old), mock.patch.object(a, "_ACTOR_SHA", a.postgres.sha(old.encode())):
+            actor = self.make()
+            self.refused(actor, "advisory-actor-rw-stderr")
+        self.assertEqual(self.world.actor_calls, ["compat-n1-rw"])
+
+    def test_stream_failures_have_fixed_phase_specific_codes_and_no_retry(self):
+        for mode in ("rw", "ro"):
+            for stream in ("stdout", "stderr"):
+                with self.subTest(mode=mode, stream=stream):
+                    actor = self.make()
+                    def mutate(app, result):
+                        if app != "compat-n1-" + mode: return result
+                        if stream == "stdout":
+                            return a.runtime.Capture(0, result.stdout + b"private-extra\n", result.stderr)
+                        return a.runtime.Capture(0, result.stdout, b"private-warning" if mode == "rw" else b"")
+                    self.world.actor_mutation = mutate
+                    self.refused(actor, "advisory-actor-" + mode + "-" + stream)
+                    self.assertEqual(self.world.actor_calls.count("compat-n1-" + mode), 1)
 
     def test_actual_adapters_collect_and_share_detector_without_fake_full_phases(self):
         actor = self.make()
