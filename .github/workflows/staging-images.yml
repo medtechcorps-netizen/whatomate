@@ -7,6 +7,8 @@ on:
       - main
     paths:
       - release/staging/bootstrap/**
+      - internal/dbcatalog/golden/production-v0.json
+      - internal/dbcatalog/shape/production-v0.sql
       - release/staging/graphstub/**
       - docker/staging/**
       - .github/workflows/staging-images.yml

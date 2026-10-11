@@ -2,7 +2,7 @@
 // seeds and tenant-RLS profile that production's PRE_DEPLOY
 // `rereply rls-migrate` accepts on its verify-only path. Staging therefore
 // never needs a production dump, a historical binary or a production
-// connection: nothing it holds comes from production.
+// connection: only the reviewed public structural profile comes from production.
 //
 // It runs as the database's migration owner. On DigitalOcean that is the
 // cluster's built-in doadmin, which owns the database the owner created in the
@@ -36,14 +36,16 @@
 //   - the default administrator is not admin@admin.com (which the migration
 //     makes a super admin) and its password is neither config.example.toml's
 //     nor shorter than 16 characters;
-//   - the public schema holds no relation, function or type, so a production
+//   - the public schema holds no namespace-dependent object, so a production
 //     database, or one this tool already built, is refused by construction.
 //
 // The version, role, session_replication_role and default-privilege checks
 // are ApplyTenantRLS's own gates (internal/database/tenant.go), which would
 // otherwise fire only after the schema has been written.
 //
-// Then, as the owner, it creates the legacy chatbot_flow_steps table that
+// After validating the fixed public production profile, it precreates its eight
+// model-derived table shapes. Then, as the owner, it creates the legacy
+// chatbot_flow_steps table that
 // production still carries, runs database.RunMigrationWithProgress with the
 // synthetic administrator, runs the same backfills as runRLSMigration in
 // cmd/whatomate/main.go (main_test.go keeps the two lists equal), applies
@@ -123,6 +125,11 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithProfile(args, stdout, stderr, loadProductionProfile)
+}
+
+// The injected loader is only a test seam; the command exposes no profile path.
+func runWithProfile(args []string, stdout, stderr io.Writer, loadProfile func() (productionProfile, []byte, error)) int {
 	flags := flag.NewFlagSet("staging-bootstrap", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "config.toml", "path to the private staging or CI config")
@@ -165,12 +172,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return report(stderr, err)
 	}
 
+	profile, overlay, err := loadProfile()
+	if err != nil {
+		return report(stderr, refuse("production profile or overlay is unavailable or invalid"))
+	}
+	plans, err := productionPrecreationPlans(owner, profile)
+	if err != nil {
+		return report(stderr, refuse("production profile does not match the source models"))
+	}
+
 	logger := logf.New(logf.Opts{
 		Writer:        stderr,
 		Level:         logf.InfoLevel,
 		DefaultFields: []any{"app", "staging-bootstrap"},
 	})
-	if err := bootstrap(owner, cfg, logger); err != nil {
+	if err := bootstrapProductionShape(owner, cfg, logger, plans, overlay); err != nil {
 		return report(stderr, err)
 	}
 	if err := database.VerifyTenantRLS(runtime, cfg.Database.RuntimeRole); err != nil {
@@ -311,10 +327,11 @@ type membership struct {
 }
 
 type publicSchema struct {
-	Schemas   int64 `gorm:"column:schemas"`
-	Relations int64 `gorm:"column:relations"`
-	Functions int64 `gorm:"column:functions"`
-	Types     int64 `gorm:"column:types"`
+	Schemas      int64 `gorm:"column:schemas"`
+	Relations    int64 `gorm:"column:relations"`
+	Functions    int64 `gorm:"column:functions"`
+	Types        int64 `gorm:"column:types"`
+	Dependencies int64 `gorm:"column:dependencies"`
 }
 
 // preflight holds every refusal that reads the database. It never writes.
@@ -449,6 +466,9 @@ func preflight(owner, runtime *gorm.DB, runtimeRole string) error {
 	if public.Relations != 0 || public.Functions != 0 || public.Types != 0 {
 		return refuse("public schema is not empty relations=%d functions=%d types=%d",
 			public.Relations, public.Functions, public.Types)
+	}
+	if public.Dependencies != 0 {
+		return refuse("public schema is not empty namespace dependencies=%d", public.Dependencies)
 	}
 	return nil
 }
@@ -586,7 +606,11 @@ func readPublicSchema(db *gorm.DB) (publicSchema, error) {
 			 WHERE namespace.nspname = 'public') AS functions,
 			(SELECT COUNT(*) FROM pg_catalog.pg_type AS datatype
 			 JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = datatype.typnamespace
-			 WHERE namespace.nspname = 'public') AS types
+			 WHERE namespace.nspname = 'public') AS types,
+			(SELECT COUNT(*) FROM pg_catalog.pg_depend AS dependency
+			 JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = dependency.refobjid
+			 WHERE dependency.refclassid = 'pg_catalog.pg_namespace'::regclass
+			 AND namespace.nspname = 'public') AS dependencies
 	`).Scan(&public).Error
 	return public, err
 }

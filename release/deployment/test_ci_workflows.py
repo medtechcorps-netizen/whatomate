@@ -741,6 +741,9 @@ STAGING_BOOTSTRAP_STEPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "set -euo pipefail",
         'go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/bootstrap" ./release/staging/bootstrap',
         'go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/rereply" ./cmd/whatomate',
+        'mkdir -p "$RUNNER_TEMP/staging-bootstrap/production-shape"',
+        'cp internal/dbcatalog/golden/production-v0.json "$RUNNER_TEMP/staging-bootstrap/production-shape/production-v0.json"',
+        'cp internal/dbcatalog/shape/production-v0.sql "$RUNNER_TEMP/staging-bootstrap/production-shape/production-v0.sql"',
     )),
     ("Bootstrap the staging database", (
         "set -euo pipefail",
@@ -1559,6 +1562,16 @@ class StagingPlacementTests(unittest.TestCase):
 
 
 class StagingBootstrapJobTests(unittest.TestCase):
+    def test_the_authoritative_profile_files_are_required_beside_the_binary(self) -> None:
+        assert_staging_bootstrap(SOURCES)
+        for source, filename in (
+            ("internal/dbcatalog/golden/production-v0.json", "production-v0.json"),
+            ("internal/dbcatalog/shape/production-v0.sql", "production-v0.sql"),
+        ):
+            line = f'          cp {source} "$RUNNER_TEMP/staging-bootstrap/production-shape/{filename}"\n'
+            with self.subTest(filename=filename), self.assertRaises(AssertionError):
+                assert_staging_bootstrap(replaced("test.yml", line, ""))
+
     def test_the_proof_runs_rls_migrate_twice_between_snapshots(self) -> None:
         job = jobs(parse(SOURCES)["test.yml"])[STAGING_BOOTSTRAP_JOB]
         accept = step_named(job, "Accept the database with rls-migrate twice and refuse a second bootstrap")
