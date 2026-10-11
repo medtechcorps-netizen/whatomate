@@ -474,8 +474,12 @@ Completed retained-record read mismatches now yield actual per-case false
 flags. Writes still require all record identities and readbacks to be valid.
 The narrow postmigration panic path above has mocked coverage; it does not
 establish a complete actual semantic-negative experiment or support arbitrary
-terminal failures and blocked phases. Living-worker failures, incomplete writes
-and unexpected stub traffic still have separate orchestration gaps and refuse.
+terminal failures and blocked phases. A completed worker window of at least
+60 seconds can preserve an observed panic or unknown-type failure while the
+same bound server remains alive, its complete logs remain available, and the
+actual stop, reverse sweep, final catalog and cleanup checks continue. Fatal
+errors, worker stops, incomplete writes and unexpected stub traffic still
+refuse rather than substitute invented completion evidence.
 Missing startup contract evidence also refuses: the FORCE RLS negative-control
 fallback is not yet implemented.
 These cases must never be represented by invented observations.
