@@ -15,6 +15,7 @@ import time
 
 import compat_adapter as adapter
 import compat_evidence as evidence
+import compat_envelope as envelope
 import release_record as records
 import ship_common as common
 
@@ -50,35 +51,20 @@ _GETS = tuple(re.compile(re.escape(API) + p + r"\Z") for p in (
 ))
 
 
-def _need(ok, detail):
-    if not ok:
-        raise evidence.CompatRefusal("compat-stale", detail)
+_need = envelope._need
 
 
 def _hash(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-def _integer(value, maximum=10**16-1, minimum=1):
-    _need(type(value) is int and minimum <= value <= maximum, "collect-integer")
-    return value
+_integer = envelope._integer
 
 
-def _date(value, observed=None):
-    _need(type(value) is str and _TIME.fullmatch(value) is not None, "collect-time")
-    try:
-        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        raise evidence.CompatRefusal("compat-stale", "collect-time") from None
-    _need(observed is None or result <= observed, "collect-time")
-    return result
+_date = envelope._date
 
 
-def _state(row):
-    status, conclusion = row.get("status"), row.get("conclusion")
-    _need(type(status) is str and ((status in _ACTIVE and conclusion is None)
-          or (status == "completed" and type(conclusion) is str and conclusion in _CONCLUSIONS)), "collect-state")
-    return status, conclusion
+_state = envelope._state
 
 
 def _directory(path, empty=False):
@@ -260,120 +246,19 @@ def _workflow(request):
     return steps
 
 
-def _repository(value):
-    _need(type(value) is dict and type(value.get("id")) is int and value["id"] == REPOSITORY_ID
-          and value.get("full_name") == evidence.REPOSITORY, "collect-repository")
+_repository = envelope._repository
 
 
-def _run_meta(row, request, workflow, observed):
-    _need(type(row) is dict, "collect-run")
-    _repository(row.get("repository")); _repository(row.get("head_repository"))
-    rid = _integer(row.get("id"))
-    _need(row.get("head_sha") == request.sha and row.get("head_branch") == "main"
-          and row.get("event") in ("push", "workflow_dispatch") and row.get("path") == evidence.WORKFLOW
-          and type(row.get("workflow_id")) is int and row["workflow_id"] == workflow
-          and row.get("name") == "Compatibility" and row.get("url") == API_URL + f"/actions/runs/{rid}"
-          and row.get("html_url") == WEB + f"/actions/runs/{rid}", "collect-run-identity")
-    status, conclusion = _state(row)
-    created = _date(row.get("created_at"), observed)
-    started = _date(row["run_started_at"], observed) if row.get("run_started_at") is not None else None
-    updated = _date(row.get("updated_at"), observed)
-    _need(created <= updated and (started is None or created <= started <= updated), "collect-run-time")
-    return {"id":rid, "number":_integer(row.get("run_number")),
-        "attempt":_integer(row.get("run_attempt"), evidence.MAX_ATTEMPTS),
-        "suite":_integer(row.get("check_suite_id")), "event":row["event"],
-        "status":status, "conclusion":conclusion, "created":created, "started":started, "updated":updated}
+_run_meta = envelope._run_meta
 
 
-def _steps(rows, expected, job_start, job_end, observed):
-    _need(type(rows) is list and len(rows) <= len(expected) + 3, "collect-steps")
-    source_order, seen, previous, positive = [], set(), 0, True
-    for step in rows:
-        _need(type(step) is dict, "collect-steps")
-        number = _integer(step.get("number"), 100)
-        name = step.get("name")
-        _need(type(name) is str and name not in seen and number > previous
-              and name in (*expected, "Set up job", "Complete job", "Post Check out the exact candidate"), "collect-step-identity")
-        seen.add(name); previous = number
-        if name in expected: source_order.append(name)
-        status, conclusion = _state(step)
-        start = _date(step["started_at"], observed) if step.get("started_at") is not None else None
-        end = _date(step["completed_at"], observed) if step.get("completed_at") is not None else None
-        if conclusion == "skipped":
-            _need((start is None and end is None) or (start is not None and end == start), "collect-step-time")
-            positive = False
-        elif status in _ACTIVE and start is None and end is None:
-            positive = False
-        else:
-            _need(start is not None and job_start is not None and job_start <= start
-                  and (end is None or start <= end) and (job_end is None or (end is not None and end <= job_end)), "collect-step-time")
-            positive &= status == "completed" and conclusion == "success"
-    _need(source_order == [name for name in expected if name in seen], "collect-step-order")
-    complete = source_order == expected and all(s.get("status") == "completed" for s in rows)
-    return complete, positive, tuple((s["name"], s["number"], s["status"], s["conclusion"], s.get("started_at"), s.get("completed_at")) for s in rows)
+_steps = envelope._steps
 
 
-def _job(row, checks, attempt, sha, expected, observed):
-    jid = _integer(row.get("id")); name = row.get("name")
-    _need(type(name) is str and name in evidence.JOBS, "collect-job")
-    rid, a = attempt["id"], attempt["attempt"]
-    check_url = row.get("check_run_url")
-    match = re.fullmatch(re.escape(API_URL) + rf"/check-runs/({_ID})", check_url) if type(check_url) is str else None
-    _need(match is not None, "collect-check-url")
-    cid = int(match[1]); check = checks.get(cid)
-    _need(type(check) is dict and row.get("run_id") == rid and type(row.get("run_id")) is int
-          and row.get("run_attempt") == a and type(row.get("run_attempt")) is int and row.get("head_sha") == sha
-          and row.get("url") == API_URL + f"/actions/jobs/{jid}"
-          and row.get("html_url") == WEB + f"/actions/runs/{rid}/job/{jid}", "collect-job-identity")
-    status, conclusion = _state(row)
-    _need(type(check.get("app")) is dict and type(check["app"].get("id")) is int and check["app"]["id"] == 15368
-          and type(check.get("check_suite")) is dict and type(check["check_suite"].get("id")) is int
-          and check["check_suite"]["id"] == attempt["suite"] and check.get("head_sha") == sha
-          and check.get("name") == name and _state(check) == (status, conclusion)
-          and check.get("html_url") == row["html_url"] and check.get("details_url") == row["html_url"]
-          and check.get("url") == check_url, "collect-check-identity")
-    _need(all(check.get(k) == row.get(k) for k in ("started_at", "completed_at")), "collect-check-time")
-    created = _date(row.get("created_at"), observed)
-    start = _date(row["started_at"], observed) if row.get("started_at") is not None else None
-    end = _date(row["completed_at"], observed) if row.get("completed_at") is not None else None
-    fresh = attempt["started"] is not None and start is not None and attempt["started"] <= created <= start
-    if conclusion == "skipped":
-        cancelled = attempt["status"] == "completed" and attempt["conclusion"] == "cancelled"
-        _need(row.get("steps") == [] and (name in ("compat-run", "compat-attest") or cancelled), "collect-skipped-job")
-        # A recognized skipped dependent does no work. Its synthetic interval
-        # is never success evidence or the completion envelope's endpoint.
-        complete, positive, steps, fresh = True, False, (), False
-    else:
-        _need(end is None or (start is not None and start <= end), "collect-job-time")
-        complete, positive, steps = _steps(row.get("steps"), expected[name], start, end, observed)
-        fresh &= status != "completed" or end is not None
-    typed = evidence.Job(name, jid, cid, 15368, rid, a, sha, status, conclusion)
-    eligible = fresh and (conclusion != "success" or positive)
-    terminal_known = status == "completed" and complete and (conclusion == "skipped" or fresh)
-    executed = (start, end) if terminal_known and conclusion != "skipped" else None
-    return typed, eligible, terminal_known, executed, (created, start, end, steps)
+_job = envelope._job
 
 
-def _artifact(row, run, sha, observed):
-    identity = _integer(row.get("id")); name = row.get("name")
-    _need(type(name) is str, "collect-artifact")
-    match = re.fullmatch(rf"compat-(?:resolution|measured)-{sha}-{run['id']}-([1-9][0-9]*)|compat-result-{sha}-([1-9][0-9]*)", name)
-    _need(match is not None and 1 <= int(match[1] or match[2]) <= run["attempt"], "collect-artifact-name")
-    _integer(row.get("size_in_bytes"), adapter.MAX_ARCHIVE)
-    _need(type(row.get("expired")) is bool and type(row.get("workflow_run")) is dict, "collect-artifact")
-    wr = row["workflow_run"]
-    _need(all(type(wr.get(k)) is int and wr[k] == v for k,v in
-              (("id",run["id"]),("repository_id",REPOSITORY_ID),("head_repository_id",REPOSITORY_ID)))
-          and wr.get("head_branch") == "main" and wr.get("head_sha") == sha, "collect-artifact-run")
-    created = _date(row.get("created_at"), observed); updated = _date(row.get("updated_at"), observed)
-    expires = _date(row.get("expires_at"))
-    _need(run["created"] <= created <= updated and created <= expires
-          and (row["expired"] or observed < expires)
-          and row.get("url") == API_URL + f"/actions/artifacts/{identity}"
-          and row.get("archive_download_url") == API_URL + f"/actions/artifacts/{identity}/zip", "collect-artifact-time")
-    # Optional API digest is deliberately not interpreted as a ZIP digest.
-    return {"id":identity,"name":name,"size":row["size_in_bytes"],"expired":row["expired"],
-            "created":created,"updated":updated,"expires":expires}
+_artifact = envelope._artifact
 
 
 def _snapshot(client, request, steps, observed):
