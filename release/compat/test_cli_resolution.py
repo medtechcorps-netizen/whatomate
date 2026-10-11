@@ -8,6 +8,7 @@ from unittest import mock
 
 import cli
 import test_cli
+import test_compat as engine_tests
 import test_record_resolver as source_tests
 import test_compat_evidence as policy_tests
 
@@ -182,6 +183,152 @@ class ResolutionTests(unittest.TestCase):
         self.case.world.files.update({(self.ctx.sha, path): raw for path, raw in files.items()})
         with self.assertRaisesRegex(cli.proof.EvidenceError, "^catalog-pending-invalid$"):
             self.preview()
+
+
+class SourceClosureProducerTests(unittest.TestCase):
+    """Real source/CLI/engine/proof path; only service/build edges are synthetic.
+
+    Synthetic declaration inputs are not Go generator or hosted evidence. No
+    resolver, classifier, engine entrypoint, evaluator or qualifier is replaced.
+    """
+    @classmethod
+    def setUpClass(cls):
+        engine_tests.ResolvedExperimentTests.setUpClass()
+
+    def setUp(self):
+        self.engine = engine_tests.ResolvedExperimentTests()
+        self.engine.setUp()
+        self.addCleanup(self.engine.doCleanups)
+        self.case = self.engine.case
+        env = test_cli.environment(attempt='2')
+        env['GITHUB_RUN_ID'] = '12345'
+        self.ctx = cli.context(env)
+        self.clients = []
+
+    def install(self, *, prior_seed_delta=False):
+        self.ci_base, self.manifests = engine_tests.source_closure_fixture(
+            self.case, self.engine.resolution.database_base_source, self.ctx.sha,
+            prior_seed_delta=prior_seed_delta)
+
+    def capture(self, argv, **options):
+        if str(argv[0]) in (str(self.case.git), str(self.case.gh)):
+            return self.case.world(argv, **options)
+        return self.engine.w.owner.raw_capture(argv, **options)
+
+    def client(self, deadline):
+        work = self.case.root / ('closure-cli-' + str(len(self.clients)))
+        work.mkdir()
+        for name in ('gh-config', 'gh-work'):
+            (work / name).mkdir()
+        with mock.patch.object(cli.runtime, 'bounded_command', side_effect=self.capture):
+            client = cli._client(work, {'COMPAT_GH_BIN': str(self.case.gh),
+                'GH_TOKEN': source_tests.support.GH_TOKEN}, deadline)
+        self.clients.append(client)
+        return client
+
+    def preview(self):
+        deadline = cli.images._Deadline(clock=self.engine.w.clock)
+        deadline.end = deadline.now() + 600
+        client = self.client(deadline)
+        with mock.patch.object(cli.runtime, 'bounded_command', side_effect=self.capture):
+            snap = cli.preview(self.case.repo, self.ctx, client,
+                               git_binary=self.case.git, deadline=deadline)
+        self.assertTrue(client.budget.closed)
+        return snap
+
+    def execute(self, snapshot):
+        deadline = self.engine.deadline
+        original_end = deadline.end
+        client = self.client(deadline)
+        def build(repo, actual, binary, config, work, actual_deadline, *, buildx_binary):
+            self.assertIs(actual_deadline, deadline)
+            self.assertEqual(actual_deadline.end, original_end)
+            self.assertEqual(actual.candidate.sha, self.ctx.sha)
+            self.assertEqual(actual.classification.migration_changes,
+                             ('generated migration closure changed',))
+            self.assertEqual(actual.classification.reasons, ())
+            self.assertEqual(actual.classification.requirements,
+                             ('compat-required', 'generated-migration-closure-ci'))
+            self.assertEqual(cli._resolved_snapshot(actual, self.ctx), snapshot)
+            self.engine.w.event('admission.resolved')
+            return self.engine.admission
+        with mock.patch.object(cli.runtime, 'bounded_command', side_effect=self.capture), \
+             mock.patch.object(cli.images, '_admit_resolved', side_effect=build):
+            raw = cli.execute(self.case.repo, self.ctx, client, snapshot,
+                git_binary=self.case.git, deadline=deadline, docker_binary='docker',
+                config_dir=self.engine.p, image_work_dir=self.engine.p, buildx_binary=None)
+        self.assertTrue(client.budget.closed)
+        self.assertEqual(deadline.end, original_end)
+        self.assertTrue(self.engine.w.owner._closed)
+        return raw
+
+    def source_comparison(self, base):
+        reader = source_tests.resolver.source_git.ImmutableGit(self.case.repo, self.case.git,
+            capture=self.case.world, clock=self.engine.w.clock)
+        with reader.operation():
+            legacy = source_tests.schema_change.classify(self.case.repo, base, self.ctx.sha)
+            current = source_tests.schema_change.classify_v2(self.case.repo, base, self.ctx.sha)
+        return legacy, current
+
+    def assert_pair(self, raw, snap, *, positive):
+        value = cli.validate_result(raw, snap, self.ctx)
+        self.assertIs(cli.accepted(value), positive)
+        context = cli.evidence_context(raw, snap, self.ctx)
+        self.assertEqual(context['version'], 3)
+        self.assertEqual(context['sha'], self.ctx.sha)
+        self.assertEqual(context['pending'], snap['pending'])
+        cli.validate_evidence(cli.canonical(context), raw, snap, self.ctx)
+        self.engine.assert_closure_phases(value)
+        return value
+
+    def test_closure_only_preview_fresh_resolution_and_real_proof_need_every_phase(self):
+        self.install()
+        legacy, current = self.source_comparison(self.ci_base)
+        self.assertEqual(legacy.reasons, ('migration-path-changed:closure',))
+        self.assertEqual((current.kind, current.dormant, current.reasons), ('none', False, ()))
+        snap = self.preview()
+        self.assertEqual(snap['preview'], {'kind': 'none', 'dormant': False, 'blocked': False})
+        preview_calls = len(self.case.world.trace)
+        raw = self.execute(snap)
+        self.assertGreater(len(self.case.world.trace), preview_calls)
+        self.assert_pair(raw, snap, positive=True)
+        self.assertEqual(self.engine.w.trace.count('admission.resolved'), 1)
+
+    def test_ci_none_does_not_replace_actual_signed_range_dormant_data(self):
+        self.install(prior_seed_delta=True)
+        _, current = self.source_comparison(self.ci_base)
+        self.assertEqual((current.kind, current.dormant, current.reasons), ('none', False, ()))
+        snap = self.preview()
+        self.assertEqual(snap['database_base']['source_sha'], self.engine.resolution.database_base_source)
+        self.assertNotEqual(snap['database_base']['source_sha'], self.ci_base)
+        self.assertEqual(snap['preview'], {'kind': 'data', 'dormant': True, 'blocked': False})
+        raw = self.execute(snap)
+        result = self.assert_pair(raw, snap, positive=True)
+        self.assertEqual(result['classification'], {'kind': 'data', 'dormant': True})
+
+    def test_closure_only_completed_negative_remains_negative_canonical_pair(self):
+        self.install(); snap = self.preview()
+        self.engine.w.false_case = 'read'
+        raw = self.execute(snap)
+        result = self.assert_pair(raw, snap, positive=False)
+        self.assertFalse(result['old_server_ok']['read'])
+        self.assertFalse(result['old_server_ok']['reverse'])
+
+    def test_closure_only_final_capture_failure_returns_no_evidence(self):
+        self.install(); snap = self.preview()
+        self.engine.w.fail = 'catalog.final'
+        with self.assertRaises(cli.proof.InfrastructureFailure):
+            self.execute(snap)
+        self.assertIn('pg.control', self.engine.w.trace)
+        self.assertTrue(self.engine.w.owner._closed)
+
+    def test_changed_latest_after_closure_preview_refuses_before_build_or_stack(self):
+        self.install(); snap = self.preview()
+        changed = self.case.add(); self.case.profile(changed['sha'])
+        with self.assertRaisesRegex(cli.proof.EvidenceError, '^cli-resolution-changed$'):
+            self.execute(snap)
+        self.assertNotIn('admission.resolved', self.engine.w.trace)
+        self.assertFalse(hasattr(self.engine.w, 'owner'))
 
 
 if __name__ == "__main__": unittest.main(verbosity=2)
