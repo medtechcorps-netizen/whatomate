@@ -290,7 +290,7 @@ def first_parent_commits(out: common.Output, repo_dir: Path, base: str, head: st
 
 
 def report_schema_block(out: common.Output, exc: schema_change.SchemaChangeBlocked) -> None:
-    lines = ["refused: schema-change-blocked (interim schema freeze; Stage 2 lifts it)"]
+    lines = ["refused: schema-change-blocked (release classifier)"]
     for reason in exc.reasons[:50]:
         try:
             lines.append("  " + common.require_public_text(reason, out.private))
@@ -309,6 +309,11 @@ def safe_text(out: common.Output, line: str) -> None:
         out.text(line)
     except common.ReleaseError:
         out.text("refused: output-unsafe")
+
+
+def schema_summary(result: schema_change.Classification) -> list[str]:
+    state = " (dormant)" if result.dormant else ""
+    return [f"- Schema classification: {result.kind}{state}", *["- " + line for line in result.summary]]
 
 
 def _digest_lines(images: Mapping[str, str]) -> list[str]:
@@ -359,11 +364,12 @@ def cmd_plan(ctx: Context) -> int:
     }
     if mode in CANDIDATE_MODES:
         release_record.require_no_downgrade(ctx.repo_dir, latest.sha, sha)
-        schema_change.guard(ctx.repo_dir, latest.sha, sha)
+        classification = schema_change.guard(ctx.repo_dir, latest.sha, sha)
         count, commits = first_parent_commits(out, ctx.repo_dir, latest.sha, sha)
         lines += [
             "- No-downgrade: the commit descends from the latest record",
             "- Schema guard: clean",
+            *schema_summary(classification),
             "- CI: Test and E2E push runs on main succeeded for this commit",
             "- Old release lanes: idle",
             f"- Active Trivy exceptions: {active_exceptions}",
@@ -380,7 +386,7 @@ def cmd_plan(ctx: Context) -> int:
             lines += ["", "Staging verifies the configured target, deployment receipt and all thirteen canary checks."]
     else:
         target, intermediates = release_record.rollback_plan(chain, target_release)
-        schema_change.guard(ctx.repo_dir, target.sha, latest.sha)
+        classification = schema_change.guard(ctx.repo_dir, target.sha, latest.sha, mode="rollback")
         outputs["target_release"] = target.release
         outputs["target_manifest_sha256"] = target.manifest_sha256
         lines += [
@@ -388,6 +394,7 @@ def cmd_plan(ctx: Context) -> int:
             *_digest_lines(target.images),
             f"- Records after the target: {len(intermediates)} (none changed the database)",
             "- Schema guard between target and latest: clean",
+            *schema_summary(classification),
             "- Old release lanes: idle",
             "",
             "The production job reads live digests and decides: rollback (live equals the latest "
@@ -1104,14 +1111,16 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
             common.fail("candidate-invalid:bootstrap-digest")
         release_record.verify_images(gh, desired_images, sha, bootstrap)
         release_record.require_no_downgrade(ctx.repo_dir, latest.sha, sha)
-        schema_change.guard(ctx.repo_dir, latest.sha, sha)
+        classification = schema_change.guard(ctx.repo_dir, latest.sha, sha)
     else:
         target_entry, _intermediates = release_record.rollback_plan(chain, target_release)
         if target_entry.manifest_sha256 != env.get("PLAN_TARGET_MANIFEST_SHA256"):
             common.fail("latest-changed-since-plan:target")
         release_record.verify_images(gh, target_entry.images, target_entry.sha, bootstrap)
-        schema_change.guard(ctx.repo_dir, target_entry.sha, latest.sha)
+        classification = schema_change.guard(ctx.repo_dir, target_entry.sha, latest.sha, mode="rollback")
         desired_images = dict(target_entry.images)
+    for line in schema_summary(classification):
+        safe_text(out, line)
     # P5 two identical double reads, digest sources, topology and VPC.
     client = do_app.DOAppClient(
         secret["app_id"],

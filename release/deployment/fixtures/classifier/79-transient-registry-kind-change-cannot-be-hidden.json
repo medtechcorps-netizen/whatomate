@@ -1,0 +1,36 @@
+{
+  "name": "transient registry kind change cannot be hidden",
+  "base_files": {
+    "cmd/whatomate/main.go": "package main\n\nfunc runRLSMigration() {\n\tprintln(1)\n}\n\nfunc other() {\n\tprintln(2)\n}\n",
+    "internal/database/postgres.go": "package database\n\nconst compiledRLSMigrationPhase = rlsMigrationPhaseUI\n\nfunc RunRLSMigrationCoordinator() {\n\tprintln(1)\n}\n\nfunc runRLSMigrationCoordinatorForPhase() {\n\tprintln(1)\n}\n\nfunc withMigrationSession() {\n\tprintln(1)\n}\n\nfunc decideRLSMigrationAction() {\n\tprintln(1)\n}\n\nfunc classifyLegacyRLSCatalog() {\n\tprintln(1)\n}\n\nfunc verifyFutureRLSPostcondition() {\n\tprintln(1)\n}\n",
+    "internal/database/seed.go": "package database\n\nfunc SeedOne() {\n\tprintln(1)\n}\n\nfunc Unrelated() {\n\tprintln(2)\n}\n",
+    "internal/database/platform_compliance.go": "package database\n\nfunc detectPlatformComplianceIdentityReviewTriggerProfile() {\n\tprintln(1)\n}\n",
+    "internal/database/tenant.go": "package database\n\nfunc VerifyTenantRLS() {\n\tprintln(1)\n}\n",
+    "internal/models/models.go": "package models\n",
+    "internal/handlers/messages.go": "package handlers\n\nfunc send() {\n\tprintln(1)\n}\n",
+    "README.md": "synthetic\n",
+    "internal/dbcatalog/golden/catalog.json": "{\"version\":0,\"objects\":[]}\n",
+    "internal/dbcatalog/golden/history.json": "[{\"version\":0,\"class\":\"baseline\",\"min_reader_version\":0}]\n",
+    "internal/dbcatalog/golden/global_tables.json": "[]\n",
+    "internal/dbcatalog/registry/data_steps.json": "[{\"id\":\"SeedOne\",\"rev\":1,\"func\":\"github.com/shridarpatil/whatomate/internal/database.SeedOne\",\"kind\":\"seed-reconciler\",\"baseline\":true,\"idempotent\":true,\"n1_safe\":false,\"requires_gates\":[],\"closure_files\":[\"internal/database/seed.go\"],\"closure_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]\n",
+    "internal/dbcatalog/golden/seeds.json": "{\"version\":1,\"permissions\":[]}\n",
+    "internal/dbcatalog/registry/migration_path.json": "{\"version\":1,\"roots\":[\"github.com/shridarpatil/whatomate/cmd/whatomate.requiredStartupDatabaseContract\",\"github.com/shridarpatil/whatomate/cmd/whatomate.runRLSMigration\",\"github.com/shridarpatil/whatomate/cmd/whatomate.validateServerMigrationMode\",\"github.com/shridarpatil/whatomate/cmd/whatomate.verifyRLSMigrationRuntime\",\"github.com/shridarpatil/whatomate/cmd/whatomate.verifyStartupDatabaseContract\",\"github.com/shridarpatil/whatomate/internal/database.compiledRLSMigrationPhase\"],\"closure_files\":[\"cmd/whatomate/main.go\",\"internal/database/platform_compliance.go\",\"internal/database/postgres.go\",\"internal/database/tenant.go\"],\"closure_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}\n",
+    "go.mod": "module github.com/shridarpatil/whatomate\n\ngo 1.26.0\n"
+  },
+  "commits": [
+    {
+      "files": {
+        "internal/dbcatalog/registry/data_steps.json": "[{\"id\":\"SeedOne\",\"rev\":1,\"func\":\"github.com/shridarpatil/whatomate/internal/database.SeedOne\",\"kind\":\"baseline-pre-ledger\",\"baseline\":true,\"idempotent\":true,\"n1_safe\":false,\"requires_gates\":[],\"closure_files\":[\"internal/database/seed.go\"],\"closure_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]\n"
+      }
+    },
+    {
+      "files": {
+        "internal/dbcatalog/registry/data_steps.json": "[{\"id\":\"SeedOne\",\"rev\":1,\"func\":\"github.com/shridarpatil/whatomate/internal/database.SeedOne\",\"kind\":\"seed-reconciler\",\"baseline\":true,\"idempotent\":true,\"n1_safe\":false,\"requires_gates\":[],\"closure_files\":[\"internal/database/seed.go\"],\"closure_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]\n"
+      }
+    }
+  ],
+  "mode": "forward",
+  "expected": {
+    "blocked": true
+  }
+}

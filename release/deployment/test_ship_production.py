@@ -85,6 +85,18 @@ class DryRunTests(ProductionCase):
         self.assertFalse(self.clients[0].allow_put)
         self.assert_sanitized()
 
+    def test_forward_classifier_refuses_before_provider_construction(self) -> None:
+        for mode in ("dry-run", "promote"):
+            with self.subTest(mode=mode):
+                blocked = ship.schema_change.SchemaChangeBlocked(["migration-path-changed:synthetic"])
+                with mock.patch.object(ship.schema_change, "guard", side_effect=blocked) as guard:
+                    self.assertEqual(self.production(mode), ship.EXIT_REFUSED, self.h.text())
+                self.assertEqual(guard.call_count, 1)
+                self.assertEqual(guard.call_args.kwargs.get("mode", "forward"), "forward")
+                self.assertEqual(self.clients, [])
+                self.assertEqual(self.h.do.requests, [])
+                self.assertEqual(self.h.https.calls, [])
+
     def test_dry_run_cas_change_fails(self) -> None:
         def change(provider: support.FakeDO, path: str) -> None:
             if path.endswith("/backups?page=1&per_page=200"):
@@ -620,6 +632,8 @@ class RollbackModeTests(ProductionCase):
         with mock.patch.object(ship.schema_change, "guard", side_effect=blocked) as guard:
             self.assertEqual(self.h.run("production"), ship.EXIT_REFUSED, self.h.text())
         self.assertEqual(guard.call_args.args[1:], (self.base, self.head))
+        self.assertEqual(guard.call_args.kwargs, {"mode": "rollback"})
+        self.assertEqual(self.clients, [])
         self.assertIn("schema-change-blocked", self.h.text())
         self.assertEqual(self.h.do.put_count(), 0)
         self.assertEqual(self.h.do.requests, [])
