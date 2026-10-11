@@ -1,10 +1,12 @@
-# Compatibility proof core
+# Compatibility experiment and proof
 
 `release/compat/proof.py` is a pure standard-library evidence evaluator. It has
 no Docker, GitHub, filesystem, network or database operations. Its synthetic
 tests exercise proof rules; they do **not** establish compatibility of a release.
-The full compatibility experiment, workflow, result attestation, release preview
-and real runs are still unimplemented.
+The ordered experiment, source-built image admission and hosted entry points
+are implemented. The advisory workflow is prepared locally, and execution
+remains disabled pending the complete synthetic validation described below.
+Component tests do not establish release compatibility.
 
 ## Result and failure contract
 
@@ -57,7 +59,7 @@ by `observations()` in `test_proof.py`. Unknown keys refuse. The reusable shapes
 are:
 
 - Execution: `{status, exit_code, failure}`. Status must be `completed` with
-  exit code 0–255 and failure `null`, or `infrastructure-error` with a fixed
+  exit code 0-255 and failure `null`, or `infrastructure-error` with a fixed
   failure category. `not-run` or missing execution cannot establish a flag.
 - Check: `{execution, passed}`. Only a successful completed execution and the
   explicit boolean `true` pass. Sweep observations add the exact six booleans
@@ -70,7 +72,7 @@ are:
   not invent a row digest algorithm or query tenant data.
 - Log window: `{raw: bytes, complete: true}` for a single designated
   application and phase. Markers are `{complete: true, application, hashes}`;
-  their hashes bind canonical probe events selected by the future runner.
+  their hashes bind canonical probe events captured by the owned collector.
 - Migration: `{execution, log, markers, catalog_sha256, tables}`.
 
 The top-level observations include the previous server boot/startup proof,
@@ -81,8 +83,8 @@ both N-1 migrations and the read-only control, all old-server sweeps/workers,
 and the final catalog observation. They must come from one correctly ordered
 experiment on the bound source and previous image. The evaluator cannot prove
 collection completeness, provenance, ordering or signatures from booleans
-and hashes alone; the future runner is responsible for measuring and binding
-those facts, rather than fabricating defaults when a phase did not run.
+and hashes alone; the owned runner measures and binds those facts. It must
+never fabricate defaults when a phase did not run.
 The before-capture keys must exactly equal that expected inventory; a vacuous
 or omitted-table baseline refuses. D0 must retain the expected identities and
 have exactly the post-forward table inventory. The independently established
@@ -183,7 +185,7 @@ execution evidence or the mandatory independently observed control failure.
 
 ## Bounded runtime foundation
 
-`runtime.py` supplies a small CLI foundation for the future runner. It drains
+`runtime.py` supplies the bounded CLI foundation for the experiment. It drains
 stdout and stderr concurrently with separate byte limits, imposes a deadline,
 and reaps its child process. A completed nonzero exit is captured as evidence;
 it is not automatically a compatibility verdict. Process or capture failures
@@ -346,9 +348,11 @@ completed invocation. Invalid protocol evidence blocks subsequent starts or
 sweeps while allowing known-resource cleanup. Unknown Docker outcomes retain
 the stricter no-retry boundary and their resource evidence.
 
-The controller image has been built from the committed source, but these
-process/controller contracts still have mocked Docker and HTTP validation
-only. Real web startup, API sweeps and a complete experiment remain unverified.
+A disposable run of the signed previous web image passed startup and all six
+API write/read cases, followed by retained-record readback. Its complete log
+and journal observations passed, all owned resources were removed, and the
+12 original local containers remained unchanged. This validates the previous
+application path; it does not prove candidate migration or rollback.
 
 `observation.py` checks the owned server's complete, append-only Docker logs
 under a nonrotating `json-file` logging configuration. Startup requires the
@@ -383,37 +387,107 @@ services were removed afterward, and all 12 pre-existing local containers
 were preserved. This validates provisioning and default environment transport;
 it does not establish application or migration compatibility.
 
-## Remaining runner and workflow work
+## Ordered experiment and source-built images
 
-The later PR8 runner must resolve and verify the previous record/image,
-validate source and classifier bindings, integrate the owned services,
-prepare the PG17 synthetic cluster, collect the complete observations above,
-and publish/attest the result. It must keep infrastructure failures distinct
-from semantic compatibility results. No workflow or runner is added here.
+`compat.py` composes the verified previous release, actual schema classifier,
+production catalog contract, synthetic fixture and owned services. It runs the
+previous API seed, two candidate migrations, candidate writes, quiescence and
+D0, both previous-version migrations, the actual read-only control, previous
+server reads and writes, the worker period and candidate reverse reads. The
+journal is sealed and the final catalog captured before proof evaluation.
+Public result bytes are returned only after exact owned-resource cleanup.
 
-Use the existing `release/staging/graphstub` and its separate Dockerfile, plus
-the current meta-relay Graph-base configuration; do not recreate their old
-proposed package paths. Existing read jobs request `attestations: read` as
-well as contents/actions read. The release workflow tests anonymous exact
-image pulls, but this core does not establish current registry visibility.
+`images.py` admits four roles built during that invocation from one clean
+selected commit: Graph stub, controller, fixture exporter and candidate web.
+Each context is exported from Git objects and bound to fixed recipe hashes,
+source manifests and inspected build results. Historical receipts and image
+labels alone cannot admit an image. The previous web image is the exact
+signed release digest; PostgreSQL and Redis also use fixed digests. Builds
+use Linux/amd64, anonymous isolated Docker configuration and a pinned Buildx
+binary. They do not publish images.
 
-Until the previous released image supports `rls-bootstrap-empty`, the planned
-fallback is `TestCompatBootstrapExport` with equal base/head golden and the
-base production overlay. Its DSN is strictly loopback-only: put the exporter
-in a compatible loopback/container network topology instead of loosening that
-guard for a Docker service name. PR7 remains constrained by the conservative
-migration closure, independently of its dormant entrypoint exemption.
+On Linux, admission creates and verifies one labelled, pinned BuildKit
+container and volume, then binds the fixed Buildx driver to that existing
+backend. Cleanup is confined to acknowledged and freshly verified owned
+resources. An ambiguous outcome never authorizes name-based adoption or
+broad removal. The Windows launcher contains the build client and its
+descendants in a private Job Object; this does not claim that terminating a
+client cancels all Docker daemon work.
 
-PR4's read-only production observation found no unknown public objects. Its
+One 2,400-second deadline covers release verification, pulls, all four builds,
+the experiment and cleanup. The aggregate pull/build phase is capped at
+1,500 seconds and must retain at least 720 seconds for the experiment plus
+180 seconds for cleanup. A later phase never receives a fresh overall budget.
+Cold-build timing and actual Linux backend composition still require real
+validation. The public readiness switch remains false until the reviewed
+validation sequence permits activation.
+
+## Advisory workflow and release selection
+
+`cli.py preview` freezes the latest and selected release identities from one
+verified record chain and classifies latest-to-candidate. An explicit dispatch
+rollback target selects a verified record without silently replacing the
+latest-release preview base. `cli.py run` verifies the selected tag again and
+requires its exact source SHA, then runs the experiment. There is no second
+moving-latest selection.
+
+The prepared `compat.yml` runs on every pull request, main push and explicit
+dispatch. It has no path filter or first-attempt restriction. `release-preview`
+feeds the exact same-run resolution into `compat-run`; the `compat` aggregator
+requires both actual job outcomes and validates source, release, run and
+attempt identity. Only a completely written, validated result receives the
+upload marker. A measured negative result is retained as an artifact while
+the compatibility check fails. Missing, malformed or incomplete evidence
+cannot become an artifact by continuing after an error.
+
+The final artifact name is `compat-result-<sha>-<run_attempt>`. The `attest`
+job runs only after successful aggregation on push or dispatch, downloads the
+same-run canonical result and revalidates it before signing. Pull requests
+cannot sign results. Read jobs use contents/actions/attestations read access;
+only the signing job has attestations and OIDC write permissions. No deployment
+environment, provider credentials or production action is part of this
+workflow. The existing CI release-tests job also discovers the compatibility
+unit and workflow tests.
+
+The experiment job is capped at 45 minutes. Checkout, artifact download and
+tool setup share 180 seconds; the core uses 2,400 seconds, the client version
+probe at most five seconds and result upload at most 60 seconds, leaving
+55 seconds of margin. The step ceiling does not extend the core deadline.
+
+## Validation still required
+
+The completed local component checks cover the owned services, fixture export,
+previous web startup and API sweeps, SQL collector formats and cleanup. The
+first complete candidate/previous experiment and the actual hosted Linux
+composition have not yet passed. The workflow is not yet published or enabled.
+
+Completed retained-record read mismatches now yield actual per-case false
+flags. Writes still require all record identities and readbacks to be valid.
+A terminal server failure that prevents dependent phases remains incomplete
+evidence in this version; causal blocked-phase support and the complete
+semantic-negative orchestration are not implemented. Missing startup contract
+evidence also refuses: the FORCE RLS negative-control fallback is not yet
+implemented. These cases must never be represented by invented observations.
+
+The current catalog adapter supports only the first released baseline
+`e0016b3595114728e7864da2adb44c29065f25ef`. It requires the exact equal v0
+source golden pins, no production profile or overlay at that previous commit,
+and the candidate's exact reviewed production profile plus comments-only NOP
+overlay. Other previous releases or catalog progression refuse. The fallback
+uses the test exporter with a loopback-only DSN inside the owned PostgreSQL
+namespace. Bootstrapping through a future previous image's
+`rls-bootstrap-empty` command is not implemented. PR7 remains constrained by
+the conservative migration closure independently of its dormant entrypoint
+exemption.
+
+The accepted production observation found no unknown public objects. Its
 known-object hash is reproduced by the synthetic production bootstrap profile;
-the accepted overlay contains comments only. The original source golden
-remains separate because column order and composite definitions differ from
-the observed production catalog. The compatibility runner must bind those
-source and observation inputs explicitly. PG17 synthetic validation alone
-does not establish equivalence with supported PG14 or authorize production
-schema changes.
+the accepted overlay contains comments only. The source golden remains
+separate because column order and composite definitions differ. PostgreSQL17
+validation alone neither establishes PostgreSQL14 equivalence nor authorizes
+production schema changes.
 
-Future hosted acceptance still requires the planned PR run, three consecutive
-green main compatibility runs, and the swallowed-UPDATE advisory case before
-the compatibility-backed classifier lift. Synthetic unit tests here do not
-replace those outcomes or any existing release approval boundary.
+Canonical acceptance still requires a green PR compatibility run, three
+consecutive green main runs before PR16, and the actual swallowed-UPDATE
+advisory case. Unit tests and the previous-application probe do not replace
+those outcomes or any existing release protection.

@@ -109,6 +109,7 @@ ACTIONLINT_INSTALL = "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7
 RELEASE_TEST_COMMANDS = (
     "python3 -B -m unittest discover -s release/deployment -p 'test_*.py' -v",
     "python3 -B -m unittest discover -s release/staging -p 'test_*.py' -v",
+    "python3 -B -m unittest discover -s release/compat -p 'test_*.py' -v",
 )
 GOLANGCI_LINT = {"version": "v2.11.4"}
 GO_BUILD = "go build -mod=readonly -v ./..."
