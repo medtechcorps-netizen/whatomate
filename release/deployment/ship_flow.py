@@ -18,6 +18,7 @@ import record_writer
 import forward_gates
 import contract_authorization
 import ship_compat
+import ship_rollback_compat
 import ship_records
 import ship_common as common
 
@@ -68,11 +69,14 @@ class Gate:
     resolved: record_resolver.ResolvedChain
     normal: ship_compat.NormalPreflight | None
     rollback: record_resolver.RollbackResolution | None
+    qualified_rollback: ship_rollback_compat.RollbackPreflight | None = None
 
     @property
     def classification(self):
         if self.normal is not None:
             return self.normal.resolution.classification
+        if self.qualified_rollback is not None:
+            return None
         return self.rollback.legacy_classification
 
 
@@ -110,7 +114,10 @@ def _staging_bypass(result):
 def gate(ctx, control, mode, target, *, deadline):
     options = _options(ctx, deadline)
     if mode == 'rollback':
-        result = ship_records.rollback(ctx.repo_dir, target, **options)
+        result = ship_rollback_compat.admit(ctx.repo_dir, control['sha'], target, **options)
+        if type(result) is ship_rollback_compat.RollbackPreflight:
+            return Gate(result.resolution.resolved, None, None, result)
+        _need(type(result) is record_resolver.RollbackResolution, 'record-chain-invalid:policy')
         return Gate(result.resolved, None, result)
     _need(mode in ('dry-run', 'promote', 'stage', 'promote-without-staging'), 'input-invalid:mode')
     result = ship_compat.preflight(ctx.repo_dir, control['sha'], **options)
@@ -188,6 +195,22 @@ def details(value):
             f'- Changed database artifact paths: {changed}',
             *_forward_paths(resolution),
             *_drill_details(value.normal), *_contract_details(value.normal)]
+    if value.qualified_rollback is not None:
+        proof = value.qualified_rollback
+        qualified, required = proof.qualified, proof.resolution.requirements
+        binding = qualified.binding
+        return ['- Database change: none; dormant: false (image rollback; retained live database)',
+            '- Reversible: true; old_server_ok: true',
+            f'- Compatibility: ok; rollback run: {qualified.run_id}; attempt: {qualified.run_attempt}',
+            f'- Producer source: {binding.producer_sha}',
+            f'- Exact target: {binding.selected.release}; live release: {binding.latest.release}',
+            f'- Database changes after the exact target: {required.non_none_count}',
+            f'- Complete span SHA256: {required.span_sha256}',
+            f'- Retained database source: {binding.database_base.source_sha}',
+            f'- Retained catalog: version {required.live.catalog.catalog_version}, minimum reader {required.live.catalog.min_reader_version}',
+            f'- Retained catalog SHA256: {required.live.catalog.catalog_sha256}',
+            '- Changed database artifact paths: none (retained live contract)',
+            '- Restore drills: not required for rollback or restore']
     if latest.live is None:
         return ['- Database history: legacy source checks; measured catalog unavailable',
                 '- Database change: none (image-only decision); dormant: false',
@@ -260,6 +283,27 @@ def promotion_outputs(value, control, verified_images, *, staging, private=()):
 
 
 @_fixed
+def rollback_outputs(value, control, *, private=()):
+    """Prepare complete qualified rollback custody before the first provider read."""
+    if value.qualified_rollback is None:
+        _need(value.normal is None and type(value.rollback) is record_resolver.RollbackResolution,
+              'record-invalid:production-handoff')
+        return None
+    proof = value.qualified_rollback
+    _need(value.normal is None and value.rollback is None and control['run_attempt'] == 1
+          and value.resolved == proof.resolution.resolved
+          and proof.resolution.producer.sha == control['sha'], 'record-invalid:production-handoff')
+    handoff = record_writer.prepare_rollback(proof, _execution(control))
+    outputs = record_handoff.encode_rollback(handoff)
+    for key, text in outputs.items():
+        _need(common.OUTPUT_KEY_RE.fullmatch(key) and common.OUTPUT_VALUE_RE.fullmatch(text),
+              'output-unsafe:text')
+        if text:
+            common.require_public_text(text, private=private)
+    return outputs
+
+
+@_fixed
 def read(ctx, *, deadline):
     return ship_records.read(ctx.repo_dir, **_options(ctx, deadline))
 
@@ -304,6 +348,16 @@ def record_bytes(ctx, control, fields, *, deadline):
         tag = ctx.env.get('SHIP_TARGET_RELEASE', '')
         _need(tag == fields['previous'] if fields['kind'] == 'restore' else tag != fields['previous'],
               'record-invalid:target')
+        outputs = {key: ctx.env.get('REC_' + key.upper(), '') for key in record_handoff.OUTPUT_KEYS}
+        if any(outputs.values()):
+            _need(fields['kind'] == 'rollback', 'record-invalid:handoff')
+            raw = record_handoff.build_rollback_record(outputs, producer_sha=control['sha'],
+                target_release=tag, workflow_sha=control['workflow_sha'], run_id=int(control['run_id']),
+                record_attempt=control['run_attempt'], publication=publication,
+                current_resolution=resolved, reconciled=fields['reconciled'])
+            _need(_base_matches(common.loads_strict(raw), fields), 'record-invalid:production-differs')
+            _need(time.monotonic() < deadline, 'record-chain-invalid:source-deadline')
+            return raw, 'absent'
         # Source-bound legacy guard and v2 exact-span policy execute within the
         # same original stage deadline. No new budget is granted for this read.
         rollback = ship_records.rollback(ctx.repo_dir, tag, **_options(ctx, deadline))

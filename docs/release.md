@@ -60,38 +60,44 @@ An image-only rollback or restore retains that live database contract. A wholly
 schema-v1 history keeps its original rollback source guard and schema-v1 writer;
 it does not invent a measured database baseline for historical records.
 
-A separate read-only rollback-proof preparation path now derives the exact target,
+Rollback admission derives the exact target,
 latest record, retained database origin and every intervening record from the
 complete authenticated chain. Its span digest includes image-only and duplicate-image
 records. It checks all intermediate reversibility and the target reader floor before
 accepting the prepared source projection, under the original operation budget.
-This preparatory path accepts only the narrow unchanged-v0 material contract;
-it does not issue a rollback decision, fetch compatibility or authorize provider
-access. Operational rollback still refuses two or more non-`none` intermediates.
-A private experiment producer separately admits the exact signed target and live
+Wholly schema-v1 and zero/one-change v2 spans keep their existing source guards
+and do not fetch Actions compatibility evidence. Two or more non-`none` records
+require the dedicated current-main proof, including dormant changes in that count.
+The source gate supports only the narrow unchanged-v0 seven-artifact contract;
+seed/registry transitions and unsupported profiles refuse before provider access.
+The experiment producer admits the exact signed target and live
 web images while building current-main tooling for catalog collection and controls.
-It reuses the existing experiment phases, deadlines and cleanup. The operational
-entrypoint, signed evidence, fresh consumer and retry custody must be connected
-and qualified before the multi-span restriction can change; a private producer
-result does not authorize a release.
+It reuses the existing experiment phases, deadlines and cleanup. A producer result
+alone does not authorize a release.
 
-Private rollback helpers now prepare and recheck a separate exact-span snapshot
+The rollback proof commands prepare and recheck a separate exact-span snapshot
 and context4 pair. The pair binds current-main tooling, both signed endpoints,
 their actual image sources, the retained database origin and raw source-material
 commitment. A dedicated adapter authenticates both subjects and a separate parser
 preserves measured failures. Normal snapshot4/context3 and its consumers remain
-unchanged. These private APIs are not wired into dispatch, collection, admission
-or retry custody; neither a parsed pair nor its digest authorizes rollback.
+unchanged. For a multi-span rollback, both plan and production run fresh signed
+source resolution, complete visible all-head collection and another source
+resolution under one original 900-second, 6000-command, 128-MiB allowance.
+Exact source equality, the current-H target/live/span binding, complete execution
+windows and unexpired evidence are required. Unknown later or overlapping work
+refuses; other heads are not filtered out. No proof or favorable caller flag can
+replace this admission. The standalone no-proof rollback policy still refuses
+these spans.
 
 Before any production provider request, the process serializes and replays the
-complete verified promotion inputs within a fixed output-size bound. Only a
+complete verified promotion or qualified rollback inputs within a fixed output-size bound. Only a
 successful deployment emits those inputs to the same run's record job. The
 record job authenticates the chain again and retains the original compatibility
 snapshot even if `main` has advanced. An exact already-published signed record
 is reused on a record-only retry; missing unpublished handoff evidence refuses.
 Oversized evidence refuses before deployment rather than omitting history.
 
-Current handoff format 6 uses the same bounded, lossless XZ framing. It retains
+Promotion handoff format 6 uses the same bounded, lossless XZ framing. It retains
 complete raw pending material, compatibility history and the original drill
 observation, and has a closed field for the complete original owner-label
 observation when the class requires it. For supported `none` and dormant changes,
@@ -100,6 +106,19 @@ from missing historical observations. A record retry replays preserved policy
 at the original UTC times; it neither fetches labels nor reevaluates drill age
 at retry time. This transport change leaves snapshot version 4, compatibility
 context version 3 and the result schema unchanged.
+
+Qualified rollback uses a separate format-7 root with the same six metadata
+outputs, 32 fixed slots and 256-KiB encoded cap. It retains the full raw source,
+all-head evidence, original entry/observation/check times and artifact expiry.
+Encoding and complete replay must finish before the first provider request;
+production checks full-precision UTC freshness again afterwards. Only successful
+PUT or reconcile emits custody. The record job rederives the original qualification
+and binds the exact original main source, workflow run, target and signed parent.
+Later `main` or artifact expiry does not rewrite that original admission. Missing
+unpublished custody, a changed parent or changed execution refuses. The v2 record
+retains the live database tuple and selected images, with `db_change=none`,
+`compat=ok`, the measured compatibility run, `old_server_ok=true`, and no new DDL.
+An all-v1 or zero/one-change route does not acquire format-7 custody.
 
 Historical formats 1-5 retain their exact field sets and same-run record-only
 replay. Formats 1-4 retain their original context-v2 route; format 5 retains
@@ -130,7 +149,7 @@ PR result is not signed main qualification or release authority.
 
 The remaining PR16 work includes positive active and additive classifier rules,
 active-contract semantic proof
-and hosted permission qualification, exact-span rollback compatibility,
+and hosted permission qualification, actual exact-span rollback qualification,
 authenticated compatibility-outage bypass, and their validation. Active forward
 database changes require both restore-drill dates within 90 days, but active
 producers remain disabled. The null timestamps are not successful drill evidence.

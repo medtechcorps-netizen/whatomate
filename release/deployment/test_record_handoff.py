@@ -746,5 +746,222 @@ class XZTests(unittest.TestCase):
         with self.assertRaises(codec.HandoffRefusal): codec.encode(handoff)
 
 
+
+
+
+class RollbackHandoffTests(unittest.TestCase):
+    """Distinct public v7 custody from concrete controlled source and evidence."""
+    @classmethod
+    def setUpClass(cls):
+        case = unittest.TestCase()
+        cls.addClassCleanup(case.doCleanups)
+        cls.case, cls.handoff = fixture.rollback_fixture(case)
+        cls.current = fixture.rollback_plain(cls.case)
+        cls.outputs = codec.encode_rollback(cls.handoff)
+
+    def args(self, **changes):
+        args = dict(producer_sha=self.handoff.preflight.resolution.producer.sha,
+            target_release=self.handoff.preflight.resolution.resolved.selected.release,
+            workflow_sha=self.handoff.execution.workflow_sha, run_id=self.handoff.execution.run_id,
+            record_attempt=1)
+        args.update(changes); return args
+
+    def decode(self, outputs=None, **changes):
+        return codec.decode_rollback(self.outputs if outputs is None else outputs, **self.args(**changes))
+
+    def build(self, outputs=None, **changes):
+        args = self.args(record_attempt=9)
+        args.update(publication=fixture.rollback_publication(self.handoff), current_resolution=self.current)
+        args.update(changes)
+        return codec.build_rollback_record(self.outputs if outputs is None else outputs, **args)
+
+    def refuse(self, outputs=None, **changes):
+        with self.assertRaises(codec.HandoffRefusal) as caught:
+            self.decode(outputs, **changes)
+        self.assertEqual(str(caught.exception), 'record-handoff-invalid')
+
+    def test_public_roundtrip_build_and_original_origin_complete_raw_retention(self):
+        decoded = self.decode()
+        self.assertEqual(decoded, self.handoff)
+        self.assertEqual(self.outputs['handoff_version'], '7')
+        self.assertEqual(set(self.outputs), set(codec.OUTPUT_KEYS))
+        self.assertEqual(decoded.preflight.collected.history, self.handoff.preflight.collected.history)
+        self.assertEqual(decoded.preflight.resolution.materials, self.handoff.preflight.resolution.materials)
+        raw = self.build()
+        value = w.common.loads_strict(raw)
+        self.assertEqual(value['sha'], decoded.preflight.resolution.requirements.target.sha)
+        self.assertEqual(value['catalog_sha256'], decoded.preflight.resolution.requirements.live.catalog.catalog_sha256)
+        self.assertEqual(value['compat_run_id'], decoded.preflight.qualified.run_id)
+        self.assertEqual(raw, w.build_qualified_rollback(decoded, fixture.rollback_publication(decoded), self.current))
+        self.assertEqual(self.decode(record_attempt=500).execution.run_attempt, 1)
+
+    def test_original_6_metadata_32_slots_caps_and_determinism(self):
+        self.assertEqual(codec.encode_rollback(self.handoff), self.outputs)
+        self.assertEqual(len(self.outputs), 38)
+        self.assertLessEqual(int(self.outputs['handoff_encoded_length']), 262144)
+        self.assertLessEqual(int(self.outputs['handoff_raw_length']), 16 * 1024 * 1024)
+        self.assertEqual((codec.MAX_ENCODED, codec.MAX_RAW, codec.MAX_EXPANDED_BYTES),
+                         (262144, 16 * 1024 * 1024, 16 * 1024 * 1024))
+        for key, value in self.outputs.items():
+            self.assertRegex(key, w.common.OUTPUT_KEY_RE)
+            self.assertRegex(value, w.common.OUTPUT_VALUE_RE)
+            if value: w.common.require_public_text(value)
+
+    def test_promotion_decoder_rejects7_and_rollback_rejects_every_promotion_version(self):
+        with self.assertRaises(codec.HandoffRefusal):
+            codec.decode(self.outputs, candidate_sha=self.args()['producer_sha'],
+                workflow_sha=self.handoff.execution.workflow_sha, run_id=self.handoff.execution.run_id, record_attempt=1)
+        HandoffTests.setUpClass()
+        for version in ('1','2','3','4','5','6'):
+            bad = dict(HandoffTests.outputs, handoff_version=version)
+            with self.subTest(version=version): self.refuse(bad)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(HandoffTests.handoff)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(self.handoff)
+
+    def test_wrong_producer_target_workflow_run_and_boolean_attempt_refuse(self):
+        for key, value in (('producer_sha','f'*40), ('target_release',self.current.latest.release),
+                           ('workflow_sha','f'*40), ('run_id',33), ('run_id',True),
+                           ('record_attempt',0), ('record_attempt',True), ('target_release','PRIVATE')):
+            with self.subTest(key=key): self.refuse(**{key:value})
+
+    def test_metadata_missing_extra_wrong_lengths_unused_chunks_and_types_refuse(self):
+        for key in codec.OUTPUT_KEYS:
+            bad = dict(self.outputs); del bad[key]
+            with self.subTest(key=key): self.refuse(bad)
+        variants = [dict(self.outputs, extra='x'), dict(self.outputs, handoff_version=True),
+                    dict(self.outputs, handoff_sha256='0'*64), dict(self.outputs, handoff_raw_length='01'),
+                    dict(self.outputs, handoff_compressed_length='9999999999'),
+                    dict(self.outputs, handoff_32='x')]
+        for bad in variants:
+            with self.subTest(metadata=bad.get('handoff_version')): self.refuse(bad)
+
+    def frame(self):
+        raw = codec._unpack_rollback(self.outputs)
+        header, blobs = codec._unframe(raw, version=7)
+        return copy.deepcopy(header), dict(blobs)
+
+    def repack(self, header, blobs):
+        raw = codec._frame(header['handoff'], blobs, version=header['version'])
+        return envelope(raw, compressed=lzma.compress(raw, format=lzma.FORMAT_XZ,
+            check=lzma.CHECK_CRC64, preset=6), version='7')
+
+    def test_closed_root_type_field_version_and_no_normal_fallback(self):
+        for mutation in (lambda h: h['handoff'].__setitem__('type','record_writer.PromotionHandoff'),
+                         lambda h: h['handoff']['fields'].__setitem__('favorable',True),
+                         lambda h: h['handoff']['fields'].pop('preflight'),
+                         lambda h: h['handoff']['fields']['facts']['fields'].__setitem__('compat_run_id',999)):
+            header, blobs = self.frame(); mutation(header); self.refuse(self.repack(header, blobs))
+        for version in (True, 1, 2, 3, 4, 5, 6, 8):
+            raw = codec._unpack_rollback(self.outputs)
+            size = int.from_bytes(raw[:4], 'big'); header = json.loads(raw[4:4+size])
+            header['version'] = version; head = raw_json(header)
+            bad = len(head).to_bytes(4,'big') + head + raw[4+size:]
+            self.refuse(envelope(bad, compressed=lzma.compress(bad), version='7'))
+
+    def test_preflight_typed_bounds_clock_and_qualified_projection_are_not_authority(self):
+        for mutate in (lambda f: f.__setitem__('command_count',True),
+                       lambda f: f.__setitem__('captured_bytes',0),
+                       lambda f: f['qualified']['fields'].__setitem__('reversible',False),
+                       lambda f: f['entry_at'].__setitem__('value','2027-01-01T00:00:00.000000Z'),
+                       lambda f: f['artifact_expires_at'].__setitem__('value','2027-01-01T00:00:00.000000Z')):
+            header, blobs = self.frame()
+            mutate(header['handoff']['fields']['preflight']['fields'])
+            self.refuse(self.repack(header, blobs))
+
+    def test_raw_subject_source_and_history_tampering_even_with_rehashed_frame_refuses(self):
+        header, blobs = self.frame()
+        fields = header['handoff']['fields']['preflight']['fields']
+        fields['resolution']['fields']['target_recipe']['fields']['sha256'] = '0'*64
+        self.refuse(self.repack(header, blobs))
+        header, blobs = self.frame()
+        attempts = header['handoff']['fields']['preflight']['fields']['collected']['fields']['history']['fields']['attempts']['items']
+        attempts[0]['fields']['measurement']['fields']['result_subject']['fields']['signer_sha'] = 'f'*40
+        self.refuse(self.repack(header, blobs))
+
+    def test_unreferenced_blob_trailing_frame_and_concatenated_xz_refuse(self):
+        header, blobs = self.frame(); blobs[hashlib.sha256(b'PRIVATE').hexdigest()] = b'PRIVATE'
+        self.refuse(self.repack(header, blobs))
+        raw = codec._unpack_rollback(self.outputs)
+        for bad in (raw+b'x', raw[:-1], b'\xff\xff\xff\xff'+raw[4:]):
+            self.refuse(envelope(bad, compressed=lzma.compress(bad), version='7'))
+        self.refuse(envelope(raw, compressed=lzma.compress(raw)+lzma.compress(b''), version='7'))
+
+    def test_size_limits_refuse_before_decoder_or_replay(self):
+        for key, val in (('handoff_raw_length', str(codec.MAX_RAW+1)),
+                         ('handoff_encoded_length', str(codec.MAX_ENCODED+1)),
+                         ('handoff_compressed_length', str(codec.MAX_COMPRESSED+1))):
+            with mock.patch.object(codec, '_xz_inflate', side_effect=AssertionError('decode')):
+                self.refuse(dict(self.outputs, **{key:val}))
+
+    def test_original_time_replay_does_not_fetch_or_requalify_at_retry_time(self):
+        with mock.patch.object(codec.rp, '_source', side_effect=AssertionError('source fetch')), \
+             mock.patch.object(codec.rp, '_actions', side_effect=AssertionError('artifact fetch')), \
+             mock.patch.object(codec.rp.time, 'monotonic', side_effect=AssertionError('clock')):
+            self.assertEqual(self.decode(record_attempt=9), self.handoff)
+            self.assertEqual(w.common.loads_strict(self.build())['compat'], 'ok')
+
+    def test_full_positive_history_retains_earlier_negative_and_foreign_attempt(self):
+        import test_compat_rollback_request as request_cases
+        h = request_cases.histories; value = self.handoff.preflight
+        binding = value.qualified.binding
+        rows = (h.row(binding, run=99, number=9, minute=1, server_false='workers'),
+                h.row(binding, run=98, number=8, minute=2, sha='b'*40,
+                      missing=w.evidence.MissingEvidence.UNKNOWN), h.row(binding))
+        history = h.history(binding, *rows)
+        collected = request_cases.collected(history)
+        qualified = w.request.qualify_rollback(value.resolution, collected)
+        original = replace(value, collected=collected, qualified=qualified,
+            command_count=max(value.command_count, collected.command_count),
+            captured_bytes=max(value.captured_bytes, collected.captured_bytes))
+        handoff = w.prepare_rollback(original, self.handoff.execution)
+        outputs = codec.encode_rollback(handoff)
+        decoded = self.decode(outputs)
+        self.assertEqual(decoded.preflight.collected.history.attempts, rows)
+        self.assertEqual(len(decoded.preflight.collected.history.workflows), 2)
+        self.assertEqual(decoded.preflight.collected.history.whole_run_deletion_coverage, 'unavailable')
+        self.assertEqual(w.common.loads_strict(self.build(outputs))['compat_run_id'], 100)
+
+    def test_later_foreign_unknown_or_overlapping_history_refuses_before_outputs(self):
+        import test_compat_rollback_request as request_cases
+        h = request_cases.histories; value = self.handoff.preflight; binding = value.qualified.binding
+        for row in (h.row(binding, run=101, number=11, minute=20, sha='b'*40),
+                    h.row(binding, run=101, number=11, minute=10, sha='b'*40,
+                          missing=w.evidence.MissingEvidence.UNKNOWN)):
+            collected = request_cases.collected(h.history(binding, h.row(binding), row))
+            forged = replace(self.handoff, preflight=replace(value, collected=collected))
+            with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(forged)
+
+    def test_complete_large_valid_history_exceeds_custody_caps_without_truncation(self):
+        import test_compat_rollback_request as request_cases
+        h = request_cases.histories; value = self.handoff.preflight; binding = value.qualified.binding
+        # Complete negative pairs and bounded envelopes for 400 earlier reviewed attempts. The pure
+        # policy must first accept them; the codec then enforces its own cap.
+        rows = tuple(h.row(binding, run=1000+i, number=1000+i, minute=1,
+                           server_false='workers') for i in range(400)) + (h.row(binding),)
+        collected = request_cases.collected(h.history(binding, *rows))
+        qualified = w.request.qualify_rollback(value.resolution, collected)
+        original = replace(value, collected=collected, qualified=qualified,
+            command_count=max(value.command_count, collected.command_count),
+            captured_bytes=max(value.captured_bytes, collected.captured_bytes))
+        handoff = w.prepare_rollback(original, self.handoff.execution)
+        before = handoff.preflight.collected.history.attempts
+        with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(handoff)
+        self.assertEqual(handoff.preflight.collected.history.attempts, before)
+        self.assertEqual(len(before), 401)
+
+    def test_input_mapping_mutation_never_changes_restored_immutable_history(self):
+        outputs = dict(self.outputs); decoded = self.decode(outputs)
+        outputs['handoff_01'] = 'PRIVATE'
+        self.assertEqual(decoded, self.handoff)
+        self.refuse(outputs)
+
+    def test_fresh_parent_drift_still_refuses_after_valid_decode(self):
+        bad = replace(self.current, image_bindings=self.current.image_bindings[:-1])
+        with self.assertRaises(codec.HandoffRefusal): self.build(current_resolution=bad)
+        with self.assertRaises(codec.HandoffRefusal):
+            self.build(publication=replace(fixture.rollback_publication(self.handoff),
+                execution=replace(self.handoff.execution, run_attempt=2)))
+
+
 if __name__ == '__main__':
     unittest.main()

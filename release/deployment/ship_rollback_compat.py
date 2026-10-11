@@ -1,8 +1,8 @@
-"""Concrete preparatory rollback preflight, without operational authority.
+"""Concrete rollback admission, without transferable operational authority.
 
 Three fresh closed phases share the original outer capture allowance. Complete
-source and all-head evidence are retained; no provider, writer or workflow is
-activated, and the public multiple-change rollback hold remains unchanged.
+source and all-head evidence are retained. The separate named admission route
+keeps legacy and zero/one-change transitions free of Actions evidence reads.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,14 +43,17 @@ class RollbackPreflight:
     captured_bytes: int
     checked_at: datetime
     artifact_expires_at: datetime
+    entry_at: datetime
 
 
-def _source(budget, repo, producer, target, gh, git, token, phase, env):
+def _source(budget, repo, producer, target, gh, git, token, phase, env, *, admission=False):
     budget.check()
     operation = transport.OperationBudget(budget.end, capture=budget.capture, clock=budget.clock)
     try:
         client = transport.ReleaseGh(gh, token, phase / 'config', phase / 'work',
                                      budget=operation, base_env=env)
+        if admission:
+            return resolver.resolve_rollback_admission(client, repo, git, producer, target)
         return resolver.resolve_rollback_proof(client, repo, git, producer, target)
     except Exception:
         operation.failed = True
@@ -93,7 +96,7 @@ def _expiry(qualified, collected, checked_at):
 
 
 def _preflight(repo_dir, producer_sha, target_tag, *, gh_binary, git_binary, token,
-               scratch_dir, deadline, capture, clock, wall_clock, base_env):
+               scratch_dir, deadline, capture, clock, wall_clock, base_env, admission=False):
     """Only command/time seams are injectable here, never favorable facts."""
     budget = normal._Budget(deadline, capture=capture, clock=clock)
     try:
@@ -110,13 +113,17 @@ def _preflight(repo_dir, producer_sha, target_tag, *, gh_binary, git_binary, tok
         budget.bind(scratch_dir, gh_binary, git_binary)
         env = common.scrubbed_env(base=base_env)
         before = _source(budget, repo_dir, producer_sha, target_tag, gh_binary, git_binary,
-                         token, scratch_dir / 'source-before', env)
+                         token, scratch_dir / 'source-before', env, admission=admission)
         budget.check()
+        if admission and type(before) is resolver.RollbackResolution:
+            # Its source operation already performed complete final checks.
+            # Do not fetch any Actions evidence for legacy or zero/one spans.
+            return before
         collected = _actions(budget, repo_dir, producer_sha, gh_binary, git_binary,
                              token, scratch_dir / 'actions', env, wall_clock)
         budget.check()
         after = _source(budget, repo_dir, producer_sha, target_tag, gh_binary, git_binary,
-                        token, scratch_dir / 'source-after', env)
+                        token, scratch_dir / 'source-after', env, admission=admission)
         budget.check()
         _need(type(before) is resolver.RollbackProofResolution and before == after,
               'source-changed')
@@ -127,7 +134,7 @@ def _preflight(repo_dir, producer_sha, target_tag, *, gh_binary, git_binary, tok
         expires = _expiry(qualified, collected, checked_at)
         budget.check()
         return RollbackPreflight(after, qualified, collected, budget.commands,
-                                 budget.captured_bytes, checked_at, expires)
+                                 budget.captured_bytes, checked_at, expires, entry_utc)
     except (evidence.CompatRefusal, common.ReleaseError, resolver.policy.PolicyRefusal,
             resolver.schema_change.SchemaChangeBlocked):
         budget.failed = True
@@ -154,3 +161,46 @@ def preflight(repo_dir: Path, producer_sha: str, target_tag: str, *, gh_binary: 
         git_binary=git_binary, token=token, scratch_dir=scratch_dir, deadline=deadline,
         capture=runtime.bounded_command, clock=time.monotonic,
         wall_clock=lambda: datetime.now(timezone.utc), base_env=os.environ)
+
+
+def admit(repo_dir: Path, producer_sha: str, target_tag: str, *, gh_binary: Path,
+          git_binary: Path, token: str, scratch_dir: Path,
+          deadline: float) -> resolver.RollbackResolution | RollbackPreflight:
+    """Fresh exact-target source policy, fetching compatibility only if needed.
+
+    The protected caller repeats this operation before provider effects. The
+    public no-proof rollback policy is unchanged; a multiple-change result
+    must complete the dedicated source/Actions/source path without new caps.
+    """
+    return _preflight(repo_dir, producer_sha, target_tag, gh_binary=gh_binary,
+        git_binary=git_binary, token=token, scratch_dir=scratch_dir, deadline=deadline,
+        capture=runtime.bounded_command, clock=time.monotonic,
+        wall_clock=lambda: datetime.now(timezone.utc), base_env=os.environ, admission=True)
+
+
+def validate_preserved(value: RollbackPreflight) -> RollbackPreflight:
+    """Pure original-time replay for closed custody, never a fresh permission.
+
+    The codec/writer must bind the original protected workflow execution and
+    exact parent independently. No caller-provided verdict, retry clock or
+    deserialized type establishes source or signature provenance.
+    """
+    try:
+        _need(type(value) is RollbackPreflight and type(value.qualified) is history.QualifiedRollback,
+              'preserved-type')
+        _need(type(value.command_count) is int and 0 < value.command_count <= normal.MAX_COMMANDS
+              and type(value.captured_bytes) is int and 0 < value.captured_bytes <= normal.MAX_BYTES,
+              'preserved-bounds')
+        qualified = bridge.qualify_rollback(value.resolution, value.collected)
+        _need(value.qualified == qualified, 'preserved-qualification')
+        _need(_utc(value.entry_at) <= value.collected.history.observed_at <= _utc(value.checked_at)
+              and value.command_count >= value.collected.command_count
+              and value.captured_bytes >= value.collected.captured_bytes, 'preserved-clock')
+        expires = _expiry(qualified, value.collected, value.checked_at)
+        _need(_utc(value.artifact_expires_at) == expires, 'preserved-expiry')
+        return value
+    except evidence.CompatRefusal:
+        raise
+    except (common.ReleaseError, resolver.policy.PolicyRefusal, ValueError, TypeError,
+            AttributeError, KeyError, IndexError, StopIteration, RecursionError, OverflowError):
+        raise evidence.CompatRefusal('compat-stale', 'rollback-preflight-preserved-invalid') from None

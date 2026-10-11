@@ -132,7 +132,7 @@ class Deps:
         smoke_rounds: int | None = None,
         smoke_delay: float | None = None,
     ) -> None:
-        self.clock = clock or common.utc_now
+        self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.sleeper = sleeper or time.sleep
         self.opener = opener
         self.gh_runner = gh_runner or subprocess.run
@@ -1128,8 +1128,19 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         # The concrete full-chain reader verified every selected image.
         classification = gate.classification
         desired_images = dict(target_entry.images)
+        handoff_outputs = ship_flow.rollback_outputs(gate, control, private=out.private)
     for line in (schema_summary(classification) if classification is not None else []) + ship_flow.details(gate):
         safe_text(out, line)
+    if gate.qualified_rollback is not None:
+        # Custody encoding may consume time. This is a fresh production clock
+        # check before provider I/O, never a record-retry qualification clock.
+        proof = gate.qualified_rollback
+        try:
+            observed = ship_flow.ship_rollback_compat._utc(ctx.deps.clock())
+        except ship_flow.compat_evidence.CompatRefusal:
+            common.fail("candidate-invalid:compat-stale")
+        if not proof.checked_at <= observed < proof.artifact_expires_at:
+            common.fail("candidate-invalid:compat-stale")
     # P5 two identical double reads, digest sources, topology and VPC.
     client = do_app.DOAppClient(
         secret["app_id"],
@@ -1180,6 +1191,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
             reconciled=True,
             state=before,
             summary=[f"- Outcome: reconcile (no PUT); production runs {target_entry.release}"],
+            handoff_outputs=handoff_outputs,
         )
         return EXIT_OK
     # P8 the image-only desired spec and the sanitized digest diff.

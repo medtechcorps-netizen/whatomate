@@ -550,5 +550,233 @@ class WriterTests(unittest.TestCase):
         self.assertIsNone(self.prepare().contract_observation)
 
 
+
+
+
+def rollback_fixture(testcase, *, rows=None, producer_overlap=False):
+    """Actual source/Actions/verification/bridge with controlled command edges.
+
+    No project predicate or positive receipt is mocked. The later ordinary
+    resolver uses the same captured world with a new bounded source operation.
+    """
+    import test_ship_rollback_compat as preflight_cases
+    preflight_cases.RollbackPreflightTests.setUpClass()
+    case = preflight_cases.RollbackPreflightTests()
+    case.setUp(); testcase.addCleanup(case.doCleanups)
+    if producer_overlap:
+        # H is an existing v1 source, so plain reader0 must be enriched exactly.
+        case.case.world.main = case.live_image['sha']
+        case.producer = case.case.world.main
+        # The preliminary setup operation is closed; derive the new exact source
+        # with a fresh location, leaving the public preflight to repeat it again.
+        case.case.client = None
+        config, work = case.case.root / 'overlap-config', case.case.root / 'overlap-work'
+        config.mkdir(); work.mkdir()
+        budget = transport.OperationBudget(700, capture=case.case.world, clock=case.case.clock)
+        client = transport.ReleaseGh(case.case.gh, preflight_cases.source.fixtures.support.GH_TOKEN,
+            config, work, budget=budget, base_env={})
+        case.expected = resolver.resolve_rollback_proof(client, case.case.repo, case.case.git,
+            case.producer, case.target['release'])
+        case.world = preflight_cases.collector.World(preflight_cases.requests.producer_binding(case.expected))
+        case.world.add()
+    if rows is not None:
+        case.world = preflight_cases.collector.World(case.world.binding)
+        for options in rows:
+            case.world.add(**options)
+    preflight = case.run_preflight()
+    execution_value = execution(workflow_sha=preflight.resolution.producer.sha)
+    return case, writer.prepare_rollback(preflight, execution_value)
+
+
+def rollback_publication(handoff, **changes):
+    return publication(execution=handoff.execution, deployed_at='2026-10-13T12:00:00Z',
+                       built=False, **changes)
+
+
+def rollback_plain(case, *, main='f' * 40):
+    """Fresh ordinary concrete read; its sources intentionally omit unused H."""
+    source = case.case
+    source.world.main = main
+    config, work = source.root / 'plain-config', source.root / 'plain-work'
+    config.mkdir(); work.mkdir()
+    budget = transport.OperationBudget(source.clock.now + 600,
+        capture=source.world, clock=source.clock)
+    import test_ship_rollback_compat as preflight_cases
+    client = transport.ReleaseGh(source.gh, preflight_cases.source.fixtures.support.GH_TOKEN,
+        config, work, budget=budget, base_env={})
+    return resolver.resolve_authenticated(client, source.repo, source.git)
+
+
+class QualifiedRollbackWriterTests(unittest.TestCase):
+    def setUp(self):
+        self.case, self.handoff = rollback_fixture(self)
+
+    def current(self):
+        return rollback_plain(self.case)
+
+    def build(self, *, handoff=None, current=None, publication_value=None, **options):
+        handoff = self.handoff if handoff is None else handoff
+        return writer.build_qualified_rollback(handoff,
+            rollback_publication(handoff) if publication_value is None else publication_value,
+            self.current() if current is None else current, **options)
+
+    def test_real_preflight_and_fresh_plain_parent_allow_main_advance(self):
+        current = self.current(); handoff = self.handoff
+        self.assertNotIn(handoff.preflight.resolution.producer.sha,
+                         {row.sha for row in current.chain.sources})
+        self.assertNotEqual(current.inventory.main_sha, handoff.execution.workflow_sha)
+        raw = self.build(current=current)
+        value = common.loads_strict(raw)
+        required = handoff.preflight.resolution.requirements
+        self.assertEqual((value['schema_version'], value['kind'], value['sha'], value['images']),
+                         (2, 'rollback', required.target.sha, dict(required.target.images)))
+        self.assertEqual((value['previous'], value['rolled_back_from']),
+                         (current.latest.release, current.latest.release))
+        self.assertEqual((value['db_change'], value['dormant'], value['reversible'],
+            value['old_server_ok'], value['compat'], value['compat_run_id'], value['staging']),
+            ('none', False, True, True, 'ok', handoff.preflight.qualified.run_id, 'bypassed'))
+        self.assertIsNone(value['fixed_forward_from'])
+        self.assertEqual({key: value[key] for key in required.live.catalog._fields}, required.live.catalog._asdict())
+        new = appended(current, raw)
+        self.assertEqual(new.latest.live, current.latest.live)
+        self.assertEqual(new.latest.actual_web_source_sha, required.target.record.web_source_sha)
+        with self.assertRaisesRegex(policy.PolicyRefusal, 'rollback-qualification-unavailable'):
+            policy.rollback_plan(current.chain, required.target.release)
+
+    def test_real_plain_reader_overlap_only_upgrades_original_H(self):
+        case, handoff = rollback_fixture(self, producer_overlap=True)
+        current = rollback_plain(case)
+        old = next(row for row in current.chain.sources if row.sha == handoff.execution.workflow_sha)
+        self.assertEqual(old.mode, 'legacy-reader0')
+        raw = writer.build_qualified_rollback(handoff, rollback_publication(handoff), current)
+        self.assertEqual(common.loads_strict(raw)['sha'], handoff.preflight.resolution.requirements.target.sha)
+
+    def test_same_digest_duplicate_target_does_not_change_exact_requested_span(self):
+        required = self.handoff.preflight.resolution.requirements
+        selected = self.handoff.preflight.resolution.resolved.selected
+        self.assertNotEqual(required.target.sha, selected.actual_web_source_sha)
+        self.assertEqual(required.target.release, selected.release)
+        bad = replace(self.handoff.preflight.resolution,
+            resolved=replace(self.handoff.preflight.resolution.resolved,
+                             selected=self.handoff.preflight.resolution.resolved.latest))
+        with self.assertRaises(writer.WriterRefusal):
+            writer.prepare_rollback(replace(self.handoff.preflight, resolution=bad), self.handoff.execution)
+
+    def test_facts_or_qualified_verdict_injection_refuse(self):
+        current = self.current()
+        for bad in (replace(self.handoff, facts=self.handoff.facts._replace(compat='bypassed')),
+                    replace(self.handoff, facts=self.handoff.facts._replace(catalog=None)),
+                    replace(self.handoff, preflight=replace(self.handoff.preflight,
+                        qualified=replace(self.handoff.preflight.qualified, run_id=999)))):
+            with self.subTest(bad=bad.facts.compat), self.assertRaises(writer.WriterRefusal):
+                self.build(handoff=bad, current=current)
+
+    def test_original_entry_history_checked_and_expiry_are_replayed(self):
+        value = self.handoff.preflight
+        for bad in (replace(value, entry_at=value.checked_at + timedelta(seconds=1)),
+                    replace(value, checked_at=value.collected.history.observed_at - timedelta(seconds=1)),
+                    replace(value, checked_at=value.artifact_expires_at),
+                    replace(value, artifact_expires_at=value.artifact_expires_at + timedelta(seconds=1)),
+                    replace(value, entry_at=value.entry_at.replace(tzinfo=None)),
+                    replace(value, command_count=True), replace(value, captured_bytes=0)):
+            with self.subTest(bad=bad.checked_at), self.assertRaises(writer.WriterRefusal):
+                writer.prepare_rollback(bad, self.handoff.execution)
+
+    def test_later_retry_uses_original_time_without_fetch_or_clock(self):
+        current = self.current()
+        with mock.patch.object(writer.rollback_preflight, '_source', side_effect=AssertionError('fetch')), \
+             mock.patch.object(writer.rollback_preflight, '_actions', side_effect=AssertionError('fetch')), \
+             mock.patch.object(writer.rollback_preflight.time, 'monotonic', side_effect=AssertionError('clock')):
+            raw = self.build(current=current)
+        self.assertEqual(common.loads_strict(raw)['compat'], 'ok')
+        self.assertLess(self.handoff.preflight.artifact_expires_at,
+                        common.require_timestamp('2027-01-01T00:00:00Z', 'fixture'))
+
+    def test_only_original_ship_H_and_attempt1_can_prepare(self):
+        for changed in (execution(workflow_sha='b' * 40), replace(self.handoff.execution, run_attempt=2),
+                        replace(self.handoff.execution, run_id=True),
+                        replace(self.handoff.execution, repository='PRIVATE'),
+                        replace(self.handoff.execution, workflow=evidence_workflow())):
+            with self.subTest(value=changed), self.assertRaises(writer.WriterRefusal):
+                writer.prepare_rollback(self.handoff.preflight, changed)
+
+    def test_publication_execution_or_preobservation_timestamp_refuse(self):
+        current = self.current()
+        for pub in (replace(rollback_publication(self.handoff), execution=replace(self.handoff.execution, run_id=33)),
+                    replace(rollback_publication(self.handoff), deployed_at='2026-10-11T12:00:00Z')):
+            with self.assertRaises(writer.WriterRefusal): self.build(current=current, publication_value=pub)
+
+    def test_same_second_publication_preserves_full_fractional_checked_time(self):
+        preflight = replace(self.handoff.preflight,
+                            checked_at=self.handoff.preflight.checked_at.replace(microsecond=900000))
+        handoff = writer.prepare_rollback(preflight, self.handoff.execution)
+        stamp = preflight.checked_at.replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        pub = replace(rollback_publication(handoff), deployed_at=stamp)
+        current = self.current()
+        raw = self.build(handoff=handoff, current=current, publication_value=pub)
+        self.assertEqual(common.loads_strict(raw)['deployed_at'], stamp)
+        self.assertEqual(handoff.preflight.checked_at.microsecond, 900000)
+        prior = (preflight.checked_at.replace(microsecond=0) - timedelta(seconds=1)).isoformat().replace('+00:00', 'Z')
+        with self.assertRaises(writer.WriterRefusal):
+            self.build(handoff=handoff, current=current, publication_value=replace(pub, deployed_at=prior))
+
+    def test_fresh_changed_signed_parent_refuses_even_same_images(self):
+        self.case.case.add(kind='restore')
+        with self.assertRaisesRegex(writer.WriterRefusal, 'parent-changed'):
+            self.build()
+
+    def test_changed_historical_source_or_ancestor_is_not_H_enrichment(self):
+        current = self.current()
+        for chain in (replace(current.chain, ancestors=current.chain.ancestors[:-1]),
+                      replace(current.chain, sources=current.chain.sources[:-1]),
+                      replace(current.chain, inputs=current.chain.inputs[:-1])):
+            with self.assertRaises(writer.WriterRefusal):
+                self.build(current=replace(current, chain=chain))
+
+    def test_all_component_image_bindings_and_latest_selection_are_preserved(self):
+        current = self.current(); bindings = list(current.image_bindings)
+        bindings[1] = replace(bindings[1], source_shas=tuple((part, 'e' * 40) for part in common.COMPONENTS))
+        for bad in (replace(current, image_bindings=tuple(bindings)),
+                    replace(current, selected=resolver._selection(current.chain, 1))):
+            with self.assertRaises(writer.WriterRefusal): self.build(current=bad)
+
+    def test_false_actual_measurements_and_later_foreign_work_refuse(self):
+        import test_compat_rollback_request as request_cases
+        h = request_cases.histories
+        value = self.handoff.preflight
+        binding = value.qualified.binding
+        for rows in ((h.row(binding, server_false='workers'),),
+                     (h.row(binding, migration_false='rw'),),
+                     (h.row(binding), h.row(binding, run=101, number=11, minute=20, sha='b'*40))):
+            collected = replace(value.collected, history=h.history(binding, *rows))
+            with self.assertRaises(writer.WriterRefusal):
+                writer.prepare_rollback(replace(value, collected=collected), self.handoff.execution)
+
+    def test_zero_one_legacy_and_normal_values_cannot_substitute_a_preflight(self):
+        for value in (None, {}, self.handoff.preflight.resolution, self.handoff.preflight.collected,
+                      self.handoff.preflight.qualified):
+            with self.assertRaises(writer.WriterRefusal): writer.prepare_rollback(value, self.handoff.execution)
+
+    def test_published_idempotency_does_not_require_replaying_old_proof(self):
+        current = self.current(); raw = self.build(current=current)
+        final = appended(current, raw)
+        with mock.patch.object(writer, 'prepare_rollback', side_effect=AssertionError('replay')):
+            self.assertEqual(writer.published_state(final, raw), 'published')
+        other = dict(common.loads_strict(raw)); other['reconciled'] = True
+        with self.assertRaises(writer.WriterRefusal):
+            writer.published_state(final, common.canonical_file_bytes(other))
+
+    def test_public_outputs_are_immutable_and_reconciled_type_is_strict(self):
+        with self.assertRaises(FrozenInstanceError): self.handoff.facts = None
+        current = self.current()
+        for value in (1, 'true', None):
+            with self.assertRaises(writer.WriterRefusal): self.build(current=current, reconciled=value)
+        self.assertTrue(common.loads_strict(self.build(current=current, reconciled=True))['reconciled'])
+
+
+def evidence_workflow():
+    return writer.evidence.WORKFLOW
+
+
 if __name__ == '__main__':
     unittest.main()
