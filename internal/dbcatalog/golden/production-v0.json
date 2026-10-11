@@ -1,0 +1,996 @@
+{
+  "version": 0,
+  "live_sha256": "1c85a9ad0b9bb652ea21b51faa2ee887592dacb00c7f4b388de5ef5d6085a4e7",
+  "golden_sha256": "17ae6791a73745f3e34ff30760aced9f27b98e189eace34f108ff1d8b93465b8",
+  "released_source": "e0016b3595114728e7864da2adb44c29065f25ef",
+  "delta": [
+    {
+      "kind": "columns",
+      "identity": "conversation_reads.last_read_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "13",
+          "production": "12"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "conversation_reads.last_read_ingested_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "12",
+          "production": "14"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "conversation_reads.metadata",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "14",
+          "production": "13"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "inbound_events.headers",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "21",
+          "production": "19"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "inbound_events.payload",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "22",
+          "production": "20"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "inbound_events.protocol",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "19",
+          "production": "21"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "inbound_events.review_hold_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "20",
+          "production": "22"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.content",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "14",
+          "production": "12"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.direction",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "12",
+          "production": "10"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.error_message",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "23",
+          "production": "21"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.flow_response",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "21",
+          "production": "19"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.inbox_conversation_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "10",
+          "production": "26"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.ingested_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "11",
+          "production": "27"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.interactive_data",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "20",
+          "production": "18"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.is_reply",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "24",
+          "production": "22"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.media_filename",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "17",
+          "production": "15"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.media_mime_type",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "16",
+          "production": "14"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.media_url",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "15",
+          "production": "13"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.message_type",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "13",
+          "production": "11"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.metadata",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "27",
+          "production": "25"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.reply_to_message_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "25",
+          "production": "23"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.sent_by_user_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "26",
+          "production": "24"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.status",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "22",
+          "production": "20"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.template_name",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "18",
+          "production": "16"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "messages.template_params",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "19",
+          "production": "17"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "meta_instagram_data_deletion_events.completed_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "13",
+          "production": "11"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "meta_instagram_data_deletion_events.identity_hashed",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "9",
+          "production": "13"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "meta_instagram_data_deletion_events.last_attempt_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "12",
+          "production": "10"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "meta_instagram_data_deletion_events.privacy_request_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "10",
+          "production": "8"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "meta_instagram_data_deletion_events.request_number",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "11",
+          "production": "9"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "meta_instagram_data_deletion_events.target_resolution",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "8",
+          "production": "12"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "organizations.name",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "6",
+          "production": "5"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "organizations.reseller_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "5",
+          "production": "8"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "organizations.settings",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "8",
+          "production": "7"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "organizations.slug",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "7",
+          "production": "6"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "outbox_jobs.payload",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "25",
+          "production": "24"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "outbox_jobs.provider_state",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "24",
+          "production": "25"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.config",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "11",
+          "production": "8"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.created_by_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "19",
+          "production": "16"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.credential_data",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "12",
+          "production": "9"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.credentials_updated_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "13",
+          "production": "10"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.enabled",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "10",
+          "production": "7"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.last_error_code",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "16",
+          "production": "13"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.last_error_message",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "17",
+          "production": "14"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.last_successful_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "15",
+          "production": "12"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.last_tested_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "14",
+          "production": "11"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.management_mode",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "7",
+          "production": "19"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.platform_app_key",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "8",
+          "production": "20"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.threads_app_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "9",
+          "production": "18"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.updated_by_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "20",
+          "production": "17"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "provider_integrations.validation_token",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "18",
+          "production": "15"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.access_token_expires_at",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "11",
+          "production": "23"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.api_version",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "14",
+          "production": "13"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.app_secret",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "12",
+          "production": "11"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.auto_read_receipt",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "17",
+          "production": "16"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.business_calling_enabled",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "18",
+          "production": "17"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.created_by_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "22",
+          "production": "21"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.is_default_incoming",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "15",
+          "production": "14"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.is_default_outgoing",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "16",
+          "production": "15"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.is_smb",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "19",
+          "production": "18"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.pin",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "21",
+          "production": "20"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.status",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "20",
+          "production": "19"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.updated_by_id",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "23",
+          "production": "22"
+        }
+      }
+    },
+    {
+      "kind": "columns",
+      "identity": "whatsapp_accounts.webhook_verify_token",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "position": {
+          "golden": "13",
+          "production": "12"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "conversation_reads",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "117949377e3804e8fe1038aa0b268cc03b318b3cc3ede449b1ae710b0a301ccb",
+          "production": "0d96b87f592699ac2a58bcc8746196d7bb3697f7b2dd0ab2e58f9f2cc34e1f98"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "inbound_events",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "bc5683251b47481a578c7b96f9275c52813ae58d75d82df7964d4e08d5e7c8e6",
+          "production": "3f03740f1627aeec66bafafda317ebc711a28f1bd7f04a22b89c82c4fec2e658"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "messages",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "6f657a762ca960118273947f5449f20e11fb56711c7cb812b4eb8b0a5133cda0",
+          "production": "a72c96383d95afd4a3e4751437f418a368e73c564025fb03b81112112893794d"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "meta_instagram_data_deletion_events",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "9cd14664a7fae5842b6b6141e331d5550609cae93ba49fa43037d2a2abe4bbd3",
+          "production": "7e63c1409bde244c0ed2c35eb56bde53660bb27cffe8ca5090b21a03080bd99a"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "organizations",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "63697f813c0cfa2b9ae24e6d604bda9d64b9851720c11a9963ba059b824bb1ea",
+          "production": "5eb86115e47f40c97e52705ae5134b2358e24fb98ee2725c859df61bc5148df4"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "outbox_jobs",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "b4db44e465618dfc31fd46c72e08fa8e26241d1fbbc8ec5dd85173ae05e8d61d",
+          "production": "4c048ecb081e9b2d2de447d855d36916a8bdab1f0707add2d0f45e50dcde1709"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "provider_integrations",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "f01f07b6da55295340427ade66c4e7ef326b608a8ef242738f46d7970194af7e",
+          "production": "8654354855017f194ba30ae9c63b816dce5a076d104e8e72e7c4ecf7acdbf286"
+        }
+      }
+    },
+    {
+      "kind": "types",
+      "identity": "whatsapp_accounts",
+      "disposition": "fix-bootstrap",
+      "attributes": {
+        "definition_sha256": {
+          "golden": "bfb958c0aa832e8c8bf127fe3309903326128e7c57ea56152cdbf3159ae8b32c",
+          "production": "af621e4c5555d0c253a4a920b183d613a57174d7e64b89d2740c9db97fe5d901"
+        }
+      }
+    }
+  ],
+  "accepted_unpublished": [],
+  "n_other_schemas": 7,
+  "bootstrap_column_order": [
+    {
+      "table": "conversation_reads",
+      "columns": [
+        "id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "organization_id",
+        "conversation_id",
+        "participant_id",
+        "user_id",
+        "reader_key",
+        "last_read_message_id",
+        "last_read_external_id",
+        "last_read_at",
+        "metadata",
+        "last_read_ingested_at"
+      ]
+    },
+    {
+      "table": "inbound_events",
+      "columns": [
+        "id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "organization_id",
+        "channel_account_id",
+        "dedupe_key",
+        "provider_event_id",
+        "event_type",
+        "status",
+        "signature_valid",
+        "received_at",
+        "processing_started_at",
+        "processed_at",
+        "next_attempt_at",
+        "attempt_count",
+        "error_code",
+        "error_message",
+        "headers",
+        "payload",
+        "protocol",
+        "review_hold_id"
+      ]
+    },
+    {
+      "table": "messages",
+      "columns": [
+        "id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "organization_id",
+        "whats_app_account",
+        "contact_id",
+        "whats_app_message_id",
+        "conversation_id",
+        "direction",
+        "message_type",
+        "content",
+        "media_url",
+        "media_mime_type",
+        "media_filename",
+        "template_name",
+        "template_params",
+        "interactive_data",
+        "flow_response",
+        "status",
+        "error_message",
+        "is_reply",
+        "reply_to_message_id",
+        "sent_by_user_id",
+        "metadata",
+        "inbox_conversation_id",
+        "ingested_at"
+      ]
+    },
+    {
+      "table": "meta_instagram_data_deletion_events",
+      "columns": [
+        "digest",
+        "platform_app_id",
+        "authorizing_user_id",
+        "issued_at",
+        "verified_at",
+        "state",
+        "organization_id",
+        "privacy_request_id",
+        "request_number",
+        "last_attempt_at",
+        "completed_at",
+        "target_resolution",
+        "identity_hashed"
+      ]
+    },
+    {
+      "table": "organizations",
+      "columns": [
+        "id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "name",
+        "slug",
+        "settings",
+        "reseller_id"
+      ]
+    },
+    {
+      "table": "outbox_jobs",
+      "columns": [
+        "id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "organization_id",
+        "channel_account_id",
+        "conversation_id",
+        "message_id",
+        "idempotency_key",
+        "payload_digest",
+        "purpose",
+        "status",
+        "priority",
+        "available_at",
+        "locked_at",
+        "locked_by",
+        "attempt_count",
+        "max_attempts",
+        "last_attempt_at",
+        "sent_at",
+        "failed_at",
+        "last_error_code",
+        "last_error",
+        "payload",
+        "provider_state"
+      ]
+    },
+    {
+      "table": "provider_integrations",
+      "columns": [
+        "id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "organization_id",
+        "provider",
+        "enabled",
+        "config",
+        "credential_data",
+        "credentials_updated_at",
+        "last_tested_at",
+        "last_successful_at",
+        "last_error_code",
+        "last_error_message",
+        "validation_token",
+        "created_by_id",
+        "updated_by_id",
+        "threads_app_id",
+        "management_mode",
+        "platform_app_key"
+      ]
+    },
+    {
+      "table": "whatsapp_accounts",
+      "columns": [
+        "id",
+        "created_at",
+        "updated_at",
+        "deleted_at",
+        "organization_id",
+        "name",
+        "app_id",
+        "phone_id",
+        "business_id",
+        "access_token",
+        "app_secret",
+        "webhook_verify_token",
+        "api_version",
+        "is_default_incoming",
+        "is_default_outgoing",
+        "auto_read_receipt",
+        "business_calling_enabled",
+        "is_smb",
+        "status",
+        "pin",
+        "created_by_id",
+        "updated_by_id",
+        "access_token_expires_at"
+      ]
+    }
+  ]
+}
