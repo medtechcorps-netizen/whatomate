@@ -292,20 +292,62 @@ ownership, configuration, network membership and start identity before acting.
 An unknown command outcome or foreign network attachment refuses further
 actions. Cleanup confirms each resource's absence and does not prune or adopt
 resources by name. The mocked tests cover these boundaries and composition
-with the socket collector. A disposable local probe also passed three-service
+with the socket collector. A disposable local probe passed three-service
 readiness, host SCRAM refusal with working local socket, complete table capture
-with FORCE RLS, and an empty phase window with unchanged public digests. Its
-in-module cleanup refused after Graph stopped; a separate exact-ID cleanup
-removed the owned resources and preserved the original container set. Cleanup
-now uses the supported `--timeout` flag, retaining strict ID acknowledgement.
-A fresh probe must still validate the corrected full roundtrip; these checks
-do not constitute a release compatibility proof.
+with FORCE RLS, and an empty phase window with unchanged public digests. The
+final probe also completed the module's exact-ID cleanup and verified that all
+12 original container IDs remained unchanged. Earlier refused attempts and
+their separate exact-ID cleanup remain preserved as development evidence.
+Cleanup uses the supported `--timeout` flag with strict ID acknowledgement.
+The probe transported generated service environment secrets through a narrow
+child-environment adapter; it did not validate secret-free argv transport for
+the base module's default service creation. These four integrated checks and
+cleanup do not constitute a release compatibility proof.
 
-There is no web service or in-network controller in this module. Those need
-separate reviewed ownership and transport integration. The existing internal
-network must not silently gain a host port or Docker socket to make a caller
-reachable. Meta-relay integration remains separate from this three-service
-foundation.
+`stack.py` remains the three-service foundation. Explicit process registration
+allows the separate lifecycle below to attach only its recorded owned IDs;
+base cleanup refuses until those processes and their manager have closed.
+The internal network gains no published host port or Docker socket.
+Meta-relay integration remains outside this foundation.
+
+## Owned application processes and private controller
+
+`processes.py` adds fixed previous/candidate web, migration and ephemeral
+controller lifecycles around a live `OwnedStack`. Cached image references,
+image IDs, source commits and recipe hashes are required inputs. Previous web
+images must use an exact release repository digest; candidate/controller local
+image IDs must come from separately verified source builds. The module checks
+image and container metadata but does not verify attestations, build or pull.
+Released web images have no recipe label: that recipe binding remains the
+caller's responsibility through the existing release/source verification.
+
+Only one web alias can exist, and web and migration processes cannot overlap.
+The fixed migration command uses `compat-fwd`, `compat-n1-rw` or
+`compat-n1-ro`; the latter requests transaction read-only at connection start.
+Database roles and the `compat` database must already be provisioned. Generated
+synthetic configuration reaches an owned tmpfs file through bounded stdin,
+never a host mount or secret argv/environment. Server configuration omits the
+migration-owner URL. A returned web handle proves running/configured state,
+not readiness or the startup contract. Migration exit codes remain raw
+observations; callers must frame the SQL phase with the PostgreSQL collector.
+
+`controller.py` accepts one bounded private JSON request on stdin. Its pure
+parser runs before container creation and the owner checks the namespace.
+Origins are exactly the owned web and Graph aliases. Readiness makes one
+request to each service. Write/read operations reuse `sweep.py` and retain the
+private record set for later cross-version readback; no fixture credentials
+are retrieved or provisioned. The response preserves all six actual case
+booleans, including false. Protocol success is not a compatibility verdict.
+The controller has no Docker socket and is removed by exact ID after its
+completed invocation. Invalid protocol evidence blocks subsequent starts or
+sweeps while allowing known-resource cleanup. Unknown Docker outcomes retain
+the stricter no-retry boundary and their resource evidence.
+
+These process/controller contracts have mocked Docker and HTTP validation
+only. No controller image recipe/build, real web startup, bootstrap export,
+fixture provisioning, 60-second worker observation or complete experiment is
+supplied here. The earlier three-service probe does not validate these newer
+application processes.
 
 ## Remaining runner and workflow work
 

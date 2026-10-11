@@ -117,6 +117,8 @@ class OwnedStack:
         self._network = None
         self._images, self._specs, self._ids, self._handles = {}, {}, {}, {}
         self._events = []
+        self._process_ids = {}
+        self._process_manager = None
         self._attempted = self._closed = self._ambiguous = self._cleanup_attempted = False
 
     @property
@@ -137,6 +139,7 @@ class OwnedStack:
         """Public-safe resource/operation metadata, never args or environments."""
         return {"source_sha": self.source_sha, "namespace": self.namespace,
                 "network_id": self._network, "container_ids": dict(self._ids),
+                "process_ids": dict(self._process_ids),
                 "operations": [dict(row) for row in self._events],
                 "ambiguous": self._ambiguous, "closed": self._closed,
                 "cleanup_attempted": self._cleanup_attempted,
@@ -216,7 +219,8 @@ class OwnedStack:
              and not row.get("EnableIPv6") and row.get("Labels") == self._labels("network"),
              "stack-network-changed")
         peers = row.get("Containers") or {}
-        need(type(peers) is dict and set(peers) <= set(self._ids.values()), "stack-foreign-attachment")
+        need(type(peers) is dict and set(peers) <= set(self._ids.values()) | set(self._process_ids.values()),
+             "stack-foreign-attachment")
         return row
 
     def _spec(self, role):
@@ -350,6 +354,8 @@ class OwnedStack:
     def cleanup(self) -> None:
         """One removal per exact recorded resource; no force/prune/adoption."""
         need(not self._closed and not self._ambiguous and not self._cleanup_attempted, "stack-outcome-unknown")
+        need(not self._process_ids, "stack-processes-remain")
+        need(self._process_manager is None or self._process_manager._closed, "stack-processes-remain")
         self._cleanup_attempted = True
         if self._network is None:
             need(not self._ids)
