@@ -16,11 +16,11 @@ import test_record_writer as fixture
 w = codec.writer
 
 
-def envelope(raw, *, compressed=None):
+def envelope(raw, *, compressed=None, version='2'):
     """Adversarial untrusted wire fixture, independent of the encoder."""
     packed = zlib.compress(raw, 9) if compressed is None else compressed
     text = base64.b64encode(packed).decode('ascii')
-    result = {'handoff_version': '1', 'handoff_sha256': hashlib.sha256(raw).hexdigest(),
+    result = {'handoff_version': version, 'handoff_sha256': hashlib.sha256(raw).hexdigest(),
         'handoff_raw_length': str(len(raw)), 'handoff_compressed_length': str(len(packed)),
         'handoff_encoded_length': str(len(text)), 'handoff_chunk_count': str((len(text) + 8191) // 8192)}
     result.update((f'handoff_{i + 1:02d}', text[i * 8192:(i + 1) * 8192]) for i in range(32))
@@ -121,7 +121,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIs(json.loads(negative.result)['old_server_ok']['workers'], False)
 
     def test_hash_lengths_counts_versions_and_slots_are_not_optional(self):
-        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '2'),
+        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '3'),
                            ('handoff_raw_length', '1'), ('handoff_compressed_length', '1'),
                            ('handoff_encoded_length', '1'), ('handoff_chunk_count', '0'),
                            ('handoff_chunk_count', '01'), ('handoff_raw_length', True)]:
@@ -260,6 +260,83 @@ class HandoffTests(unittest.TestCase):
         with mock.patch.object(codec, 'MAX_COMPRESSED', 1), \
              mock.patch.object(w.common.Output, 'set_outputs', side_effect=AssertionError('partial output')):
             with self.assertRaises(codec.HandoffRefusal): codec.encode(self.handoff)
+
+    def legacy_outputs(self):
+        """Exact pre-audit version-1 field graph, not a new encoder route."""
+        wire = copy.deepcopy(self.wire)
+        wire['version'] = 1
+        del wire['handoff']['fields']['resolution']['fields']['audit']
+        used = set()
+        def visit(value):
+            if type(value) is dict:
+                if value.get('type') == 'bytes': used.add(value['sha256'])
+                for child in value.values(): visit(child)
+            elif type(value) is list:
+                for child in value: visit(child)
+        visit(wire['handoff'])
+        wire['blobs'] = [row for row in wire['blobs'] if row['sha256'] in used]
+        return envelope(raw_json(wire), version='1')
+
+    def test_version2_preserves_all_audit_ranges_and_drill_source_bytes(self):
+        restored = self.decode(record_attempt=2)
+        self.assertEqual(self.outputs['handoff_version'], '2')
+        self.assertEqual(self.wire['version'], 2)
+        self.assertEqual(restored.resolution.audit, self.resolution.audit)
+        self.assertEqual(len(restored.resolution.audit.changes), 3)
+        self.assertEqual(restored.resolution.audit.drills.raw,
+            (fixture.composition.source.ROOT / codec.r._DRILLS).read_bytes())
+        self.assertEqual({role for row in restored.resolution.audit.changes for role in row.roles},
+            {'database-origin', 'latest-record', 'selected-web'})
+
+    def test_version1_is_historical_custody_only_and_record_retry_still_replays(self):
+        restored = self.decode(self.legacy_outputs(), record_attempt=3)
+        self.assertIsNone(restored.resolution.audit)
+        fresh = replace(self.resolution.resolved,
+            inventory=replace(self.resolution.resolved.inventory, main_sha='f' * 40))
+        self.assertEqual(w.build_promotion(restored, fixture.publication(), fresh),
+            w.build_promotion(self.handoff, fixture.publication(), fresh))
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(restored)
+        with self.assertRaises(codec.p.PolicyRefusal):
+            codec.r.validate_forward_audit(restored.resolution.audit,
+                candidate_sha=restored.resolution.candidate.sha,
+                database_base_source=restored.resolution.database_base_source,
+                latest_record_sha=restored.resolution.resolved.latest.record_sha,
+                selected_web_source_sha=restored.resolution.previous_web_source_sha)
+
+    def test_versions_cannot_be_relabelled_or_omit_or_inject_audit_fields(self):
+        self.refuse(self.mutate(lambda fields: fields['resolution']['fields'].pop('audit')))
+        self.refuse(self.mutate(lambda fields: fields['resolution']['fields'].update(audit=None)))
+        old = self.legacy_outputs(); old['handoff_version'] = '2'; self.refuse(old)
+        changed = dict(self.outputs); changed['handoff_version'] = '1'; self.refuse(changed)
+        wire = copy.deepcopy(self.wire); wire['version'] = 1
+        self.refuse(envelope(raw_json(wire), version='1'))
+
+    def test_audit_wrong_partition_binding_and_malformed_rows_refuse(self):
+        def audit(fields): return fields['resolution']['fields']['audit']['fields']
+        def first(fields): return audit(fields)['changes']['items'][0]['fields']
+        for change in (lambda f: audit(f).update(candidate_sha='f' * 40),
+                       lambda f: audit(f)['drills']['fields'].update(path='PRIVATE'),
+                       lambda f: audit(f)['changes']['items'].pop(),
+                       lambda f: first(f)['roles'].update(items=[]),
+                       lambda f: first(f).update(base_sha='f' * 40),
+                       lambda f: first(f).update(head_sha='f' * 40),
+                       lambda f: first(f)['rows']['items'].append({'type':'record_resolver.ChangedPath',
+                           'fields':{'status':'M','path':'../PRIVATE'}})):
+            self.refuse(self.mutate(change))
+
+    def test_complete_large_audit_refuses_original_codec_cap_before_any_emission(self):
+        audit = self.handoff.resolution.audit
+        rows = tuple(sorted((codec.r.ChangedPath('M', 'files/' + hashlib.sha512(str(i).encode()).hexdigest() + '.py')
+                             for i in range(2200)), key=lambda row:row.path))
+        ranges = (replace(audit.changes[0], rows=rows), *audit.changes[1:])
+        changed = replace(self.handoff, resolution=replace(self.resolution, audit=replace(audit, changes=ranges)))
+        codec.r.validate_forward_audit(changed.resolution.audit, candidate_sha=self.resolution.candidate.sha,
+            database_base_source=self.resolution.database_base_source,
+            latest_record_sha=self.resolution.resolved.latest.record_sha,
+            selected_web_source_sha=self.resolution.previous_web_source_sha)
+        with mock.patch.object(w.common.Output, 'set_outputs', side_effect=AssertionError('partial output')), \
+             mock.patch.object(w.transport.runtime, 'bounded_command', side_effect=AssertionError('provider/command')):
+            with self.assertRaises(codec.HandoffRefusal): codec.encode(changed)
 
 
 if __name__ == '__main__':
