@@ -240,9 +240,11 @@ operations require contiguous entries from the next sequence number, including
 when the baseline cursor is zero; a baseline is not complete worker history.
 
 Requests, response sizes and total time are bounded. POST/PUT operations are
-never retried, and an ambiguous or failed case prevents further use of that
-adapter. Results expose six booleans only after complete readback; missing
-evidence cannot become favorable partial proof. Focused tests use fake HTTP
+never retried, and an ambiguous, unsafe or incomplete case prevents further use
+of that adapter. Results expose six booleans only after complete readback. A
+complete value mismatch remains false on later reads of the same written record
+set; a later match cannot erase it. Missing evidence cannot become favorable
+partial proof. Focused tests use fake HTTP
 responses and verify payloads against current handlers. They do not establish
 that two real server versions can complete these cases. Worker observation,
 provisioning and container isolation remain runner responsibilities.
@@ -470,16 +472,26 @@ previous web startup and API sweeps, SQL collector formats and cleanup. The
 first complete candidate/previous experiment and the actual hosted Linux
 composition have not yet passed. The workflow is not yet published or enabled.
 
-Completed retained-record read mismatches now yield actual per-case false
-flags. Writes still require all record identities and readbacks to be valid.
+Completed retained-record read and write-readback mismatches now yield actual
+per-case false flags. Writes still require complete acknowledgements, valid
+record identities and all six readbacks with intact identity and safety checks.
 The narrow postmigration panic path above has mocked coverage; it does not
 establish a complete actual semantic-negative experiment or support arbitrary
 terminal failures and blocked phases. A completed worker window of at least
 60 seconds can preserve an observed panic or unknown-type failure while the
 same bound server remains alive, its complete logs remain available, and the
 actual stop, reverse sweep, final catalog and cleanup checks continue. Fatal
-errors, worker stops, incomplete writes and unexpected stub traffic still
-refuse rather than substitute invented completion evidence.
+errors, worker stops and incomplete writes still refuse rather than substitute
+invented completion evidence.
+
+The continuous journal can attribute a narrow class of extra synthetic sends
+to an explicitly bound old-server period. Each must match independently retained
+fixture and nonce facts, have a fresh message identity, and receive both exact
+status callbacks. Expected traffic must still be complete. After exact server
+removal, the ledger reconciles the worker window against its full history and
+counts each extra send once. Other unexpected traffic, ambiguous attribution,
+missing callbacks, and mixed panic/unknown-type plus extra-send failures still
+refuse. This path has mocked coverage; actual negative validation remains due.
 Missing startup contract evidence also refuses: the FORCE RLS negative-control
 fallback is not yet implemented.
 These cases must never be represented by invented observations.
