@@ -669,5 +669,63 @@ class DiagnosticTests(unittest.TestCase):
         self.assertLess(len(stderr.getvalue()), 1024)
 
 
+class BuildDiagnosticTests(unittest.TestCase):
+    def test_exact_carrier_private_marker_projection_and_bounded_cause_walk(self):
+        private=b'/private/token PRIVATE_SQL Password=secret https://secret.example/'
+        error=cli.images._BuildFailure('candidate',cli.runtime.Capture(2,private,b'failed to solve: '+private))
+        value=cli._build_failure_diagnostic(error)
+        self.assertTrue(value.startswith('compatibility-build-diagnostic: '))
+        data=json.loads(value.split(': ',1)[1])
+        self.assertEqual(data['role'],'candidate');self.assertEqual(data['exit_code'],2)
+        self.assertEqual(data['families'],['buildkit']);self.assertIsNone(data['cleanup_complete'])
+        for word in ('private','token','PRIVATE_SQL','Password','secret','https'):
+            self.assertNotIn(word,value)
+        self.assertLess(len(value),1024)
+        outer=cli.proof.InfrastructureFailure('admission-builder-ownership-unresolved')
+        outer.__cause__=error
+        self.assertEqual(cli._build_failure_diagnostic(outer),value)
+        for _ in range(4):
+            parent=ValueError('private');parent.__context__=outer;outer=parent
+        self.assertIsNone(cli._build_failure_diagnostic(outer))
+        outer.__context__=outer
+        self.assertIsNone(cli._build_failure_diagnostic(outer))
+        class Foreign(cli.images._BuildFailure):
+            def _public(self):raise AssertionError('arbitrary accessor')
+        self.assertIsNone(cli._build_failure_diagnostic(Foreign('graph',cli.runtime.Capture(1,b'',b''))))
+        error._snapshot=('private',)
+        self.assertIsNone(cli._build_failure_diagnostic(error))
+
+    def test_build_refusal_and_cleanup_cause_emit_facts_without_public_result(self):
+        env=environment();ctx=cli.context(env)
+        for cleanup in (True,False):
+            error=cli.images._BuildFailure('fixture',cli.runtime.Capture(17,b'private-source',b'npm ERR! private'))
+            cli.images._BuildFailure._finish_cleanup(error,cleanup)
+            if not cleanup:
+                outer=cli.proof.InfrastructureFailure('admission-builder-ownership-unresolved')
+                outer.__cause__=error
+            else:outer=error
+            with self.subTest(cleanup=cleanup),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp).resolve();env['RUNNER_TEMP']=str(root)
+                for name in ('docker','buildx'):
+                    (root/name).touch()
+                    env['COMPAT_'+('DOCKER' if name=='docker' else 'BUILDX')+'_BIN']=str(root/name)
+                with mock.patch.dict(cli.os.environ,env,clear=True), \
+                     mock.patch.object(cli,'_read_public',return_value=cli.canonical(snapshot(ctx))), \
+                     mock.patch.object(cli,'_scratch',return_value=root),mock.patch.object(cli,'_client'), \
+                     mock.patch.object(cli,'execute',side_effect=outer), \
+                     mock.patch.object(cli,'_write_public') as write,mock.patch.object(cli,'_mark_complete') as mark, \
+                     contextlib.redirect_stderr(io.StringIO()) as stderr,contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(cli.main(['run']),1)
+                write.assert_not_called();mark.assert_not_called()
+                self.assertFalse((root/'public'/'compat-result.json').exists())
+            lines=stderr.getvalue().splitlines();self.assertEqual(len(lines),3)
+            self.assertEqual(lines[0],cli._failure_message(outer))
+            data=json.loads(lines[2].split(': ',1)[1])
+            self.assertEqual((data['role'],data['exit_code'],data['cleanup_complete']),('fixture',17,cleanup))
+            self.assertEqual(data['stdout_bytes'],14);self.assertEqual(data['families'],['package'])
+            self.assertNotIn('private',stderr.getvalue());self.assertEqual(stdout.getvalue(),'')
+            self.assertLess(len(lines[2]),1024)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -432,6 +432,25 @@ def _failure_diagnostic(error):
     return "compatibility-diagnostic: " + "; ".join(parts)
 
 
+def _build_failure_diagnostic(error):
+    seen = set()
+    for _ in range(4):
+        if error is None or id(error) in seen:
+            return None
+        seen.add(id(error))
+        if type(error) is images._BuildFailure:
+            value = images._BuildFailure._public(error)
+            if value is None:
+                return None
+            raw = canonical(value)
+            if len(raw) <= 1024:
+                return "compatibility-build-diagnostic: " + raw.decode('ascii').rstrip('\n')
+            return None
+        cause = BaseException.__cause__.__get__(error)
+        error = cause if cause is not None else BaseException.__context__.__get__(error)
+    return None
+
+
 def main(argv=None):
     try:
         args = sys.argv[1:] if argv is None else argv
@@ -477,6 +496,9 @@ def main(argv=None):
     except (proof.EvidenceError, common.ReleaseError, OSError, ValueError, TypeError, KeyError) as error:
         print(_failure_message(error), file=sys.stderr)
         print(_failure_diagnostic(error), file=sys.stderr)
+        build_diagnostic = _build_failure_diagnostic(error)
+        if build_diagnostic is not None:
+            print(build_diagnostic, file=sys.stderr)
         return 1
 
 

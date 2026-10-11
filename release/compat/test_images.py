@@ -371,7 +371,13 @@ class AdmissionRoundtripTests(unittest.TestCase):
 
     def test_partial_failure_never_builds_later_roles_or_retries(self):
         self.drift='controller-failure'
-        with self.assertRaisesRegex(m.proof.EvidenceError,'build-failed'):self.admit()
+        with self.assertRaisesRegex(m.proof.EvidenceError,'build-failed') as raised:self.admit()
+        self.assertIs(type(raised.exception),m._BuildFailure)
+        public=m._BuildFailure._public(raised.exception)
+        self.assertEqual((public['role'],public['exit_code'],public['cleanup_complete']),('controller',3,True))
+        self.assertEqual((public['stdout_bytes'],public['stderr_bytes']),(0,0))
+        self.assertEqual(public['stdout_sha256'],hashlib.sha256(b'').hexdigest())
+        self.assertEqual(public['families'],['unknown'])
         with self.assertRaises(m.proof.EvidenceError):self.admit()
         self.assertEqual([x[0] for x in self.builds],['graph','controller'])
         result=json.loads((self.work/('candidate-'+self.candidate)/'result.json').read_bytes())
@@ -519,6 +525,87 @@ class AdmissionRoundtripTests(unittest.TestCase):
                 self.assertFalse(result['cleanup_complete'])
                 self.assertNotIn('cause',result)
             finally:child.doCleanups()
+
+
+    def test_nonzero_build_diagnostic_survives_actual_cleanup_refusal(self):
+        self.drift='nonzero';events=[]
+        class Backend:
+            def __init__(inner,*args):inner.closed=False;inner.name='compat-'+'9'*32
+            def start(inner):events.append('start')
+            def check(inner):pass
+            def close(inner):events.append('close');raise m.proof.InfrastructureFailure('admission-builder-ownership-unresolved')
+            def summary(inner):return {'closed':False}
+        with patch.object(m,'_host_linux',return_value=True),patch.object(m,'_LinuxBuilder',Backend), \
+             patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')):
+            with self.assertRaises(m.proof.InfrastructureFailure) as raised:self.admit()
+            with self.assertRaises(m.proof.EvidenceError):self.admit()
+        cause=raised.exception.__cause__
+        self.assertIs(type(cause),m._BuildFailure)
+        self.assertEqual(cause.args,('admission-build-failed',))
+        public=m._BuildFailure._public(cause)
+        self.assertEqual((public['role'],public['exit_code'],public['cleanup_complete']),('graph',3,False))
+        self.assertEqual((public['stdout_bytes'],public['stdout_sha256']),(12,hashlib.sha256(b'build output').hexdigest()))
+        self.assertEqual(events,['start','close']);self.assertEqual(len(self.builds),1)
+
+
+class BuildDiagnosticTests(unittest.TestCase):
+    def test_wording_categories_publish_only_measured_primitives(self):
+        examples={'compiler':b'/secret/file.go:1:2: undefined: privateIdentifier',
+            'resource':b'private disk: No space left on device', 'signal':b'private binary: signal: killed',
+            'network':b'private URL: dial tcp: secret.example: no such host',
+            'registry':b'private registry: toomanyrequests: private-token',
+            'package':b'npm ERR! private-token /private/path',
+            'buildkit':b'ERROR: failed to solve: private SQL text',
+            'context':b'failed to calculate checksum of private key'}
+        for family,raw in examples.items():
+            with self.subTest(family=family):
+                error=m._BuildFailure('fixture',m.runtime.Capture(17,b'private stdout',raw))
+                value=m._BuildFailure._public(error)
+                self.assertEqual(error.args,('admission-build-failed',))
+                self.assertEqual(value['families'],[family]);self.assertIsNone(value['cleanup_complete'])
+                self.assertEqual((value['role'],value['exit_code']),('fixture',17))
+                for prefix,stream in (('stdout',b'private stdout'),('stderr',raw)):
+                    self.assertEqual(value[prefix+'_bytes'],len(stream))
+                    self.assertEqual(value[prefix+'_sha256'],hashlib.sha256(stream).hexdigest())
+                public=json.dumps(value)
+                for private in ('private','secret','SQL','Identifier','example','token'):
+                    self.assertNotIn(private,public)
+                self.assertNotIn('Capture',repr(error))
+                self.assertLess(len(public),1024)
+        value=m._BuildFailure._public(m._BuildFailure('graph',m.runtime.Capture(137,b'signal: killed',b'')))
+        self.assertEqual(value['families'],['signal'])  # Never infer OOM from killed/137.
+
+    def test_multiple_wording_flags_unknown_and_no_cross_stream_splicing(self):
+        error=m._BuildFailure('candidate',m.runtime.Capture(-9,b'no such host',b'failed to solve: npm error private'))
+        value=m._BuildFailure._public(error)
+        self.assertEqual(value['families'],['buildkit','network','package'])
+        self.assertEqual(value['exit_code'],-9)
+        for out,err in ((b'/private/path token sql',b'unknown compiler reason'),(b'no such ',b'host')):
+            value=m._BuildFailure._public(m._BuildFailure('graph',m.runtime.Capture(1,out,err)))
+            self.assertEqual(value['families'],['unknown'])
+
+    def test_invalid_constructor_and_tampered_slots_never_emit(self):
+        class Hostile(str):
+            def __str__(self):raise AssertionError('private text')
+            def __hash__(self):raise AssertionError('private hash')
+        for role,capture in ((Hostile('graph'),m.runtime.Capture(1,b'',b'')),('foreign',m.runtime.Capture(1,b'',b'')),
+                ('graph',m.runtime.Capture(0,b'',b'')),('graph',m.runtime.Capture(True,b'',b'')),
+                ('graph',m.runtime.Capture(2**32,b'',b'')),('graph',m.runtime.Capture(1,b'x'*(16*m.runtime.MIB+1),b'')),
+                ('graph',m.runtime.Capture(1,Hostile('private'),b'')),('graph',object())):
+            self.assertIsNone(m._BuildFailure._public(m._BuildFailure(role,capture)))
+        good=m._BuildFailure('graph',m.runtime.Capture(1,b'private',b'no such host'))
+        original=good._snapshot
+        for index,bad in ((0,Hostile('graph')),(0,'private'),(1,False),(1,0),(1,2**40),
+                (2,False),(2,-1),(2,16*m.runtime.MIB+1),(3,'private'),(3,Hostile('a'*64)),
+                (4,-1),(5,'A'*64),(6,('private',)),(6,('network','network')),
+                (6,('unknown','network')),(6,[]),(6,(Hostile('network'),))):
+            changed=list(original);changed[index]=bad;good._snapshot=tuple(changed)
+            self.assertIsNone(m._BuildFailure._public(good))
+        good._snapshot=original;good._cleanup_complete='private'
+        self.assertIsNone(m._BuildFailure._public(good))
+        self.assertIsNone(m._BuildFailure._public(m._BuildFailure.__new__(m._BuildFailure)))
+        class Foreign(m._BuildFailure):pass
+        self.assertIsNone(m._BuildFailure._public(Foreign('graph',m.runtime.Capture(1,b'',b''))))
 
 
 class LinuxWorld:

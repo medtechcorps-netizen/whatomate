@@ -63,6 +63,83 @@ def sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+# Wording categories only, never root-cause or compatibility conclusions.
+# Match private bounded bytes; publish no matching line, token, path or offset.
+_BUILD_WORDING = (
+    ('compiler', (b'undefined:', b'syntax error:', b'cannot use ', b'compilation terminated.', b'error ts')),
+    ('resource', (b'no space left on device', b'cannot allocate memory', b'fatal error: out of memory')),
+    ('signal', (b'signal: killed', b'terminated by signal', b'killed by signal')),
+    ('network', (b'no such host', b'dial tcp', b'temporary failure in name resolution', b'connection refused',
+                 b'tls handshake timeout', b'i/o timeout', b'network is unreachable', b'certificate signed by unknown authority')),
+    ('registry', (b'toomanyrequests', b'pull rate limit', b'unauthorized: authentication required',
+                  b'denied: requested access', b'pull access denied', b'failed to authorize')),
+    ('package', (b'npm err!', b'npm error', b'e: unable to locate package', b'e: failed to fetch',
+                 b'e: package ', b'sub-process /usr/bin/dpkg returned an error code')),
+    ('buildkit', (b'failed to solve:', b'failed to export', b'failed to connect to buildkit', b'failed to dial grpc')),
+    ('context', (b'failed to calculate checksum', b'failed to compute cache key', b'failed to read dockerfile',
+                 b'failed to read build context')),
+)
+_BUILD_FAMILIES = frozenset(name for name, _ in _BUILD_WORDING)
+
+
+class _BuildFailure(proof.EvidenceError):
+    """Diagnostic carrier for one completed nonzero build, never an admission.
+
+    Only primitive bounded facts survive capture. No raw bytes, Capture,
+    environment, command or paths are retained by this exception.
+    """
+    __slots__ = ('_snapshot', '_cleanup_complete')
+
+    def __init__(self, role, value):
+        super().__init__('admission-build-failed')
+        self._snapshot = None
+        self._cleanup_complete = None
+        if (type(role) is not str or role not in ('graph', 'controller', 'fixture', 'candidate')
+                or type(value) is not runtime.Capture or type(value.returncode) is not int
+                or not -2147483648 <= value.returncode <= 4294967295 or value.returncode == 0
+                or type(value.stdout) is not bytes or type(value.stderr) is not bytes
+                or len(value.stdout) > 16 * runtime.MIB or len(value.stderr) > 16 * runtime.MIB):
+            return
+        families = set()
+        for raw in (value.stdout, value.stderr):
+            lowered = raw.lower()
+            for name, phrases in _BUILD_WORDING:
+                if any(phrase in lowered for phrase in phrases):
+                    families.add(name)
+        self._snapshot = (role, value.returncode, len(value.stdout), sha(value.stdout),
+                          len(value.stderr), sha(value.stderr), tuple(sorted(families)) or ('unknown',))
+
+    def _finish_cleanup(self, value):
+        if type(self) is _BuildFailure:
+            _BuildFailure._cleanup_complete.__set__(self, value if type(value) is bool else None)
+
+    def _public(self):
+        # Exact type and slot access avoid custom attributes/properties. A
+        # tampered carrier produces no projection, preserving generic refusal.
+        if type(self) is not _BuildFailure:
+            return None
+        try:
+            data = _BuildFailure._snapshot.__get__(self)
+            cleanup = _BuildFailure._cleanup_complete.__get__(self)
+        except AttributeError:
+            return None
+        if type(data) is not tuple or len(data) != 7 or cleanup is not None and type(cleanup) is not bool:
+            return None
+        role, code, out_n, out_sha, err_n, err_sha, families = data
+        if (type(role) is not str or role not in ('graph', 'controller', 'fixture', 'candidate')
+                or type(code) is not int or not -2147483648 <= code <= 4294967295 or code == 0
+                or any(type(n) is not int or not 0 <= n <= 16 * runtime.MIB for n in (out_n, err_n))
+                or any(type(s) is not str or re.fullmatch('[0-9a-f]{64}', s) is None for s in (out_sha, err_sha))
+                or type(families) is not tuple or not 1 <= len(families) <= len(_BUILD_FAMILIES)
+                or any(type(name) is not str or name not in _BUILD_FAMILIES | {'unknown'} for name in families)):
+            return None
+        if families != tuple(sorted(set(families))) or 'unknown' in families and families != ('unknown',):
+            return None
+        return {'version': 1, 'role': role, 'exit_code': code, 'stdout_bytes': out_n, 'stdout_sha256': out_sha,
+                'stderr_bytes': err_n, 'stderr_sha256': err_sha, 'families': list(families),
+                'family_scope': 'matched-wording-only', 'cleanup_complete': cleanup}
+
+
 class _Deadline:
     """One private clock for verification, build, experiment AND cleanup."""
     def __init__(self, *, clock=time.monotonic):
@@ -849,7 +926,7 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
              'plugin_sha256':plugin_sha,'build_phase_cap_seconds':_BUILD,'overall_cap_seconds':_TOTAL,
              'cleanup_complete':False}
     _save(work/'intent.json',receipt)
-    backend=None;error=None;bindings={};rows={};engine=None
+    backend=None;error=None;bindings={};rows={};engine=None;build_failure=None
 
     def engine_info():
         value=transport.capture([binary,'--config',str(config),'--context','default','info','--format','{{json .}}'],
@@ -908,7 +985,9 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
                  and type(value.stdout) is bytes and type(value.stderr) is bytes,'admission-build-capture')
             role_receipt.update(exit_code=value.returncode,stdout_bytes=len(value.stdout),stderr_bytes=len(value.stderr),
                                 stdout_sha256=sha(value.stdout),stderr_sha256=sha(value.stderr),outcome='completed')
-            need(value.returncode==0,'admission-build-failed')
+            if value.returncode != 0:
+                build_failure=_BuildFailure(role,value)
+                raise build_failure
             deadline.build_seconds();_check_export(context,contexts[role]);recheck()
             need(_build_environment(build_config,role_work)==build_env,'admission-build-environment-changed')
             iid=_regular(role_work/'image.id',128).decode('ascii','strict').strip()
@@ -944,6 +1023,8 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
                 error=caught
             receipt['builder']=backend.summary()
         receipt['cleanup_complete']=backend is None or backend.closed
+        if build_failure is not None:
+            _BuildFailure._finish_cleanup(build_failure,receipt['cleanup_complete'])
     try:
         if error is not None:raise error
         need(receipt['cleanup_complete'],'admission-builder-cleanup-unresolved')
