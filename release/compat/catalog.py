@@ -62,8 +62,9 @@ class CatalogContract:
         need(previous.sha == _BASE and type(candidate_sha) is str and _SHA.fullmatch(candidate_sha),
              "catalog-progression-unsupported")
         self.previous_sha, self.candidate_sha = previous.sha, candidate_sha
-        self.previous_web = previous.images.get("web")
-        need(type(self.previous_web) is str and runtime._WEB.fullmatch(self.previous_web))
+        digest = previous.images.get("web")
+        need(type(digest) is str and runtime.common.DIGEST_RE.fullmatch(digest))
+        self.previous_web = runtime.common.IMAGE_REPOSITORY["web"] + "@" + digest
         env = runtime.common.scrubbed_env({"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}, base=base_env)
         def git(args, limit=4*runtime.MIB):
             try:

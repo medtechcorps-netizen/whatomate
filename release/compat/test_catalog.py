@@ -19,7 +19,7 @@ REPO=Path(__file__).resolve().parents[2]
 HEAD="e"*40
 BLOBS={name:(REPO/name).read_bytes() for name in c._PINS}
 ENTRY=c.runtime.release_record.Entry("prod-20261011T000000Z-e0016b35","promote",c._BASE,
-    {"web":test_processes.PREV},"1"*64,"2026-10-11T00:00:00Z",None,None,False,{})
+    {"web":test_processes.PREV.split('@',1)[1]},"1"*64,"2026-10-11T00:00:00Z",None,None,False,{})
 
 
 class Git:
@@ -83,6 +83,31 @@ class CatalogTests(unittest.TestCase):
         self.good=compare(self.contract)
 
     def encoded(self,value):return (json.dumps(value)+'\n').encode()
+
+    def test_real_manifest_entry_digest_composes_exact_repository(self):
+        # Use the real record validator/Entry constructor, not a fabricated
+        # repository-qualified Entry.images value that production never emits.
+        record=c.runtime.release_record
+        raw=record.build_manifest({'kind':'promote','release':ENTRY.release,'sha':c._BASE,
+            'images':{'web':ENTRY.images['web'],'meta-relay':'sha256:'+'8'*64,'gmail-relay':'sha256:'+'9'*64},
+            'previous':c.runtime.common.BOOTSTRAP_TAG,'rolled_back_from':None,'reconciled':False,
+            'built_at':ENTRY.deployed_at,'deployed_at':ENTRY.deployed_at,'workflow_sha':c._BASE,
+            'environment_values_sha256':'2'*64,'non_source_projection_sha256':'3'*64})
+        manifest=record.validate_manifest(c.runtime.common.loads_strict(raw))
+        previous=record.manifest_entry(manifest,raw)
+        actual=c.CatalogContract(REPO,previous,HEAD,base_env={},capture=Git())
+        self.assertEqual(previous.images['web'],ENTRY.images['web'])
+        self.assertEqual(actual.previous_web,c.runtime.common.IMAGE_REPOSITORY['web']+'@'+ENTRY.images['web'])
+        self.assertEqual(actual.previous_web,test_processes.PREV)
+
+    def test_malformed_or_qualified_entry_digest_refuses_before_git(self):
+        for digest in (test_processes.PREV,'sha256:'+'A'*64,'sha256:'+'1'*63,
+                       ENTRY.images['web']+'\n','sha512:'+'1'*64,None,True):
+            with self.subTest(digest=digest):
+                fake=Git()
+                with self.assertRaises(c.proof.EvidenceError):
+                    c.CatalogContract(REPO,ENTRY._replace(images={'web':digest}),HEAD,base_env={},capture=fake)
+                self.assertEqual(fake.calls,[])
 
     def test_actual_source_bound_127_tables_and_first_baseline_nop(self):
         self.assertEqual(len(self.contract.expected_preexisting_tables),127)
