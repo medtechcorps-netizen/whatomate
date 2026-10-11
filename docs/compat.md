@@ -4,9 +4,11 @@
 no Docker, GitHub, filesystem, network or database operations. Its synthetic
 tests exercise proof rules; they do **not** establish compatibility of a release.
 The ordered experiment, source-built image admission and hosted entry points
-are implemented. The advisory workflow is prepared locally, and execution
-remains disabled pending the complete synthetic validation described below.
-Component tests do not establish release compatibility.
+are implemented and enabled in this source for hosted qualification. The
+local positive experiment and swallowed-UPDATE fixture-branch advisory have
+separate source-bound evidence described below. Hosted CI qualifies each
+candidate; three accepted consecutive main compatibility runs remain required
+before PR16. Component tests do not establish release compatibility.
 
 ## Result and failure contract
 
@@ -430,8 +432,8 @@ the experiment and cleanup. The aggregate pull/build phase is capped at
 1,500 seconds and must retain at least 720 seconds for the experiment plus
 180 seconds for cleanup. A later phase never receives a fresh overall budget.
 Cold-build timing and actual Linux backend composition still require real
-validation. The public readiness switch remains false until the reviewed
-validation sequence permits activation.
+hosted validation for each candidate. The readiness switch is enabled; the
+accepted local advisory does not replace hosted qualification.
 
 ## Advisory workflow and release selection
 
@@ -442,7 +444,7 @@ latest-release preview base. `cli.py run` verifies the selected tag again and
 requires its exact source SHA, then runs the experiment. There is no second
 moving-latest selection.
 
-The prepared `compat.yml` runs on every pull request, main push and explicit
+`compat.yml` runs on every pull request, main push and explicit
 dispatch. It has no path filter or first-attempt restriction. `release-preview`
 feeds the exact same-run resolution into `compat-run`; the `compat` aggregator
 requires both actual job outcomes and validates source, release, run and
@@ -476,8 +478,22 @@ catalog checks. All owned containers and the owned network were removed; the
 original container and network ID sets and volume-name hash matched the
 baseline. Independent review accepted the source-bound result.
 This is local evidence for that candidate, not hosted qualification or proof
-for later source changes. The actual hosted Linux composition has not yet
-passed; the workflow is not yet published or enabled.
+for later source changes. Hosted CI must qualify each candidate's Linux
+composition; enabling the entry points does not establish that outcome.
+
+The local swallowed-UPDATE advisory passed on fixture-branch candidate
+`534ce02ca4d1c4147bff2fae80a4e0cae3b4eb02`. Its synthetic psql actor returned
+exit zero in both modes: the read-write UPDATE produced a modification log,
+and the read-only UPDATE produced SQLSTATE 25006 despite the swallowed error.
+The real CREATE negative control also produced 25006. The evaluator therefore
+reported `rw:false`, `ro:false`, and `negative_control:true`, detecting both
+violations despite successful actor exits. Catalog and table-content checks
+remained unchanged. The owned exporter, process manager and stack closed, and
+the original 12-container, 12-network and volume-name baseline was restored.
+This accepted local advisory validates the detector with a synthetic psql
+fixture; its actor is not the signed previous binary. It is distinct from the
+`d9e164812a08f9e642b72c80749cdc5498543f81` positive experiment and supplies
+neither a full compatibility proof nor a hosted artifact.
 
 Completed retained-record read and write-readback mismatches now yield actual
 per-case false flags. Writes still require complete acknowledgements, valid
@@ -528,7 +544,8 @@ separate because column order and composite definitions differ. PostgreSQL17
 validation alone neither establishes PostgreSQL14 equivalence nor authorizes
 production schema changes.
 
-Canonical acceptance still requires a green PR compatibility run, three
-consecutive green main runs before PR16, and the actual swallowed-UPDATE
-advisory case. Unit tests and the previous-application probe do not replace
-those outcomes or any existing release protection.
+The actual local swallowed-UPDATE advisory requirement is satisfied by the
+source-bound result above. Canonical qualification still requires a green PR
+compatibility run and three accepted consecutive main runs before PR16. Unit
+tests and local probes do not replace those hosted outcomes or any existing
+release protection.

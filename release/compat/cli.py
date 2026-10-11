@@ -1,4 +1,4 @@
-"""Hosted compatibility entry points, disabled with the experiment adapter.
+"""Hosted compatibility entry points using the reviewed experiment adapter.
 
 The preview freezes latest and selected release identities from one verified
 chain. The run re-verifies the selected immutable tag and constrains its SHA;

@@ -1,10 +1,10 @@
-"""Ordered first-baseline experiment; public execution is not enabled yet.
+"""Ordered compatibility experiment with reviewed source-built admission.
 
-The initial local source/build admission adapter remains disabled pending
-review. run_experiment() refuses before live work until deliberately enabled;
-image labels supplied by a caller never substitute for source/build evidence.
+The readiness switch can disable run_experiment() before live work; image
+labels supplied by a caller never substitute for source/build evidence.
 The private engine tests use mock admission and transports, not live images.
-No CLI, hosted workflow, publication or production mode is implemented here.
+The CLI and advisory hosted workflow compose this module separately. It has
+no production deployment mode.
 """
 from __future__ import annotations
 
@@ -432,7 +432,7 @@ def run_experiment(repo: Path, candidate_sha: str, run_id: int, run_attempt: int
                    release_client, *, docker_binary: str, config_dir: Path,
                    image_work_dir: Path | None = None, buildx_binary: Path | None = None,
                    rollback_target=None, expected_previous_sha: str | None = None):
-    """Validate immutable inputs; disabled pending source-build admission review.
+    """Validate immutable inputs before the reviewed source-built experiment.
 
     No arbitrary images, observations, successful flags, phase dictionaries,
     command callbacks, SQL or private fixture inputs are accepted here.
@@ -447,8 +447,8 @@ def run_experiment(repo: Path, candidate_sha: str, run_id: int, run_attempt: int
     if expected_previous_sha is not None:
         need(type(expected_previous_sha) is str and _SHA.fullmatch(expected_previous_sha) is not None,
              "experiment-previous-expectation-invalid")
-    # Review must enable the complete adapter deliberately; accidental public
-    # calls cannot launch a build while this slice is still under review.
+    # The explicit readiness switch still refuses before release verification
+    # or builds when the reviewed adapter is administratively disabled.
     need(image_admission._READY_FOR_EXECUTION, "experiment-source-build-admission-unreviewed")
     need(isinstance(image_work_dir, Path), "experiment-image-work-required")
     need(buildx_binary is None or isinstance(buildx_binary, Path), "experiment-builder-location-invalid")

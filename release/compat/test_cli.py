@@ -172,6 +172,47 @@ class RunTests(unittest.TestCase):
 
 
 class FileAndEntryTests(unittest.TestCase):
+    def test_default_enabled_preview_uses_bound_resolution_and_canonical_output(self):
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve(); repo = root / "repo"; runner = root / "runner"
+                repo.mkdir(); runner.mkdir()
+                env = environment("pull_request", "refs/pull/267/merge", "2")
+                env["RUNNER_TEMP"] = str(runner)
+                ctx = cli.context(env)
+                entry = SimpleNamespace(release=TAG, sha=OLD, images={"web": DIGEST})
+                client = SimpleNamespace(work_dir=runner / "private-chain")
+                source = mock.Mock()
+                client_environments = []
+                def client_for(work, actual_env):
+                    client_environments.append(dict(actual_env))
+                    return client
+                with mock.patch.dict(cli.os.environ, env, clear=True), \
+                     mock.patch.object(Path, "cwd", return_value=repo), \
+                     mock.patch.object(cli, "_client", side_effect=client_for) as make_client, \
+                     mock.patch.object(cli.images, "_verification_transport", return_value=contextlib.nullcontext()), \
+                     mock.patch.object(cli.images, "_Source", return_value=source) as make_source, \
+                     mock.patch.object(cli.records, "load_bootstrap", return_value="bootstrap"), \
+                     mock.patch.object(cli.records, "resolve_chain", return_value=cli.records.Chain((entry,))) as resolve, \
+                     mock.patch.object(cli.records, "verify_images") as verify, \
+                     mock.patch.object(cli.schema_change, "classify", return_value=SimpleNamespace(
+                         kind="none", dormant=False, reasons=("synthetic-block",) if blocked else ())), \
+                     contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                     contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    status = cli.main(["preview"])
+                work = runner / ("compat-preview-" + ctx.suffix)
+                expected = snapshot(ctx); expected["preview"]["blocked"] = blocked
+                self.assertEqual(status, int(blocked))
+                self.assertEqual((work / "public" / "resolution.json").read_bytes(), cli.canonical(expected))
+                self.assertEqual(stdout.getvalue(), ""); self.assertEqual(stderr.getvalue(), "")
+                make_client.assert_called_once()
+                self.assertEqual(make_client.call_args.args[0], work)
+                self.assertEqual(client_environments, [env])
+                make_source.assert_called_once_with(repo, SHA, mock.ANY)
+                self.assertEqual(source.clean.call_count, 2)
+                resolve.assert_called_once_with(client, repo, bootstrap="bootstrap", work_dir=client.work_dir)
+                verify.assert_called_once_with(client, entry.images, OLD, "bootstrap")
+
     def test_client_version_setup_is_five_seconds_and_restores_transport(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
