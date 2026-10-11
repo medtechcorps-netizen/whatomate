@@ -60,6 +60,17 @@ An image-only rollback or restore retains that live database contract. A wholly
 schema-v1 history keeps its original rollback source guard and schema-v1 writer;
 it does not invent a measured database baseline for historical records.
 
+A separate read-only rollback-proof preparation path now derives the exact target,
+latest record, retained database origin and every intervening record from the
+complete authenticated chain. Its span digest includes image-only and duplicate-image
+records. It checks all intermediate reversibility and the target reader floor before
+accepting the prepared source projection, under the original operation budget.
+This preparatory path accepts only the narrow unchanged-v0 material contract;
+it does not issue a rollback decision, fetch compatibility or authorize provider
+access. Operational rollback still refuses two or more non-`none` intermediates.
+The dedicated experiment, signed evidence, fresh consumer and retry custody must
+be connected before that restriction can change.
+
 Before any production provider request, the process serializes and replays the
 complete verified promotion inputs within a fixed output-size bound. Only a
 successful deployment emits those inputs to the same run's record job. The

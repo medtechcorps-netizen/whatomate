@@ -143,6 +143,23 @@ class PolicyChain:
 
 
 @dataclass(frozen=True, slots=True)
+class RollbackRequirements:
+    """Checked span data, without compatibility or image-only permission.
+
+    The source resolver applies its separate supported-material restrictions.
+    This pure shape can describe synthetic future policy without claiming that
+    the current source decoder or an actual experiment supports that policy.
+    """
+    target: PolicyEntry
+    intermediates: tuple[PolicyEntry, ...]
+    non_none_count: int
+    live: LiveContract
+    runtime_source_supported: bool
+    span: tuple[tuple[str, str], ...]
+    span_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class RollbackDecision:
     target: PolicyEntry
     intermediates: tuple[PolicyEntry, ...]
@@ -353,8 +370,8 @@ def normalize_chain(inputs: tuple[RecordInput, ...], sources: tuple[SourceFacts,
                        all(source.mode != "synthetic-policy" for source in sources))
 
 
-def rollback_plan(chain: PolicyChain, target_tag: str) -> RollbackDecision:
-    """Exact-tag policy calculation, never a writer or provider authorization."""
+def _rollback_requirements(chain: PolicyChain, target_tag: str) -> RollbackRequirements:
+    """Recheck every crossed record; this is not an operational decision."""
     _need(type(chain) is PolicyChain)
     # Frozen objects are still caller-constructible data. Recheck the complete
     # source/raw/link calculation before trusting a manually assembled chain.
@@ -371,6 +388,19 @@ def rollback_plan(chain: PolicyChain, target_tag: str) -> RollbackDecision:
     _need(all(entry.facts.reversible for entry in intermediates), "rollback-irreversible-span")
     _need(target.reader.reader_version >= live.catalog.min_reader_version, "rollback-reader-too-old")
     count = sum(entry.facts.db_change != "none" for entry in intermediates)
-    _need(count < 2, "rollback-qualification-unavailable")
-    facts = records.ManifestFacts(2, "none", False, True, None, live.catalog, "bypassed", None, "bypassed")
-    return RollbackDecision(target, intermediates, count, live, facts, chain.runtime_source_supported)
+    span = tuple((entry.release, entry.record.manifest_sha256)
+                 for entry in (target,) + intermediates)
+    span_sha256 = _digest(common.canonical_payload_bytes({
+        "purpose": "rollback-span-v1", "records": [list(row) for row in span],
+    }))
+    return RollbackRequirements(target, intermediates, count, live,
+                                chain.runtime_source_supported, span, span_sha256)
+
+
+def rollback_plan(chain: PolicyChain, target_tag: str) -> RollbackDecision:
+    """Exact-tag policy calculation, never a writer or provider authorization."""
+    required = _rollback_requirements(chain, target_tag)
+    _need(required.non_none_count < 2, "rollback-qualification-unavailable")
+    facts = records.ManifestFacts(2, "none", False, True, None, required.live.catalog, "bypassed", None, "bypassed")
+    return RollbackDecision(required.target, required.intermediates, required.non_none_count,
+                            required.live, facts, required.runtime_source_supported)

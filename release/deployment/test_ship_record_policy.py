@@ -406,5 +406,144 @@ class RollbackTests(unittest.TestCase):
         self.assertEqual(p.rollback_plan(chain, chain.entries[-1].release).live.catalog.catalog_sha256, p.V0_MEASUREMENT)
 
 
+class RollbackRequirementsTests(unittest.TestCase):
+    def test_multiple_dormant_changes_are_described_without_authorizing_rollback(self):
+        scenario = Scenario();target = scenario.add(current("1" * 40))
+        scenario.add(current("2" * 40), db_change="data", dormant=True)
+        scenario.add(current("3" * 40), db_change="expand", dormant=True)
+        chain = scenario.normalize()
+        required = p._rollback_requirements(chain, target["release"])
+        self.assertIs(type(required), p.RollbackRequirements)
+        self.assertEqual(required.non_none_count, 2)
+        self.assertTrue(required.runtime_source_supported)
+        self.assertIs(required.live, chain.entries[-1].live)
+        self.assertFalse(hasattr(required, "image_only_facts"))
+        self.assertNotIsInstance(required, p.RollbackDecision)
+        with self.assertRaisesRegex(p.PolicyRefusal, "rollback-qualification-unavailable"):
+            p.rollback_plan(chain, target["release"])
+
+    def test_inclusive_span_keeps_none_rollback_restore_and_duplicate_image_tags(self):
+        scenario = Scenario();target = scenario.add(current("1" * 40))
+        scenario.add(current("2" * 40), db_change="data", dormant=True)
+        scenario.add(current("3" * 40))
+        scenario.add(current("4" * 40), db_change="data", dormant=True)
+        duplicate = scenario.add(current("1" * 40), kind="rollback", target=target)
+        scenario.add(current("1" * 40), kind="restore")
+        chain = scenario.normalize()
+        early = p._rollback_requirements(chain, target["release"])
+        later = p._rollback_requirements(chain, duplicate["release"])
+        self.assertEqual(tuple(entry.kind for entry in early.intermediates),
+                         ("promote", "promote", "promote", "rollback", "restore"))
+        self.assertEqual(early.span, tuple((entry.release, entry.record.manifest_sha256)
+                                         for entry in chain.entries[1:]))
+        self.assertEqual((early.non_none_count, later.non_none_count), (2, 0))
+        self.assertEqual(early.target.images, later.target.images)
+        self.assertEqual(later.span, early.span[-2:])
+        self.assertNotEqual(early.span_sha256, later.span_sha256)
+        self.assertEqual(p.rollback_plan(chain, duplicate["release"]).intermediates,
+                         later.intermediates)
+
+    def test_latest_target_has_one_bound_row_but_no_crossed_changes(self):
+        scenario = Scenario();latest = scenario.add(current(), db_change="data", dormant=True)
+        chain = scenario.normalize()
+        required = p._rollback_requirements(chain, latest["release"])
+        self.assertEqual(required.intermediates, ())
+        self.assertEqual(required.non_none_count, 0)
+        self.assertEqual(required.span, ((latest["release"], chain.inputs[-1].manifest_sha256),))
+        self.assertRegex(required.span_sha256, r"^[0-9a-f]{64}$")
+        self.assertFalse(hasattr(required, "action"))
+
+    def test_intermediate_manifest_change_binds_even_when_class_and_images_are_equal(self):
+        scenario = Scenario();target = scenario.add(current("1" * 40))
+        middle = scenario.add(current("2" * 40))
+        scenario.add(current("3" * 40))
+        before = p._rollback_requirements(scenario.normalize(), target["release"])
+        middle["compat_run_id"] += 1
+        after = p._rollback_requirements(scenario.normalize(), target["release"])
+        self.assertEqual(before.non_none_count, after.non_none_count)
+        self.assertEqual(before.intermediates[0].images, after.intermediates[0].images)
+        self.assertEqual(before.span[0], after.span[0])
+        self.assertEqual(before.span[-1], after.span[-1])
+        self.assertNotEqual(before.span[1][1], after.span[1][1])
+        self.assertNotEqual(before.span_sha256, after.span_sha256)
+
+    def test_forged_entries_omission_order_and_raw_hash_cannot_supply_span(self):
+        scenario = Scenario();target = scenario.add(current("1" * 40))
+        scenario.add(current("2" * 40), db_change="data", dormant=True)
+        scenario.add(current("3" * 40))
+        chain = scenario.normalize()
+        changed = replace(chain.entries[2], facts=chain.entries[2].facts._replace(db_change="none", dormant=False))
+        mutations = (
+            replace(chain, entries=chain.entries[:2]+chain.entries[3:]),
+            replace(chain, entries=chain.entries[:2]+tuple(reversed(chain.entries[2:]))),
+            replace(chain, entries=chain.entries[:2]+(changed,)+chain.entries[3:]),
+            replace(chain, inputs=chain.inputs[:2]+chain.inputs[3:]),
+            replace(chain, inputs=chain.inputs[:-1]+(replace(chain.inputs[-1], manifest_sha256="a" * 64),)),
+        )
+        for changed_chain in mutations:
+            with self.subTest(chain=changed_chain.entries), self.assertRaises(p.PolicyRefusal):
+                p._rollback_requirements(changed_chain, target["release"])
+
+    def test_missing_live_and_invalid_exact_tag_still_refuse(self):
+        scenario = Scenario();target = scenario.add(p.legacy_reader0("1" * 40), version=1)
+        with self.assertRaisesRegex(p.PolicyRefusal, "record-policy-legacy-live-unavailable"):
+            p._rollback_requirements(scenario.normalize(), target["release"])
+        scenario.add(current("2" * 40))
+        chain = scenario.normalize()
+        for tag in (None, "latest", "prod-20261003T120200Z-99999999"):
+            with self.subTest(tag=tag), self.assertRaisesRegex(p.PolicyRefusal, "rollback-target-invalid"):
+                p._rollback_requirements(chain, tag)
+
+    def test_irreversible_check_precedes_reader_floor_and_count_hold(self):
+        scenario = Scenario();target = scenario.add(current("1" * 40))
+        scenario.add(current("2" * 40), db_change="data", reversible=False)
+        scenario.add(future("3" * 40, minimum=1, kind="contract"), db_change="contract")
+        chain = scenario.normalize()
+        for calculation in (p._rollback_requirements, p.rollback_plan):
+            with self.subTest(calculation=calculation.__name__), self.assertRaisesRegex(
+                    p.PolicyRefusal, "rollback-irreversible-span"):
+                calculation(chain, target["release"])
+        scenario.documents[2]["reversible"] = True
+        chain = scenario.normalize()
+        for calculation in (p._rollback_requirements, p.rollback_plan):
+            with self.subTest(calculation=calculation.__name__), self.assertRaisesRegex(
+                    p.PolicyRefusal, "rollback-reader-too-old"):
+                calculation(chain, target["release"])
+
+    def test_synthetic_future_requirements_do_not_claim_source_runtime_support(self):
+        scenario = Scenario();target = scenario.add(current("1" * 40))
+        expanded = future("2" * 40)
+        scenario.add(expanded, db_change="expand")
+        scenario.add(future("3" * 40, version=2, prior=expanded), db_change="expand")
+        chain = scenario.normalize()
+        required = p._rollback_requirements(chain, target["release"])
+        self.assertFalse(required.runtime_source_supported)
+        self.assertEqual(required.non_none_count, 2)
+        self.assertEqual(required.live.catalog.catalog_version, 2)
+        with self.assertRaisesRegex(p.PolicyRefusal, "rollback-qualification-unavailable"):
+            p.rollback_plan(chain, target["release"])
+
+    def test_actual_legacy_web_reader_stays_separate_from_record_and_live_origin(self):
+        scenario = Scenario()
+        target = scenario.add(current("1" * 40), target=scenario.documents[0])
+        origin = scenario.add(current("2" * 40), db_change="data", dormant=True)
+        chain = scenario.normalize()
+        required = p._rollback_requirements(chain, target["release"])
+        self.assertNotEqual(required.target.reader.sha, required.target.sha)
+        self.assertEqual(required.target.reader.sha, scenario.documents[0]["sha"])
+        self.assertEqual(required.live.origin_release, origin["release"])
+        self.assertEqual(required.live.origin_source.sha, origin["sha"])
+        self.assertEqual(required.span[0], (target["release"], chain.inputs[1].manifest_sha256))
+
+    def test_preparation_data_are_frozen_and_never_accepted_as_a_decision_input(self):
+        scenario = Scenario();target = scenario.add(current())
+        chain = scenario.normalize()
+        required = p._rollback_requirements(chain, target["release"])
+        with self.assertRaises(FrozenInstanceError):required.non_none_count = 0
+        with self.assertRaises(TypeError):required.span[0] = (target["release"], "a" * 64)
+        with self.assertRaises(p.PolicyRefusal):p.rollback_plan(required, target["release"])
+        with self.assertRaises(p.PolicyRefusal):p._rollback_requirements(required, target["release"])
+
+
 if __name__ == "__main__":
     unittest.main()
