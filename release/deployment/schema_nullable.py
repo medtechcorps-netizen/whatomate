@@ -175,3 +175,93 @@ def classify_source(declaration, before_catalog, after_catalog, *, base_sha, hea
     except (wire.SemanticRefusal, catalog.PendingRefusal, ValueError, TypeError,
             KeyError, AttributeError, UnicodeError, OverflowError, RecursionError):
         raise NullableSourceRefusal() from None
+
+
+# A source-classification declaration, not an extension of the no-default
+# observation/runtime profile. The exact PG17 deparser template was qualified
+# independently for signed int8 boundaries before this rule was implemented.
+CONSTANT_SOURCE_PATH = "internal/dbcatalog/source-classification/int8-constant-column-v1.json"
+_DECIMAL = re.compile(r"0|-?[1-9][0-9]{0,18}\Z")
+
+
+class ConstantSourceRefusal(ValueError):
+    def __init__(self):
+        super().__init__("constant-source-invalid")
+
+
+def _constant_operation(raw):
+    op = wire._fields(wire._load(raw, wire.MAX_OPERATION),
+        ("format_version", "id", "kind", "relation", "column", "type", "nullable", "default"))
+    _need(type(op["format_version"]) is int and op["format_version"] == 1
+          and type(op["id"]) is str and wire._ID.fullmatch(op["id"])
+          and op["kind"] == "add_int8_constant_column"
+          and wire._name(op["relation"]) and wire._name(op["column"])
+          and op["type"] == "pg_catalog.int8" and type(op["nullable"]) is bool)
+    default = wire._fields(op["default"], ("kind", "decimal"))
+    decimal = default["decimal"]
+    _need(default["kind"] == "int8-literal" and type(decimal) is str
+          and _DECIMAL.fullmatch(decimal) is not None and -(2**63) <= int(decimal) < 2**63)
+    expression = "'" + decimal + "'::bigint"
+    statement = ('ALTER TABLE ONLY "public"."' + op["relation"] + '" ADD COLUMN "'
+                 + op["column"] + '" pg_catalog.int8 DEFAULT ' + "'" + decimal
+                 + "'::pg_catalog.int8" + ("" if op["nullable"] else " NOT NULL") + ";\n").encode("ascii")
+    return op, expression, statement
+
+
+def _classify_constant(declaration, before_catalog, after_catalog, base_sha, head_sha):
+    _budget(declaration, before_catalog, after_catalog)
+    _need(type(base_sha) is str and _SHA.fullmatch(base_sha) is not None
+          and type(head_sha) is str and _SHA.fullmatch(head_sha) is not None and base_sha != head_sha)
+    value = wire._fields(wire._load(declaration, MAX_DOCUMENT),
+        ("format_version", "postgres_major", "purpose", "operation", "default_expression", "before", "after"))
+    _need(type(value["format_version"]) is int and value["format_version"] == 1
+          and type(value["postgres_major"]) is int and value["postgres_major"] == 17
+          and value["purpose"] == "int8-constant-column-source-shape")
+    operation_raw = wire._json_bytes(value["operation"])
+    op, expression, statement = _constant_operation(operation_raw)
+    _need(value["default_expression"] == expression)
+    left, old_type = _endpoint(value["before"], before_catalog, "base", op)
+    right, new_type = _endpoint(value["after"], after_catalog, "head", op)
+    before, after = value["before"], value["after"]
+    name = op["relation"]
+    relation = catalog.ObjectRef("relations", name, "")
+    row = catalog.ObjectRef("types", name, "")
+    array = catalog.ObjectRef("types", "_" + name, "")
+    column = catalog.ObjectRef("columns", name + "." + op["column"], name)
+    slots = before["slots"]
+    not_null = not op["nullable"]
+    _need(len(slots) < wire.MAX_SLOTS and len(after["slots"]) == len(slots) + 1
+          and after["slots"][:-1] == slots and all(slot["name"] != op["column"] for slot in slots))
+    expected = {"number": len(slots)+1, "name": op["column"], "type_namespace": "pg_catalog",
+        "type_name": "int8", "type_modifier": -1, "type_text": "bigint", "not_null": not_null,
+        "dropped": False, "local": True, "inherited_count": 0, "default_present": True,
+        "identity": "", "generated": "", "collation_namespace": "", "collation_name": "", "acl": ""}
+    _need(after["slots"][-1] == expected
+          and old_type[:12] == new_type[:12] and old_type[13:] == new_type[13:]
+          and new_type[12] == old_type[12] + [[len(slots)+1, op["column"], "bigint", not_null, ""]]
+          and left[relation] == right[relation] and left[array] == right[array]
+          and before["array_definition_json"] == after["array_definition_json"]
+          and left[row]["definition_sha256"] != right[row]["definition_sha256"]
+          and {k: v for k, v in left[row].items() if k != "definition_sha256"}
+          == {k: v for k, v in right[row].items() if k != "definition_sha256"})
+    _need(column not in left and column in right)
+    _need(right[column] == {"position": str(len(slots)+1), "type_sha256": wire._digest(b"bigint"),
+        "not_null": str(not_null).lower(), "default_sha256": wire._digest(expression.encode("ascii")),
+        "identity": "", "generated": "", "collation_sha256": wire._digest(b""), "acl": ""})
+    _need(all(right.get(ref) == attrs for ref, attrs in left.items()
+              if ref.kind == "columns" and ref.parent == name))
+    explained = (column, row)
+    changed = {ref for ref in left.keys() | right.keys() if left.get(ref) != right.get(ref)}
+    _need(set(explained) <= changed)
+    return SourceNullableDelta(base_sha, head_sha, wire._digest(declaration),
+        wire._digest(before_catalog), wire._digest(after_catalog), wire._digest(operation_raw),
+        wire._digest(statement), explained, tuple(sorted(changed - set(explained))))
+
+
+def classify_constant_source(declaration, before_catalog, after_catalog, *, base_sha, head_sha):
+    """Explain only the closed typed int8 source delta; never execute a default."""
+    try:
+        return _classify_constant(declaration, before_catalog, after_catalog, base_sha, head_sha)
+    except (NullableSourceRefusal, wire.SemanticRefusal, catalog.PendingRefusal, ValueError,
+            TypeError, KeyError, AttributeError, UnicodeError, OverflowError, RecursionError):
+        raise ConstantSourceRefusal() from None

@@ -23,6 +23,7 @@ import release_record
 import ship_common as common
 import pending_plan
 import schema_nullable
+import schema_index
 
 
 GUARDED_TREES = ("internal/database/", "internal/models/")
@@ -876,28 +877,65 @@ def _v2_catalog(value: Any) -> None:
         _valid(all(_v2_attribute(shape, attrs[key]) for key, shape in _V2_ATTRIBUTES[kind].items()))
 
 
+def _v2_source_budget(declarations, before_raw, after_raw):
+    """Charge each source role once before any new declaration is decoded."""
+    _valid(type(declarations) is tuple and len(declarations) == 3)
+    if all(raw is None for raw in declarations):
+        return
+    limits = (schema_nullable.MAX_DOCUMENT, schema_nullable.MAX_DOCUMENT, schema_index.MAX_DECLARATION)
+    _valid(all(raw is None or type(raw) is bytes and 0 < len(raw) <= limit
+               for raw, limit in zip(declarations, limits)))
+    _valid(all(type(raw) is bytes and 0 < len(raw) <= schema_nullable.MAX_DOCUMENT
+               for raw in (before_raw, after_raw)))
+    _valid(sum(len(raw) for raw in declarations if raw is not None)
+           + len(before_raw) + len(after_raw) <= schema_nullable.MAX_TOTAL)
+    _valid(declarations[0] is None or declarations[1] is None)
+
+
 def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals: list,
-                      reasons: set[str], summary: list[str], requirements: set[str], *, source=None) -> str:
+                      reasons: set[str], summary: list[str], requirements: set[str], *,
+                      source=None, constant_source=None, index_source=None) -> str:
     """Direct current-format rules; full transitions include every companion.
 
     A relation-only synthetic expand example is not a complete table migration.
     Row/array types and other opaque companions conservatively raise its class
     unless the complete closed source declaration explains that exact delta.
     """
+    # Recheck the joint raw boundary even for direct pure callers. Each family
+    # must refer to the same immutable comparison, not just equal parsed JSON.
+    sources = (source, constant_source, index_source)
+    present = [item for item in sources if item is not None]
+    if present:
+        _valid(all(type(item) is tuple and len(item) == 5 for item in present))
+        _valid(all(type(item[1]) is bytes and type(item[2]) is bytes
+                   and type(item[3]) is str and type(item[4]) is str for item in present))
+        before_raw, after_raw, base_sha, head_sha = present[0][1:]
+        _v2_source_budget(tuple(None if item is None else item[0] for item in sources), before_raw, after_raw)
+        _valid(all(item[1:] == present[0][1:] for item in present))
     _v2_catalog(before)
     _v2_catalog(after)
     _globals(old_globals)
     _globals(new_globals)
     explained = set()
-    if source is not None:
+    for label, material in zip(("nullable", "constant", "index"), sources):
+        if material is None:
+            continue
         # Only raw immutable material is accepted here, never a supplied verdict.
-        _valid(type(source) is tuple and len(source) == 5)
-        declaration, before_raw, after_raw, base_sha, head_sha = source
-        delta = schema_nullable.classify_source(declaration, before_raw, after_raw,
-                                               base_sha=base_sha, head_sha=head_sha)
+        declaration, before_raw, after_raw, base_sha, head_sha = material
+        if label == "nullable":
+            delta = schema_nullable.classify_source(declaration, before_raw, after_raw,
+                                                   base_sha=base_sha, head_sha=head_sha)
+        elif label == "constant":
+            delta = schema_nullable.classify_constant_source(declaration, before_raw, after_raw,
+                                                            base_sha=base_sha, head_sha=head_sha)
+        else:
+            delta = schema_index.classify_source(declaration, before_raw, after_raw,
+                                                base_sha=base_sha, head_sha=head_sha)
         _valid(common.loads_strict(before_raw) == before and common.loads_strict(after_raw) == after)
-        explained = {(ref.kind, ref.identity) for ref in delta.explained}
-        summary.append("source nullable declaration: sha256=" + delta.declaration_sha256
+        current = {(ref.kind, ref.identity) for ref in delta.explained}
+        _valid(not current.intersection(explained))
+        explained.update(current)
+        summary.append("source " + label + " declaration: sha256=" + delta.declaration_sha256
                        + "; operation=" + delta.operation_sha256 + "; source interpretation only")
     left = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in before["objects"]}
     right = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in after["objects"]}
@@ -951,7 +989,7 @@ def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals:
                     summary.append("new definer function " + name)
                 else:
                     proposed = "expand"
-            elif kind == "indexes" and attrs["unique"] == "false":
+            elif kind == "indexes" and attrs["unique"] == "false" and key not in explained:
                 requirements.add("index-operation-unsupported")
         if key in explained:
             proposed = "expand"
@@ -1145,13 +1183,24 @@ def _classify_v2(repo: _Repository, base: str, head: str,
     try:
         section = "nullable-source"
         declaration = repo.blob(head, schema_nullable.SOURCE_PATH)
+        section = "constant-source"
+        constant_declaration = repo.blob(head, schema_nullable.CONSTANT_SOURCE_PATH)
+        section = "index-source"
+        index_declaration = repo.blob(head, schema_index.SOURCE_PATH)
+        declarations = (declaration, constant_declaration, index_declaration)
+        labels = ("nullable-source", "constant-source", "index-source")
+        source_section = next((label for label, raw in zip(labels, declarations) if raw is not None), "catalog")
+        if sum(raw is not None for raw in declarations) > 1:
+            source_section = "source-classification"
         section = "catalog"
         before_raw = repo.blob(base, CATALOG)
-        if declaration is not None:
-            section = "nullable-source"
-            # Bound the new three-slot material before this v2 pass decodes it;
+        after_raw = None
+        if any(raw is not None for raw in declarations):
+            after_raw = repo.blob(head, CATALOG)
+            section = source_section
+            # Bound all descriptor/catalog roles before this v2 pass decodes;
             # the unchanged legacy classifier has its own original read bounds.
-            schema_nullable._budget(declaration, before_raw, repo.blob(head, CATALOG))
+            _v2_source_budget(declarations, before_raw, after_raw)
         if before_raw is None:
             reasons.add("catalog-baseline-required")
             return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), (), tuple(sorted(requirements)))
@@ -1161,11 +1210,15 @@ def _classify_v2(repo: _Repository, base: str, head: str,
         section = "global-tables"
         old_global = repo.document(base, GLOBALS, _globals)
         new_global = repo.document(head, GLOBALS, _globals)
-        section = "nullable-source" if declaration is not None else "catalog"
+        section = source_section
         source = None if declaration is None else (
-            declaration, before_raw, repo.blob(head, CATALOG), base, head)
+            declaration, before_raw, after_raw, base, head)
+        constant_source = None if constant_declaration is None else (
+            constant_declaration, before_raw, after_raw, base, head)
+        index_source = None if index_declaration is None else (
+            index_declaration, before_raw, after_raw, base, head)
         semantic = _v2_catalog_delta(old, new, old_global, new_global, reasons, summary, requirements,
-                                     source=source)
+                                     source=source, constant_source=constant_source, index_source=index_source)
         section = "history"
         before = repo.document(base, HISTORY, _history)
         after = repo.document(head, HISTORY, _history)
