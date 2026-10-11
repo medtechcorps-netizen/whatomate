@@ -681,6 +681,44 @@ old-binary compatibility and ordered multi-operation proof remain prerequisites.
 V2 supplies no active DDL permission and adds no constant-default, concurrent-index
 or other operation support.
 
+## Preparatory nullable source/profile binding
+
+The pure profile bridge binds the retained origin's release/manifest/source and
+catalog coordinates, the candidate source/coordinates, and four complete source
+documents before it accepts any observations. The closed descriptor fixes one
+nullable int8 operation, its renderer, exact source roles/paths/lengths/hashes,
+complete expected before/after catalogs and the v2 default-ACL contract. Catalog
+files use the existing Go struct serialization; sorted descriptor JSON is a
+different wire format. Logical catalog version, wire version, source-file hashes
+and observed catalog hashes retain their separate meanings.
+
+Explanation reparses all retained inputs, compares both complete observed
+catalogs to the independently bound source expectations, then recomputes the
+unchanged v2 graph/security explanation. Opaque frozen holders do not bypass
+validation: canonical output recomputes from their retained source and observation
+bytes. Every source/observation slot counts toward the original 8 MiB aggregate
+before decoding, even when multiple slots contain the same bytes; individual
+catalogs/observations remain limited to 4 MiB.
+
+The 18 new profile tests and 25 v1/v2 semantic tests passed with no skips and
+1,682 stable source pins. The positive derives both expected catalogs from the
+preexisting source golden and a separately reviewed model/query blueprint before
+opening the actual fixture. Its old row-type definition must match the existing
+golden hash before the declared extra slot may generate the target. It preserves
+4,431 unrelated objects and explains the actual 4,432-to-4,433-object transition.
+The complete six input slots total 7,062,107 bytes; canonical output is 2,223 bytes.
+A complete 9,273,887-byte source/observation combination refuses at the unchanged
+aggregate bound. Other negatives cover source/role mismatches, coherent but wrong
+expected catalogs, malformed graph/security evidence and forged holders.
+
+The tests use controlled source identities. This bridge does not authenticate
+Git, signatures, source history or images, and no runtime caller or classifier
+uses it. A future concrete caller must read fixed immutable source paths under
+the original budget and final checks. Newly authored candidate bytes cannot be
+claimed to have existed at a legacy retained origin. The production-v0 shape
+remains distinct from the tested application golden; neither logical history nor
+active production admission follows from this pure explanation.
+
 ## Validation still required
 
 The complete local synthetic experiment passed on candidate
