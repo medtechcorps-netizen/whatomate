@@ -454,7 +454,7 @@ class ConstantSourceTests(unittest.TestCase):
 
     def test_literal_grammar_rejects_expressions_and_noncanonical_numbers(self):
         for value in (None, True, 1, 1.0, "", "+1", "-0", "01", "-01", " 1", "1 ", "1\n", "1.0", "1e0",
-                      "１", "NULL", "1+0", "nextval('x')", "'1'", "1::int8", "9223372036854775808",
+                      "\uff11", "NULL", "1+0", "nextval('x')", "'1'", "1::int8", "9223372036854775808",
                       "-9223372036854775809", "9" * 100):
             before, after, declaration = self.inputs(); declaration["operation"]["default"]["decimal"] = value
             with self.subTest(value=value): self.refused(before, after, declaration)
