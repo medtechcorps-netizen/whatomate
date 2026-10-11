@@ -142,3 +142,84 @@ func TestCatalogSnapshotOutputFailureReturnsFailure(t *testing.T) {
 		t.Fatal("output failure was hidden")
 	}
 }
+
+func TestCatalogNullableBaselineHasOnlyTheFixedMode(t *testing.T) {
+	args, err := parseCatalogSnapshotArgs([]string{"-mode", "nullable-v2-baseline"})
+	if err != nil || args.mode != "nullable-v2-baseline" || args.seedCounts || args.listUnknown || args.configPath != "config.toml" {
+		t.Fatal("fixed baseline mode did not parse")
+	}
+	for _, extra := range [][]string{
+		{"-seed-counts"}, {"-list-unknown"}, {"private-positional"},
+		{"-operation", "private.json"}, {"-profile", "private.json"},
+		{"-relation", "other_table"}, {"-expected-sha256", "caller-hash"},
+	} {
+		t.Run(strings.Join(extra, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			load := func(string) (*config.Config, error) {
+				t.Fatal("invalid baseline option loaded config")
+				return nil, nil
+			}
+			argv := append([]string{"-mode", "nullable-v2-baseline"}, extra...)
+			if catalogSnapshotCommand(context.Background(), argv, &stdout, &stderr, load, nil) != 2 || stdout.Len() != 0 || stderr.String() != "catalog-snapshot:invalid-arguments; use -help\n" {
+				t.Fatal("arbitrary baseline options were not safely refused before configuration")
+			}
+		})
+	}
+	for _, mode := range []string{"compare", "json", "sha256"} {
+		args, err := parseCatalogSnapshotArgs([]string{"-mode", mode, "-seed-counts", "-list-unknown"})
+		if err != nil || args.mode != mode || !args.seedCounts || !args.listUnknown {
+			t.Fatal("existing mode options changed")
+		}
+	}
+}
+
+func TestCatalogNullableBaselineDispatchKeepsOriginalParentDeadline(t *testing.T) {
+	parentDeadline := time.Now().Add(2 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	load := func(string) (*config.Config, error) {
+		return &config.Config{Database: config.DatabaseConfig{URL: "runtime-only", MigrationURL: "must-not-be-used"}}, nil
+	}
+	called := 0
+	// This checks dispatch/buffering only; the collector boundary is controlled.
+	// Real baseline qualification belongs to the fixed Go API and actual H run.
+	collect := func(inner context.Context, cfg config.DatabaseConfig, args catalogSnapshotArgs) ([]byte, error) {
+		called++
+		deadline, ok := inner.Deadline()
+		if !ok || !deadline.Equal(parentDeadline) || cfg.URL != "runtime-only" || args.mode != "nullable-v2-baseline" || args.seedCounts || args.listUnknown {
+			t.Fatal("fixed mode changed credentials, options or the earlier parent deadline")
+		}
+		return []byte("controlled-complete-observation\n"), nil
+	}
+	if catalogSnapshotCommand(ctx, []string{"-mode", "nullable-v2-baseline"}, &stdout, &stderr, load, collect) != 0 || called != 1 || stdout.String() != "controlled-complete-observation\n" || stderr.Len() != 0 {
+		t.Fatal("fixed mode did not publish exactly one completed collector result")
+	}
+}
+
+func TestCatalogNullableBaselineCaptureFailureNeverPublishesPartialBytes(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	load := func(string) (*config.Config, error) { return &config.Config{}, nil }
+	collect := func(context.Context, config.DatabaseConfig, catalogSnapshotArgs) ([]byte, error) {
+		return []byte("private-partial-observation"), errors.New("postgres://private-secret@private-host/db")
+	}
+	if catalogSnapshotCommand(context.Background(), []string{"-mode", "nullable-v2-baseline"}, &stdout, &stderr, load, collect) != 1 || stdout.Len() != 0 || stderr.String() != "catalog-snapshot:capture-failed\n" {
+		t.Fatal("baseline failure exposed a partial observation or raw driver error")
+	}
+}
+
+func TestCatalogNullableBaselineCollectorRejectsOverridesBeforeDatabase(t *testing.T) {
+	for _, args := range []catalogSnapshotArgs{
+		{mode: "nullable-v2-baseline", seedCounts: true},
+		{mode: "nullable-v2-baseline", listUnknown: true},
+	} {
+		raw, err := collectCatalogSnapshot(context.Background(), config.DatabaseConfig{URL: "not-a-database-url"}, args)
+		if err == nil || err.Error() != "invalid arguments" || raw != nil {
+			t.Fatal("direct collector accepted an arbitrary baseline option")
+		}
+	}
+	raw, err := collectCatalogSnapshot(context.Background(), config.DatabaseConfig{MigrationURL: "postgres://migration:private@host/db"}, catalogSnapshotArgs{mode: "nullable-v2-baseline"})
+	if err == nil || err.Error() != "runtime database configuration required" || raw != nil {
+		t.Fatal("fixed baseline fell back to privileged migration credentials")
+	}
+}

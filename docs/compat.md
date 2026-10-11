@@ -719,6 +719,30 @@ claimed to have existed at a legacy retained origin. The production-v0 shape
 remains distinct from the tested application golden; neither logical history nor
 active production admission follows from this pure explanation.
 
+### Preparatory production-v0 graph baseline
+
+The fixed `catalog-snapshot -mode nullable-v2-baseline` command uses a complete
+expected catalog reconstructed from the reviewed source profile. The owning adapter
+captures the full V2 observation through the admitted candidate image, requires
+the production-v0 catalog and two exact default-ACL rows, and binds the result
+to that image's source and recipe. The fixed command uses the exclusive catalog
+slot and removes its process before returning accepted bytes. Any failure is
+sticky; a second attempt on the same owner is refused.
+
+Only this command's owned log capture permits 4 MiB of stdout. Ordinary captures
+retain their limits. The command remains read-only and executes no nullable
+column operation. Its returned metadata is a private baseline observation,
+not a transition explanation or release qualification.
+
+Local validation passed 42 catalog tests plus two fuzz seed groups, 12 CLI tests,
+86 Python tests and repository lint. Ten registry groups passed after explicitly
+recording the one newly reached source file: the migration closure contains
+231 files and 3,158 declarations. Data-step, seed and active catalog manifests
+remain unchanged. The controlled graph fixture is synthetic and keeps the
+source-derived expectation independent; actual source-built image qualification
+is still required. This baseline does not complete PR16 or activate its engine,
+classifier, production migration or multi-span rollback paths.
+
 ## Validation still required
 
 The complete local synthetic experiment passed on candidate

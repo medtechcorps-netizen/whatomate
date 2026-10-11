@@ -1,0 +1,1 @@
+{"column":"extra","default":null,"format_version":1,"id":"add_extra","kind":"add_nullable_column","nullable":true,"relation":"organizations","type":"pg_catalog.int8"}

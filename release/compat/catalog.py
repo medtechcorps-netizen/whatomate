@@ -15,7 +15,7 @@ are public outputs. Docker/Go/DB operations never execute at import.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 from pathlib import Path
 import re
@@ -48,6 +48,7 @@ _COUNT_KEYS = {"non_public_schemas", "non_public_objects", "other_roles", "defau
                "statistics", "tablespaces", "other_acl_entries", "other_policy_roles"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_NULLABLE_CATALOG_SHA256 = "1c85a9ad0b9bb652ea21b51faa2ee887592dacb00c7f4b388de5ef5d6085a4e7"
 # Only the CLI's fixed public diagnostics may refine a refusal. Never echo
 # arbitrary process output: it may contain configuration or driver details.
 _CLI_FAILURES = {
@@ -69,6 +70,54 @@ def _json(raw):
         return runtime.common.loads_strict(raw)
     except runtime.common.ReleaseError:
         raise proof.EvidenceError("catalog-json-invalid") from None
+
+
+def _nullable_expected(golden_raw, profile_raw):
+    """Reconstruct only the pinned 72 deltas, without an observed input."""
+    import catalog_semantics as wire
+    need(type(golden_raw) is bytes and type(profile_raw) is bytes
+         and hashlib.sha256(golden_raw).hexdigest() == _PINS[_GOLDEN]
+         and hashlib.sha256(profile_raw).hexdigest() == _PINS[_PROFILE],
+         "catalog-baseline-source-invalid")
+    golden, profile = _json(golden_raw), _json(profile_raw)
+    need(type(golden) is dict and set(golden) == {"version", "objects"}
+         and type(golden["version"]) is int and golden["version"] == 0)
+    need(type(profile) is dict and set(profile) == {"version", "live_sha256", "golden_sha256",
+         "released_source", "delta", "accepted_unpublished", "n_other_schemas", "bootstrap_column_order"}
+         and type(profile["version"]) is int and profile["version"] == 0
+         and profile["released_source"] == _BASE and profile["golden_sha256"] == _PINS[_GOLDEN]
+         and profile["live_sha256"] == _NULLABLE_CATALOG_SHA256 and profile["accepted_unpublished"] == []
+         and type(profile["delta"]) is list and len(profile["delta"]) == 72,
+         "catalog-baseline-source-invalid")
+    wire.catalog_format._catalog(golden, 0)
+    objects = golden["objects"]
+    need(wire._catalog_bytes(objects) == golden_raw, "catalog-baseline-source-invalid")
+    rows = {(row["kind"], row["identity"]): row for row in objects}
+    inventory = tuple((row["kind"], row["identity"], row.get("parent")) for row in objects)
+    seen = set()
+    for delta in profile["delta"]:
+        need(type(delta) is dict and set(delta) == {"kind", "identity", "disposition", "attributes"}
+             and delta["disposition"] == "fix-bootstrap", "catalog-baseline-source-invalid")
+        key = (delta["kind"], delta["identity"])
+        need(key in rows and key not in seen and delta["kind"] in {"columns", "types"},
+             "catalog-baseline-source-invalid")
+        seen.add(key)
+        changes = delta["attributes"]
+        attribute = "position" if delta["kind"] == "columns" else "definition_sha256"
+        need(type(changes) is dict and set(changes) == {attribute}, "catalog-baseline-source-invalid")
+        pair = changes[attribute]
+        need(type(pair) is dict and set(pair) == {"golden", "production"}
+             and type(pair["golden"]) is str and type(pair["production"]) is str
+             and rows[key]["attributes"][attribute] == pair["golden"]
+             and pair["golden"] != pair["production"], "catalog-baseline-source-invalid")
+        rows[key]["attributes"][attribute] = pair["production"]
+    need(tuple((row["kind"], row["identity"], row.get("parent")) for row in objects) == inventory,
+         "catalog-baseline-source-invalid")
+    wire.catalog_format._catalog(golden, 0)
+    raw = wire._catalog_bytes(objects)
+    need(hashlib.sha256(raw).hexdigest() == _NULLABLE_CATALOG_SHA256,
+         "catalog-baseline-source-invalid")
+    return raw
 
 
 class CatalogContract:
@@ -352,6 +401,30 @@ class CatalogContract:
         need(len(set(self.expected_preexisting_tables)) == len(tables))
         self._seal = object()
         self._pins = dict(_PINS)
+        # Private original source bytes, not data from an observation or a new
+        # H-only profile attributed to the historical database origin.
+        self._nullable_source = (blobs[_GOLDEN], blobs[_PROFILE])
+
+    def parse_nullable_baseline(self, raw):
+        import catalog_semantics_v2 as semantic
+        try:
+            expected = _nullable_expected(*self._nullable_source)
+            observation = semantic.parse_observation(raw)
+            value, facts, _ = semantic._observation(semantic.canonical_observation(observation))
+            snapshot, graph = value["snapshot"], value["graph"]
+            need(snapshot["sha256"] == self.target_sha256 == _NULLABLE_CATALOG_SHA256
+                 and semantic.base._catalog_bytes(snapshot["objects"]) == expected
+                 and frozenset((ref.kind, ref.identity) for ref in facts) == self._known,
+                 "catalog-baseline-mismatch")
+            need(graph["relation"]["object"]["identity"] == "organizations"
+                 and graph["security"]["default_acl_rows"] == semantic._contract(),
+                 "catalog-baseline-profile-invalid")
+            return observation
+        except proof.EvidenceError:
+            raise
+        except (semantic.SemanticRefusal, semantic.base.catalog_format.PendingRefusal,
+                TypeError, ValueError, KeyError, AttributeError, RecursionError, UnicodeError):
+            raise proof.EvidenceError("catalog-baseline-output-invalid") from None
 
     def check_initial_tables(self, tables: postgres.TableCapture):
         need(type(tables) is postgres.TableCapture and tables._all_columns
@@ -395,6 +468,18 @@ class CatalogObservation:
     stdout_bytes: int
 
 
+@dataclass(frozen=True)
+class NullableBaselineObservation:
+    """Private complete bytes and actual H binding; never a release verdict."""
+    raw: bytes = field(repr=False)
+    sha256: str
+    stdout_sha256: str
+    stdout_bytes: int
+    source_sha: str
+    image_id: str
+    recipe_sha256: str
+
+
 class OwnedCatalog:
     def __init__(self, manager: processes.OwnedProcesses, pg: postgres.SyntheticPostgres, contract: CatalogContract):
         need(type(manager) is processes.OwnedProcesses and type(pg) is postgres.SyntheticPostgres and type(contract) is CatalogContract)
@@ -419,6 +504,7 @@ class OwnedCatalog:
         self._failed=False
         self._baseline=None
         self._initial_attempted=False
+        self._nullable_attempted=False
 
     def _quiescent(self):
         need(not self._failed and not self.manager._protocol_failed and self.pg._phase is None
@@ -466,6 +552,32 @@ class OwnedCatalog:
         except Exception:
             self._failed=True
             self.manager._protocol_failed=True
+            raise
+
+    def observe_nullable_baseline(self, inputs):
+        """One fixed baseline graph capture, with cleanup before any return."""
+        need(not self._nullable_attempted, "catalog-baseline-already-attempted")
+        self._nullable_attempted = True
+        try:
+            self._quiescent()
+            binding = self.manager._nullable_binding()
+            need(binding.source_sha == (self.contract.catalog_control_sha
+                 if getattr(self.contract, "purpose", None) == "rollback-v0" else self.contract.candidate_sha),
+                 "catalog-image-source-mismatch")
+            handle = self.manager.start_nullable_baseline(inputs)
+            completed = self.manager.wait_nullable_baseline(handle)
+            self.manager.remove(handle)
+            need(type(completed.returncode) is int and completed.returncode == 0 and not completed.stderr,
+                 "catalog-baseline-cli-failed")
+            self.contract.parse_nullable_baseline(completed.stdout)
+            self._quiescent()
+            need(self.manager._nullable_binding() == binding, "catalog-image-source-mismatch")
+            return NullableBaselineObservation(completed.stdout, self.contract.target_sha256,
+                hashlib.sha256(completed.stdout).hexdigest(), len(completed.stdout),
+                binding.source_sha, binding.image_id, binding.recipe_sha256)
+        except Exception:
+            self._failed = True
+            self.manager._protocol_failed = True
             raise
 
     def after_phase(self, inputs, *, original_columns=False):

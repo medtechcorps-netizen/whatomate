@@ -551,5 +551,115 @@ class ProcessTests(unittest.TestCase):
         self.assertNotIn("hostname", str(caught.exception))
 
 
+class NullableBaselineProcessTests(unittest.TestCase):
+    setUp = ProcessTests.setUp
+
+    def manager(self):
+        previous, live, controller, control = rollback_bindings(self.world)
+        return p.OwnedProcesses(self.owner, previous, live, controller, catalog_control=control)
+
+    def test_fixed_h_command_and_runtime_only_configuration(self):
+        manager = self.manager()
+        handle = manager.start_nullable_baseline(INPUTS)
+        row = self.world.containers[handle.container_id]
+        self.assertEqual(row["Config"]["Cmd"], ["-ec", p._WAIT_CONFIG +
+            "catalog-snapshot -config /compat/private/config.toml -mode nullable-v2-baseline"])
+        self.assertEqual(handle.image_id, manager.catalog_binding.image_id)
+        self.assertNotEqual(handle.image_id, manager.bindings["candidate"].image_id)
+        db = self.world.configs[handle.container_id]["database"]
+        self.assertEqual(set(db), {"url", "runtime_role", "rls_enabled"})
+        self.assertEqual(urlsplit(db["url"]).username, "compat_runtime")
+        self.assertNotIn(INPUTS.owner_password, json.dumps(db))
+        manager.wait_nullable_baseline(handle)
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+
+    def test_only_fixed_graph_log_gets_four_mib_other_operations_stay_one(self):
+        manager = self.manager()
+        self.world.catalog_response = b"x" * (p.runtime.MIB + 1)
+        handle = manager.start_nullable_baseline(INPUTS)
+        result = manager.wait_nullable_baseline(handle)
+        self.assertEqual(result.stdout, self.world.catalog_response)
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+        graph_logs = [(args, options) for args, options in self.world.calls if args[:1] == ["logs"]]
+        self.assertEqual(len(graph_logs), 1)
+        self.assertEqual(graph_logs[0][1]["stdout_limit"], 4*p.runtime.MIB)
+        self.assertEqual(graph_logs[0][1]["stderr_limit"], p.runtime.MIB)
+        for args, options in self.world.calls:
+            if args[:1] != ["logs"]:
+                self.assertEqual(options["stdout_limit"], p.runtime.MIB)
+                self.assertEqual(options["stderr_limit"], p.runtime.MIB)
+
+    def test_graph_compare_handle_confusion_and_copy_refuse_before_logs(self):
+        manager = self.manager(); ordinary = manager.start_catalog(INPUTS)
+        with self.assertRaises(p.proof.EvidenceError): manager.wait_nullable_baseline(ordinary)
+        self.assertFalse(any(args[:1] == ["logs"] for args, _ in self.world.calls))
+        manager.remove(ordinary)
+        handle = manager.start_nullable_baseline(INPUTS)
+        for callback in (lambda: manager.wait_catalog(handle),
+                         lambda: manager.wait_nullable_baseline(replace(handle))):
+            with self.assertRaises(p.proof.EvidenceError): callback()
+        self.assertFalse(any(args[:1] == ["logs"] for args, _ in self.world.calls))
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+
+    def test_both_stream_caps_are_enforced_and_no_private_echo(self):
+        manager = self.manager(); handle = manager.start_nullable_baseline(INPUTS)
+        for stdout, stderr in ((b"x"*(4*p.runtime.MIB+1), b""),
+                               (b"{}", b"private"+b"x"*p.runtime.MIB)):
+            self.world.catalog_response, self.world.catalog_stderr = stdout, stderr
+            with self.assertRaisesRegex(p.proof.EvidenceError, "catalog-log-incomplete") as caught:
+                manager.wait_nullable_baseline(handle)
+            self.assertNotIn("private", str(caught.exception))
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+
+    def test_actual_nonzero_and_stderr_are_preserved_without_success_verdict(self):
+        manager = self.manager(); self.world.catalog_exit = 1
+        self.world.catalog_stderr = b"catalog-snapshot:capture-failed\n"
+        handle = manager.start_nullable_baseline(INPUTS)
+        result = manager.wait_nullable_baseline(handle)
+        self.assertEqual((result.returncode, result.stderr), (1, self.world.catalog_stderr))
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+
+    def test_h_image_source_recipe_or_inspected_image_drift_refuses(self):
+        manager = self.manager(); binding = manager.catalog_binding
+        for field, value in (("source_sha", "b"*40), ("recipe_sha256", "0"*64)):
+            manager.bindings["catalog-control"] = replace(binding, **{field: value})
+            before = len(self.world.mutations)
+            with self.assertRaises(p.proof.EvidenceError): manager.start_nullable_baseline(INPUTS)
+            self.assertEqual(len(self.world.mutations), before)
+        manager.bindings["catalog-control"] = binding
+        self.world.images[binding.reference]["Config"]["Labels"][p.stack.RECIPE_LABEL] = "0"*64
+        with self.assertRaises(p.proof.EvidenceError): manager.start_nullable_baseline(INPUTS)
+
+    def test_active_peer_and_unsafe_stopped_state_refuse(self):
+        manager = self.manager(); peer = manager.start_web("previous", INPUTS)
+        with self.assertRaises(p.proof.EvidenceError): manager.start_nullable_baseline(INPUTS)
+        manager.remove(peer); handle = manager.start_nullable_baseline(INPUTS)
+        row = self.world.containers[handle.container_id]
+        saved = copy.deepcopy(row)
+        for mutate in (lambda r: r["HostConfig"].update(LogConfig={"Type":"local","Config":{}}),
+                       lambda r: r["State"].update(OOMKilled=True),
+                       lambda r: r.update(RestartCount=1),
+                       lambda r: r["Config"].update(Tty=True),
+                       lambda r: r["State"].update(ExitCode=False)):
+            self.world.containers[handle.container_id] = copy.deepcopy(saved)
+            mutate(self.world.containers[handle.container_id])
+            with self.assertRaises(p.proof.EvidenceError): manager.wait_nullable_baseline(handle)
+
+    def test_capture_deadline_failure_is_not_retried(self):
+        manager = self.manager(); handle = manager.start_nullable_baseline(INPUTS)
+        original = self.owner.capture; attempts = []
+        def expired(argv, **options):
+            if argv[5:6] == ["logs"]:
+                attempts.append(tuple(argv))
+                raise p.proof.InfrastructureFailure("experiment-deadline")
+            return original(argv, **options)
+        self.owner.capture = expired
+        with self.assertRaisesRegex(p.proof.InfrastructureFailure, "experiment-deadline"):
+            manager.wait_nullable_baseline(handle)
+        self.assertEqual(len(attempts), 1)
+        self.owner.capture = original
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

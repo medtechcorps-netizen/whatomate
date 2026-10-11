@@ -29,6 +29,8 @@ _WRITE_CONFIG = ('umask 077; test ! -e /compat/private; mkdir -m 700 /compat/pri
 _WAIT_CONFIG = ('i=0; while [ ! -f /compat/ready ]; do i=$((i+1)); '
                 '[ "$i" -lt 300 ] || exit 75; sleep 0.1; done; exec /app/rereply ')
 _PHASES = {"compat-fwd": "candidate", "compat-n1-rw": "previous", "compat-n1-ro": "previous"}
+_NULLABLE_COMMAND = ["-ec", _WAIT_CONFIG +
+    "catalog-snapshot -config /compat/private/config.toml -mode nullable-v2-baseline"]
 
 
 def need(ok, code="process-input-invalid"):
@@ -267,7 +269,8 @@ class OwnedProcesses:
         self._ambiguous = False
         return observed
 
-    def _create(self, slot, version, phase):
+    def _create(self, slot, version, phase, *, nullable_baseline=False):
+        need(type(nullable_baseline) is bool and (not nullable_baseline or slot == "catalog"))
         need(slot in {"web", "migration", "controller", "catalog"} and slot not in self._ids)
         need(not self._ids if slot == "catalog" else "catalog" not in self._ids, "process-slot-in-use")
         need(not ({"web", "migration"} & set(self._ids)) if slot in {"web", "migration"} else True,
@@ -277,6 +280,8 @@ class OwnedProcesses:
         command = [] if controller else ["-ec", _WAIT_CONFIG +
             ("server" if slot == "web" else "catalog-snapshot" if slot == "catalog" else "rls-migrate")
             + " -config /compat/private/config.toml" + (" -mode compare" if slot == "catalog" else "")]
+        if nullable_baseline:
+            command = list(_NULLABLE_COMMAND)
         name = self.owner.namespace + "-" + slot
         labels = dict(image["Config"].get("Labels") or {})
         labels.update({stack.LABEL: self.owner.token, stack.ROLE_LABEL: slot,
@@ -309,10 +314,12 @@ class OwnedProcesses:
         self._check(slot, running=False)
         return identifier
 
-    def _start(self, slot, version, phase, inputs):
+    def _start(self, slot, version, phase, inputs, *, nullable_baseline=False):
+        need(type(nullable_baseline) is bool and (not nullable_baseline or slot == "catalog"))
         need(not self._protocol_failed, "process-controller-failed")
         raw = _configuration(self.owner, inputs, phase)  # Validate before I/O.
-        identifier = self._create(slot, version, phase)
+        identifier = (self._create(slot, version, phase, nullable_baseline=True) if nullable_baseline
+                      else self._create(slot, version, phase))
         self._id_mutation(["container", "start", identifier], "start", slot, identifier)
         row = self._check(slot, running=True)
         started = row["State"].get("StartedAt")
@@ -359,6 +366,7 @@ class OwnedProcesses:
     def wait_catalog(self, handle):
         """Return actual complete CLI bytes, not an accepted catalog result."""
         need(type(handle) is ProcessHandle and self._handles.get("catalog") is handle)
+        need(self._specs["catalog"]["command"] != _NULLABLE_COMMAND, "catalog-baseline-handle-invalid")
         self._assert_all()
         waited = self._call(["container", "wait", handle.container_id], timeout=90)
         need(type(waited.returncode) is int and waited.returncode == 0 and not waited.stderr
@@ -375,6 +383,76 @@ class OwnedProcesses:
         need(type(streams.returncode) is int and streams.returncode == 0
              and type(streams.stdout) is bytes and type(streams.stderr) is bytes, "catalog-log-incomplete")
         self._check("catalog", running=False)
+        return runtime.Capture(code, streams.stdout, streams.stderr)
+
+    def _nullable_binding(self):
+        """Recheck the local admitted H image; labels alone confer no authority."""
+        binding = self.catalog_binding
+        need(type(binding) is ImageBinding and binding.reference == binding.image_id
+             and binding.source_sha == self.owner.source_sha == self.bindings["controller"].source_sha,
+             "catalog-baseline-image-invalid")
+        version = "catalog-control" if "catalog-control" in self.bindings else "candidate"
+        row = stack._json(self._read(["image", "inspect", binding.reference]))
+        self._validate_image("catalog-control", binding, row)
+        need(row == self._images[version], "catalog-baseline-image-invalid")
+        return binding
+
+    def start_nullable_baseline(self, inputs):
+        """Fixed read-only graph command, with the ordinary exclusive catalog slot."""
+        self._nullable_binding()
+        version = "catalog-control" if "catalog-control" in self.bindings else "candidate"
+        return self._start("catalog", version, "compat-control", inputs, nullable_baseline=True)
+
+    def _nullable_handle(self, handle):
+        need(type(handle) is ProcessHandle and self._handles.get("catalog") is handle
+             and handle.slot == "catalog" and handle.phase == "compat-control"
+             and self._specs["catalog"]["command"] == _NULLABLE_COMMAND,
+             "catalog-baseline-handle-invalid")
+        binding = self._nullable_binding()
+        version = "catalog-control" if "catalog-control" in self.bindings else "candidate"
+        need(handle.version == version and handle.image_id == binding.image_id,
+             "catalog-baseline-handle-invalid")
+        return binding
+
+    def _nullable_baseline_logs(self, handle):
+        """Only this exact owned command has a 4 MiB stdout allowance."""
+        self._nullable_handle(handle)
+        self._assert_all()
+        self._check("catalog", running=False)
+        try:
+            value = self.owner.capture([self.owner.binary, "--config", str(self.owner.config),
+                "--context", "default", "logs", handle.container_id], env=dict(self.owner.env),
+                timeout=10, stdout_limit=4*runtime.MIB, stderr_limit=runtime.MIB)
+        except proof.InfrastructureFailure:
+            raise
+        except Exception:
+            raise proof.InfrastructureFailure("container") from None
+        need(type(value) is runtime.Capture and type(value.stdout) is bytes
+             and type(value.stderr) is bytes and len(value.stdout) <= 4*runtime.MIB
+             and len(value.stderr) <= runtime.MIB, "catalog-log-incomplete")
+        return value
+
+    def wait_nullable_baseline(self, handle):
+        """Complete stopped-process bytes only; acceptance and cleanup are external."""
+        self._nullable_handle(handle)
+        self._assert_all()
+        waited = self._call(["container", "wait", handle.container_id], timeout=90)
+        need(type(waited.returncode) is int and waited.returncode == 0
+             and type(waited.stdout) is bytes and type(waited.stderr) is bytes and not waited.stderr
+             and re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})\n?", waited.stdout) is not None,
+             "catalog-exit-invalid")
+        code = int(waited.stdout)
+        row = self._check("catalog", running=False)
+        state = row["State"]
+        need(row["HostConfig"].get("LogConfig") in ({"Type":"json-file","Config":{}},
+             {"Type":"json-file","Config":{"max-size":"-1"}}) and row["Config"].get("Tty") is False,
+             "catalog-log-driver-unproven")
+        need(code <= 255 and type(state.get("ExitCode")) is int and state["ExitCode"] == code
+             and not state.get("OOMKilled") and not state.get("Error"), "catalog-exit-invalid")
+        streams = self._nullable_baseline_logs(handle)
+        need(type(streams.returncode) is int and streams.returncode == 0, "catalog-log-incomplete")
+        self._check("catalog", running=False)
+        self._nullable_handle(handle)
         return runtime.Capture(code, streams.stdout, streams.stderr)
 
     def controller(self, request: bytes) -> bytes:

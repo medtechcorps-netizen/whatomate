@@ -59,6 +59,7 @@
     "internal/dbcatalog/builtin.go",
     "internal/dbcatalog/capture.go",
     "internal/dbcatalog/format.go",
+    "internal/dbcatalog/nullable_builtin.go",
     "internal/dbcatalog/queries.go",
     "internal/dbcatalog/seed.go",
     "internal/dbcatalog/semantics.go",
@@ -240,5 +241,5 @@
     "pkg/whatsapp/types.go",
     "pkg/whatsapp/webhook.go"
   ],
-  "closure_sha256": "d36167bcf2311cb40f796b7fdb291d537f90bab2d76386a7af22d5a340883acf"
+  "closure_sha256": "36a5908ddde57fec58b86be5bd366f1815cab1dfe14fa1fabb926ed4cccba978"
 }

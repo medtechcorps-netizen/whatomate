@@ -23,7 +23,7 @@ const catalogSnapshotTimeout = 60 * time.Second
 
 const catalogSnapshotUsage = `Usage: rereply catalog-snapshot [options]
   -config string  Configuration file (default "config.toml")
-  -mode string    compare, json or sha256 (default "compare")
+  -mode string    compare, json, sha256 or nullable-v2-baseline (default "compare")
   -seed-counts    Include global seed counts and key hashes, never seed values
   -list-unknown   Show unknown public identifiers for the owner's console only
 
@@ -57,6 +57,9 @@ func parseCatalogSnapshotArgs(args []string) (catalogSnapshotArgs, error) {
 		return parsed, errors.New("invalid arguments")
 	}
 	if flags.NArg() != 0 || (parsed.mode != "compare" && parsed.mode != "json" && parsed.mode != "sha256") {
+		if flags.NArg() == 0 && parsed.mode == "nullable-v2-baseline" && !parsed.seedCounts && !parsed.listUnknown {
+			return parsed, nil
+		}
 		return parsed, errors.New("invalid arguments")
 	}
 	return parsed, nil
@@ -132,6 +135,16 @@ func collectCatalogSnapshot(ctx context.Context, cfg config.DatabaseConfig, args
 	dsn, err := catalogRuntimeDSN(cfg)
 	if err != nil {
 		return nil, err
+	}
+	if args.mode == "nullable-v2-baseline" {
+		if args.seedCounts || args.listUnknown {
+			return nil, errors.New("invalid arguments")
+		}
+		observation, err := dbcatalog.CaptureBuiltinNullableV2Baseline(ctx, dsn, catalogSnapshotTimeout)
+		if err != nil {
+			return nil, err
+		}
+		return dbcatalog.CanonicalNullableObservationV2(observation)
 	}
 	golden, err := dbcatalog.BuiltinCatalog()
 	if err != nil {

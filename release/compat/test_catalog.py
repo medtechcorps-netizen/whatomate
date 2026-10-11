@@ -706,4 +706,175 @@ class RollbackCatalogTests(unittest.TestCase):
         manager.close(); manager.owner.cleanup()
 
 
+def nullable_baseline_fixture():
+    """Synthetic production-order service bytes, never actual image evidence.
+
+    Retain the real PG17 physical graph fixture, rebinding its organizations
+    slots to the independently authored production source catalog. The new
+    actual-H qualification must separately produce this shape through Docker.
+    """
+    import catalog_semantics_v2 as semantic
+    value = json.loads((REPO / "internal/dbcatalog/testdata/nullable-column-v2.json").read_bytes())["before"]
+    expected = (REPO / "internal/dbcatalog/profiles/nullable-column-v1/catalog-v0.json").read_bytes()
+    value["snapshot"]["objects"] = json.loads(expected)["objects"]
+    digest = c.hashlib.sha256(expected).hexdigest()
+    value["snapshot"]["sha256"] = value["graph"]["catalog_sha256"] = digest
+    positions = {row["identity"].split(".", 1)[1]: int(row["attributes"]["position"])
+                 for row in value["snapshot"]["objects"]
+                 if row["kind"] == "columns" and row.get("parent") == "organizations"}
+    slots = value["graph"]["slots"]
+    for slot in slots:
+        slot["number"] = positions[slot["name"]]
+    slots.sort(key=lambda slot: slot["number"])
+    definition = json.loads(value["graph"]["row_type"]["definition_json"])
+    for member in definition[12]:
+        member[0] = positions[member[1]]
+    definition[12].sort(key=lambda member: member[0])
+    value["graph"]["row_type"]["definition_json"] = json.dumps(definition, ensure_ascii=False)
+    return semantic.base._json_bytes(value)
+
+
+class NullableBaselineCatalogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.raw = nullable_baseline_fixture()
+
+    def setUp(self):
+        self.contract = c.CatalogContract(REPO, ENTRY, test_stack.SOURCE, base_env={}, capture=Git())
+
+    def owned(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        world = World()
+        for reference in (test_processes.CAND, test_processes.CONTROL):
+            world.images[reference]["Config"]["Labels"][c.processes.stack.SOURCE_LABEL] = test_stack.SOURCE
+        world.images[test_processes.CAND]["Config"]["Labels"].update({
+            c.processes.stack.ROLE_LABEL: "candidate", c.processes.stack.RECIPE_LABEL: test_processes.RECIPE})
+        owner = c.processes.stack.OwnedStack("docker", Path(tmp.name), test_stack.SOURCE,
+            c.processes.stack.GraphImage(test_stack.GRAPH, test_stack.SOURCE),
+            token=test_stack.TOKEN, capture=world.capture)
+        owner.start()
+        manager = c.processes.OwnedProcesses(owner,
+            c.processes.ImageBinding(test_processes.PREV, "sha256:"+"4"*64, c._BASE, test_processes.RECIPE),
+            c.processes.ImageBinding(test_processes.CAND, test_processes.CAND, test_stack.SOURCE, test_processes.RECIPE),
+            c.processes.ImageBinding(test_processes.CONTROL, test_processes.CONTROL, test_stack.SOURCE, test_processes.RECIPE))
+        pg = c.postgres.SyntheticPostgres("docker", Path(tmp.name), owner._ids["pg"], owner.token,
+                                        "compat_runtime", capture=world.capture)
+        world.catalog_response = self.raw
+        self.world, self.owner, self.manager, self.pg = world, owner, manager, pg
+        return c.OwnedCatalog(manager, pg, self.contract)
+
+    def test_independent_source_derivation_matches_new_full_source_catalog(self):
+        raw = c._nullable_expected(BLOBS[c._GOLDEN], BLOBS[c._PROFILE])
+        self.assertEqual(raw, (REPO / "internal/dbcatalog/profiles/nullable-column-v1/catalog-v0.json").read_bytes())
+        self.assertEqual(c.hashlib.sha256(raw).hexdigest(), self.contract.target_sha256)
+        self.assertNotEqual(raw, BLOBS[c._GOLDEN])
+        original = {(o["kind"], o["identity"]): o for o in json.loads(BLOBS[c._GOLDEN])["objects"]}
+        current = {(o["kind"], o["identity"]): o for o in json.loads(raw)["objects"]}
+        self.assertEqual(set(original), set(current))
+        self.assertEqual(sum(original[key] != current[key] for key in current), 72)
+
+    def test_profile_missing_duplicate_or_wrong_old_value_refuses_even_with_hash_bound(self):
+        profile = json.loads(BLOBS[c._PROFILE])
+        for mutate in (lambda p: p["delta"].pop(),
+                       lambda p: p["delta"].__setitem__(1, copy.deepcopy(p["delta"][0])),
+                       lambda p: p["delta"][0]["attributes"]["position"].update(golden="999"),
+                       lambda p: p["delta"][0].update(identity="absent.column")):
+            changed = copy.deepcopy(profile); mutate(changed)
+            raw = (json.dumps(changed)+"\n").encode()
+            # A fixed synthetic source hash lets this pure unit reach the
+            # structural/old-value checks, without mocking a success predicate.
+            with mock.patch.dict(c._PINS, {c._PROFILE: c.hashlib.sha256(raw).hexdigest()}):
+                with self.assertRaises(c.proof.EvidenceError): c._nullable_expected(BLOBS[c._GOLDEN], raw)
+
+    def test_source_bytes_are_retained_not_reread_from_worktree(self):
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unexpected source I/O")):
+            result = self.contract.parse_nullable_baseline(self.raw)
+        self.assertEqual(result.raw, self.raw)
+        changed = bytearray(BLOBS[c._PROFILE]); changed[-2] ^= 1
+        self.contract._nullable_source = (BLOBS[c._GOLDEN], bytes(changed))
+        with self.assertRaises(c.proof.EvidenceError): self.contract.parse_nullable_baseline(self.raw)
+
+    def test_full_owned_capture_over_one_mib_has_h_bindings_cleanup_and_one_attempt(self):
+        observer = self.owned()
+        self.assertGreater(len(self.raw), c.runtime.MIB)
+        result = observer.observe_nullable_baseline(test_processes.INPUTS)
+        self.assertEqual(result.raw, self.raw)
+        self.assertEqual((result.source_sha, result.image_id, result.recipe_sha256),
+                         (test_stack.SOURCE, test_processes.CAND, test_processes.RECIPE))
+        self.assertEqual((result.sha256, result.stdout_bytes, result.stdout_sha256),
+                         (self.contract.target_sha256, len(self.raw), c.hashlib.sha256(self.raw).hexdigest()))
+        self.assertFalse(self.manager._ids)
+        self.assertFalse(observer._failed)
+        self.assertNotIn(self.raw[:80].decode(), repr(result))
+        before = len(self.world.calls)
+        with self.assertRaises(c.proof.EvidenceError): observer.observe_nullable_baseline(test_processes.INPUTS)
+        self.assertEqual(len(self.world.calls), before)
+        # Ordinary final catalog remains available after the one graph read.
+        self.world.catalog_response = (json.dumps(compare(self.contract))+"\n").encode()
+        self.assertEqual(observer.observe(test_processes.INPUTS).sha256, result.sha256)
+        self.manager.close(); self.owner.cleanup()
+
+    def test_golden_shape_changed_catalog_and_unexpected_acl_refuse(self):
+        import catalog_semantics_v2 as semantic
+        original = json.loads((REPO / "internal/dbcatalog/testdata/nullable-column-v2.json").read_bytes())["before"]
+        variants = [original]
+        for mutation in ("known", "missing", "hash", "acl", "relation"):
+            value = json.loads(self.raw)
+            if mutation == "known":
+                attrs = value["snapshot"]["objects"][0]["attributes"]
+                attrs["not_null"] = "false" if attrs["not_null"] == "true" else "true"
+            if mutation == "missing": value["snapshot"]["objects"].pop(0)
+            if mutation in {"known", "missing"}:
+                digest = c.hashlib.sha256(semantic.base._catalog_bytes(value["snapshot"]["objects"])).hexdigest()
+                value["snapshot"]["sha256"] = value["graph"]["catalog_sha256"] = digest
+            if mutation == "hash": value["snapshot"]["sha256"] = "0"*64
+            if mutation == "acl": value["graph"]["security"]["default_acl_rows"][0]["acl"][0]["grantable"] = True
+            if mutation == "relation": value["graph"]["relation"]["object"]["identity"] = "users"
+            variants.append(value)
+        for value in variants:
+            with self.subTest(kind=variants.index(value)), self.assertRaises(c.proof.EvidenceError):
+                self.contract.parse_nullable_baseline(semantic.base._json_bytes(value))
+
+    def test_incomplete_nonzero_stderr_or_malformed_output_latches_after_removal(self):
+        for kind in ("partial", "nonzero", "stderr", "malformed"):
+            with self.subTest(kind=kind):
+                observer = self.owned()
+                if kind == "partial": self.world.catalog_response = self.raw[:-20]
+                if kind == "nonzero": self.world.catalog_exit = 1
+                if kind == "stderr": self.world.catalog_stderr = b"private configuration"
+                if kind == "malformed": self.world.catalog_response = b"{}\n"
+                with self.assertRaises(c.proof.EvidenceError) as caught:
+                    observer.observe_nullable_baseline(test_processes.INPUTS)
+                self.assertNotIn("private", str(caught.exception))
+                self.assertTrue(observer._failed and self.manager._protocol_failed)
+                self.assertFalse(self.manager._ids)
+                with self.assertRaises(c.proof.EvidenceError): observer.observe(test_processes.INPUTS)
+
+    def test_valid_bytes_cannot_survive_removal_or_final_quiescence_failure(self):
+        for phase in ("remove", "quiescence", "late-capture"):
+            observer = self.owned(); original = self.world.capture
+            def captured(argv, **options):
+                args = argv[5:]
+                if phase == "remove" and args[:2] == ["container", "rm"]:
+                    return c.runtime.Capture(1, b"", b"private")
+                result = original(argv, **options)
+                if args[:1] == ["logs"]:
+                    if phase == "quiescence": self.world.state[9] = 1
+                    if phase == "late-capture": raise c.proof.InfrastructureFailure("experiment-deadline")
+                return result
+            self.owner.capture = captured
+            with self.assertRaises((c.proof.EvidenceError, c.proof.InfrastructureFailure)):
+                observer.observe_nullable_baseline(test_processes.INPUTS)
+            self.assertTrue(observer._failed and self.manager._protocol_failed)
+
+    def test_active_pg_phase_and_wrong_h_bindings_refuse_before_graph(self):
+        observer = self.owned(); self.pg._phase = object()
+        with self.assertRaises(c.proof.EvidenceError): observer.observe_nullable_baseline(test_processes.INPUTS)
+        self.assertFalse(any(args[:1] == ["logs"] for args, _ in self.world.calls))
+        observer = self.owned()
+        self.contract.candidate_sha = "b"*40
+        with self.assertRaises(c.proof.EvidenceError): observer.observe_nullable_baseline(test_processes.INPUTS)
+        self.assertFalse(any(args[:1] == ["logs"] for args, _ in self.world.calls))
+
+
 if __name__=='__main__':unittest.main(verbosity=2)
