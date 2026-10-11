@@ -698,7 +698,7 @@ func nullableV2SourceInventory(sources map[string][]byte) bool {
 	known := map[string]bool{"internal/database/tenant.go": false, "internal/database/postgres.go": true}
 	seenFiles, totalBytes, totalWriters := 0, 0, 0
 	for path, raw := range sources {
-		if !(strings.HasPrefix(path, "internal/") || strings.HasPrefix(path, "cmd/") || strings.HasPrefix(path, "pkg/")) || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+		if (!strings.HasPrefix(path, "internal/") && !strings.HasPrefix(path, "cmd/") && !strings.HasPrefix(path, "pkg/")) || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return false
 		}
 		totalBytes += len(raw)

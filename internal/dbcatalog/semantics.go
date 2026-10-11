@@ -423,7 +423,7 @@ func validateNullableParts(s Snapshot, g nullableGraph, version int, expectedDef
 		return err
 	}
 	fields := rowDefinition[12].([]any)
-	if g.Slots == nil || len(g.Slots) == 0 || len(g.Slots) > nullableSlotLimit || len(g.Slots) != len(fields) {
+	if len(g.Slots) == 0 || len(g.Slots) > nullableSlotLimit || len(g.Slots) != len(fields) {
 		return refuse("nullable-slots")
 	}
 	seen := map[string]bool{}
