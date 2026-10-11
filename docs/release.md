@@ -68,8 +68,12 @@ accepting the prepared source projection, under the original operation budget.
 This preparatory path accepts only the narrow unchanged-v0 material contract;
 it does not issue a rollback decision, fetch compatibility or authorize provider
 access. Operational rollback still refuses two or more non-`none` intermediates.
-The dedicated experiment, signed evidence, fresh consumer and retry custody must
-be connected before that restriction can change.
+A private experiment producer separately admits the exact signed target and live
+web images while building current-main tooling for catalog collection and controls.
+It reuses the existing experiment phases, deadlines and cleanup. The operational
+entrypoint, signed evidence, fresh consumer and retry custody must be connected
+and qualified before the multi-span restriction can change; a private producer
+result does not authorize a release.
 
 Before any production provider request, the process serializes and replays the
 complete verified promotion inputs within a fixed output-size bound. Only a

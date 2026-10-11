@@ -459,6 +459,21 @@ This is source consistency data, not a measured database result or signed rollba
 proof. Normal snapshot4/context3, the CLI target refusal and operational multi-span
 rollback refusal remain unchanged.
 
+The private rollback producer consumes that distinct resolution and keeps three
+image roles separate: the exact signed target runs as the previous application,
+the exact signed live release runs as the candidate application, and current-main
+tooling supplies the catalog collector, controller, graph and fixture. Its four
+tooling builds retain their real source and build receipts. Target and live pulls
+share the existing build and overall deadlines; equal digests can share a pull only
+when their source and recipe bindings also agree.
+
+The experiment retains the existing migration, read/write, worker, reverse and
+cleanup phases. Catalog collection and terminal failure evidence bind to the
+tooling source, independently of the live application source. This private path
+does not activate a CLI command or change snapshot4/context3, signed proof
+collection, release admission or retry custody. Controlled tests of the path are
+not actual database or hosted rollback qualification.
+
 The resolution format is version 4. Both `latest` and `selected` contain the
 verified release tag, signed manifest SHA-256, source SHA and web digest.
 `database_base` separately binds the supported legacy source or retained v2

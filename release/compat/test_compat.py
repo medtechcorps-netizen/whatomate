@@ -21,6 +21,7 @@ import test_observation as to
 import test_proof as tp
 import test_stack as ts
 import test_record_resolver as tr
+import test_record_resolver_rollback as trb
 
 _WORLD = None
 BASE = c.catalog._BASE
@@ -1026,6 +1027,263 @@ class ResolvedExperimentTests(unittest.TestCase):
             c._Engine(self.p, PREVIOUS, SHA, 1, 1, self.resolution.classification, self.contract,
                 self.admitted, 'docker', self.p, resolution=self.resolution)
         self.assertFalse(hasattr(self.w, 'owner'))
+
+
+class RollbackExperimentTests(unittest.TestCase):
+    """Real source resolution/engine/evaluator, controlled service/build edges.
+
+    These synthetic signatures and recipes test binding, not live admission or
+    a signed rollback qualification. H, T's actual web, L and retained O differ.
+    """
+    @classmethod
+    def setUpClass(cls):
+        trb.RollbackProofResolverTests.setUpClass()
+
+    def setUp(self):
+        EngineTests.setUp(self)
+        self.started = self.w.clock.now
+        self.deadline = c.image_admission._Deadline(clock=self.w.clock)
+        case = trb.RollbackProofResolverTests()
+        case.setUp(); self.addCleanup(case.doCleanups); self.case = case
+        target = case.add(version=1, sha='1' * 40, images=case.boot['images'])
+        live = case.add(version=1, sha='4' * 40)
+        case.add(sha='2' * 40, db_change='data', dormant=True)
+        case.add(sha='3' * 40, db_change='expand', dormant=True)
+        case.add(kind='rollback', target=live)
+        for source in (case.boot['sha'], live['sha'], SHA):
+            case.profile(source)
+        case.world.files[case.boot['sha'], case.RECIPE] += b'# target actual image\n'
+        case.world.files[live['sha'], case.RECIPE] += b'# live actual image\n'
+        config, work = case.root / 'config', case.root / 'work'
+        config.mkdir(); work.mkdir()
+        def elapsed(args):
+            if args == [str(case.gh), '--version']:
+                self.w.clock.sleep(40)
+        case.world.before = elapsed
+        budget = tr.rt.OperationBudget(self.deadline.end, capture=case.world, clock=self.deadline.clock)
+        case.client = tr.rt.ReleaseGh(case.gh, tr.support.GH_TOKEN, config, work, budget=budget, base_env={})
+        self.resolution = tr.resolver.resolve_rollback_proof(case.client, case.repo, case.git, SHA, target['release'])
+        self.contract = c.catalog.CatalogContract.from_rollback_resolution(self.resolution)
+        selected, latest = self.resolution.resolved.selected, self.resolution.resolved.latest
+        web = c.runtime.common.IMAGE_REPOSITORY['web'] + '@'
+        binding = lambda ref, digit, source, recipe: c.processes.ImageBinding(ref, 'sha256:' + digit * 64, source, recipe)
+        self.admission = c.image_admission._AdmittedRollback(c.image_admission._SEAL,
+            binding(web + dict(selected.images)['web'], '1', selected.actual_web_source_sha, self.resolution.target_recipe.sha256),
+            binding(web + dict(latest.images)['web'], '2', latest.actual_web_source_sha, self.resolution.live_recipe.sha256),
+            binding('sha256:' + '3' * 64, '3', SHA, '5' * 64),
+            binding('sha256:' + '4' * 64, '4', SHA, '5' * 64),
+            c.stack.GraphImage(ts.GRAPH, SHA), c.fixture.ExportImage('sha256:' + '6' * 64, SHA, '5' * 64), {})
+        self.w.terminal_previous_source = selected.actual_web_source_sha
+        self.w.terminal_identity_source = SHA
+        self.w.image_roles = []
+        contract, admitted = self.contract, self.admission
+        class Manager(FakeManager):
+            def __init__(inner, owner, previous, candidate, controller, *, catalog_control=None):
+                super().__init__(owner, previous, candidate, controller)
+                inner.previous, inner.candidate, inner.catalog_control = previous, candidate, catalog_control
+                inner.evidence_source_sha = catalog_control.source_sha
+                assert catalog_control is admitted.catalog_control
+                assert controller.source_sha == catalog_control.source_sha == owner.source_sha
+            def start_web(inner, version, inputs):
+                inner.w.image_roles.append(('web.' + version, getattr(inner, version)))
+                return super().start_web(version, inputs)
+            def start_migration(inner, phase, inputs):
+                value = inner.candidate if phase == 'compat-fwd' else inner.previous
+                inner.w.image_roles.append((phase, value))
+                return super().start_migration(phase, inputs)
+        class Catalog(FakeCatalog):
+            def __init__(inner, manager, pg, actual):
+                super().__init__(manager, pg, actual)
+                assert manager.catalog_control is admitted.catalog_control
+                assert actual is not None and actual.catalog_control_sha == manager.evidence_source_sha
+            @staticmethod
+            def observation(value=None):
+                return c.catalog.CatalogObservation(contract.target_sha256 if value is None or value == tp.CATALOG else value,
+                                                    'a' * 64, 123)
+            @staticmethod
+            def tables(value):
+                return c.postgres.TableCapture(object(), {}, dict.fromkeys(contract.expected_preexisting_tables, value), True)
+        class Fixture(FakeFixture):
+            def run(inner, inputs, **kwargs):
+                return replace(super().run(inputs, **kwargs), catalog_sha256=contract.target_sha256)
+        class Observation(FakeObservation):
+            @classmethod
+            def for_old_boot(cls, manager, handle, fixture, *, run_id, run_attempt, **kwargs):
+                value = cls(manager, handle, fixture, **kwargs)
+                assert manager.evidence_source_sha == SHA
+                value.identity = {'sha': value.w.terminal_identity_source,
+                    'previous_web_digest': dict(selected.images)['web'], 'run_id': run_id, 'run_attempt': run_attempt}
+                return value
+        for module, name, value in [(c.processes, 'OwnedProcesses', Manager), (c.catalog, 'OwnedCatalog', Catalog),
+                (c.fixture, 'OwnedFixture', Fixture), (c.observation, 'OwnedObservation', Observation)]:
+            active = patch.object(module, name, value); active.start(); self.addCleanup(active.stop)
+
+    def run_rollback(self, *, resolution=None, admitted=None, deadline=None):
+        resolution = self.resolution if resolution is None else resolution
+        end, trace = self.deadline.end, len(self.case.world.trace)
+        def build(repo, actual, binary, config, work, actual_deadline, *, buildx_binary):
+            self.assertIs(actual, resolution); self.assertIs(actual_deadline, self.deadline)
+            self.assertEqual(actual_deadline.end, end)
+            self.w.event('admission.rollback')
+            return self.admission if admitted is None else admitted
+        with patch.object(c.image_admission, '_admit_rollback_resolved', side_effect=build), \
+             patch.object(c.image_admission, '_verification_transport', side_effect=AssertionError('legacy verification')), \
+             patch.object(c.image_admission, '_admit_resolved', side_effect=AssertionError('normal admission')), \
+             patch.object(c.runtime, 'verified_previous', side_effect=AssertionError('legacy verification')), \
+             patch.object(c.schema_change, 'classify', side_effect=AssertionError('endpoint classification')), \
+             patch.object(c.schema_change, 'classify_v2', side_effect=AssertionError('endpoint classification')), \
+             patch.object(c.runtime, 'bounded_command', side_effect=lambda *a, **kw: self.w.owner.raw_capture(*a, **kw)):
+            raw = c._run_rollback_resolved_experiment(self.p, resolution, 12345, 2,
+                deadline=self.deadline if deadline is None else deadline,
+                docker_binary='docker', config_dir=self.p, image_work_dir=self.p)
+        self.assertEqual(self.deadline.end, end)
+        self.assertEqual(len(self.case.world.trace), trace)
+        return json.loads(raw)
+
+    def test_distinct_signed_endpoints_and_control_follow_complete_original_phase_order(self):
+        result = self.run_rollback()
+        target, latest = self.resolution.resolved.selected, self.resolution.resolved.latest
+        origin = self.resolution.requirements.live.origin_source.sha
+        self.assertEqual(len({SHA, target.record_sha, target.actual_web_source_sha,
+                              latest.actual_web_source_sha, origin}), 5)
+        self.assertEqual(result['sha'], SHA)
+        self.assertEqual(result['previous_release'], target.release)
+        self.assertEqual(result['previous_web_digest'], dict(target.images)['web'])
+        self.assertEqual(result['classification'], {'kind': 'none', 'dormant': False})
+        self.assertTrue(result['forward']); self.assertTrue(result['reversible'])
+        self.assertTrue(all(result['old_migrate_ok'].values())); self.assertTrue(all(result['old_server_ok'].values()))
+        self.assertEqual(result['catalog_sha256'], self.contract.target_sha256)
+        self.assertEqual(len(self.contract.expected_preexisting_tables), 127)
+        self.assertEqual([name for name, _ in self.w.image_roles], [
+            'web.previous', 'compat-fwd', 'compat-fwd', 'web.candidate', 'compat-n1-rw',
+            'compat-n1-ro', 'web.previous', 'web.candidate'])
+        for name, image in self.w.image_roles:
+            self.assertIs(image, self.admission.live if name in {'compat-fwd', 'web.candidate'} else self.admission.target)
+        self.assertEqual([name for name in self.w.trace if name.startswith('controller.')],
+                         ['controller.setup', 'controller.write', 'controller.write', 'controller.read', 'controller.write', 'controller.read'])
+        self.assertIn('pg.control', self.w.trace)
+        self.assertEqual(self.w.trace[-4:], ['ledger.seal', 'catalog.final', 'manager.close', 'stack.cleanup'])
+        self.assertTrue(self.w.owner._closed)
+        self.assertNotIn('catalog_control', result)
+
+    def test_original_deadline_includes_source_client_and_worker_interval(self):
+        self.assertEqual(self.w.clock.now, self.started + 40)
+        self.assertTrue(self.case.client.budget.closed)
+        self.run_rollback()
+        self.assertEqual(self.deadline.end, self.started + 2400)
+        self.assertEqual(self.w.clock.now, self.started + 100)
+
+    def test_complete_false_keeps_actual_reverse_control_final_catalog_and_cleanup(self):
+        self.w.false_case = 'read'
+        result = self.run_rollback()
+        self.assertFalse(result['old_server_ok']['read']); self.assertFalse(result['old_server_ok']['reverse'])
+        self.assertTrue(result['reversible'])
+        self.assertEqual(self.w.trace.count('controller.read'), 2)
+        self.assertIn('pg.control', self.w.trace)
+        self.assertEqual(self.w.trace[-3:], ['catalog.final', 'manager.close', 'stack.cleanup'])
+
+    def test_terminal_target_panic_is_bound_to_control_H_and_actual_target_source(self):
+        self.w.terminal_old_boot = True
+        result = self.run_rollback()
+        self.assertFalse(any(result['old_server_ok'].values()))
+        self.assertTrue(result['forward']); self.assertTrue(result['reversible'])
+        self.assertEqual(result['sha'], SHA)
+        self.assertEqual(self.w.trace.count('controller.write'), 2)
+        self.assertEqual(self.w.trace.count('controller.read'), 0)
+        self.assertEqual(self.w.trace.count('web.candidate'), 1)  # Reverse is causally blocked, never invented.
+        self.assertIn('pg.control', self.w.trace); self.assertIn('ledger.seal', self.w.trace)
+        self.assertEqual(self.w.trace[-3:], ['catalog.final', 'manager.close', 'stack.cleanup'])
+
+    def test_terminal_live_identity_is_not_control_identity(self):
+        self.w.terminal_old_boot = True
+        self.w.terminal_identity_source = self.resolution.resolved.latest.actual_web_source_sha
+        with self.assertRaises(c.proof.EvidenceError):
+            self.run_rollback()
+        self.assertTrue(self.w.owner._closed)
+
+    def test_terminal_record_control_or_origin_source_never_replaces_actual_target(self):
+        self.w.terminal_old_boot = True
+        for source in (self.resolution.resolved.selected.record_sha, SHA,
+                       self.resolution.requirements.live.origin_source.sha):
+            self.w.terminal_previous_source = source
+            with self.subTest(source=source), self.assertRaisesRegex(c.proof.EvidenceError, 'terminal-source'):
+                self.run_rollback()
+            self.assertTrue(self.w.owner._closed)
+
+    def test_swapped_signed_endpoint_bindings_refuse_before_owned_stack(self):
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'image-binding'):
+            self.run_rollback(admitted=replace(self.admission, target=self.admission.live, live=self.admission.target))
+        self.assertFalse(hasattr(self.w, 'owner'))
+
+    def test_wrong_endpoint_digest_source_or_recipe_refuses_before_owned_stack(self):
+        for role in ('target', 'live'):
+            original = getattr(self.admission, role)
+            for field, value in [('reference', original.image_id), ('source_sha', SHA), ('recipe_sha256', 'f' * 64)]:
+                bad = replace(self.admission, **{role: replace(original, **{field: value})})
+                with self.subTest(role=role, field=field), self.assertRaisesRegex(c.proof.EvidenceError, 'image-binding'):
+                    self.run_rollback(admitted=bad)
+        self.assertFalse(hasattr(self.w, 'owner'))
+
+    def test_every_tooling_source_is_H_and_control_is_local(self):
+        for role in ('catalog_control', 'controller', 'graph', 'fixture'):
+            bad = replace(self.admission, **{role: replace(getattr(self.admission, role), source_sha='b' * 40)})
+            with self.subTest(role=role), self.assertRaisesRegex(c.proof.EvidenceError, 'image-binding'):
+                self.run_rollback(admitted=bad)
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'image-binding'):
+            self.run_rollback(admitted=replace(self.admission, catalog_control=replace(
+                self.admission.catalog_control, reference=self.admission.live.reference)))
+        self.assertFalse(hasattr(self.w, 'owner'))
+
+    def test_wrong_or_unsealed_admission_cannot_enter_either_engine(self):
+        normal = c.image_admission._Admitted(c.image_admission._SEAL, self.admission.target,
+            self.admission.live, self.admission.controller, self.admission.graph, self.admission.fixture, {})
+        for value in (object(), normal, replace(self.admission, seal=object())):
+            with self.subTest(value=type(value)), self.assertRaisesRegex(c.proof.EvidenceError, 'source-build-unproven'):
+                self.run_rollback(admitted=value)
+        wrapped = c._RollbackImages(c._ROLLBACK_IMAGE_SEAL, self.admission.target, self.admission.live,
+            self.admission.catalog_control, self.admission.controller, self.admission.graph, self.admission.fixture)
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'source-build-unproven'):
+            c._Engine(self.p, PREVIOUS, SHA, 1, 1, c.schema_change.Classification('none', False, (), ()),
+                self.contract, wrapped, 'docker', self.p)
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'source-build-unproven'):
+            c._Engine._for_rollback(self.p, self.resolution, 1, 1, self.contract, images(), 'docker', self.p)
+        self.assertFalse(hasattr(self.w, 'owner'))
+
+    def test_changed_main_span_or_material_refuses_before_admission(self):
+        resolution = self.resolution
+        variants = [replace(resolution, resolved=replace(resolution.resolved,
+                        inventory=replace(resolution.resolved.inventory, main_sha='e' * 40))),
+                    replace(resolution, requirements=replace(resolution.requirements, span_sha256='f' * 64)),
+                    replace(resolution, materials=resolution.materials[:-1])]
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(c.proof.EvidenceError):
+                self.run_rollback(resolution=value)
+        self.assertEqual(self.w.trace, [])
+
+    def test_incomplete_later_phase_never_becomes_false_result(self):
+        self.w.false_case = 'read'; self.w.fail = 'catalog.final'
+        with self.assertRaises(c.proof.InfrastructureFailure):
+            self.run_rollback()
+        self.assertTrue(self.w.owner._closed)
+
+    def test_cleanup_failure_withholds_result(self):
+        self.w.cleanup_fail = True
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'cleanup'):
+            self.run_rollback()
+        self.assertIn('catalog.final', self.w.trace)
+        self.assertEqual(self.w.trace[-1], 'stack.cleanup')
+
+    def test_foreign_expired_or_insufficient_deadline_never_restarts(self):
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'overall-invalid'):
+            self.run_rollback(deadline=object())
+        self.w.clock.now = self.deadline.end - 899
+        with self.assertRaisesRegex(c.proof.InfrastructureFailure, 'experiment-reserve'):
+            self.run_rollback()
+        self.assertNotIn('stack.start', self.w.trace)
+        self.w.trace.clear(); self.w.clock.now = self.deadline.end
+        with self.assertRaises(c.proof.InfrastructureFailure):
+            self.run_rollback()
+        self.assertEqual(self.w.trace, [])
 
 
 class BudgetTests(unittest.TestCase):

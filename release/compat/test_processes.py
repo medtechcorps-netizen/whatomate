@@ -110,6 +110,23 @@ class World(test_stack.DockerWorld):
         return result
 
 
+
+def rollback_bindings(world, source_sha=test_stack.SOURCE):
+    """Synthetic inspected T/L images and separate local H web/control image."""
+    live_ref = p.runtime.common.IMAGE_REPOSITORY["web"] + "@" + CAND
+    world.images[live_ref] = copy.deepcopy(world.images[CAND])
+    world.images[live_ref]["RepoDigests"] = [live_ref]
+    local = "sha256:" + "8" * 64
+    world.images[local] = copy.deepcopy(world.images[CAND])
+    world.images[local]["Id"] = local
+    world.images[local]["Config"]["Labels"].update({p.stack.SOURCE_LABEL: source_sha,
+        p.stack.ROLE_LABEL: "candidate", p.stack.RECIPE_LABEL: RECIPE})
+    world.images[CONTROL]["Config"]["Labels"][p.stack.SOURCE_LABEL] = source_sha
+    return (p.ImageBinding(PREV, "sha256:" + "4" * 64, "d" * 40, RECIPE),
+            p.ImageBinding(live_ref, CAND, "e" * 40, RECIPE),
+            p.ImageBinding(CONTROL, CONTROL, source_sha, RECIPE),
+            p.ImageBinding(local, local, source_sha, RECIPE))
+
 class ProcessTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -123,6 +140,62 @@ class ProcessTests(unittest.TestCase):
 
     def manager(self):
         return p.OwnedProcesses(self.owner, *self.bindings)
+
+    def test_optional_catalog_control_preserves_three_normal_roles(self):
+        manager = self.manager()
+        self.assertEqual(tuple(manager.bindings), ("previous", "candidate", "controller"))
+        self.assertIs(manager.catalog_binding, manager.bindings["candidate"])
+        self.assertEqual(manager.evidence_source_sha, "e" * 40)
+        handle = manager.start_catalog(INPUTS)
+        self.assertEqual(handle.version, "candidate")
+        self.assertEqual(handle.image_id, CAND)
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+
+    def test_separate_h_control_routes_only_catalog_and_evidence(self):
+        previous, live, controller, control = rollback_bindings(self.world)
+        manager = p.OwnedProcesses(self.owner, previous, live, controller, catalog_control=control)
+        self.assertIs(manager.catalog_binding, control)
+        self.assertEqual(manager.evidence_source_sha, self.owner.source_sha)
+        for phase, image in (("compat-fwd", live), ("compat-n1-rw", previous), ("compat-n1-ro", previous)):
+            handle = manager.start_migration(phase, INPUTS)
+            self.assertEqual(handle.image_id, image.image_id)
+            self.assertEqual(self.world.containers[handle.container_id]["Config"]["Cmd"],
+                ["-ec", p._WAIT_CONFIG + "rls-migrate -config /compat/private/config.toml"])
+            self.assertEqual(manager.wait_migration(handle), 0)
+            manager.remove(handle)
+        for version, image in (("candidate", live), ("previous", previous)):
+            handle = manager.start_web(version, INPUTS)
+            self.assertEqual(handle.image_id, image.image_id)
+            with self.assertRaises(p.proof.EvidenceError): manager.start_catalog(INPUTS)
+            manager.remove(handle)
+        handle = manager.start_catalog(INPUTS)
+        self.assertEqual((handle.version, handle.image_id), ("catalog-control", control.image_id))
+        self.assertEqual(self.world.containers[handle.container_id]["Config"]["Cmd"],
+            ["-ec", p._WAIT_CONFIG + "catalog-snapshot -config /compat/private/config.toml -mode compare"])
+        self.assertNotIn(INPUTS.owner_password, json.dumps(self.world.configs[handle.container_id]))
+        self.assertEqual(manager.wait_catalog(handle).returncode, 0)
+        manager.remove(handle); manager.close(); self.owner.cleanup()
+
+    def test_explicit_control_source_reference_layout_and_recipe_fail_before_creation(self):
+        previous, live, controller, control = rollback_bindings(self.world)
+        original = copy.deepcopy(self.world.images[control.reference])
+        for failure in ("source", "controller", "signed", "role", "recipe", "entrypoint", "environment"):
+            with self.subTest(failure=failure):
+                self.world.images[control.reference] = copy.deepcopy(original)
+                chosen, driver = control, controller
+                row = self.world.images[control.reference]
+                if failure == "source": chosen = replace(control, source_sha="1" * 40)
+                elif failure == "controller": driver = replace(controller, source_sha="1" * 40)
+                elif failure == "signed": chosen = replace(control, reference=live.reference)
+                elif failure == "role": row["Config"]["Labels"][p.stack.ROLE_LABEL] = "catalog-control"
+                elif failure == "recipe": del row["Config"]["Labels"][p.stack.RECIPE_LABEL]
+                elif failure == "entrypoint": row["Config"]["Entrypoint"] = ["/bin/sh"]
+                else: row["Config"]["Env"] = ["SECRET=private"]
+                count = len(self.world.mutations)
+                with self.assertRaises(p.proof.EvidenceError):
+                    p.OwnedProcesses(self.owner, previous, live, driver, catalog_control=chosen)
+                self.assertEqual(len(self.world.mutations), count)
+                self.assertIsNone(self.owner._process_manager)
 
     def frame(self, operation="readiness", **extra):
         f = test_controller.fixture()

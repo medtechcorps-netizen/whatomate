@@ -199,6 +199,143 @@ class CatalogContract:
         contract.pending_binding = projection.binding
         return contract
 
+    @classmethod
+    def from_rollback_resolution(cls, resolution: record_resolver.RollbackProofResolution):
+        """Pure complete consistency replay of the preparatory rollback source.
+
+        This data does not authenticate signatures, commit ancestry or freshness;
+        the concrete resolver owns those observations. No additional source read
+        or H image-recipe assertion is made here. T/L recipes describe only their
+        actual image sources; H admission retains its independent build receipt.
+        """
+        need(cls is CatalogContract and type(resolution) is record_resolver.RollbackProofResolution)
+        policy, transport = record_resolver.policy, record_resolver.transport
+        try:
+            resolved, producer = resolution.resolved, resolution.producer
+            need(type(resolved) is record_resolver.ResolvedChain
+                 and type(resolved.chain) is policy.PolicyChain
+                 and type(producer) is policy.SourceFacts)
+            chain = resolved.chain
+            need(chain.baseline is None and chain.runtime_source_supported is True)
+            need(policy.normalize_chain(chain.inputs, chain.sources, chain.ancestors) == chain)
+            latest, selected = resolved.latest, resolved.selected
+            need(type(latest) is record_resolver.ReleaseSelection
+                 and type(selected) is record_resolver.ReleaseSelection
+                 and type(selected.index) is int and 0 <= selected.index < len(chain.entries)
+                 and type(latest.index) is int and latest.index == len(chain.entries) - 1)
+            need(latest == record_resolver._selection(chain, latest.index)
+                 and selected == record_resolver._selection(chain, selected.index))
+            required = policy._rollback_requirements(chain, selected.release)
+            need(type(resolution.requirements) is policy.RollbackRequirements
+                 and resolution.requirements == required and required.non_none_count >= 2
+                 and required.runtime_source_supported is True, "catalog-rollback-span-invalid")
+            need(all(entry.facts.db_change == "none" or
+                     (entry.facts.db_change in {"data", "expand"} and entry.facts.dormant is True)
+                     for entry in required.intermediates), "catalog-progression-unsupported")
+            policy._source(producer)
+            need(producer.mode == "reviewed-v0" and producer in chain.sources)
+            documents = tuple(runtime.common.loads_strict(row.raw) for row in chain.inputs)
+            bootstrap = documents[0]  # normalize_chain verified the pinned raw bootstrap.
+            images = resolved.image_bindings
+            need(type(images) is tuple and len(images) == len(documents))
+            for document, binding in zip(documents, images, strict=True):
+                expected_images = tuple((key, document["images"][key]) for key in runtime.common.COMPONENTS)
+                expected_sources = tuple((key, bootstrap["legacy_signer"]["source_commit"]
+                    if document["images"][key] == bootstrap["images"][key] else document["sha"])
+                    for key in runtime.common.COMPONENTS)
+                need(type(binding) is transport.VerifiedImages and binding.release == document["release"]
+                     and binding.record_sha == document["sha"] and binding.images == expected_images
+                     and binding.source_shas == expected_sources, "catalog-image-source-mismatch")
+            legacy, complete, readers, _commits = record_resolver._source_requirements(documents, images)
+            complete.add(producer.sha)
+            facts = {row.sha: row for row in chain.sources}
+            need(tuple(row.sha for row in chain.sources) == tuple(sorted(readers | complete)))
+            need(all(facts[sha].mode == "reviewed-v0" if sha in complete else
+                     sha in legacy and facts[sha].mode == "legacy-reader0" for sha in facts))
+            inventory = resolved.inventory
+            need(type(inventory) is transport.InventorySnapshot
+                 and type(inventory.repository_id) is int and inventory.repository_id == transport.REPOSITORY_ID
+                 and inventory.main_sha == producer.sha)
+            records = tuple(sorted(chain.entries[1:], key=lambda row: row.release))
+            need(type(inventory.records) is tuple and type(inventory.tags) is tuple
+                 and len(inventory.records) == len(inventory.tags) == len(records))
+            for entry, row, tag in zip(records, inventory.records, inventory.tags, strict=True):
+                need(type(row) is transport.ReleaseIdentity and type(tag) is transport.TagIdentity
+                     and row.release == tag.release == entry.release and tag.sha == entry.sha
+                     and type(row.release_id) is int and row.release_id > 0
+                     and type(row.asset_id) is int and row.asset_id > 0
+                     and type(row.size) is int and row.size == len(entry.record.raw)
+                     and (row.digest is None or row.digest == "sha256:" + entry.record.manifest_sha256))
+            need(len({row.asset_id for row in inventory.records}) == len(records)
+                 and len({row.release_id for row in inventory.records}) == len(records))
+            sources = {producer.sha: producer}
+            for entry in (required.target, *required.intermediates):
+                sources[entry.reader.sha] = entry.reader
+                if entry.live is not None:
+                    origin = entry.live.origin_source
+                    need(origin.mode == "reviewed-v0" and entry.live.catalog == producer.catalog
+                         and origin.catalog == entry.live.catalog and origin.artifacts == producer.artifacts,
+                         "catalog-fallback-not-equal")
+                    sources[origin.sha] = origin
+            materials = resolution.materials
+            need(type(materials) is tuple and len(materials) == len(sources)
+                 and all(type(row) is record_resolver.RollbackSourceMaterial for row in materials)
+                 and tuple(row.source_sha for row in materials) == tuple(sorted(sources)))
+            endpoints = {selected.actual_web_source_sha, latest.actual_web_source_sha}
+            expected = dict(producer.artifacts)
+            material_map = {}
+            for material in materials:
+                source = sources[material.source_sha]
+                absent = (source.mode == "legacy-reader0" and source.sha == policy.V0_RELEASED_SOURCE
+                          and source.sha in endpoints)
+                need(source.mode in {"reviewed-v0", "legacy-reader0"})
+                need(material.provenance == ("legacy-e001-absent-overlay" if absent else "equal-reviewed-v0"))
+                need(type(material.blobs) is tuple and len(material.blobs) == len(policy.SOURCE_PATHS)
+                     and all(type(row) is record_resolver.BlobObservation for row in material.blobs)
+                     and tuple(row.path for row in material.blobs) == policy.SOURCE_PATHS)
+                total = 0
+                for row in material.blobs:
+                    if absent and row.path in {policy.PROFILE, policy.OVERLAY}:
+                        need(row.raw is None, "catalog-fallback-not-equal")
+                    else:
+                        need(type(row.raw) is bytes and 0 < len(row.raw) <= policy.MAX_SOURCE_FILE_BYTES
+                             and hashlib.sha256(row.raw).hexdigest() == expected[row.path],
+                             "catalog-fallback-not-equal")
+                        total += len(row.raw)
+                need(total <= policy.MAX_SOURCE_BYTES)
+                if not absent:
+                    decoded = policy.reviewed_v0_source(source.sha,
+                        tuple(policy.SourceBlob(row.path, row.raw) for row in material.blobs))
+                    need(source == decoded if source.mode == "reviewed-v0" else
+                         source == policy.legacy_reader0(source.sha))
+                material_map[source.sha] = {row.path: row.raw for row in material.blobs}
+            need(type(resolution.workflow) is bytes and 0 < len(resolution.workflow) <= policy.MAX_SOURCE_FILE_BYTES
+                 and type(resolution.workflow_sha256) is str
+                 and hashlib.sha256(resolution.workflow).hexdigest() == resolution.workflow_sha256)
+            for selection, recipe in ((selected, resolution.target_recipe), (latest, resolution.live_recipe)):
+                need(type(recipe) is record_resolver.WebRecipe and recipe.source_sha == selection.actual_web_source_sha
+                     and recipe.path == "docker/release/web.Dockerfile" and type(recipe.raw) is bytes
+                     and 0 < len(recipe.raw) <= policy.MAX_SOURCE_FILE_BYTES
+                     and type(recipe.sha256) is str and hashlib.sha256(recipe.raw).hexdigest() == recipe.sha256,
+                     "catalog-image-source-mismatch")
+            need(selected.actual_web_source_sha != latest.actual_web_source_sha
+                 or resolution.target_recipe == resolution.live_recipe, "catalog-image-source-mismatch")
+            contract = cls.__new__(cls)
+            contract.purpose = "rollback-v0"
+            contract.previous_sha, contract.candidate_sha = selected.actual_web_source_sha, latest.actual_web_source_sha
+            contract.previous_web = runtime.common.IMAGE_REPOSITORY["web"] + "@" + dict(selected.images)["web"]
+            contract.candidate_web = runtime.common.IMAGE_REPOSITORY["web"] + "@" + dict(latest.images)["web"]
+            contract.catalog_control_sha = producer.sha
+            contract.database_base_source = contract.catalog_baseline_sha = required.live.origin_source.sha
+            contract.baseline_provenance = "retained-live-v2"
+            contract.target_recipe, contract.live_recipe = resolution.target_recipe, resolution.live_recipe
+            contract._base_overlay = "equal-reviewed-v0-nop"
+            contract._load_pinned(material_map[producer.sha])
+            return contract
+        except (policy.PolicyRefusal, runtime.common.ReleaseError, KeyError, IndexError,
+                AttributeError, TypeError, ValueError, RecursionError):
+            raise proof.EvidenceError("catalog-rollback-invalid") from None
+
     def _load_pinned(self, blobs):
         golden, profile = _json(blobs[_GOLDEN]), _json(blobs[_PROFILE])
         need(type(golden) is dict and set(golden) == {"version","objects"} and golden["version"] == 0)
@@ -264,6 +401,18 @@ class OwnedCatalog:
         need(manager.bindings["previous"].source_sha==contract.previous_sha
              and manager.bindings["previous"].reference==contract.previous_web
              and manager.bindings["candidate"].source_sha==contract.candidate_sha, "catalog-image-source-mismatch")
+        if getattr(contract, "purpose", None) == "rollback-v0":
+            need("catalog-control" in manager.bindings
+                 and manager.bindings["candidate"].reference == contract.candidate_web
+                 and manager.bindings["previous"].recipe_sha256 == contract.target_recipe.sha256
+                 and manager.bindings["candidate"].recipe_sha256 == contract.live_recipe.sha256
+                 and manager.catalog_binding.reference == manager.catalog_binding.image_id
+                 and manager.catalog_binding.source_sha == contract.catalog_control_sha
+                 and manager.bindings["controller"].source_sha == contract.catalog_control_sha
+                 and manager.owner.source_sha == contract.catalog_control_sha,
+                 "catalog-image-source-mismatch")
+        else:
+            need("catalog-control" not in manager.bindings, "catalog-image-source-mismatch")
         need(pg.container==manager.owner._ids["pg"] and pg.token==manager.owner.token and pg.runtime_role=="compat_runtime",
              "catalog-pg-binding-invalid")
         self.manager,self.pg,self.contract=manager,pg,contract
