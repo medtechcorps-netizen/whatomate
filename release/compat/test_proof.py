@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import ast
 import hashlib
 import json
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -100,6 +102,146 @@ def terminal_observations():
                     "reason": "retained-record-unavailable" if phase.startswith("reverse.") else "server-unavailable",
                     "binding": dict(old["boot"]["binding"])}
     return value
+
+
+class MigrationEvaluatorTests(unittest.TestCase):
+    @staticmethod
+    def evidence():
+        # Deliberately no unrelated forward/server/worker proof observations.
+        return {"rw": migration("compat-n1-rw"), "ro": migration("compat-n1-ro"),
+                "negative_control": {"execution": execution(1), "sqlstate": "25006",
+                                     "log": {"raw": control_log(), "complete": True}}}
+
+    def evaluate(self, value, **baseline):
+        return proof.evaluate_migrations(value, **({"baseline_catalog_sha256": CATALOG,
+                                                    "baseline_tables": tables()} | baseline))
+
+    def test_standalone_exact_flags_without_unrelated_phases(self):
+        value = self.evidence(); saved = copy.deepcopy(value)
+        result = self.evaluate(value)
+        self.assertEqual(result, {"rw": True, "ro": True, "negative_control": True})
+        self.assertTrue(all(type(flag) is bool for flag in result.values()))
+        self.assertEqual(value, saved)
+        result["rw"] = False
+        self.assertTrue(self.evaluate(value)["rw"])
+
+    def test_swallowed_update_and_read_only_error_are_independently_false(self):
+        value = self.evidence()
+        value["rw"]["log"]["raw"] = line("compat-n1-rw")
+        value["ro"]["log"]["raw"] = line("compat-n1-ro", "ERROR", "25006", "read only")
+        # Both actors claim exit zero and retain the baseline logical data.
+        self.assertEqual(self.evaluate(value), {"rw": False, "ro": False, "negative_control": True})
+
+    def test_each_complete_rw_and_ro_violation_preserves_other_flag(self):
+        mutations = {
+            "exit": lambda row: row["execution"].update(exit_code=1),
+            "mod": lambda row: row["log"].update(raw=line(row["markers"]["application"])),
+            "error": lambda row: row["log"].update(raw=line(row["markers"]["application"], "ERROR", "42501", "permission")),
+            "warning-25006": lambda row: row["log"].update(raw=line(row["markers"]["application"], "WARNING", "25006", "read only")),
+            "marker": lambda row: row["markers"].update(hashes=[CHANGED]),
+            "catalog": lambda row: row.update(catalog_sha256=CHANGED),
+            "data": lambda row: row.update(tables=tables(CHANGED)),
+            "deleted-table": lambda row: row["tables"].update(digests={}),
+            "added-table": lambda row: row["tables"]["digests"].update({CHANGED: DATA}),
+        }
+        for mode in ("rw", "ro"):
+            for name, mutate in mutations.items():
+                value = self.evidence(); mutate(value[mode])
+                with self.subTest(mode=mode, signal=name):
+                    result = self.evaluate(value)
+                    self.assertFalse(result[mode])
+                    self.assertTrue(result["ro" if mode == "rw" else "rw"])
+                    self.assertTrue(result["negative_control"])
+
+    def test_control_refusal_even_when_both_migrations_are_already_false(self):
+        mutations = {
+            "success": lambda row: row["execution"].update(exit_code=0),
+            "state": lambda row: row.update(sqlstate="42501"),
+            "incomplete": lambda row: row["log"].update(complete=False),
+            "missing": lambda row: row["log"].update(raw=b""),
+            "wrong-query": lambda row: row["log"].update(raw=control_log().replace(proof.READ_ONLY_CONTROL_SQL.encode(), b"UPDATE fixture SET value=1")),
+            "missing-statement": lambda row: row["log"].update(raw=line("compat-control", "ERROR", "25006", "read only")),
+            "duplicate": lambda row: row["log"].update(raw=control_log() + control_log()),
+            "other-error": lambda row: row["log"].update(raw=control_log() + line("compat-control", "ERROR", "42501", "permission")),
+            "unrelated-write": lambda row: row["log"].update(raw=line("compat-control") + control_log()),
+            "foreign-app": lambda row: row["log"].update(raw=control_log().replace(b"compat-control", b"compat-n1-ro")),
+            "extra-field": lambda row: row.update(passed=True),
+        }
+        for name, mutate in mutations.items():
+            value = self.evidence()
+            for mode in ("rw", "ro"): value[mode]["execution"]["exit_code"] = 1
+            mutate(value["negative_control"])
+            with self.subTest(control=name), self.assertRaises(proof.EvidenceError): self.evaluate(value)
+
+    def test_control_accepts_only_optional_exact_executed_create(self):
+        value = self.evidence()
+        value["negative_control"]["log"]["raw"] = line("compat-control", body="statement: " + proof.READ_ONLY_CONTROL_SQL) + control_log()
+        self.assertTrue(self.evaluate(value)["negative_control"])
+
+    def test_missing_and_malformed_migration_observations_never_become_flags(self):
+        for mode in ("rw", "ro", "negative_control"):
+            value = self.evidence(); del value[mode]
+            with self.subTest(missing=mode), self.assertRaises(proof.EvidenceError): self.evaluate(value)
+        mutations = [lambda row: row.pop("execution"), lambda row: row.update(execution={"status": "not-run", "exit_code": None, "failure": None}),
+            lambda row: row["execution"].update(exit_code=True), lambda row: row["log"].update(complete=False),
+            lambda row: row["log"].update(raw=line("compat-fwd")), lambda row: row["log"].update(raw=line("compat-n1-rw")[:-1]),
+            lambda row: row["markers"].update(complete=False), lambda row: row["markers"].update(application="compat-fwd"),
+            lambda row: row["markers"].update(hashes=["not-a-digest"]), lambda row: row["tables"].update(complete=False),
+            lambda row: row.update(catalog_sha256="not-a-digest"), lambda row: row.update(passed=True)]
+        for mode in ("rw", "ro"):
+            for index, mutate in enumerate(mutations):
+                value = self.evidence(); mutate(value[mode])
+                with self.subTest(mode=mode, mutation=index), self.assertRaises(proof.EvidenceError): self.evaluate(value)
+        value = self.evidence(); value["forward"] = {}
+        with self.assertRaises(proof.EvidenceError): self.evaluate(value)
+
+    def test_complete_nonempty_baseline_is_required_and_bounds_remain(self):
+        baselines = [{"baseline_catalog_sha256": "bad"}, {"baseline_tables": None},
+                     {"baseline_tables": {"complete": False, "digests": {TABLE: DATA}}},
+                     {"baseline_tables": {"complete": True, "digests": {}}},
+                     {"baseline_tables": {"complete": True, "digests": {TABLE: "bad"}}},
+                     {"baseline_tables": {"complete": True, "digests": {TABLE: DATA}, "expected": True}}]
+        for baseline in baselines:
+            with self.subTest(baseline=baseline), self.assertRaises(proof.EvidenceError): self.evaluate(self.evidence(), **baseline)
+        with mock.patch.object(proof, "MAX_TABLES", 0), self.assertRaises(proof.EvidenceError): self.evaluate(self.evidence())
+        with mock.patch.object(proof, "MAX_LOG_BYTES", 0), self.assertRaises(proof.EvidenceError): self.evaluate(self.evidence())
+
+    def test_infrastructure_failure_never_becomes_a_negative_advisory(self):
+        for phase in ("rw", "ro", "negative_control"):
+            for failure in sorted(proof._INFRA):
+                value = self.evidence(); value["rw"]["execution"]["exit_code"] = 1
+                value[phase]["execution"] = {"status": "infrastructure-error", "exit_code": None, "failure": failure}
+                with self.subTest(phase=phase, failure=failure), self.assertRaises(proof.InfrastructureFailure): self.evaluate(value)
+
+    def test_full_proof_delegates_and_still_requires_later_evidence(self):
+        value = observations()
+        with mock.patch.object(proof, "evaluate_migrations", wraps=proof.evaluate_migrations) as shared:
+            result = proof.evaluate_proof(value)
+        shared.assert_called_once_with(value["old_migrate"], baseline_catalog_sha256=CATALOG,
+                                       baseline_tables=value["quiescence"]["tables"])
+        self.assertEqual(result["old_migrate_ok"], self.evaluate(self.evidence()))
+        value["old_migrate"]["rw"]["execution"]["exit_code"] = 1
+        del value["old_server"]["reverse_sweep"]
+        with self.assertRaises(proof.EvidenceError): proof.evaluate_proof(value)
+
+    def test_shared_predicate_ast_is_the_accepted_original_detector(self):
+        tree = ast.parse(Path(proof.__file__).read_text(encoding="utf-8"))
+        shared = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "evaluate_migrations")
+        loop = next(node for node in shared.body if isinstance(node, ast.For))
+        digest = hashlib.sha256(ast.dump(loop, include_attributes=False).encode()).hexdigest()
+        self.assertEqual(digest, "41bf0e947dc1439d16e3a445e5ad71c5bc9aa780448076f500e29485f6096511")
+
+    def test_standalone_result_contains_no_raw_private_evidence(self):
+        value = self.evidence(); sentinel = "PRIVATE_VALUE_MUST_NOT_ESCAPE"
+        value["rw"]["log"]["raw"] = line("compat-n1-rw", body="statement: UPDATE fixture SET value='" + sentinel + "'")
+        result = self.evaluate(value)
+        self.assertNotIn(sentinel, json.dumps(result))
+        self.assertEqual(set(result), {"rw", "ro", "negative_control"})
+        # This result is intentionally not a full compatibility artifact.
+        with self.assertRaises(proof.EvidenceError): proof.result_bytes(result)
+        value["rw"]["log"]["raw"] = sentinel.encode() + b"\n"
+        with self.assertRaises(proof.EvidenceError) as caught: self.evaluate(value)
+        self.assertEqual(str(caught.exception), "pg-prefix-invalid")
 
 
 class PgParserTests(unittest.TestCase):

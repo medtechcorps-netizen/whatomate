@@ -317,6 +317,39 @@ def _classification(value: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def evaluate_migrations(value: Any, *, baseline_catalog_sha256: Any, baseline_tables: Any) -> dict[str, bool]:
+    """Check complete raw migration/control observations against an actual D0.
+
+    Return only migration flags, not a compatibility result. The caller must
+    independently establish the baseline's complete inventory, quiescence,
+    ownership and capture order; this pure helper authenticates none of them.
+    No forward, server or worker observations are required or synthesized.
+    Invalid/missing evidence and an unproven control raise, never return false.
+    """
+    s0, d0 = _digest(baseline_catalog_sha256), _tables(baseline_tables)
+    # evaluate_proof already establishes a nonempty verified table inventory.
+    # Standalone advisory callers must not turn a missing D0 into empty equality.
+    _need(bool(d0), "migration-baseline-incomplete")
+    old = _fields(value, {"rw", "ro", "negative_control"})
+    rw = _migration(old["rw"], "compat-n1-rw")
+    ro = _migration(old["ro"], "compat-n1-ro")
+    control = _fields(old["negative_control"], {"execution", "sqlstate", "log"})
+    control_code, control_log = _execution(control["execution"]), _log(control["log"], "compat-control")
+    _need(control_code != 0 and control["sqlstate"] == "25006" and "25006" in control_log.error_states,
+          "negative-control-unproven")
+    # The control is a deliberately failed CREATE TABLE, never a successful
+    # write or a different error accidentally accompanying a 25006 message.
+    _need(control_log.error_states == ("25006",), "negative-control-ambiguous")
+    expected_control = hashlib.sha256(READ_ONLY_CONTROL_SQL.encode("utf-8")).hexdigest()
+    _need(control_log.failed_statements == (("25006", expected_control),), "negative-control-statement-unproven")
+    _need(control_log.statement_hashes in ((), (expected_control,)), "negative-control-ambiguous")
+    migration_flags = []
+    for code, log, markers, catalog, tables in (rw, ro):
+        migration_flags.append(code == 0 and not log.error_states and "25006" not in log.sqlstates and not log.statement_hashes and not markers
+                               and catalog == s0 and tables == d0)
+    return {"rw": migration_flags[0], "ro": migration_flags[1], "negative_control": True}
+
+
 def evaluate_proof(value: Any) -> dict[str, Any]:
     """Return the exact public result only after every required input is checked.
 
@@ -363,23 +396,8 @@ def evaluate_proof(value: Any) -> dict[str, Any]:
           "quiescence-unproven")
     d0, s0 = _tables(quiet["tables"]), _digest(quiet["catalog_sha256"])
     _need(set(expected_tables) <= set(d0) and set(d0) == set(passes[1][4]), "quiescence-inventory-unproven")
-    old = _fields(row["old_migrate"], {"rw", "ro", "negative_control"})
-    rw = _migration(old["rw"], "compat-n1-rw")
-    ro = _migration(old["ro"], "compat-n1-ro")
-    control = _fields(old["negative_control"], {"execution", "sqlstate", "log"})
-    control_code, control_log = _execution(control["execution"]), _log(control["log"], "compat-control")
-    _need(control_code != 0 and control["sqlstate"] == "25006" and "25006" in control_log.error_states,
-          "negative-control-unproven")
-    # The control is a deliberately failed CREATE TABLE, never a successful
-    # write or a different error accidentally accompanying a 25006 message.
-    _need(control_log.error_states == ("25006",), "negative-control-ambiguous")
-    expected_control = hashlib.sha256(READ_ONLY_CONTROL_SQL.encode("utf-8")).hexdigest()
-    _need(control_log.failed_statements == (("25006", expected_control),), "negative-control-statement-unproven")
-    _need(control_log.statement_hashes in ((), (expected_control,)), "negative-control-ambiguous")
-    migration_flags = []
-    for code, log, markers, catalog, tables in (rw, ro):
-        migration_flags.append(code == 0 and not log.error_states and "25006" not in log.sqlstates and not log.statement_hashes and not markers
-                               and catalog == s0 and tables == d0)
+    old_migrate = evaluate_migrations(row["old_migrate"], baseline_catalog_sha256=s0,
+                                      baseline_tables=quiet["tables"])
     server = _fields(row["old_server"], {"boot", "read_sweep", "write_sweep", "workers", "stopped", "candidate_ready", "reverse_sweep"})
     terminal = type(server["boot"]) is dict and server["boot"].get("state") == "observed-semantic-failure"
     if terminal:
@@ -404,7 +422,6 @@ def evaluate_proof(value: Any) -> dict[str, Any]:
         stopped, rebooted, reverse = _check(server["stopped"]), _check(server["candidate_ready"]), _sweep(server["reverse_sweep"])
     final_catalog = _digest(row["final_catalog_sha256"])
     forward = previous_boot and all(pass_flags) and candidate_ready and candidate_write and s0 == expected
-    old_migrate = {"rw": migration_flags[0], "ro": migration_flags[1], "negative_control": True}
     result = {
         **identity, "classification": classification, "forward": forward,
         "old_migrate_ok": old_migrate,
