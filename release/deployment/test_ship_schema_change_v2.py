@@ -1116,6 +1116,179 @@ class InvocationArtifactBudgetTests(unittest.TestCase):
         self.assertEqual(sum(command[:2] == ("cat-file", "blob") for command in commands), 16)
         self.assertNotIn(("b" * 40, "one-more.json"), repo.cache)
 
+class CompleteNullableSourcePolicyTests(unittest.TestCase):
+    """Real disposable immutable source history; no DB or future engine claim."""
+
+    @classmethod
+    def setUpClass(cls):
+        import test_ship_schema_nullable as fixture
+        cls.fixture = fixture
+        cls.source_inputs = fixture.declared_catalogs()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = support.TempRepo(Path(self.temp.name) / "repo")
+        self.before, self.after, self.declaration = self.source_inputs
+        self.base_files = {sc.CATALOG: self.before.decode(), sc.HISTORY: text(history()), sc.GLOBALS: "[]\n",
+            sc.MIGRATION_PATH: text(migration()), "cmd/whatomate/main.go": MAIN,
+            "internal/database/tenant.go": TENANT, "README.md": "source-only future fixture\n"}
+        self.base = self.repo.commit(self.base_files)
+
+    def head(self, *, after=None, declaration=None, engine=True, kind="expand", floor=0, changes=None):
+        after = self.after if after is None else after
+        declaration = self.declaration if declaration is None else declaration
+        files = {sc.CATALOG: after.decode(), sc.HISTORY: text(history(1, kind, engine, floor)),
+            sc.schema_nullable.SOURCE_PATH: self.fixture.wire(declaration).decode()}
+        files.update(changes or {})
+        return self.repo.commit(files)
+
+    def result(self, **kwargs):
+        head = self.head(**kwargs)
+        return sc.classify_v2(self.repo.root, self.base, head)
+
+    def test_full_declared_nullable_delta_is_expand_but_runtime_stays_held(self):
+        head = self.head()
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", False, ()))
+        self.assertTrue({"compat-required", "restore-drills", "producer-class-unsupported", "catalog-format/profile-unsupported"} <= set(result.requirements))
+        self.assertNotIn("contract-label", result.requirements)
+        self.assertTrue(any("source nullable declaration:" in line for line in result.summary))
+        self.assertTrue(sc.check(self.repo.root, self.base, head))  # Legacy operational guard is unchanged.
+
+    def test_missing_declaration_keeps_complete_delta_contract(self):
+        result = self.result(changes={sc.schema_nullable.SOURCE_PATH: None}, kind="contract")
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+
+    def test_engine_false_remains_blocked_not_dormant(self):
+        result = self.result(engine=False)
+        self.assertEqual((result.kind, result.dormant), ("expand", False))
+        self.assertIn("active-catalog-without-apply-engine", result.reasons)
+        self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_missing_engine_flag_remains_blocked(self):
+        value = history(1, "expand", True); value[-1].pop("apply_engine")
+        result = self.result(changes={sc.HISTORY: text(value)})
+        self.assertIn("active-catalog-without-apply-engine", result.reasons)
+
+    def test_none_current_head_without_declaration_is_unchanged(self):
+        head = self.repo.commit({"README.md": "unchanged current source\n"})
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("none", False, ()))
+        self.assertEqual(result.requirements, ("compat-required", "generated-migration-closure-ci"))
+
+    def test_malformed_present_cannot_hide_behind_none(self):
+        head = self.repo.commit({sc.schema_nullable.SOURCE_PATH: "{}\n"})
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertIn("classifier-v2-invalid:nullable-source", result.reasons)
+
+    def test_malformed_present_cannot_hide_behind_dormant_data(self):
+        head = self.repo.commit({sc.schema_nullable.SOURCE_PATH: "{}\n", sc.SEEDS: text({"version": 0})})
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertIn("classifier-v2-invalid:nullable-source", result.reasons)
+
+    def test_malformed_present_cannot_hide_behind_precatalog_baseline(self):
+        base = self.repo.commit({sc.CATALOG: None})
+        head = self.repo.commit({sc.schema_nullable.SOURCE_PATH: "{}\n"})
+        result = sc.classify_v2(self.repo.root, base, head)
+        self.assertIn("classifier-v2-invalid:nullable-source", result.reasons)
+
+    def test_residual_existing_type_contract_dominates_nullable(self):
+        value = json.loads(self.after)
+        next(r for r in value["objects"] if (r["kind"], r["identity"]) == ("types", "users"))["attributes"]["definition_sha256"] = J
+        after = self.fixture.catalog_bytes(value)
+        declaration = self.fixture.bind_documents(self.declaration, self.before, after)
+        result = self.result(after=after, declaration=declaration, kind="contract")
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+
+    def test_residual_policy_change_contract_dominates_data(self):
+        value = json.loads(self.after)
+        next(r for r in value["objects"] if r["kind"] == "policies")["attributes"]["using_sha256"] = J
+        after = self.fixture.catalog_bytes(value)
+        declaration = self.fixture.bind_documents(self.declaration, self.before, after)
+        result = self.result(after=after, declaration=declaration, kind="contract", changes={sc.SEEDS: text({"version": 0})})
+        self.assertEqual(result.kind, "contract")
+
+    def test_data_precedence_over_explained_expand(self):
+        result = self.result(changes={sc.SEEDS: text({"version": 0})})
+        self.assertEqual((result.kind, result.dormant), ("data", False))
+        self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_unprotected_residual_relation_still_blocked(self):
+        value = json.loads(self.after)
+        value["objects"].append(row("relations", "unprotected", rls="false", force_rls="false"))
+        after = self.fixture.catalog_bytes(value)
+        declaration = self.fixture.bind_documents(self.declaration, self.before, after)
+        result = self.result(after=after, declaration=declaration, kind="contract")
+        self.assertIn("unprotected-new-relation:unprotected", result.reasons)
+
+    def test_floor_and_history_precedence_remains(self):
+        result = self.result(kind="contract", floor=1)
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+
+    def test_history_version_and_append_only_checks_remain(self):
+        bad = history(1, "expand", True); bad[0]["apply_engine"] = True
+        result = self.result(changes={sc.HISTORY: text(bad)})
+        self.assertIn("history-rewritten", result.reasons)
+        head = self.head(changes={sc.HISTORY: text(history())})
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertIn("history-catalog-version-mismatch", result.reasons)
+
+    def test_stale_raw_catalog_binding_refuses(self):
+        value = json.loads(self.after)
+        next(r for r in value["objects"] if (r["kind"], r["identity"]) == ("types", "users"))["attributes"]["definition_sha256"] = J
+        result = self.result(after=self.fixture.catalog_bytes(value))
+        self.assertIn("classifier-v2-invalid:nullable-source", result.reasons)
+
+    def test_source_namespace_is_not_a_pending_plan_or_activation(self):
+        result = self.result()
+        self.assertFalse(any(line.startswith("pending source plan:") for line in result.summary))
+        self.assertIn("catalog-format/profile-unsupported", result.requirements)
+
+    def test_real_scoped_git_binds_refs_and_original_budget(self):
+        head = self.head()
+        reader = source_git.ImmutableGit(self.repo.root, Path(shutil.which("git")))
+        with reader.operation():
+            result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+        self.assertTrue(reader.closed)
+        for detail in ("calls", "bytes", "deadline"):
+            real_git = sc._git
+            def refuse(root, args):
+                if args[:2] == ["ls-tree", "-z"] and args[-1] == sc.schema_nullable.SOURCE_PATH:
+                    raise source_git.SourceGitRefusal("git-failed:source-" + detail)
+                return real_git(root, args)
+            with self.subTest(detail=detail), mock.patch.object(sc, "_git", side_effect=refuse):
+                with self.assertRaises(source_git.SourceGitRefusal): sc.classify_v2(self.repo.root, self.base, head)
+
+    def test_descriptor_blob_must_be_regular_and_bounded(self):
+        head = self.head()
+        real_git = sc._git
+        for reply in (b"120000 blob " + b"a"*40 + b"\t" + sc.schema_nullable.SOURCE_PATH.encode() + b"\0",
+                      b"160000 commit " + b"a"*40 + b"\t" + sc.schema_nullable.SOURCE_PATH.encode() + b"\0"):
+            def invalid(root, args):
+                if args[:2] == ["ls-tree", "-z"] and args[-1] == sc.schema_nullable.SOURCE_PATH: return reply
+                return real_git(root, args)
+            with self.subTest(reply=reply[:6]), mock.patch.object(sc, "_git", side_effect=invalid):
+                result = sc.classify_v2(self.repo.root, self.base, head)
+            self.assertIn("classifier-v2-invalid:nullable-source", result.reasons)
+
+    def test_declared_refs_are_actual_immutable_comparison_inputs(self):
+        head = self.head()
+        real = sc.schema_nullable.classify_source
+        calls = []
+        def observed(declaration, before, after, *, base_sha, head_sha):
+            calls.append((base_sha, head_sha, self.fixture.sha(before), self.fixture.sha(after)))
+            return real(declaration, before, after, base_sha=base_sha, head_sha=head_sha)
+        with mock.patch.object(sc.schema_nullable, "classify_source", side_effect=observed):
+            result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual(result.kind, "expand")
+        self.assertEqual(calls, [(self.base, head, self.fixture.sha(self.before), self.fixture.sha(self.after))])
+
+
 
 if __name__ == "__main__":
     unittest.main()

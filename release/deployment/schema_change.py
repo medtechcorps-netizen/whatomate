@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import release_record
 import ship_common as common
 import pending_plan
+import schema_nullable
 
 
 GUARDED_TREES = ("internal/database/", "internal/models/")
@@ -876,16 +877,28 @@ def _v2_catalog(value: Any) -> None:
 
 
 def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals: list,
-                      reasons: set[str], summary: list[str], requirements: set[str]) -> str:
+                      reasons: set[str], summary: list[str], requirements: set[str], *, source=None) -> str:
     """Direct current-format rules; full transitions include every companion.
 
     A relation-only synthetic expand example is not a complete table migration.
-    Row/array types and other opaque companions conservatively raise its class.
+    Row/array types and other opaque companions conservatively raise its class
+    unless the complete closed source declaration explains that exact delta.
     """
     _v2_catalog(before)
     _v2_catalog(after)
     _globals(old_globals)
     _globals(new_globals)
+    explained = set()
+    if source is not None:
+        # Only raw immutable material is accepted here, never a supplied verdict.
+        _valid(type(source) is tuple and len(source) == 5)
+        declaration, before_raw, after_raw, base_sha, head_sha = source
+        delta = schema_nullable.classify_source(declaration, before_raw, after_raw,
+                                               base_sha=base_sha, head_sha=head_sha)
+        _valid(common.loads_strict(before_raw) == before and common.loads_strict(after_raw) == after)
+        explained = {(ref.kind, ref.identity) for ref in delta.explained}
+        summary.append("source nullable declaration: sha256=" + delta.declaration_sha256
+                       + "; operation=" + delta.operation_sha256 + "; source interpretation only")
     left = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in before["objects"]}
     right = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in after["objects"]}
     old_global = {r["name"]: r for r in old_globals}
@@ -940,6 +953,8 @@ def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals:
                     proposed = "expand"
             elif kind == "indexes" and attrs["unique"] == "false":
                 requirements.add("index-operation-unsupported")
+        if key in explained:
+            proposed = "expand"
         if proposed == "contract" or classification == "contract":
             classification = "contract"
         elif proposed == "expand":
@@ -1128,15 +1143,29 @@ def _classify_v2(repo: _Repository, base: str, head: str,
     kind, dormant = legacy.kind, legacy.dormant
     section = "catalog"
     try:
-        if repo.blob(base, CATALOG) is None:
+        section = "nullable-source"
+        declaration = repo.blob(head, schema_nullable.SOURCE_PATH)
+        section = "catalog"
+        before_raw = repo.blob(base, CATALOG)
+        if declaration is not None:
+            section = "nullable-source"
+            # Bound the new three-slot material before this v2 pass decodes it;
+            # the unchanged legacy classifier has its own original read bounds.
+            schema_nullable._budget(declaration, before_raw, repo.blob(head, CATALOG))
+        if before_raw is None:
             reasons.add("catalog-baseline-required")
             return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), (), tuple(sorted(requirements)))
+        section = "catalog"
         old = repo.document(base, CATALOG, _v2_catalog)
         new = repo.document(head, CATALOG, _v2_catalog)
         section = "global-tables"
         old_global = repo.document(base, GLOBALS, _globals)
         new_global = repo.document(head, GLOBALS, _globals)
-        semantic = _v2_catalog_delta(old, new, old_global, new_global, reasons, summary, requirements)
+        section = "nullable-source" if declaration is not None else "catalog"
+        source = None if declaration is None else (
+            declaration, before_raw, repo.blob(head, CATALOG), base, head)
+        semantic = _v2_catalog_delta(old, new, old_global, new_global, reasons, summary, requirements,
+                                     source=source)
         section = "history"
         before = repo.document(base, HISTORY, _history)
         after = repo.document(head, HISTORY, _history)
