@@ -343,6 +343,98 @@ class ObservationTests(unittest.TestCase):
         self.assertFalse(observed.evidence()["full_compatibility_proof"])
         self.manager.close(); self.owner.cleanup()
 
+    def measured_worker_failure(self, kind="panic"):
+        messages = {"panic": log("Panic recovered", level="error"),
+                    "unknown": log("Failed to process message", level="error", fields='error="unknown job type: synthetic"')}
+        def tick(seconds):
+            self.clock.sleep(seconds)
+            if messages[kind] not in self.world.raw: self.world.raw += messages[kind]
+        observed = self.observer(sleep=tick)
+        observed.wait_startup(); self.assertTrue(observed.boot()["ready"])
+        return observed, observed.workers()
+
+    def test_complete_living_worker_failure_survives_final_capture_without_reset(self):
+        for kind in ("panic", "unknown"):
+            with self.subTest(kind=kind):
+                h = ObservationTests("test_positive_owned_boot_and_actual_sixty_second_window")
+                h.setUp(); self.addCleanup(h.doCleanups)
+                observed, worker = h.measured_worker_failure(kind)
+                self.assertEqual(worker["observed_seconds"], 60)
+                self.assertEqual(worker["unexpected_stub_entries"], 0)
+                key = "panic_count" if kind == "panic" else "unknown_type_count"
+                self.assertEqual(worker[key], 1)
+                self.assertFalse(observed._failed); self.assertFalse(h.manager._protocol_failed)
+                result = observed.finish_period()
+                self.assertEqual(result[key], 1); self.assertTrue(result["alive"])
+                self.assertEqual(worker[key], 1)
+                self.assertFalse(observed._failed); self.assertFalse(h.manager._protocol_failed)
+                self.assertNotIn("synthetic", json.dumps(result))
+                h.manager.remove(h.handle); h.manager.close(); h.owner.cleanup()
+
+    def test_worker_failure_is_sticky_private_and_log_counts_remain_monotonic(self):
+        observed, worker = self.measured_worker_failure()
+        worker["panic_count"] = 0  # A caller cannot rewrite retained collector facts.
+        self.world.raw += log("Panic recovered", level="error")
+        result = observed.finish_period()
+        self.assertEqual(result["panic_count"], 2)
+        self.assertEqual(observed._worker_failure[-2:], (1, 0))
+        self.manager.remove(self.handle); self.manager.close(); self.owner.cleanup()
+
+    def test_complete_worker_failure_never_waives_later_infrastructure_or_ownership(self):
+        for failure in ("fatal", "runtime-fatal", "worker-stop", "death", "restart", "truncated", "duplicate-marker",
+                        "reverse-clock", "image", "poison", "late", "foreign-transport"):
+            with self.subTest(failure=failure):
+                h = ObservationTests("test_positive_owned_boot_and_actual_sixty_second_window")
+                h.setUp(); self.addCleanup(h.doCleanups); observed, _ = h.measured_worker_failure()
+                row = h.world.containers[h.handle.container_id]; original = h.owner.capture
+                foreign = lambda *args, **kwargs: self.fail("foreign transport invoked")
+                if failure == "fatal": h.world.raw += log("Failed to connect to Redis", level="fatal")
+                elif failure == "runtime-fatal": h.world.raw += (TIME + " fatal error: out of memory\n").encode()
+                elif failure == "worker-stop": h.world.raw += log("Worker stopped")
+                elif failure == "death": row["State"]["Running"] = False
+                elif failure == "restart": row["RestartCount"] = 1
+                elif failure == "truncated": h.world.raw = startup()
+                elif failure == "duplicate-marker": h.world.raw += log("Embedded workers started", fields="count=1")
+                elif failure == "reverse-clock": h.clock.now -= 1
+                elif failure == "image": h.manager.bindings["previous"] = replace(h.manager.bindings["previous"])
+                elif failure == "poison": h.manager._protocol_failed = True
+                elif failure == "late": h.world.mutate_log = lambda w:setattr(h.clock, "now", h.clock.now + 31)
+                else: h.world.mutate_log = lambda w:setattr(h.owner, "capture", foreign)
+                with self.assertRaises(o.proof.EvidenceError): observed.finish_period()
+                self.assertTrue(observed._failed); self.assertTrue(h.manager._protocol_failed)
+                self.assertIs(h.owner.capture, foreign if failure == "foreign-transport" else original)
+
+    def test_worker_semantic_continuation_requires_complete_clean_journal_window(self):
+        self.world.extra_rows = [{"seq":13, "time":TIME, "kind":"graph", "method":"POST", "route":"messages", "status":200}]
+        observed, worker = self.measured_worker_failure()
+        self.assertEqual(worker["unexpected_stub_entries"], 1)
+        self.assertIsNone(observed._worker_failure)
+        with self.assertRaises(o.proof.EvidenceError): observed.finish_period()
+        self.assertTrue(self.manager._protocol_failed)
+
+    def test_late_failure_after_healthy_workers_has_no_retained_semantic_authority(self):
+        observed = self.observer(); observed.wait_startup(); observed.boot()
+        worker = observed.workers()
+        self.assertEqual(worker["panic_count"], 0); self.assertIsNone(observed._worker_failure)
+        self.world.raw += log("Panic recovered", level="error")
+        with self.assertRaises(o.proof.EvidenceError): observed.finish_period()
+        self.assertTrue(self.manager._protocol_failed)
+
+    def test_runtime_fatal_cannot_be_retained_from_worker_window(self):
+        observed = self.observer(); observed.wait_startup(); observed.boot()
+        self.world.raw += (TIME + " fatal error: out of memory\n" + TIME + " panic: mixed\n").encode()
+        with self.assertRaisesRegex(o.proof.EvidenceError, "worker-stopped"): observed.workers()
+        self.assertIsNone(observed._worker_failure); self.assertTrue(self.manager._protocol_failed)
+
+    def test_worker_window_clock_cannot_reverse_during_final_log_capture(self):
+        observed = self.observer(); observed.wait_startup(); observed.boot()
+        final_log = self.world.log_calls + 14  # initial + twelve 5s observations + final.
+        def drift(world):
+            if world.log_calls == final_log: self.clock.now -= 1
+        self.world.mutate_log = drift
+        with self.assertRaises(o.proof.EvidenceError): observed.workers()
+        self.assertIsNone(observed._worker_failure)
+
     def test_start_marker_wrong_role_missing_spoof_or_duplicate_refuses_no_positive(self):
         originals = [startup().replace(b"runtime_role=compat_runtime", b"runtime_role=postgres"),
             startup().replace(b"PostgreSQL tenant RLS verified", b"PostgreSQL platform compliance guards verified"),

@@ -33,6 +33,7 @@ class World:
         self.trace=[]; self.clock=to.Clock(); self.fail=None; self.cleanup_fail=False
         self.codes={}; self.logs={}; self.markers={}; self.catalogs={}; self.digests={}
         self.false_case=None; self.worker_panic=0; self.bad_control=False
+        self.worker_unknown=0
         self.terminal_old_boot=False
         self.terminal_previous_source=BASE
         self.pending=1; self.rows=0; self.readiness=[b'[17,"*","postgres"]\n']
@@ -179,7 +180,7 @@ class FakeObservation:
     def workers(self):
         self.w.event('workers.begin');self.w.clock.sleep(60);self.w.event('workers.end')
         return {'execution':tp.execution(),'observed_seconds':60,'panic_count':self.w.worker_panic,
-                'unknown_type_count':0,'unexpected_stub_entries':0}
+                'unknown_type_count':self.w.worker_unknown,'unexpected_stub_entries':0}
 
 
 class FakeLedger:
@@ -327,6 +328,31 @@ class EngineTests(unittest.TestCase):
         result=json.loads(self.engine().run())
         self.assertFalse(result['forward']);self.assertFalse(result['old_server_ok']['read'])
         self.assertFalse(result['old_server_ok']['reverse']);self.assertFalse(result['old_server_ok']['workers'])
+
+    def test_living_worker_false_still_performs_reverse_seal_catalog_and_cleanup(self):
+        for kind in ('panic','unknown'):
+            with self.subTest(kind=kind):
+                self.w.trace.clear();self.w.worker_panic=int(kind=='panic');self.w.worker_unknown=int(kind=='unknown')
+                result=json.loads(self.engine().run());trace=self.w.trace
+                self.assertFalse(result['old_server_ok']['workers'])
+                self.assertTrue(result['old_server_ok']['boot']);self.assertTrue(result['old_server_ok']['reverse'])
+                self.assertTrue(result['forward']);self.assertTrue(result['reversible'])
+                self.assertEqual([v for v in trace if v.startswith('controller.')],
+                    ['controller.setup','controller.write','controller.write','controller.read','controller.write','controller.read'])
+                self.assertEqual(trace.count('web.candidate'),2)
+                self.assertLess(trace.index('workers.end'),len(trace)-1-trace[::-1].index('controller.read'))
+                self.assertLess(trace.index('ledger.seal'),trace.index('catalog.final'))
+                self.assertEqual(trace[-1],'stack.cleanup')
+
+    def test_living_worker_false_does_not_suppress_required_later_failures(self):
+        self.w.worker_panic=1
+        for point in ('ledger.seal','catalog.final','stack.cleanup'):
+            with self.subTest(point=point):
+                self.w.trace.clear();self.w.fail=point
+                with patch.object(c.proof,'result_bytes') as output:
+                    with self.assertRaises(c.proof.EvidenceError):self.engine().run()
+                    output.assert_not_called()
+        self.w.fail=None
 
     def test_missing_25006_control_produces_no_result(self):
         self.w.bad_control=True
@@ -566,6 +592,16 @@ class BudgetTests(unittest.TestCase):
         self.assertFalse(h.manager._protocol_failed)
         self.assertTrue(all(options.get('timeout',0)<=7 for args,options in h.world.calls
                             if args[:2]==['logs','--timestamps']))
+        h.manager.remove(h.handle);h.manager.close();h.owner.cleanup()
+
+    def test_native_living_worker_semantic_finish_uses_same_owned_budget_bridge(self):
+        h=self.harness();observer,worker=h.measured_worker_failure();original=h.owner.capture
+        with c._Budget(h.owner,clock=h.clock,seconds=100) as budget:
+            with budget.window(7):last=budget.observer_call(observer.finish_period)
+            self.assertEqual(last['panic_count'],worker['panic_count'])
+            self.assertIs(h.owner.capture,budget.transport)
+            self.assertFalse(h.manager._protocol_failed)
+        self.assertIs(h.owner.capture,original)
         h.manager.remove(h.handle);h.manager.close();h.owner.cleanup()
 
     def test_native_observer_exception_restores_both_layers(self):
