@@ -299,10 +299,12 @@ final probe also completed the module's exact-ID cleanup and verified that all
 12 original container IDs remained unchanged. Earlier refused attempts and
 their separate exact-ID cleanup remain preserved as development evidence.
 Cleanup uses the supported `--timeout` flag with strict ID acknowledgement.
-The probe transported generated service environment secrets through a narrow
-child-environment adapter; it did not validate secret-free argv transport for
-the base module's default service creation. These four integrated checks and
-cleanup do not constitute a release compatibility proof.
+Service creation now passes generated secrets through an explicit child
+environment with key-only Docker arguments. A subsequent disposable fixture
+run exercised that default transport and checked that generated secrets never
+appeared in child arguments. Docker's private container configuration still
+contains those environment values; it is not a public artifact. These checks
+and cleanup do not constitute a release compatibility proof.
 
 `stack.py` remains the three-service foundation. Explicit process registration
 allows the separate lifecycle below to attach only its recorded owned IDs;
@@ -334,7 +336,8 @@ observations; callers must frame the SQL phase with the PostgreSQL collector.
 `controller.py` accepts one bounded private JSON request on stdin. Its pure
 parser runs before container creation and the owner checks the namespace.
 Origins are exactly the owned web and Graph aliases. Readiness makes one
-request to each service. Write/read operations reuse `sweep.py` and retain the
+request to each service. Setup registers the synthetic Graph account and
+checks its exact identity. Write/read operations reuse `sweep.py` and retain the
 private record set for later cross-version readback; no fixture credentials
 are retrieved or provisioned. The response preserves all six actual case
 booleans, including false. Protocol success is not a compatibility verdict.
@@ -343,11 +346,42 @@ completed invocation. Invalid protocol evidence blocks subsequent starts or
 sweeps while allowing known-resource cleanup. Unknown Docker outcomes retain
 the stricter no-retry boundary and their resource evidence.
 
-These process/controller contracts have mocked Docker and HTTP validation
-only. No controller image recipe/build, real web startup, bootstrap export,
-fixture provisioning, 60-second worker observation or complete experiment is
-supplied here. The earlier three-service probe does not validate these newer
-application processes.
+The controller image has been built from the committed source, but these
+process/controller contracts still have mocked Docker and HTTP validation
+only. Real web startup, API sweeps and a complete experiment remain unverified.
+
+`observation.py` checks the owned server's complete, append-only Docker logs
+under a nonrotating `json-file` logging configuration. Startup requires the
+actual RLS contract marker. The missing-marker FORCE RLS negative-control
+fallback is not implemented, so missing evidence refuses the observation.
+Worker observation requires at least 60 monotonic seconds and checks the
+whole observed log period for panic and unknown-type lines. Graph journal
+pagination accounts for the journal reads themselves; the final read's own
+entry occurs after its returned snapshot and is explicitly outside that
+snapshot. These observation paths have mocked validation, not an actual
+60-second application-worker run.
+
+## Owned synthetic fixture export
+
+`fixture.py` provisions the fixed synthetic database and restricted roles,
+then runs the test-only `TestCompatFixtureExport` in its own container sharing
+the owned PostgreSQL container's network namespace. This keeps the exporter's
+DSN on literal loopback without publishing a host port. The exporter uses the
+reviewed production profile and source-owned global seeds, then creates a
+synthetic organization, non-superuser account, entitlement and WhatsApp
+account. Chatbot automation stays disabled; API sweeps create their own rows.
+
+The fixture image is built from a pinned Go toolchain and a committed source
+archive. Inputs use bounded private stdin; the adapter accepts one complete
+result only after both the attached process and stopped container report exit
+zero. It consumes the attempt even on failure. Cleanup removes only its exact
+recorded container before releasing the services for their separate cleanup.
+
+A disposable actual run passed fixture export with the observed production
+catalog hash and private identity bindings. The exporter and all three
+services were removed afterward, and all 12 pre-existing local containers
+were preserved. This validates provisioning and default environment transport;
+it does not establish application or migration compatibility.
 
 ## Remaining runner and workflow work
 
@@ -370,12 +404,14 @@ in a compatible loopback/container network topology instead of loosening that
 guard for a Docker service name. PR7 remains constrained by the conservative
 migration closure, independently of its dormant entrypoint exemption.
 
-PR4's production observation/overlay remains a prerequisite. PG17 synthetic
-validation does not establish the actual production catalog or equivalence
-with supported PG14. Compare the original
-O-1 hash with the same golden-only known identities, separately check the
-overlay-known synthetic inventory, and separately account for accepted
-unpublished production objects. None of these measurements runs here.
+PR4's read-only production observation found no unknown public objects. Its
+known-object hash is reproduced by the synthetic production bootstrap profile;
+the accepted overlay contains comments only. The original source golden
+remains separate because column order and composite definitions differ from
+the observed production catalog. The compatibility runner must bind those
+source and observation inputs explicitly. PG17 synthetic validation alone
+does not establish equivalence with supported PG14 or authorize production
+schema changes.
 
 Future hosted acceptance still requires the planned PR run, three consecutive
 green main compatibility runs, and the swallowed-UPDATE advisory case before
