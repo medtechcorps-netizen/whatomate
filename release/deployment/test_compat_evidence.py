@@ -21,6 +21,7 @@ T0 = datetime(2026, 10, 11, tzinfo=timezone.utc)
 LATEST = evidence.ReleaseIdentity("prod-20261010T234723Z-bbbbbbbb", "1" * 64, OTHER, "sha256:" + "2" * 64)
 CLASS = evidence.Classification("none", False)
 AUTHORITY = tuple(evidence.CatalogBlob(p, HASH) for p in evidence.CATALOG_PATHS)
+_DEFAULT_PENDING = object()
 
 
 def canonical(value):
@@ -35,9 +36,17 @@ def database_base(latest=LATEST):
     return evidence.DatabaseBase("legacy-source-only", latest.sha, None, None)
 
 
-def request(classification=CLASS, latest=LATEST, *, base=None, web_source=None):
+def pending_binding(latest=LATEST, authority=AUTHORITY):
+    hashes = {row.path: row.sha256 for row in authority}
+    active = tuple((name, hashes["internal/dbcatalog/golden/" + path]) for name, path in
+        (("active_catalog", "catalog.json"), ("active_globals", "global_tables.json"), ("active_history", "history.json")))
+    return evidence.PendingBinding(1, SHA, latest.sha, digest(b"[]\n"), digest(b"[]\n"), active, (), (), None)
+
+
+def request(classification=CLASS, latest=LATEST, *, base=None, web_source=None, pending=_DEFAULT_PENDING):
     return evidence.NormalRequest(evidence.SourceFacts(SHA, latest, classification, CATALOG, AUTHORITY,
-        database_base(latest) if base is None else base, latest.sha if web_source is None else web_source), latest, OBSERVATION)
+        database_base(latest) if base is None else base, latest.sha if web_source is None else web_source,
+        pending_binding(latest) if pending is _DEFAULT_PENDING else pending), latest, OBSERVATION)
 
 
 def subject(name, raw, run, attempt):
@@ -57,7 +66,8 @@ def pack(result, context, run=100, attempt=1):
 
 
 def pair(run=100, attempt=1, *, classification=CLASS, latest=LATEST, selected=None, target=None,
-         event="push", server_false=None, migration_false=None, forward=True, version=2, base=None, web_source=None):
+         event="push", server_false=None, migration_false=None, forward=True, version=3, base=None, web_source=None,
+         pending=_DEFAULT_PENDING):
     selected = selected or latest
     result = {"sha": SHA, "previous_release": selected.release, "previous_web_digest": selected.web_digest,
         "classification": {"kind": classification.kind, "dormant": classification.dormant}, "forward": forward,
@@ -70,9 +80,11 @@ def pair(run=100, attempt=1, *, classification=CLASS, latest=LATEST, selected=No
         "requested_rollback_target": target, "latest": asdict(latest), "selected": asdict(selected),
         "preview": {"kind": classification.kind, "dormant": classification.dormant, "blocked": False},
         "result_sha256": digest(result_raw)}
-    if version == 2:
+    if version in (2, 3):
         context.update(database_base=asdict(database_base(latest) if base is None else base),
                        selected_web_source_sha=selected.sha if web_source is None else web_source)
+    if version == 3:
+        context["pending"] = evidence.pending_wire.to_wire(pending_binding(latest) if pending is _DEFAULT_PENDING else pending)
     return pack(result_raw, context, run, attempt)
 
 
@@ -333,7 +345,7 @@ class PairBoundaryTests(unittest.TestCase):
             context = json.loads(original.context); context["result_sha256"] = digest(raw)
             with self.subTest(raw=raw[:30]): self.reject(pack(raw, context))
         for raw in (original.context[:-1], b" " + original.context, b"x" * 4097,
-                    original.context.replace(b'"version":2', b'"version":2,"version":2'), b"\xff"):
+                    original.context.replace(b'"version":3', b'"version":3,"version":3'), b"\xff"):
             self.reject(pack(original.result, raw))
 
     def test_direct_parser_rejects_boolean_attempt_identity(self):
@@ -363,13 +375,16 @@ class PairBoundaryTests(unittest.TestCase):
         try:
             spec.loader.exec_module(producer)
             ctx = producer.Context(SHA, 100, 1, None, "push", evidence.REF)
-            snap = {"version": 3, "sha": SHA, "run_id": 100, "run_attempt": 1,
+            binding = replace(pending_binding(), active_artifacts=producer.compat.catalog.PENDING_ACTIVE_ARTIFACTS)
+            snap = {"version": 4, "sha": SHA, "run_id": 100, "run_attempt": 1,
                 "requested_rollback_target": None, "latest": asdict(LATEST), "selected": asdict(LATEST),
                 "database_base": asdict(database_base()), "selected_web_source_sha": LATEST.sha,
+                "pending": evidence.pending_wire.to_wire(binding),
                 "preview": {"kind": "none", "dormant": False, "blocked": False}}
-            # The migrated producer emits the same context2 bytes consumed by
+            # The migrated producer emits the same context3 bytes consumed by
             # policy, including actual negatives; signatures remain external.
-            for original in (pair(), pair(server_false="read"), pair(migration_false="rw")):
+            for original in (pair(pending=binding), pair(server_false="read", pending=binding),
+                             pair(migration_false="rw", pending=binding)):
                 raw = producer.canonical(producer.evidence_context(original.result, snap, ctx))
                 self.assertEqual(raw, original.context)
                 rebound = pack(original.result, raw)

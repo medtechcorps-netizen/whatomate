@@ -5,8 +5,8 @@ regular blob and authenticate their candidate/latest-record revisions. Empty
 tuples then mean observed absence; missing historical material is not absence.
 Active catalog bytes remain separate and are never replaced by a pending target.
 The parsed object graph is ephemeral; only raw material and the small binding
-belong in future protected custody and signed compatibility context respectively.
-No current caller, writer or producer selects this preparatory contract.
+belong in protected custody and signed compatibility context respectively.
+Current callers replay these bytes before accepting the derived binding.
 """
 from dataclasses import dataclass
 import re

@@ -4,8 +4,8 @@ The outer context decoder must reject duplicate JSON fields and noncanonical
 bytes before calling parse_wire. This module accepts only the decoded, exact
 JSON shape. Hashes and declared lengths do not prove complete source capture,
 active+1, object coverage or a valid plan: pending_source.replay must still
-validate the raw authenticated material. No current producer or gate uses this
-preparatory format. Historical null is deliberately not observed absence.
+validate the raw authenticated material before current admission. Historical
+null is deliberately not observed absence.
 """
 import re
 

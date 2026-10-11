@@ -22,15 +22,17 @@ the candidate against current `main`, and requires matching signed compatibility
 evidence. The staging deployment and production processes independently repeat
 that admission before constructing a provider client. Approval does not freeze
 the record chain: a changed latest record or candidate requires a fresh run.
-The supported forward classes are `none` and `data` with `dormant: true` against
-the reviewed v0 catalog. Both old-server compatibility and migration reversibility
+The supported forward classes are `none`, dormant `data`, and a source-bound
+dormant pending `expand` against the reviewed v0 catalog. Both old-server compatibility and migration reversibility
 must pass; `candidate-invalid:irreversible-needs-fix-forward-mode` refuses an
 irreversible result until the separately reviewed recovery implementation.
 
 The classifier also recognizes a complete format-1 dormant pending expansion
 and checks its full first-parent history for replacement, removal or malformed
-intermediate bundles. These source plans still carry `producer-class-unsupported`:
-classification alone cannot authorize a release. Summaries list every changed
+intermediate bundles. A valid all-expand plan remains unapplied metadata: the
+producer and consumer replay its complete raw source and require matching
+context-v3 compatibility evidence. The active catalog and table inventory stay
+unchanged. Classification alone cannot authorize a release. Summaries list every changed
 path from the database origin, latest record and selected web source, together
 with planned step and gate names; they do not claim that those steps ran.
 
@@ -49,15 +51,20 @@ snapshot even if `main` has advanced. An exact already-published signed record
 is reused on a record-only retry; missing unpublished handoff evidence refuses.
 Oversized evidence refuses before deployment rather than omitting history.
 
-Current handoff format 4 uses bounded, lossless XZ framing and retains the drill
-observation made after the final source and compatibility checks. Record retries
+Current handoff format 5 uses bounded, lossless XZ framing and retains complete
+raw pending observations and the drill observation made after the final source
+and compatibility checks. Explicitly observed empty inventories differ from
+missing historical observations. Record retries
 replay that original observation instead of evaluating drill age at retry time.
-Historical formats 1-3 retain their exact older fields and cannot be re-encoded
-as a current handoff without a real observation. The currently supported changes
+Historical formats 1-4 retain their exact older fields and original context-v2
+record-only replay. They cannot be upgraded into new current admission by
+inventing observations; older positive context-v1/v2 evidence cannot qualify a
+new release. Authenticated old negative results retain their audit meaning.
+The currently supported changes
 are exempt from the restore-drill requirement; their observation says so.
 
-The remaining PR16 work includes pending producer/custody integration, positive
-active and additive classifier rules, operational contract-label admission,
+The remaining PR16 work includes actual pending-fixture hosted qualification,
+positive active and additive classifier rules, operational contract-label admission,
 exact-span rollback compatibility, authenticated compatibility-outage bypass,
 and their validation. A bounded owner-label collector and pure authorization
 policy are preparatory only; workflow permissions and the release caller do not

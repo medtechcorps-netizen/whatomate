@@ -38,6 +38,32 @@ def drills(value, *, now=composition.actions.NOW):
     return writer.forward_gates.observe_forward_drills(value, now=now)
 
 
+def historical_handoff(value, *, observation=None, workflow_execution=None):
+    """Synthetic historical context2 custody, never a current admission."""
+    history = composition.collected(value, version=2)
+    return writer._prepare_promotion_context2_custody(replace(value, pending=None), history,
+        images(value), execution() if workflow_execution is None else workflow_execution,
+        staging='passed', drills=observation)
+
+
+def retained_pending_resolution():
+    """Real resolver/parsers over synthetic Git captures and full public v0."""
+    source = composition.source
+    source.ForwardPendingTests.setUpClass()
+    case = source.ForwardPendingTests(); case.setUp()
+    try:
+        old = case.add()
+        case.profile(old['sha']); case.install(old['sha'])
+        sha = case.candidate(composition.fixtures.SHA); case.install(sha)
+        value = case.forward(sha)
+        assert value.pending.candidate_files == value.pending.previous_files
+        assert (value.classification.kind, value.classification.dormant, value.classification.reasons) == ('none', False, ())
+        assert len(case.replay(value).plan.entries[0].objects) == 4452
+        return value
+    finally:
+        case.doCleanups()
+
+
 def projected(chain, *, selected=None, main='b' * 40):
     """Synthetic current view; never represented as authenticated outside tests."""
     bootstrap = common.loads_strict(chain.inputs[0].raw)
@@ -110,9 +136,24 @@ class WriterTests(unittest.TestCase):
                         replace(original, required=True), replace(original, staging_restore=original.observed_at),
                         replace(original, source_sha256='f' * 64)):
             self.refusal(self.prepare, drills=changed)
-        historical = self.prepare(drills=None)
+        self.refusal(self.prepare, drills=None)
+        historical = historical_handoff(self.forward)
         self.assertIsNone(historical.drills)
-        self.assertTrue(writer.build_promotion(historical, publication(), self.forward.resolved))
+        self.refusal(writer.build_promotion, historical, publication(), self.forward.resolved)
+        self.assertTrue(writer._build_promotion_context2_custody(historical, publication(), self.forward.resolved))
+
+    def test_current_pending_is_mandatory_and_old_context_cannot_admit_new_promotion(self):
+        for value in (replace(self.forward, pending=None),
+                      replace(self.forward, pending=replace(self.forward.pending, previous_sha='f' * 40))):
+            self.refusal(self.prepare, value=value)
+        old = historical_handoff(self.forward, observation=drills(self.forward))
+        self.refusal(self.prepare, history=old.collected)
+        self.refusal(writer._prepare_promotion_context2_custody, self.forward, old.collected,
+            images(self.forward), execution(), staging='passed', drills=old.drills)
+        # Historical context2 cannot be manufactured from current context3 by
+        # dropping the raw pending observation alone.
+        self.refusal(writer._prepare_promotion_context2_custody, replace(self.forward, pending=None),
+            self.history, images(self.forward), execution(), staging='passed', drills=old.drills)
 
     def test_current_active_class_hold_is_not_lifted_by_a_synthetic_valid_drill(self):
         from datetime import datetime, timezone
@@ -394,7 +435,7 @@ class WriterTests(unittest.TestCase):
     def test_no_first_v2_image_only_tuple_is_invented_for_all_v1(self):
         self.refusal(writer.build_image_only, self.legacy.resolved, publication(built=False))
         self.assertTrue(writer.prepare_promotion(self.legacy, self.legacy_history,
-                        images(self.legacy), execution(), staging='passed'))
+                        images(self.legacy), execution(), staging='passed', drills=drills(self.legacy)))
 
     def test_exact_requested_target_span_and_duplicate_images_are_not_collapsed(self):
         scenario = policy_cases.Scenario()

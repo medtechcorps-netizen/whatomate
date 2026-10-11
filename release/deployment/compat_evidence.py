@@ -18,6 +18,8 @@ import re
 import sys
 
 import ship_common as common
+import pending_binding as pending_wire
+from pending_source import PendingBinding
 
 # Import only the pure proof module under a distinct name; importing the
 # producer CLI would also import operational image/runtime modules. Loading
@@ -124,6 +126,7 @@ class SourceFacts:
     catalog_authority: tuple[CatalogBlob, ...]
     database_base: DatabaseBase
     previous_web_source_sha: str
+    pending_binding: PendingBinding | None = None  # Historical context2 custody only.
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +267,7 @@ class BoundMeasurement:
     context_version: int
     database_base: DatabaseBase | None
     selected_web_source_sha: str | None
+    pending_binding: PendingBinding | None = None
 
     @property
     def positive(self):
@@ -299,6 +303,7 @@ class QualifiedCompat:
     execution_window: ExecutionWindow
     database_base: DatabaseBase
     previous_web_source_sha: str
+    pending_binding: PendingBinding | None = None
 
     @property
     def old_server(self):
@@ -463,7 +468,7 @@ def _history(value, sha, observation_id=None):
                 _need(moments == sorted(moments), "history-window-order")
 
 
-def _request(value):
+def _request_common(value):
     _need(type(value) is NormalRequest and value.mode == "normal", "request-shape")
     _need(type(value.source) is SourceFacts and _string(value.observation_id, _HASH), "request-shape")
     source = value.source
@@ -471,14 +476,43 @@ def _request(value):
     c = source.classification
     _need(type(c) is Classification and type(c.reasons) is tuple and not c.reasons,
           "classification-blocked")
-    _need(type(c.dormant) is bool and ((c.kind == "none" and not c.dormant) or (c.kind == "data" and c.dormant)),
-          "classification-unsupported")
+    _need(type(c.kind) is str and type(c.dormant) is bool, "classification-unsupported")
     _need(_string(source.expected_after_catalog_sha256, _HASH), "catalog-expectation")
     _need(type(source.catalog_authority) is tuple and len(source.catalog_authority) == len(CATALOG_PATHS)
           and all(type(b) is CatalogBlob and _string(b.sha256, _HASH) for b in source.catalog_authority)
           and tuple(b.path for b in source.catalog_authority) == CATALOG_PATHS, "catalog-authority")
     _database_base(source.database_base, value.latest)
     _need(_string(source.previous_web_source_sha, _SHA), "previous-web-source")
+
+
+def _pending(value, candidate_sha, previous_sha, authority):
+    active = tuple((name, next(row.sha256 for row in authority if row.path == path))
+        for name, path in (("active_catalog", "internal/dbcatalog/golden/catalog.json"),
+                           ("active_globals", "internal/dbcatalog/golden/global_tables.json"),
+                           ("active_history", "internal/dbcatalog/golden/history.json")))
+    try:
+        return pending_wire.validate_against(value, candidate_sha=candidate_sha,
+            previous_sha=previous_sha, active_artifacts=active)
+    except pending_wire.PendingBindingRefusal:
+        raise CompatRefusal("compat-stale", "pending-binding") from None
+
+
+def _request(value):
+    _request_common(value)
+    source, c = value.source, value.source.classification
+    binding = _pending(source.pending_binding, source.sha, value.latest.sha, source.catalog_authority)
+    _need((c.kind == "none" and not c.dormant) or (c.kind == "data" and c.dormant)
+          or (c.kind == "expand" and c.dormant and binding.target_version is not None),
+          "classification-unsupported")
+
+
+def _request_context2_custody(value):
+    """Exact historical data validation, never a current predeploy fallback."""
+    _request_common(value)
+    c = value.source.classification
+    _need(value.source.pending_binding is None
+          and ((c.kind == "none" and not c.dormant) or (c.kind == "data" and c.dormant)),
+          "context2-custody-only")
 
 
 def _subject(value, name, raw, attempt):
@@ -517,10 +551,12 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
         keys = {"version", "repository", "workflow_path", "workflow_sha", "event", "ref", "sha", "run_id",
                 "run_attempt", "requested_rollback_target", "latest", "selected", "preview", "result_sha256"}
         _need(type(context) is dict and type(context.get("version")) is int
-              and context["version"] in (1, 2), "context-version")
+              and context["version"] in (1, 2, 3), "context-version")
         version = context["version"]
-        if version == 2:
+        if version in (2, 3):
             keys |= {"database_base", "selected_web_source_sha"}
+        if version == 3:
+            keys.add("pending")
         _need(type(context) is dict and set(context) == keys and common.canonical_file_bytes(context) == pair.context,
               "context-shape")
         _need(context["repository"] == REPOSITORY
@@ -540,8 +576,8 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
         else:
             _proof.validate_rollback_target(target)
             _need(attempt.event == "workflow_dispatch" and selected.release == target, "context-selection")
-        database_base = actual_source = None
-        if version == 2:
+        database_base = actual_source = pending = None
+        if version in (2, 3):
             # This protocol defines normal forward evidence only. Context1
             # explicit-target observations remain parseable for audit, not a
             # newly invented exact-target/live rollback qualification.
@@ -549,13 +585,19 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
             database_base = _database_base_dict(context["database_base"], latest)
             actual_source = context["selected_web_source_sha"]
             _need(_string(actual_source, _SHA), "previous-web-source")
+        if version == 3:
+            pending = pending_wire.parse_wire(context["pending"])
+            pending_wire.validate_against(pending, candidate_sha=attempt.sha,
+                previous_sha=latest.sha, active_artifacts=pending.active_artifacts)
         _need(result["previous_release"] == selected.release and result["previous_web_digest"] == selected.web_digest,
               "result-selection")
         preview = context["preview"]
         _need(type(preview) is dict and set(preview) == {"kind", "dormant", "blocked"}
               and type(preview["dormant"]) is bool and preview["blocked"] is False
               and ((preview["kind"] == "none" and not preview["dormant"])
-                   or (preview["kind"] == "data" and preview["dormant"])), "context-preview")
+                   or (preview["kind"] == "data" and preview["dormant"])
+                   or (version == 3 and preview["kind"] == "expand" and preview["dormant"]
+                       and pending.target_version is not None)), "context-preview")
         classification = Classification(**result["classification"])
         preview_class = Classification(preview["kind"], preview["dormant"])
         _need(target is not None or classification == preview_class, "context-classification")
@@ -563,7 +605,7 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
             result["forward"], tuple(result["old_migrate_ok"][key] for key in MIGRATIONS),
             tuple(result["old_server_ok"][key] for key in SERVERS), result["reversible"],
             hashlib.sha256(pair.result).hexdigest(), hashlib.sha256(pair.context).hexdigest(),
-            version, database_base, actual_source)
+            version, database_base, actual_source, pending)
     except (common.ReleaseError, _proof.EvidenceError, ValueError, TypeError, KeyError, RecursionError):
         raise CompatRefusal("compat-stale", "pair-invalid") from None
 
@@ -589,9 +631,26 @@ def _identity_current(measured, request):
 
 
 def _current(measured, request):
+    return (_identity_current(measured, request) and measured.context_version == 3
+            and measured.database_base == request.source.database_base
+            and measured.selected_web_source_sha == request.source.previous_web_source_sha
+            and measured.pending_binding == request.source.pending_binding)
+
+
+def _current_context2_custody(measured, request):
     return (_identity_current(measured, request) and measured.context_version == 2
             and measured.database_base == request.source.database_base
-            and measured.selected_web_source_sha == request.source.previous_web_source_sha)
+            and measured.selected_web_source_sha == request.source.previous_web_source_sha
+            and measured.pending_binding is None and request.source.pending_binding is None)
+
+
+def _negative_current(measured, request):
+    # Old actual false flags retain their audit meaning. Old positives never
+    # gain current protocol eligibility or fabricated pending observations.
+    return (_current(measured, request) or (_identity_current(measured, request)
+        and (measured.context_version == 1 or (measured.context_version == 2
+            and measured.database_base == request.source.database_base
+            and measured.selected_web_source_sha == request.source.previous_web_source_sha))))
 
 
 def _successful(attempt):
@@ -611,13 +670,27 @@ def _negative(measured):
 
 def require_compat(request: NormalRequest, history: VisibleHistory) -> QualifiedCompat:
     _request(request)
+    return _qualify(request, history, _current)
+
+
+def _require_context2_custody(request: NormalRequest, history: VisibleHistory) -> QualifiedCompat:
+    """Replay old same-run custody only; external original execution checks apply.
+
+    The closed codec selects this private path for original versions1..4.
+    Types and this function are not custody or signature capabilities.
+    """
+    _request_context2_custody(request)
+    return _qualify(request, history, _current_context2_custody)
+
+
+def _qualify(request, history, current):
     _history(history, request.source.sha, request.observation_id)
     _need(history.enumeration == "complete-visible", "history-incomplete")
     rows = _measurements(history)
-    positives = [(a, m) for a, m in rows if _current(m, request) and m.positive and _successful(a)]
+    positives = [(a, m) for a, m in rows if current(m, request) and m.positive and _successful(a)]
     if not positives:
         negatives = [(a, m) for a, m in rows if not (m is None or m.positive)
-                     and (_current(m, request) or (m.context_version == 1 and _identity_current(m, request)))]
+                     and _negative_current(m, request)]
         if negatives:
             _negative(max(negatives, key=lambda row: (row[0].run_number, row[0].run_attempt))[1])
         raise CompatRefusal("compat-missing" if not rows else "compat-stale", "no-qualified-positive")
@@ -637,7 +710,7 @@ def require_compat(request: NormalRequest, history: VisibleHistory) -> Qualified
               "later-or-unknown-timing")
         if observation is not None and not observation.positive:
             _negative(observation)
-        _need(_current(observation, request) and observation.positive and _successful(other),
+        _need(current(observation, request) and observation.positive and _successful(other),
               "later-or-overlapping-incomplete")
     pair = selected.measurement
     return QualifiedCompat(request.source.sha, request.latest, selected.run_id, selected.run_number,
@@ -646,7 +719,7 @@ def require_compat(request: NormalRequest, history: VisibleHistory) -> Qualified
         pair.result_subject.signer_uri, pair.result_subject.signer_sha, measured.classification,
         measured.catalog_sha256, request.source.catalog_authority, measured.forward, measured.migrations,
         measured.servers, measured.reversible, request.observation_id, selected.execution_window,
-        measured.database_base, measured.selected_web_source_sha)
+        measured.database_base, measured.selected_web_source_sha, measured.pending_binding)
 
 
 def assess_bypass_history(sha: str, history: VisibleHistory) -> BypassHistory:

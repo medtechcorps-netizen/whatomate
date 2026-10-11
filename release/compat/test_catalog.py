@@ -336,8 +336,9 @@ class MaterialCatalogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         test_record_resolver.ForwardResolverTests.setUpClass()
+        test_record_resolver.ForwardPendingTests.setUpClass()
 
-    def scenario(self, *, legacy=False, explicit=False, e001=False):
+    def scenario(self, *, legacy=False, explicit=False, e001=False, pending=False):
         case = test_record_resolver.ForwardResolverTests()
         case.setUp()
         self.addCleanup(case.doCleanups)
@@ -355,7 +356,11 @@ class MaterialCatalogTests(unittest.TestCase):
             origin = case.add()
             case.profile(origin["sha"])
             case.add(kind="rollback", target=old)
-        result = case.forward(case.candidate(HEAD), selected_tag=old["release"] if explicit or legacy else None)
+        candidate = case.candidate(HEAD)
+        if pending:
+            case.world.files.update({(candidate, path): raw
+                for path, raw in test_record_resolver.ForwardPendingTests.pending_files.items()})
+        result = case.forward(candidate, selected_tag=old["release"] if explicit or legacy else None)
         self.case = case
         return result
 
@@ -383,6 +388,50 @@ class MaterialCatalogTests(unittest.TestCase):
         self.assertEqual(len(actual.expected_preexisting_tables), 127)
         self.assertEqual(actual.target_sha256, c.record_resolver.policy.V0_MEASUREMENT)
         self.assertEqual(actual.parse_compare((json.dumps(compare(actual)) + "\n").encode()), actual.target_sha256)
+
+    def test_pending_target_is_replayed_but_never_replaces_live_catalog_or_inventory(self):
+        result = self.scenario(pending=True)
+        actual = self.consume(result)
+        source, policy = c.pending_source, c.record_resolver.policy
+        expected = source.replay(result.pending, candidate_sha=HEAD,
+            previous_sha=result.resolved.latest.record_sha, active_catalog=BLOBS[policy.GOLDEN],
+            active_globals=BLOBS[policy.GLOBALS], active_history=BLOBS[policy.HISTORY])
+        self.assertEqual(actual.pending_binding, expected.binding)
+        self.assertEqual(actual.pending_binding.target_version, 1)
+        self.assertEqual(len(expected.plan.entries[0].objects), 4452)
+        self.assertEqual(len(actual._known), 4432)
+        self.assertEqual(len(actual.expected_preexisting_tables), 127)
+        self.assertEqual(actual.target_sha256, policy.V0_MEASUREMENT)
+        self.assertEqual(actual.pending_binding.active_artifacts, c.PENDING_ACTIVE_ARTIFACTS)
+        self.assertNotEqual(actual.pending_binding.previous_sha, actual.database_base_source)
+        self.assertEqual(actual.public()["source_sha256"], c._PINS)
+
+    def test_pending_history_absence_tamper_and_role_substitution_refuse_without_reads(self):
+        result = self.scenario(pending=True)
+        material = result.pending
+        row = material.candidate_files[0]
+        changed = replace(row, raw=row.raw + b" ")
+        variants = [None, replace(material, candidate_sha="f" * 40),
+            replace(material, previous_sha=result.database_base_source),
+            replace(material, candidate_files=(changed, *material.candidate_files[1:])),
+            replace(material, candidate_files=material.candidate_files[:-1]),
+            replace(material, candidate_files=(), previous_files=material.candidate_files)]
+        for index, value in enumerate(variants):
+            with self.subTest(index=index), self.assertRaisesRegex(c.proof.EvidenceError, "catalog-pending-invalid"):
+                self.consume(replace(result, pending=value))
+
+    def test_observed_empty_is_explicit_and_unsupported_pending_class_stays_blocked(self):
+        result = self.scenario()
+        binding = self.consume(result).pending_binding
+        self.assertEqual((binding.candidate_files, binding.previous_files, binding.target_version), ((), (), None))
+        files = dict(test_record_resolver.ForwardPendingTests.pending_files)
+        plan = c.pending_source.plan
+        doc = json.loads(files[plan.PLAN]); doc["entries"][0]["class"] = "contract"
+        files[plan.PLAN] = plan.canonical(doc)
+        material = replace(result.pending, candidate_files=tuple(
+            c.pending_source.PendingBlob(path, raw) for path, raw in sorted(files.items())))
+        with self.assertRaisesRegex(c.proof.EvidenceError, "catalog-pending-unsupported"):
+            self.consume(replace(result, pending=material))
 
     def test_exact_historical_target_does_not_change_retained_origin(self):
         result = self.scenario(explicit=True)

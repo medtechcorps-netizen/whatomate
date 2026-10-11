@@ -9,6 +9,7 @@ import unittest
 
 import compat_request as bridge
 import compat_evidence as evidence
+import pending_source
 import test_compat_collect as actions
 import test_compat_evidence as fixtures
 import test_record_resolver as source
@@ -53,13 +54,22 @@ def identities(value):
     return identity, base
 
 
-def bind_pairs(world, value, *, old_protocol=False, wrong_catalog=False):
+def pending(value):
+    active = {row.path: row.raw for row in value.catalog_material.candidate_blobs}
+    return pending_source.replay(value.pending, candidate_sha=value.candidate.sha,
+        previous_sha=value.resolved.latest.record_sha, active_catalog=active[source.policy.GOLDEN],
+        active_globals=active[source.policy.GLOBALS], active_history=active[source.policy.HISTORY]).binding
+
+
+def bind_pairs(world, value, *, old_protocol=False, wrong_catalog=False, version=3):
     latest, base = identities(value)
+    binding = pending(value) if not old_protocol and version == 3 else None
     for (run, attempt), original in tuple(world.pairs.items()):
         result = actions.json.loads(original.result)
         pair = fixtures.pair(run, attempt, latest=latest,
             classification=evidence.Classification(value.classification.kind, value.classification.dormant),
-            base=base, web_source=value.previous_web_source_sha, version=1 if old_protocol else 2,
+            base=base, web_source=value.previous_web_source_sha, version=1 if old_protocol else version,
+            pending=binding,
             server_false=next((key for key, passed in result['old_server_ok'].items() if not passed), None))
         pair = fixtures.edit_pair(pair, result=lambda row: row.update(catalog_sha256=(
             dict(source.policy.V0_PINS)[source.policy.GOLDEN] if wrong_catalog else source.policy.V0_MEASUREMENT)))

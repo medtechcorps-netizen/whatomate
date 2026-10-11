@@ -178,7 +178,7 @@ class OriginTests(unittest.TestCase):
             measurement=f.pair(101, base=replace(BASE, source_sha="d" * 40), web_source=WEB))
         self.refuse((self.row(), later))
 
-    def test_context2_does_not_introduce_rollback_or_new_result_sha_semantics(self):
+    def test_context3_does_not_introduce_rollback_or_new_result_sha_semantics(self):
         target = replace(f.LATEST, release="prod-20261009T000000Z-bbbbbbbb")
         pair = f.pair(event="workflow_dispatch", target=target.release, selected=target, base=BASE, web_source=WEB)
         row = f.attempt(event="workflow_dispatch", measurement=pair)

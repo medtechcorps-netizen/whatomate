@@ -6,8 +6,11 @@ dataclasses and equality with a captured main SHA are data consistency checks,
 not capabilities or proof that main is still current. This module neither
 grants a deleted-history bypass nor activates a release writer.
 """
+from dataclasses import replace
+
 import compat_collect as collect
 import compat_evidence as evidence
+import pending_source
 import record_resolver as resolver
 
 policy, common = resolver.policy, resolver.common
@@ -106,7 +109,7 @@ def _material(resolution, latest):
     return base, tuple(evidence.CatalogBlob(path, artifacts[path]) for path in paths)
 
 
-def _build_request(resolution, collected):
+def _build_request_base(resolution, collected):
     _need(type(resolution) is resolver.ForwardResolution and type(collected) is collect.CollectedHistory)
     latest = _chain(resolution.resolved)
     candidate = resolution.candidate
@@ -123,8 +126,6 @@ def _build_request(resolution, collected):
         _need(type(rows) is tuple and len(rows) <= 8192
               and all(type(value) is str and len(value) <= 8192 for value in rows))
     _need(not classification.reasons
-          and ((classification.kind == "none" and not classification.dormant)
-               or (classification.kind == "data" and classification.dormant))
           and classification.requirements == ("compat-required", "generated-migration-closure-ci"))
     _need(type(resolution.workflow) is bytes
           and 0 < len(resolution.workflow) <= policy.MAX_SOURCE_FILE_BYTES
@@ -143,9 +144,38 @@ def _build_request(resolution, collected):
         evidence.Classification(classification.kind, classification.dormant, classification.reasons),
         candidate.catalog.catalog_sha256, authority, base, latest.actual_web_source_sha)
     request = evidence.NormalRequest(source, identity, collected.history.observation_id)
-    evidence._request(request)
     evidence._history(collected.history, candidate.sha, request.observation_id)
     return request
+
+
+def _build_request(resolution, collected):
+    request = _build_request_base(resolution, collected)
+    active = {row.path: row.raw for row in resolution.catalog_material.candidate_blobs}
+    projection = pending_source.replay(resolution.pending,
+        candidate_sha=resolution.candidate.sha, previous_sha=resolution.resolved.latest.record_sha,
+        active_catalog=active[policy.GOLDEN], active_globals=active[policy.GLOBALS],
+        active_history=active[policy.HISTORY])
+    _need(projection.plan is None or all(entry.kind == "expand" for entry in projection.plan.entries))
+    request = replace(request, source=replace(request.source, pending_binding=projection.binding))
+    evidence._request(request)
+    return request
+
+
+def _build_context2_custody_request(resolution, collected):
+    _need(type(resolution) is resolver.ForwardResolution and resolution.pending is None)
+    request = _build_request_base(resolution, collected)
+    evidence._request_context2_custody(request)
+    return request
+
+
+def _fixed_build(function, resolution, collected):
+    try:
+        return function(resolution, collected)
+    except evidence.CompatRefusal:
+        raise
+    except (policy.PolicyRefusal, common.ReleaseError, ValueError, TypeError,
+            AttributeError, KeyError, IndexError, RecursionError, OverflowError):
+        raise evidence.CompatRefusal("compat-stale", "request-resolution-invalid") from None
 
 
 def build_request(resolution, collected) -> evidence.NormalRequest:
@@ -155,15 +185,20 @@ def build_request(resolution, collected) -> evidence.NormalRequest:
     safely superseded under the existing execution-window policy. No blanket
     issues-empty condition or new history/negative policy is introduced here.
     """
-    try:
-        return _build_request(resolution, collected)
-    except evidence.CompatRefusal:
-        raise
-    except (policy.PolicyRefusal, common.ReleaseError, ValueError, TypeError,
-            AttributeError, KeyError, IndexError, RecursionError, OverflowError):
-        raise evidence.CompatRefusal("compat-stale", "request-resolution-invalid") from None
+    return _fixed_build(_build_request, resolution, collected)
 
 
 def qualify(resolution, collected) -> evidence.QualifiedCompat:
     """Use the existing normal policy; never a rollback/bypass authorization."""
     return evidence.require_compat(build_request(resolution, collected), collected.history)
+
+
+def _qualify_context2_custody(resolution, collected) -> evidence.QualifiedCompat:
+    """Exact old context2 replay, solely for closed original same-run custody.
+
+    No current source resolver yields pending=None. The codec/writer must bind
+    the original wire version, execution and parent before choosing this path;
+    a Python object or call here does not authenticate those external facts.
+    """
+    request = _fixed_build(_build_context2_custody_request, resolution, collected)
+    return evidence._require_context2_custody(request, collected.history)
