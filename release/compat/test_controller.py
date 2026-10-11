@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import controller as c
 import test_sweep
 
+BUSINESS = "999987654321098"
+
 
 def fixture():
     value = test_sweep.fixture()
@@ -56,6 +58,31 @@ class FakeSweep:
         return self.flags
 
 
+class SetupWorld(test_sweep.World):
+    """Real Sweep transport with independently checked HMAC and Graph shape."""
+    def __init__(self):
+        super().__init__()
+        self.f = fixture()
+        self.accounts = []
+
+    def product(self, method, path, value):
+        raise AssertionError("setup must not contact product")
+
+    def stub(self, method, path, value):
+        assert path == "/_control/accounts"
+        if method == "POST":
+            assert value == {"business_account_id": BUSINESS, "phone_number_id": self.f.phone_number_id,
+                             "display_phone_number": self.f.phone_number_id, "verified_name": self.f.namespace}
+            self.accounts = [dict(value)]
+            return {"ok": True}
+        assert method == "GET" and value is None
+        return {"accounts": self.accounts}
+
+    def factory(self, value):
+        return c.sweep.Sweep(value, product=self.transport(), stub=self.transport(True),
+                             wall=lambda: test_sweep.WALL, sleep=lambda _: None)
+
+
 class ControllerTests(unittest.TestCase):
     def setUp(self):
         self.fake = FakeSweep()
@@ -64,7 +91,7 @@ class ControllerTests(unittest.TestCase):
         return json.loads(c.handle(raw(value), sweep_factory=self.fake.factory))
 
     def test_pure_preflight_performs_no_sweep_or_http_operations(self):
-        values = [request("readiness"), request("write", nonce=test_sweep.NONCE),
+        values = [request("setup", business_account_id=BUSINESS), request("readiness"), request("write", nonce=test_sweep.NONCE),
                   request("read", record=asdict(record()))]
         with patch.object(c.sweep.Sweep, "login", side_effect=AssertionError("no login")), \
                 patch.object(c.sweep.Sweep, "write", side_effect=AssertionError("no write")), \
@@ -147,6 +174,75 @@ class ControllerTests(unittest.TestCase):
             value["fixture"].update(delta)
             self.assertEqual(self.handle(value)["failure"], "evidence")
         self.assertFalse(self.fake.calls)
+
+    def test_setup_real_signed_transport_post_then_bound_get_only(self):
+        world = SetupWorld()
+        value = json.loads(c.handle(raw(request("setup", business_account_id=BUSINESS)), sweep_factory=world.factory))
+        self.assertEqual(value, {"version": 1, "status": "ok", "operation": "setup", "registered": True})
+        self.assertEqual([(x[0], x[1]) for x in world.calls],
+                         [("POST", "/_control/accounts"), ("GET", "/_control/accounts")])
+        self.assertTrue(all(0 < x[4] <= 45 for x in world.calls))
+        self.assertNotEqual(world.calls[0][2]["X-Stub-Nonce"], world.calls[1][2]["X-Stub-Nonce"])
+        self.assertNotIn(fixture().control_key, json.dumps(value))
+        self.assertNotIn(fixture().password, json.dumps(value))
+        self.assertNotIn("cases", value)
+
+    def test_setup_schema_and_synthetic_business_identity_refuse_before_io(self):
+        values = [request("setup"), request("setup", business_account_id=BUSINESS, payload={}),
+                  request("setup", business_account_id=BUSINESS, url=fixture().stub_origin),
+                  request("setup", business_account_id=BUSINESS, display_phone_number="private")]
+        values += [request("setup", business_account_id=x) for x in
+                   (None, True, 999987654321098, "", "123456789012345", BUSINESS + " ", fixture().phone_number_id)]
+        for value in values:
+            with self.subTest(value=value.get("business_account_id")):
+                self.assertEqual(self.handle(value), {"version": 1, "status": "error", "failure": "evidence"})
+        self.assertFalse(self.fake.calls)
+
+    def test_setup_requires_exact_ack_without_retry_or_read_after_failure(self):
+        for reply in ({"ok": False}, {"ok": 1}, {"ok": True, "extra": "secret"}, {}):
+            world = SetupWorld()
+            world.mutate = lambda method, path, value: reply
+            value = c.handle(raw(request("setup", business_account_id=BUSINESS)), sweep_factory=world.factory)
+            self.assertEqual(json.loads(value)["failure"], "evidence")
+            self.assertEqual(len(world.calls), 1)
+            self.assertNotIn(b"secret", value)
+
+    def test_setup_readback_missing_duplicate_foreign_or_changed_rows_refuse(self):
+        expected = {"business_account_id": BUSINESS, "phone_number_id": fixture().phone_number_id,
+                    "display_phone_number": fixture().phone_number_id, "verified_name": fixture().namespace}
+        variants = [{}, {"accounts": []}, {"accounts": [expected, expected]},
+                    {"accounts": [dict(expected, business_account_id="999000000000001")]},
+                    {"accounts": [dict(expected, phone_number_id="999000000000002")]},
+                    {"accounts": [dict(expected, verified_name="foreign")]},
+                    {"accounts": [dict(expected, display_phone_number="999000000000003")]},
+                    {"accounts": [dict(expected, extra="secret")]},
+                    {"accounts": [expected], "extra": "secret"}]
+        for reply in variants:
+            world = SetupWorld()
+            world.mutate = lambda method, path, value: reply if method == "GET" else value
+            value = c.handle(raw(request("setup", business_account_id=BUSINESS)), sweep_factory=world.factory)
+            self.assertEqual(json.loads(value)["failure"], "evidence")
+            self.assertEqual(len(world.calls), 2)
+            self.assertNotIn(b"secret", value)
+
+    def test_setup_ambiguous_http_or_malformed_response_never_retries_or_leaks(self):
+        responses = [(c.sweep.Reply(302, (), b"secret"), "infrastructure"),
+                     (c.sweep.Reply(403, (), b"secret"), "semantic"),
+                     (c.sweep.Reply(200, (), b'{"ok":true,"ok":true}'), "evidence"),
+                     (c.sweep.Reply(200, (), b'{"ok":NaN}'), "evidence"),
+                     (c.sweep.Reply(200, (), b"x" * (c.sweep.MAX_BODY + 1)), "evidence"),
+                     (RuntimeError("raw secret control key"), "infrastructure")]
+        for response, failure in responses:
+            world = SetupWorld()
+            def intercept(method, path, body):
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            world.intercept = intercept
+            value = c.handle(raw(request("setup", business_account_id=BUSINESS)), sweep_factory=world.factory)
+            self.assertEqual(json.loads(value), {"version": 1, "status": "error", "failure": failure})
+            self.assertEqual(len(world.calls), 1)
+            self.assertNotIn(b"secret", value)
 
     def test_closed_schema_missing_extra_and_wrong_types_before_io(self):
         base = request("write", nonce=test_sweep.NONCE)

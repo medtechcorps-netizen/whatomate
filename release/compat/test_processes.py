@@ -170,6 +170,46 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(private[0]["timeout"], 30)
         m.close();self.owner.cleanup()
 
+    def test_controller_setup_private_protocol_has_own_deadline_not_sweep_flags(self):
+        m = self.manager();m.start_web("previous", INPUTS)
+        response = {"version": 1, "status": "ok", "operation": "setup", "registered": True}
+        self.world.response = json.dumps(response).encode()
+        request = self.frame("setup", business_account_id=test_controller.BUSINESS)
+        self.assertEqual(json.loads(m.controller(request)), response)
+        calls = [opts for args, opts in self.world.calls if args[:4] == ["container", "start", "--attach", "--interactive"]]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["input_bytes"], request)
+        self.assertEqual(calls[0]["timeout"], 100)
+        self.assertNotIn("controller", self.owner._process_ids)
+        self.assertFalse(m.evidence()["controller_protocol_failed"])
+        self.assertNotIn(test_controller.BUSINESS, json.dumps(m.evidence()))
+        m.close();self.owner.cleanup()
+
+    def test_controller_setup_malformed_request_refuses_before_docker(self):
+        m = self.manager();m.start_web("candidate", INPUTS);count = len(self.world.calls)
+        for request in (self.frame("setup"), self.frame("setup", business_account_id="outside"),
+                        self.frame("setup", business_account_id=test_controller.BUSINESS, payload={} )):
+            with self.assertRaises(p.proof.EvidenceError):m.controller(request)
+        self.assertEqual(len(self.world.calls), count)
+
+    def test_controller_setup_invalid_ack_latches_without_favorable_case_flags(self):
+        for change in ({"registered": 1}, {"registered": False}, {"cases": {"flow": True}}):
+            with self.subTest(change=change):
+                # Each malformed result gets a separate manager: no replay after
+                # the latch, and exact known-resource cleanup remains available.
+                m = self.manager();m.start_web("candidate", INPUTS)
+                response = {"version": 1, "status": "ok", "operation": "setup", "registered": True, **change}
+                self.world.response = json.dumps(response).encode()
+                with self.assertRaises(p.proof.EvidenceError):
+                    m.controller(self.frame("setup", business_account_id=test_controller.BUSINESS))
+                self.assertTrue(m.evidence()["controller_protocol_failed"])
+                count = len(self.world.calls)
+                with self.assertRaises(p.proof.EvidenceError):m.controller(self.frame())
+                self.assertEqual(len(self.world.calls), count)
+                self.assertNotIn("controller", self.owner._process_ids)
+                m.close()
+                self.owner._process_manager = None
+
     def test_controller_write_and_read_retain_private_records_and_false_cases(self):
         m = self.manager();m.start_web("candidate", INPUTS)
         fixture = controller._fixture(json.loads(self.frame())["fixture"])

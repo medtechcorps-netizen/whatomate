@@ -2,8 +2,9 @@
 
 Input and successful retained records are private in-memory transport, never a
 public compatibility artifact. The caller provisions the fixture, owns the
-internal Docker network and bounds the process lifetime. No provisioning,
-classification, Docker access, retry loop or complete proof exists here.
+internal Docker network and bounds the process lifetime. Setup registers only
+that synthetic fixture in owned Graph before measured sweeps. No database
+provisioning, classification, Docker access, retry or complete proof exists here.
 """
 from __future__ import annotations
 
@@ -111,6 +112,27 @@ def _readiness(fixture, http_factory, clock):
     return flags
 
 
+def _setup(fixture, business_account_id, sweep_factory):
+    # Reuse the existing bounded transport and HMAC implementation. These two
+    # control requests provision a fixture; they are never measured sweep or
+    # worker evidence. No login, arbitrary payload, endpoint or retry is used.
+    account = {"business_account_id": business_account_id,
+               "phone_number_id": fixture.phone_number_id,
+               "display_phone_number": fixture.phone_number_id,
+               "verified_name": fixture.namespace}
+    client = sweep_factory(fixture)
+    client._begin()
+    acknowledged = client._call("POST", "/_control/accounts", account, stub=True)
+    _need(type(acknowledged) is dict and set(acknowledged) == {"ok"}
+          and acknowledged["ok"] is True)
+    observed = client._call("GET", "/_control/accounts", stub=True)
+    # OwnedStack starts Graph without accounts. Admit precisely our one account,
+    # including its complete returned shape; missing/foreign/duplicate rows fail.
+    _need(type(observed) is dict and set(observed) == {"accounts"}
+          and observed["accounts"] == [account])
+    return True
+
+
 def parse_request(raw: bytes) -> dict:
     """Pure preflight for the owner, before creating any controller resource.
 
@@ -121,15 +143,21 @@ def parse_request(raw: bytes) -> dict:
     request = _parse(raw)
     _need(type(request.get("version")) is int and request["version"] == 1)
     operation = request.get("operation")
-    _need(type(operation) is str and operation in {"readiness", "write", "read"})
+    _need(type(operation) is str and operation in {"setup", "readiness", "write", "read"})
     keys = {"version", "operation", "fixture"}
-    if operation == "write":
+    if operation == "setup":
+        keys.add("business_account_id")
+    elif operation == "write":
         keys.add("nonce")
     elif operation == "read":
         keys.add("record")
     _need(set(request) == keys)
     fixture = _fixture(request["fixture"])
-    if operation == "write":
+    if operation == "setup":
+        _need(type(request["business_account_id"]) is str
+              and sweep._DIGITS.fullmatch(request["business_account_id"]) is not None
+              and request["business_account_id"] != fixture.phone_number_id)
+    elif operation == "write":
         _need(type(request["nonce"]) is str and sweep._NONCE.fullmatch(request["nonce"]) is not None)
     elif operation == "read":
         _record(request["record"], fixture)
@@ -140,8 +168,9 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
            clock=time.monotonic) -> bytes:
     """One bounded private frame; fixed failures never retain exception text.
 
-    The owning process adapter must enforce a wall deadline: readiness 30s,
-    write 600s and read 400s. Sweep retains its existing per-operation budgets.
+    The owning process adapter must enforce a wall deadline: setup 100s,
+    readiness 30s, write 600s and read 400s. Setup uses two <=45s requests;
+    Sweep retains its existing per-operation budgets.
     A success response is protocol completion, not compatibility qualification.
     """
     try:
@@ -154,7 +183,9 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
         elif operation == "read":
             record = sweep.RecordSet(**request["record"])
         response = {"version": 1, "status": "ok", "operation": operation}
-        if operation == "readiness":
+        if operation == "setup":
+            response["registered"] = _setup(fixture, request["business_account_id"], sweep_factory)
+        elif operation == "readiness":
             response["ready"] = _readiness(fixture, http_factory, clock)
         else:
             client = sweep_factory(fixture)
