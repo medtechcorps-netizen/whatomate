@@ -6,6 +6,7 @@ Plain selection does not invoke rollback policy or fabricate a live catalog.
 Only the reviewed v0 source format and authenticated v1-prefix reader0 exist.
 """
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import record_policy as policy
@@ -15,6 +16,8 @@ import schema_change
 import ship_common as common
 import source_git
 import pending_source
+import contract_authorization as contract
+import contract_collect
 
 _CATALOG_PINS = dict(policy.V0_PINS)
 _CATALOG_PATHS = tuple(sorted(_CATALOG_PINS))
@@ -112,6 +115,13 @@ class ForwardResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class ForwardAdmission:
+    """Exact-main source observation, not semantic or deployment permission."""
+    resolution: ForwardResolution
+    contract_observation: contract.ContractObservation | None
+
+
+@dataclass(frozen=True, slots=True)
 class RollbackResolution:
     """Source-bound transition data, never permission to mutate a provider.
 
@@ -179,6 +189,21 @@ def resolve_forward(client: transport.ReleaseGh, repo_dir: Path,
     An explicit tag selects an exact historical image; it grants no rollback.
     """
     return _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, forward=True)
+
+
+def _contract_now():
+    return datetime.now(timezone.utc)
+
+
+def resolve_admission_forward(client: transport.ReleaseGh, repo_dir: Path,
+                              git_binary: Path, candidate_sha: str) -> ForwardAdmission:
+    """Observe the current-main owner gate inside the original source budget.
+
+    Only the latest release may be selected. Generic preview/rollback remain
+    independent; a label never repairs unsupported semantic evidence.
+    """
+    return _resolve(client, repo_dir, git_binary, None, candidate_sha,
+                    forward=True, admission=True)
 
 
 def resolve_rollback(client: transport.ReleaseGh, repo_dir: Path,
@@ -412,11 +437,14 @@ def _forward_pending(reader, repo_dir, latest_sha, candidate_sha, database_base,
     return pending, classification
 
 
-def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False):
+def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False,
+             admission=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
     try:
+        if admission and (not forward or rollback or selected_tag is not None):
+            budget.fail("resolver-selection")
         if rollback and (forward or selected_tag is None):
             budget.fail("resolver-selection")
         if forward and (type(candidate_sha) is not str or common.SHA1_RE.fullmatch(candidate_sha) is None):
@@ -425,6 +453,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                 (selected_tag != common.BOOTSTRAP_TAG and common.RECORD_TAG_RE.fullmatch(selected_tag) is None)):
             budget.fail("resolver-selection")
         snapshot = client.capture_snapshot()
+        if admission and candidate_sha != snapshot.main_sha:
+            budget.fail("resolver-main")
         bootstrap = records.load_bootstrap()
         bootstrap_raw = common.canonical_file_bytes(bootstrap)
         # Consume the entire inventory before deriving policy. Each yielded
@@ -493,6 +523,19 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                 audit = _forward_audit(reader, repo_dir, latest, selected, candidate_sha, database_base)
                 pending, classification = _forward_pending(reader, repo_dir, latest.record_sha, candidate_sha,
                     database_base, material, classification)
+                observation = None
+                if admission and classification.kind == "contract":
+                    if classification.dormant is not False:
+                        raise contract.ContractRefusal("contract-label-classification")
+                    observation = contract_collect.collect_contract(client, candidate_sha,
+                        wall_clock=_contract_now)
+                    if (type(observation) is not contract.ContractObservation
+                            or type(observation.observed_at) is not datetime
+                            or observation.observed_at.tzinfo is not timezone.utc
+                            or observation.observed_at.fold != 0):
+                        raise contract.ContractRefusal("contract-label-observation-time")
+                    contract.require_contract_label(observation, candidate_sha=candidate_sha,
+                        repository_id=transport.REPOSITORY_ID, now=observation.observed_at)
             if rollback:
                 legacy_chain, legacy_classification, decision = _rollback_source(chain, repo_dir, tag)
             budget.check()
@@ -502,12 +545,16 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
         budget.check()
         resolved = ResolvedChain(chain, snapshot, images, latest, selected)
         if forward:
-            return ForwardResolution(resolved, candidate, classification, workflow,
+            result = ForwardResolution(resolved, candidate, classification, workflow,
                 common.sha256_bytes(workflow), selected.actual_web_source_sha, database_base,
                 material, recipe, audit, pending)
+            return ForwardAdmission(result, observation) if admission else result
         if rollback:
             return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)
         return resolved
+    except contract.ContractRefusal:
+        budget.failed = True
+        raise
     except (policy.PolicyRefusal, schema_change.SchemaChangeBlocked):
         if rollback:
             # These two reviewed policy classes carry fixed refusal codes or

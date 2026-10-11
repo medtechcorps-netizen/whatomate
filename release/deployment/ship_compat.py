@@ -1,11 +1,13 @@
-"""Preparatory concrete normal preflight; no deployment or writer activation.
+"""Concrete normal preflight; no provider mutation or transferable authority.
 
-The public operation constructs its own release and Actions adapters. Returned
-frozen projections are evidence data, not capabilities or a promise of future
-freshness. A future ship caller must run this operation afresh at plan and
-production time. No rollback, break-glass, provider or mutation path exists.
+The public operation constructs its own release and Actions adapters. The ship
+caller runs it afresh at plan, staging and production admission. Conditional
+owner collection shares each original source budget and final rechecks; the
+final complete observation is preserved separately from immutable source facts.
+Active-contract semantic qualification remains refused. Returned projections do
+not promise future freshness. No rollback or break-glass path exists here.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import math
 import os
@@ -19,6 +21,7 @@ import compat_request as bridge
 import record_resolver as resolver
 import record_transport as transport
 import forward_gates
+import contract_authorization as contract
 
 common, runtime = transport.common, transport.runtime
 MAX_SECONDS = 900
@@ -54,6 +57,7 @@ class NormalPreflight:
     command_count: int
     captured_bytes: int
     drills: forward_gates.DrillGate | None = None
+    contract_observation: contract.ContractObservation | None = None
 
 
 class _Budget:
@@ -154,13 +158,33 @@ def _source(budget, repo, sha, gh, git, token, phase, env):
     try:
         client = transport.ReleaseGh(gh, token, phase / "config", phase / "work",
                                      budget=operation, base_env=env)
-        return resolver.resolve_forward(client, repo, git, sha)
+        return resolver.resolve_admission_forward(client, repo, git, sha)
     except Exception:
         # close must not mask the primary source refusal on construction errors.
         operation.failed = True
         raise
     finally:
         operation.close()
+
+
+def _contract_pair(before, after, history_observed_at):
+    """Compare all observed facts; only the collection instant may advance."""
+    _need(type(before) is resolver.ForwardAdmission and type(after) is resolver.ForwardAdmission,
+          "admission")
+    _need(before.resolution == after.resolution, "source-changed")
+    forward_gates.validate_preserved_contract(before.resolution, before.contract_observation)
+    forward_gates.validate_preserved_contract(after.resolution, after.contract_observation)
+    first, last = before.contract_observation, after.contract_observation
+    if first is None:
+        _need(last is None, "contract-changed")
+        return None
+    _need(type(last) is contract.ContractObservation
+          and replace(first, observed_at=last.observed_at) == last, "contract-changed")
+    _need(type(history_observed_at) is datetime and history_observed_at.tzinfo is timezone.utc
+          and history_observed_at.fold == 0
+          and first.observed_at <= last.observed_at
+          and history_observed_at <= last.observed_at, "contract-clock")
+    return last
 
 
 def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch_dir,
@@ -180,26 +204,28 @@ def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch
         before = _source(budget, repo_dir, candidate_sha, gh_binary, git_binary, token,
                          scratch_dir / "source-before", env)
         budget.check()
-        _need(before.resolved.inventory.main_sha == candidate_sha, "main-changed")
+        _need(before.resolution.resolved.inventory.main_sha == candidate_sha, "main-changed")
         phase = scratch_dir / "actions"
         client = collect.ActionsGh(str(gh_binary), token, phase / "config",
             seconds=min(600, budget.remaining()), base_env=env, capture=budget.capture, clock=budget.clock)
-        history = collect.collect_history(collect.CollectionRequest(candidate_sha, before.workflow),
+        history = collect.collect_history(collect.CollectionRequest(candidate_sha, before.resolution.workflow),
                                            client, phase / "work", wall_clock=wall_clock)
         budget.check()
         after = _source(budget, repo_dir, candidate_sha, gh_binary, git_binary, token,
                         scratch_dir / "source-after", env)
         budget.check()
-        _need(after == before, "source-changed")
-        qualified = bridge.qualify(after, history)
+        observation = _contract_pair(before, after, history.history.observed_at)
+        qualified = bridge.qualify(after.resolution, history)
         budget.check()
         observed_at = wall_clock()
         _need(type(observed_at) is datetime and observed_at.tzinfo is timezone.utc
               and observed_at.fold == 0 and observed_at >= history.history.observed_at, "drill-clock")
-        drills = forward_gates.observe_forward_drills(after, now=observed_at)
+        _need(observation is None or observed_at >= observation.observed_at, "contract-clock")
+        drills = forward_gates.observe_forward_drills(after.resolution, now=observed_at)
         budget.check()
-        return NormalPreflight(after, qualified, history, budget.commands, budget.captured_bytes, drills)
-    except forward_gates.DrillRefusal as exc:
+        return NormalPreflight(after.resolution, qualified, history, budget.commands, budget.captured_bytes,
+                               drills, observation)
+    except (forward_gates.DrillRefusal, contract.ContractRefusal) as exc:
         budget.failed = True
         common.fail("schema-change-blocked:" + str(exc))
     except (evidence.CompatRefusal, common.ReleaseError):

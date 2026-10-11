@@ -42,7 +42,7 @@ class HandoffTests(unittest.TestCase):
             fixture.images(cls.resolution), fixture.execution(), staging='passed', drills=fixture.drills(cls.resolution))
         cls.outputs = codec.encode(cls.handoff)
         # Retain a separately built historical v2 wire for all inherited JSON,
-        # per-blob zlib and closed-type adversarial cases. Public success uses v5.
+        # per-blob zlib and closed-type adversarial cases. Public success uses v6.
         cls.historical = fixture.historical_handoff(cls.resolution)
         budget = codec._Budget(version=2)
         node = codec._value(cls.historical, w.PromotionHandoff, budget, 0, encoding=True)
@@ -137,7 +137,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIs(json.loads(negative.result)['old_server_ok']['workers'], False)
 
     def test_hash_lengths_counts_versions_and_slots_are_not_optional(self):
-        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '6'),
+        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '7'),
                            ('handoff_raw_length', '1'), ('handoff_compressed_length', '1'),
                            ('handoff_encoded_length', '1'), ('handoff_chunk_count', '0'),
                            ('handoff_chunk_count', '01'), ('handoff_raw_length', True)]:
@@ -295,7 +295,7 @@ class HandoffTests(unittest.TestCase):
 
     def test_version2_preserves_all_audit_ranges_and_drill_source_bytes(self):
         restored = self.decode(envelope(self.raw), record_attempt=2)
-        self.assertEqual(self.outputs['handoff_version'], '5')
+        self.assertEqual(self.outputs['handoff_version'], '6')
         self.assertEqual(self.wire['version'], 2)
         self.assertEqual(restored.resolution.audit, self.resolution.audit)
         self.assertEqual(len(restored.resolution.audit.changes), 3)
@@ -356,7 +356,7 @@ class HandoffTests(unittest.TestCase):
             with self.assertRaises(codec.HandoffRefusal): codec.encode(changed)
 
 
-def xz_envelope(raw, *, compressed=None, version='5'):
+def xz_envelope(raw, *, compressed=None, version='6'):
     packed = (lzma.compress(raw, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=6)
               if compressed is None else compressed)
     return envelope(raw, compressed=packed, version=version)
@@ -415,7 +415,7 @@ class XZTests(unittest.TestCase):
         restored = self.decode(record_attempt=4)
         self.assertEqual(restored, self.handoff)
         self.assertEqual(restored.collected.history, self.history.history)
-        self.assertEqual(self.header['version'], 5)
+        self.assertEqual(self.header['version'], 6)
         self.assertEqual(int(self.outputs['handoff_raw_length']), len(self.frame))
         self.assertEqual(self.outputs['handoff_sha256'], hashlib.sha256(self.frame).hexdigest())
         self.assertGreater(len(self.frame), 1762225)
@@ -466,7 +466,7 @@ class XZTests(unittest.TestCase):
                     b'[' * 49 + b'0' + b']' * 49,
                     header + b' ', json.dumps(self.header, indent=2).encode()):
             self.refuse(xz_envelope(len(bad).to_bytes(4, 'big') + bad + self.payload))
-        for version in (True, 1, 2, 3, 4, 6):
+        for version in (True, 1, 2, 3, 4, 5, 7):
             changed = copy.deepcopy(self.header); changed['version'] = version
             self.refuse(xz_envelope(frame(changed, self.payload)))
         changed = dict(self.outputs); changed['handoff_version'] = '2'; self.refuse(changed)
@@ -679,6 +679,71 @@ class XZTests(unittest.TestCase):
             'history_attempts': 400, 'qualification_completed': True,
             'collected_command_count': history.command_count, 'collected_captured_bytes': history.captured_bytes,
             'encode_refused': True, 'caps_unchanged': True, 'no_truncation': True}
+
+
+    def test_v5_historical_pending_drills_preserved_without_owner_field(self):
+        budget = codec._Budget(version=5)
+        node = codec._value(self.handoff, w.PromotionHandoff, budget, 0, encoding=True)
+        self.assertNotIn('contract_observation', node['fields'])
+        outputs = xz_envelope(codec._frame(node, budget.blobs, version=5), version='5')
+        original = self.decode(outputs, record_attempt=19)
+        self.assertEqual(original, self.handoff)
+        self.assertIsNone(original.contract_observation)
+        self.assertEqual(original.resolution.pending, self.handoff.resolution.pending)
+        self.assertEqual(original.drills, self.handoff.drills)
+        self.assertEqual(self.build_record(outputs), self.build_record())
+        node['fields']['contract_observation'] = None
+        self.refuse(xz_envelope(codec._frame(node, budget.blobs, version=5), version='5'))
+
+    def test_v6_owner_field_mandatory_and_noncontract_receipt_refuses_public_replay(self):
+        node = copy.deepcopy(self.header); node['handoff']['fields'].pop('contract_observation')
+        self.refuse(xz_envelope(frame(node, self.payload)))
+        observation = fixture.contract_observation(self.resolution)
+        with self.assertRaises(codec.HandoffRefusal):
+            codec.encode(replace(self.handoff, contract_observation=observation))
+        self.assertIsNone(self.decode(record_attempt=400).contract_observation)
+
+    def test_complete_owner_observation_closed_frame_preserves_every_row_without_active_authority(self):
+        resolution = replace(self.resolution, classification=self.resolution.classification._replace(kind='contract', dormant=False))
+        observation = fixture.contract_observation(resolution, events=80)
+        codec.contract.require_contract_label(observation, candidate_sha=resolution.candidate.sha,
+            repository_id=w.transport.REPOSITORY_ID, now=observation.observed_at)
+        handoff = replace(self.handoff, resolution=resolution, contract_observation=observation)
+        budget = codec._Budget()
+        node = codec._value(handoff, w.PromotionHandoff, budget, 0, encoding=True)
+        raw = codec._frame(node, budget.blobs)
+        packed = codec._xz_compress(raw)
+        # Closed raw transport only; the public replay must retain active holds.
+        outputs = xz_envelope(raw, compressed=packed)
+        value, blobs = codec._unframe(codec._unpack(outputs))
+        decoded_budget = codec._Budget(blobs)
+        decoded = codec._value(value['handoff'], w.PromotionHandoff, decoded_budget, 0, encoding=False)
+        self.assertEqual(decoded, handoff)
+        self.assertEqual(decoded_budget.used, blobs.keys())
+        self.assertEqual(len(decoded.contract_observation.pulls[0].events), 80)
+        self.assertEqual(len(decoded.contract_observation.pulls[0].labels), 100)
+        self.refuse(outputs)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(handoff)
+        type(self).measurements['owner_observation_closed_only'] = {
+            'events': 80, 'labels': 100, 'raw_bytes': len(raw), 'compressed_bytes': len(packed),
+            'encoded_bytes': int(outputs['handoff_encoded_length']), 'public_active_refused': True}
+
+    def test_high_entropy_complete_owner_inventory_refuses_caps_without_truncating(self):
+        resolution = replace(self.resolution, classification=self.resolution.classification._replace(kind='contract', dormant=False))
+        observation = fixture.contract_observation(resolution, events=2000)
+        codec.contract.require_contract_label(observation, candidate_sha=resolution.candidate.sha,
+            repository_id=w.transport.REPOSITORY_ID, now=observation.observed_at)
+        handoff = replace(self.handoff, resolution=resolution, contract_observation=observation)
+        with self.assertRaises(codec.HandoffRefusal):
+            budget = codec._Budget()
+            node = codec._value(handoff, w.PromotionHandoff, budget, 0, encoding=True)
+            raw = codec._frame(node, budget.blobs)
+            packed = codec._xz_compress(raw)
+            codec._unpack(xz_envelope(raw, compressed=packed))
+        self.assertEqual(len(observation.pulls[0].events), 2000)
+        self.assertEqual(len(observation.pulls[0].labels), 100)
+        self.assertEqual((codec.MAX_ENCODED, codec.MAX_COMPRESSED, codec.MAX_NODES), (262144, 196608, 100000))
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(handoff)
 
 
 if __name__ == '__main__':

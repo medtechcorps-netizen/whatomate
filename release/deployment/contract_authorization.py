@@ -1,10 +1,11 @@
 """Pure policy for a narrow post-merge owner label; no collection or authority.
 
-A future bounded GitHub adapter must bind these facts to the authenticated
+The bounded GitHub adapter must bind these facts to the authenticated
 repository/current main, enumerate the complete visible association/label event
-connections, and recheck mutable state before provider access. Constructing a
-dataclass or an unkeyed digest does none of those things. This module is not
-selected by shipping and does not authorize database changes.
+connections, and recheck mutable state before provider access. Normal source
+admission selects this policy only for a classified contract. Constructing a
+dataclass or an unkeyed digest establishes no provenance; even a valid owner
+observation cannot lift the active semantic hold or authorize database changes.
 
 REST label-event names alone are insufficient. The projection requires GraphQL
 label node identity and its non-null creation/update times. The definition must
