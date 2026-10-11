@@ -39,6 +39,7 @@ _UNKNOWN = re.compile(r"\bunknown(?:[- ]job)?[- ]type\b", re.IGNORECASE)
 _PANIC = re.compile(r"\bpanic(?:ked)?\b", re.IGNORECASE)
 _MAIN = re.compile(r"(?:^|/)cmd/whatomate/main\.go:[1-9][0-9]*\Z")
 _WORKER = re.compile(r"(?:^|/)internal/worker/worker\.go:[1-9][0-9]*\Z")
+_OLD_BOOT = object()
 
 
 def need(value, code="observation-invalid"):
@@ -122,7 +123,7 @@ def _completed():
 
 class OwnedObservation:
     def __init__(self, manager: processes.OwnedProcesses, handle: processes.ProcessHandle,
-                 fixture: controller.sweep.Fixture, *, clock=time.monotonic, sleep=time.sleep):
+                 fixture: controller.sweep.Fixture, *, clock=time.monotonic, sleep=time.sleep, _old_boot=None):
         need(type(manager) is processes.OwnedProcesses and type(handle) is processes.ProcessHandle
              and handle.slot == "web" and handle.version in {"previous", "candidate"}
              and handle.phase == {"previous": "compat-prev-server", "candidate": "compat-cand-server"}[handle.version])
@@ -139,13 +140,31 @@ class OwnedObservation:
         self._journal_rows = []
         self._journal_counts = None
         self._events = len(manager._events)
-        self._check()
+        self._old_boot = _old_boot
+        self._old_boot_done = False
+        if _old_boot is None:
+            self._check()
+        else:
+            need(type(_old_boot) is tuple and len(_old_boot) == 3 and _old_boot[0] is _OLD_BOOT
+                 and handle.version == "previous", "observation-old-boot-context")
+            proof.artifact_name(manager.bindings["candidate"].source_sha, _old_boot[2])
+            need(type(_old_boot[1]) is int and 1 <= _old_boot[1] < 10**16, "observation-old-boot-context")
+            self._checked_state(running=None)
+
+    @classmethod
+    def for_old_boot(cls, manager, handle, fixture, *, run_id, run_attempt, clock=time.monotonic, sleep=time.sleep):
+        """Only an already returned owned previous handle; never adopt a failed start."""
+        return cls(manager, handle, fixture, clock=clock, sleep=sleep,
+                   _old_boot=(_OLD_BOOT, run_id, run_attempt))
 
     def _check(self):
+        return self._checked_state(running=True)
+
+    def _checked_state(self, *, running):
         need(not self._failed and not self.manager._protocol_failed
              and self.manager._handles.get("web") is self.handle, "observation-handle-stale")
         self.manager._assert_all()
-        row = self.manager._check("web", running=True)
+        row = self.manager._check("web", running=running)
         host, cfg, state = row["HostConfig"], row["Config"], row["State"]
         # json-file's empty options mean no rotation. local's default bounded
         # rotation is deliberately unsupported, as are remote/lossy drivers.
@@ -166,6 +185,104 @@ class OwnedObservation:
         self._streams = current
         self._check()
         return parsed
+
+    def _old_logs(self):
+        """Terminal-capable reads retain every ordinary identity/log guard."""
+        self._checked_state(running=None)
+        result = self.manager._call(["logs", "--timestamps", self.handle.container_id], timeout=10)
+        if result.returncode != 0:
+            raise proof.InfrastructureFailure("observation-log-capture")
+        current = result.stdout, result.stderr
+        need(all(now.startswith(before) for now, before in zip(current, self._streams)), "observation-log-truncated")
+        parsed = parse_logs(*current, started_at=self.handle.started_at)
+        self._streams = current
+        return parsed, self._checked_state(running=None)
+
+    def _terminal_old(self, logs, row):
+        state = row["State"]
+        need(state["Running"] is False and state.get("Status") == "exited", "observation-terminal-state")
+        finished = _instant(state.get("FinishedAt"))
+        need(finished >= _instant(self.handle.started_at), "observation-terminal-time")
+        # Require the recognized defect AFTER the actual start+RLS contract in
+        # the same stream. Arbitrary mentions of panic in customer fields or a
+        # defect before the contract cannot prove this narrow terminal case.
+        panic = 0
+        for raw in self._streams:
+            start_seen = rls_seen = False
+            for line in raw.splitlines(keepends=True):
+                match = _DOCKER_TIME.fullmatch(line.decode().rstrip("\n\r"))
+                need(match is not None and _instant(match[1]) <= finished, "observation-terminal-time")
+                fields = parse_logs(line, b"", started_at=self.handle.started_at)["records"]
+                if _marker(fields, "Starting ReReply server..."):
+                    need(not start_seen and not rls_seen, "observation-terminal-contract")
+                    start_seen = True
+                if _marker(fields, "PostgreSQL tenant RLS verified", runtime_role="compat_runtime"):
+                    need(start_seen and not rls_seen, "observation-terminal-contract")
+                    rls_seen = True
+                text = _SGR.sub("", match[2])
+                # Source main.go also logs infrastructure failures at fatal
+                # (Redis, realtime and storage). Runtime fatal error includes
+                # OOM even when Docker's OOMKilled is false. Do not qualify
+                # either, including a mixed window which also has a panic.
+                need(not any(r.get("level") == "fatal" for r in fields)
+                     and not re.match(r"fatal error:", text), "observation-terminal-fatal-unclassified")
+                is_panic = bool(re.match(r"panic:\s+\S", text))
+                if is_panic:
+                    need(start_seen and rls_seen, "observation-terminal-before-contract")
+                    panic += 1
+        counts = self._period_counts(logs)
+        previous = self.manager.bindings["previous"]
+        binding = {"sha": self.manager.bindings["candidate"].source_sha,
+                   "previous_source_sha": previous.source_sha, "previous_web_digest": previous.reference.rsplit("@", 1)[-1],
+                   "run_id": self._old_boot[1], "run_attempt": self._old_boot[2], "owner_token": self.manager.owner.token,
+                   "container_id": self.handle.container_id, "started_at": self.handle.started_at}
+        value = {"state": "observed-semantic-failure", "phase": "old.boot", "binding": binding,
+                 "terminal": {"running": False, "exit_code": state.get("ExitCode"), "finished_at": state.get("FinishedAt"),
+                              "oom_killed": False, "daemon_error": False, "restart_count": row.get("RestartCount", 0)},
+                 "logs": {"complete": True, "stdout_sha256": hashlib.sha256(self._streams[0]).hexdigest(),
+                          "stderr_sha256": hashlib.sha256(self._streams[1]).hexdigest(),
+                          "stdout_bytes": len(self._streams[0]), "stderr_bytes": len(self._streams[1]), "lines": logs["lines"],
+                          "start_markers": counts["markers"]["start"], "rls_markers": counts["markers"]["rls"],
+                          "fatal_markers": 0, "panic_markers": panic}}
+        proof._terminal_old_boot(value, binding)
+        return value
+
+    def wait_old_boot(self, timeout=90):
+        """Return a narrow terminal observation, or None for ordinary boot().
+
+        No HTTP request occurs here. A stopped process without complete source
+        contract and recognized terminal defect remains an evidence refusal.
+        A semantic return consumes this path without resetting any failure latch.
+        """
+        try:
+            need(self._old_boot is not None and not self._old_boot_done and not self._startup_attempted
+                 and not self._booted and not self._period_attempted, "observation-old-boot-order")
+            self._old_boot_done = self._startup_attempted = True
+            need(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 90,
+                 "observation-startup-bounds")
+            with self._readonly_budget(timeout) as remaining:
+                for _ in range(math.ceil(timeout) + 1):
+                    if remaining() <= 0: break
+                    logs, row = self._old_logs()
+                    self._startup_summary = self._period_counts(logs)
+                    need(all(n <= 1 for n in self._startup_summary["markers"].values()), "observation-startup-ambiguous")
+                    if row["State"]["Running"] is False:
+                        # A second full read after termination checks the final
+                        # state and catches truncation/drift during collection.
+                        logs, final = self._old_logs()
+                        need(final["State"] == row["State"], "observation-terminal-changed")
+                        return self._terminal_old(logs, final)
+                    if all(n == 1 for n in self._startup_summary["markers"].values()) and not any(
+                            self._startup_summary[k] for k in ("panic_count", "unknown_type_count", "fatal_count", "stopped_or_error_count")):
+                        self._startup_ready = True
+                        return None
+                    if remaining() <= 0: break
+                    self._sleep(min(1, remaining()))
+            if not self._startup_summary or not self._startup_summary["lines"]:
+                raise proof.InfrastructureFailure("observation-startup-no-log")
+            raise proof.EvidenceError("observation-startup-incomplete")
+        except Exception as error:
+            self._fail(error)
 
     def _controller(self, operation, **extra):
         self._check()
