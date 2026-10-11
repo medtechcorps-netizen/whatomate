@@ -224,6 +224,15 @@ def _path(value: Any) -> bool:
             and all(part not in {"", ".", ".."} for part in value.split("/")))
 
 
+def _changed_path(value: Any) -> bool:
+    # Changed files include repository metadata such as .github/workflows.
+    # Registry identifiers retain their separate, narrower _path contract.
+    return (type(value) is str
+            and re.fullmatch(r"[A-Za-z_.][A-Za-z0-9_./-]{0,511}", value) is not None
+            and all(part.casefold() not in {"", ".", "..", ".git"}
+                    for part in value.split("/")))
+
+
 class _Repository:
     """Bounded artifact reads, cached only for this classifier invocation."""
 
@@ -1074,7 +1083,7 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
         section = "history-range"
         _valid(_git(repo_dir, ["merge-base", base, head]).strip() == base.encode())
         changes = changed_paths(repo_dir, base, head)
-        _valid(len(changes) <= 10000 and all(_path(path) for _, path in changes))
+        _valid(len(changes) <= 10000 and all(_changed_path(path) for _, path in changes))
         section = "migration-path"
         migrations = _v2_migrations(repo, base, head, changes, reasons, summary)
         section = "tenant-profile"

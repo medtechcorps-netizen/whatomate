@@ -199,7 +199,7 @@ class FileAndEntryTests(unittest.TestCase):
                 client_environments = []; deadlines = []
                 def client_for(work, actual_env, deadline):
                     client_environments.append(dict(actual_env)); deadlines.append(deadline)
-                    self.assertLessEqual(deadline.remaining(), 240)
+                    self.assertLessEqual(deadline.remaining(), 600)
                     return client
                 with mock.patch.dict(cli.os.environ, env, clear=True), \
                      mock.patch.object(Path, "cwd", return_value=repo), \
@@ -219,6 +219,55 @@ class FileAndEntryTests(unittest.TestCase):
                 self.assertEqual(client_environments, [env])
                 self.assertIs(make_client.call_args.args[2], deadlines[0])
                 resolve.assert_called_once_with(client, repo, Path("/git"), SHA, selected_tag=None)
+
+    def test_preview_complete_chain_and_classification_share_original_six_hundred_seconds(self):
+        # Synthetic elapsed work crosses the old cap. Real deadline, client and
+        # OperationBudget are used; only external capture/resolution are faked.
+        for elapsed, expires in ((320, False), (601, True)):
+            with self.subTest(elapsed=elapsed), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve(); repo = root / "repo"; runner = root / "runner"
+                repo.mkdir(); runner.mkdir(); binary = root / "gh"; binary.touch()
+                env = environment("pull_request", "refs/pull/269/merge")
+                env.update(RUNNER_TEMP=str(runner), COMPAT_GH_BIN=str(binary), GH_TOKEN="synthetic-token")
+                ctx = cli.context(env); clock = [100.0]; deadlines = []; calls = []
+                original_init, original_scratch = cli.images._Deadline.__init__, cli._scratch
+                def init(deadline):
+                    original_init(deadline, clock=lambda: clock[0]); deadlines.append(deadline)
+                def scratch(*args):
+                    clock[0] += 30  # Local setup also consumes the original deadline.
+                    return original_scratch(*args)
+                def capture(argv, **options):
+                    calls.append((argv, options)); clock[0] += 2
+                    return cli.runtime.Capture(0, b"gh version 2.98.0 (2026-10-08)\n", b"")
+                def resolve(client, actual_repo, git_binary, sha, *, selected_tag):
+                    self.assertEqual((actual_repo, sha, selected_tag), (repo, ctx.sha, None))
+                    self.assertEqual(clock[0], 132)
+                    self.assertEqual(client.budget._deadline, 700)
+                    self.assertEqual(client.budget.remaining(), 568)
+                    clock[0] = 100 + elapsed
+                    # Even a source boundary returning after expiry must not
+                    # publish. preview's final original-deadline check owns it.
+                    if not expires: client.budget.close()
+                    return resolved(ctx)
+                with mock.patch.dict(cli.os.environ, env, clear=True), \
+                     mock.patch.object(Path, "cwd", return_value=repo), \
+                     mock.patch.object(cli.images._Deadline, "__init__", init), \
+                     mock.patch.object(cli, "_scratch", side_effect=scratch), \
+                     mock.patch.object(cli, "_git_binary", return_value=Path("/synthetic-git")), \
+                     mock.patch.object(cli.runtime, "bounded_command", side_effect=capture), \
+                     mock.patch.object(cli.record_resolver, "resolve_forward", side_effect=resolve), \
+                     mock.patch.object(cli, "_mark_complete") as marker, \
+                     contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                     contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    status = cli.main(["preview"])
+                self.assertEqual(status, int(expires)); self.assertEqual(len(deadlines), 1)
+                self.assertEqual(deadlines[0].end, 700)
+                self.assertEqual(len(calls), 1); self.assertEqual(calls[0][1]["timeout"], 5)
+                target = runner / ("compat-preview-" + ctx.suffix) / "public/resolution.json"
+                self.assertEqual(target.exists(), not expires); marker.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                if expires: self.assertIn("admission-deadline", stderr.getvalue())
+                else: self.assertEqual(target.read_bytes(), cli.canonical(snapshot(ctx)))
 
     def test_client_version_setup_is_inside_shared_deadline_and_five_seconds(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -543,6 +592,46 @@ class EvidenceEntryTests(unittest.TestCase):
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_source_and_transport_fixed_codes_require_exact_owners(self):
+        owners = ((cli.record_resolver.source_git.SourceGitRefusal,
+                   ("git-failed:source-deadline", "git-failed:source-budget",
+                    "git-failed:source-capture", "git-failed:source-command")),
+                  (cli.record_transport.TransportRefusal,
+                   ("record-chain-invalid:transport-deadline", "record-chain-invalid:transport-bound",
+                    "record-chain-invalid:transport-capture", "record-chain-invalid:transport-resolver")))
+        for owner, codes in owners:
+            for code in codes:
+                self.assertEqual(cli._diagnostic_code(owner(code)), code)
+                self.assertEqual(cli._failure_message(owner(code)), "compatibility-entrypoint-refused")
+                self.assertEqual(cli._diagnostic_code(cli.common.ReleaseError(code)), "unknown")
+                self.assertEqual(cli._diagnostic_code(cli.proof.EvidenceError(code)), "unknown")
+            class Foreign(owner): pass
+            self.assertEqual(cli._diagnostic_code(Foreign(codes[0])), "unknown")
+            for code in (codes[0]+":private/path", "git-failed:source-private-token"):
+                text = cli._failure_diagnostic(owner(code))
+                self.assertIn("code=unknown", text); self.assertNotIn("private", text)
+
+    def test_real_budget_failure_reports_fixed_phase_without_capture_or_raw_text(self):
+        clock = [100.0]
+        def private_capture(*args, **kwargs):
+            raise OSError("private token path command output")
+        budget = cli.record_transport.OperationBudget(700, capture=private_capture, clock=lambda:clock[0])
+        try:
+            budget.capture(["private-command"], env={}, timeout=30, stdout_limit=128, stderr_limit=128)
+        except cli.record_transport.TransportRefusal as error:
+            text = cli._failure_diagnostic(error)
+        else: self.fail("capture must refuse")
+        self.assertIn("phase=release-capture family=release code=record-chain-invalid:transport-capture", text)
+        self.assertNotIn("private", text)
+        clock[0] = 100
+        budget = cli.record_transport.OperationBudget(700, capture=private_capture, clock=lambda:clock[0])
+        clock[0] = 700
+        try: budget.remaining()
+        except cli.record_transport.TransportRefusal as error:
+            self.assertIn("phase=release-budget family=release code=record-chain-invalid:transport-deadline",
+                          cli._failure_diagnostic(error))
+        else: self.fail("deadline must refuse")
+
     def test_runtime_and_cli_codes_are_type_approved_only(self):
         for code in ("network", "pull", "capture", "container", "process", "boot-timeout",
                      "release-verification-failed", "cli-path-invalid", "cli-token-unavailable"):

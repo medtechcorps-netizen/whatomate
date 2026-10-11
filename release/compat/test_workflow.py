@@ -189,6 +189,8 @@ def validate(doc):
     require(final['if'] == '${{ always() }}' and final['env'] == {
         'CHECK_RESULT':'${{ steps.check.outcome }}', 'SIGN_RESULT':'${{ steps.sign.outcome }}',
         'CONTEXT_SIGN_RESULT':'${{ steps.sign-context.outcome }}'}, 'either missing signature fails')
+    require(preview['timeout-minutes'] == 15 and step(preview,identifier='preview')['timeout-minutes'] == 11,
+            'full-chain preview has 600 seconds inside 660 seconds and 900-second job')
     require(run['timeout-minutes'] == 45 and step(run,identifier='experiment')['timeout-minutes'] == 41,
             'canonical job and one aggregate experiment budget')
     setup = [step(run,name=name) for name in ('Check out the exact candidate',"Download this run's exact resolution",
@@ -237,6 +239,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(45*60-(180+images._TOTAL+5+60),55)
         self.assertGreater(41*60,images._TOTAL+5)
 
+    def test_preview_budget_and_exact_collector_workflow_binding(self):
+        import hashlib
+        import compat_collect
+        raw = (ROOT/'.github/workflows/compat.yml').read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), compat_collect.WORKFLOW_SHA256)
+        request = compat_collect.CollectionRequest(test_cli.SHA, raw)
+        self.assertEqual(set(compat_collect._workflow(request)), {'release-preview','compat-run','compat','compat-attest'})
+        with self.assertRaises(compat_collect.evidence.CompatRefusal):
+            compat_collect._workflow(compat_collect.CollectionRequest(test_cli.SHA, raw+b'\n'))
+        # The internal cap includes version checks and capture cleanup. The
+        # outer step adds 60s; the job adds240s for checkout/install/upload.
+        preview = DOCUMENT['jobs']['release-preview']
+        self.assertEqual(step(preview,identifier='preview')['timeout-minutes']*60-600,60)
+        self.assertEqual(preview['timeout-minutes']*60-11*60,240)
+
     def test_security_and_identity_mutations_refuse(self):
         mutations = [
             lambda d:d['on']['pull_request'].update(paths=['internal/**']) if d['on']['pull_request'] else d['on'].update(pull_request={'paths':['internal/**']}),
@@ -264,6 +281,8 @@ class WorkflowTests(unittest.TestCase):
             lambda d:step(d['jobs']['compat'],identifier='ready').update(**{'if':"${{ always() }}"}),
             lambda d:step(d['jobs']['attest'],identifier='sign-context')['with'].update(**{'subject-path':PUBLIC_SIGN}),
             lambda d:step(d['jobs']['attest'],identifier='sign')['with'].update(**{'subject-path':'${{ runner.temp }}/compat-input/compat-result.json'}),
+            lambda d:d['jobs']['release-preview'].update(**{'timeout-minutes':10}),
+            lambda d:step(d['jobs']['release-preview'],identifier='preview').update(**{'timeout-minutes':5}),
             lambda d:d['jobs']['compat-run'].update(**{'timeout-minutes':90}),
             lambda d:step(d['jobs']['compat-run'],identifier='experiment').update(run='echo ${{ inputs.rollback_target }}'),
             lambda d:step(d['jobs']['compat-run'],name='Check out the exact candidate').update(**{'timeout-minutes':2}),

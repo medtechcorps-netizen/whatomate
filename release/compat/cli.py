@@ -411,11 +411,21 @@ _DIAGNOSTIC_RELEASE_CODES = frozenset({
     "record-chain-invalid:attestation", "record-invalid", "downgrade-refused:unknown-commit",
     "git-failed:merge-base", "input-invalid:json", "input-invalid:json-duplicate-key", "input-invalid:json-number",
 })
+_DIAGNOSTIC_SOURCE_CODES = frozenset({
+    "git-failed:source-deadline", "git-failed:source-budget",
+    "git-failed:source-capture", "git-failed:source-command",
+})
+_DIAGNOSTIC_TRANSPORT_CODES = frozenset({
+    "record-chain-invalid:transport-deadline", "record-chain-invalid:transport-bound",
+    "record-chain-invalid:transport-capture", "record-chain-invalid:transport-resolver",
+})
 
 
 def _diagnostic_code(error):
     args = BaseException.args.__get__(error)
-    allowed = (_DIAGNOSTIC_EVIDENCE_CODES if isinstance(error, proof.EvidenceError)
+    allowed = (_DIAGNOSTIC_SOURCE_CODES if type(error) is record_resolver.source_git.SourceGitRefusal
+               else _DIAGNOSTIC_TRANSPORT_CODES if type(error) is record_transport.TransportRefusal
+               else _DIAGNOSTIC_EVIDENCE_CODES if isinstance(error, proof.EvidenceError)
                else _DIAGNOSTIC_RELEASE_CODES if isinstance(error, common.ReleaseError) else ())
     return args[0] if len(args) == 1 and type(args[0]) is str and args[0] in allowed else "unknown"
 
@@ -498,7 +508,10 @@ def main(argv=None):
         root = regular_path(Path(os.environ.get("RUNNER_TEMP", "")), directory=True)
         if command == "preview":
             deadline = images._Deadline()
-            deadline.end = min(deadline.end, deadline.now() + 240)
+            # Complete historical image verification and immutable-source
+            # classification share the existing source-operation 600s ceiling.
+            # Establish it before scratch/client work; never reset it later.
+            deadline.end = min(deadline.end, deadline.now() + 600)
             work = _scratch(repo, ctx, "preview", os.environ)
             git_binary = _git_binary(os.environ)
             value = preview(repo, ctx, _client(work, os.environ, deadline),
@@ -556,6 +569,10 @@ _DIAGNOSTIC_PHASES = tuple((function.__code__, phase) for function, phase in (
     (_resolved_snapshot, "cli-snapshot"), (_git_binary, "cli-path"),
     (record_resolver.resolve_forward, "release-verify"), (record_resolver._resolve, "release-verify"),
     (record_transport.ReleaseGh.__init__, "release-client"),
+    (record_transport.OperationBudget.capture, "release-capture"),
+    (record_transport.OperationBudget.remaining, "release-budget"),
+    (record_resolver.source_git.ImmutableGit._call, "source-capture"),
+    (record_resolver.source_git.ImmutableGit._check, "source-budget"),
     (runtime.verified_previous, "release-verify"), (runtime.ReadOnlyGh.__init__, "release-client"),
     (runtime.ReadOnlyGh._run, "release-transport"), (runtime.ReadOnlyGh.download_manifest, "release-download"),
     (runtime.ReadOnlyGh.verify_file, "release-record-attestation"),

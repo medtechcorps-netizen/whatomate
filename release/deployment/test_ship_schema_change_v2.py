@@ -312,6 +312,28 @@ class SourceHistoryPolicyTests(unittest.TestCase):
         self.assertIn("compat-required", result.requirements)
         with self.assertRaises(AttributeError): result.kind = "expand"
 
+    def test_workflow_and_hidden_config_changes_are_valid_repository_paths(self):
+        result = self.result({".github/workflows/compat.yml": "name: synthetic\n",
+                              ".gitignore": "synthetic-output/\n",
+                              ".config/tool.json": "{}\n"})
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("none", False, ()))
+        # Hidden repository files do not broaden the registry identifier grammar.
+        self.assertFalse(sc._path(".github/workflows/compat.yml"))
+
+    def test_workflow_change_does_not_hide_an_unsafe_migration_change(self):
+        result = self.result({".github/workflows/compat.yml": "name: synthetic\n",
+                              "cmd/whatomate/main.go": MAIN.replace("println(1)", "println(9)")})
+        self.assertIn("migration-contract-stale", result.reasons)
+        self.assertNotIn("classifier-v2-invalid:history-range", result.reasons)
+
+    def test_changed_path_projection_still_refuses_unsafe_or_oversized_names(self):
+        head = self.repo.commit({"README.md": "changed\n"})
+        for path in ("../outside", ".github/../outside", ".git/config", "x/.GIT/config",
+                     "/absolute", "C:/absolute", "x//y", "x\\y", "x\ny", "x" * 513):
+            with self.subTest(path=path), mock.patch.object(sc, "changed_paths", return_value=[("M", path)]):
+                result = sc.classify_v2(self.repo.root, self.base, head)
+                self.assertIn("classifier-v2-invalid:history-range", result.reasons)
+
     def test_valid_migration_change_only_new_api_is_nonblocking(self):
         head = self.repo.commit({"cmd/whatomate/main.go": MAIN.replace("println(1)", "println(3)"), sc.MIGRATION_PATH: text(migration(J))})
         result = sc.classify_v2(self.repo.root, self.base, head)
