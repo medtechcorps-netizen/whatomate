@@ -742,5 +742,98 @@ class RollbackMaterialDigestTests(unittest.TestCase):
         self.rejected(replace(exact,live_recipe=replace(recipe,raw=changed,sha256=self.digest(changed))))
 
 
+class RollbackAdmissionResolverTests(unittest.TestCase):
+    """Conditional source preparation retains the original low-span policy."""
+    setUpClass = fixtures.ResolverTests.__dict__['setUpClass']
+    setUp = fixtures.ResolverTests.setUp
+    add = fixtures.ResolverTests.add
+    profile = fixtures.ForwardResolverTests.profile
+    WORKFLOW = fixtures.ForwardResolverTests.WORKFLOW
+    MAIN = fixtures.ForwardResolverTests.MAIN
+    RECIPE = fixtures.ForwardResolverTests.RECIPE
+    scenario = RollbackProofResolverTests.scenario
+    legacy = RollbackResolverTests.legacy
+    closed = RollbackResolverTests.closed
+
+    def admission(self, producer, tag):
+        config, work = self.root / 'config', self.root / 'work'
+        config.mkdir(); work.mkdir()
+        budget = rt.OperationBudget(700, capture=self.world, clock=self.clock)
+        self.client = rt.ReleaseGh(self.gh, fixtures.support.GH_TOKEN, config, work,
+                                  budget=budget, base_env={'SHIP_DO_TOKEN': 'PRIVATE'})
+        return resolver.resolve_rollback_admission(self.client, self.repo, self.git, producer, tag)
+
+    def test_all_v1_does_not_load_or_invent_complete_producer_source(self):
+        target, latest = self.legacy()
+        result = self.admission('f' * 40, target['release'])
+        self.assertIs(type(result), resolver.RollbackResolution)
+        self.assertIsNone(result.resolved.latest.live)
+        self.assertEqual(result.legacy_chain.latest.sha, latest['sha'])
+        self.assertNotIn('f' * 40, {row.sha for row in result.resolved.chain.sources})
+        self.closed()
+
+    def test_one_span_needs_neither_main_producer_nor_proof_material(self):
+        target = self.add(version=1)
+        self.add(db_change='data', dormant=True)
+        result = self.admission('f' * 40, target['release'])
+        self.assertIs(type(result), resolver.RollbackResolution)
+        self.assertEqual(result.decision.non_none_count, 1)
+        self.assertNotIn('f' * 40, {row.sha for row in result.resolved.chain.sources})
+        self.closed()
+
+    def test_latest_selection_keeps_restore_route_without_proof(self):
+        latest = self.add()
+        result = self.admission('f' * 40, latest['release'])
+        self.assertIs(type(result), resolver.RollbackResolution)
+        self.assertEqual(result.resolved.selected, result.resolved.latest)
+        self.assertEqual(result.decision.non_none_count, 0)
+        self.closed()
+
+    def test_multiple_span_returns_full_material_but_never_public_decision(self):
+        producer, target, _first, latest = self.scenario()
+        result = self.admission(producer, target['release'])
+        self.assertIs(type(result), resolver.RollbackProofResolution)
+        self.assertEqual(result.producer.sha, result.resolved.inventory.main_sha)
+        self.assertEqual(result.requirements.non_none_count, 2)
+        self.assertEqual(result.requirements.span[-1][0], latest['release'])
+        with self.assertRaisesRegex(policy.PolicyRefusal, 'rollback-qualification-unavailable'):
+            policy.rollback_plan(result.resolved.chain, target['release'])
+        self.closed()
+
+    def test_multiple_span_requires_actual_captured_main(self):
+        producer, target, _first, _latest = self.scenario()
+        with self.assertRaises(rt.TransportRefusal):
+            self.admission('f' * 40, target['release'])
+        self.closed(True)
+
+    def test_repeated_legacy_producer_sha_requires_complete_profile(self):
+        producer = self.world.main
+        target = self.add(version=1, sha=producer)
+        self.add(db_change='data', dormant=True)
+        latest = self.add(db_change='expand', dormant=True)
+        self.profile(latest['sha'])
+        self.profile(producer)
+        result = self.admission(producer, target['release'])
+        matches = [row for row in result.resolved.chain.sources if row.sha == producer]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].mode, 'reviewed-v0')
+        self.assertEqual(result.resolved.selected.reader, matches[0])
+        self.closed()
+
+    def test_full_intermediate_irreversibility_cannot_be_bypassed_by_lane_count(self):
+        producer, target, _first, _latest = self.scenario()
+        self.add(reversible=False)
+        with self.assertRaisesRegex(policy.PolicyRefusal, '^rollback-irreversible-span$'):
+            self.admission(producer, target['release'])
+        self.closed(True)
+
+    def test_unsupported_raw_material_refuses_without_lower_span_fallback(self):
+        producer, target, _first, _latest = self.scenario()
+        self.world.files[producer, policy.SEEDS] += b'\n'
+        with self.assertRaisesRegex(policy.PolicyRefusal, '^rollback-proof-source-unsupported$'):
+            self.admission(producer, target['release'])
+        self.closed(True)
+
+
 if __name__ == '__main__':
     unittest.main()

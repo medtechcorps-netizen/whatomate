@@ -41,8 +41,11 @@ Do not use it:
    reader version. Image rollback never rewinds that database contract. The
    bounded reviewed-v0 Release implementation accepts spans with fewer than two
    records whose `db_change` is non-`none`, including dormant data records;
-   two or more require exact target/live/span signed
-   rollback compatibility that is not implemented yet, so they refuse. Do not
+   two or more require fresh exact target/live/span signed rollback compatibility
+   through the Release plan and production gates. That route is restricted to
+   the unchanged reviewed-v0 seven-artifact source profile and retains complete
+   same-run custody for the record job. Missing, stale, failed or unsupported
+   evidence refuses before provider access. Do not
    use the console to bypass that refusal. A wholly schema-v1 history uses its
    original equal-catalog source guard. See [Release admission](release.md) and
    [the catalog contract](catalog.md). If live database state is uncertain after

@@ -353,6 +353,19 @@ def resolve_rollback_proof(client: transport.ReleaseGh, repo_dir: Path,
                     forward=False, rollback_proof=True)
 
 
+def resolve_rollback_admission(client: transport.ReleaseGh, repo_dir: Path,
+                               git_binary: Path, producer_sha: str,
+                               target_tag: str) -> RollbackResolution | RollbackProofResolution:
+    """Select the guarded legacy/image-only lane or prepare dedicated evidence.
+
+    Source selection happens inside one original authenticated operation. A
+    proof-shaped result still requires fresh all-head compatibility evidence;
+    this entry never substitutes a normal receipt or removes the public hold.
+    """
+    return _resolve(client, repo_dir, git_binary, target_tag, producer_sha,
+                    forward=False, rollback_admission=True)
+
+
 def _rollback_proof_source(reader, repo_dir, chain, latest, selected, producer):
     requirements = policy._rollback_requirements(chain, selected.release)
     if requirements.non_none_count < 2:
@@ -732,11 +745,14 @@ def _resolve_nullable_profile(client: transport.ReleaseGh, repo_dir: Path,
 
 
 def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False,
-             admission=False, rollback_proof=False, nullable_profile=False):
+             admission=False, rollback_proof=False, nullable_profile=False, rollback_admission=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
     try:
+        if rollback_admission and (forward or rollback or admission or rollback_proof
+                                   or nullable_profile or selected_tag is None):
+            budget.fail("resolver-selection")
         if nullable_profile and (not forward or rollback or admission or rollback_proof or selected_tag is not None):
             budget.fail("resolver-selection")
         if admission and (not forward or rollback or selected_tag is not None):
@@ -745,7 +761,7 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             budget.fail("resolver-selection")
         if rollback_proof and (forward or rollback or admission or selected_tag is None):
             budget.fail("resolver-selection")
-        if (forward or rollback_proof) and (type(candidate_sha) is not str or common.SHA1_RE.fullmatch(candidate_sha) is None):
+        if (forward or rollback_proof or rollback_admission) and (type(candidate_sha) is not str or common.SHA1_RE.fullmatch(candidate_sha) is None):
             budget.fail("resolver-candidate")
         if selected_tag is not None and (type(selected_tag) is not str or
                 (selected_tag != common.BOOTSTRAP_TAG and common.RECORD_TAG_RE.fullmatch(selected_tag) is None)):
@@ -759,6 +775,18 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
         # value has already passed the existing canonical/signature checks.
         raw_records = tuple(records.collect_authenticated_records(client, work_dir=client.work_dir))
         documents = (bootstrap, *(records.validate_manifest(common.loads_strict(row.raw)) for row in raw_records))
+        proof_lane = rollback_proof
+        if rollback_admission:
+            # This provisional wire count only plans complete source loading.
+            # Full normalization, exact target and every intermediate guard
+            # below determine the returned lane. It supplies no policy facts.
+            positions = [index for index, row in enumerate(documents) if row['release'] == selected_tag]
+            if len(positions) != 1:
+                budget.fail("resolver-selection")
+            proof_lane = (documents[-1]['schema_version'] == 2 and
+                sum(records.manifest_facts(row).db_change != 'none' for row in documents[positions[0] + 1:]) >= 2)
+            if proof_lane and candidate_sha != snapshot.main_sha:
+                budget.fail("resolver-main")
         images = (client.verify_selected_images(None),
                   *(client.verify_selected_images(row) for row in raw_records))
         for document, binding in zip(documents, images, strict=True):
@@ -771,7 +799,7 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                     or binding.source_shas != expected_sources):
                 budget.fail("resolver-images")
         legacy, required, readers, commits = _source_requirements(documents, images)
-        if forward or rollback_proof:
+        if forward or proof_lane:
             # Plan this before any facts are decoded: the candidate may be a
             # SHA already seen in the historical v1 prefix. Its complete
             # contract must win there too, with one consistent SourceFacts.
@@ -834,9 +862,9 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                         raise contract.ContractRefusal("contract-label-observation-time")
                     contract.require_contract_label(observation, candidate_sha=candidate_sha,
                         repository_id=transport.REPOSITORY_ID, now=observation.observed_at)
-            if rollback:
+            if rollback or (rollback_admission and not proof_lane):
                 legacy_chain, legacy_classification, decision = _rollback_source(chain, repo_dir, tag)
-            if rollback_proof:
+            if proof_lane:
                 producer = next(fact for fact in facts if fact.sha == candidate_sha)
                 requirements, workflow, materials, target_recipe, live_recipe = _rollback_proof_source(
                     reader, repo_dir, chain, latest, selected, producer)
@@ -855,9 +883,9 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             if nullable_profile:
                 return NullableProfilePreparation(result, *nullable_sources)
             return ForwardAdmission(result, observation) if admission else result
-        if rollback:
+        if rollback or (rollback_admission and not proof_lane):
             return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)
-        if rollback_proof:
+        if proof_lane:
             return RollbackProofResolution(resolved, requirements, producer, workflow,
                 common.sha256_bytes(workflow), materials, target_recipe, live_recipe)
         return resolved
@@ -865,7 +893,7 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
         budget.failed = True
         raise
     except (policy.PolicyRefusal, schema_change.SchemaChangeBlocked):
-        if rollback or rollback_proof:
+        if rollback or rollback_proof or rollback_admission:
             # These two reviewed policy classes carry fixed refusal codes or
             # structured classifier reasons, never arbitrary driver output.
             budget.failed = True

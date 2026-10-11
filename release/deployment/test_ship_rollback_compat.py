@@ -4,7 +4,7 @@ No Git, GH, provider or service process is launched. Test setup derives artifact
 bindings with the actual resolver and private producer; the preflight must then
 independently reconstruct everything through its own three concrete phases.
 """
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 import copy
 from pathlib import Path
@@ -375,6 +375,97 @@ class RollbackPreflightTests(unittest.TestCase):
                 ship.preflight(self.case.repo, self.producer, self.target['release'],
                                **options, **{name: object()})
         self.assertEqual(self.calls, [])
+
+
+class RollbackAdmissionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        RollbackPreflightTests.setUpClass()
+        source.RollbackResolverTests.setUpClass()
+
+    def setUp(self):
+        self.fixture = RollbackPreflightTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+
+    def test_admission_reuses_all_three_concrete_phases_for_multiple_span(self):
+        result = self.fixture.run_preflight(admission=True)
+        self.assertIs(type(result), ship.RollbackPreflight)
+        self.assertEqual(result.resolution, self.fixture.expected)
+        self.assertEqual(result.entry_at, actions.NOW)
+        self.assertIs(ship.validate_preserved(result), result)
+        self.assertEqual([phase for phase, argv, _ in self.fixture.calls if argv[1:] == ['--version']],
+                         ['source-before', 'actions', 'source-after'])
+        self.assertTrue(all(options['timeout'] <= self.fixture.deadline - 100
+                            for _, _, options in self.fixture.calls))
+
+    def test_zero_and_one_spans_do_not_fetch_any_actions_evidence(self):
+        for count in (0, 1):
+            with self.subTest(count=count):
+                self.fixture.scenario(change_count=count, prepare=False)
+                self.fixture.world.capture = mock.Mock(side_effect=AssertionError('Actions must not run'))
+                result = self.fixture.run_preflight(admission=True)
+                self.assertIs(type(result), ship.resolver.RollbackResolution)
+                self.assertEqual(result.decision.non_none_count, count)
+                self.assertEqual({phase for phase, _, _ in self.fixture.calls}, {'source-before'})
+                self.fixture.world.capture.assert_not_called()
+
+    def test_all_v1_uses_real_legacy_guard_and_no_actions_client(self):
+        case = source.RollbackResolverTests()
+        case.setUp(); self.addCleanup(case.doCleanups)
+        target, _latest = case.legacy()
+        calls = []
+        def capture(argv, **options):
+            calls.append(list(argv))
+            self.assertFalse(any('/actions/' in arg for arg in argv))
+            return case.world(argv, **options)
+        result = ship._preflight(case.repo, 'f' * 40, target['release'],
+            gh_binary=case.gh, git_binary=case.git, token=source.fixtures.support.GH_TOKEN,
+            scratch_dir=case.root / 'admission', deadline=700, capture=capture,
+            clock=case.clock, wall_clock=lambda: actions.NOW, base_env={}, admission=True)
+        self.assertIs(type(result), ship.resolver.RollbackResolution)
+        self.assertIsNone(result.resolved.latest.live)
+        self.assertEqual(result.legacy_classification.reasons, ())
+        self.assertEqual(len([args for args in calls if args[1:] == ['--version']]), 1)
+
+    def test_actual_negative_and_missing_evidence_never_downgrade_to_image_only(self):
+        for mode in ('missing', 'negative'):
+            with self.subTest(mode=mode):
+                self.fixture.scenario()
+                if mode == 'missing':
+                    self.fixture.world.runs.clear()
+                else:
+                    self.fixture.replace_history(server_false='read')
+                with self.assertRaises(ship.evidence.CompatRefusal):
+                    self.fixture.run_preflight(admission=True)
+
+    def test_preserved_replay_rejects_favorable_holder_and_original_clock_mutations(self):
+        value = self.fixture.run_preflight(admission=True)
+        changed = (
+            replace(value, qualified=replace(value.qualified, run_id=value.qualified.run_id + 1)),
+            replace(value, entry_at=value.collected.history.observed_at + timedelta(seconds=1)),
+            replace(value, checked_at=value.collected.history.observed_at - timedelta(seconds=1)),
+            replace(value, checked_at=value.artifact_expires_at),
+            replace(value, artifact_expires_at=value.artifact_expires_at + timedelta(seconds=1)),
+            replace(value, command_count=True),
+            replace(value, captured_bytes=ship.normal.MAX_BYTES + 1),
+        )
+        for row in changed:
+            with self.subTest(row=row), self.assertRaises(ship.evidence.CompatRefusal):
+                ship.validate_preserved(row)
+        # Replaying preserved facts never performs a retry-time collection.
+        with mock.patch.object(ship.runtime, 'bounded_command', side_effect=AssertionError('network')):
+            self.assertIs(ship.validate_preserved(value), value)
+
+    def test_public_admission_has_no_supplied_source_receipt_or_clock(self):
+        case = self.fixture.case
+        options = dict(gh_binary=case.gh, git_binary=case.git, token=source.fixtures.support.GH_TOKEN,
+                       scratch_dir=self.fixture.scratch, deadline=self.fixture.deadline)
+        for key in ('resolution', 'qualified', 'collected', 'capture', 'wall_clock', 'admission'):
+            with self.subTest(key=key), self.assertRaises(TypeError):
+                ship.admit(case.repo, self.fixture.producer, self.fixture.target['release'],
+                           **options, **{key: object()})
+        self.assertEqual(self.fixture.calls, [])
 
 
 if __name__ == '__main__':

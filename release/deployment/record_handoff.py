@@ -1,4 +1,4 @@
-"""Closed, bounded transport for preserved promotion data; no trust grant.
+"""Closed, bounded promotion and rollback custody data; no trust grant.
 
 Only protected same-workflow needs.production.outputs custody can authorize the
 decoded data. An unkeyed hash and reconstructed immutable types do not verify
@@ -7,6 +7,8 @@ old artifact download occurs. The operational caller encodes/roundtrips before
 effects and emits only after success. Format6 adds complete original owner
 observations; historical1-5 retain their exact field sets and absence semantics.
 No record-time label collection, new clock or active-contract proof is supplied.
+Separate version7 carries full original rollback qualification under the same
+bounds; promotion1-6 roots and their historical replay remain unchanged.
 Some otherwise valid upstream-max histories exceed these transport limits;
 they refuse before effects. No attempt or source bytes are dropped to make room.
 """
@@ -25,6 +27,8 @@ e, c, p, r, t, d = (writer.evidence, writer.collect, writer.policy,
 s = r.schema_change
 pending = r.pending_source
 contract = writer.contract_authorization
+rp = writer.rollback_preflight
+rh, envelope = rp.history, rp.envelope
 
 VERSION = "6"
 CHUNK_SIZE = 8192
@@ -197,6 +201,58 @@ _SCHEMAS = {
         ("kind", str), ("dormant", bool), ("reasons", _STRINGS), ("summary", _STRINGS),
         ("migration_changes", _STRINGS), ("requirements", _STRINGS))),
 }
+# Version7 is a separate rollback root. None of these types is reachable from
+# the unchanged promotion1-6 root schemas or historical omission rules.
+_SCHEMAS.update({
+    e.ReleaseIdentity: ("compat_evidence.ReleaseIdentity", (
+        ("release", str), ("manifest_sha256", str), ("sha", str), ("web_digest", str))),
+    e.OriginIdentity: ("compat_evidence.OriginIdentity", (("release", str), ("manifest_sha256", str))),
+    e.CatalogTuple: ("compat_evidence.CatalogTuple", (
+        ("catalog_version", int), ("min_reader_version", int), ("catalog_sha256", str),
+        ("data_steps_sha256", str), ("seeds_sha256", str))),
+    e.DatabaseBase: ("compat_evidence.DatabaseBase", (
+        ("mode", str), ("source_sha", str), ("origin", _optional(e.OriginIdentity)),
+        ("catalog", _optional(e.CatalogTuple)))),
+    e.RollbackSpan: ("compat_evidence.RollbackSpan", (("records", int), ("non_none", int), ("sha256", str))),
+    e.RollbackBinding: ("compat_evidence.RollbackBinding", (
+        ("producer_sha", str), ("latest", e.ReleaseIdentity), ("selected", e.ReleaseIdentity),
+        ("database_base", e.DatabaseBase), ("selected_web_source_sha", str),
+        ("live_web_source_sha", str), ("span", e.RollbackSpan), ("source_material_sha256", str))),
+    p.RollbackRequirements: ("record_policy.RollbackRequirements", (
+        ("target", p.PolicyEntry), ("intermediates", _many(p.PolicyEntry)), ("non_none_count", int),
+        ("live", p.LiveContract), ("runtime_source_supported", bool), ("span", _PAIRS), ("span_sha256", str))),
+    r.RollbackSourceMaterial: ("record_resolver.RollbackSourceMaterial", (
+        ("source_sha", str), ("provenance", str), ("blobs", _many(r.BlobObservation)))),
+    r.RollbackProofResolution: ("record_resolver.RollbackProofResolution", (
+        ("resolved", r.ResolvedChain), ("requirements", p.RollbackRequirements), ("producer", p.SourceFacts),
+        ("workflow", bytes), ("workflow_sha256", str), ("materials", _many(r.RollbackSourceMaterial)),
+        ("target_recipe", r.WebRecipe), ("live_recipe", r.WebRecipe))),
+    envelope.WorkflowObservation: ("compat_envelope.WorkflowObservation", (("sha", str), ("raw", _optional(bytes)))),
+    envelope.EnvelopeFacts: ("compat_envelope.EnvelopeFacts", (("raw", bytes),)),
+    rh.RollbackAttempt: ("compat_rollback_history.RollbackAttempt", (
+        ("envelope", envelope.EnvelopeFacts), ("measurement", ("union", e.AuthenticatedPair, e.MissingEvidence)))),
+    rh.RollbackHistory: ("compat_rollback_history.RollbackHistory", (
+        ("producer_sha", str), ("repository", str), ("workflow_path", str), ("observation_id", str),
+        ("observed_at", datetime), ("workflows", _many(envelope.WorkflowObservation)),
+        ("attempts", _many(rh.RollbackAttempt)), ("enumeration", str), ("whole_run_deletion_coverage", str))),
+    rh.CollectedRollbackHistory: ("compat_rollback_history.CollectedRollbackHistory", (
+        ("history", rh.RollbackHistory), ("issues", _STRINGS), ("command_count", int),
+        ("captured_bytes", int), ("transcript_sha256", str))),
+    rh.QualifiedRollback: ("compat_rollback_history.QualifiedRollback", (
+        ("binding", e.RollbackBinding), ("run_id", int), ("run_number", int), ("run_attempt", int),
+        ("requested_at", _optional(datetime)), ("started_at", datetime), ("completed_at", datetime),
+        ("artifact_id", int), ("artifact_name", str), ("result_sha256", str), ("context_sha256", str),
+        ("signer_uri", str), ("workflow_sha", str), ("catalog_sha256", str), ("forward", bool),
+        ("migrations", _many(bool)), ("servers", _many(bool)), ("reversible", bool),
+        ("observation_id", str), ("execution_window", e.ExecutionWindow))),
+    rp.RollbackPreflight: ("ship_rollback_compat.RollbackPreflight", (
+        ("resolution", r.RollbackProofResolution), ("qualified", rh.QualifiedRollback),
+        ("collected", rh.CollectedRollbackHistory), ("command_count", int), ("captured_bytes", int),
+        ("checked_at", datetime), ("artifact_expires_at", datetime), ("entry_at", datetime))),
+    writer.RollbackHandoff: ("record_writer.RollbackHandoff", (
+        ("preflight", rp.RollbackPreflight), ("execution", writer.WorkflowExecution), ("facts", d.ManifestFacts))),
+})
+
 _MISSING = {
     "active": e.MissingEvidence.ACTIVE, "never-started-proven": e.MissingEvidence.NEVER_STARTED,
     "started-incomplete": e.MissingEvidence.STARTED_INCOMPLETE, "artifact-expired": e.MissingEvidence.EXPIRED,
@@ -470,7 +526,7 @@ def _frame(encoded, blobs, *, version=6):
     # the canonical header; raw blobs follow in exact digest order. The outer
     # metadata binds the complete frame's size and SHA256, including this prefix.
     rows = sorted(blobs.items())
-    _need(type(version) is int and version in (3, 4, 5, 6))
+    _need(type(version) is int and version in (3, 4, 5, 6, 7))
     header = _canonical({"version": version, "handoff": encoded,
         "blobs": [{"sha256": digest, "length": len(raw)} for digest, raw in rows]})
     size = 4 + len(header) + sum(len(raw) for _, raw in rows)
@@ -492,7 +548,7 @@ def _unframe(raw, *, version=6):
     size = int.from_bytes(raw[:4], "big")
     _need(0 < size <= MAX_RAW - 4 and 4 + size <= len(raw))
     value = _json(raw[4:4 + size])
-    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4, 5, 6))
+    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4, 5, 6, 7))
     rows = value["blobs"]
     _need(type(rows) is list and 1 <= len(rows) <= MAX_BLOBS)
     offset, total, previous, blobs = 4 + size, 0, "", {}
@@ -626,6 +682,91 @@ def encode(handoff):
         if item:
             writer.common.require_public_text(item)
     restored = decode(outputs, candidate_sha=handoff.candidate_images.sha,
+        workflow_sha=handoff.execution.workflow_sha, run_id=handoff.execution.run_id, record_attempt=1)
+    _need(restored == handoff)
+    return outputs
+
+
+def _unpack_rollback(outputs):
+    _exact(outputs, OUTPUT_KEYS)
+    _need(all(type(value) is str and len(value) <= CHUNK_SIZE and value.isascii() for value in outputs.values())
+          and outputs["handoff_version"] == "7"
+          and writer.common.SHA256_RE.fullmatch(outputs["handoff_sha256"]))
+    encoded_size = _length(outputs["handoff_encoded_length"], MAX_ENCODED)
+    compressed_size = _length(outputs["handoff_compressed_length"], MAX_COMPRESSED)
+    raw_size = _length(outputs["handoff_raw_length"], MAX_RAW)
+    count = _length(outputs["handoff_chunk_count"], len(CHUNK_SLOTS))
+    _need(count == (encoded_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    for index, key in enumerate(CHUNK_SLOTS):
+        expected = CHUNK_SIZE if index < count - 1 else encoded_size - CHUNK_SIZE * index if index == count - 1 else 0
+        _need(len(outputs[key]) == expected)
+    text = "".join(outputs[key] for key in CHUNK_SLOTS)
+    _need(len(text) == encoded_size)
+    compressed = _unb64(text, MAX_COMPRESSED)
+    _need(len(compressed) == compressed_size)
+    raw = _xz_inflate(compressed, raw_size)
+    _need(len(raw) == raw_size
+          and writer.common.sha256_bytes(raw) == outputs["handoff_sha256"])
+    return raw
+
+
+
+def _replay_rollback(handoff, producer_sha, target_release, workflow_sha, run_id, record_attempt):
+    _need(type(producer_sha) is str and writer.common.SHA1_RE.fullmatch(producer_sha)
+          and type(workflow_sha) is str and writer.common.SHA1_RE.fullmatch(workflow_sha)
+          and type(target_release) is str and (target_release == writer.common.BOOTSTRAP_TAG
+              or writer.common.RECORD_TAG_RE.fullmatch(target_release))
+          and type(run_id) is int and 1 <= run_id <= MAX_INTEGER
+          and type(record_attempt) is int and 1 <= record_attempt <= MAX_INTEGER)
+    _need(type(handoff) is writer.RollbackHandoff
+          and handoff.preflight.resolution.producer.sha == producer_sha
+          and handoff.preflight.resolution.resolved.selected.release == target_release
+          and handoff.execution == writer.WorkflowExecution(writer.common.REPOSITORY,
+              d.SHIP_SIGNER, workflow_sha, run_id, 1))
+    _need(writer.prepare_rollback(handoff.preflight, handoff.execution) == handoff)
+    return handoff
+
+
+@_public
+def decode_rollback(outputs, *, producer_sha, target_release, workflow_sha, run_id, record_attempt):
+    """Only closed version7 rollback custody; no promotion fallback or clock."""
+    raw = _unpack_rollback(outputs)
+    value, blobs = _unframe(raw, version=7)
+    budget = _Budget(blobs, version=7)
+    handoff = _value(value["handoff"], writer.RollbackHandoff, budget, 0, encoding=False)
+    _need(budget.used == budget.blobs.keys())
+    return _replay_rollback(handoff, producer_sha, target_release, workflow_sha, run_id, record_attempt)
+
+
+@_public
+def build_rollback_record(outputs, *, producer_sha, target_release, workflow_sha, run_id,
+                          record_attempt, publication, current_resolution, reconciled=False):
+    """The caller checks published exact-byte idempotency before this replay."""
+    handoff = decode_rollback(outputs, producer_sha=producer_sha, target_release=target_release,
+        workflow_sha=workflow_sha, run_id=run_id, record_attempt=record_attempt)
+    return writer.build_qualified_rollback(handoff, publication, current_resolution, reconciled=reconciled)
+
+
+@_public
+def encode_rollback(handoff):
+    """Precompute the whole retained history before effects; never truncate."""
+    budget = _Budget(version=7)
+    encoded = _value(handoff, writer.RollbackHandoff, budget, 0, encoding=True)
+    raw = _frame(encoded, budget.blobs, version=7)
+    compressed = _xz_compress(raw)
+    _need(0 < len(compressed) <= MAX_COMPRESSED)
+    text = _b64(compressed); _need(len(text) <= MAX_ENCODED)
+    count = (len(text) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    outputs = {"handoff_version": "7", "handoff_sha256": writer.common.sha256_bytes(raw),
+        "handoff_raw_length": str(len(raw)), "handoff_compressed_length": str(len(compressed)),
+        "handoff_encoded_length": str(len(text)), "handoff_chunk_count": str(count)}
+    outputs.update((key, text[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]) for i, key in enumerate(CHUNK_SLOTS))
+    for key, item in outputs.items():
+        _need(writer.common.OUTPUT_KEY_RE.fullmatch(key) and writer.common.OUTPUT_VALUE_RE.fullmatch(item))
+        if item:
+            writer.common.require_public_text(item)
+    restored = decode_rollback(outputs, producer_sha=handoff.preflight.resolution.producer.sha,
+        target_release=handoff.preflight.resolution.resolved.selected.release,
         workflow_sha=handoff.execution.workflow_sha, run_id=handoff.execution.run_id, record_attempt=1)
     _need(restored == handoff)
     return outputs

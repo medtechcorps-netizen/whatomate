@@ -324,7 +324,7 @@ class FlowTests(unittest.TestCase):
         fields = {**self.fields, 'kind': 'restore', 'release': 'prod-20261011T120000Z-' + current.latest.record_sha[:8],
             'sha': current.latest.record_sha, 'images': dict(current.latest.images),
             'previous': current.latest.release, 'rolled_back_from': None, 'built_at': None}
-        self.ctx.env['SHIP_TARGET_RELEASE'] = current.latest.release
+        self.ctx.env = {'SHIP_TARGET_RELEASE': current.latest.release}
         with mock.patch.object(flow.ship_records, 'rollback', return_value=rollback):
             raw, state = self.record(fields, current)
         self.assertEqual(state, 'absent')
@@ -386,6 +386,83 @@ class FlowTests(unittest.TestCase):
         self.ctx.env.update({'REC_' + key.upper(): text for key, text in output.items()})
         with mock.patch.object(flow.ship_compat, 'preflight', side_effect=AssertionError('no new admission')):
             self.assertEqual(self.record(), (self.raw, 'absent'))
+
+
+class QualifiedRollbackFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.case, self.handoff = fixture.rollback_fixture(self)
+        self.preflight = self.handoff.preflight
+        self.gate = flow.Gate(self.preflight.resolution.resolved, None, None, self.preflight)
+        self.control = dict(sha=self.preflight.resolution.producer.sha,
+            workflow_sha=self.handoff.execution.workflow_sha,
+            run_id=str(self.handoff.execution.run_id), run_attempt=1)
+        self.encoded = flow.rollback_outputs(self.gate, self.control)
+        self.current = fixture.rollback_plain(self.case)
+        self.raw = w.build_qualified_rollback(self.handoff,
+            fixture.rollback_publication(self.handoff), self.current)
+        self.fields = fields_from(self.raw)
+        self.ctx = SimpleNamespace(repo_dir=self.case.case.repo,
+            env={'SHIP_TARGET_RELEASE': self.preflight.resolution.resolved.selected.release,
+            **{'REC_' + key.upper(): value for key, value in self.encoded.items()}})
+        self.deadline = time.monotonic() + 600
+
+    def record(self, *, fields=None, control=None):
+        with mock.patch.object(flow, 'read', return_value=self.current) as read:
+            result = flow.record_bytes(self.ctx, control or self.control,
+                fields or self.fields, deadline=self.deadline)
+        self.assertEqual(read.call_args.kwargs['deadline'], self.deadline)
+        return result
+
+    def test_summary_and_all_fixed_outputs_keep_exact_target_live_and_producer(self):
+        self.assertEqual(set(self.encoded), set(flow.record_handoff.OUTPUT_KEYS))
+        self.assertEqual(self.encoded['handoff_version'], '7')
+        self.assertEqual(flow.record_handoff.decode_rollback(self.encoded,
+            producer_sha=self.control['sha'], workflow_sha=self.control['workflow_sha'],
+            target_release=self.ctx.env['SHIP_TARGET_RELEASE'], run_id=int(self.control['run_id']),
+            record_attempt=1), self.handoff)
+        lines = flow.details(self.gate)
+        self.assertIn('- Producer source: ' + self.control['sha'], lines)
+        self.assertIn('- Complete span SHA256: ' + self.preflight.resolution.requirements.span_sha256, lines)
+        self.assertIn('- Database changes after the exact target: 2', lines)
+        self.assertTrue(all(c.OUTPUT_VALUE_RE.fullmatch(value) for value in self.encoded.values()))
+
+    def test_mixed_receipt_sources_or_execution_cannot_encode_rollback(self):
+        for gate, control in ((replace(self.gate, normal=object()), self.control),
+                (replace(self.gate, rollback=object()), self.control),
+                (replace(self.gate, resolved=self.current), self.control),
+                (self.gate, {**self.control, 'sha': 'f' * 40}),
+                (self.gate, {**self.control, 'workflow_sha': 'f' * 40}),
+                (self.gate, {**self.control, 'run_attempt': 2})):
+            with self.subTest(gate=type(gate).__name__), self.assertRaises(c.ReleaseError):
+                flow.rollback_outputs(gate, control)
+
+    def test_record_retry_replays_original_custody_with_fresh_plain_parent_only(self):
+        self.assertNotEqual(self.current.inventory.main_sha, self.control['sha'])
+        self.assertNotIn(self.control['sha'], {source.sha for source in self.current.chain.sources})
+        with mock.patch.object(flow.ship_rollback_compat, 'admit', side_effect=AssertionError('new admission')):
+            self.assertEqual(self.record(control={**self.control, 'run_attempt': 3}), (self.raw, 'absent'))
+
+    def test_record_rejects_changed_target_run_and_normal_protocol(self):
+        original = dict(self.ctx.env)
+        self.ctx.env['SHIP_TARGET_RELEASE'] = self.preflight.resolution.requirements.intermediates[0].release
+        with self.assertRaises(c.ReleaseError): self.record()
+        self.ctx.env = original
+        with self.assertRaises(c.ReleaseError):
+            self.record(control={**self.control, 'run_id': str(int(self.control['run_id']) + 1)})
+        self.ctx.env['REC_HANDOFF_VERSION'] = '6'
+        with self.assertRaises(c.ReleaseError): self.record()
+
+    def test_missing_custody_cannot_enable_the_guarded_no_proof_policy(self):
+        for key in flow.record_handoff.OUTPUT_KEYS: self.ctx.env['REC_' + key.upper()] = ''
+        # The real public policy remains the refusal. The source read boundary
+        # below exposes that refusal; it never supplies a favorable decision.
+        with self.assertRaisesRegex(p.PolicyRefusal, 'rollback-qualification-unavailable') as expected:
+            p.rollback_plan(self.preflight.resolution.resolved.chain, self.ctx.env['SHIP_TARGET_RELEASE'])
+        with mock.patch.object(flow, '_options', return_value={'deadline': self.deadline}), \
+                mock.patch.object(flow.ship_records, 'rollback', side_effect=expected.exception) as read:
+            with self.assertRaisesRegex(c.ReleaseError, '^record-chain-invalid:policy$'):
+                self.record()
+        self.assertEqual(read.call_args.kwargs['deadline'], self.deadline)
 
 
 class ForwardSummaryTests(unittest.TestCase):

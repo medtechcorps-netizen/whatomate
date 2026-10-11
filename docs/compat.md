@@ -451,14 +451,15 @@ to captured current `main`; supplying a target does not authorize a deployment.
 Read-only source preparation for that experiment uses a distinct resolution.
 It binds the producer to captured current `main`, keeps both actual signed web-image
 sources separate from their release records and the retained database origin, and
-retains the complete ordered target-through-latest span. The first preparatory
+retains the complete ordered target-through-latest span. The
 source gate requires the same seven active artifacts across complete producer and
 span source material, in addition to the existing five fixed v0 profile pins; it
 therefore refuses seed or registry transitions. Only the existing exact released
 source exception permits absent profile/overlay files at a legacy image endpoint.
 This is source consistency data, not a measured database result or signed rollback
-proof. Normal snapshot4/context3 and the operational multi-span rollback refusal
-remain unchanged.
+proof. Normal snapshot4/context3 and the standalone no-proof rollback refusal
+remain unchanged; the operational qualified route additionally requires fresh
+signed evidence and complete custody.
 
 The private rollback producer consumes that distinct resolution and keeps three
 image roles separate: the exact signed target runs as the previous application,
@@ -497,9 +498,17 @@ but remains eligible for the unchanged workflow's upload and independent signing
 infrastructure, partial-write, failed-upload and cancellation paths do not become
 ready evidence. The workflow bytes, permissions and limits are unchanged.
 
-Operational rollback across two or more non-none changes, its record-job custody
-and writer integration remain held. Zero/one-change requests do not need this
-proof, and an all-v1 chain cannot invent the required retained v2 live contract.
+Operational rollback across two or more non-none changes uses the dedicated
+fresh source/collection/source gate in both plan and production. Before any
+provider request, it serializes and replays complete format-7 rollback custody,
+then rechecks the selected artifact's expiry at full UTC precision. Missing,
+negative, stale, oversized or mismatched evidence refuses. Successful PUT and
+reconcile both carry that custody to the record job. Zero/one-change requests do
+not fetch this proof, and an all-v1 chain cannot invent a retained v2 live contract.
+The source gate still requires the unchanged reviewed-v0 seven-artifact profile;
+this is not support for arbitrary multi-DDL histories. The record preserves the
+live database tuple, writes the selected image sources and replays original-time
+qualification without fetching expired artifacts or substituting current main.
 The normal snapshot4/context3 contract is unchanged; rollback context4 makes no
 claim about unapplied pending plans. Local synthetic routing and verifier tests
 do not establish exact-source hosted rollback qualification.
@@ -547,7 +556,8 @@ The current normal admission requires the source-bound context-v3 pair;
 historical context-v1/v2 positives do not establish this newer contract. Their
 actual false flags remain available for negative auditing. Exact old context-v2
 record retries retain a separate closed historical replay path.
-Operational multi-span rollback and active schema changes remain unsupported.
+Active schema changes remain unsupported. The qualified rollback route is
+separate from normal evidence and never accepts a normal forward receipt.
 
 After successful upload, a separate guarded `evidence_ready` output permits
 the `attest` job on push or dispatch, including a complete measured negative.
@@ -636,8 +646,8 @@ for this non-main-base PR; it supplies no main-release authority or active
 DDL/data proof.
 
 Active semantic expansion and contract proof, hosted permission qualification,
-dedicated multi-span rollback
-proof and compatibility-outage bypass remain unfinished PR16 work. Visible API
+actual dedicated multi-span rollback
+qualification and compatibility-outage bypass remain unfinished PR16 work. Visible API
 pagination cannot establish absence of entirely deleted runs, so it does not
 authorize an outage bypass. This partial implementation does not complete the
 canonical plan or enable active DDL/data. The PR8 qualification prerequisite and
@@ -852,7 +862,7 @@ and complete repeated inventories. Fatal collection issues require incomplete
 coverage and cannot qualify. Coverage remains `complete-visible`; whole-run
 deletion detection is explicitly unavailable.
 
-The preparatory concrete collector now uses the fixed repository and workflow
+The concrete rollback collector uses the fixed repository and workflow
 API, enumerates all visible main push/dispatch heads without head/status/date
 filters, and reads each head's immutable workflow through the owned Git reader.
 It retains every attempt's closed raw run/job/check/artifact envelope and verifies
@@ -863,14 +873,28 @@ workflow source never borrows the current producer's execution window.
 The collector shares one already-open caller allowance across Git, API and
 signature subprocesses, binds its returned observation to actual captured
 transcripts, and closes that collection phase on return or refusal. It does not
-activate an operational caller. The preparatory rollback preflight now resolves
+itself authorize provider effects. The rollback preflight resolves
 complete signed source before and after collection using three fresh, closed
 phase budgets under one original outer allowance. It requires complete source
 equality, exact history qualification and a final check of the selected artifact's
 expiry. It preserves the original history observation time rather than treating
 the final source read as a fresh Actions observation. The returned result is data,
-not operational permission. Public rollback across two or more non-none
-intermediates still refuses. Existing normal collection predicates are unchanged.
+not transferable operational permission. The protected plan and production
+callers construct this result internally for spans of two or more non-none
+records, repeat admission independently and require complete format-7 custody
+before provider access. The standalone no-proof rollback API still refuses
+such spans. Existing normal collection predicates are unchanged.
+
+Format 7 retains all raw source and history inputs rather than a winning receipt
+alone. The record job replays qualification at the original captured times and
+requires the exact signed parent, target, producer and workflow execution.
+It accepts a later plain chain read that omits only the original authenticated
+producer enrichment; it never substitutes later main or fetches old artifacts.
+Exact already-published record bytes remain the first idempotency path.
+Formats 1-6 keep their existing promotion schemas and historical replay routes.
+These code paths and controlled tests do not establish an actual multi-change
+production history, exact-source hosted rollback qualification or deleted-run
+coverage. Existing all-v1 production history remains all-v1.
 
 The preflight and unchanged normal preflight passed 63 synthetic cases (22 new
 rollback cases and 41 normal cases), including source and inventory drift,

@@ -1091,6 +1091,8 @@ class PostGateHarness(Harness):
             autospec=True, side_effect=self._gate))
         case.enterContext(mock.patch.object(self.ship.ship_flow, "promotion_outputs",
             autospec=True, side_effect=self._promotion_outputs))
+        case.enterContext(mock.patch.object(self.ship.ship_flow, "rollback_outputs",
+            autospec=True, side_effect=self._rollback_outputs))
         case.enterContext(mock.patch.object(self.ship.ship_flow, "record_bytes",
             autospec=True, side_effect=self._record_bytes))
         case.enterContext(mock.patch.object(self.ship.ship_flow, "verify_published",
@@ -1122,13 +1124,19 @@ class PostGateHarness(Harness):
                 images=tuple(entry.images.items()), actual_web_source_sha=entry.sha, live=None)
         # Deliberately simple test data, not a forged authenticated dataclass.
         resolved = SimpleNamespace(chain=chain, latest=projection(chain.latest), selected=projection(selected))
-        return SimpleNamespace(resolved=resolved, classification=classification, normal=None, rollback=None)
+        return SimpleNamespace(resolved=resolved, classification=classification, normal=None, rollback=None,
+                               qualified_rollback=None)
 
     def _promotion_outputs(self, value: Any, control: Mapping[str, Any], images: Mapping[str, str],
                            *, staging: str, private: Iterable[str] = ()) -> dict[str, str]:
         self.flow_calls.append(dict(operation="promotion_outputs", sha=control["sha"],
                                     images=dict(images), staging=staging))
         return {}  # Explicitly invalid for a real schema2 record job.
+
+    def _rollback_outputs(self, value: Any, control: Mapping[str, Any],
+                          *, private: Iterable[str] = ()) -> None:
+        self.flow_calls.append(dict(operation="rollback_outputs", sha=control["sha"]))
+        return None  # Explicit legacy-only post-gate provider fixture.
 
     def _record_bytes(self, ctx: Any, control: Mapping[str, Any], fields: Mapping[str, Any], *, deadline: float) -> tuple[bytes, str]:
         self.flow_calls.append(dict(operation="legacy-record-bytes", deadline=deadline))

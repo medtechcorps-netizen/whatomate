@@ -19,6 +19,7 @@ import ship_flow as flow
 import test_ship_compat as fixtures
 import test_ship_support as support
 import test_record_writer as writer_fixture
+import test_ship_rollback_compat as rollback_fixture
 
 c = ship.common
 
@@ -74,7 +75,7 @@ class CallerTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(flow.shutil, 'which', return_value=str(self.case.git)))
             clock_module = SimpleNamespace(monotonic=self.case.clock)
-            for module in (ship, flow, flow.ship_compat, flow.ship_records):
+            for module in (ship, flow, flow.ship_compat, flow.ship_records, flow.ship_rollback_compat):
                 stack.enter_context(mock.patch.object(module, 'time', clock_module))
             # Keep the real datetime type and all concrete policy checks. Only
             # the existing private wall-clock seam receives deterministic UTC.
@@ -271,6 +272,235 @@ class CallerTests(unittest.TestCase):
 
     def test_mixed_chain_restore_records_current_live_contract_without_normal_proof(self):
         self.image_only(restore=True)
+
+
+class QualifiedRollbackCallerTests(unittest.TestCase):
+    """Full source/verifier/custody/writer route, with only external I/O faked."""
+    @classmethod
+    def setUpClass(cls):
+        rollback_fixture.RollbackPreflightTests.setUpClass()
+
+    def setUp(self):
+        self.fixture = rollback_fixture.RollbackPreflightTests()
+        self.fixture.setUp(); self.addCleanup(self.fixture.doCleanups)
+        self.case = self.fixture.case
+        root = self.case.root
+        self.now = rollback_fixture.actions.NOW
+        self.sha = self.fixture.producer
+        self.gh = self.case.world.fake
+        self.env = support.context_env(self.sha, root)
+        self.env['SHIP_GH_BIN'] = str(self.case.gh)
+        selected = self.fixture.expected.resolved.selected
+        latest = self.fixture.expected.resolved.latest
+        self.env.update(SHIP_MODE='rollback', SHIP_TARGET_RELEASE=selected.release,
+            PLAN_LATEST_RELEASE=latest.release, PLAN_LATEST_MANIFEST_SHA256=latest.manifest_sha256,
+            PLAN_TARGET_RELEASE=selected.release, PLAN_TARGET_MANIFEST_SHA256=selected.manifest_sha256)
+        self.target = root / 'target.json'; self.target.write_bytes(support.canonical(support.make_target()))
+        self.policy = root / 'ship.trivyignore'; self.policy.write_bytes(b'# no exceptions\n')
+        self.do = support.FakeDO(spec=support.make_spec(dict(latest.images)), backups=[{
+            'created_at': c.format_timestamp(self.now - timedelta(hours=2)), 'size_gigabytes': 0.03}])
+        self.https = support.FakeHttps()
+        self.output = io.StringIO(); self.sleeps = []
+        self.deps = ship.Deps(clock=lambda: self.now, sleeper=self.sleeps.append,
+            opener=self.do, gh_runner=self.gh, https_request=self.https, stdout=self.output,
+            repo_dir=self.case.repo, target_path=self.target, trivy_policy_path=self.policy,
+            poll_limit=8, smoke_rounds=2, smoke_delay=0)
+
+    outputs = CallerTests.outputs
+    to_record = CallerTests.to_record
+
+    def run_command(self, *args):
+        for sha, raw in self.fixture.world.workflow_bytes.items():
+            self.case.world.commits.add(sha)
+            if raw is not None:
+                self.case.world.files[sha, flow.ship_rollback_compat.evidence.WORKFLOW] = raw
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(flow.shutil, 'which', return_value=str(self.case.git)))
+            clock_module = SimpleNamespace(monotonic=self.case.clock)
+            for module in (ship, flow, flow.ship_compat, flow.ship_records, flow.ship_rollback_compat):
+                stack.enter_context(mock.patch.object(module, 'time', clock_module))
+            original = flow.ship_rollback_compat._preflight
+            def preflight(*args, **kwargs):
+                kwargs['wall_clock'] = lambda: self.now
+                return original(*args, **kwargs)
+            stack.enter_context(mock.patch.object(flow.ship_rollback_compat, '_preflight', side_effect=preflight))
+            stack.enter_context(mock.patch.object(flow.ship_rollback_compat.runtime, 'bounded_command', self.fixture.capture))
+            return ship.main(list(args), self.env, self.deps)
+
+    def production(self):
+        return CallerTests.production(self, 'rollback')
+
+    def record_raw(self):
+        return (Path(self.env['RUNNER_TEMP']) / 'ship-record' / 'release-manifest.json').read_bytes()
+
+    def test_plan_production_and_retention_independent_record_use_complete_dedicated_proof(self):
+        self.assertEqual(self.run_command('plan'), ship.EXIT_OK, self.output.getvalue())
+        previous_reads = self.fixture.world.workflow_reads
+        self.now += timedelta(seconds=1)
+        self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(self.fixture.world.workflow_reads, previous_reads + 2)
+        self.assertEqual(self.do.put_count(), 1)
+        self.assertEqual(len(self.https.calls), 6)
+        outputs = self.to_record()
+        self.assertEqual(outputs['handoff_version'], '7')
+        original = self.fixture.expected
+        handoff = flow.record_handoff.decode_rollback(
+            {key: outputs[key] for key in flow.record_handoff.OUTPUT_KEYS}, producer_sha=self.sha,
+            target_release=original.resolved.selected.release, workflow_sha=self.sha,
+            run_id=int(self.env['GITHUB_RUN_ID']), record_attempt=1)
+        self.assertEqual(handoff.preflight.resolution, original)
+        self.assertEqual(handoff.preflight.checked_at, self.now)
+        self.assertEqual(handoff.preflight.collected.history.attempts[0].measurement.context,
+                         self.fixture.world.pairs[100, 1].context)
+        # Record publication may happen after main moves and artifact retention
+        # ends. Only preserved original custody and a fresh exact parent apply.
+        self.case.world.main = 'f' * 40
+        self.now += timedelta(days=400)
+        self.fixture.world.capture = mock.Mock(side_effect=AssertionError('expired Actions'))
+        self.env['GITHUB_RUN_ATTEMPT'] = '2'
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_OK, self.output.getvalue())
+        raw = self.record_raw(); doc = c.loads_strict(raw)
+        self.assertEqual((doc['schema_version'], doc['kind'], doc['sha'], doc['compat'], doc['old_server_ok']),
+                         (2, 'rollback', original.resolved.selected.record_sha, 'ok', True))
+        self.assertEqual(doc['compat_run_id'], 100)
+        self.assertEqual(doc['images'], dict(original.resolved.selected.images))
+        self.assertEqual(doc['previous'], original.resolved.latest.release)
+        self.assertEqual(doc['rolled_back_from'], original.resolved.latest.release)
+        self.assertEqual({key: doc[key] for key in original.requirements.live.catalog._fields},
+                         original.requirements.live.catalog._asdict())
+        self.assertIsNone(doc['fixed_forward_from'])
+        self.assertNotEqual(doc['sha'], self.sha)
+        self.gh.attested_files[hashlib.sha256(raw).hexdigest()] = self.sha
+        self.assertEqual(self.run_command('record', '--stage', 'publish'), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(self.run_command('record', '--stage', 'verify'), ship.EXIT_OK, self.output.getvalue())
+        self.env['GITHUB_RUN_ATTEMPT'] = '3'
+        for key in flow.record_handoff.OUTPUT_KEYS:
+            self.env['REC_' + key.upper()] = ''
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(self.record_raw(), raw)
+        self.assertEqual(self.outputs()['state'], 'published')
+        self.fixture.world.capture.assert_not_called()
+        self.assertEqual(self.do.put_count(), 1)
+
+    def test_reconcile_success_carries_same_complete_custody_without_put(self):
+        selected = self.fixture.expected.resolved.selected
+        self.do = support.FakeDO(spec=support.make_spec(dict(selected.images)), backups=self.do.backups)
+        self.deps.opener = self.do
+        self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        outputs = self.to_record()
+        self.assertEqual((outputs['reconciled'], outputs['handoff_version']), ('true', '7'))
+        self.assertEqual(self.do.put_count(), 0)
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_OK, self.output.getvalue())
+        doc = c.loads_strict(self.record_raw())
+        self.assertTrue(doc['reconciled'])
+        self.assertEqual((doc['compat'], doc['old_server_ok']), ('ok', True))
+
+    def test_missing_or_actual_negative_refuses_before_any_provider_construction(self):
+        for mode in ('missing', 'negative'):
+            with self.subTest(mode=mode):
+                if mode == 'missing': self.fixture.world.runs.clear()
+                else: self.fixture.replace_history(server_false='read')
+                with mock.patch.object(ship.do_app, 'DOAppClient', side_effect=AssertionError('provider')) as client:
+                    self.assertEqual(self.run_command('plan'), ship.EXIT_REFUSED, self.output.getvalue())
+                    self.assertEqual(self.production(), ship.EXIT_REFUSED, self.output.getvalue())
+                client.assert_not_called()
+        self.assertEqual(self.do.requests, [])
+        self.assertFalse(any(key.startswith('handoff_') for key in self.outputs()))
+
+    def test_successful_plan_does_not_cover_new_negative_at_production(self):
+        self.assertEqual(self.run_command('plan'), ship.EXIT_OK, self.output.getvalue())
+        self.fixture.replace_history(server_false='workers')
+        with mock.patch.object(ship.do_app, 'DOAppClient', side_effect=AssertionError('provider')) as client:
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.output.getvalue())
+        client.assert_not_called()
+        self.assertIn('candidate-invalid:compat-old-server-incompatible', self.output.getvalue())
+
+    def test_later_unknown_foreign_head_cannot_be_filtered_out(self):
+        self.fixture.world.add(run=101, number=11, minute=30, sha='e' * 40,
+                               missing=flow.compat_evidence.MissingEvidence.MISSING)
+        self.fixture.world.workflow_bytes['e' * 40] = None
+        with mock.patch.object(ship.do_app, 'DOAppClient', side_effect=AssertionError('provider')) as client:
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.output.getvalue())
+        client.assert_not_called()
+
+    def test_custody_size_failure_occurs_before_provider_and_emits_no_handoff(self):
+        with mock.patch.object(flow.record_handoff, 'MAX_ENCODED', 8192), \
+                mock.patch.object(ship.do_app, 'DOAppClient', side_effect=AssertionError('provider')) as client:
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.output.getvalue())
+        client.assert_not_called()
+        self.assertIn('record-invalid:handoff', self.output.getvalue())
+        self.assertEqual(self.outputs(), {})
+
+    def test_expiry_after_custody_preparation_refuses_before_provider(self):
+        original = flow.record_handoff.encode_rollback
+        def encode(value):
+            encoded = original(value)
+            self.now = value.preflight.artifact_expires_at
+            return encoded
+        with mock.patch.object(flow.record_handoff, 'encode_rollback', side_effect=encode), \
+                mock.patch.object(ship.do_app, 'DOAppClient', side_effect=AssertionError('provider')) as client:
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.output.getvalue())
+        client.assert_not_called()
+        self.assertIn('candidate-invalid:compat-stale', self.output.getvalue())
+
+    def test_real_default_clock_retains_fractional_same_second_before_provider(self):
+        self.now = self.now.replace(microsecond=900000)
+        actual_dt = ship.dt
+        clock_source = SimpleNamespace(datetime=SimpleNamespace(now=lambda timezone: self.now),
+            timezone=actual_dt.timezone, timedelta=actual_dt.timedelta)
+        with mock.patch.object(ship, 'dt', clock_source):
+            self.deps.clock = ship.Deps().clock
+            self.assertEqual(self.deps.clock(), self.now)
+            self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+            outputs = self.to_record()
+            original = flow.record_handoff.decode_rollback(
+                {key: outputs[key] for key in flow.record_handoff.OUTPUT_KEYS}, producer_sha=self.sha,
+                target_release=self.fixture.target['release'], workflow_sha=self.sha,
+                run_id=int(self.env['GITHUB_RUN_ID']), record_attempt=1)
+        self.assertEqual(original.preflight.checked_at, self.now)
+        self.assertEqual(outputs['deployed_at'], c.format_timestamp(self.now))
+        self.assertEqual(self.do.put_count(), 1)
+
+    def test_backward_fractional_clock_after_custody_refuses_before_provider(self):
+        self.now = self.now.replace(microsecond=900000)
+        original = flow.record_handoff.encode_rollback
+        def encode(value):
+            encoded = original(value)
+            self.now = value.preflight.checked_at - timedelta(microseconds=1)
+            return encoded
+        with mock.patch.object(flow.record_handoff, 'encode_rollback', side_effect=encode), \
+                mock.patch.object(ship.do_app, 'DOAppClient', side_effect=AssertionError('provider')) as client:
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.output.getvalue())
+        client.assert_not_called()
+        self.assertIn('candidate-invalid:compat-stale', self.output.getvalue())
+
+    def test_one_microsecond_before_expiry_passes_exact_provider_boundary(self):
+        original = flow.record_handoff.encode_rollback
+        def encode(value):
+            encoded = original(value)
+            self.now = value.preflight.artifact_expires_at - timedelta(microseconds=1)
+            self.do.backups = [{'created_at': c.format_timestamp(self.now - timedelta(hours=2)),
+                                'size_gigabytes': 0.03}]
+            return encoded
+        with mock.patch.object(flow.record_handoff, 'encode_rollback', side_effect=encode):
+            self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(self.do.put_count(), 1)
+        self.assertEqual(len(self.https.calls), 6)
+        self.assertEqual(self.outputs()['handoff_version'], '7')
+
+    def test_changed_target_custody_or_parent_refuses_record_without_another_put(self):
+        self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        outputs = self.to_record()
+        original_target = self.env['SHIP_TARGET_RELEASE']
+        self.env['SHIP_TARGET_RELEASE'] = self.fixture.expected.resolved.chain.entries[2].release
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_REFUSED, self.output.getvalue())
+        self.env['SHIP_TARGET_RELEASE'] = original_target
+        self.env['REC_HANDOFF_01'] = ''
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_REFUSED, self.output.getvalue())
+        self.env['REC_HANDOFF_01'] = outputs['handoff_01']
+        self.case.add(kind='restore')
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_REFUSED, self.output.getvalue())
+        self.assertEqual(self.do.put_count(), 1)
 
 
 if __name__ == '__main__':

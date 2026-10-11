@@ -12,7 +12,8 @@ New promotion qualification uses the preserved predeployment capture. It never
 reinterprets later main as the deployed candidate or fetches expired evidence.
 Already published exact bytes use a separate idempotency path first. Image-only
 v2 records require a retained live contract; absent legacy metadata, outage
-bypass, multi-span qualification, and PR20 fixed-forward remain unsupported.
+bypass, unqualified multi-span transitions, and PR20 fixed-forward remain unsupported.
+The dedicated rollback handoff replays complete current-v0 qualification.
 """
 from dataclasses import dataclass
 from functools import wraps
@@ -23,6 +24,7 @@ import compat_request as request
 import record_resolver as resolver
 import forward_gates
 import contract_authorization
+import ship_rollback_compat as rollback_preflight
 
 policy, records, common, transport = resolver.policy, resolver.records, resolver.common, resolver.transport
 
@@ -373,3 +375,68 @@ def published_state(current_resolution, raw):
     _need(matches == (chain.entries[-1],) and matches[0].record.raw == raw
           and matches[0].record.manifest_sha256 == common.sha256_bytes(raw), "record-writer-published-conflict")
     return "published"
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackHandoff:
+    """Complete original exact-target inputs; external same-run custody required."""
+    preflight: rollback_preflight.RollbackPreflight
+    execution: WorkflowExecution
+    facts: records.ManifestFacts
+
+
+@_public
+def prepare_rollback(preflight, execution):
+    """Pure replay at the original observation times, with no retry clock."""
+    rollback_preflight.validate_preserved(preflight)
+    _execution(execution)
+    resolution = preflight.resolution
+    _need(execution.run_attempt == 1 and execution.workflow_sha == resolution.producer.sha,
+          "record-writer-execution-changed")
+    required = policy._rollback_requirements(resolution.resolved.chain,
+                                             resolution.resolved.selected.release)
+    qualified = preflight.qualified
+    _need(required == resolution.requirements and required.non_none_count >= 2
+          and required.runtime_source_supported is True
+          and qualified.forward is True and qualified.reversible is True
+          and all(qualified.migrations) and all(qualified.servers)
+          and qualified.catalog_sha256 == required.live.catalog.catalog_sha256)
+    facts = records.ManifestFacts(2, "none", False, True, True, required.live.catalog,
+                                  "ok", qualified.run_id, "bypassed")
+    return RollbackHandoff(preflight, execution, facts)
+
+
+@_public
+def build_qualified_rollback(handoff, publication, current_resolution, *, reconciled=False):
+    """Append the proved exact target against unchanged authenticated history.
+
+    Current main may have advanced and old artifacts may now be expired. Only
+    preserved original-time inputs are replayed; the fresh ordinary chain may
+    gain the original H source facts and no other historical enrichment.
+    """
+    _need(type(handoff) is RollbackHandoff)
+    expected = prepare_rollback(handoff.preflight, handoff.execution)
+    _need(handoff == expected, "record-writer-handoff-changed")
+    _publication(publication)
+    _need(publication.execution == handoff.execution, "record-writer-execution-changed")
+    # Publication timestamps have whole-second precision; custody keeps the
+    # complete original UTC instant. Caller ordering supplies the within-second order.
+    _need(common.require_timestamp(publication.deployed_at, "record-writer-invalid")
+          >= handoff.preflight.checked_at.replace(microsecond=0), "record-writer-execution-changed")
+    chain = _resolved(current_resolution)
+    resolution = handoff.preflight.resolution
+    before = resolution.resolved
+    _need(current_resolution.selected == current_resolution.latest
+          and current_resolution.image_bindings == before.image_bindings,
+          "record-writer-parent-changed")
+    chain = policy.normalize_chain(chain.inputs, _promotion_sources(chain, resolution.producer),
+                                   chain.ancestors)
+    _need(chain == before.chain, "record-writer-parent-changed")
+    # The public no-proof rollback_plan remains unchanged. This dedicated
+    # path rechecks the full exact span after equality, never a caller verdict.
+    required = policy._rollback_requirements(chain, before.selected.release)
+    _need(required == resolution.requirements, "record-writer-parent-changed")
+    target = required.target
+    raw = _serialize("rollback", target.sha, target.images, before.latest.release,
+                     publication, handoff.facts, reconciled=reconciled)
+    return _append(chain, raw, target.record.web_source_sha)
