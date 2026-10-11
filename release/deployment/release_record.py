@@ -47,6 +47,13 @@ MANIFEST_KEYS = frozenset(
         "deployed_at", "signer", "fingerprints",
     }
 )
+MANIFEST_V2_KEYS = MANIFEST_KEYS | frozenset(
+    {
+        "dormant", "reversible", "old_server_ok", "catalog_version",
+        "min_reader_version", "catalog_sha256", "data_steps_sha256",
+        "seeds_sha256", "compat_run_id", "compat", "staging", "fixed_forward_from",
+    }
+)
 BOOTSTRAP_KEYS = frozenset(
     {
         "schema_version", "kind", "release", "sha", "images", "db_change",
@@ -86,6 +93,35 @@ class Chain(NamedTuple):
             if entry.release == release:
                 return index
         return None
+
+
+class DocumentCatalog(NamedTuple):
+    """Wire claims only; source/profile validation and live origin are not inferred."""
+
+    catalog_version: int
+    min_reader_version: int
+    catalog_sha256: str
+    data_steps_sha256: str
+    seeds_sha256: str
+
+
+class ManifestFacts(NamedTuple):
+    """Immutable, unauthenticated document facts, not release authorization.
+
+    V1's no-change/reversible policy is explicit legacy normalization. Missing
+    catalog, compat and old-server evidence stays absent. Neither version
+    supplies a source-derived reader capability or a live-contract origin.
+    """
+
+    schema_version: int
+    db_change: str
+    dormant: bool
+    reversible: bool
+    old_server_ok: bool | None
+    catalog: DocumentCatalog | None
+    compat: str | None
+    compat_run_id: int | None
+    staging: str | None
 
 
 # --------------------------------------------------------------------------
@@ -562,14 +598,24 @@ def _tag_or_bootstrap(value: Any, code: str) -> str:
 
 def validate_manifest(value: Any) -> dict[str, Any]:
     code = "record-invalid"
-    manifest = common.exact_keys(value, MANIFEST_KEYS, code)
-    if manifest["schema_version"] != 1 or manifest["kind"] not in KINDS:
+    if type(value) is not dict or type(value.get("schema_version")) is not int:
+        common.fail(code)
+    version = value["schema_version"]
+    if version not in (1, 2):
+        common.fail(code)
+    manifest = common.exact_keys(value, MANIFEST_KEYS if version == 1 else MANIFEST_V2_KEYS, code)
+    if type(manifest["kind"]) is not str or manifest["kind"] not in KINDS:
         common.fail(code)
     release = common.exact_string(manifest["release"], code, common.RECORD_TAG_RE)
     sha = common.require_sha1(manifest["sha"], code)
     _images(manifest["images"], code)
-    if manifest["db_change"] is not False or manifest["schema_guard"] != "clean":
+    if manifest["schema_guard"] != "clean":
         common.fail(code)
+    if version == 1:
+        if manifest["db_change"] is not False:
+            common.fail(code)
+    else:
+        _validate_v2_fields(manifest, code)
     previous = _tag_or_bootstrap(manifest["previous"], code)
     deployed_at = manifest["deployed_at"]
     deployed = common.require_timestamp(deployed_at, code)
@@ -609,6 +655,67 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     return manifest
 
 
+def _validate_v2_fields(manifest: Mapping[str, Any], code: str) -> None:
+    change = common.exact_string(manifest["db_change"], code)
+    if change not in ("none", "expand", "data", "contract"):
+        common.fail(code)
+    dormant = common.exact_bool(manifest["dormant"], code)
+    reversible = common.exact_bool(manifest["reversible"], code)
+    if dormant and change in ("none", "contract"):
+        common.fail(code)
+    version = common.exact_int(manifest["catalog_version"], code)
+    common.exact_int(manifest["min_reader_version"], code, maximum=version)
+    for key in ("catalog_sha256", "data_steps_sha256", "seeds_sha256"):
+        common.require_sha256(manifest[key], code)
+    compat = common.exact_string(manifest["compat"], code)
+    staging = common.exact_string(manifest["staging"], code)
+    if staging not in ("passed", "bypassed") or manifest["fixed_forward_from"] is not None:
+        common.fail(code)
+    if compat == "ok":
+        common.exact_bool(manifest["old_server_ok"], code)
+        if type(manifest["compat_run_id"]) is not int:
+            common.fail(code)
+        common.require_run_id(manifest["compat_run_id"], code)
+    elif compat == "bypassed":
+        if (
+            manifest["compat_run_id"] is not None or manifest["old_server_ok"] != "unproven"
+            or change != "none" or dormant or not reversible or staging != "bypassed"
+        ):
+            common.fail(code)
+    else:
+        common.fail(code)
+    if manifest["kind"] in ("rollback", "restore"):
+        # These are image-only transitions. The later chain adapter must
+        # validate inherited live metadata and the exact requested span.
+        if change != "none" or dormant or not reversible or staging != "bypassed":
+            common.fail(code)
+        if compat == "ok" and manifest["old_server_ok"] is not True:
+            common.fail(code)
+        if manifest["kind"] == "restore" and compat != "bypassed":
+            common.fail(code)
+
+
+def manifest_facts(value: Any) -> ManifestFacts:
+    """Validate and copy immutable wire facts without authentication or I/O."""
+    manifest = validate_manifest(value)
+    if manifest["schema_version"] == 1:
+        return ManifestFacts(1, "none", False, True, None, None, None, None, None)
+    return ManifestFacts(
+        2, manifest["db_change"], manifest["dormant"], manifest["reversible"],
+        None if manifest["old_server_ok"] == "unproven" else manifest["old_server_ok"],
+        DocumentCatalog(*(manifest[key] for key in DocumentCatalog._fields)),
+        manifest["compat"], manifest["compat_run_id"], manifest["staging"],
+    )
+
+
+def _require_legacy_document(document: Mapping[str, Any]) -> None:
+    # Structural v2 support must not activate old bool-based execution paths.
+    # Source-derived normalization, receipt qualification and the v2 writer
+    # are deliberately a later atomic integration.
+    if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        common.fail("record-chain-invalid:policy-unavailable")
+
+
 def build_manifest(fields: Mapping[str, Any]) -> bytes:
     manifest = {
         "schema_version": 1,
@@ -634,6 +741,7 @@ def build_manifest(fields: Mapping[str, Any]) -> bytes:
 
 
 def manifest_entry(manifest: Mapping[str, Any], raw: bytes) -> Entry:
+    _require_legacy_document(manifest)
     return Entry(
         release=manifest["release"],
         kind=manifest["kind"],
@@ -650,6 +758,8 @@ def manifest_entry(manifest: Mapping[str, Any], raw: bytes) -> Entry:
 
 def require_link(entries: Sequence[Entry], entry: Entry, repo_dir: Path | None) -> None:
     """Previous links, strictly increasing time and the per-kind rules."""
+    for item in (*entries, entry):
+        _require_legacy_document(item.document)
     code = "record-chain-invalid:link"
     previous = entries[-1]
     if entry.previous != previous.release:
@@ -822,6 +932,8 @@ def _legacy_predicate_matches(item: Mapping[str, Any], component: str, legacy: M
 def rollback_plan(chain: Chain, tag: str) -> tuple[Entry, tuple[Entry, ...]]:
     """Target = prod-0000 or a chain record (never newer than latest; the
     latest itself means restore intent) plus every record after it."""
+    for entry in chain.entries:
+        _require_legacy_document(entry.document)
     if tag != common.BOOTSTRAP_TAG and common.RECORD_TAG_RE.fullmatch(tag or "") is None:
         common.fail("rollback-target-invalid")
     index = chain.find(tag)
@@ -840,6 +952,8 @@ def decide_rollback_case(live: Mapping[str, str], chain: Chain, target: Entry) -
     NO record, PUT the latest digests back). A live state equal to an older
     record is a deliberate rollback, so restore refuses it: reconcile with
     that record instead."""
+    for entry in (*chain.entries, target):
+        _require_legacy_document(entry.document)
     live_images = dict(live)
     latest = chain.latest
     if target.release == latest.release:
