@@ -1155,4 +1155,230 @@ class ResolvedAdmissionTests(unittest.TestCase):
         self.assertFalse(result['cleanup_complete']);self.assertEqual(result['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
 
 
+class RollbackAdmissionTests(unittest.TestCase):
+    """Real controlled resolver/catalog checks, mocked image/build transport.
+
+    The signed-record captures are synthetic. These tests exercise source and
+    ownership composition without claiming signatures from a live service.
+    """
+    def setUp(self):
+        self.f=AdmissionRoundtripTests('test_complete_four_builds_same_source_and_monotonic_shared_cap')
+        self.f.setUp();self.addCleanup(self.f.doCleanups)
+        self.git_calls=[];original=m._Source.git
+        def git(source,args,*rest):
+            self.git_calls.append(args)
+            if args[0]=='cat-file':raise AssertionError('closed endpoint recipe must not reopen Git')
+            return original(source,args,*rest)
+        active=patch.object(m._Source,'git',git);active.start();self.addCleanup(active.stop)
+
+    def prepare(self,**options):
+        from test_catalog import rollback_resolution
+        resolution=rollback_resolution(self,**options)
+        f=self.f;f.candidate=resolution.producer.sha
+        for iid in f.images.values():
+            f.rows[iid]['Config']['Labels'][m.stack.SOURCE_LABEL]=f.candidate
+        self.refs={}
+        for role,selected,recipe in (
+                ('target',resolution.resolved.selected,resolution.target_recipe),
+                ('live',resolution.resolved.latest,resolution.live_recipe)):
+            reference=m.common.IMAGE_REPOSITORY['web']+'@'+dict(selected.images)['web']
+            self.refs[role]=reference
+            # The same signed ref has the same loaded ID, independent of role.
+            row=f.web(selected.actual_web_source_sha,'sha256:'+m.sha(reference.encode()),recipe.sha256)
+            row['RepoDigests']=[reference];f.rows[reference]=row
+        self.resolution=resolution
+        return resolution
+
+    def admit(self,resolution=None):
+        f=self.f
+        return m._admit_rollback_resolved(f.root,self.resolution if resolution is None else resolution,
+                                        str(f.binary),f.config,f.work,f.deadline)
+
+    def no_effects(self):
+        self.assertEqual(self.f.calls,[]);self.assertEqual(self.f.builds,[])
+        self.assertEqual(list(self.f.work.iterdir()),[])
+
+    def test_two_signed_images_four_h_builds_and_receipt_keep_all_roles_distinct(self):
+        r=self.prepare(rolled_back=True);result=self.admit()
+        self.assertEqual(len({r.producer.sha,r.target_recipe.source_sha,r.live_recipe.source_sha,
+                              r.requirements.live.origin_source.sha}),4)
+        self.assertIs(type(result),m._AdmittedRollback);self.assertIs(result.seal,m._SEAL)
+        self.assertFalse(isinstance(result,m._Admitted))
+        self.assertEqual((result.target.source_sha,result.live.source_sha),
+                         (r.target_recipe.source_sha,r.live_recipe.source_sha))
+        self.assertNotEqual(result.target.reference,result.live.reference)
+        self.assertEqual((result.target.recipe_sha256,result.live.recipe_sha256),
+                         (r.target_recipe.sha256,r.live_recipe.sha256))
+        self.assertEqual([role for role,_ in self.f.builds],['graph','controller','fixture','candidate'])
+        self.assertEqual([seconds for _,seconds in self.f.builds],[1492,1392,1292,1192])
+        for binding in (result.catalog_control,result.controller,result.graph,result.fixture):
+            self.assertEqual(binding.source_sha,r.producer.sha)
+        self.assertEqual(result.catalog_control.reference,result.catalog_control.image_id)
+        self.assertEqual(result.receipt['roles']['candidate']['source'],r.producer.sha)
+        self.assertEqual(result.receipt['source'],r.producer.sha)
+        self.assertEqual(result.receipt['purpose'],'rollback-v0')
+        self.assertFalse(result.receipt['release_attestation']);self.assertTrue(result.receipt['cleanup_complete'])
+        self.assertEqual(result.receipt['signed_endpoints']['target']['reference'],result.target.reference)
+        self.assertEqual(result.receipt['signed_endpoints']['live']['reference'],result.live.reference)
+        self.assertTrue(self.git_calls);self.assertTrue(all(args[0]!='cat-file' for args in self.git_calls))
+        with self.assertRaises(AttributeError):result.live=result.target
+
+    def test_same_signed_tuple_pulls_once_but_validates_both_roles_and_retains_span(self):
+        r=self.prepare(same_endpoint=True);span=r.requirements.span;calls=[]
+        original=m.processes.OwnedProcesses._validate_image
+        def validate(manager,role,binding,row):
+            if binding.reference==self.refs['target']:calls.append(role)
+            return original(manager,role,binding,row)
+        with patch.object(m.processes.OwnedProcesses,'_validate_image',validate):result=self.admit()
+        self.assertEqual(result.target,result.live)
+        self.assertEqual(calls,['previous','candidate'])
+        self.assertEqual([a[-1] for a in self.f.calls if a[5:7]==['image','pull']],
+                         [self.refs['target'],m.runtime.POSTGRES,m.runtime.REDIS])
+        self.assertEqual(sum(a[5:8]==['image','inspect',self.refs['target']] for a in self.f.calls),2)
+        self.assertEqual(r.requirements.span,span);self.assertEqual(len(span),4)
+        self.assertNotEqual(r.resolved.selected.release,r.resolved.latest.release)
+        self.assertNotEqual(r.requirements.live.origin_source.sha,result.live.source_sha)
+
+    def test_distinct_signed_references_are_both_pulled_and_rechecked(self):
+        self.prepare();self.admit()
+        self.assertEqual([a[-1] for a in self.f.calls if a[5:7]==['image','pull']],
+                         [self.refs['target'],self.refs['live'],m.runtime.POSTGRES,m.runtime.REDIS])
+        for ref in self.refs.values():
+            self.assertEqual(sum(a[5:8]==['image','inspect',ref] for a in self.f.calls),2)
+
+    def test_same_digest_conflicting_source_or_recipe_refuses_before_source_or_pull(self):
+        self.prepare(same_endpoint=True);bound=m._resolved_rollback(self.resolution);f=self.f
+        for field,value in (('source_sha','f'*40),('recipe_sha256','f'*64)):
+            changed=replace(bound,live=replace(bound.live,**{field:value}))
+            with self.subTest(field=field),patch.object(m,'_Source',side_effect=AssertionError('source effect')), \
+                 self.assertRaisesRegex(m.proof.EvidenceError,'rollback-image-conflict'):
+                m._admit_core(f.root,None,f.candidate,str(f.binary),f.config,f.work,f.deadline,rollback=changed)
+        self.no_effects()
+
+    def test_closed_core_rejects_normal_previous_inputs_or_wrong_h(self):
+        self.prepare();bound=m._resolved_rollback(self.resolution);f=self.f
+        for previous,resolved,candidate in ((f.previous,None,f.candidate),(None,bound.target,f.candidate),
+                                            (None,None,'f'*40)):
+            with self.subTest(candidate=candidate),patch.object(m,'_Source',side_effect=AssertionError('source effect')), \
+                 self.assertRaisesRegex(m.proof.EvidenceError,'rollback-input'):
+                m._admit_core(f.root,previous,candidate,str(f.binary),f.config,f.work,f.deadline,
+                              resolved_previous=resolved,rollback=bound)
+        self.no_effects()
+
+    def test_typed_chain_image_source_and_recipe_tampering_refuse_before_effects(self):
+        r=self.prepare();resolved=r.resolved;idx=resolved.selected.index;binding=resolved.image_bindings[idx]
+        altered_binding=replace(binding,source_shas=tuple((p,r.producer.sha if p=='web' else value)
+                                                        for p,value in binding.source_shas))
+        changes=[{},SimpleNamespace(producer=r.producer),
+                 replace(r,workflow=r.workflow+b' '),
+                 replace(r,materials=r.materials[:-1]),
+                 replace(r,target_recipe=replace(r.target_recipe,sha256='f'*64)),
+                 replace(r,live_recipe=replace(r.live_recipe,source_sha=r.producer.sha)),
+                 replace(r,resolved=replace(resolved,image_bindings=resolved.image_bindings[:idx]+
+                                            (altered_binding,)+resolved.image_bindings[idx+1:]))]
+        for value in changes:
+            with self.subTest(kind=type(value).__name__),self.assertRaises(m.proof.EvidenceError):self.admit(value)
+            self.no_effects()
+
+    def test_loaded_live_wrong_source_refuses_before_any_build(self):
+        r=self.prepare();self.f.rows[self.refs['live']]['Config']['Labels'][m.stack.SOURCE_LABEL]=r.producer.sha
+        with self.assertRaisesRegex(m.proof.EvidenceError,'process-source-invalid'):self.admit()
+        self.assertEqual(self.f.builds,[])
+
+    def test_loaded_live_wrong_digest_refuses_before_any_build(self):
+        self.prepare();self.f.rows[self.refs['live']]['RepoDigests']=[self.refs['target']]
+        with self.assertRaises(m.proof.EvidenceError):self.admit()
+        self.assertEqual(self.f.builds,[])
+
+    def test_loaded_target_wrong_present_recipe_refuses_before_any_build(self):
+        self.prepare();self.f.rows[self.refs['target']]['Config']['Labels'][m.stack.RECIPE_LABEL]='f'*64
+        with self.assertRaisesRegex(m.proof.EvidenceError,'process-source-invalid'):self.admit()
+        self.assertEqual(self.f.builds,[])
+
+    def test_historical_recipe_label_absence_keeps_captured_recipe_and_actual_source(self):
+        r=self.prepare(bootstrap_image=True)
+        del self.f.rows[self.refs['target']]['Config']['Labels'][m.stack.RECIPE_LABEL]
+        result=self.admit()
+        self.assertNotEqual(r.resolved.selected.record_sha,result.target.source_sha)
+        self.assertEqual(result.target.source_sha,r.target_recipe.source_sha)
+        self.assertEqual(result.target.recipe_sha256,r.target_recipe.sha256)
+
+    def test_live_image_drift_after_all_builds_refuses_before_admission(self):
+        self.prepare();original=self.f.capture
+        def capture(args,*rest,**kwargs):
+            value=original(args,*rest,**kwargs)
+            if args[0]==str(self.f.plugin) and len(self.f.builds)==4:
+                self.f.rows[self.refs['live']]['Id']='sha256:'+'f'*64
+            return value
+        with patch.object(m,'_build_capture',capture), \
+             self.assertRaisesRegex(m.proof.EvidenceError,'infrastructure-image-changed'):self.admit()
+        self.assertEqual(len(self.f.builds),4)
+
+    def test_expired_and_consumed_outer_budget_never_gets_fresh_allowance(self):
+        self.prepare();self.f.clock.value+=2401
+        with self.assertRaisesRegex(m.proof.InfrastructureFailure,'deadline'):self.admit()
+        self.no_effects()
+
+    def test_endpoint_pulls_consume_the_single_aggregate_build_cap(self):
+        self.prepare();self.f.clock.value+=1493
+        with self.assertRaisesRegex(m.proof.InfrastructureFailure,'build-reserve'):self.admit()
+        self.assertEqual(self.f.builds,[])
+        self.assertLessEqual(len([a for a in self.f.calls if a[5:7]==['image','pull']]),4)
+
+    def test_partial_build_stops_once_and_preserves_h_diagnostics(self):
+        self.prepare();self.f.drift='controller-failure'
+        with self.assertRaises(m._BuildFailure):self.admit()
+        with self.assertRaises(m.proof.EvidenceError):self.admit()
+        self.assertEqual([role for role,_ in self.f.builds],['graph','controller'])
+        receipt=json.loads((self.f.work/('candidate-'+self.f.candidate)/'result.json').read_bytes())
+        self.assertEqual(receipt['source'],self.resolution.producer.sha)
+        self.assertEqual(receipt['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
+        self.assertTrue(receipt['cleanup_complete'])
+
+    def test_linux_has_one_builder_and_cleanup_before_return(self):
+        self.prepare();objects=[];outer=self
+        class Backend:
+            def __init__(self,*args):self.closed=False;self.name='compat-'+'9'*32;objects.append(self)
+            def start(self):outer.f.clock.value+=10
+            def check(self):pass
+            def close(self):self.closed=True;outer.f.clock.value+=5
+            def summary(self):return {'closed':self.closed}
+        with patch.object(m,'_host_linux',return_value=True),patch.object(m,'_LinuxBuilder',Backend), \
+             patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')):result=self.admit()
+        self.assertEqual(len(objects),1);self.assertTrue(objects[0].closed)
+        self.assertTrue(result.receipt['cleanup_complete']);self.assertEqual(len(self.f.builds),4)
+
+    def test_cleanup_completion_cannot_reset_overall_deadline(self):
+        self.prepare();outer=self;events=[]
+        class Backend:
+            def __init__(self,*args):self.closed=False;self.name='compat-'+'9'*32
+            def start(self):pass
+            def check(self):pass
+            def close(self):self.closed=True;events.append('close');outer.f.clock.value+=2400
+            def summary(self):return {'closed':self.closed}
+        with patch.object(m,'_host_linux',return_value=True),patch.object(m,'_LinuxBuilder',Backend), \
+             patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')), \
+             self.assertRaisesRegex(m.proof.InfrastructureFailure,'deadline'):self.admit()
+        self.assertEqual(events,['close']);self.assertEqual(len(self.f.builds),4)
+        receipt=json.loads((self.f.work/('candidate-'+self.f.candidate)/'result.json').read_bytes())
+        self.assertTrue(receipt['cleanup_complete'])
+        self.assertEqual(receipt['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
+
+    def test_cleanup_refusal_keeps_original_build_failure_and_never_returns_images(self):
+        self.prepare();self.f.drift='controller-failure';events=[]
+        class Backend:
+            def __init__(self,*args):self.closed=False;self.name='compat-'+'9'*32
+            def start(self):events.append('start')
+            def check(self):pass
+            def close(self):events.append('close');raise m.proof.InfrastructureFailure('admission-builder-ownership-unresolved')
+            def summary(self):return {'closed':False}
+        with patch.object(m,'_host_linux',return_value=True),patch.object(m,'_LinuxBuilder',Backend), \
+             patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')):
+            with self.assertRaises(m.proof.InfrastructureFailure) as caught:self.admit()
+            with self.assertRaises(m.proof.EvidenceError):self.admit()
+        self.assertIs(type(caught.exception.__cause__),m._BuildFailure)
+        self.assertFalse(m._BuildFailure._public(caught.exception.__cause__)['cleanup_complete'])
+        self.assertEqual(events,['start','close']);self.assertEqual(len(self.f.builds),2)
+
+
 if __name__=='__main__':unittest.main()

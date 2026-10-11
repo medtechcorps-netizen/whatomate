@@ -16,6 +16,7 @@ import test_processes
 import test_postgres
 import test_stack
 import test_record_resolver
+import test_record_resolver_rollback
 
 REPO=Path(__file__).resolve().parents[2]
 HEAD="e"*40
@@ -520,6 +521,189 @@ class MaterialCatalogTests(unittest.TestCase):
             changed = replace(result, resolved=replace(result.resolved, selected=replace(selected, images=images)))
             with self.subTest(images=images), self.assertRaises(c.proof.EvidenceError):
                 self.consume(changed)
+
+
+def rollback_resolution(testcase, *, rolled_back=False, e001=False, bootstrap_image=False, same_endpoint=False):
+    """Real resolver, real v0 bytes, synthetic transport/signature boundary.
+
+    This exercises source composition without claiming GitHub authentication or
+    actual runtime compatibility. Recipes are exact local checked-in fixtures.
+    """
+    fixture = test_record_resolver_rollback.RollbackProofResolverTests
+    fixture.setUpClass()
+    case = fixture()
+    case.setUp(); testcase.addCleanup(case.doCleanups)
+    alternate = None
+    if rolled_back and not same_endpoint:
+        alternate = case.add(version=1)
+        case.profile(alternate["sha"])
+    producer, target, _first, latest = case.scenario(
+        target_sha=c._BASE if e001 else None,
+        target_images=case.boot["images"] if bootstrap_image else None)
+    if rolled_back or same_endpoint:
+        latest = case.add(kind="rollback", target=target if same_endpoint else alternate)
+    actual_target = (case.boot["legacy_signer"]["source_commit"] if bootstrap_image else target["sha"])
+    case.profile(actual_target)
+    if e001:
+        for path in (c._PROFILE, c._OVERLAY):
+            del case.world.files[actual_target, path]
+    recipe = (REPO / "docker/release/web.Dockerfile").read_bytes()
+    for sha in {actual_target, latest["sha"]}:
+        case.world.files[sha, case.RECIPE] = recipe
+    result = case.proof(producer, target["release"])
+    testcase.assertTrue(case.client.budget.closed)
+    testcase.assertFalse(case.client.budget.failed)
+    return result
+
+
+class RollbackCatalogTests(unittest.TestCase):
+    """Complete pure replay; no fabricated ForwardResolution or success flag."""
+    def consume(self, result):
+        with mock.patch.object(c.runtime, "bounded_command", side_effect=AssertionError("unexpected command")), \
+             mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")), \
+             mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unexpected file read")):
+            return c.CatalogContract.from_rollback_resolution(result)
+
+    def test_distinct_h_t_l_o_are_retained_without_live_catalog_invention(self):
+        result = rollback_resolution(self, rolled_back=True)
+        actual = self.consume(result)
+        self.assertEqual(actual.purpose, "rollback-v0")
+        self.assertEqual(actual.previous_sha, result.resolved.selected.actual_web_source_sha)
+        self.assertEqual(actual.candidate_sha, result.resolved.latest.actual_web_source_sha)
+        self.assertEqual(actual.catalog_control_sha, result.producer.sha)
+        self.assertEqual(actual.database_base_source, result.requirements.live.origin_source.sha)
+        self.assertEqual(len({actual.previous_sha, actual.candidate_sha, actual.catalog_control_sha,
+                              actual.database_base_source}), 4)
+        self.assertEqual(actual.catalog_baseline_sha, actual.database_base_source)
+        self.assertEqual(actual.baseline_provenance, "retained-live-v2")
+        self.assertEqual(actual.target_recipe, result.target_recipe)
+        self.assertEqual(actual.live_recipe, result.live_recipe)
+        self.assertEqual(actual.target_sha256, c.record_resolver.policy.V0_MEASUREMENT)
+        self.assertEqual(len(actual.expected_preexisting_tables), 127)
+        self.assertFalse(hasattr(actual, "pending_binding"))
+        self.assertEqual(actual.parse_compare((json.dumps(compare(actual)) + "\n").encode()), actual.target_sha256)
+
+    def test_exact_e001_two_absences_are_only_endpoint_not_retained_origin(self):
+        result = rollback_resolution(self, e001=True)
+        actual = self.consume(result)
+        self.assertEqual(actual.previous_sha, c._BASE)
+        self.assertNotEqual(actual.catalog_baseline_sha, c._BASE)
+        self.assertEqual(actual._base_overlay, "equal-reviewed-v0-nop")
+        index = next(i for i, row in enumerate(result.materials) if row.source_sha == c._BASE)
+        material = result.materials[index]
+        for path in (c._PROFILE, c._OVERLAY):
+            blobs = tuple(replace(row, raw=BLOBS[path]) if row.path == path else row for row in material.blobs)
+            changed = replace(result, materials=tuple(replace(row, blobs=blobs) if i == index else row
+                                                     for i, row in enumerate(result.materials)))
+            with self.subTest(path=path), self.assertRaises(c.proof.EvidenceError): self.consume(changed)
+
+    def test_bootstrap_digest_exception_uses_actual_source_not_record_sha(self):
+        result = rollback_resolution(self, bootstrap_image=True)
+        actual = self.consume(result)
+        self.assertNotEqual(actual.previous_sha, result.resolved.selected.record_sha)
+        self.assertEqual(actual.previous_sha, result.target_recipe.source_sha)
+        self.assertEqual(actual.previous_web, c.runtime.common.IMAGE_REPOSITORY["web"] + "@" +
+                         dict(result.resolved.selected.images)["web"])
+
+    def test_requirements_selection_inventory_and_complete_image_bindings_cannot_be_relabelled(self):
+        value = rollback_resolution(self, rolled_back=True)
+        resolved, requirements = value.resolved, value.requirements
+        bad_images = list(resolved.image_bindings)
+        binding = bad_images[-1]
+        bad_images[-1] = replace(binding, source_shas=tuple((key, value.producer.sha) for key, _ in binding.source_shas))
+        variants = [replace(value, requirements=replace(requirements, non_none_count=1)),
+            replace(value, requirements=replace(requirements, span=requirements.span[:-1])),
+            replace(value, requirements=replace(requirements, span_sha256="0" * 64)),
+            replace(value, resolved=replace(resolved, selected=resolved.latest)),
+            replace(value, resolved=replace(resolved, latest=resolved.selected)),
+            replace(value, resolved=replace(resolved, image_bindings=tuple(bad_images))),
+            replace(value, resolved=replace(resolved, image_bindings=resolved.image_bindings[:-1])),
+            replace(value, resolved=replace(resolved, inventory=replace(resolved.inventory, main_sha="0" * 40))),
+            replace(value, resolved=replace(resolved, inventory=replace(resolved.inventory, records=()))),
+            replace(value, workflow=value.workflow + b"# changed\n"),
+            replace(value, producer=replace(value.producer, mode="synthetic-policy"))]
+        for index, changed in enumerate(variants):
+            with self.subTest(index=index), self.assertRaises(c.proof.EvidenceError): self.consume(changed)
+
+    def test_complete_raw_material_has_no_missing_duplicate_reordered_or_unequal_escape(self):
+        value = rollback_resolution(self)
+        first = value.materials[0]
+        variants = [value.materials[:-1], (*value.materials, first), tuple(reversed(value.materials)),
+                    (replace(first, provenance="legacy-e001-absent-overlay"), *value.materials[1:]),
+                    (replace(first, blobs=first.blobs[:-1]), *value.materials[1:]),
+                    (replace(first, blobs=tuple(reversed(first.blobs))), *value.materials[1:])]
+        for path in c.record_resolver.policy.SOURCE_PATHS:
+            for raw in (None, b"{}\n"):
+                changed = replace(first, blobs=tuple(replace(row, raw=raw) if row.path == path else row
+                                                    for row in first.blobs))
+                variants.append((changed, *value.materials[1:]))
+        for index, rows in enumerate(variants):
+            with self.subTest(index=index), self.assertRaises(c.proof.EvidenceError):
+                self.consume(replace(value, materials=rows))
+
+    def test_same_actual_endpoint_requires_one_identical_recipe_observation(self):
+        value = rollback_resolution(self, same_endpoint=True)
+        self.assertEqual(value.target_recipe, value.live_recipe)
+        self.assertEqual(len(value.requirements.span), 4)
+        self.consume(value)
+        raw = value.live_recipe.raw + b"# inconsistent second observation\n"
+        changed = replace(value.live_recipe, raw=raw, sha256=c.hashlib.sha256(raw).hexdigest())
+        with self.assertRaises(c.proof.EvidenceError): self.consume(replace(value, live_recipe=changed))
+
+    def test_recipe_path_source_bytes_and_digest_are_closed(self):
+        value = rollback_resolution(self)
+        for name in ("target_recipe", "live_recipe"):
+            recipe = getattr(value, name)
+            for changed in (replace(recipe, path="Dockerfile"), replace(recipe, source_sha=value.producer.sha),
+                            replace(recipe, raw=recipe.raw+b"# changed\n"), replace(recipe, sha256="0"*64)):
+                with self.subTest(name=name, changed=changed.path), self.assertRaises(c.proof.EvidenceError):
+                    self.consume(replace(value, **{name:changed}))
+        with self.assertRaises(c.proof.EvidenceError): self.consume(object())
+
+    def owned(self, value):
+        contract = self.consume(value)
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        world = World()
+        stack = c.processes.stack
+        world.images[test_stack.GRAPH]["Config"]["Labels"][stack.SOURCE_LABEL] = contract.catalog_control_sha
+        owner = stack.OwnedStack("docker", Path(tmp.name), contract.catalog_control_sha,
+            stack.GraphImage(test_stack.GRAPH, contract.catalog_control_sha), token=test_stack.TOKEN,
+            capture=world.capture)
+        owner.start()
+        previous, live, controller, control = test_processes.rollback_bindings(world, contract.catalog_control_sha)
+        chosen = []
+        for reference, sha, recipe in ((contract.previous_web, contract.previous_sha, contract.target_recipe),
+                                       (contract.candidate_web, contract.candidate_sha, contract.live_recipe)):
+            row = copy.deepcopy(world.images[test_processes.CAND])
+            row["Id"] = reference.split("@", 1)[1]
+            row["RepoDigests"] = [reference]
+            row["Config"]["Labels"][stack.SOURCE_LABEL] = sha
+            world.images[reference] = row
+            chosen.append(c.processes.ImageBinding(reference, row["Id"], sha, recipe.sha256))
+        manager = c.processes.OwnedProcesses(owner, *chosen, controller, catalog_control=control)
+        pg = c.postgres.SyntheticPostgres("docker", Path(tmp.name), owner._ids["pg"], owner.token,
+                                        "compat_runtime", capture=world.capture)
+        world.catalog_response = (json.dumps(compare(contract)) + "\n").encode()
+        return contract, manager, pg, world
+
+    def test_owned_catalog_runs_h_and_refuses_normal_or_wrong_endpoint_bindings(self):
+        contract, manager, pg, world = self.owned(rollback_resolution(self, rolled_back=True))
+        observer = c.OwnedCatalog(manager, pg, contract)
+        observed = observer.observe(test_processes.INPUTS)
+        self.assertEqual(observed.sha256, contract.target_sha256)
+        create = [args for args, _ in world.calls if args[:2] == ["container", "create"]][-1]
+        self.assertIn(manager.catalog_binding.reference, create)
+        self.assertNotIn(manager.bindings["candidate"].reference, create)
+        normal = copy.copy(contract); del normal.purpose
+        with self.assertRaises(c.proof.EvidenceError): c.OwnedCatalog(manager, pg, normal)
+        original = manager.bindings["candidate"]
+        for changed in (replace(original, reference=test_processes.PREV),
+                        replace(original, recipe_sha256="0" * 64),
+                        replace(original, source_sha=contract.database_base_source)):
+            manager.bindings["candidate"] = changed
+            with self.assertRaises(c.proof.EvidenceError): c.OwnedCatalog(manager, pg, contract)
+        manager.bindings["candidate"] = original
+        manager.close(); manager.owner.cleanup()
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
