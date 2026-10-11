@@ -467,10 +467,17 @@ probe at most five seconds and result upload at most 60 seconds, leaving
 
 ## Validation still required
 
-The completed local component checks cover the owned services, fixture export,
-previous web startup and API sweeps, SQL collector formats and cleanup. The
-first complete candidate/previous experiment and the actual hosted Linux
-composition have not yet passed. The workflow is not yet published or enabled.
+The complete local synthetic experiment passed on candidate
+`d9e164812a08f9e642b72c80749cdc5498543f81` against signed Release 13
+(`prod-20261010T234723Z-e0016b35`). It completed both forward migrations,
+old migration read/write and read-only checks with the negative control,
+cross-version API reads and writes, the worker window, reverse sweep and final
+catalog checks. All owned containers and the owned network were removed; the
+original container and network ID sets and volume-name hash matched the
+baseline. Independent review accepted the source-bound result.
+This is local evidence for that candidate, not hosted qualification or proof
+for later source changes. The actual hosted Linux composition has not yet
+passed; the workflow is not yet published or enabled.
 
 Completed retained-record read and write-readback mismatches now yield actual
 per-case false flags. Writes still require complete acknowledgements, valid
