@@ -24,6 +24,8 @@ import ship_common as common
 import pending_plan
 import schema_nullable
 import schema_index
+import schema_relation
+import schema_tenant_profile
 
 
 GUARDED_TREES = ("internal/database/", "internal/models/")
@@ -877,24 +879,34 @@ def _v2_catalog(value: Any) -> None:
         _valid(all(_v2_attribute(shape, attrs[key]) for key, shape in _V2_ATTRIBUTES[kind].items()))
 
 
-def _v2_source_budget(declarations, before_raw, after_raw):
+def _v2_source_budget(declarations, before_raw, after_raw, extra_roles=None):
     """Charge each source role once before any new declaration is decoded."""
-    _valid(type(declarations) is tuple and len(declarations) == 3)
+    _valid(type(declarations) is tuple and len(declarations) in (3, 5))
     if all(raw is None for raw in declarations):
         return
-    limits = (schema_nullable.MAX_DOCUMENT, schema_nullable.MAX_DOCUMENT, schema_index.MAX_DECLARATION)
+    limits = (schema_nullable.MAX_DOCUMENT, schema_nullable.MAX_DOCUMENT, schema_index.MAX_DECLARATION,
+              schema_relation.MAX_DECLARATION, schema_tenant_profile.MAX_DECLARATION)
     _valid(all(raw is None or type(raw) is bytes and 0 < len(raw) <= limit
                for raw, limit in zip(declarations, limits)))
     _valid(all(type(raw) is bytes and 0 < len(raw) <= schema_nullable.MAX_DOCUMENT
                for raw in (before_raw, after_raw)))
+    extra = ()
+    if len(declarations) == 5 and any(raw is not None for raw in declarations[3:]):
+        _valid(type(extra_roles) is tuple and len(extra_roles) == 4)
+        _valid(all(type(raw) is bytes and 0 < len(raw) <= limit for raw, limit in zip(extra_roles,
+                   (schema_tenant_profile.MAX_GLOBALS,) * 2 + (schema_tenant_profile.MAX_TENANT,) * 2)))
+        extra = extra_roles
+    else:
+        _valid(extra_roles is None)
     _valid(sum(len(raw) for raw in declarations if raw is not None)
-           + len(before_raw) + len(after_raw) <= schema_nullable.MAX_TOTAL)
+           + len(before_raw) + len(after_raw) + sum(map(len, extra)) <= schema_nullable.MAX_TOTAL)
     _valid(declarations[0] is None or declarations[1] is None)
 
 
 def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals: list,
                       reasons: set[str], summary: list[str], requirements: set[str], *,
-                      source=None, constant_source=None, index_source=None) -> str:
+                      source=None, constant_source=None, index_source=None,
+                      relation_source=None, profile_source=None) -> str:
     """Direct current-format rules; full transitions include every companion.
 
     A relation-only synthetic expand example is not a complete table migration.
@@ -903,46 +915,70 @@ def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals:
     """
     # Recheck the joint raw boundary even for direct pure callers. Each family
     # must refer to the same immutable comparison, not just equal parsed JSON.
-    sources = (source, constant_source, index_source)
-    present = [item for item in sources if item is not None]
+    sources = (source, constant_source, index_source, relation_source, profile_source)
+    present = [item for item in sources[:3] if item is not None]
+    extended = [item for item in sources[3:] if item is not None]
+    profile_delta = None
+    if extended:
+        _valid(all(type(item) is tuple and len(item) == 9 for item in extended))
+        _valid(all(item[1:] == extended[0][1:] for item in extended))
+        bc, ac, bg, ag, bt, at, base_sha, head_sha = extended[0][1:]
+        _v2_source_budget(tuple(None if item is None else item[0] for item in sources), bc, ac, (bg, ag, bt, at))
+        _valid(all(type(item) is tuple and len(item) == 5
+                   and item[1:] == (bc, ac, base_sha, head_sha) for item in present))
+        _valid(common.loads_strict(bc) == before and common.loads_strict(ac) == after
+               and common.loads_strict(bg) == old_globals and common.loads_strict(ag) == new_globals)
     if present:
         _valid(all(type(item) is tuple and len(item) == 5 for item in present))
         _valid(all(type(item[1]) is bytes and type(item[2]) is bytes
                    and type(item[3]) is str and type(item[4]) is str for item in present))
         before_raw, after_raw, base_sha, head_sha = present[0][1:]
-        _v2_source_budget(tuple(None if item is None else item[0] for item in sources), before_raw, after_raw)
+        if not extended:
+            _v2_source_budget(tuple(None if item is None else item[0] for item in sources[:3]), before_raw, after_raw)
         _valid(all(item[1:] == present[0][1:] for item in present))
     _v2_catalog(before)
     _v2_catalog(after)
     _globals(old_globals)
     _globals(new_globals)
     explained = set()
-    for label, material in zip(("nullable", "constant", "index"), sources):
+    for label, material in zip(("nullable", "constant", "index", "relation", "tenant-profile"), sources):
         if material is None:
             continue
         # Only raw immutable material is accepted here, never a supplied verdict.
-        declaration, before_raw, after_raw, base_sha, head_sha = material
+        declaration, before_raw, after_raw = material[:3]
+        base_sha, head_sha = material[-2:]
         if label == "nullable":
             delta = schema_nullable.classify_source(declaration, before_raw, after_raw,
                                                    base_sha=base_sha, head_sha=head_sha)
         elif label == "constant":
             delta = schema_nullable.classify_constant_source(declaration, before_raw, after_raw,
                                                             base_sha=base_sha, head_sha=head_sha)
-        else:
+        elif label == "index":
             delta = schema_index.classify_source(declaration, before_raw, after_raw,
                                                 base_sha=base_sha, head_sha=head_sha)
+        elif label == "relation":
+            delta = schema_relation.classify_source(declaration, *material[1:7], base_sha=base_sha, head_sha=head_sha)
+            _valid(delta.operation.mode != "direct-tenant" or profile_source is not None)
+        else:
+            delta = schema_tenant_profile.classify_source(declaration,
+                None if relation_source is None else relation_source[0],
+                *material[1:7], base_sha=base_sha, head_sha=head_sha)
+            profile_delta = delta
         _valid(common.loads_strict(before_raw) == before and common.loads_strict(after_raw) == after)
         current = {(ref.kind, ref.identity) for ref in delta.explained}
         _valid(not current.intersection(explained))
         explained.update(current)
         summary.append("source " + label + " declaration: sha256=" + delta.declaration_sha256
-                       + "; operation=" + delta.operation_sha256 + "; source interpretation only")
+                       + ("; operation=" + delta.operation_sha256 if label != "tenant-profile" else "")
+                       + "; source interpretation only")
     left = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in before["objects"]}
     right = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in after["objects"]}
     old_global = {r["name"]: r for r in old_globals}
     new_global = {r["name"]: r for r in new_globals}
+    validated_profiles = set() if profile_delta is None else {
+        (item.function_ref.kind, item.function_ref.identity) for item in profile_delta.profiles}
     if any(kind == "functions" and re.fullmatch(r"rereply_tenant_policy_additive_fingerprint_v(?:[2-9]|[1-9][0-9]+)\([0-9a-f]{64}\)", name)
-           for kind, name in right):
+           and (kind, name) not in validated_profiles for kind, name in right):
         reasons.add("additive-profile-unsupported")
         requirements.add("additive-profile-unsupported")
     old_relations = {name for kind, name in left if kind == "relations"}
@@ -987,7 +1023,9 @@ def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals:
             elif kind == "functions":
                 if attrs["security_definer"] == "true":
                     summary.append("new definer function " + name)
-                else:
+                elif attrs["owner"] == "MIGRATION_OWNER" and attrs["acl"] in {
+                        "MIGRATION_OWNER>MIGRATION_OWNER:EXECUTE:false;MIGRATION_OWNER>PUBLIC:EXECUTE:false",
+                        "MIGRATION_OWNER>MIGRATION_OWNER:EXECUTE:false;MIGRATION_OWNER>RUNTIME:EXECUTE:false"}:
                     proposed = "expand"
             elif kind == "indexes" and attrs["unique"] == "false" and key not in explained:
                 requirements.add("index-operation-unsupported")
@@ -1171,6 +1209,33 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
     return _classify_v2(repo, base, head, legacy)
 
 
+def _v2_profile_history(repo: _Repository, base: str, head: str) -> None:
+    """Check retained identities at every first parent, in the original scope."""
+    raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+    _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+    revisions = raw.decode("ascii").splitlines()
+    _valid(len(revisions) <= MAX_HISTORY_COMMITS and len(set(revisions)) == len(revisions)
+           and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+           and ((base == head and not revisions) or (base != head and revisions and revisions[-1] == head)))
+    prior = tuple(repo.blob(base, path) for path in (CATALOG, GLOBALS, _V2_TENANT))
+    for revision in revisions:
+        current = tuple(repo.blob(revision, path) for path in (CATALOG, GLOBALS, _V2_TENANT))
+        schema_tenant_profile.validate_retained_pair(prior[0], current[0], prior[1], current[1], prior[2], current[2])
+        prior = current
+
+
+def _v2_tenant_explained(left: str, right: str, delta) -> bool:
+    """Freshly replayed exact declaration hashes, never a whole-file waiver."""
+    before = dict(schema_relation._tenant_inventory(left.encode()).declarations)
+    after = dict(schema_relation._tenant_inventory(right.encode()).declarations)
+    changes = {name: (None if name not in before else hashlib.sha256(before[name]).hexdigest(),
+                     None if name not in after else hashlib.sha256(after[name]).hexdigest())
+               for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+    expected = {item.name: (item.before_declaration_sha256, item.after_declaration_sha256)
+                for item in delta.tenant_changes}
+    return changes == expected
+
+
 def _classify_v2(repo: _Repository, base: str, head: str,
                  legacy: Classification) -> PolicyClassification:
     repo_dir = repo.root
@@ -1187,20 +1252,31 @@ def _classify_v2(repo: _Repository, base: str, head: str,
         constant_declaration = repo.blob(head, schema_nullable.CONSTANT_SOURCE_PATH)
         section = "index-source"
         index_declaration = repo.blob(head, schema_index.SOURCE_PATH)
-        declarations = (declaration, constant_declaration, index_declaration)
-        labels = ("nullable-source", "constant-source", "index-source")
+        section = "relation-source"
+        relation_declaration = repo.blob(head, schema_relation.SOURCE_PATH)
+        section = "tenant-profile-source"
+        profile_declaration = repo.blob(head, schema_tenant_profile.SOURCE_PATH)
+        declarations = (declaration, constant_declaration, index_declaration, relation_declaration, profile_declaration)
+        labels = ("nullable-source", "constant-source", "index-source", "relation-source", "tenant-profile-source")
         source_section = next((label for label, raw in zip(labels, declarations) if raw is not None), "catalog")
         if sum(raw is not None for raw in declarations) > 1:
             source_section = "source-classification"
         section = "catalog"
         before_raw = repo.blob(base, CATALOG)
         after_raw = None
+        extra_roles = None
         if any(raw is not None for raw in declarations):
             after_raw = repo.blob(head, CATALOG)
+            if relation_declaration is not None or profile_declaration is not None:
+                section = "global-tables"
+                before_global, after_global = repo.blob(base, GLOBALS), repo.blob(head, GLOBALS)
+                section = "tenant-profile"
+                before_tenant, after_tenant = repo.blob(base, _V2_TENANT), repo.blob(head, _V2_TENANT)
+                extra_roles = (before_global, after_global, before_tenant, after_tenant)
             section = source_section
             # Bound all descriptor/catalog roles before this v2 pass decodes;
             # the unchanged legacy classifier has its own original read bounds.
-            _v2_source_budget(declarations, before_raw, after_raw)
+            _v2_source_budget(declarations, before_raw, after_raw, extra_roles)
         if before_raw is None:
             reasons.add("catalog-baseline-required")
             return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), (), tuple(sorted(requirements)))
@@ -1217,8 +1293,19 @@ def _classify_v2(repo: _Repository, base: str, head: str,
             constant_declaration, before_raw, after_raw, base, head)
         index_source = None if index_declaration is None else (
             index_declaration, before_raw, after_raw, base, head)
+        relation_source = None if relation_declaration is None else (
+            relation_declaration, before_raw, after_raw, *extra_roles, base, head)
+        profile_source = None if profile_declaration is None else (
+            profile_declaration, before_raw, after_raw, *extra_roles, base, head)
         semantic = _v2_catalog_delta(old, new, old_global, new_global, reasons, summary, requirements,
-                                     source=source, constant_source=constant_source, index_source=index_source)
+                                     source=source, constant_source=constant_source, index_source=index_source,
+                                     relation_source=relation_source, profile_source=profile_source)
+        profile_delta = None
+        if profile_source is not None:
+            profile_delta = schema_tenant_profile.classify_source(profile_declaration, relation_declaration,
+                *profile_source[1:7], base_sha=base, head_sha=head)
+            section = "tenant-profile-history"
+            _v2_profile_history(repo, base, head)
         section = "history"
         before = repo.document(base, HISTORY, _history)
         after = repo.document(head, HISTORY, _history)
@@ -1252,13 +1339,15 @@ def _classify_v2(repo: _Repository, base: str, head: str,
         if any(path == _V2_TENANT for _, path in changes):
             left, right = repo.text(base, _V2_TENANT), repo.text(head, _V2_TENANT)
             if _v2_tenant_declarations(left) != _v2_tenant_declarations(right):
-                kind, dormant = "contract", False
-                summary.append("tenant profile declarations changed")
+                if profile_delta is None or not _v2_tenant_explained(left, right, profile_delta):
+                    kind, dormant = "contract", False
+                    summary.append("tenant profile declarations changed")
             for name in ("tenantRLSRoutingVersion", "tenantRLSAdditiveProfileVersion", "tenantPolicyFingerprintSignature", "tenantAdditivePolicyFingerprintSignature"):
                 if _constant_bytes(left, name) != _constant_bytes(right, name):
                     kind, dormant = "contract", False
                     requirements.add("additive-profile-unsupported")
-            if re.search(r"\btenantRLSAdditiveProfileV(?:[2-9]|[1-9][0-9]+)\b", _go_code(right or "")):
+            if (profile_delta is None
+                    and re.search(r"\btenantRLSAdditiveProfileV(?:[2-9]|[1-9][0-9]+)\b", _go_code(right or ""))):
                 reasons.add("additive-profile-unsupported")
                 requirements.add("additive-profile-unsupported")
         section = "pending"

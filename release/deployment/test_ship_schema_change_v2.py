@@ -182,7 +182,8 @@ class DirectCurrentFormatRuleTests(unittest.TestCase):
                 self.assertEqual(self.delta([row("relations", "t"), row(kind, "t.rule", "t")], [row("relations", "t"), row(kind, "t.rule", "t", definition_sha256=J)])[0], "contract")
 
     def test_direct_new_invoker_function(self):
-        self.assertEqual(self.added(row("functions", "fn(" + H + ")"))[:2], ("expand", set()))
+        acl = "MIGRATION_OWNER>MIGRATION_OWNER:EXECUTE:false;MIGRATION_OWNER>PUBLIC:EXECUTE:false"
+        self.assertEqual(self.added(row("functions", "fn(" + H + ")", acl=acl))[:2], ("expand", set()))
 
     def test_new_definer_even_without_public_acl(self):
         result = self.added(row("functions", "fn(" + H + ")", security_definer="true"))
@@ -1566,6 +1567,306 @@ class CompleteColumnIndexSourcePolicyTests(unittest.TestCase):
             with self.subTest(present=not changes), mock.patch.object(sc._Repository, "blob", oversized):
                 result = sc.classify_v2(self.repo.root, self.base, head)
             self.assertIn("classifier-v2-invalid:catalog", result.reasons)
+
+
+class InvokerCreationPrivilegeTests(unittest.TestCase):
+    """New-object creation tuples do not waive any old privilege changes."""
+
+    A = "MIGRATION_OWNER>MIGRATION_OWNER:EXECUTE:false;MIGRATION_OWNER>PUBLIC:EXECUTE:false"
+    B = "MIGRATION_OWNER>MIGRATION_OWNER:EXECUTE:false;MIGRATION_OWNER>RUNTIME:EXECUTE:false"
+
+    def classify(self, old, new):
+        return sc._v2_catalog_delta(catalog(old), catalog(new), [], [], set(), [], set())
+
+    def test_exact_a_and_b_new_invokers(self):
+        for acl in (self.A, self.B):
+            with self.subTest(acl=acl):
+                self.assertEqual(self.classify([], [row("functions", "f(" + H + ")", acl=acl)]), "expand")
+
+    def test_empty_extra_foreign_and_owner_privileges_are_contract(self):
+        invalid = ("", self.A.split(";")[0], self.A + ";MIGRATION_OWNER>RUNTIME:EXECUTE:false",
+            self.A.replace("MIGRATION_OWNER>PUBLIC", "OTHER>PUBLIC"),
+            self.A.replace("EXECUTE:false", "EXECUTE:true"), self.A + ";MIGRATION_OWNER>PUBLIC:USAGE:false")
+        for acl in invalid:
+            with self.subTest(acl=acl):
+                self.assertEqual(self.classify([], [row("functions", "f(" + H + ")", acl=acl)]), "contract")
+        with self.assertRaises(sc._Invalid):
+            self.classify([], [row("functions", "f(" + H + ")", acl=self.A.replace("PUBLIC", "OTHER"))])
+        for owner in ("RUNTIME", "PUBLIC", "OTHER"):
+            self.assertEqual(self.classify([], [row("functions", "f(" + H + ")", owner=owner, acl=self.A)]), "contract")
+
+    def test_existing_owner_acl_and_definer_remain_contract(self):
+        old = row("functions", "f(" + H + ")", acl=self.A)
+        for changed in (row("functions", "f(" + H + ")", acl=self.B),
+                        row("functions", "f(" + H + ")", acl=self.A, owner="OTHER")):
+            self.assertEqual(self.classify([old], [changed]), "contract")
+        self.assertEqual(self.classify([], [row("functions", "f(" + H + ")", acl=self.A, security_definer="true")]), "contract")
+        historical = row("functions", "f(" + H + ")", acl="")
+        self.assertEqual(self.classify([historical], [historical]), "none")
+
+
+class CompleteRelationProfileSourcePolicyTests(unittest.TestCase):
+    """Future immutable source intent, actual classifier; no engine or DB grant."""
+
+    @classmethod
+    def setUpClass(cls):
+        import test_ship_schema_tenant_profile as profiles
+        import test_ship_schema_relation as relations
+        import test_ship_schema_index as indexes
+        cls.p, cls.r, cls.i = profiles, relations, indexes
+        cls.introduction = profiles.scenario()
+        cls.production = profiles.scenario(production=True)
+        cls.retention = profiles.retained(cls.introduction)
+        cls.third = profiles.scenario(prior=cls.introduction, version=3)
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = support.TempRepo(Path(self.temp.name) / "repo")
+
+    def rows(self, version):
+        return history() + [{"version": n, "class": "expand", "min_reader_version": 0, "apply_engine": True}
+                            for n in range(1, version + 1)]
+
+    def pair(self, value=None, *, kind="expand", engine=True, floor=0, changes=None):
+        value = self.introduction if value is None else value
+        profile_raw, relation_raw, bc, ac, bg, ag, bt, at = value
+        old_version, new_version = json.loads(bc)["version"], json.loads(ac)["version"]
+        files = {sc.CATALOG: bc.decode(), sc.GLOBALS: bg.decode(), sc._V2_TENANT: bt.decode(),
+            sc.HISTORY: text(self.rows(old_version)), sc.MIGRATION_PATH: text(migration()),
+            "cmd/whatomate/main.go": MAIN, "README.md": "controlled source-only future intent\n",
+            sc.SEEDS: None, sc.schema_nullable.SOURCE_PATH: None, sc.schema_nullable.CONSTANT_SOURCE_PATH: None,
+            sc.schema_index.SOURCE_PATH: None, sc.schema_relation.SOURCE_PATH: None,
+            sc.schema_tenant_profile.SOURCE_PATH: None}
+        base = self.repo.commit(files)
+        rows = self.rows(new_version)
+        if new_version > old_version:
+            rows[-1].update({"class": kind, "apply_engine": engine, "min_reader_version": floor})
+        files = {sc.CATALOG: ac.decode(), sc.GLOBALS: ag.decode(), sc._V2_TENANT: at.decode(), sc.HISTORY: text(rows),
+            sc.schema_relation.SOURCE_PATH: None if relation_raw is None else relation_raw.decode(),
+            sc.schema_tenant_profile.SOURCE_PATH: None if profile_raw is None else profile_raw.decode(),
+            "README.md": "controlled prospective head\n"}
+        files.update(changes or {})
+        return base, self.repo.commit(files)
+
+    def classify(self, value=None, **kwargs):
+        return sc.classify_v2(self.repo.root, *self.pair(value, **kwargs))
+
+    def global_value(self, *, production=False):
+        fixture = self.r.declared_catalogs(production=production)
+        return (None, self.r.wire(fixture[6]), *fixture[:6])
+
+    def test_complete_global_bundle_source_and_production(self):
+        for production in (False, True):
+            result = self.classify(self.global_value(production=production))
+            self.assertEqual((result.kind, result.reasons), ("expand", ()))
+            self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_complete_tenant_v2_source_and_production(self):
+        for value in (self.introduction, self.production):
+            result = self.classify(value)
+            self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", False, ()))
+            self.assertNotIn("additive-profile-unsupported", result.requirements)
+            self.assertTrue({"producer-class-unsupported", "catalog-format/profile-unsupported", "restore-drills"}
+                            <= set(result.requirements))
+            self.assertEqual(sum(" declaration:" in s and s.startswith("source ") for s in result.summary), 2)
+
+    def test_append_v3_preserves_v2_and_core(self):
+        result = self.classify(self.third)
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+        self.assertNotIn("additive-profile-unsupported", result.requirements)
+
+    def test_retained_noop_is_usable_but_not_an_execution_grant(self):
+        result = self.classify(self.retention)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("none", False, ()))
+        self.assertNotIn("additive-profile-unsupported", result.requirements)
+        self.assertIn("catalog-format/profile-unsupported", result.requirements)
+
+    def test_retained_profile_composes_with_independent_index(self):
+        value = self.retention
+        after, declaration = self.i.add_index(value[2], value[3])
+        declaration = self.i.bind_documents(declaration, value[2], after)
+        value = self.p.rebind(value, raw_changes={1: after})
+        result = self.classify(value, changes={sc.schema_index.SOURCE_PATH: self.i.wire(declaration).decode()})
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+        self.assertNotIn("index-operation-unsupported", result.requirements)
+
+    def test_retained_profile_and_unrelated_global_bundle(self):
+        value = self.retention
+        relation = self.r.add_relation(value[2], value[4], value[6], mode="global", table="later_global_items")
+        value = self.p.bind(relation[:6], relation[6])
+        result = self.classify(value)
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+
+    def test_missing_profile_keeps_unsupported_and_cannot_explain_tenant_bundle(self):
+        result = self.classify(changes={sc.schema_tenant_profile.SOURCE_PATH: None})
+        self.assertIn("classifier-v2-invalid:relation-source", result.reasons)
+        result = self.classify(self.retention, changes={sc.schema_tenant_profile.SOURCE_PATH: None})
+        self.assertIn("additive-profile-unsupported", result.reasons)
+
+    def test_missing_relation_refuses_profile_introduction(self):
+        result = self.classify(changes={sc.schema_relation.SOURCE_PATH: None})
+        self.assertIn("classifier-v2-invalid:tenant-profile-source", result.reasons)
+
+    def test_malformed_present_before_noop_and_dormant_shortcuts(self):
+        value = (None, None, *self.introduction[2:])
+        value = (None, None, value[2], value[2], value[4], value[4], value[6], value[6])
+        for path, label in ((sc.schema_relation.SOURCE_PATH, "relation-source"),
+                            (sc.schema_tenant_profile.SOURCE_PATH, "tenant-profile-source")):
+            for changes in ({}, {sc.SEEDS: text({"version": 0})}):
+                result = self.classify(value, changes={**changes, path: "{}\n"})
+                self.assertIn("classifier-v2-invalid:" + label, result.reasons)
+
+    def test_malformed_present_before_catalog_baseline_shortcut(self):
+        base, _ = self.pair()
+        base = self.repo.commit({sc.CATALOG: None})
+        head = self.repo.commit({sc.schema_relation.SOURCE_PATH: "{}\n", sc.schema_tenant_profile.SOURCE_PATH: None})
+        self.assertIn("classifier-v2-invalid:relation-source", sc.classify_v2(self.repo.root, base, head).reasons)
+
+    def test_existing_unrelated_security_remains_contract(self):
+        def change(doc):
+            next(r for r in doc["objects"] if (r["kind"], r["identity"]) == ("relations", "organizations"))["attributes"]["owner"] = "OTHER"
+        result = self.classify(self.p.mutate_catalog(self.introduction, change), kind="contract")
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+
+    def test_retained_acl_policy_or_fingerprint_edits_refuse(self):
+        for kind, name, key, bad in (("relations", "source_profile_v2_items", "acl", ""),
+            ("policies", "source_profile_v2_items.rereply_tenant_isolation", "roles", "PUBLIC"),
+            ("functions", "rereply_tenant_policy_additive_fingerprint_v2(" + EMPTY + ")", "source_sha256", J)):
+            def change(doc):
+                next(r for r in doc["objects"] if (r["kind"], r["identity"]) == (kind, name))["attributes"][key] = bad
+            result = self.classify(self.p.mutate_catalog(self.retention, change))
+            self.assertIn("classifier-v2-invalid:tenant-profile-source", result.reasons)
+
+    def test_exact_new_bundle_extra_acl_or_policy_refuses(self):
+        def change(doc):
+            attrs = next(r for r in doc["objects"] if (r["kind"], r["identity"]) == ("relations", "source_profile_v2_items"))["attributes"]
+            attrs["acl"] = ";".join(sorted(attrs["acl"].split(";") + ["MIGRATION_OWNER>PUBLIC:SELECT:false"]))
+        result = self.classify(self.p.mutate_catalog(self.introduction, change))
+        self.assertIn("classifier-v2-invalid:source-classification", result.reasons)
+
+    def test_data_and_reader_floor_still_dominate(self):
+        self.assertEqual(self.classify(changes={sc.SEEDS: text({"version": 0})}).kind, "data")
+        self.assertEqual(self.classify(kind="contract", floor=1).kind, "contract")
+
+    def test_current_engine_false_stays_blocked(self):
+        result = self.classify(engine=False)
+        self.assertEqual((result.kind, result.dormant), ("expand", False))
+        self.assertIn("active-catalog-without-apply-engine", result.reasons)
+        self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_history_version_and_append_only_rules_remain(self):
+        bad = self.rows(1); bad[0]["apply_engine"] = True
+        self.assertIn("history-rewritten", self.classify(changes={sc.HISTORY: text(bad)}).reasons)
+        self.assertIn("history-catalog-version-mismatch", self.classify(changes={sc.HISTORY: text(history())}).reasons)
+
+    def test_changed_then_reverted_fingerprint_refuses_in_original_history(self):
+        _, base = self.pair()
+        doc = json.loads(self.retention[3])
+        next(r for r in doc["objects"] if r["identity"].startswith("rereply_tenant_policy_additive_fingerprint_v2("))["attributes"]["source_sha256"] = J
+        self.repo.commit({sc.CATALOG: self.p.encoded(doc).decode()})
+        head = self.repo.commit({sc.CATALOG: self.retention[3].decode(), sc.schema_relation.SOURCE_PATH: None,
+            sc.schema_tenant_profile.SOURCE_PATH: self.retention[0].decode()})
+        self.assertIn("classifier-v2-invalid:tenant-profile-history", sc.classify_v2(self.repo.root, base, head).reasons)
+
+    def test_changed_then_reverted_profile_source_refuses(self):
+        _, base = self.pair()
+        source = self.retention[-1].replace(b'"source_profile_v2_items"', b'"organizations"')
+        self.repo.commit({sc._V2_TENANT: source.decode()})
+        head = self.repo.commit({sc._V2_TENANT: self.retention[-1].decode(), sc.schema_relation.SOURCE_PATH: None,
+            sc.schema_tenant_profile.SOURCE_PATH: self.retention[0].decode()})
+        self.assertIn("classifier-v2-invalid:tenant-profile-history", sc.classify_v2(self.repo.root, base, head).reasons)
+
+    def test_first_parent_bound_does_not_skip_oversized_history(self):
+        base, head = self.pair(self.retention); original = sc._git
+        def bounded(root, args):
+            if args[:3] == ["rev-list", "--first-parent", "--reverse"]:
+                return (b"a" * 40 + b"\n") * (sc.MAX_HISTORY_COMMITS + 1)
+            return original(root, args)
+        with mock.patch.object(sc, "_git", side_effect=bounded):
+            result = sc.classify_v2(self.repo.root, base, head)
+        self.assertIn("classifier-v2-invalid:tenant-profile-history", result.reasons)
+
+    def test_joint_eleven_roles_count_aliases_before_any_decode(self):
+        doc = b" " * (4 << 20)
+        with mock.patch.object(sc.schema_nullable.wire, "_load", side_effect=AssertionError("decoded")):
+            with self.assertRaises(sc._Invalid):
+                sc._v2_source_budget((None, None, None, b"{}\n", b"{}\n"), doc, doc, (b"[]\n",)*2 + (b"x",)*2)
+        for index, limit in ((0, 256 << 10), (2, 512 << 10)):
+            extras = [b"[]\n", b"[]\n", b"x", b"x"]; extras[index] = b" " * (limit + 1)
+            with self.assertRaises(sc._Invalid): sc._v2_source_budget((None, None, None, b"{}\n", None), b"{}", b"{}", tuple(extras))
+
+    def test_full_documents_fit_each_pair_but_not_joint_union(self):
+        value = self.introduction
+        doc = self.p.encoded({"padding": "x" * ((4 << 20) - (128 << 10))})
+        self.assertLess(len(doc), sc.schema_nullable.MAX_DOCUMENT)
+        # All four auxiliary roles are real, complete JSON/string documents.
+        auxiliary = (self.p.encoded({"padding": "x" * (80 << 10)}),) * 2
+        tenant = b"// " + b"x" * (80 << 10) + b"\n"
+        raw = (None, None, None, value[1], value[0])
+        self.assertGreater(sum(len(x) for x in raw if x is not None) + 2*len(doc)
+                           + sum(map(len, auxiliary)) + 2*len(tenant), 8 << 20)
+        with mock.patch.object(sc.schema_nullable.wire, "_load", side_effect=AssertionError("overcap decoded")):
+            with self.assertRaises(sc._Invalid): sc._v2_source_budget(raw, doc, doc, (*auxiliary, tenant, tenant))
+
+    def test_same_comparison_raw_bindings_are_required(self):
+        value = self.introduction
+        material = (value[1], *value[2:], "a"*40, "b"*40)
+        for at in (3, 5, 7):
+            other = list((value[0], *value[2:], "a"*40, "b"*40))
+            other[at] = (b" " + other[at]) if type(other[at]) is bytes else "c"*40
+            with self.assertRaises(sc._Invalid):
+                sc._v2_catalog_delta(json.loads(value[2]), json.loads(value[3]), json.loads(value[4]), json.loads(value[5]),
+                    set(), [], set(), relation_source=material, profile_source=tuple(other))
+
+    def test_preparsed_profile_is_not_an_input_capability(self):
+        value = self.introduction
+        parsed = sc.schema_tenant_profile.classify_source(*value, base_sha="a"*40, head_sha="b"*40)
+        with self.assertRaises(sc._Invalid):
+            sc._v2_catalog_delta(json.loads(value[2]), json.loads(value[3]), json.loads(value[4]), json.loads(value[5]),
+                                set(), [], set(), profile_source=parsed)
+
+    def test_actual_raw_profile_hash_path_and_length_are_not_advisory(self):
+        for key, bad in (("path", "internal/elsewhere.json"), ("bytes", True), ("sha256", J)):
+            changed = self.p.rebind(self.introduction,
+                declaration_change=lambda d: d["after"]["tenant_source"].update({key: bad}))
+            self.assertIn("classifier-v2-invalid:source-classification", self.classify(changed).reasons)
+
+    def test_catalog_io_diagnostic_remains_catalog(self):
+        base, head = self.pair(); original = sc._Repository.blob
+        def fail(repo, revision, path):
+            if revision == base and path == sc.CATALOG: raise sc._Invalid()
+            return original(repo, revision, path)
+        with mock.patch.object(sc._Repository, "blob", fail):
+            self.assertIn("classifier-v2-invalid:catalog", sc.classify_v2(self.repo.root, base, head).reasons)
+
+    def test_absent_descriptors_preserve_normal_none_requirements(self):
+        value = self.introduction
+        raw = (None, None, value[2], value[2], value[4], value[4], value[6], value[6])
+        result = self.classify(raw)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("none", False, ()))
+        self.assertEqual(result.requirements, ("compat-required", "generated-migration-closure-ci"))
+
+    def test_generic_tenant_exemption_does_not_cover_other_declaration_edits(self):
+        value = self.introduction
+        source = value[-1].replace(b'"whatsapp_coexistence_states"', b'"organizations"')
+        value = self.p.rebind(value, raw_changes={5: source})
+        self.assertIn("classifier-v2-invalid:source-classification", self.classify(value).reasons)
+
+    def test_legacy_public_guard_is_not_silently_replaced(self):
+        base, head = self.pair()
+        self.assertIn("catalog-changed:" + sc.CATALOG, sc.classify(self.repo.root, base, head).reasons)
+
+    def test_real_source_scope_identity_and_transport_refusal(self):
+        base, head = self.pair(); original = sc._git
+        for path in (sc.schema_relation.SOURCE_PATH, sc.schema_tenant_profile.SOURCE_PATH):
+            def fail(root, args):
+                if args[:2] == ["ls-tree", "-z"] and args[-1] == path:
+                    raise source_git.SourceGitRefusal("git-failed:source-deadline")
+                return original(root, args)
+            with mock.patch.object(sc, "_git", side_effect=fail), self.assertRaises(source_git.SourceGitRefusal):
+                sc.classify_v2(self.repo.root, base, head)
 
 
 if __name__ == "__main__":
