@@ -210,6 +210,36 @@ def validate(doc):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_public_rollback_negative_uses_unchanged_upload_sign_and_failed_verdict_guards(self):
+        import test_cli_rollback as rollback_tests
+        case = rollback_tests.PublicRollbackCLITests()
+        case.setUpClass()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.w.false_case = 'read'
+        measured, pair, attempt = case.published(negative=True)
+        self.assertFalse(measured.positive)
+        self.assertEqual(attempt.conclusion, 'failure')
+        self.assertEqual(json.loads(pair.context)['version'], 4)
+        self.assertEqual(case.output.read_text(), 'complete=true\n')
+        aggregate, attest = DOCUMENT['jobs']['compat'], DOCUMENT['jobs']['attest']
+        ready_if = step(aggregate, identifier='ready')['if']
+        values = {'steps.check.outputs.complete': 'true', 'steps.canonical.outcome': 'success'}
+        self.assertTrue(condition(ready_if, values))
+        self.assertTrue(condition(attest['if'], {'needs.compat.outputs.evidence_ready': 'true',
+                                               'github.event_name': 'workflow_dispatch'}))
+        self.assertFalse(condition(ready_if, values, cancelled=True))
+        values['steps.canonical.outcome'] = 'failure'
+        self.assertFalse(condition(ready_if, values))
+        gate = heredoc(step(aggregate, name='Require proof and publication success')['run'])
+        with patch.dict(os.environ, {'PREVIEW_RESULT': 'success', 'RUN_RESULT': 'success',
+                                    'CHECK_RESULT': 'failure', 'UPLOAD_RESULT': 'success'}), \
+             self.assertRaises(SystemExit) as stopped:
+            exec(compile(gate, '<rollback-aggregate>', 'exec'), {})
+        self.assertNotEqual(stopped.exception.code, 0)
+        self.assertNotIn('continue-on-error', aggregate)
+        self.assertNotIn('continue-on-error', attest)
+
     def test_current_workflow_contract(self):
         validate(DOCUMENT)
 

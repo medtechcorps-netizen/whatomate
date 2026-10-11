@@ -247,7 +247,7 @@ def execute(repo, ctx, client, snapshot, *, git_binary, deadline,
 
 
 def _rollback_context(ctx):
-    """Private rollback producer identity; normal dispatch remains unchanged."""
+    """Explicit main-dispatch rollback identity; normal routing stays separate."""
     need(type(ctx) is Context and type(ctx.sha) is str and _SHA.fullmatch(ctx.sha)
          and type(ctx.run_id) is int and 1 <= ctx.run_id < 10**16
          and type(ctx.attempt) is int and 1 <= ctx.attempt <= 9999,
@@ -353,7 +353,7 @@ def validate_rollback_evidence(raw, result, snapshot, ctx):
 
 
 def _preview_rollback(repo, ctx, client, *, git_binary, deadline):
-    """Private concrete preview; no public CLI command selects this route."""
+    """Concrete rollback preview for an already validated explicit target."""
     _rollback_context(ctx)
     need(type(deadline) is images._Deadline, "cli-deadline-invalid")
     deadline.remaining()
@@ -409,6 +409,18 @@ def _write_evidence(directory, result, context_raw, snapshot, ctx):
     written_context = _read_public(directory / "compat-context.json", limit=_MAX_CONTEXT)
     need(written_result == result and written_context == context_raw, "cli-evidence-written")
     validate_evidence(written_context, written_result, snapshot, ctx)
+
+
+def _write_rollback_evidence(directory, result, context_raw, snapshot, ctx):
+    validate_rollback_evidence(context_raw, result, snapshot, ctx)
+    _write_public(directory / "compat-result.json", result)
+    _write_public(directory / "compat-context.json", context_raw)
+    need({p.name for p in directory.iterdir()} == {"compat-result.json", "compat-context.json"},
+         "cli-evidence-inventory")
+    written_result = _read_public(directory / "compat-result.json")
+    written_context = _read_public(directory / "compat-context.json", limit=_MAX_CONTEXT)
+    need(written_result == result and written_context == context_raw, "cli-evidence-written")
+    validate_rollback_evidence(written_context, written_result, snapshot, ctx)
 
 
 def _mark_complete(env):
@@ -652,6 +664,8 @@ def main(argv=None):
         command = args[0]
         need(images._READY_FOR_EXECUTION, "cli-experiment-disabled")
         ctx = context(os.environ)
+        if ctx.target is not None:
+            _rollback_context(ctx)
         repo = regular_path(Path.cwd().resolve(), directory=True)
         root = regular_path(Path(os.environ.get("RUNNER_TEMP", "")), directory=True)
         if command == "preview":
@@ -662,43 +676,67 @@ def main(argv=None):
             deadline.end = min(deadline.end, deadline.now() + 600)
             work = _scratch(repo, ctx, "preview", os.environ)
             git_binary = _git_binary(os.environ)
-            value = preview(repo, ctx, _client(work, os.environ, deadline),
-                git_binary=git_binary, deadline=deadline)
+            if ctx.target is None:
+                value = preview(repo, ctx, _client(work, os.environ, deadline),
+                    git_binary=git_binary, deadline=deadline)
+            else:
+                value = _preview_rollback(repo, ctx, _client(work, os.environ, deadline),
+                    git_binary=git_binary, deadline=deadline)
             _write_public(work / "public" / "resolution.json", canonical(value))
             return 1 if value["preview"]["blocked"] else 0
         raw = _read_public(root / "compat-input" / "resolution.json")
         snapshot = common.loads_strict(raw)
-        need(canonical(validate_snapshot(snapshot, ctx)) == raw, "cli-snapshot-noncanonical")
+        if ctx.target is None:
+            need(canonical(validate_snapshot(snapshot, ctx)) == raw, "cli-snapshot-noncanonical")
+        else:
+            need(canonical(validate_rollback_snapshot(snapshot, ctx)) == raw, "cli-snapshot-noncanonical")
         if command in {"check", "validate-evidence"}:
             need(os.environ.get("COMPAT_PREVIEW_OUTCOME") == "success"
                  and os.environ.get("COMPAT_RUN_OUTCOME") == "success", "cli-upstream-failed")
             result = _read_public(root / "compat-input" / "compat-result.json")
-            value = validate_result(result, snapshot, ctx)
+            if ctx.target is None:
+                value = validate_result(result, snapshot, ctx)
+            else:
+                value = validate_rollback_result(result, snapshot, ctx)
             if command == "validate-evidence":
                 need({p.name for p in (root / "compat-input").iterdir()}
                      == {"resolution.json", "compat-result.json", "compat-context.json"},
                      "cli-evidence-inventory")
                 context_raw = _read_public(root / "compat-input" / "compat-context.json", limit=_MAX_CONTEXT)
-                validate_evidence(context_raw, result, snapshot, ctx)
+                if ctx.target is None:
+                    validate_evidence(context_raw, result, snapshot, ctx)
+                else:
+                    validate_rollback_evidence(context_raw, result, snapshot, ctx)
             else:
-                context_raw = canonical(evidence_context(result, snapshot, ctx))
+                if ctx.target is None:
+                    context_raw = canonical(evidence_context(result, snapshot, ctx))
+                else:
+                    context_raw = canonical(rollback_evidence_context(result, snapshot, ctx))
             work = _scratch(repo, ctx, command, os.environ)
-            _write_evidence(work / "public", result, context_raw, snapshot, ctx)
+            if ctx.target is None:
+                _write_evidence(work / "public", result, context_raw, snapshot, ctx)
+            else:
+                _write_rollback_evidence(work / "public", result, context_raw, snapshot, ctx)
             _mark_complete(os.environ)
             return 0 if command == "validate-evidence" or accepted(value) else 1
-        need(ctx.target is None, "cli-target-proof-unsupported")
         need(snapshot["preview"]["blocked"] is False, "cli-preview-blocked")
         deadline = images._Deadline()
         work = _scratch(repo, ctx, "run", os.environ)
         docker = regular_path(Path(os.environ.get("COMPAT_DOCKER_BIN", "")))
         plugin = regular_path(Path(os.environ.get("COMPAT_BUILDX_BIN", "")))
         git_binary = _git_binary(os.environ)
-        result = execute(repo, ctx, _client(work, os.environ, deadline), snapshot,
-            git_binary=git_binary, deadline=deadline, docker_binary=str(docker),
-            config_dir=work / "docker-config", image_work_dir=work / "images", buildx_binary=plugin)
+        if ctx.target is None:
+            result = execute(repo, ctx, _client(work, os.environ, deadline), snapshot,
+                git_binary=git_binary, deadline=deadline, docker_binary=str(docker),
+                config_dir=work / "docker-config", image_work_dir=work / "images", buildx_binary=plugin)
+        else:
+            result = _execute_rollback(repo, ctx, _client(work, os.environ, deadline), snapshot,
+                git_binary=git_binary, deadline=deadline, docker_binary=str(docker),
+                config_dir=work / "docker-config", image_work_dir=work / "images", buildx_binary=plugin)
         _write_public(work / "public" / "compat-result.json", result)
         return 0
-    except (proof.EvidenceError, common.ReleaseError, OSError, ValueError, TypeError, KeyError) as error:
+    except (proof.EvidenceError, common.ReleaseError, record_resolver.policy.PolicyRefusal,
+            OSError, ValueError, TypeError, KeyError) as error:
         print(_failure_message(error), file=sys.stderr)
         print(_failure_diagnostic(error), file=sys.stderr)
         build_diagnostic = _build_failure_diagnostic(error)
@@ -714,6 +752,10 @@ _DIAGNOSTIC_PHASES = tuple((function.__code__, phase) for function, phase in (
     (regular_path, "cli-path"), (_read_public, "cli-read"), (_write_public, "cli-write"),
     (_mark_complete, "cli-complete"), (validate_snapshot, "cli-snapshot"), (validate_result, "cli-result"),
     (preview, "preview"), (execute, "execute"),
+    (_rollback_context, "cli-context"), (_rollback_snapshot, "cli-snapshot"),
+    (validate_rollback_snapshot, "cli-snapshot"), (validate_rollback_result, "cli-result"),
+    (_preview_rollback, "preview"), (_execute_rollback, "execute"),
+    (_write_rollback_evidence, "cli-write"), (validate_rollback_evidence, "cli-result"),
     (_resolved_snapshot, "cli-snapshot"), (_git_binary, "cli-path"),
     (record_resolver.resolve_forward, "release-verify"), (record_resolver._resolve, "release-verify"),
     (record_transport.ReleaseGh.__init__, "release-client"),

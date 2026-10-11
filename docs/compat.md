@@ -443,11 +443,12 @@ operation. Normal classification compares that database origin to the candidate;
 after an image rollback, it need not equal the latest record's source. `cli.py run`
 authenticates the sources again and requires exact agreement of the canonical
 version-4 snapshot with the preview before image admission or an experiment.
-An explicit rollback target
-can be previewed but cannot run or publish proof yet (`cli-target-proof-unsupported`):
-the dedicated exact-span rollback experiment remains a separate PR16 requirement.
+An explicit rollback target selects the separate proof lane only on a validated
+`workflow_dispatch` of `refs/heads/main`. Other events or refs refuse before
+client construction. The source resolver independently binds the tooling source
+to captured current `main`; supplying a target does not authorize a deployment.
 
-Read-only source preparation for that future experiment uses a distinct resolution.
+Read-only source preparation for that experiment uses a distinct resolution.
 It binds the producer to captured current `main`, keeps both actual signed web-image
 sources separate from their release records and the retained database origin, and
 retains the complete ordered target-through-latest span. The first preparatory
@@ -456,8 +457,8 @@ span source material, in addition to the existing five fixed v0 profile pins; it
 therefore refuses seed or registry transitions. Only the existing exact released
 source exception permits absent profile/overlay files at a legacy image endpoint.
 This is source consistency data, not a measured database result or signed rollback
-proof. Normal snapshot4/context3, the CLI target refusal and operational multi-span
-rollback refusal remain unchanged.
+proof. Normal snapshot4/context3 and the operational multi-span rollback refusal
+remain unchanged.
 
 The private rollback producer consumes that distinct resolution and keeps three
 image roles separate: the exact signed target runs as the previous application,
@@ -469,12 +470,11 @@ when their source and recipe bindings also agree.
 
 The experiment retains the existing migration, read/write, worker, reverse and
 cleanup phases. Catalog collection and terminal failure evidence bind to the
-tooling source, independently of the live application source. This private path
-does not activate a CLI command or change snapshot4/context3, signed proof
-collection, release admission or retry custody. Controlled tests of the path are
-not actual database or hosted rollback qualification.
+tooling source, independently of the live application source. The proof lane does
+not change normal snapshot4/context3, release admission or retry custody.
+Controlled tests of the path are not actual database or hosted qualification.
 
-Private rollback preview/run helpers now bind that experiment to a separate
+The public preview/run commands bind that experiment to a separate
 version-1 snapshot with purpose `rollback-v0` and context version 4. They require
 an explicit target on current-main workflow dispatch, re-resolve the full source
 projection inside the original deadline, and compare the fresh snapshot before
@@ -490,13 +490,21 @@ cannot enter the rollback parser. Complete negative measurements retain their
 actual flags and final catalog hash. Parsing or signing them does not make them
 successful. File limits remain 16 KiB for results and 4 KiB for context.
 
-These helpers are not connected to CLI dispatch, workflow publication, the
-compatibility collector, release admission or retry custody. The public target
-and multi-span holds remain. The pending normal snapshot4/context3 contract is
-unchanged, and rollback context4 makes no claim about unapplied pending plans.
-Synthetic protocol tests do not qualify an actual hosted rollback.
+For this lane, `check` and `validate-evidence` use a separate closed validator and
+create-only writer for the same two canonical artifact names. Both files must
+round-trip exactly before the complete marker. A complete negative fails `check`
+but remains eligible for the unchanged workflow's upload and independent signing;
+infrastructure, partial-write, failed-upload and cancellation paths do not become
+ready evidence. The workflow bytes, permissions and limits are unchanged.
 
-The resolution format is version 4. Both `latest` and `selected` contain the
+Operational rollback across two or more non-none changes, its record-job custody
+and writer integration remain held. Zero/one-change requests do not need this
+proof, and an all-v1 chain cannot invent the required retained v2 live contract.
+The normal snapshot4/context3 contract is unchanged; rollback context4 makes no
+claim about unapplied pending plans. Local synthetic routing and verifier tests
+do not establish exact-source hosted rollback qualification.
+
+The normal resolution format is version 4. Both `latest` and `selected` contain the
 verified release tag, signed manifest SHA-256, source SHA and web digest.
 `database_base` separately binds the supported legacy source or retained v2
 origin record and measured catalog; `selected_web_source_sha` identifies the
@@ -539,7 +547,7 @@ The current normal admission requires the source-bound context-v3 pair;
 historical context-v1/v2 positives do not establish this newer contract. Their
 actual false flags remain available for negative auditing. Exact old context-v2
 record retries retain a separate closed historical replay path.
-Operational rollback-target proof and active schema changes remain unsupported.
+Operational multi-span rollback and active schema changes remain unsupported.
 
 After successful upload, a separate guarded `evidence_ready` output permits
 the `attest` job on push or dispatch, including a complete measured negative.
@@ -868,7 +876,7 @@ The preflight and unchanged normal preflight passed 63 synthetic cases (22 new
 rollback cases and 41 normal cases), including source and inventory drift,
 foreign-head vetoes, expiry, shared deadlines and aggregate command/byte limits.
 These checks do not establish hosted signatures, permissions, deleted-run
-coverage or future freshness, and do not activate the rollback workflow.
+coverage, future freshness or operational rollback admission.
 
 The concrete collector and shared verifier/GET seams passed 99 synthetic cases;
 the existing pure history/request bridge passed 43 more. Controlled immutable
