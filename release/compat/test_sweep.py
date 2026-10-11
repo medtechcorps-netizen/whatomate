@@ -116,7 +116,7 @@ class World:
                          phone_number_id=self.f.phone_number_id, to=self.conversations[ident]["contact"]["phone_number"],
                          text_sha256=hashlib.sha256(text.encode()).hexdigest())
                 return {"message": msg}
-            return {"messages": self.messages[ident]}
+            return {"messages": self.messages[ident], "total": len(self.messages[ident]), "page": 1, "limit": 100}
         if path == "/api/templates" and method == "POST":
             assert value["category"] == "UTILITY" and value["header_type"] == "NONE"
             ident = self.uid()
@@ -258,10 +258,10 @@ class SweepTests(unittest.TestCase):
     def test_each_retained_case_detects_independent_drift(self):
         mutations = {
             "contacts": lambda w, r: w.contacts[r.contact_id].update(profile_name="changed"),
-            "inbound": lambda w, r: w.messages[r.conversation_id][0]["message"].update(whatsapp_message_id="other"),
-            "outbound": lambda w, r: w.messages[r.conversation_id][1]["message"].update(id=ACCOUNT),
+            "inbound": lambda w, r: w.messages[r.conversation_id][0]["message"].update(content="changed"),
+            "outbound": lambda w, r: w.messages[r.conversation_id][1]["message"].update(content="changed"),
             "template": lambda w, r: w.templates[r.template_id].update(body_content="changed"),
-            "flow": lambda w, r: w.flows[r.flow_id].update(graph={}),
+            "flow": lambda w, r: w.flows[r.flow_id].update(description="changed"),
             "settings": lambda w, r: w.settings.update(greeting_message="changed"),
         }
         for case, mutate in mutations.items():
@@ -269,8 +269,97 @@ class SweepTests(unittest.TestCase):
                 world = World()
                 record = world.client().write(NONCE)
                 mutate(world, record)
-                with self.assertRaises(s.SemanticFailure):
-                    world.client().read(record)
+                client = world.client()
+                world.calls.clear()
+                actual = client.read(record)
+                self.assertEqual(actual, {key: key != case for key in s.proof.SWEEP_CASES})
+                self.assertEqual(len(world.calls), 7)
+                self.assertEqual(world.calls[-1][1], "/api/chatbot/settings")
+                self.assertTrue(all(method == "GET" for method, *_ in world.calls))
+                self.assertFalse(client._failed)
+                self.assertFalse(s.proof._sweep({"execution": {"status": "completed", "exit_code": 0, "failure": None},
+                                                "cases": actual}))
+
+    def test_all_six_false_are_complete_repeatable_observations(self):
+        world = World(); record = world.client().write(NONCE)
+        world.contacts[record.contact_id]["profile_name"] = "changed"
+        for row in world.messages[record.conversation_id]: row["message"]["content"] = "changed"
+        world.templates[record.template_id]["body_content"] = "changed"
+        world.flows[record.flow_id]["trigger_keywords"] = []
+        world.settings["greeting_message"] = "changed"
+        client = world.client(); world.calls.clear()
+        for _ in range(2):
+            self.assertEqual(client.read(record), dict.fromkeys(s.proof.SWEEP_CASES, False))
+        self.assertEqual(len(world.calls), 14)
+        self.assertTrue(all(method == "GET" for method, *_ in world.calls))
+        self.assertEqual(client.stub_receipts(), {"calls": [], "windows": []})
+
+    def test_message_absence_requires_complete_validated_page(self):
+        world = World(); record = world.client().write(NONCE)
+        world.messages[record.conversation_id].pop(0)
+        actual = world.client().read(record)
+        self.assertFalse(actual["inbound"]); self.assertTrue(actual["outbound"])
+        for metadata in ({"total": 2}, {"total": True}, {"page": 2}, {"page": True}, {"limit": 99}, {"total": None}, {"has_more": True}):
+            world.mutate = lambda m, p, r: {"data": {**r["data"], **metadata}} if "/messages?" in p else r
+            client = world.client()
+            with self.assertRaisesRegex(s.proof.EvidenceError, "sweep-message-page-incomplete"):
+                client.read(record)
+            self.assertTrue(client._failed)
+
+    def test_identity_safety_and_provider_bindings_stay_strict(self):
+        mutations = [lambda w, r: w.contacts[r.contact_id].update(id=ACCOUNT),
+                     lambda w, r: w.contacts[r.contact_id].update(whatsapp_account="other"),
+                     lambda w, r: w.messages[r.conversation_id][0]["message"].update(whatsapp_message_id="other"),
+                     lambda w, r: w.messages[r.conversation_id][1]["message"].update(direction="incoming"),
+                     lambda w, r: w.templates[r.template_id].update(status="APPROVED"),
+                     lambda w, r: w.flows[r.flow_id].update(graph={}),
+                     lambda w, r: w.flows[r.flow_id].update(on_complete_action="handoff"),
+                     lambda w, r: w.settings.update(enabled=True),
+                     lambda w, r: w.settings.update(ai_enabled=True),
+                     lambda w, r: w.conversations.clear()]
+        for mutate in mutations:
+            world = World(); record = world.client().write(NONCE); mutate(world, record)
+            client = world.client()
+            with self.assertRaises(s.proof.EvidenceError): client.read(record)
+            self.assertTrue(client._failed)
+
+    def test_mirrored_display_mismatch_is_false_but_ownership_is_not(self):
+        for part, key in (("contact", "profile_name"), ("contact_identity", "display_name")):
+            world = World(); record = world.client().write(NONCE)
+            world.conversations[record.conversation_id][part][key] = "changed"
+            self.assertFalse(world.client().read(record)["contacts"])
+
+    def test_late_failure_never_returns_partial_false_cases(self):
+        for status in (401, 403, 404, 500, 302):
+            world = World(); record = world.client().write(NONCE)
+            world.contacts[record.contact_id]["profile_name"] = "changed"
+            world.intercept = lambda m, p, b: s.Reply(status, (), b'private') if p == "/api/chatbot/settings" else None
+            client = world.client()
+            with self.assertRaises(s.proof.EvidenceError) as caught: client.read(record)
+            self.assertNotIn("private", str(caught.exception)); self.assertTrue(client._failed)
+            count = len(world.calls)
+            with self.assertRaises(s.proof.EvidenceError): client.read(record)
+            self.assertEqual(len(world.calls), count)
+
+    def test_malformed_later_field_is_not_hidden_by_earlier_false(self):
+        for change in ({"name": "changed", "body_content": None}, {"name": "changed", "body_content": "x" * 8193}):
+            world = World(); record = world.client().write(NONCE)
+            world.templates[record.template_id].update(change)
+            with self.assertRaisesRegex(s.proof.EvidenceError, "sweep-response-invalid"):
+                world.client().read(record)
+        world = World(); record = world.client().write(NONCE)
+        world.flows[record.flow_id].update(name="changed", trigger_keywords=["ok", None])
+        with self.assertRaises(s.proof.EvidenceError): world.client().read(record)
+
+    def test_write_precheck_cannot_discard_complete_false_result(self):
+        world = World(); client = world.client()
+        world.mutate = lambda m, p, r: {"data": {**r["data"], "profile_name": "changed"}} if p.startswith("/api/contacts/") else r
+        with self.assertRaises(s.SemanticFailure): client.write(NONCE)
+        self.assertTrue(client._failed)
+        self.assertEqual(world.calls[-1][1], "/api/chatbot/settings")
+        count = len(world.calls)
+        with self.assertRaises(s.proof.EvidenceError): client.write(NONCE)
+        self.assertEqual(len(world.calls), count)
 
     def test_record_foreign_binding_and_path_injection_refuse(self):
         world = World()
@@ -284,7 +373,7 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(len(world.calls), before)
 
     def test_duplicate_or_foreign_conversation_and_messages_refuse(self):
-        for case in ("duplicate-conversation", "foreign-account", "duplicate-message", "missing-message"):
+        for case in ("duplicate-conversation", "foreign-account", "duplicate-message"):
             with self.subTest(case=case):
                 world = World()
                 record = world.client().write(NONCE)
@@ -294,8 +383,6 @@ class SweepTests(unittest.TestCase):
                     world.conversations[record.conversation_id]["channel_account"]["external_account_id"] = "legacy-account:" + ORG
                 elif case == "duplicate-message":
                     world.messages[record.conversation_id].append(world.messages[record.conversation_id][0])
-                else:
-                    world.messages[record.conversation_id] = []
                 with self.assertRaises(s.SemanticFailure):
                     world.client().read(record)
 

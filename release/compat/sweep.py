@@ -4,8 +4,9 @@ Fixtures and RecordSet values are private, in-memory run data. The caller owns
 the isolated stack, synthetic accounts/entitlements/legacy-reply allowlist,
 stable configuration across versions, and process/worker/SQL evidence. No I/O
 occurs at import. No POST/PUT is retried, even after an ambiguous transport error.
-On any incomplete case this adapter raises; it cannot manufacture a completed
-false row for proof.py's not-yet-implemented semantic-blocked runner contract.
+Completed retained reads preserve bounded value mismatches as false cases.
+Identity, runtime safety and incomplete evidence still raise; an unrun case is
+never manufactured for the future semantic-blocked runner contract.
 """
 from __future__ import annotations
 
@@ -52,6 +53,19 @@ def _same(ok: bool) -> None:
 def _obj(value):
     _need(type(value) is dict, "sweep-response-invalid")
     return value
+
+
+def _text_equal(value, expected):
+    # Wrong/missing types are incomplete response evidence, not a completed
+    # value comparison. Neither private value enters errors or public output.
+    _need(type(value) is str and len(value) <= 8192, "sweep-response-invalid")
+    return value == expected
+
+
+def _text_fields(value, expected):
+    # Eager validation: an early false must not hide a later malformed field.
+    comparisons = [_text_equal(value.get(key), wanted) for key, wanted in expected.items()]
+    return all(comparisons)
 
 
 def _uuid(value):
@@ -365,7 +379,7 @@ class Sweep:
                 return rows, cursor
         raise proof.InfrastructureFailure("sweep-journal-unsettled")
 
-    def _conversation(self, expected, contact_id, conversation_id=None, *, wait=False):
+    def _conversation(self, expected, contact_id, conversation_id=None, *, wait=False, retained_values=False):
         for attempt in range(40 if wait else 1):
             values = self._call("GET", "/api/conversations?limit=100&search=" + expected["phone"]).get("conversations")
             _need(type(values) is list and len(values) <= 100, "sweep-response-invalid")
@@ -381,7 +395,6 @@ class Sweep:
                       and value.get("external_conversation_id") == "legacy-contact:" + contact_id)
                 contact, account = _obj(value.get("contact")), _obj(value.get("channel_account"))
                 _same(contact.get("id") == contact_id and contact.get("phone_number") == expected["phone"]
-                      and contact.get("profile_name") == expected["name"]
                       and contact.get("whatsapp_account") == self._f.account_name
                       and contact.get("organization_id") == self._f.organization_id)
                 _same(account.get("id") == self._f.channel_account_id and account.get("organization_id") == self._f.organization_id
@@ -396,8 +409,12 @@ class Sweep:
                 _same(all(identity.get(k) == v for k, v in {"organization_id": self._f.organization_id,
                       "contact_id": contact_id, "channel_account_id": self._f.channel_account_id, "channel": "whatsapp",
                       "external_id": "legacy-contact:" + contact_id, "address": expected["phone"],
-                      "normalized_address": expected["phone"], "display_name": expected["name"]}.items())
+                      "normalized_address": expected["phone"]}.items())
                       and identity.get("is_primary") is True and identity.get("is_verified") is True)
+                names = [_text_equal(contact.get("profile_name"), expected["name"]),
+                         _text_equal(identity.get("display_name"), expected["name"])]
+                if not retained_values:
+                    _same(all(names))
                 return value
             if wait and attempt < 39:
                 self._sleep(0.25)
@@ -427,6 +444,38 @@ class Sweep:
         value = _obj(self._call("GET", "/api/chatbot/settings").get("settings"))
         _same(value.get("enabled") is False and value.get("ai_enabled") is False)
         return value
+
+    def _retained_message(self, record, ident, text, direction, *, wamid=None):
+        response = self._call("GET", f"/api/conversations/{record.conversation_id}/messages?limit=100")
+        rows = response.get("messages")
+        _need(set(response) == {"messages", "page", "limit", "total"}
+              and type(rows) is list and len(rows) <= 100
+              and type(response.get("page")) is int and response["page"] == 1
+              and type(response.get("limit")) is int and response["limit"] == 100
+              and type(response.get("total")) is int and response["total"] == len(rows),
+              "sweep-message-page-incomplete")
+        messages = []
+        seen = set()
+        for row in rows:
+            row = _obj(row)
+            message = _obj(row.get("message", row))
+            key = _uuid(message.get("id"))
+            _same(key not in seen)
+            seen.add(key)
+            _same(message.get("organization_id") == self._f.organization_id
+                  and message.get("contact_id") == record.contact_id
+                  and message.get("whatsapp_account") == self._f.account_name
+                  and message.get("inbox_conversation_id") == record.conversation_id)
+            messages.append(message)
+        # Select by the retained identity, not by the expected content: changed
+        # text is observable. Absence is false only after complete enumeration.
+        matches = [message for message in messages if message["id"] == ident]
+        if not matches:
+            return False
+        message = matches[0]
+        _same(message.get("direction") == direction and message.get("message_type") == "text"
+              and (wamid is None or message.get("whatsapp_message_id") == wamid))
+        return _text_equal(message.get("content"), text)
 
     def write(self, nonce: str) -> RecordSet:
         self._begin()
@@ -475,7 +524,9 @@ class Sweep:
             self._call("PUT", "/api/chatbot/settings", {"greeting_message": expected["settings"]})
             record = RecordSet(self._binding(), nonce, contact_id, conversation_id, inbound, outbound,
                                _uuid(template.get("id")), _uuid(flow.get("id")))
-            self._read(record)  # Do not reset this write's deadline/request budget.
+            # A write cannot discard an early readback mismatch and later return
+            # a favorable RecordSet. Keep this precheck strict and same-budget.
+            _same(all(self._read(record).values()))
             return record
         except Exception:
             self._failed = True
@@ -488,20 +539,32 @@ class Sweep:
         expected = self._expected(record.nonce)
         contact = self._call("GET", "/api/contacts/" + record.contact_id)
         _same(contact.get("id") == record.contact_id and contact.get("phone_number") == expected["phone"]
-              and contact.get("profile_name") == expected["name"] and contact.get("whatsapp_account") == self._f.account_name)
-        self._conversation(expected, record.contact_id, record.conversation_id)
-        self._message(record.conversation_id, record.contact_id, expected["inbound"], "incoming", wamid=expected["wamid"], retained=record.inbound_id)
-        self._message(record.conversation_id, record.contact_id, expected["outbound"], "outgoing", retained=record.outbound_id)
+              and contact.get("whatsapp_account") == self._f.account_name)
+        contact_name = _text_equal(contact.get("profile_name"), expected["name"])
+        conversation = self._conversation(expected, record.contact_id, record.conversation_id, retained_values=True)
+        names = [_text_equal(conversation["contact"]["profile_name"], expected["name"]),
+                 _text_equal(conversation["contact_identity"]["display_name"], expected["name"])]
+        inbound = self._retained_message(record, record.inbound_id, expected["inbound"], "incoming", wamid=expected["wamid"])
+        outbound = self._retained_message(record, record.outbound_id, expected["outbound"], "outgoing")
         template = self._call("GET", "/api/templates/" + record.template_id)
-        _same(all(template.get(k) == v for k, v in {"id": record.template_id, "whatsapp_account": self._f.account_name,
-              "name": expected["template"], "language": "en_US", "category": "UTILITY", "status": "DRAFT",
-              "header_type": "NONE", "body_content": expected["name"]}.items()))
+        _same(template.get("id") == record.template_id and template.get("whatsapp_account") == self._f.account_name
+              and template.get("status") == "DRAFT")
+        template_values = _text_fields(template, {"name": expected["template"], "language": "en_US", "category": "UTILITY",
+                                                 "header_type": "NONE", "body_content": expected["name"]})
         flow = self._call("GET", "/api/chatbot/flows/" + record.flow_id)
         _same(all(flow.get(k) == v for k, v in {"id": record.flow_id, "organization_id": self._f.organization_id,
-              "name": expected["flow"], "description": expected["name"], "trigger_keywords": [expected["template"]],
               "on_complete_action": "none", "is_enabled": True, "graph": self._graph()}.items()))
-        _same(self._settings().get("greeting_message") == expected["settings"])
-        return {name: True for name in sorted(proof.SWEEP_CASES)}
+        flow_values = _text_fields(flow, {"name": expected["flow"], "description": expected["name"]})
+        keywords = flow.get("trigger_keywords")
+        _need(type(keywords) is list and len(keywords) <= 100, "sweep-response-invalid")
+        for keyword in keywords:
+            _text_equal(keyword, "")  # Validate every item; equality is below.
+        settings = _text_equal(self._settings().get("greeting_message"), expected["settings"])
+        # No partial result escapes if any later GET, identity or safety check
+        # failed. All six booleans describe completed private observations.
+        return {"contacts": contact_name and all(names), "inbound": inbound, "outbound": outbound,
+                "template": template_values, "flow": flow_values and keywords == [expected["template"]],
+                "settings": settings}
 
     def read(self, record: RecordSet) -> dict[str, bool]:
         self._begin()

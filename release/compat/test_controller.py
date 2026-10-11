@@ -212,6 +212,25 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(read["cases"], {key: True for key in c.sweep.proof.SWEEP_CASES})
         self.assertEqual(len(world.contacts), 1)
 
+    def test_actual_read_value_mismatch_completes_but_late_auth_failure_does_not(self):
+        world = test_sweep.World(); world.f = fixture()
+        def factory(value):
+            return c.sweep.Sweep(value, product=world.transport(), stub=world.transport(True),
+                                 wall=lambda: test_sweep.WALL, sleep=lambda _: None)
+        retained = world.client().write(test_sweep.NONCE)
+        world.templates[retained.template_id]["body_content"] = "changed"
+        frame = raw(request("read", record=asdict(retained)))
+        result = json.loads(c.handle(frame, sweep_factory=factory))
+        self.assertEqual(result, {"version": 1, "status": "ok", "operation": "read",
+                                  "cases": {key: key != "template" for key in c.sweep.proof.SWEEP_CASES},
+                                  "stub_receipts": receipts("read")})
+        world.intercept = lambda m, p, b: c.sweep.Reply(401, (), b'private') if p == "/api/chatbot/settings" else None
+        failed = json.loads(c.handle(frame, sweep_factory=factory))
+        self.assertEqual(failed, {"version": 1, "status": "error", "failure": "semantic"})
+        self.assertNotIn("cases", failed)
+        for private in (fixture().password, fixture().control_key, retained.contact_id, "private"):
+            self.assertNotIn(private, json.dumps(failed))
+
     def test_readiness_fixed_gets_no_login_and_no_sweep_flags(self):
         calls = []
         class HTTP:

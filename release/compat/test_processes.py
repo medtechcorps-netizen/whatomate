@@ -327,6 +327,32 @@ class ProcessTests(unittest.TestCase):
         self.assertNotIn(retained.contact_id, json.dumps(m.evidence()))
         m.close();self.owner.cleanup()
 
+    def test_actual_completed_read_false_uses_normal_ack_error_still_latches(self):
+        m = self.manager(); m.start_web("previous", INPUTS)
+        api = test_controller.test_sweep.World()
+        api.f = controller._fixture(json.loads(self.frame())["fixture"])
+        retained = api.client().write(test_controller.test_sweep.NONCE)
+        api.messages[retained.conversation_id][0]["message"]["content"] = "changed"
+        def factory(value):
+            return controller.sweep.Sweep(value, product=api.transport(), stub=api.transport(True),
+                                          wall=lambda: test_controller.test_sweep.WALL, sleep=lambda _: None)
+        frame = self.frame("read", record=asdict(retained))
+        self.world.response = controller.handle(frame, sweep_factory=factory)
+        result = json.loads(m.controller(frame))
+        self.assertEqual(result["cases"], {key: key != "inbound" for key in p.proof.SWEEP_CASES})
+        self.assertFalse(m.evidence()["controller_protocol_failed"])
+        self.assertEqual(json.loads(m.controller_receipts()[-1])["operation"], "read")
+        api.intercept = lambda method, path, body: controller.sweep.Reply(404, (), b'private') if path == "/api/chatbot/settings" else None
+        self.world.response = controller.handle(frame, sweep_factory=factory)
+        self.world.response_exit = 1
+        with self.assertRaises(controller.sweep.SemanticFailure): m.controller(frame)
+        self.assertTrue(m.evidence()["controller_protocol_failed"])
+        count = len(self.world.calls)
+        with self.assertRaises(p.proof.EvidenceError): m.controller(frame)
+        self.assertEqual(len(self.world.calls), count)
+        m.close(); self.owner.cleanup()
+        self.assertFalse(self.world.containers)
+
     def test_controller_malformed_request_refuses_before_creation(self):
         m = self.manager();m.start_web("candidate", INPUTS);count = len(self.world.mutations)
         raw = json.loads(self.frame());raw["fixture"]["product_origin"] = "https://outside.example"
