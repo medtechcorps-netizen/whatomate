@@ -1,0 +1,4 @@
+-- O-1 found no unknown public objects. There is no production-only additive DDL.
+-- Known physical column-order differences are recreated only by the separate
+-- test-only empty-database production bootstrap profile, never ALTER/reorder.
+-- This deliberately empty overlay is idempotent and is never run in production.

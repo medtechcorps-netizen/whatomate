@@ -254,6 +254,12 @@ func catalogEmptyTarget(t *testing.T) catalogFixture {
 // sequence. The public schema must be empty before its first write. It is only
 // compiled into this external test binary, never a release command or package.
 func BootstrapEmptyForTest(owner, runtime *gorm.DB, runtimeRole string) error {
+	return bootstrapCatalogProfileForTest(owner, runtime, runtimeRole, nil)
+}
+
+// The optional profile runs only after the same empty-schema and role guards.
+// The original golden bootstrap passes nil and keeps its existing behavior.
+func bootstrapCatalogProfileForTest(owner, runtime *gorm.DB, runtimeRole string, precreate func(*gorm.DB) error) error {
 	var nonempty int64
 	if err := owner.Raw(`SELECT
 	 (SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public') +
@@ -281,6 +287,11 @@ func BootstrapEmptyForTest(owner, runtime *gorm.DB, runtimeRole string) error {
 	}
 	if !permitted {
 		return errors.New("catalog bootstrap requires the isolated non-superuser database and schema owner")
+	}
+	if precreate != nil {
+		if err := precreate(owner); err != nil {
+			return err
+		}
 	}
 	if err := owner.AutoMigrate(&models.ChatbotFlowStep{}); err != nil {
 		return err
@@ -355,8 +366,9 @@ func TestTenantRLS_CatalogBootstrapRefusesCollationBeforeMutation(t *testing.T) 
 // COMPAT_BOOTSTRAP_DSN must log in as its non-superuser database/schema owner;
 // COMPAT_BOOTSTRAP_RUNTIME_ROLE (default rereply_app) must already exist and be
 // distinct and unprivileged. The caller owns database/role creation and cleanup.
-// No URL, password or private descriptor is printed. This export verifies the
-// future catalog; the consumer separately proves runtime login and old/new code.
+// No URL, password or private descriptor is printed. This export selects the
+// accepted production-shape profile plus overlay and verifies the future
+// catalog; the consumer separately proves runtime login and old/new code.
 func TestCompatBootstrapExport(t *testing.T) {
 	raw := os.Getenv("COMPAT_BOOTSTRAP_DSN")
 	if raw == "" {
@@ -373,8 +385,11 @@ func TestCompatBootstrapExport(t *testing.T) {
 	}
 	// Deliberately do not print driver errors: the explicit export connection
 	// is an input, even though it must point only at a local synthetic target.
-	if err := BootstrapEmptyForTest(owner, nil, runtimeRole); err != nil {
+	if err := BootstrapProductionShapeEmptyForTest(owner, nil, runtimeRole); err != nil {
 		t.Fatal("synthetic compatibility bootstrap refused or failed")
+	}
+	if err := applyProductionOverlayForTest(owner); err != nil {
+		t.Fatal("synthetic compatibility overlay refused or failed")
 	}
 	t.Log("synthetic compatibility bootstrap exported and future catalog verified")
 }
