@@ -52,7 +52,7 @@ Oversized evidence refuses before deployment rather than omitting history.
 Current handoff format 4 uses bounded, lossless XZ framing and retains the drill
 observation made after the final source and compatibility checks. Record retries
 replay that original observation instead of evaluating drill age at retry time.
-Historical formats 1–3 retain their exact older fields and cannot be re-encoded
+Historical formats 1-3 retain their exact older fields and cannot be re-encoded
 as a current handoff without a real observation. The currently supported changes
 are exempt from the restore-drill requirement; their observation says so.
 
