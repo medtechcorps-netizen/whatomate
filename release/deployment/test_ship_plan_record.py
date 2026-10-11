@@ -28,7 +28,8 @@ class StageCase(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.repo, self.base = support.base_repo(self.root / "repo")
         self.head = self.repo.commit({"README.md": "readme v2\n"}, "Add the second readme line")
-        self.h = support.Harness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h = support.PostGateHarness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h.install(self)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -152,11 +153,11 @@ class PlanTests(StageCase):
         for mode, target in (("promote", ""), ("dry-run", ""), ("rollback", "prod-0000")):
             with self.subTest(mode=mode):
                 blocked = ship.schema_change.SchemaChangeBlocked(["migration-path-changed:synthetic"])
-                with mock.patch.object(ship.schema_change, "guard", side_effect=blocked) as guard:
+                with mock.patch.object(ship.ship_flow, "gate", side_effect=blocked) as guard:
                     self.assertEqual(self.plan(mode, target), ship.EXIT_REFUSED, self.h.text())
                 self.assertEqual(guard.call_count, 1)
-                self.assertEqual(guard.call_args.kwargs.get("mode", "forward"),
-                                 "rollback" if mode == "rollback" else "forward")
+                self.assertEqual(guard.call_args.args[2:], (mode, target))
+                self.assertIsInstance(guard.call_args.kwargs["deadline"], float)
                 self.assertEqual(self.h.do.requests, [])
                 self.assertEqual(self.h.https.calls, [])
 
@@ -441,6 +442,10 @@ class CandidateStageTests(StageCase):
 
 
 class RecordStageTests(StageCase):
+    """Legacy schema1 publication protocol through explicit test-only boundary.
+
+    Actual schema2 custody/writer acceptance is covered by concrete flow tests.
+    """
     def setUp(self) -> None:
         super().setUp()
         self.manifest = support.manifest(kind="promote", sha=self.head, images=support.NEW, previous="prod-0000",

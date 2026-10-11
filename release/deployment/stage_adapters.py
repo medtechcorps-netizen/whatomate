@@ -8,10 +8,12 @@ No adapter constructs a provider client or grants a mutation capability.
 
 from __future__ import annotations
 
+import time
+
 import release_record
-import schema_change
 import ship
 import ship_common as common
+import ship_flow
 import spec_images
 import stage_contract as contract
 import trivy_policy
@@ -32,6 +34,9 @@ class Adapters:
 
     def verify_plan(self, candidate, candidate_sha256, run_id):
         ctx, control = self.ctx, self.control
+        # CI and old-lane checks consume this same source preflight allowance.
+        # Provider reconciliation and health have separate lifecycle budgets.
+        deadline = time.monotonic() + ship_flow.PLAN_SECONDS
         require(common.validate_context(ctx.env) == control, "context-invalid:stage-control")
         require(ship.parse_mode(ctx.env) == ("stage", ""), "input-invalid:stage-mode")
         require(run_id == control["run_id"] and candidate_sha256 == ctx.env.get("CANDIDATE_SHA256"), "candidate-invalid:stage-binding")
@@ -46,11 +51,9 @@ class Adapters:
         gh = ctx.gh()
         ship.require_ci_green(gh, control["sha"])
         ship.require_old_lanes_idle(gh, ctx.repo_dir)
-        chain = release_record.resolve_chain(gh, ctx.repo_dir, bootstrap=bootstrap, work_dir=ctx.work_dir("stage-chain"))
-        latest = chain.latest
+        value = ship_flow.gate(ctx, control, mode="stage", target="", deadline=deadline)
+        latest = value.resolved.latest
         require(latest.release == ctx.env.get("PLAN_LATEST_RELEASE") and latest.manifest_sha256 == ctx.env.get("PLAN_LATEST_MANIFEST_SHA256"), "latest-changed-since-plan")
-        release_record.require_no_downgrade(ctx.repo_dir, latest.sha, control["sha"])
-        schema_change.guard(ctx.repo_dir, latest.sha, control["sha"])
         return True
 
     def _discover_source(self, images):

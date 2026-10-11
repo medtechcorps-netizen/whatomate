@@ -17,7 +17,8 @@ class ModeBoundaryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.repo, self.base = support.base_repo(self.root / "repo")
         self.head = self.repo.commit({"README.md": "stage candidate\n"})
-        self.h = support.Harness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h = support.PostGateHarness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h.install(self)
 
     def test_all_production_modes_refuse_staging_inputs_before_any_io(self):
         for mode in ship.PRODUCTION_MODES:

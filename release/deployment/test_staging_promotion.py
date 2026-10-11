@@ -29,7 +29,8 @@ class PromotionEvidenceTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.repo, self.base = support.base_repo(self.root / "repo")
         self.head = self.repo.commit({"README.md": "new release\n"})
-        self.h = support.Harness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h = support.PostGateHarness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h.install(self)
 
     def evidence(self):
         return [json.loads(base64.b64decode(self.h.env[name])) for name in ("STAGE_RECEIPT_B64", "STAGE_REPORT_B64")]
@@ -81,8 +82,9 @@ class PromotionEvidenceTests(unittest.TestCase):
         self.assertEqual(environment["SHIP_MODE"], "stage")
         deps = self.h.deps()
         deps.https_request = world.request
-        # Keep the actual CLI, lifecycle and GH verification adapters together;
-        # only the provider transport and GH subprocess boundary are synthetic.
+        # Keep CLI, lifecycle and product-verification adapters together. The
+        # source gate is the explicit legacy PostGateHarness boundary; provider
+        # and GH commands are synthetic. This does not qualify compatibility.
         with mock.patch.object(stage, "StageClient", side_effect=lambda *args, allow_put, **kwargs: world.factory(allow_put=allow_put)):
             result = stage.main(["deploy"], environment, deps, pins_path=pins_file, template_path=template_file)
         self.assertEqual(result, ship.EXIT_OK, self.h.text())
@@ -218,6 +220,8 @@ class PromotionEvidenceTests(unittest.TestCase):
         self.assertEqual(self.h.run("record", "--stage", "verify"), ship.EXIT_OK, self.h.text())
         self.assertIn("staging: bypassed", (path.parent / "notes.md").read_text())
         ctx = ship.Context(self.h.env, self.h.deps(), common.Output(stdout=io.StringIO()))
+        # This scenario intentionally tests the historical schema1 publication
+        # protocol via PostGateHarness, not new schema2 source/custody policy.
         chain = release_record.resolve_chain(ctx.gh(), self.repo.root, bootstrap=self.h.bootstrap, work_dir=self.root / "verified-chain")
         self.assertEqual(chain.latest.release, manifest["release"])
         release_record.require_link(list(chain.entries[:-1]), chain.latest, self.repo.root)

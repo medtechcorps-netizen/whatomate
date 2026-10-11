@@ -1,4 +1,4 @@
-# Release: promote by digest (Stage 1)
+# Release: promote by digest
 
 `Release` (`.github/workflows/ship.yml`) builds the three release images from
 one commit on `main`, proves them, and moves production to exactly those
@@ -6,8 +6,49 @@ image digests with one DigitalOcean PUT. Nothing else in the app spec
 changes. Every successful promote or rollback leaves an attested GitHub
 Release record, so the next run knows what production should be running.
 
-Production holds test data only today. The pipeline is still built as if it
-held real data: it refuses rather than guesses.
+The pipeline refuses rather than guessing about production state.
+
+## Stage 2 compatibility admission: bounded PR16 implementation
+
+This implementation connects the reviewed-v0 compatibility lane to Release.
+It is a partial implementation of Stage 2 PR16, not completion of that plan.
+Read the [catalog contract](catalog.md) and [compatibility workflow](compat.md)
+with this runbook. Active DDL, data application, new catalog/profile formats,
+and irreversible deployment remain disabled.
+
+For `dry-run`, `stage`, `promote` and `promote-without-staging`, the plan job
+authenticates the entire release chain and immutable source objects, checks
+the candidate against current `main`, and requires matching signed compatibility
+evidence. The staging deployment and production processes independently repeat
+that admission before constructing a provider client. Approval does not freeze
+the record chain: a changed latest record or candidate requires a fresh run.
+The supported forward classes are `none` and `data` with `dormant: true` against
+the reviewed v0 catalog. Both old-server compatibility and migration reversibility
+must pass; `candidate-invalid:irreversible-needs-fix-forward-mode` refuses an
+irreversible result until the separately reviewed recovery implementation.
+
+A successful promote writes a schema-v2 manifest. It records the measured
+database catalog independently of the images currently running, including the
+catalog version, minimum reader version, compatibility run and staging result.
+An image-only rollback or restore retains that live database contract. A wholly
+schema-v1 history keeps its original rollback source guard and schema-v1 writer;
+it does not invent a measured database baseline for historical records.
+
+Before any production provider request, the process serializes and replays the
+complete verified promotion inputs within a fixed output-size bound. Only a
+successful deployment emits those inputs to the same run's record job. The
+record job authenticates the chain again and retains the original compatibility
+snapshot even if `main` has advanced. An exact already-published signed record
+is reused on a record-only retry; missing unpublished handoff evidence refuses.
+Oversized evidence refuses before deployment rather than omitting history.
+
+The remaining PR16 work includes the positive pending/additive/active classifier
+rules and producer formats, contract-label and restore-drill gates, exact-span
+rollback compatibility, authenticated compatibility-outage bypass, and their
+operational validation. None is enabled by this bounded implementation. The
+null restore-drill timestamps are not successful drill evidence. The existing
+staging failure-injection drills do not substitute for database restore/fork
+drills.
 
 ## Release jobs
 
@@ -61,8 +102,8 @@ Steps:
    reply, an inbox send, and that the conversation auto-refreshes. Watch the
    runtime logs for webhook 503s.
 
-A promote builds new images, so its digests are always new, even when the
-code equals the running release.
+A promote builds and verifies its candidate images. Rebuilding the same source
+does not guarantee different digests; the attested digests identify the result.
 
 ## Approval: owner only
 
@@ -201,9 +242,16 @@ GitHub actor. It still requires the owner's production approval. A red CAUTION
 banner appears in plan/candidate/production summaries, and release notes state
 `staging: bypassed`. It immediately follows the normal promote code path and
 records kind `promote`; the attested manifest schema and record-chain rules do
-not gain a bypass field or kind. An unchanged schema is mandatory, including
-for this emergency mode. A bypass is not permission to skip a failing product
-test or a production guard.
+not gain a bypass kind. Schema-v2 records explicitly retain `staging: bypassed`.
+This mode still requires green compatibility evidence. It admits only `none`
+with the required catalog, history, global-table, seed and data-registry artifacts
+unchanged and no migration-path change; unavailable source facts refuse it.
+It cannot bypass an unavailable compatibility run or a signed semantic failure.
+A retained database origin that differs from the latest record's source also
+refuses this bounded staging bypass: artifact equality alone does not prove
+migration-path equality. Use the normal staging path for those releases.
+A staging bypass is not permission to skip a failing product test or a production
+guard.
 
 **PR10 requires all four real PR9 proofs to be recorded and reviewed before
 owner-authorized merge.** The following operational proofs were independently
@@ -324,7 +372,15 @@ CVE-2026-12345 exp:2026-12-31
 The expiry is at most 90 days ahead. An expired entry fails every run until a
 reviewed PR removes or renews it. Secrets can never be excepted.
 
-## Catalog and data classifier
+## Legacy classifier and preview
+
+The following describes the retained legacy preview/CI guard and the original
+all-v1 rollback boundary. The Release normal path now uses the authenticated
+v2 admission described above. In that path, a valid generated migration-closure
+change can proceed only with its full signed compatibility proof. Dormant data
+changes are recorded explicitly as `db_change: data`, `dormant: true`; they do
+not apply data. Future catalog forms still refuse at source decoding even when
+the pure classifier can describe a possible future contract.
 
 The classifier compares the latest signed record's source with the candidate.
 While that base lacks `internal/dbcatalog/golden/catalog.json`, the Stage 1
@@ -397,9 +453,13 @@ python3 release/deployment/schema_change.py preview --base <latest-record-sha> -
 
 The `schema-guard` job of `Test` retains the same blocking-reason contract. It
 compares each pull request's merge result with its merge base, and a push to
-`main` with its first parent. Release plan and production repeat the check
-against signed release sources before provider I/O. A green PR comparison does
-not replace the cumulative released-source preview. Use a normal merge or
+`main` with its first parent. The all-v1 rollback source guard retains that
+legacy contract. Normal Release plan and production instead classify from the
+authenticated retained database origin (or the supported legacy source when
+there is no v2 origin); after an image rollback this can differ from the latest
+record's image source. They then require the bound compatibility result before
+provider I/O. A green PR comparison does not replace this released-state
+admission. Use a normal merge or
 squash for a history that adds and later reverts a guarded edit; a rebase may
 leave the final pushed commit with a different first-parent comparison. The
 classifier does not detect every product path that writes rows: existing
