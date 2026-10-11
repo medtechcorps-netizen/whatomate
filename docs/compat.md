@@ -447,6 +447,18 @@ An explicit rollback target
 can be previewed but cannot run or publish proof yet (`cli-target-proof-unsupported`):
 the dedicated exact-span rollback experiment remains a separate PR16 requirement.
 
+Read-only source preparation for that future experiment uses a distinct resolution.
+It binds the producer to captured current `main`, keeps both actual signed web-image
+sources separate from their release records and the retained database origin, and
+retains the complete ordered target-through-latest span. The first preparatory
+source gate requires the same seven active artifacts across complete producer and
+span source material, in addition to the existing five fixed v0 profile pins; it
+therefore refuses seed or registry transitions. Only the existing exact released
+source exception permits absent profile/overlay files at a legacy image endpoint.
+This is source consistency data, not a measured database result or signed rollback
+proof. Normal snapshot4/context3, the CLI target refusal and operational multi-span
+rollback refusal remain unchanged.
+
 The resolution format is version 4. Both `latest` and `selected` contain the
 verified release tag, signed manifest SHA-256, source SHA and web digest.
 `database_base` separately binds the supported legacy source or retained v2

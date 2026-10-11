@@ -136,6 +136,31 @@ class RollbackResolution:
     decision: policy.RollbackDecision | None
 
 
+@dataclass(frozen=True, slots=True)
+class RollbackSourceMaterial:
+    source_sha: str
+    provenance: str
+    blobs: tuple[BlobObservation, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackProofResolution:
+    """Preparatory exact-span source data, not compatible or deployable proof.
+
+    No producer, Actions qualification, provider observation or runtime command
+    contract is established here. The operational rollback route still refuses
+    multiple non-none intermediates. Raw material never supplies row contents.
+    """
+    resolved: ResolvedChain
+    requirements: policy.RollbackRequirements
+    producer: policy.SourceFacts
+    workflow: bytes
+    workflow_sha256: str
+    materials: tuple[RollbackSourceMaterial, ...]
+    target_recipe: WebRecipe
+    live_recipe: WebRecipe
+
+
 def _selection(chain, index):
     entry = chain.entries[index]
     return ReleaseSelection(index, entry.release, entry.sha, entry.record.manifest_sha256,
@@ -217,6 +242,79 @@ def resolve_rollback(client: transport.ReleaseGh, repo_dir: Path,
     """
     return _resolve(client, repo_dir, git_binary, selected_tag, None,
                     forward=False, rollback=True)
+
+
+def resolve_rollback_proof(client: transport.ReleaseGh, repo_dir: Path,
+                           git_binary: Path, producer_sha: str,
+                           target_tag: str) -> RollbackProofResolution:
+    """Prepare a current-main/current-v0 dormant span without authorizing it.
+
+    The exact source operation retains the complete authenticated chain and
+    both signed endpoint image identities. No normal ForwardResolution or
+    favorable compatibility flag can replace this operation's inputs.
+    """
+    return _resolve(client, repo_dir, git_binary, target_tag, producer_sha,
+                    forward=False, rollback_proof=True)
+
+
+def _rollback_proof_source(reader, repo_dir, chain, latest, selected, producer):
+    requirements = policy._rollback_requirements(chain, selected.release)
+    if requirements.non_none_count < 2:
+        raise policy.PolicyRefusal("rollback-proof-not-required")
+    span = (requirements.target, *requirements.intermediates)
+    if (producer.mode != "reviewed-v0" or not requirements.runtime_source_supported
+            or any(entry.facts.db_change != "none" and
+                   (entry.facts.db_change not in {"data", "expand"} or not entry.facts.dormant)
+                   for entry in requirements.intermediates)):
+        raise policy.PolicyRefusal("rollback-proof-source-unsupported")
+    # Shape alone is insufficient: this first lane also requires identical
+    # source-bound registry and seed bytes. Future transitions stay closed.
+    sources = {producer.sha: producer}
+    for entry in span:
+        sources[entry.reader.sha] = entry.reader
+        if entry.live is not None:
+            origin = entry.live.origin_source
+            if (origin.mode != "reviewed-v0" or entry.live.catalog != producer.catalog
+                    or origin.catalog != entry.live.catalog or origin.artifacts != producer.artifacts):
+                raise policy.PolicyRefusal("rollback-proof-source-unsupported")
+            sources[origin.sha] = origin
+    origin_sha = requirements.live.origin_source.sha
+    for base in sorted({latest.record_sha, origin_sha}):
+        if base != producer.sha and reader.output(repo_dir, ["merge-base", base, producer.sha],
+                code="git-failed:source-ancestry") != (base + "\n").encode("ascii"):
+            raise policy.PolicyRefusal("rollback-proof-source-unsupported")
+    endpoints = {selected.actual_web_source_sha, latest.actual_web_source_sha}
+    expected = dict(producer.artifacts)
+    materials = []
+    for sha, facts in sorted(sources.items()):
+        legacy = (facts.mode == "legacy-reader0" and sha == policy.V0_RELEASED_SOURCE
+                  and sha in endpoints)
+        if facts.mode not in {"reviewed-v0", "legacy-reader0"}:
+            raise policy.PolicyRefusal("rollback-proof-source-unsupported")
+        if facts.mode == "reviewed-v0" and (facts.catalog != producer.catalog
+                                            or facts.artifacts != producer.artifacts):
+            raise policy.PolicyRefusal("rollback-proof-source-unsupported")
+        observations, total = [], 0
+        for path in policy.SOURCE_PATHS:
+            raw = reader.read_blob(sha, path)
+            if legacy and path in {policy.PROFILE, policy.OVERLAY}:
+                valid = raw is None
+            else:
+                valid = type(raw) is bytes and bool(raw) and common.sha256_bytes(raw) == expected[path]
+            if not valid:
+                raise policy.PolicyRefusal("rollback-proof-source-unsupported")
+            total += len(raw) if raw is not None else 0
+            if total > policy.MAX_SOURCE_BYTES:
+                raise policy.PolicyRefusal("record-source-invalid")
+            observations.append(BlobObservation(path, raw))
+        materials.append(RollbackSourceMaterial(sha, "legacy-e001-absent-overlay" if legacy
+                         else "equal-reviewed-v0", tuple(observations)))
+    workflow = reader.read_blob(producer.sha, ".github/workflows/compat.yml")
+    if not workflow:
+        raise policy.PolicyRefusal("record-source-invalid")
+    target_recipe = _web_recipe(reader, selected)
+    live_recipe = target_recipe if latest.actual_web_source_sha == selected.actual_web_source_sha else _web_recipe(reader, latest)
+    return requirements, workflow, tuple(materials), target_recipe, live_recipe
 
 
 def _rollback_source(chain, repo_dir, selected_tag):
@@ -438,7 +536,7 @@ def _forward_pending(reader, repo_dir, latest_sha, candidate_sha, database_base,
 
 
 def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False,
-             admission=False):
+             admission=False, rollback_proof=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
@@ -447,13 +545,15 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             budget.fail("resolver-selection")
         if rollback and (forward or selected_tag is None):
             budget.fail("resolver-selection")
-        if forward and (type(candidate_sha) is not str or common.SHA1_RE.fullmatch(candidate_sha) is None):
+        if rollback_proof and (forward or rollback or admission or selected_tag is None):
+            budget.fail("resolver-selection")
+        if (forward or rollback_proof) and (type(candidate_sha) is not str or common.SHA1_RE.fullmatch(candidate_sha) is None):
             budget.fail("resolver-candidate")
         if selected_tag is not None and (type(selected_tag) is not str or
                 (selected_tag != common.BOOTSTRAP_TAG and common.RECORD_TAG_RE.fullmatch(selected_tag) is None)):
             budget.fail("resolver-selection")
         snapshot = client.capture_snapshot()
-        if admission and candidate_sha != snapshot.main_sha:
+        if (admission or rollback_proof) and candidate_sha != snapshot.main_sha:
             budget.fail("resolver-main")
         bootstrap = records.load_bootstrap()
         bootstrap_raw = common.canonical_file_bytes(bootstrap)
@@ -473,7 +573,7 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                     or binding.source_shas != expected_sources):
                 budget.fail("resolver-images")
         legacy, required, readers, commits = _source_requirements(documents, images)
-        if forward:
+        if forward or rollback_proof:
             # Plan this before any facts are decoded: the candidate may be a
             # SHA already seen in the historical v1 prefix. Its complete
             # contract must win there too, with one consistent SourceFacts.
@@ -538,6 +638,10 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                         repository_id=transport.REPOSITORY_ID, now=observation.observed_at)
             if rollback:
                 legacy_chain, legacy_classification, decision = _rollback_source(chain, repo_dir, tag)
+            if rollback_proof:
+                producer = next(fact for fact in facts if fact.sha == candidate_sha)
+                requirements, workflow, materials, target_recipe, live_recipe = _rollback_proof_source(
+                    reader, repo_dir, chain, latest, selected, producer)
             budget.check()
         # Git's final metadata preflight happens before the final complete
         # GitHub snapshot. Neither creates a new allowance or resets the clock.
@@ -551,12 +655,15 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             return ForwardAdmission(result, observation) if admission else result
         if rollback:
             return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)
+        if rollback_proof:
+            return RollbackProofResolution(resolved, requirements, producer, workflow,
+                common.sha256_bytes(workflow), materials, target_recipe, live_recipe)
         return resolved
     except contract.ContractRefusal:
         budget.failed = True
         raise
     except (policy.PolicyRefusal, schema_change.SchemaChangeBlocked):
-        if rollback:
+        if rollback or rollback_proof:
             # These two reviewed policy classes carry fixed refusal codes or
             # structured classifier reasons, never arbitrary driver output.
             budget.failed = True
