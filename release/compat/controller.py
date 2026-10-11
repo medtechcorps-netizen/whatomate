@@ -277,8 +277,9 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
                 _record(asdict(record), fixture)
                 _need(record.nonce == nonce)
                 response["record"] = asdict(record)
-            # Sweep.write already checks retained values internally but returns
-            # only a RecordSet. Obtain the flags from actual Sweep.read instead
+            # Sweep.write retains completed initial flags privately and returns
+            # only a RecordSet. This same-client read combines those sticky flags
+            # with all six fresh reads; obtain its actual flags instead
             # of manufacturing six true values from a successful return.
             response["cases"] = _flags(client.read(record))
             response['stub_receipts'] = client.stub_receipts()

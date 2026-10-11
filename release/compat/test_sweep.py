@@ -166,6 +166,38 @@ class World:
         return {"callback_status": 200}
 
 
+class WriteReadbackWorld(World):
+    """Only completed retained GET values drift; mutation acknowledgements stay exact."""
+    def __init__(self, cases=()):
+        super().__init__()
+        self.mismatch_cases = set(cases)
+        self.mismatch_readbacks = {1}
+        self.readbacks = 0
+        self.mutate = self.readback
+
+    def readback(self, method, path, response):
+        if method == "GET" and path.startswith("/api/contacts/"):
+            self.readbacks += 1
+        if method != "GET" or self.readbacks not in self.mismatch_readbacks:
+            return response
+        response = json.loads(json.dumps(response))  # Do not change retained fake server rows.
+        data = response.get("data", {})
+        if path.startswith("/api/contacts/") and "contacts" in self.mismatch_cases:
+            data["profile_name"] = "changed"
+        if "/messages?" in path:
+            for row in data["messages"]:
+                case = "inbound" if row["message"]["direction"] == "incoming" else "outbound"
+                if case in self.mismatch_cases:
+                    row["message"]["content"] = "changed"
+        if path.startswith("/api/templates/") and "template" in self.mismatch_cases:
+            data["body_content"] = "changed"
+        if path.startswith("/api/chatbot/flows/") and "flow" in self.mismatch_cases:
+            data["description"] = "changed"
+        if path == "/api/chatbot/settings" and "settings" in self.mismatch_cases:
+            data["settings"]["greeting_message"] = "changed"
+        return response
+
+
 class SweepTests(unittest.TestCase):
     def test_successful_stub_receipts_survive_read_budget_reset_without_credentials(self):
         world=World();client=world.client();record=client.write(NONCE)
@@ -351,15 +383,84 @@ class SweepTests(unittest.TestCase):
         world.flows[record.flow_id].update(name="changed", trigger_keywords=["ok", None])
         with self.assertRaises(s.proof.EvidenceError): world.client().read(record)
 
-    def test_write_precheck_cannot_discard_complete_false_result(self):
-        world = World(); client = world.client()
-        world.mutate = lambda m, p, r: {"data": {**r["data"], "profile_name": "changed"}} if p.startswith("/api/contacts/") else r
-        with self.assertRaises(s.SemanticFailure): client.write(NONCE)
-        self.assertTrue(client._failed)
-        self.assertEqual(world.calls[-1][1], "/api/chatbot/settings")
-        count = len(world.calls)
-        with self.assertRaises(s.proof.EvidenceError): client.write(NONCE)
-        self.assertEqual(len(world.calls), count)
+    def test_write_readback_each_false_survives_later_true_without_skipping_reads(self):
+        for case in s.proof.SWEEP_CASES:
+            with self.subTest(case=case):
+                world = WriteReadbackWorld([case]); client = world.client()
+                record = client.write(NONCE)
+                self.assertIs(type(record), s.RecordSet)
+                self.assertEqual(len(record.__dataclass_fields__), 8)
+                self.assertFalse(client._failed)
+                self.assertEqual(world.calls[-1][1], "/api/chatbot/settings")
+                expected = {key: key != case for key in s.proof.SWEEP_CASES}
+                world.calls.clear()
+                for _ in range(2):
+                    actual = client.read(record)
+                    self.assertEqual(actual, expected)
+                    actual[case] = True  # Caller cannot rewrite retained history.
+                self.assertEqual(len(world.calls), 14)
+                self.assertTrue(all(method == "GET" for method, *_ in world.calls))
+                self.assertEqual(world.client().read(record), dict.fromkeys(s.proof.SWEEP_CASES, True))
+
+    def test_write_all_false_and_later_false_accumulate_only_for_exact_written_record(self):
+        world = WriteReadbackWorld(s.proof.SWEEP_CASES); client = world.client()
+        record = client.write(NONCE)
+        self.assertEqual(client.read(record), dict.fromkeys(s.proof.SWEEP_CASES, False))
+        world.mismatch_readbacks.clear()
+        other = client.write("abcdef0123456789abcdef0123456789")
+        self.assertTrue(all(client.read(other).values()))
+        # Successful initial write, then completed false, then true also remains false.
+        world.mismatch_readbacks = {world.readbacks + 1}; world.mismatch_cases = {"template"}
+        self.assertFalse(client.read(other)["template"])
+        self.assertFalse(client.read(other)["template"])
+        self.assertTrue(all(world.client().read(other).values()))
+        self.assertEqual(client._write_cases[record], (False,) * 6)
+
+    def test_write_readback_complete_message_absence_is_false_after_identity_was_retained(self):
+        for direction, case in (("incoming", "inbound"), ("outgoing", "outbound")):
+            world = WriteReadbackWorld(); original = world.mutate
+            def missing(method, path, response):
+                response = original(method, path, response)
+                if world.readbacks == 1 and "/messages?" in path:
+                    response = json.loads(json.dumps(response))
+                    data = response["data"]
+                    data["messages"] = [v for v in data["messages"] if v["message"]["direction"] != direction]
+                    data["total"] = len(data["messages"])
+                return response
+            world.mutate = missing; client = world.client(); record = client.write(NONCE)
+            self.assertEqual(client.read(record), {key: key != case for key in s.proof.SWEEP_CASES})
+            self.assertTrue(all(world.client().read(record).values()))
+
+    def test_write_false_never_hides_later_incomplete_unsafe_or_foreign_readback(self):
+        changes = (lambda d: d.update(id=ACCOUNT), lambda d: d.update(on_complete_action="handoff"),
+                   lambda d: d.update(graph={}), lambda d: d.update(description=None))
+        for change in changes:
+            world = WriteReadbackWorld(["contacts"]); original = world.mutate
+            def unsafe(method, path, response):
+                response = original(method, path, response)
+                if path.startswith("/api/chatbot/flows/"): change(response["data"])
+                return response
+            world.mutate = unsafe; client = world.client()
+            with self.assertRaises(s.proof.EvidenceError): client.write(NONCE)
+            self.assertTrue(client._failed); self.assertEqual(client._write_cases, {})
+            count = len(world.calls)
+            with self.assertRaises(s.proof.EvidenceError): client.write(NONCE)
+            self.assertEqual(len(world.calls), count)
+
+    def test_sticky_false_does_not_hide_followup_auth_or_page_incompleteness(self):
+        for failure in ("auth", "page", "unsafe", "foreign"):
+            world = WriteReadbackWorld(["contacts"]); client = world.client(); record = client.write(NONCE)
+            if failure == "auth":
+                world.intercept = lambda m, p, b: s.Reply(401, (), b'private') if p == "/api/chatbot/settings" else None
+            elif failure == "page":
+                world.mutate = lambda m, p, r: {"data": {**r["data"], "total": 101}} if "/messages?" in p else r
+            elif failure == "unsafe": world.settings["enabled"] = True
+            else: record = replace(record, fixture_binding="0" * 64)
+            with self.assertRaises(s.proof.EvidenceError): client.read(record)
+            self.assertTrue(client._failed)
+            count = len(world.calls)
+            with self.assertRaises(s.proof.EvidenceError): client.read(record)
+            self.assertEqual(len(world.calls), count)
 
     def test_record_foreign_binding_and_path_injection_refuse(self):
         world = World()

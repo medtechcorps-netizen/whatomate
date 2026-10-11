@@ -231,6 +231,58 @@ class ControllerTests(unittest.TestCase):
         for private in (fixture().password, fixture().control_key, retained.contact_id, "private"):
             self.assertNotIn(private, json.dumps(failed))
 
+    def test_actual_write_initial_false_survives_healthy_followup_and_retains_reverse_record(self):
+        for case in c.sweep.proof.SWEEP_CASES:
+            with self.subTest(case=case):
+                world = test_sweep.WriteReadbackWorld([case]); world.f = fixture()
+                clients = []
+                def factory(value):
+                    client = c.sweep.Sweep(value, product=world.transport(), stub=world.transport(True),
+                                           wall=lambda: test_sweep.WALL, sleep=lambda _: None)
+                    clients.append(client); return client
+                frame = raw(request("write", nonce=test_sweep.NONCE))
+                written = json.loads(c.handle(frame, sweep_factory=factory))
+                self.assertEqual(written["status"], "ok")
+                self.assertEqual(written["cases"], {key: key != case for key in c.sweep.proof.SWEEP_CASES})
+                self.assertEqual(world.readbacks, 2)  # Complete initial and controller follow-up reads.
+                self.assertFalse(clients[0]._failed)
+                c.validate_receipts(json.loads(frame), written)
+                self.assertEqual(len(written["record"]), 8)
+                reverse = json.loads(c.handle(raw(request("read", record=written["record"])), sweep_factory=factory))
+                self.assertTrue(all(reverse["cases"].values()))
+                self.assertEqual(len(world.contacts), 1)
+                self.assertEqual(sum(m == "POST" and p == "/api/contacts" for m, p, *_ in world.calls), 1)
+                self.assertNotIn("_write_cases", written)
+                for private in (fixture().password, fixture().control_key):
+                    self.assertNotIn(private, json.dumps(written))
+
+    def test_actual_write_false_then_late_followup_failure_has_no_partial_frame(self):
+        for failure in ("auth", "unsafe", "malformed"):
+            world = test_sweep.WriteReadbackWorld(["contacts"]); world.f = fixture()
+            original = world.mutate; clients = []
+            def mutate(method, path, response):
+                response = original(method, path, response)
+                if world.readbacks == 2 and path == "/api/chatbot/settings":
+                    if failure == "unsafe": response["data"]["settings"]["enabled"] = True
+                    if failure == "malformed": response["data"]["settings"]["greeting_message"] = None
+                return response
+            world.mutate = mutate
+            world.intercept = lambda m, p, b: c.sweep.Reply(401, (), b'private') if (
+                failure == "auth" and world.readbacks == 2 and p == "/api/chatbot/settings") else None
+            def factory(value):
+                client = c.sweep.Sweep(value, product=world.transport(), stub=world.transport(True),
+                                       wall=lambda: test_sweep.WALL, sleep=lambda _: None)
+                clients.append(client); return client
+            stdout = io.BytesIO()
+            code = c.run(io.BytesIO(raw(request("write", nonce=test_sweep.NONCE))), stdout, sweep_factory=factory)
+            failed = json.loads(stdout.getvalue())
+            self.assertEqual(code, 1)
+            self.assertEqual(set(failed), {"version", "status", "failure"})
+            self.assertEqual(failed["status"], "error")
+            self.assertTrue(clients[0]._failed); self.assertEqual(world.readbacks, 2)
+            self.assertEqual(world.calls[-1][1], "/api/chatbot/settings")
+            self.assertNotIn(b'private', stdout.getvalue())
+
     def test_readiness_fixed_gets_no_login_and_no_sweep_flags(self):
         calls = []
         class HTTP:

@@ -3,7 +3,7 @@
 No Docker, GitHub, database, image builds or real compatibility runs occur.
 The public production admission refusal is tested separately from mock runs.
 """
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from contextlib import nullcontext
 import json
 from pathlib import Path
@@ -328,6 +328,87 @@ class EngineTests(unittest.TestCase):
         result=json.loads(self.engine().run())
         self.assertFalse(result['forward']);self.assertFalse(result['old_server_ok']['read'])
         self.assertFalse(result['old_server_ok']['reverse']);self.assertFalse(result['old_server_ok']['workers'])
+
+    def http_write_case(self, write_number, case, *, late_failure=False):
+        """Real controller/Sweep plus fake HTTP; other adapters remain ordered mocks."""
+        http = tc.test_sweep.WriteReadbackWorld([case]); frames = []; writes = []
+        original = FakeManager.controller
+        def controller(manager, raw):
+            request = c.controller.parse_request(raw); op = request['operation']
+            if op == 'setup': return original(manager, raw)
+            manager.w.event('controller.' + op)
+            http.f = c.controller._fixture(request['fixture'])
+            if op == 'write':
+                writes.append(request['nonce'])
+                http.mismatch_readbacks = {http.readbacks + 1} if len(writes) == write_number else set()
+            if late_failure and op == 'write' and len(writes) == write_number:
+                final_read = http.readbacks + 2
+                http.intercept = lambda m, p, b: c.controller.sweep.Reply(401, (), b'private') if (
+                    http.readbacks == final_read and p == '/api/chatbot/settings') else None
+            def factory(value):
+                return c.controller.sweep.Sweep(value, product=http.transport(), stub=http.transport(True),
+                    wall=lambda: tc.test_sweep.WALL, sleep=lambda _: None)
+            response = c.controller.handle(raw, sweep_factory=factory)
+            value = c.controller._parse(response); frames.append((request, value))
+            # Emulate the real manager's refusal: a failed private frame is not
+            # an execution-completed row. Never assign proof flags on this path.
+            c.need(value['status'] == 'ok', 'mock-controller-failed')
+            c.controller.validate_receipts(request, value)
+            return response
+        engine = self.engine()
+        engine.inputs = replace(engine.inputs, organization_id=tc.test_sweep.ORG)
+        return engine, http, frames, controller
+
+    def test_real_write_readback_false_keeps_reverse_reads_and_complete_engine_order(self):
+        for write_number in (2, 3):
+            for case in c.proof.SWEEP_CASES:
+                with self.subTest(write_number=write_number, case=case):
+                    self.w.trace.clear()
+                    engine, http, frames, controller = self.http_write_case(write_number, case)
+                    with patch.object(FakeManager, 'controller', controller): result = json.loads(engine.run())
+                    self.assertEqual(result['forward'], write_number != 2)
+                    self.assertEqual(result['old_server_ok']['write'], write_number != 3)
+                    self.assertTrue(result['old_server_ok']['read'])
+                    self.assertTrue(result['old_server_ok']['reverse'])
+                    self.assertTrue(result['old_server_ok']['workers']); self.assertTrue(result['reversible'])
+                    write_frames = [value for request, value in frames if request['operation'] == 'write']
+                    self.assertEqual(write_frames[write_number - 1]['cases'],
+                                     {key: key != case for key in c.proof.SWEEP_CASES})
+                    read_frames = [(request, value) for request, value in frames if request['operation'] == 'read']
+                    self.assertEqual(read_frames[0][0]['record'], write_frames[1]['record'])
+                    self.assertEqual(read_frames[1][0]['record'], write_frames[2]['record'])
+                    self.assertTrue(all(all(value['cases'].values()) for _, value in read_frames))
+                    self.assertEqual(http.readbacks, 8)  # 3x(initial + follow-up), 2 independent reads.
+                    self.assertEqual(len(http.contacts), 3)
+                    trace = self.w.trace
+                    self.assertEqual([v for v in trace if v.startswith('controller.')],
+                        ['controller.setup', 'controller.write', 'controller.write', 'controller.read',
+                         'controller.write', 'controller.read'])
+                    self.assertEqual(trace.count('migration.compat-fwd'), 2)
+                    self.assertIn('migration.compat-n1-rw', trace); self.assertIn('migration.compat-n1-ro', trace)
+                    self.assertIn('pg.control', trace)
+                    self.assertLess(trace.index('workers.end'), len(trace) - 1 - trace[::-1].index('controller.read'))
+                    self.assertLess(trace.index('ledger.seal'), trace.index('catalog.final'))
+                    self.assertEqual(trace[-1], 'stack.cleanup')
+
+    def test_actual_write_false_followed_by_incomplete_readback_never_emits_result(self):
+        engine, http, frames, controller = self.http_write_case(2, 'contacts', late_failure=True)
+        with patch.object(FakeManager, 'controller', controller), patch.object(c.proof, 'result_bytes') as output:
+            with self.assertRaisesRegex(c.proof.EvidenceError, 'mock-controller-failed'): engine.run()
+            output.assert_not_called()
+        self.assertEqual(frames[-1][1], {'version': 1, 'status': 'error', 'failure': 'semantic'})
+        self.assertEqual(http.readbacks, 4)
+        self.assertNotIn('workers.begin', self.w.trace)
+        self.assertEqual(self.w.trace[-1], 'stack.cleanup')
+
+    def test_previous_seed_false_is_still_missing_baseline_not_compatibility_result(self):
+        engine, http, _, controller = self.http_write_case(1, 'template')
+        with patch.object(FakeManager, 'controller', controller), patch.object(c.proof, 'result_bytes') as output:
+            with self.assertRaisesRegex(c.proof.EvidenceError, 'previous-seed-failed'): engine.run()
+            output.assert_not_called()
+        self.assertEqual(http.readbacks, 2)
+        self.assertNotIn('catalog.initial', self.w.trace)
+        self.assertEqual(self.w.trace[-1], 'stack.cleanup')
 
     def test_living_worker_false_still_performs_reverse_seal_catalog_and_cleanup(self):
         for kind in ('panic','unknown'):
