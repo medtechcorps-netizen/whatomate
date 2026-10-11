@@ -61,6 +61,7 @@
     "internal/dbcatalog/format.go",
     "internal/dbcatalog/queries.go",
     "internal/dbcatalog/seed.go",
+    "internal/dbcatalog/semantics.go",
     "internal/dbcatalog/types.go",
     "internal/demodata/klinik_relive_sales.go",
     "internal/demodata/seed.go",
@@ -238,5 +239,5 @@
     "pkg/whatsapp/types.go",
     "pkg/whatsapp/webhook.go"
   ],
-  "closure_sha256": "ae3ab4e2fd759f986775bdafee84627173b2e75d1c8e3c12a5dd14525a61ba69"
+  "closure_sha256": "75d05e5737c946ea16efefd6daab120f4da1d29a03055361f8fce51c2d157184"
 }
