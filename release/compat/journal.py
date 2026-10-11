@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import controller
 import fixture
+import observation
 import processes
 
 proof = processes.proof
@@ -64,6 +65,8 @@ class JournalLedger:
         self._expected = Counter()
         self._sends, self._statuses, self._unbound_statuses = {}, {}, []
         self._nonces, self._wamids = set(), set()
+        self._known_sends, self._residual_sends, self._residual_rows = {}, {}, set()
+        self._old_period = None
         self._cursor, self._rejected_cursor, self._bytes = 0, 0, 0
         self._failed, self._sealed, self._setup = False, False, False
         self._check()
@@ -77,6 +80,120 @@ class JournalLedger:
         need(self.provisioned.owner_token == self.manager.owner.token
              and self.provisioned.pg_container_id == pg.container_id
              and self.provisioned.pg_started_at == pg.started_at, 'journal-owner-changed')
+        if self._old_period is not None and not self._old_period['closed']:
+            self._period_check()
+
+    def _period_check(self):
+        period = self._old_period
+        need(self.manager.owner.token == period['token'] and self.manager.bindings['previous'] is period['image'],
+             'journal-old-period-binding')
+        events = self.manager._events
+        need(events[:len(period['events'])] == period['events'], 'journal-old-period-history')
+        handle = period['handle']
+        if handle is None:
+            need(not self.manager._ids and events == period['events'], 'journal-old-period-unbound')
+            return
+        web = []
+        for event in events[len(period['events']):]:
+            need(event.get('outcome') == 'acknowledged', 'journal-old-period-history')
+            if event.get('slot') == 'web':
+                need(event.get('id') == handle.container_id, 'journal-old-period-history')
+                web.append(event.get('operation'))
+            else:
+                need(event.get('slot') == 'controller' and event.get('operation') in
+                     {'create','controller','remove'}, 'journal-old-period-history')
+        need(web in (['create','start','configure'], ['create','start','configure','stop','remove'],
+                     ['create','start','configure','remove']), 'journal-old-period-history')
+        if 'web' in self.manager._handles:
+            need(web == ['create','start','configure'] and self.manager._handles['web'] is handle
+                 and self.manager._ids == {'web':handle.container_id}, 'journal-old-period-binding')
+        else:
+            need(not self.manager._ids and web[-1] == 'remove', 'journal-old-removal-unproven')
+
+    def _settled(self):
+        return (self._expected == Counter({encoded(self._control('GET','journal')):1})
+                and not self._sends and not self._statuses and not self._unbound_statuses)
+
+    def open_old_period(self):
+        """Explicit preboot checkpoint; never infer phase authority from rows."""
+        try:
+            self._check()
+            need(self._old_period is None and not self.manager._ids, 'journal-old-period-order')
+            self.capture()
+            need(self._settled() and self._setup and self._known_sends, 'journal-old-period-unsettled')
+            self._old_period = {'after':self._cursor, 'end':None, 'closed':False, 'handle':None,
+                'observer':None, 'token':self.manager.owner.token, 'image':self.manager.bindings['previous'],
+                'events':[dict(v) for v in self.manager._events]}
+        except Exception as error:
+            self._fail(error)
+
+    def bind_old_period(self, handle, observer):
+        """Bind the actual returned old handle before accepting any new rows."""
+        try:
+            need(self._old_period is not None and self._old_period['handle'] is None
+                 and not self._old_period['closed'], 'journal-old-period-order')
+            need(type(handle) is processes.ProcessHandle and handle.slot == 'web'
+                 and handle.version == 'previous' and handle.phase == 'compat-prev-server'
+                 and handle.image_id == self._old_period['image'].image_id
+                 and self.manager._handles.get('web') is handle
+                 and type(observer) is observation.OwnedObservation
+                 and observer.manager is self.manager and observer.handle is handle
+                 and observer.fixture == self.fixture and not observer._failed,
+                 'journal-old-period-binding')
+            self._old_period.update(handle=handle, observer=observer)
+            self._check()
+        except Exception as error:
+            self._fail(error)
+
+    def close_old_period(self, observer, workers):
+        """After exact removal, reconcile whole-period residuals with quiet rows.
+
+        Only extra fully attributed sends are counted (once each); their two
+        statuses are completeness obligations, not extra sends. Missing worker
+        evidence is allowed only for an actual terminal-boot path with zero
+        residuals. Mixed worker panic/unknown plus residual remains unsupported.
+        """
+        try:
+            self._check()
+            period = self._old_period
+            need(period is not None and not period['closed'] and period['handle'] is not None
+                 and observer is period['observer'] and not self.manager._ids,
+                 'journal-old-period-order')
+            self.capture()
+            need(self._settled(), 'journal-old-period-incomplete')
+            if workers is None:
+                need(not self._residual_sends and observer._old_boot_done and not observer._booted and not observer._startup_ready
+                     and not observer._failed, 'journal-old-terminal-incomplete')
+                result = None
+            else:
+                need(observer._workers_done and observer._booted and observer._startup_ready
+                     and observer._period_attempted and observer._period_summary is not None
+                     and not observer._failed, 'journal-worker-observation-incomplete')
+                fields = {'execution','observed_seconds','panic_count','unknown_type_count','unexpected_stub_entries'}
+                need(type(workers) is dict and set(workers) == fields
+                     and workers['execution'] == observation._completed()
+                     and all(type(workers[k]) is int and 0 <= workers[k] <= MAX_ROWS for k in fields - {'execution'})
+                     and 60 <= workers['observed_seconds'] <= 300, 'journal-worker-observation-incomplete')
+                counts, rows = observer._journal_counts, observer._journal_rows
+                need(type(counts) is dict and set(counts) == {'baseline_requests','window_requests','observed_read_rows','after','cursor'}
+                     and all(type(v) is int and v >= 0 for v in counts.values())
+                     and period['after'] <= counts['after'] <= counts['cursor'] <= self._cursor
+                     and type(rows) is list, 'journal-worker-window-binding')
+                expected_rows = self._rows[counts['after']:counts['cursor']]
+                need([encoded(v) for v in rows] == expected_rows, 'journal-worker-window-binding')
+                own = sum(observation._own_journal_read(v) for v in rows)
+                other = {v['seq'] for v in rows if not observation._own_journal_read(v)}
+                need(own == counts['observed_read_rows'] == counts['window_requests']
+                     and len(other) == workers['unexpected_stub_entries']
+                     and other <= self._residual_rows, 'journal-worker-window-unattributed')
+                need(not self._residual_sends or workers['panic_count'] == workers['unknown_type_count'] == 0,
+                     'journal-mixed-worker-failure-unsupported')
+                result = {**workers, 'execution':dict(workers['execution']),
+                          'unexpected_stub_entries':len(self._residual_sends)}
+            period.update(closed=True, end=self._cursor)
+            return result
+        except Exception as error:
+            self._fail(error)
 
     def _fail(self, error):
         self._failed = True
@@ -129,6 +246,7 @@ class JournalLedger:
                 key = encoded(send)
                 need(key not in self._sends, 'journal-write-binding')
                 self._sends[key] = nonce
+                self._known_sends[key] = nonce
             for call in calls:
                 extra = {}
                 if call['route'] == 'accounts' and call['method'] == 'POST':
@@ -170,25 +288,35 @@ class JournalLedger:
                  'journal-unexpected-send')
             send = {k:v for k,v in shape.items() if k != 'message_id'}
             key = encoded(send)
-            need(key in self._sends, 'journal-unexpected-send')
-            del self._sends[key]
+            if key in self._sends:
+                del self._sends[key]
+            else:
+                period = self._old_period
+                need(period is not None and not period['closed'] and period['handle'] is not None
+                     and row['seq'] > period['after'] and key in self._known_sends
+                     and len(self._residual_sends) < 32, 'journal-unexpected-send')
+                self._residual_sends[wamid] = row['seq']
+                self._residual_rows.add(row['seq'])
             self._wamids.add(wamid)
             self._statuses[wamid] = ['sent','delivered']
             return
         if shape.get('kind') == 'webhook' and shape.get('route') == 'status':
-            self._unbound_statuses.append(shape)
-            need(len(self._unbound_statuses) <= 32, 'journal-status-bound')
+            self._unbound_statuses.append((row['seq'], shape))
+            active = self._old_period is not None and not self._old_period['closed'] and self._old_period['handle'] is not None
+            need(len(self._unbound_statuses) <= (96 if active else 32), 'journal-status-bound')
             return
         raise proof.EvidenceError('journal-unexpected-entry')
 
     def _match_statuses(self):
         deferred = []
-        for shape in self._unbound_statuses:
+        for seq, shape in self._unbound_statuses:
             wamid = shape.get('message_id')
-            if type(wamid) is str and _WAMID.fullmatch(wamid) is not None and wamid not in self._wamids and self._sends:
+            period = self._old_period
+            if type(wamid) is str and _WAMID.fullmatch(wamid) is not None and wamid not in self._wamids and (
+                    self._sends or (period is not None and not period['closed'] and period['handle'] is not None)):
                 # A status goroutine can win scheduling over the send handler's
                 # deferred journal append. It never counts as accepted yet.
-                deferred.append(shape)
+                deferred.append((seq, shape))
                 continue
             remaining = self._statuses.get(wamid)
             need(remaining, 'journal-unexpected-status')
@@ -196,6 +324,9 @@ class JournalLedger:
                 'phone_number_id':self.fixture.phone_number_id, 'business_account_id':self.provisioned.business_account_id,
                 'message_id':wamid,'delivery_status':remaining[0],'attempt':1}
             need(shape == expected and type(shape.get('attempt')) is int, 'journal-unexpected-status')
+            if wamid in self._residual_sends:
+                need(period is not None and not period['closed'] and seq > period['after'], 'journal-unexpected-status')
+                self._residual_rows.add(seq)
             remaining.pop(0)
             if not remaining: del self._statuses[wamid]
         self._unbound_statuses = deferred
@@ -241,6 +372,7 @@ class JournalLedger:
         try:
             self._check()
             need(not self.manager._ids, 'journal-producers-active')
+            need(self._old_period is None or self._old_period['closed'], 'journal-old-period-unclosed')
             self.capture()
             final_read = Counter({encoded(self._control('GET','journal')):1})
             need(self._expected == final_read and not self._sends and not self._statuses
@@ -255,4 +387,7 @@ class JournalLedger:
         return {'cursor':self._cursor, 'rejected_cursor':self._rejected_cursor,
                 'rows':len(self._rows), 'bytes':self._bytes, 'receipts':len(self._audits),
                 'pending':self._pending(), 'sha256':hashlib.sha256(b'\n'.join(self._rows)).hexdigest(),
+                'old_period':None if self._old_period is None else {
+                    'after':self._old_period['after'], 'end':self._old_period['end'],
+                    'closed':self._old_period['closed'], 'extra_sends':len(self._residual_sends)},
                 'failed':self._failed, 'sealed':self._sealed, 'full_compatibility_proof':False}

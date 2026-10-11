@@ -319,7 +319,9 @@ class _Engine:
         ro = self._migration("compat-n1-ro", original_columns=False)
         control = self.pg.read_only_control()
 
+        self.ledger.open_old_period()
         handle, observed, old_boot, terminal = self._old_server()
+        self.ledger.bind_old_period(handle, observed)
         if terminal:
             def blocked(phase):
                 return {"state": "blocked-by-semantic", "phase": phase, "cause_phase": "old.boot",
@@ -342,6 +344,9 @@ class _Engine:
             stopped = self._stop(handle, observed)
         self.old_stop = self.ledger.capture()
         need(self.old_stop.pending == 1, "experiment-old-period-incomplete")
+        reconciled = self.ledger.close_old_period(observed, None if terminal else workers)
+        if not terminal:
+            workers = reconciled
 
         if not terminal:
             handle, observed, reverse_boot = self._server("candidate")
