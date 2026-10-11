@@ -437,17 +437,23 @@ accepted local advisory does not replace hosted qualification.
 
 ## Advisory workflow and release selection
 
-`cli.py preview` freezes the latest and selected release identities from one
-verified record chain and classifies latest-to-candidate. An explicit dispatch
-rollback target selects a verified record without silently replacing the
-latest-release preview base. `cli.py run` verifies the selected tag again and
-requires its exact source SHA, then runs the experiment. There is no second
-moving-latest selection.
+`cli.py preview` freezes the latest and selected release identities, retained
+database origin and actual web-image source from one authenticated source
+operation. Normal classification compares that database origin to the candidate;
+after an image rollback, it need not equal the latest record's source. `cli.py run`
+authenticates the sources again and requires exact agreement of the canonical
+version-3 snapshot with the preview before image admission or an experiment.
+An explicit rollback target
+can be previewed but cannot run or publish proof yet (`cli-target-proof-unsupported`):
+the dedicated exact-span rollback experiment remains a separate PR16 requirement.
 
-The resolution format is version 2. Both `latest` and `selected` contain the
+The resolution format is version 3. Both `latest` and `selected` contain the
 verified release tag, signed manifest SHA-256, source SHA and web digest.
-Version 1 resolutions are rejected, not silently upgraded. The manifest
-digest comes from the verified record bytes, not a GitHub metadata identifier.
+`database_base` separately binds the supported legacy source or retained v2
+origin record and measured catalog; `selected_web_source_sha` identifies the
+actual selected image source. Older resolutions are rejected, not silently
+upgraded. The manifest digest comes from the verified record bytes, not a GitHub
+metadata identifier. A legacy source has no invented measured live catalog.
 
 `compat.yml` runs on every pull request, main push and explicit
 dispatch. It has no path filter or first-attempt restriction. `release-preview`
@@ -460,21 +466,24 @@ cannot become an artifact by continuing after an error.
 
 The final artifact name is `compat-result-<sha>-<run_attempt>` and contains
 exactly `compat-result.json` and `compat-context.json`. The result schema and
-verdict are unchanged. The context is version 1 with exactly these fields:
+verdict are unchanged. The current normal producer emits context version 2
+with exactly these fields:
 
 - `version`, `repository`, `workflow_path`, `workflow_sha`, `event`, `ref`,
   `sha`, `run_id`, `run_attempt` and `requested_rollback_target`;
 - `latest` and `selected`, each with `release`, `manifest_sha256`, `sha` and
   `web_digest`;
 - `preview`, with `kind`, `dormant` and `blocked`;
+- `database_base`, with `mode`, `source_sha`, `origin` and `catalog`, and
+  `selected_web_source_sha`, copied from the authenticated resolution;
 - `result_sha256`, covering the exact canonical result bytes, including LF.
 
 Both files are sorted compact ASCII JSON with a final LF. The result remains
 bounded to 16 KiB and the context to 4 KiB. Normal selection requires the
-result classification to equal the frozen latest-to-candidate preview. With
-an explicit rollback target, that preview remains latest-to-candidate while
-the result describes selected-to-candidate; the two classifications need not
-match. This distinction does not add support for active schema changes.
+result classification to equal the frozen database-origin-to-candidate preview.
+The current normal admission requires the source-bound context-v2 pair;
+historical context-v1 qualification does not establish this newer contract.
+Explicit rollback-target proof and active schema changes remain unsupported.
 
 After successful upload, a separate guarded `evidence_ready` output permits
 the `attest` job on push or dispatch, including a complete measured negative.
@@ -501,16 +510,22 @@ The separate signing job has a six-minute ceiling: checkout and two downloads
 have one minute each, the two signing steps one minute each, leaving one minute
 for local revalidation and final enforcement. Both signatures are required.
 
-This is the PR16 producer foundation only. Production enforcement, newest-run
-selection, legacy record normalization, v2 rollback database provenance and
-semantic expand classification are not implemented here. A future normal
-promotion consumer must veto later incomplete attempts or authenticated
-negative results after its selected positive; a fresh later positive may
-supersede older infrastructure gaps. Break-glass requires a separate exact-SHA
-negative-history check. Visible API pagination cannot establish the absence of
-entirely deleted runs, so that coverage capability remains unresolved. No
-consumer guard is lifted by these producer files. PR16 publication and merge
-remain behind PR8 qualification and three accepted main compatibility runs.
+The bounded PR16 implementation now connects this normal producer to Release
+plan, staging and production admission and schema-v2 records. It authenticates
+the complete mixed record history, retained database origin, actual image
+sources and compatibility pair. The consumer vetoes later or overlapping
+incomplete attempts or authenticated negative results; a fresh later
+positive may supersede older infrastructure gaps. The original collection
+window and full visible attempt history cross to the record job unchanged.
+
+Semantic expansion, contract/drill gates, dedicated multi-span rollback proof
+and compatibility-outage bypass remain unfinished PR16 work. Visible API
+pagination cannot establish absence of entirely deleted runs, so it does not
+authorize an outage bypass. This partial implementation does not complete the
+canonical plan or enable active DDL/data. The PR8 qualification prerequisite and
+three distinct signed main runs are accepted; this new source/context contract
+still requires its own hosted qualification and protected release validation.
+See [the Release runbook](release.md) for the current operational boundary.
 
 ## Validation still required
 
