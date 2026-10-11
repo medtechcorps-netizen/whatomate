@@ -126,6 +126,41 @@ class PreflightTests(unittest.TestCase):
             self.assertGreater(options['timeout'], 0)
         self.assertNotIn('PRIVATE', repr(result))
 
+    def test_drills_observe_after_final_source_and_qualification_without_new_capture(self):
+        from datetime import timedelta
+        samples = []
+        def wall():
+            samples.append((self.phase, len(self.calls)))
+            return actions.NOW + (timedelta(seconds=7) if self.phase == 'source-after' else timedelta())
+        result = self.run_preflight(wall_clock=wall)
+        self.assertEqual(samples[-1], ('source-after', len(self.calls)))
+        self.assertEqual(result.drills.observed_at, actions.NOW + timedelta(seconds=7))
+        self.assertGreater(result.drills.observed_at, result.collected.history.observed_at)
+        self.assertEqual(result.drills, ship.forward_gates.DrillGate(False, result.drills.observed_at, None, None, None))
+        self.assertEqual(result.command_count, len(self.calls))
+
+    def test_original_budget_exhaustion_during_observation_returns_no_preflight(self):
+        original = ship.forward_gates.observe_forward_drills
+        def observe(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.case.clock.now = self.deadline
+            return result
+        with mock.patch.object(ship.forward_gates, 'observe_forward_drills', side_effect=observe):
+            self.assertEqual(self.refuse().detail, 'preflight-deadline')
+
+    def test_invalid_or_backwards_final_wall_clock_refuses(self):
+        from datetime import timedelta
+        for value in (actions.NOW.replace(tzinfo=None), actions.NOW - timedelta(seconds=1), 'PRIVATE'):
+            self.scenario()
+            def wall():
+                return value if self.phase == 'source-after' else actions.NOW
+            self.assertEqual(self.refuse(wall_clock=wall).detail, 'preflight-drill-clock')
+
+    def test_owned_drill_refusal_code_survives_preflight_boundary(self):
+        with mock.patch.object(ship.forward_gates, 'observe_forward_drills',
+                side_effect=ship.forward_gates.DrillRefusal('restore-drills-missing')):
+            self.refuse('schema-change-blocked:restore-drills-missing')
+
     def test_current_e001_legacy_has_no_invented_live_contract(self):
         self.scenario(legacy=True)
         result = self.run_preflight()

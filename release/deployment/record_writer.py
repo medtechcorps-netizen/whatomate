@@ -19,6 +19,7 @@ import compat_collect as collect
 import compat_evidence as evidence
 import compat_request as request
 import record_resolver as resolver
+import forward_gates
 
 policy, records, common, transport = resolver.policy, resolver.records, resolver.common, resolver.transport
 
@@ -39,7 +40,7 @@ def _public(function):
             return function(*args, **kwargs)
         except WriterRefusal:
             raise
-        except (evidence.CompatRefusal, policy.PolicyRefusal, common.ReleaseError,
+        except (evidence.CompatRefusal, policy.PolicyRefusal, common.ReleaseError, forward_gates.DrillRefusal,
                 ValueError, TypeError, AttributeError, KeyError, IndexError,
                 RecursionError, OverflowError):
             raise WriterRefusal("record-writer-invalid") from None
@@ -90,6 +91,7 @@ class PromotionHandoff:
     candidate_images: CandidateImages
     execution: WorkflowExecution
     facts: records.ManifestFacts
+    drills: forward_gates.DrillGate | None = None
 
 
 def _execution(value):
@@ -166,11 +168,20 @@ def _resolved(value):
 
 
 @_public
-def prepare_promotion(resolution, collected, candidate_images, execution, *, staging):
+def prepare_promotion(resolution, collected, candidate_images, execution, *, staging, drills=None):
     """Qualify the original production capture, never an arbitrary receipt."""
     _execution(execution)
     _need(type(staging) is str and staging in ("passed", "bypassed"))
     qualified = request.qualify(resolution, collected)
+    if drills is None:
+        # Exact historical custody only. Current production/encoder requires an
+        # observation; an old exempt handoff is not upgraded during record retry.
+        change = resolution.classification
+        _need((change.kind == "none" and change.dormant is False)
+              or (change.kind in ("expand", "data") and change.dormant is True))
+    else:
+        forward_gates.validate_preserved_drills(resolution, drills)
+        _need(drills.observed_at >= collected.history.observed_at)
     candidate = resolution.candidate
     _candidate_images(candidate_images, candidate.sha)
     # The bridge binds the profile measurement and exact source-authority pins.
@@ -182,7 +193,7 @@ def prepare_promotion(resolution, collected, candidate_images, execution, *, sta
           and qualified.catalog_sha256 == candidate.catalog.catalog_sha256)
     facts = records.ManifestFacts(2, resolution.classification.kind, resolution.classification.dormant,
         reversible, qualified.old_server, candidate.catalog, "ok", qualified.run_id, staging)
-    return PromotionHandoff(resolution, collected, candidate_images, execution, facts)
+    return PromotionHandoff(resolution, collected, candidate_images, execution, facts, drills)
 
 
 def _serialize(kind, sha, images, previous, publication, facts, *, reconciled=False):
@@ -252,7 +263,7 @@ def build_promotion(handoff, publication, current_resolution):
     """
     _need(type(handoff) is PromotionHandoff)
     expected = prepare_promotion(handoff.resolution, handoff.collected, handoff.candidate_images,
-                                 handoff.execution, staging=handoff.facts.staging)
+                                 handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
     _need(handoff == expected, "record-writer-handoff-changed")
     _publication(publication)
     _need(publication.execution == handoff.execution, "record-writer-execution-changed")

@@ -4,6 +4,7 @@ Concrete source/Actions captures are covered in test_ship_compat/ship_records.
 These cases exercise the same-run handoff, writer, retries and drift semantics.
 """
 from dataclasses import replace
+from datetime import timedelta
 import io
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,7 +31,7 @@ class FlowTests(unittest.TestCase):
         cls.forward = fixture.WriterTests.forward
         cls.history = fixture.WriterTests.history
         cls.preflight = flow.ship_compat.NormalPreflight(cls.forward,
-            fixture.composition.bridge.qualify(cls.forward, cls.history), cls.history, 1, 1)
+            fixture.composition.bridge.qualify(cls.forward, cls.history), cls.history, 1, 1, fixture.drills(cls.forward))
         cls.gate = flow.Gate(cls.forward.resolved, cls.preflight, None)
         cls.control = dict(sha=cls.forward.candidate.sha, workflow_sha=cls.forward.candidate.sha,
                            run_id=str(fixture.execution().run_id), run_attempt=1)
@@ -117,7 +118,7 @@ class FlowTests(unittest.TestCase):
         resolution = case.forward(sha)
         history = fixture.composition.collected(resolution)
         return flow.ship_compat.NormalPreflight(resolution,
-            fixture.composition.bridge.qualify(resolution, history), history, 1, 1)
+            fixture.composition.bridge.qualify(resolution, history), history, 1, 1, fixture.drills(resolution))
 
     def bypass_gate(self, preflight):
         with mock.patch.object(flow.ship_compat, 'preflight', return_value=preflight) as call:
@@ -172,7 +173,7 @@ class FlowTests(unittest.TestCase):
         resolution = fixture.WriterTests.legacy
         history = fixture.WriterTests.legacy_history
         value = flow.ship_compat.NormalPreflight(resolution,
-            fixture.composition.bridge.qualify(resolution, history), history, 1, 1)
+            fixture.composition.bridge.qualify(resolution, history), history, 1, 1, fixture.drills(resolution))
         self.assertEqual(resolution.classification.kind, 'none')
         with self.assertRaisesRegex(c.ReleaseError, '^schema-change-blocked:staging-bypass-source-unavailable$'):
             self.bypass_gate(value)
@@ -207,6 +208,23 @@ class FlowTests(unittest.TestCase):
             with self.assertRaisesRegex(c.ReleaseError, '^record-chain-invalid:source-deadline$'):
                 flow.read(self.ctx, deadline=time.monotonic() - 1)
         read.assert_not_called()
+
+    def test_current_outputs_require_observation_but_historical_summary_is_explicit(self):
+        historical = replace(self.preflight, drills=None)
+        value = flow.Gate(self.forward.resolved, historical, None)
+        self.assertIn('- Restore drills: unobserved (historical custody)', flow.details(value))
+        with self.assertRaisesRegex(c.ReleaseError, '^record-invalid:production-handoff$'):
+            flow.promotion_outputs(value, self.control, dict(fixture.images(self.forward).images), staging='passed')
+
+    def test_summary_uses_preserved_utc_and_never_claims_completed_exempt_drills(self):
+        lines = flow.details(self.gate)
+        drill_lines = [line for line in lines if line.startswith('- Restore drills:')]
+        stamp = self.preflight.drills.observed_at.isoformat().replace('+00:00', 'Z')
+        self.assertEqual(drill_lines, [f'- Restore drills: not required for none or dormant changes; observed at {stamp}'])
+        changed = replace(self.preflight.drills, required=True)
+        invalid = flow.Gate(self.forward.resolved, replace(self.preflight, drills=changed), None)
+        with self.assertRaisesRegex(c.ReleaseError, '^schema-change-blocked:restore-drills-observation-invalid$'):
+            flow.details(invalid)
 
     def test_original_output_preflight_roundtrips_complete_handoff(self):
         self.assertEqual(set(self.encoded), set(flow.record_handoff.OUTPUT_KEYS))
@@ -328,7 +346,7 @@ class ForwardSummaryTests(unittest.TestCase):
     def lines(self, resolution):
         # Real resolver-derived source audit; qualification is already covered
         # by the normal gate composition. No fabricated authority is exercised.
-        normal = SimpleNamespace(resolution=resolution,
+        normal = SimpleNamespace(resolution=resolution, drills=None,
             qualified=SimpleNamespace(reversible=True, old_server=True, run_id=38100000001))
         return flow.details(flow.Gate(resolution.resolved, normal, None))
 

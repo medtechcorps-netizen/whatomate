@@ -39,10 +39,10 @@ class HandoffTests(unittest.TestCase):
         cls.resolution = fixture.WriterTests.forward
         cls.history = fixture.WriterTests.history
         cls.handoff = w.prepare_promotion(cls.resolution, cls.history,
-            fixture.images(cls.resolution), fixture.execution(), staging='passed')
+            fixture.images(cls.resolution), fixture.execution(), staging='passed', drills=fixture.drills(cls.resolution))
         cls.outputs = codec.encode(cls.handoff)
         # Retain a separately built historical v2 wire for all inherited JSON,
-        # per-blob zlib and closed-type adversarial cases. Public success uses v3.
+        # per-blob zlib and closed-type adversarial cases. Public success uses v4.
         budget = codec._Budget(version=2)
         node = codec._value(cls.handoff, w.PromotionHandoff, budget, 0, encoding=True)
         cls.wire = {'version': 2, 'handoff': node, 'blobs': [
@@ -118,7 +118,7 @@ class HandoffTests(unittest.TestCase):
         # an actual completed window before the newer successful attempt.
         world.artifacts[100][0]['expired'] = True
         history = fixture.composition.collected(self.resolution, world)
-        plan = w.prepare_promotion(self.resolution, history, fixture.images(self.resolution), fixture.execution(), staging='passed')
+        plan = w.prepare_promotion(self.resolution, history, fixture.images(self.resolution), fixture.execution(), staging='passed', drills=fixture.drills(self.resolution))
         restored = self.decode(codec.encode(plan))
         self.assertEqual(restored.collected, history)
         self.assertEqual(len(restored.collected.history.attempts), 3)
@@ -128,7 +128,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIs(json.loads(negative.result)['old_server_ok']['workers'], False)
 
     def test_hash_lengths_counts_versions_and_slots_are_not_optional(self):
-        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '4'),
+        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '5'),
                            ('handoff_raw_length', '1'), ('handoff_compressed_length', '1'),
                            ('handoff_encoded_length', '1'), ('handoff_chunk_count', '0'),
                            ('handoff_chunk_count', '01'), ('handoff_raw_length', True)]:
@@ -286,7 +286,7 @@ class HandoffTests(unittest.TestCase):
 
     def test_version2_preserves_all_audit_ranges_and_drill_source_bytes(self):
         restored = self.decode(envelope(self.raw), record_attempt=2)
-        self.assertEqual(self.outputs['handoff_version'], '3')
+        self.assertEqual(self.outputs['handoff_version'], '4')
         self.assertEqual(self.wire['version'], 2)
         self.assertEqual(restored.resolution.audit, self.resolution.audit)
         self.assertEqual(len(restored.resolution.audit.changes), 3)
@@ -346,10 +346,10 @@ class HandoffTests(unittest.TestCase):
             with self.assertRaises(codec.HandoffRefusal): codec.encode(changed)
 
 
-def xz_envelope(raw, *, compressed=None):
+def xz_envelope(raw, *, compressed=None, version='4'):
     packed = (lzma.compress(raw, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=6)
               if compressed is None else compressed)
-    return envelope(raw, compressed=packed, version='3')
+    return envelope(raw, compressed=packed, version=version)
 
 
 def frame(header, payload):
@@ -378,16 +378,39 @@ class XZTests(unittest.TestCase):
     decode = HandoffTests.decode
     refuse = HandoffTests.refuse
 
-    def test_v3_complete_history_public_roundtrip_and_historical_reencoding(self):
+    def test_v3_exact_historical_frame_has_no_observation_or_reencode_authority(self):
+        budget = codec._Budget(version=3)
+        node = codec._value(self.handoff, w.PromotionHandoff, budget, 0, encoding=True)
+        raw = codec._frame(node, budget.blobs, version=3)
+        old = self.decode(xz_envelope(raw, version='3'), record_attempt=17)
+        self.assertEqual(old, replace(self.handoff, drills=None))
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(old)
+        self.assertEqual(w.build_promotion(old, fixture.publication(), self.resolution.resolved),
+                         w.build_promotion(self.handoff, fixture.publication(), self.resolution.resolved))
+
+    def test_v4_requires_complete_original_observation_without_wire_upgrade(self):
+        self.assertEqual(self.decode(record_attempt=99).drills, self.handoff.drills)
+        for change in (lambda fields: fields.pop('drills'), lambda fields: fields.update(drills=None),
+                       lambda fields: fields['drills']['fields'].update(required=1),
+                       lambda fields: fields['drills']['fields'].update(required=True),
+                       lambda fields: fields['drills']['fields'].update(source_sha256='f' * 64),
+                       lambda fields: fields['drills']['fields'].update(staging_restore={'type':'utc', 'value':'2026-10-11T00:00:00.000000Z'}),
+                       lambda fields: fields['drills']['fields']['observed_at'].update(value='2020-01-01T00:00:00.000000Z')):
+            header = copy.deepcopy(self.header); change(header['handoff']['fields'])
+            self.refuse(xz_envelope(frame(header, self.payload)))
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(replace(self.handoff, drills=None))
+
+    def test_v4_complete_history_public_roundtrip_and_historical_no_upgrade(self):
         restored = self.decode(record_attempt=4)
         self.assertEqual(restored, self.handoff)
         self.assertEqual(restored.collected.history, self.history.history)
-        self.assertEqual(self.header['version'], 3)
+        self.assertEqual(self.header['version'], 4)
         self.assertEqual(int(self.outputs['handoff_raw_length']), len(self.frame))
         self.assertEqual(self.outputs['handoff_sha256'], hashlib.sha256(self.frame).hexdigest())
         self.assertGreater(len(self.frame), 1762225)
         old = self.decode(envelope(self.raw), record_attempt=2)
-        self.assertEqual(codec.encode(old), self.outputs)
+        self.assertIsNone(old.drills)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(old)
         # Hash-bound transport does not admit a different operation identity.
         self.refuse(run_id=self.handoff.execution.run_id + 1)
 
@@ -401,7 +424,7 @@ class XZTests(unittest.TestCase):
             self.refuse()
             with self.assertRaisesRegex(codec.HandoffRefusal, '^record-handoff-invalid$'):
                 codec.encode(self.handoff)
-            self.assertEqual(self.decode(envelope(self.raw)), self.handoff)
+            self.assertEqual(self.decode(envelope(self.raw)), replace(self.handoff, drills=None))
             self.assertIsNone(self.decode(HandoffTests.legacy_outputs(self)).resolution.audit)
         with mock.patch.object(lzma, 'is_check_supported', return_value=False):
             self.refuse()
@@ -432,7 +455,7 @@ class XZTests(unittest.TestCase):
                     b'[' * 49 + b'0' + b']' * 49,
                     header + b' ', json.dumps(self.header, indent=2).encode()):
             self.refuse(xz_envelope(len(bad).to_bytes(4, 'big') + bad + self.payload))
-        for version in (True, 1, 2, 4):
+        for version in (True, 1, 2, 3, 5):
             changed = copy.deepcopy(self.header); changed['version'] = version
             self.refuse(xz_envelope(frame(changed, self.payload)))
         changed = dict(self.outputs); changed['handoff_version'] = '2'; self.refuse(changed)
@@ -456,7 +479,7 @@ class XZTests(unittest.TestCase):
         for limit in ('MAX_BLOBS', 'MAX_BLOB', 'MAX_EXPANDED_BYTES', 'MAX_NODES'):
             with self.subTest(limit=limit), mock.patch.object(codec, limit, 1): self.refuse()
 
-    def test_v3_replay_and_complete_audit_are_not_bypassed_by_rehashed_frames(self):
+    def test_v4_replay_and_complete_audit_are_not_bypassed_by_rehashed_frames(self):
         for modify in (lambda f: f['resolution']['fields'].pop('audit'),
                        lambda f: f['resolution']['fields'].update(audit=None),
                        lambda f: f['facts']['fields'].update(compat_run_id=123),

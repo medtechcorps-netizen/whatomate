@@ -3,6 +3,7 @@
 No actual signature authority, Git process, provider or network is exercised.
 """
 from dataclasses import FrozenInstanceError, replace
+from datetime import timedelta
 import hashlib
 from pathlib import Path
 import unittest
@@ -30,6 +31,11 @@ def images(value):
     sha = value.candidate.sha
     return writer.CandidateImages(sha, tuple((part, 'sha256:' + hashlib.sha256((sha + part).encode()).hexdigest())
         for part in common.COMPONENTS), tuple((part, sha) for part in common.COMPONENTS))
+
+
+def drills(value, *, now=composition.actions.NOW):
+    # Actual pure observer over real resolver-derived synthetic source bytes.
+    return writer.forward_gates.observe_forward_drills(value, now=now)
 
 
 def projected(chain, *, selected=None, main='b' * 40):
@@ -79,7 +85,7 @@ class WriterTests(unittest.TestCase):
         value = self.forward if value is None else value
         return writer.prepare_promotion(value, self.history if history is None else history,
             options.pop('candidate_images', images(value)), options.pop('execution', execution()),
-            staging=options.pop('staging', 'passed'), **options)
+            staging=options.pop('staging', 'passed'), drills=options.pop('drills', drills(self.forward)), **options)
 
     def refusal(self, call, *args, code=None, **kwargs):
         with self.assertRaises(writer.WriterRefusal) as caught:
@@ -88,6 +94,36 @@ class WriterTests(unittest.TestCase):
         self.assertIsNone(caught.exception.__cause__)
         if code is not None:
             self.assertEqual(str(caught.exception), code)
+
+    def test_observation_survives_later_publication_and_main_without_retry_clock(self):
+        original = drills(self.forward)
+        plan = self.prepare(drills=original)
+        later = replace(publication(), deployed_at='2027-05-01T00:00:00Z')
+        fresh = replace(self.forward.resolved, inventory=replace(self.forward.resolved.inventory, main_sha='f' * 40))
+        raw = writer.build_promotion(plan, later, fresh)
+        self.assertEqual(plan.drills, original)
+        self.assertEqual(common.loads_strict(raw)['deployed_at'], later.deployed_at)
+
+    def test_original_observation_precedes_no_collected_evidence_and_cannot_invent_dates(self):
+        original = drills(self.forward)
+        for changed in (replace(original, observed_at=self.history.history.observed_at - timedelta(microseconds=1)),
+                        replace(original, required=True), replace(original, staging_restore=original.observed_at),
+                        replace(original, source_sha256='f' * 64)):
+            self.refusal(self.prepare, drills=changed)
+        historical = self.prepare(drills=None)
+        self.assertIsNone(historical.drills)
+        self.assertTrue(writer.build_promotion(historical, publication(), self.forward.resolved))
+
+    def test_current_active_class_hold_is_not_lifted_by_a_synthetic_valid_drill(self):
+        from datetime import datetime, timezone
+        change = self.forward.classification._replace(kind='expand', dormant=False)
+        data = b'{"version":1,"staging_restore":"2026-10-11T00:00:00Z","production_fork":"2026-10-11T00:00:00Z"}'
+        value = replace(self.forward, classification=change,
+            audit=replace(self.forward.audit, drills=replace(self.forward.audit.drills, raw=data)))
+        observation = drills(value, now=datetime(2026, 10, 11, 12, tzinfo=timezone.utc))
+        self.assertTrue(observation.required)
+        self.refusal(writer.prepare_promotion, value, self.history, images(value), execution(),
+                     staging='passed', drills=observation)
 
     def test_first_v2_promotion_establishes_measured_contract_from_real_composition(self):
         plan = self.prepare(self.legacy, self.legacy_history)
