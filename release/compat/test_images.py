@@ -4,6 +4,7 @@ Only tiny local Python children exercise pipe draining/deadline/reaping. Git
 object responses and Docker responses are synthetic and explicitly mocked.
 """
 import hashlib
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -955,6 +956,203 @@ class WindowsContainmentTests(unittest.TestCase):
         (self.root/'DOCKER-CREDENTIAL-wincred.EXE').write_bytes(b'not executed')
         with self.assertRaisesRegex(m.proof.EvidenceError,'credential-helper-available'):
             m._build_environment(config,self.root)
+
+
+class ResolvedAdmissionTests(unittest.TestCase):
+    """Real pure chain/material types, fake source/daemon/build command edges.
+
+    This constructs synthetic adapter data; it is not signature verification.
+    The rollback record, retained DB origin and actual image source differ.
+    """
+    @classmethod
+    def setUpClass(cls):
+        r=m.record_resolver;root=Path(__file__).resolve().parents[2]
+        cls.catalog_bytes={p:(root/p).read_bytes() for p in r.policy.SOURCE_PATHS}
+
+    def setUp(self):
+        self.f=AdmissionRoundtripTests('test_complete_four_builds_same_source_and_monotonic_shared_cap')
+        self.f.setUp();self.addCleanup(self.f.doCleanups)
+        self.r=m.record_resolver;self.resolution=self.projection()
+        self.git_calls=[];original=m._Source.git;outer=self
+        def git(source,args,*rest):
+            outer.git_calls.append(args)
+            if args[0]=='cat-file':raise AssertionError('previous recipe source operation already closed')
+            return original(source,args,*rest)
+        active=patch.object(m._Source,'git',git);active.start();self.addCleanup(active.stop)
+
+    def projection(self):
+        import test_ship_support as support
+        r=self.r;boot=r.records.load_bootstrap();record='d'*40;origin='e'*40
+        def source(sha):
+            return r.policy.reviewed_v0_source(sha,tuple(r.policy.SourceBlob(p,self.catalog_bytes[p])
+                                                       for p in r.policy.SOURCE_PATHS))
+        facts=source(origin);candidate=source(self.f.candidate)
+        first=support.manifest(kind='promote',sha=record,images=boot['images'],previous=boot['release'],
+                               deployed_at='2026-10-05T00:00:00Z')
+        middle=support.manifest(kind='promote',sha=origin,
+            images={p:'sha256:'+hashlib.sha256(p.encode()).hexdigest() for p in m.common.COMPONENTS},
+            previous=first['release'],deployed_at='2026-10-06T00:00:00Z')
+        last=support.manifest(kind='rollback',sha=record,images=boot['images'],previous=middle['release'],
+            rolled_back_from=middle['release'],deployed_at='2026-10-07T00:00:00Z')
+        for doc in (middle,last):
+            doc.update(schema_version=2,db_change='none',dormant=False,reversible=True,
+                       fixed_forward_from=None,**facts.catalog._asdict())
+            doc.update(old_server_ok=True,compat_run_id=38100000001,compat='ok',staging='passed')
+        last.update(old_server_ok='unproven',compat_run_id=None,compat='bypassed',staging='bypassed')
+        docs=(boot,first,middle,last);actual=(boot['sha'],boot['sha'],origin,boot['sha'])
+        inputs=tuple(r.policy.RecordInput(m.common.canonical_file_bytes(doc),
+                         m.sha(m.common.canonical_file_bytes(doc)),web) for doc,web in zip(docs,actual))
+        chain=r.policy.normalize_chain(inputs,(r.policy.legacy_reader0(boot['sha']),facts),
+                                       ((boot['sha'],record),(record,origin)))
+        bindings=tuple(r.transport.VerifiedImages(doc['release'],doc['sha'],
+            tuple((p,doc['images'][p]) for p in m.common.COMPONENTS),
+            tuple((p,web) for p in m.common.COMPONENTS)) for doc,web in zip(docs,actual))
+        selected=r._selection(chain,3)
+        resolved=r.ResolvedChain(chain,r.transport.InventorySnapshot(1297344686,self.f.candidate,(),()),
+                                 bindings,selected,selected)
+        pins=tuple(sorted(dict(r.policy.V0_PINS)))
+        material=r.CatalogMaterial(candidate.sha,tuple(r.policy.SourceBlob(p,self.catalog_bytes[p]) for p in pins),
+            origin,'retained-live-v2',tuple(r.BlobObservation(p,self.catalog_bytes[p]) for p in pins))
+        recipe=r.WebRecipe(boot['sha'],m._WEB_RECIPE,b'previous-recipe',m.sha(b'previous-recipe'))
+        result=r.ForwardResolution(resolved,candidate,
+            r.schema_change.PolicyClassification('none',False,(),(),(),()),b'workflow',m.sha(b'workflow'),
+            boot['sha'],origin,material,recipe)
+        old=self.f.rows.pop(self.f.previous_ref)
+        self.f.previous_ref=m.common.IMAGE_REPOSITORY['web']+'@'+boot['images']['web']
+        old['RepoDigests']=[self.f.previous_ref];old['Config']['Labels'][m.stack.SOURCE_LABEL]=boot['sha']
+        self.f.rows[self.f.previous_ref]=old
+        return result
+
+    def admit(self,resolution=None):
+        f=self.f
+        return m._admit_resolved(f.root,self.resolution if resolution is None else resolution,
+                                str(f.binary),f.config,f.work,f.deadline)
+
+    def refuse_before_effects(self,value,code='admission-resolution'):
+        with self.assertRaisesRegex(m.proof.EvidenceError,code):self.admit(value)
+        self.assertEqual(self.f.calls,[]);self.assertEqual(self.f.builds,[])
+        self.assertEqual(list(self.f.work.iterdir()),[])
+
+    def test_rollback_manifest_origin_and_actual_web_remain_distinct(self):
+        r=self.resolution;self.assertEqual(len({r.resolved.selected.record_sha,r.database_base_source,
+                                               r.previous_web_source_sha}),3)
+        result=self.admit();self.assertIs(result.seal,m._SEAL)
+        self.assertEqual(result.previous.source_sha,r.previous_web_source_sha)
+        self.assertEqual(result.previous.recipe_sha256,r.previous_recipe.sha256)
+        self.assertEqual(result.previous.reference,self.f.previous_ref)
+        self.assertEqual([p for p,_ in self.f.builds],['graph','controller','fixture','candidate'])
+        self.assertEqual([s for _,s in self.f.builds],[1494,1394,1294,1194])
+        self.assertTrue(all(b.source_sha==self.f.candidate for b in
+                            (result.candidate,result.controller,result.graph,result.fixture)))
+        self.assertTrue(result.receipt['cleanup_complete']);self.assertFalse(result.receipt['release_attestation'])
+        self.assertTrue(self.git_calls);self.assertTrue(all(args[0]!='cat-file' for args in self.git_calls))
+
+    def test_no_legacy_entry_duck_projection_or_arbitrary_recipe_argument(self):
+        for value in (self.f.previous,SimpleNamespace(**self.resolution.__dict__) if hasattr(self.resolution,'__dict__')
+                      else SimpleNamespace(candidate=self.resolution.candidate),{},True):
+            with self.subTest(value=type(value)):self.refuse_before_effects(value)
+        f=self.f
+        with self.assertRaises(TypeError):
+            m._admit_resolved(f.root,self.resolution,str(f.binary),f.config,f.work,f.deadline,recipe=b'foreign')
+        self.assertEqual(self.f.calls,[])
+
+    def test_source_material_must_match_candidate_and_exact_five_pins(self):
+        r=self.resolution;mat=r.catalog_material;first=mat.candidate_blobs[0]
+        changes=[replace(r,candidate=replace(r.candidate,mode='synthetic-policy')),
+                 replace(r,catalog_material=replace(mat,candidate_sha='f'*40)),
+                 replace(r,catalog_material=replace(mat,candidate_blobs=mat.candidate_blobs[:-1])),
+                 replace(r,catalog_material=replace(mat,candidate_blobs=tuple(reversed(mat.candidate_blobs)))),
+                 replace(r,catalog_material=replace(mat,candidate_blobs=(first._replace(raw=b'wrong'),)+mat.candidate_blobs[1:])),
+                 replace(r,candidate=replace(r.candidate,artifacts=r.candidate.artifacts[:-1]))]
+        for value in changes:
+            with self.subTest(value=value.catalog_material.candidate_sha):self.refuse_before_effects(value)
+
+    def test_recipe_fixed_path_bytes_hash_source_and_bound_are_all_required(self):
+        r=self.resolution;recipe=r.previous_recipe
+        for field,value in (('path','other.Dockerfile'),('raw',b''),('raw',b'changed'),('raw',None),
+                            ('sha256','0'*64),('source_sha',r.resolved.selected.record_sha),
+                            ('source_sha',r.database_base_source),('raw',b'x'*(4*m.runtime.MIB+1))):
+            with self.subTest(field=field):
+                self.refuse_before_effects(replace(r,previous_recipe=replace(recipe,**{field:value})))
+
+    def test_selected_chain_and_attested_image_cross_bindings_cannot_be_substituted(self):
+        r=self.resolution;resolved=r.resolved;selected=resolved.selected;binding=resolved.image_bindings[-1]
+        changes=[replace(r,previous_web_source_sha=selected.record_sha),
+                 replace(r,resolved=replace(resolved,selected=replace(selected,index=True))),
+                 replace(r,resolved=replace(resolved,selected=replace(selected,record_sha='f'*40))),
+                 replace(r,resolved=replace(resolved,latest=self.r._selection(resolved.chain,0))),
+                 replace(r,resolved=replace(resolved,image_bindings=resolved.image_bindings[:-1]))]
+        for altered in (replace(binding,record_sha='f'*40),replace(binding,release='prod-0000'),
+                        replace(binding,images=tuple(reversed(binding.images))),
+                        replace(binding,images=(('web',self.f.previous_ref),)+binding.images[1:]),
+                        replace(binding,source_shas=(('web',selected.record_sha),)+binding.source_shas[1:])):
+            changes.append(replace(r,resolved=replace(resolved,image_bindings=resolved.image_bindings[:-1]+(altered,))))
+        for index,value in enumerate(changes):
+            with self.subTest(index=index):self.refuse_before_effects(value)
+
+    def test_loaded_previous_image_must_match_actual_source_and_optional_recipe_label(self):
+        r=self.resolution;row=self.f.rows[self.f.previous_ref]
+        row['Config']['Labels'][m.stack.SOURCE_LABEL]=r.resolved.selected.record_sha
+        with self.assertRaisesRegex(m.proof.EvidenceError,'process-source-invalid'):self.admit()
+        self.assertEqual(self.f.builds,[])
+
+    def test_absent_historical_recipe_label_still_binds_captured_recipe(self):
+        del self.f.rows[self.f.previous_ref]['Config']['Labels'][m.stack.RECIPE_LABEL]
+        self.assertEqual(self.admit().previous.recipe_sha256,self.resolution.previous_recipe.sha256)
+
+    def test_loaded_image_wrong_digest_refuses_before_build(self):
+        self.f.rows[self.f.previous_ref]['RepoDigests']=['ghcr.io/foreign/web@sha256:'+'6'*64]
+        with self.assertRaises(m.proof.EvidenceError):self.admit()
+        self.assertEqual(self.f.builds,[])
+
+    def test_present_wrong_recipe_label_refuses_before_build(self):
+        self.f.rows[self.f.previous_ref]['Config']['Labels'][m.stack.RECIPE_LABEL]='0'*64
+        with self.assertRaisesRegex(m.proof.EvidenceError,'process-source-invalid'):self.admit()
+        self.assertEqual(self.f.builds,[])
+
+    def test_exact_historical_selection_is_admitted_without_granting_rollback_policy(self):
+        resolved=self.resolution.resolved
+        earlier=self.r._selection(resolved.chain,1)
+        chosen=replace(self.resolution,resolved=replace(resolved,selected=earlier))
+        self.assertNotEqual(earlier.release,resolved.latest.release)
+        with patch.object(m,'_verification_transport',side_effect=AssertionError('legacy bridge')), \
+             patch.object(m.runtime.release_record,'git',side_effect=AssertionError('legacy Git')):
+            result=self.admit(chosen)
+        self.assertEqual(result.previous.source_sha,earlier.actual_web_source_sha)
+        self.assertFalse(result.receipt['release_attestation'])
+
+    def test_caller_deadline_is_not_reset_after_source_operation(self):
+        self.f.clock.value+=1501
+        with self.assertRaisesRegex(m.proof.InfrastructureFailure,'build-reserve'):self.admit()
+        self.assertEqual(self.f.calls,[]);self.assertEqual(self.f.builds,[])
+
+    def test_expired_deadline_refuses_before_source_export_or_work_creation(self):
+        self.f.clock.value+=2401
+        with self.assertRaisesRegex(m.proof.InfrastructureFailure,'deadline'):self.admit()
+        self.assertEqual(self.f.calls,[]);self.assertEqual(list(self.f.work.iterdir()),[])
+
+    def test_partial_build_failure_still_stops_without_retry_or_image_adoption(self):
+        self.f.drift='controller-failure'
+        with self.assertRaisesRegex(m.proof.EvidenceError,'build-failed'):self.admit()
+        with self.assertRaises(m.proof.EvidenceError):self.admit()
+        self.assertEqual([p for p,_ in self.f.builds],['graph','controller'])
+        result=json.loads((self.f.work/('candidate-'+self.f.candidate)/'result.json').read_bytes())
+        self.assertEqual(result['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
+        self.assertTrue(result['cleanup_complete'])
+
+    def test_linux_cleanup_failure_still_suppresses_resolved_admission(self):
+        class Backend:
+            def __init__(self,*args):self.closed=False;self.name='compat-'+'9'*32
+            def start(self):pass
+            def check(self):pass
+            def close(self):raise m.proof.InfrastructureFailure('admission-builder-ownership-unresolved')
+            def summary(self):return {'closed':False}
+        with patch.object(m,'_host_linux',return_value=True),patch.object(m,'_LinuxBuilder',Backend), \
+             patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')):
+            with self.assertRaisesRegex(m.proof.InfrastructureFailure,'ownership-unresolved'):self.admit()
+        self.assertEqual(len(self.f.builds),4)
+        result=json.loads((self.f.work/('candidate-'+self.f.candidate)/'result.json').read_bytes())
+        self.assertFalse(result['cleanup_complete']);self.assertEqual(result['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
 
 
 if __name__=='__main__':unittest.main()

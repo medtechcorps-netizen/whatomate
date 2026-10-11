@@ -28,6 +28,7 @@ import fixture
 import processes
 import runtime
 import stack
+import record_resolver
 
 proof, common = runtime.proof, runtime.common
 _READY_FOR_EXECUTION = True
@@ -897,7 +898,101 @@ class _LinuxBuilder:
                 'ownership_bound':self.container_row is not None and self.volume_row is not None}
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedPrevious:
+    digest: str
+    source_sha: str
+    recipe_sha256: str
+
+
+def _resolved_previous(resolution):
+    """Check cross-bindings, not cryptography or deployment authorization.
+
+    The future operational caller must obtain this exact projection internally
+    from resolve_forward. Constructing its dataclasses cannot authenticate it.
+    Catalog measurement/policy remain separate from image-source admission.
+    """
+    r = record_resolver
+    need(type(resolution) is r.ForwardResolution, 'admission-resolution-invalid')
+    candidate, material = resolution.candidate, resolution.catalog_material
+    need(type(candidate) is r.policy.SourceFacts and candidate.mode == 'reviewed-v0'
+         and type(candidate.sha) is str and common.SHA1_RE.fullmatch(candidate.sha)
+         and type(material) is r.CatalogMaterial and material.candidate_sha == candidate.sha,
+         'admission-resolution-source')
+    try:
+        r.policy._source(candidate)
+    except r.policy.PolicyRefusal:
+        raise proof.EvidenceError('admission-resolution-source') from None
+    pins = dict(r.policy.V0_PINS)
+    blobs = material.candidate_blobs
+    need(type(blobs) is tuple and len(blobs) == len(pins)
+         and all(type(row) is r.policy.SourceBlob and type(row.raw) is bytes
+                 and 0 < len(row.raw) <= r.policy.MAX_SOURCE_FILE_BYTES for row in blobs)
+         and tuple(row.path for row in blobs) == tuple(sorted(pins))
+         and sum(len(row.raw) for row in blobs) <= r.policy.MAX_SOURCE_BYTES,
+         'admission-resolution-material')
+    artifacts = dict(candidate.artifacts)
+    need(all(sha(row.raw) == pins[row.path] == artifacts[row.path] for row in blobs),
+         'admission-resolution-material')
+    resolved = resolution.resolved
+    need(type(resolved) is r.ResolvedChain and type(resolved.chain) is r.policy.PolicyChain,
+         'admission-resolution-selection')
+    chain, selected = resolved.chain, resolved.selected
+    need(chain.runtime_source_supported is True and chain.baseline is None
+         and type(chain.entries) is tuple and 1 <= len(chain.entries) <= 501
+         and all(type(row) is r.policy.PolicyEntry and type(row.record) is r.policy.RecordInput
+                 for row in chain.entries)
+         and type(selected) is r.ReleaseSelection and type(selected.index) is int
+         and 0 <= selected.index < len(chain.entries)
+         and type(resolved.latest) is r.ReleaseSelection
+         and resolved.latest == r._selection(chain, len(chain.entries)-1)
+         and selected == r._selection(chain, selected.index), 'admission-resolution-selection')
+    need(type(resolved.image_bindings) is tuple and len(resolved.image_bindings) == len(chain.entries)
+         and all(type(row) is r.transport.VerifiedImages for row in resolved.image_bindings),
+         'admission-resolution-image')
+    binding = resolved.image_bindings[selected.index]
+    images, sources = binding.images, binding.source_shas
+    for rows, pattern in ((images, common.DIGEST_RE), (sources, common.SHA1_RE)):
+        need(type(rows) is tuple and len(rows) == len(common.COMPONENTS)
+             and all(type(row) is tuple and len(row) == 2 and type(row[0]) is str
+                     and type(row[1]) is str and pattern.fullmatch(row[1]) for row in rows)
+             and tuple(row[0] for row in rows) == common.COMPONENTS,
+             'admission-resolution-image')
+    need(binding.release == selected.release and binding.record_sha == selected.record_sha
+         and images == selected.images and dict(sources)['web'] == selected.actual_web_source_sha
+         and resolution.previous_web_source_sha == selected.actual_web_source_sha,
+         'admission-resolution-image')
+    recipe = resolution.previous_recipe
+    need(type(recipe) is r.WebRecipe and recipe.path == _WEB_RECIPE
+         and recipe.source_sha == selected.actual_web_source_sha
+         and type(recipe.raw) is bytes and 0 < len(recipe.raw) <= r.policy.MAX_SOURCE_FILE_BYTES
+         and type(recipe.sha256) is str and common.SHA256_RE.fullmatch(recipe.sha256)
+         and sha(recipe.raw) == recipe.sha256, 'admission-resolution-recipe')
+    return _ResolvedPrevious(dict(images)['web'], selected.actual_web_source_sha, recipe.sha256)
+
+
+def _admit_resolved(repo,resolution,binary,config,image_work_dir,deadline,*,buildx_binary=None):
+    """Preparatory path; no caller switch or authentication from typed data.
+
+    Reuse the caller's original deadline and source-built ownership lifecycle.
+    Previous recipe bytes came from the closed source operation; no Git read
+    or legacy verifier bridge recovers them after that operation has closed.
+    """
+    need(type(deadline) is _Deadline, 'admission-resolution-deadline')
+    deadline.remaining()
+    previous = _resolved_previous(resolution)
+    deadline.remaining()
+    return _admit_core(repo,None,resolution.candidate.sha,binary,config,image_work_dir,deadline,
+                       buildx_binary=buildx_binary,resolved_previous=previous)
+
+
 def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,buildx_binary=None):
+    """Active legacy entrypoint; retain its original validation and I/O order."""
+    return _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,buildx_binary=buildx_binary)
+
+
+def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,buildx_binary=None,
+                resolved_previous=None):
     """Build four fixed roles once from one immutable, clean source selection.
 
     A location is not evidence: all build receipts originate here. Persistent
@@ -906,7 +1001,7 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
     """
     source=_Source(repo,candidate,deadline)
     blobs=source.blobs(source.inventory(candidate));contexts=_role_inputs(blobs)
-    digest=previous.images.get('web')
+    digest=previous.images.get('web') if resolved_previous is None else resolved_previous.digest
     need(type(digest) is str and common.DIGEST_RE.fullmatch(digest),'admission-previous-invalid')
     need(Path(binary).is_absolute() and Path(binary).is_file(),'admission-docker-location')
     reference=common.IMAGE_REPOSITORY['web']+'@'+digest
@@ -955,8 +1050,13 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
             docker.pull(image)
             infrastructure[image]=docker.inspect(image)
         previous_row=infrastructure[reference]
-        previous_recipe=sha(source.git(['cat-file','blob',previous.sha+':'+_WEB_RECIPE]))
-        previous_binding=processes.ImageBinding(reference,previous_row['Id'],previous.sha,previous_recipe)
+        if resolved_previous is None:
+            previous_recipe=sha(source.git(['cat-file','blob',previous.sha+':'+_WEB_RECIPE]))
+            previous_source=previous.sha
+        else:
+            previous_recipe=resolved_previous.recipe_sha256
+            previous_source=resolved_previous.source_sha
+        previous_binding=processes.ImageBinding(reference,previous_row['Id'],previous_source,previous_recipe)
         processes.OwnedProcesses._validate_image(None,'previous',previous_binding,previous_row)
         if _host_linux():
             backend=_LinuxBuilder(binary,config,plugin,build_config,work,candidate,deadline)
