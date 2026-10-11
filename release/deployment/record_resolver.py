@@ -395,12 +395,13 @@ def _forward_pending(reader, repo_dir, latest_sha, candidate_sha, database_base,
         requirements.update(range_requirements)
         summary.extend(line for line in range_summary if line not in summary)
     try:
-        pending_source.replay(pending, candidate_sha=candidate_sha, previous_sha=latest_sha, **active_args)
+        projection = pending_source.replay(pending, candidate_sha=candidate_sha, previous_sha=latest_sha, **active_args)
+        if projection.plan is not None and any(entry.kind != "expand" for entry in projection.plan.entries):
+            reasons.add("pending-format-unsupported")
+            requirements.update(("pending-format-unsupported", "producer-class-unsupported"))
     except pending_source.PendingSourceRefusal:
         reasons.update(("pending-format-unsupported", "classifier-v2-invalid:pending-material"))
         requirements.update(("pending-format-unsupported", "producer-class-unsupported"))
-    if pending.candidate_files:
-        requirements.add("producer-class-unsupported")
     summary.append("policy classification: " + kind + (" (dormant)" if dormant else ""))
     if len(summary) > 25000:
         raise policy.PolicyRefusal("record-source-invalid")

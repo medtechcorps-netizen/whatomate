@@ -1055,6 +1055,7 @@ def _v2_pending(repo: _Repository, base: str, head: str, reasons: set[str],
     plan = None
     introduced = False
     active = None
+    existing_producer_block = "producer-class-unsupported" in requirements
     for revision in (base, *revisions):
         # Without the trailing slash, a blob/gitlink masquerading as the
         # pending directory is visible too and fails the closed path check.
@@ -1087,6 +1088,8 @@ def _v2_pending(repo: _Repository, base: str, head: str, reasons: set[str],
     if supported:
         reasons.discard("pending-format-unsupported")
         requirements.discard("pending-format-unsupported")
+        if not existing_producer_block:
+            requirements.discard("producer-class-unsupported")
     summary.append("pending source plan: active=" + str(plan.active_version) + "; target="
                    + str(plan.entries[0].version) + "; source=" + head)
     for path, digest in plan.files:
@@ -1105,9 +1108,10 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
     """Prepare forward policy; does NOT authorize a release or lift guard().
 
     Source catalog labels are not measured DB shape or signed evidence. Active
-    future catalogs, pending-plan producers and additive >=2 producers remain
-    explicitly unsupported. Dormant pending source classification is not a
-    producer or SQL-safety claim. REQUIRE_COMPAT adoption remains atomic.
+    future catalogs and additive >=2 producers remain explicitly unsupported.
+    A valid immutable pending expansion is dormant metadata; it still needs
+    the exact source-bound compatibility experiment and is not SQL-safety or
+    apply-engine authority. REQUIRE_COMPAT adoption remains atomic.
     """
     repo = _Repository(repo_dir)
     legacy = _classify(repo, base, head)
@@ -1170,7 +1174,8 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
                 reasons.add("additive-profile-unsupported")
                 requirements.add("additive-profile-unsupported")
         section = "pending"
-        if _v2_pending(repo, base, head, reasons, summary, requirements) and kind == "none":
+        pending_introduced = _v2_pending(repo, base, head, reasons, summary, requirements)
+        if pending_introduced and kind == "none":
             kind, dormant = "expand", True
         section = "registry"
         rows = repo.document(head, REGISTRY, _registry, optional=True) or []
@@ -1180,7 +1185,8 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
             requirements.add("contract-label")
         if kind in {"expand", "data", "contract"} and not dormant:
             requirements.add("restore-drills")
-        if kind != "none" and not (kind == "data" and dormant):
+        if kind != "none" and not (dormant and (kind == "data"
+                or (kind == "expand" and pending_introduced))):
             requirements.add("producer-class-unsupported")
         summary.append("policy classification: " + kind + (" (dormant)" if dormant else ""))
         _valid(len(summary) <= 25000)

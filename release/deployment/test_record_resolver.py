@@ -1169,7 +1169,7 @@ class ForwardPendingTests(unittest.TestCase):
         self.assertEqual(result.pending.previous_files, ())
         self.assertEqual((result.classification.kind, result.classification.dormant, result.classification.reasons),
                          ("expand", True, ()))
-        self.assertIn("producer-class-unsupported", result.classification.requirements)
+        self.assertEqual(result.classification.requirements, ("compat-required", "generated-migration-closure-ci"))
         self.assertEqual(result.candidate.catalog, self.v0.catalog)
         self.assertEqual(result.resolved.latest.live.origin_source.sha, base)
         self.assertEqual(result.resolved.latest.live.catalog, self.v0.catalog)
@@ -1197,6 +1197,8 @@ class ForwardPendingTests(unittest.TestCase):
                 case.install(sha)
                 result = case.forward(sha)
                 self.assertEqual((result.classification.kind, result.classification.reasons), ("none", ()))
+                self.assertEqual(result.classification.requirements,
+                                 ("compat-required", "generated-migration-closure-ci"))
                 self.assertEqual(result.pending.candidate_files, result.pending.previous_files)
                 self.assertEqual(case.replay(result).binding.candidate_digest, case.replay(result).binding.previous_digest)
                 commands = [args for args, _ in case.world.trace]
@@ -1367,7 +1369,30 @@ class ForwardPendingTests(unittest.TestCase):
         result = self.forward(sha)
         self.assertEqual((result.classification.kind, result.classification.dormant), ("data", True))
         self.assertEqual(result.classification.reasons, ())
+        self.assertEqual(result.classification.requirements, ("compat-required", "generated-migration-closure-ci"))
+
+    def test_raw_endpoint_unsupported_kind_stays_blocked_after_classifier_capture(self):
+        base, sha = self.ordinary(); self.install(sha)
+        path = pending_source.plan.PLAN
+        original = self.pending_files[path]
+        document = json.loads(original)
+        document["entries"][0]["class"] = "data"
+        changed = pending_source.plan.canonical(document)
+        switched = False
+
+        def after(args, result):
+            nonlocal switched
+            if not switched:
+                self.world.files[(sha, path)] = changed
+                switched = True
+            return result
+
+        self.material_transport(after)
+        result = self.forward(sha)
+        self.assertEqual((result.classification.kind, result.classification.dormant), ("expand", True))
+        self.assertIn("pending-format-unsupported", result.classification.reasons)
         self.assertIn("producer-class-unsupported", result.classification.requirements)
+        self.assertEqual(dict((row.path, row.raw) for row in result.pending.candidate_files)[path], changed)
 
     def test_final_git_and_complete_inventory_refresh_follow_pending_capture(self):
         base, sha = self.ordinary()
