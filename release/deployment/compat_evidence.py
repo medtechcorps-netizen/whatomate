@@ -8,7 +8,7 @@ cannot establish that a deleted run never contained a negative result.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 import hashlib
@@ -277,6 +277,45 @@ class BoundMeasurement:
 
 
 @dataclass(frozen=True, slots=True)
+class RollbackSpan:
+    records: int
+    non_none: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackBinding:
+    """Signed data only; a future bridge must rederive the full source/span."""
+    producer_sha: str
+    latest: ReleaseIdentity
+    selected: ReleaseIdentity
+    database_base: DatabaseBase
+    selected_web_source_sha: str
+    live_web_source_sha: str
+    span: RollbackSpan
+    source_material_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class BoundRollbackMeasurement:
+    """A complete rollback measurement, never an operational qualification."""
+    binding: RollbackBinding
+    catalog_sha256: str
+    forward: bool
+    migrations: tuple[bool, ...]
+    servers: tuple[bool, ...]
+    reversible: bool
+    result_sha256: str
+    context_sha256: str
+
+    @property
+    def positive(self):
+        # Actual flags only. Source/catalog freshness and history selection are
+        # separate future predicates; this property grants no release access.
+        return self.forward and self.reversible and all(self.migrations) and all(self.servers)
+
+
+@dataclass(frozen=True, slots=True)
 class QualifiedCompat:
     candidate_sha: str
     previous: ReleaseIdentity
@@ -525,28 +564,34 @@ def _subject(value, name, raw, attempt):
           and _string(value.verification_reference, _HASH), "subject-binding")
 
 
+def _authenticated_pair_payload(pair, attempt):
+    """Fixed shared subject/artifact/result checks; no parser callback."""
+    _need(type(attempt) is Attempt and _string(attempt.sha, _SHA)
+          and _number(attempt.run_id) and _number(attempt.run_number)
+          and _number(attempt.run_attempt, 9999), "attempt-shape")
+    _need(type(pair) is AuthenticatedPair and type(pair.result) is bytes and type(pair.context) is bytes
+          and 0 < len(pair.result) <= 16384 and 0 < len(pair.context) <= 4096, "pair-bound")
+    _subject(pair.result_subject, "compat-result.json", pair.result, attempt)
+    _subject(pair.context_subject, "compat-context.json", pair.context, attempt)
+    artifact = pair.artifact
+    _need(type(artifact) is Artifact and _number(artifact.artifact_id) and artifact.expired is False
+          and artifact.sha == attempt.sha and type(artifact.run_id) is int and artifact.run_id == attempt.run_id
+          and type(artifact.run_attempt) is int and artifact.run_attempt == attempt.run_attempt
+          and artifact.name == _proof.artifact_name(attempt.sha, attempt.run_attempt), "artifact-binding")
+    _need(type(artifact.files) is tuple and len(artifact.files) == 2
+          and all(type(f) is ArtifactFile and f.kind == "regular" for f in artifact.files), "artifact-inventory")
+    files = {f.name: f.sha256 for f in artifact.files}
+    _need(files == {"compat-result.json": hashlib.sha256(pair.result).hexdigest(),
+                    "compat-context.json": hashlib.sha256(pair.context).hexdigest()}, "artifact-inventory")
+    result = common.loads_strict(pair.result)
+    _need(_proof.result_bytes(result) == pair.result, "result-noncanonical")
+    return result
+
+
 def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> BoundMeasurement:
     """Validate a pair whose cryptographic verification is the caller's duty."""
     try:
-        _need(type(attempt) is Attempt and _string(attempt.sha, _SHA)
-              and _number(attempt.run_id) and _number(attempt.run_number)
-              and _number(attempt.run_attempt, 9999), "attempt-shape")
-        _need(type(pair) is AuthenticatedPair and type(pair.result) is bytes and type(pair.context) is bytes
-              and 0 < len(pair.result) <= 16384 and 0 < len(pair.context) <= 4096, "pair-bound")
-        _subject(pair.result_subject, "compat-result.json", pair.result, attempt)
-        _subject(pair.context_subject, "compat-context.json", pair.context, attempt)
-        artifact = pair.artifact
-        _need(type(artifact) is Artifact and _number(artifact.artifact_id) and artifact.expired is False
-              and artifact.sha == attempt.sha and type(artifact.run_id) is int and artifact.run_id == attempt.run_id
-              and type(artifact.run_attempt) is int and artifact.run_attempt == attempt.run_attempt
-              and artifact.name == _proof.artifact_name(attempt.sha, attempt.run_attempt), "artifact-binding")
-        _need(type(artifact.files) is tuple and len(artifact.files) == 2
-              and all(type(f) is ArtifactFile and f.kind == "regular" for f in artifact.files), "artifact-inventory")
-        files = {f.name: f.sha256 for f in artifact.files}
-        _need(files == {"compat-result.json": hashlib.sha256(pair.result).hexdigest(),
-                        "compat-context.json": hashlib.sha256(pair.context).hexdigest()}, "artifact-inventory")
-        result = common.loads_strict(pair.result)
-        _need(_proof.result_bytes(result) == pair.result, "result-noncanonical")
+        result = _authenticated_pair_payload(pair, attempt)
         context = common.loads_strict(pair.context)
         keys = {"version", "repository", "workflow_path", "workflow_sha", "event", "ref", "sha", "run_id",
                 "run_attempt", "requested_rollback_target", "latest", "selected", "preview", "result_sha256"}
@@ -608,6 +653,92 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
             version, database_base, actual_source, pending)
     except (common.ReleaseError, _proof.EvidenceError, ValueError, TypeError, KeyError, RecursionError):
         raise CompatRefusal("compat-stale", "pair-invalid") from None
+
+
+def validate_rollback_binding(value: RollbackBinding) -> RollbackBinding:
+    """Validate closed wire facts, not their source or signature authority."""
+    _need(type(value) is RollbackBinding and _string(value.producer_sha, _SHA), "rollback-binding")
+    _release(value.latest); _release(value.selected)
+    _need(value.selected.release != value.latest.release, "rollback-selection")
+    base = _database_base(value.database_base, value.latest)
+    _need(base.mode == "retained-live-v2" and base.catalog.catalog_version == 0
+          and base.catalog.min_reader_version == 0, "rollback-database-base")
+    _need(_string(value.selected_web_source_sha, _SHA) and _string(value.live_web_source_sha, _SHA)
+          and _string(value.source_material_sha256, _HASH), "rollback-source")
+    span = value.span
+    _need(type(span) is RollbackSpan and type(span.records) is int and 3 <= span.records <= 501
+          and type(span.non_none) is int and 2 <= span.non_none < span.records
+          and _string(span.sha256, _HASH), "rollback-span")
+    return value
+
+
+def parse_rollback_binding(value: dict) -> RollbackBinding:
+    """Parse an exact decoded binding object; outer JSON framing stays separate."""
+    _need(type(value) is dict and set(value) == {"producer_sha", "latest", "selected", "database_base",
+        "selected_web_source_sha", "live_web_source_sha", "span", "source_material_sha256"}, "rollback-binding")
+    span = value["span"]
+    _need(type(span) is dict and set(span) == {"version", "records", "non_none", "sha256"}
+          and type(span["version"]) is int and span["version"] == 1, "rollback-span")
+    latest, selected = _release_dict(value["latest"]), _release_dict(value["selected"])
+    base = _database_base_dict(value["database_base"], latest)
+    return validate_rollback_binding(RollbackBinding(value["producer_sha"], latest, selected, base,
+        value["selected_web_source_sha"], value["live_web_source_sha"],
+        RollbackSpan(span["records"], span["non_none"], span["sha256"]), value["source_material_sha256"]))
+
+
+def rollback_binding_wire(value: RollbackBinding) -> dict:
+    value = validate_rollback_binding(value)
+    result = asdict(value)
+    result["span"]["version"] = 1
+    return result
+
+
+def parse_authenticated_rollback_pair(pair: AuthenticatedPair, attempt: Attempt) -> BoundRollbackMeasurement:
+    """Bind authenticated context4 to actual result bytes without selecting it.
+
+    The caller authenticates both subjects through the fixed verifier. This
+    parser neither accepts normal contexts nor replays source material. Complete
+    false flags and a changed final catalog hash remain measured evidence.
+    """
+    try:
+        result = _authenticated_pair_payload(pair, attempt)
+        context = common.loads_strict(pair.context)
+        keys = {"version", "purpose", "repository", "workflow_path", "workflow_sha", "event", "ref", "sha",
+                "run_id", "run_attempt", "requested_rollback_target", "latest", "selected", "preview",
+                "database_base", "selected_web_source_sha", "live_web_source_sha", "span",
+                "source_material_sha256", "result_sha256"}
+        _need(type(context) is dict and set(context) == keys
+              and type(context["version"]) is int and context["version"] == 4
+              and context["purpose"] == "rollback-v0"
+              and common.canonical_file_bytes(context) == pair.context, "rollback-context-shape")
+        _need(context["repository"] == REPOSITORY and context["workflow_path"] == WORKFLOW
+              and context["workflow_sha"] == context["sha"] == attempt.sha
+              and context["ref"] == attempt.ref == REF
+              and context["event"] == attempt.event == "workflow_dispatch"
+              and attempt.repository == REPOSITORY and attempt.workflow_path == WORKFLOW
+              and attempt.workflow_sha == attempt.sha, "rollback-context-identity")
+        for name, expected in (("run_id", attempt.run_id), ("run_attempt", attempt.run_attempt)):
+            _need(type(context[name]) is int and context[name] == expected and result[name] == expected,
+                  "context-attempt")
+        _need(result["sha"] == attempt.sha and context["result_sha256"] == hashlib.sha256(pair.result).hexdigest(),
+              "context-result")
+        binding = parse_rollback_binding({"producer_sha": context["sha"], **{key: context[key] for key in
+            ("latest", "selected", "database_base", "selected_web_source_sha", "live_web_source_sha",
+             "span", "source_material_sha256")}})
+        _need(type(context["requested_rollback_target"]) is str
+              and context["requested_rollback_target"] == binding.selected.release
+              and result["previous_release"] == binding.selected.release
+              and result["previous_web_digest"] == binding.selected.web_digest, "rollback-context-selection")
+        preview = context["preview"]
+        _need(type(preview) is dict and set(preview) == {"kind", "dormant", "blocked"}
+              and preview["kind"] == "none" and preview["dormant"] is False and preview["blocked"] is False
+              and result["classification"] == {"kind": "none", "dormant": False}, "rollback-context-preview")
+        return BoundRollbackMeasurement(binding, result["catalog_sha256"], result["forward"],
+            tuple(result["old_migrate_ok"][key] for key in MIGRATIONS),
+            tuple(result["old_server_ok"][key] for key in SERVERS), result["reversible"],
+            hashlib.sha256(pair.result).hexdigest(), hashlib.sha256(pair.context).hexdigest())
+    except (common.ReleaseError, _proof.EvidenceError, ValueError, TypeError, KeyError, RecursionError):
+        raise CompatRefusal("compat-stale", "rollback-pair-invalid") from None
 
 
 def _measurements(history):

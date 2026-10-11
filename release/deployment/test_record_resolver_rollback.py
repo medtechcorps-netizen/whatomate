@@ -1,6 +1,11 @@
 """Rollback source operations using synthetic Git/GitHub/verifier captures."""
 import unittest
 from unittest import mock
+from dataclasses import replace
+import hashlib
+import json
+from pathlib import Path
+import subprocess
 
 import test_record_resolver as fixtures
 
@@ -555,6 +560,186 @@ class RollbackProofResolverTests(unittest.TestCase):
                     self.assertEqual(reached, [True])
                 finally:
                     case.doCleanups()
+
+
+class RollbackMaterialDigestTests(unittest.TestCase):
+    """Pure framing fixtures deliberately carry no authenticated source claim.
+
+    Unprojected chain/policy fields are absent to establish that a commitment
+    alone cannot substitute for the complete catalog/source validator.
+    """
+    def setUp(self):
+        self.h='a'*40;self.target='b'*40;self.live='c'*40
+        facts=policy.legacy_reader0(self.h)
+        def selection(source):
+            return resolver.ReleaseSelection(0,'fixture-not-a-release',source,'0'*64,(),source,facts,None)
+        resolved=resolver.ResolvedChain(None,None,(),selection(self.live),selection(self.target))
+        self.workflow=b'name: fixture\n'
+        self.target_raw=b'FROM scratch\n# target\n';self.live_raw=b'FROM scratch\n# live\n'
+        self.blobs=tuple(resolver.BlobObservation(path,b'raw:'+str(i).encode())
+                         for i,path in enumerate(policy.SOURCE_PATHS))
+        self.value=resolver.RollbackProofResolution(resolved,None,facts,self.workflow,self.digest(self.workflow),
+            (resolver.RollbackSourceMaterial('1'*40,'equal-reviewed-v0',self.blobs),),
+            resolver.WebRecipe(self.target,'docker/release/web.Dockerfile',self.target_raw,self.digest(self.target_raw)),
+            resolver.WebRecipe(self.live,'docker/release/web.Dockerfile',self.live_raw,self.digest(self.live_raw)))
+
+    @staticmethod
+    def digest(raw):
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def canonical(value):
+        return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode('ascii')
+
+    def expected(self):
+        return {'purpose':'rollback-v0-material-v1','producer_sha':self.h,
+            'workflow':{'path':'.github/workflows/compat.yml','bytes':len(self.workflow),'sha256':self.digest(self.workflow)},
+            'materials':[{'source_sha':'1'*40,'provenance':'equal-reviewed-v0',
+                'blobs':[[path,{'bytes':5,'sha256':self.digest(b'raw:'+str(i).encode())}]
+                         for i,path in enumerate(policy.SOURCE_PATHS)]}],
+            'recipes':{'target':{'source_sha':self.target,'path':'docker/release/web.Dockerfile',
+                                 'bytes':len(self.target_raw),'sha256':self.digest(self.target_raw)},
+                       'live':{'source_sha':self.live,'path':'docker/release/web.Dockerfile',
+                               'bytes':len(self.live_raw),'sha256':self.digest(self.live_raw)}}}
+
+    def rejected(self,value):
+        with self.assertRaises(policy.PolicyRefusal) as caught:resolver.rollback_material_digest(value)
+        self.assertEqual(caught.exception.args,('rollback-material-invalid',))
+
+    def material(self,*,source='1'*40,provenance='equal-reviewed-v0',blobs=None):
+        return resolver.RollbackSourceMaterial(source,provenance,self.blobs if blobs is None else blobs)
+
+    def test_exact_raw_projection_domain_and_no_trailing_lf(self):
+        raw=self.canonical(self.expected())
+        actual=resolver.rollback_material_digest(self.value)
+        self.assertEqual(actual,self.digest(raw))
+        self.assertNotEqual(actual,self.digest(raw+b'\n'))
+        # Deliberately partial non-v0 framing is not source/chain authority.
+        self.assertIsNone(self.value.resolved.chain);self.assertEqual(self.value.producer.mode,'legacy-reader0')
+
+    def test_no_io_client_construction_or_policy_validation(self):
+        with mock.patch.object(Path,'read_bytes',side_effect=AssertionError('file read')), \
+             mock.patch.object(subprocess,'Popen',side_effect=AssertionError('process')), \
+             mock.patch.object(resolver.records,'git',side_effect=AssertionError('Git')), \
+             mock.patch.object(resolver.transport,'ReleaseGh',side_effect=AssertionError('client')), \
+             mock.patch.object(resolver.policy,'normalize_chain',side_effect=AssertionError('policy')):
+            self.assertEqual(resolver.rollback_material_digest(self.value),self.digest(self.canonical(self.expected())))
+
+    def test_each_raw_observation_and_source_or_provenance_changes_commitment(self):
+        baseline=resolver.rollback_material_digest(self.value);changes=[]
+        for i,blob in enumerate(self.blobs):
+            rows=tuple(replace(row,raw=row.raw+b'x') if n==i else row for n,row in enumerate(self.blobs))
+            changes.append(replace(self.value,materials=(self.material(blobs=rows),)))
+        changes += [replace(self.value,producer=replace(self.value.producer,sha='d'*40)),
+                    replace(self.value,materials=(self.material(source='2'*40),)),
+                    replace(self.value,materials=(self.material(provenance='legacy-e001-absent-overlay'),)),
+                    replace(self.value,workflow=self.workflow+b'x',workflow_sha256=self.digest(self.workflow+b'x'))]
+        for role in ('target_recipe','live_recipe'):
+            recipe=getattr(self.value,role);raw=recipe.raw+b'x'
+            changes.append(replace(self.value,**{role:replace(recipe,raw=raw,sha256=self.digest(raw))}))
+            selected='selected' if role=='target_recipe' else 'latest'
+            resolution=replace(self.value.resolved,**{selected:replace(getattr(self.value.resolved,selected),
+                                                                     actual_web_source_sha='d'*40)})
+            changes.append(replace(self.value,resolved=resolution,**{role:replace(recipe,source_sha='d'*40)}))
+        for i,value in enumerate(changes):
+            with self.subTest(index=i):self.assertNotEqual(resolver.rollback_material_digest(value),baseline)
+
+    def test_equal_endpoint_roles_are_both_committed_without_deduplication(self):
+        same=replace(self.value,resolved=replace(self.value.resolved,latest=self.value.resolved.selected),
+                     live_recipe=self.value.target_recipe)
+        expected=self.expected();expected['recipes']['live']=dict(expected['recipes']['target'])
+        actual=resolver.rollback_material_digest(same)
+        self.assertEqual(actual,self.digest(self.canonical(expected)))
+        del expected['recipes']['live']
+        self.assertNotEqual(actual,self.digest(self.canonical(expected)))
+
+    def test_null_and_empty_bytes_are_distinct_without_absence_authority(self):
+        results=[]
+        for raw in (None,b'',b'raw:0'):
+            rows=(replace(self.blobs[0],raw=raw),*self.blobs[1:])
+            value=replace(self.value,materials=(self.material(blobs=rows),))
+            results.append(resolver.rollback_material_digest(value))
+            expected=self.expected()
+            expected['materials'][0]['blobs'][0][1]=(None if raw is None else {'bytes':len(raw),'sha256':self.digest(raw)})
+            self.assertEqual(results[-1],self.digest(self.canonical(expected)))
+        self.assertEqual(len(set(results)),3)
+
+    def test_material_inventory_order_unique_count_and_exact_types(self):
+        first=self.material();second=self.material(source='2'*40)
+        for rows in ((),[first],(first,first),(second,first),(object(),),
+                     (self.material(source='bad'),),(self.material(provenance='PRIVATE-unknown'),),
+                     (self.material(provenance=True),)):
+            with self.subTest(rows=type(rows).__name__):self.rejected(replace(self.value,materials=rows))
+        values=tuple(self.material(source=f'{i:040x}',blobs=tuple(replace(b,raw=None) for b in self.blobs))
+                     for i in range(2*(records.MAX_RECORDS+1)))
+        self.assertRegex(resolver.rollback_material_digest(replace(self.value,materials=values)),r'^[0-9a-f]{64}$')
+        self.rejected(replace(self.value,materials=(*values,self.material(source='f'*40))))
+
+    def test_all_seven_paths_cannot_be_omitted_reordered_duplicated_or_replaced(self):
+        variants=(self.blobs[:-1],tuple(reversed(self.blobs)),(self.blobs[0],)*len(self.blobs),list(self.blobs),
+                  (replace(self.blobs[0],path='PRIVATE/unknown'),*self.blobs[1:]),
+                  (replace(self.blobs[0],path=True),*self.blobs[1:]),
+                  (object(),*self.blobs[1:]))
+        for rows in variants:
+            with self.subTest(kind=type(rows).__name__):self.rejected(replace(self.value,materials=(self.material(blobs=rows),)))
+
+    def test_recipe_path_source_and_stored_hash_disagreement_refuse(self):
+        for role in ('target_recipe','live_recipe'):
+            recipe=getattr(self.value,role)
+            for field,value in (('path','Dockerfile'),('path',True),('source_sha','f'*40),('source_sha',False),
+                                ('sha256','0'*64),('sha256',b'0'*64),('raw',recipe.raw+b'x'),('raw',b'')):
+                with self.subTest(role=role,field=field):self.rejected(replace(self.value,**{role:replace(recipe,**{field:value})}))
+        for value in ('0'*64,True,b'0'*64,'A'*64):self.rejected(replace(self.value,workflow_sha256=value))
+        self.rejected(replace(self.value,workflow=self.workflow+b'x'))
+
+    def test_exact_projection_and_sha_types_refuse_without_formatting_private_values(self):
+        class Private:
+            def __str__(self):raise AssertionError('private str')
+            def __repr__(self):raise AssertionError('private repr')
+            def __eq__(self,other):raise AssertionError('private equality')
+        for value in (None,{},True,Private()):self.rejected(value)
+        for value in (True,b'a'*40,'A'*40,'short',Private()):
+            self.rejected(replace(self.value,producer=replace(self.value.producer,sha=value)))
+            selected=replace(self.value.resolved.selected,actual_web_source_sha=value)
+            self.rejected(replace(self.value,resolved=replace(self.value.resolved,selected=selected)))
+        self.rejected(replace(self.value,resolved=Private()))
+        self.rejected(replace(self.value,producer=Private()))
+        self.rejected(replace(self.value,target_recipe=Private()))
+        self.rejected(replace(self.value,materials=(self.material(provenance=Private()),)))
+
+    def test_raw_types_and_nonempty_workflow_recipe_guards(self):
+        for raw in (True,'PRIVATE',bytearray(b'raw'),memoryview(b'raw'),object()):
+            self.rejected(replace(self.value,workflow=raw))
+            self.rejected(replace(self.value,target_recipe=replace(self.value.target_recipe,raw=raw)))
+            rows=(replace(self.blobs[0],raw=raw),*self.blobs[1:])
+            self.rejected(replace(self.value,materials=(self.material(blobs=rows),)))
+        self.rejected(replace(self.value,workflow=b'',workflow_sha256=self.digest(b'')))
+
+    def test_per_file_and_per_material_boundaries(self):
+        raw=b'x'*policy.MAX_SOURCE_FILE_BYTES
+        two=tuple(replace(b,raw=raw if i<2 else None) for i,b in enumerate(self.blobs))
+        self.assertRegex(resolver.rollback_material_digest(replace(self.value,materials=(self.material(blobs=two),))),r'^[0-9a-f]{64}$')
+        over=tuple(replace(b,raw=b'x' if i==2 else b.raw) for i,b in enumerate(two))
+        self.rejected(replace(self.value,materials=(self.material(blobs=over),)))
+        too_big=raw+b'x'
+        self.rejected(replace(self.value,workflow=too_big,workflow_sha256=self.digest(too_big)))
+        self.rejected(replace(self.value,target_recipe=replace(self.value.target_recipe,raw=too_big,sha256=self.digest(too_big))))
+        rows=(replace(self.blobs[0],raw=too_big),*self.blobs[1:])
+        self.rejected(replace(self.value,materials=(self.material(blobs=rows),)))
+
+    def test_aggregate_raw_bound_counts_both_recipe_roles(self):
+        raw=b'x'*policy.MAX_SOURCE_FILE_BYTES
+        overhead=len(self.workflow)+len(self.target_raw)+len(self.live_raw)
+        rows=[]
+        for i in range(rt.MAX_BYTES//policy.MAX_SOURCE_BYTES):
+            tail=raw[:-overhead] if i==rt.MAX_BYTES//policy.MAX_SOURCE_BYTES-1 else raw
+            blobs=tuple(replace(b,raw=raw if j==0 else tail if j==1 else None)
+                        for j,b in enumerate(self.blobs))
+            rows.append(self.material(source=f'{i:040x}',blobs=blobs))
+        exact=replace(self.value,materials=tuple(rows))
+        self.assertRegex(resolver.rollback_material_digest(exact),r'^[0-9a-f]{64}$')
+        recipe=exact.live_recipe;changed=recipe.raw+b'x'
+        self.rejected(replace(exact,live_recipe=replace(recipe,raw=changed,sha256=self.digest(changed))))
 
 
 if __name__ == '__main__':

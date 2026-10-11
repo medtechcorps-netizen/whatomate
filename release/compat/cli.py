@@ -246,6 +246,141 @@ def execute(repo, ctx, client, snapshot, *, git_binary, deadline,
     return raw  # An actual false result is valid evidence, not a passing gate.
 
 
+def _rollback_context(ctx):
+    """Private rollback producer identity; normal dispatch remains unchanged."""
+    need(type(ctx) is Context and type(ctx.sha) is str and _SHA.fullmatch(ctx.sha)
+         and type(ctx.run_id) is int and 1 <= ctx.run_id < 10**16
+         and type(ctx.attempt) is int and 1 <= ctx.attempt <= 9999,
+         "cli-snapshot-context")
+    need(ctx.event == "workflow_dispatch" and ctx.ref == "refs/heads/main"
+         and ctx.target is not None, "cli-target-invalid")
+    proof.validate_rollback_target(ctx.target)
+
+
+def _rollback_snapshot(resolution, ctx):
+    """Derive public bindings only after complete source-material replay.
+
+    This private projection and its types are not authentication capabilities;
+    the named preview/run wrappers obtain their source facts concretely.
+    """
+    _rollback_context(ctx)
+    need(type(resolution) is record_resolver.RollbackProofResolution, "cli-snapshot-context")
+    contract = compat.catalog.CatalogContract.from_rollback_resolution(resolution)
+    latest, selected = resolution.resolved.latest, resolution.resolved.selected
+    need(resolution.producer.sha == resolution.resolved.inventory.main_sha == ctx.sha
+         and contract.catalog_control_sha == ctx.sha
+         and selected.release == ctx.target, "cli-snapshot-context")
+    live, required = latest.live, resolution.requirements
+    try:
+        material = record_resolver.rollback_material_digest(resolution)
+    except record_resolver.policy.PolicyRefusal:
+        raise proof.EvidenceError("cli-snapshot-invalid") from None
+    value = {"version": 1, "purpose": "rollback-v0", "sha": ctx.sha,
+        "run_id": ctx.run_id, "run_attempt": ctx.attempt, "requested_rollback_target": ctx.target,
+        "latest": _identity(latest), "selected": _identity(selected),
+        "preview": {"kind": "none", "dormant": False, "blocked": False},
+        "database_base": {"mode": "retained-live-v2", "source_sha": live.origin_source.sha,
+            "origin": {"release": live.origin_release, "manifest_sha256": live.origin_manifest_sha256},
+            "catalog": live.catalog._asdict()},
+        "selected_web_source_sha": selected.actual_web_source_sha,
+        "live_web_source_sha": latest.actual_web_source_sha,
+        "span": {"version": 1, "records": len(required.span),
+                 "non_none": required.non_none_count, "sha256": required.span_sha256},
+        "source_material_sha256": material}
+    return validate_rollback_snapshot(value, ctx)
+
+
+def validate_rollback_snapshot(value, ctx):
+    _rollback_context(ctx)
+    need(type(value) is dict and set(value) == {"version", "purpose", "sha", "run_id", "run_attempt",
+         "requested_rollback_target", "latest", "selected", "preview", "database_base",
+         "selected_web_source_sha", "live_web_source_sha", "span", "source_material_sha256"},
+         "cli-snapshot-invalid")
+    need(type(value["version"]) is int and value["version"] == 1 and value["purpose"] == "rollback-v0"
+         and value["sha"] == ctx.sha and type(value["run_id"]) is int and value["run_id"] == ctx.run_id
+         and type(value["run_attempt"]) is int and value["run_attempt"] == ctx.attempt
+         and value["requested_rollback_target"] == ctx.target, "cli-snapshot-context")
+    try:
+        binding = compat_evidence.parse_rollback_binding({"producer_sha": value["sha"],
+            **{key: value[key] for key in ("latest", "selected", "database_base", "selected_web_source_sha",
+                                          "live_web_source_sha", "span", "source_material_sha256")}})
+    except compat_evidence.CompatRefusal:
+        raise proof.EvidenceError("cli-snapshot-invalid") from None
+    need(binding.selected.release == ctx.target, "cli-snapshot-selection")
+    preview = value["preview"]
+    need(type(preview) is dict and set(preview) == {"kind", "dormant", "blocked"}
+         and preview["kind"] == "none" and preview["dormant"] is False and preview["blocked"] is False,
+         "cli-snapshot-preview")
+    return value
+
+
+def validate_rollback_result(raw, snapshot, ctx):
+    validate_rollback_snapshot(snapshot, ctx)
+    need(type(raw) is bytes and 0 < len(raw) <= _MAX_PUBLIC, "cli-result-invalid")
+    value = common.loads_strict(raw)
+    need(proof.result_bytes(value) == raw, "cli-result-noncanonical")
+    selected = snapshot["selected"]
+    need(value["sha"] == ctx.sha and value["run_id"] == ctx.run_id and value["run_attempt"] == ctx.attempt
+         and value["previous_release"] == selected["release"]
+         and value["previous_web_digest"] == selected["web_digest"], "cli-result-context")
+    need(value["classification"] == {"kind": "none", "dormant": False}, "cli-result-classification")
+    # Preserve the actual final catalog, including a complete mismatch. The
+    # later qualifier compares it with the retained source expectation.
+    return value
+
+
+def rollback_evidence_context(result, snapshot, ctx):
+    """Bind complete actual rollback measurements, including false flags.
+
+    The unchanged public result identifies producer H and target T. Its
+    context records signed live L and retained origin O separately; it never
+    asserts history qualification or authorizes an operational rollback.
+    """
+    validate_rollback_result(result, snapshot, ctx)
+    value = {**snapshot, "version": 4, "repository": common.REPOSITORY,
+        "workflow_path": _WORKFLOW_PATH, "workflow_sha": ctx.sha, "event": ctx.event, "ref": ctx.ref,
+        "result_sha256": hashlib.sha256(result).hexdigest()}
+    need(len(canonical(value)) <= _MAX_CONTEXT, "cli-context-bound")
+    return value
+
+
+def validate_rollback_evidence(raw, result, snapshot, ctx):
+    need(type(raw) is bytes and 0 < len(raw) <= _MAX_CONTEXT, "cli-context-bound")
+    value = common.loads_strict(raw)
+    need(canonical(value) == raw and raw == canonical(rollback_evidence_context(result, snapshot, ctx)),
+         "cli-evidence-context")
+    return value
+
+
+def _preview_rollback(repo, ctx, client, *, git_binary, deadline):
+    """Private concrete preview; no public CLI command selects this route."""
+    _rollback_context(ctx)
+    need(type(deadline) is images._Deadline, "cli-deadline-invalid")
+    deadline.remaining()
+    resolution = record_resolver.resolve_rollback_proof(client, repo, git_binary, ctx.sha, ctx.target)
+    deadline.remaining()
+    value = _rollback_snapshot(resolution, ctx)
+    deadline.remaining()
+    return value
+
+
+def _execute_rollback(repo, ctx, client, snapshot, *, git_binary, deadline,
+                      docker_binary, config_dir, image_work_dir, buildx_binary):
+    """Freshly resolve before the private actual engine; no new budget."""
+    validate_rollback_snapshot(snapshot, ctx)
+    need(type(deadline) is images._Deadline, "cli-deadline-invalid")
+    deadline.remaining()
+    resolution = record_resolver.resolve_rollback_proof(client, repo, git_binary, ctx.sha, ctx.target)
+    need(canonical(_rollback_snapshot(resolution, ctx)) == canonical(snapshot), "cli-resolution-changed")
+    deadline.remaining()
+    raw = compat._run_rollback_resolved_experiment(repo, resolution, ctx.run_id, ctx.attempt, deadline=deadline,
+        docker_binary=docker_binary, config_dir=config_dir, image_work_dir=image_work_dir,
+        buildx_binary=buildx_binary)
+    validate_rollback_result(raw, snapshot, ctx)
+    deadline.remaining()
+    return raw
+
+
 def _read_public(path, *, limit=_MAX_PUBLIC):
     regular_path(path)
     with path.open("rb") as stream:
