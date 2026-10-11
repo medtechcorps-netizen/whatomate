@@ -106,6 +106,86 @@ class ReleaseTransportTests(unittest.TestCase):
     def collect(self, client):
         return list(records.collect_authenticated_records(client, work_dir=client.work_dir))
 
+    def test_fixed_contract_queries_typed_variables_and_same_capture_budget(self):
+        client = self.client(); client.capture_snapshot()
+        calls, original = [], self.world
+        def capture(argv, **options):
+            if argv[1:5] == ["api", "--method", "POST", "graphql"]:
+                calls.append((list(argv), options))
+                return rt.runtime.Capture(0, b'{"data":{}}', b"")
+            return original(argv, **options)
+        client.budget._capture = capture
+        before = client.budget.commands
+        for stage, kwargs in (("associations", {}), ("labels", {"number": 268}),
+                              ("events", {"number": 268, "after": "opaque-end-cursor"})):
+            self.assertEqual(client._contract_page(stage, self.world.main,
+                byte_allowance=rt._CONTRACT_BYTES, **kwargs), b'{"data":{}}')
+            self.assertIsNone(client._contract_request)
+        self.assertEqual(client.budget.commands, before + 3)
+        for (args, options), stage in zip(calls, ("associations", "labels", "events")):
+            self.assertIn("query=" + rt._CONTRACT_QUERIES[stage], args)
+            self.assertIn("candidate=" + self.world.main, args)
+            self.assertIn("owner=medtechcorps-netizen", args)
+            self.assertIn("name=whatomate", args)
+            self.assertNotIn(support.GH_TOKEN, args)
+            self.assertNotIn("SHIP_DO_TOKEN", options["env"])
+            self.assertEqual(options["env"]["GH_HOST"], "github.com")
+            self.assertLessEqual(options["stdout_limit"] + options["stderr_limit"], rt._CONTRACT_BYTES)
+        number = calls[1][0].index("number=268")
+        self.assertEqual(calls[1][0][number - 1], "-F")
+        self.assertNotIn("after=opaque-end-cursor", calls[1][0])
+        self.assertIn("after=opaque-end-cursor", calls[2][0])
+
+    def test_contract_method_refuses_arbitrary_source_stage_and_variables(self):
+        cases = [("mutation", self.world.main, {}), ("associations", "main", {}),
+                 ("associations", "b" * 40, {}), ("associations", self.world.main, {"number": 268}),
+                 ("labels", self.world.main, {"number": True}),
+                 ("labels", self.world.main, {"number": 2**31}),
+                 ("labels", self.world.main, {"number": 268, "after": "cursor"}),
+                 ("events", self.world.main, {"number": 268, "after": "PRIVATE\n"})]
+        for stage, sha, kwargs in cases:
+            with self.subTest(stage=stage, kwargs=kwargs):
+                client = self.client(); client.capture_snapshot(); before = len(self.world.calls)
+                with self.assertRaises(rt.TransportRefusal) as caught:
+                    client._contract_page(stage, sha, byte_allowance=rt._CONTRACT_BYTES, **kwargs)
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.assertTrue(client.budget.failed)
+                self.assertEqual(len(self.world.calls), before)
+        client = self.client(); client.capture_snapshot(); before = len(self.world.calls)
+        with self.assertRaises(rt.TransportRefusal):
+            client._run(["api", "--method", "POST", "graphql", "-f", "query=mutation { PRIVATE }"], code="ignored")
+        self.assertEqual(len(self.world.calls), before)
+
+    def test_contract_reserves_stderr_and_restores_scope_on_failure(self):
+        for mode in ("bounded", "stderr", "nonzero"):
+            client = self.client(); client.capture_snapshot(); options_seen = []
+            def capture(argv, **options):
+                options_seen.append(options)
+                return rt.runtime.Capture(1 if mode == "nonzero" else 0, b"{}",
+                                          b"PRIVATE" if mode == "stderr" else b"")
+            client.budget._capture = capture
+            call = lambda: client._contract_page("associations", self.world.main,
+                                                 byte_allowance=rt._CONTRACT_STDERR + 12)
+            if mode == "bounded": self.assertEqual(call(), b"{}")
+            else:
+                with self.assertRaises(rt.TransportRefusal) as caught: call()
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.assertTrue(client.budget.failed)
+            self.assertIsNone(client._contract_request)
+            self.assertEqual(options_seen[0]["stdout_limit"], 12)
+            self.assertEqual(options_seen[0]["stderr_limit"], rt._CONTRACT_STDERR)
+
+    def test_contract_foreign_scope_replacement_is_preserved_and_poisoned(self):
+        client = self.client(); client.capture_snapshot(); foreign = object()
+        def capture(argv, **options):
+            client._contract_request = foreign
+            return rt.runtime.Capture(0, b"{}", b"")
+        client.budget._capture = capture
+        with self.assertRaises(rt.TransportRefusal):
+            client._contract_page("associations", self.world.main, byte_allowance=rt._CONTRACT_BYTES)
+        self.assertIs(client._contract_request, foreign)
+        self.assertTrue(client.budget.failed)
+
     def test_mixed_raw_and_final_snapshot_with_real_inherited_verifier(self):
         first, second = self.first(), wire.v2()
         raw1, raw2 = self.world.add(first), self.world.add(second)

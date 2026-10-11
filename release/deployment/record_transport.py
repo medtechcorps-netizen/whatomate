@@ -30,6 +30,17 @@ _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
+
+# Fixed query documents only; callers cannot supply GraphQL source or endpoints.
+_CONTRACT_QUERIES = {
+    'associations': 'query ContractAssociations($owner: String!, $name: String!, $candidate: GitObjectID!) {\n  repository(owner: $owner, name: $name) {\n    databaseId\n    nameWithOwner\n    owner { __typename login ... on User { id } }\n    defaultBranchRef { name target { oid } }\n    object(oid: $candidate) { __typename ... on Commit {\n      oid\n      associatedPullRequests(first: 100) {\n        pageInfo { hasNextPage endCursor }\n        edges { cursor node { id number merged isDraft state baseRefName\n      mergeCommit { oid } headRefOid mergedAt\n      repository { databaseId nameWithOwner } } }\n      }\n    } }\n  }\n}\n',
+    'labels': 'query ContractLabels($owner: String!, $name: String!, $candidate: GitObjectID!, $number: Int!) {\n  repository(owner: $owner, name: $name) {\n    databaseId\n    nameWithOwner\n    owner { __typename login ... on User { id } }\n    defaultBranchRef { name target { oid } }\n    object(oid: $candidate) { __typename ... on Commit { oid } }\n    pullRequest(number: $number) {\n      id number merged isDraft state baseRefName\n      mergeCommit { oid } headRefOid mergedAt\n      repository { databaseId nameWithOwner }\n      labels(first: 100) {\n        pageInfo { hasNextPage endCursor }\n        edges { cursor node { id name createdAt updatedAt repository { databaseId nameWithOwner } } }\n      }\n    }\n  }\n}\n',
+    'events': 'query ContractEvents($owner: String!, $name: String!, $candidate: GitObjectID!, $number: Int!, $after: String) {\n  repository(owner: $owner, name: $name) {\n    databaseId\n    nameWithOwner\n    owner { __typename login ... on User { id } }\n    defaultBranchRef { name target { oid } }\n    object(oid: $candidate) { __typename ... on Commit { oid } }\n    pullRequest(number: $number) {\n      id number merged isDraft state baseRefName\n      mergeCommit { oid } headRefOid mergedAt\n      repository { databaseId nameWithOwner }\n      timelineItems(first: 100, after: $after, itemTypes: [LABELED_EVENT, UNLABELED_EVENT]) {\n        pageInfo { hasNextPage endCursor }\n        edges { cursor node {\n          __typename\n          ... on LabeledEvent { id createdAt actor { __typename login ... on User { id } ... on Bot { id } ... on Organization { id } }\n            label { id name createdAt updatedAt repository { databaseId nameWithOwner } }\n            labelable { __typename ... on PullRequest { id repository { databaseId nameWithOwner } } } }\n          ... on UnlabeledEvent { id createdAt actor { __typename login ... on User { id } ... on Bot { id } ... on Organization { id } }\n            label { id name createdAt updatedAt repository { databaseId nameWithOwner } }\n            labelable { __typename ... on PullRequest { id repository { databaseId nameWithOwner } } } }\n        } }\n      }\n    }\n  }\n}\n',
+}
+_CONTRACT_STDERR = 65536
+_CONTRACT_BYTES = 8 * MIB
+
+
 class TransportRefusal(common.ReleaseError):
     pass
 
@@ -183,6 +194,8 @@ class ReleaseGh(records.Gh):
         self._download_attempts = set()
         self._verification_args = self._scope = self._image_scope = None
         self._finished = False
+        self._contract_request = None
+        self._contract_collected = False
         try:
             self._work_identity = _directory(work_dir, empty=True)
             self._config_identity = _directory(config_dir, empty=True)
@@ -228,6 +241,10 @@ class ReleaseGh(records.Gh):
             limit = records.MAX_MANIFEST_BYTES
         if self._scope is not None and args == self._verification_args:
             allowed, duration = True, 60
+        contract = self._contract_request
+        if contract is not None:
+            self._need(tuple(args) == contract[0], "contract-scope")
+            allowed, limit = True, contract[1]
         self._need(allowed, "command")
         env = dict(self._env)
         env["GH_HOST"] = "github.com"
@@ -235,7 +252,43 @@ class ReleaseGh(records.Gh):
                                      stdout_limit=limit, stderr_limit=65536)
         self._check()
         self._need(result.returncode == 0, "command-failed")
+        if contract is not None:
+            self._need(not result.stderr, "contract-response")
         return result.stdout
+
+    def _contract_page(self, stage, candidate_sha, *, number=None, after=None, byte_allowance):
+        """One fixed read query inside this client's original operation."""
+        self._check()
+        self._need(self._contract_request is None and self._scope is None
+                   and self._image_scope is None, "contract-scope")
+        self._need(type(self._snapshot) is InventorySnapshot
+                   and self._snapshot.repository_id == REPOSITORY_ID
+                   and type(candidate_sha) is str and _SHA.fullmatch(candidate_sha) is not None
+                   and self._snapshot.main_sha == candidate_sha, "contract-source")
+        self._need(type(stage) is str and stage in _CONTRACT_QUERIES, "contract-input")
+        self._need(type(byte_allowance) is int
+                   and _CONTRACT_STDERR < byte_allowance <= _CONTRACT_BYTES, "contract-bound")
+        self._need((stage == "associations" and number is None and after is None)
+                   or (stage != "associations" and type(number) is int and 0 < number < 2**31
+                       and (stage == "events" or after is None)), "contract-input")
+        self._need(after is None or (type(after) is str and 0 < len(after) <= 1024
+                   and all(32 <= ord(char) < 127 for char in after)), "contract-input")
+        owner, name = common.REPOSITORY.split("/")
+        args = ["api", "--method", "POST", "graphql", *HEADERS,
+                "-f", "query=" + _CONTRACT_QUERIES[stage],
+                "-f", "owner=" + owner, "-f", "name=" + name,
+                "-f", "candidate=" + candidate_sha]
+        if number is not None:
+            args.extend(["-F", "number=" + str(number)])
+        if after is not None:
+            args.extend(["-f", "after=" + after])
+        scope = (tuple(args), min(MIB, byte_allowance - _CONTRACT_STDERR))
+        self._contract_request = scope
+        try:
+            return self._run(args, code="record-chain-invalid:transport-contract")
+        finally:
+            self._need(self._contract_request is scope, "contract-scope")
+            self._contract_request = None
 
     def _get(self, path):
         try:
