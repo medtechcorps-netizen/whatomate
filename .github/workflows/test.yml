@@ -42,10 +42,11 @@ jobs:
           python3 -B -m unittest discover -s release/staging -p 'test_*.py' -v
           python3 -B -m unittest discover -s release/compat -p 'test_*.py' -v
 
-  # Stage 1's interim schema freeze (release/deployment/schema_change.py) at
-  # pull-request time. A change the Release plan would refuse with
-  # schema-change-blocked fails here, through the required 'test' check,
-  # before it can merge and leave main unpromotable. A pull request is checked
+  # The CI-only source guard preserves the legacy freeze except for its
+  # narrow validated generated-closure change. Source admission alone is not
+  # compatibility proof: the controlled merge also requires the separate
+  # exact-candidate compat result until the owner makes compat required.
+  # Actual generated contracts remain checked in go-race. A PR is checked
   # from its merge base with main to GitHub's merge commit, so only its own
   # changes count; a push to main is checked against its first parent, so
   # the job always runs and the aggregator needs no exception.
@@ -75,7 +76,7 @@ jobs:
           import schema_change
           import ship_common as common
 
-          MESSAGE = "guarded database code changed; it cannot be promoted in Part A; split or revert"
+          MESSAGE = "source change is outside the CI admission policy; compatibility does not override this refusal"
           REPO = Path.cwd()
 
           def commit(*args):
@@ -85,6 +86,9 @@ jobs:
           event = os.environ.get("GITHUB_EVENT_NAME", "")
           try:
               head = commit("rev-parse", "--verify", "HEAD^{commit}")
+              expected = common.require_sha1(os.environ.get("GITHUB_SHA", ""), "context-invalid:sha")
+              if head != expected:
+                  common.fail("context-invalid:sha")
               if event == "pull_request":
                   # The checkout is GitHub's merge of the pull request into
                   # main; its merge base with main is the main commit it was
@@ -95,7 +99,7 @@ jobs:
                   base = commit("rev-parse", "--verify", head + "^1^{commit}")
               else:
                   common.fail("context-invalid:event")
-              reasons = schema_change.check(REPO, base, head)
+              reasons = schema_change.check_ci_source(REPO, base, head)
           except common.ReleaseError as error:
               print("schema guard failed closed: %s" % error)
               sys.exit(1)

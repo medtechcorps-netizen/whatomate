@@ -5,6 +5,7 @@ The public production admission refusal is tested separately from mock runs.
 """
 from dataclasses import asdict, replace
 from contextlib import nullcontext
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -678,6 +679,39 @@ class AdmissionTests(unittest.TestCase):
         self.assertIs(seen['capture'].__self__,deadline)
 
 
+def source_closure_fixture(case, origin, candidate, *, prior_seed_delta=False):
+    """Controlled policy input, not an actual Go-regenerated closure.
+
+    The synthetic root keeps exactly the same body while its reached helper
+    changes. The declaration JSON digest follows the generator's File/ID/Source
+    framing, but real Go closure discovery and hosted behavior remain separate
+    qualification requirements. No classifier or proof decision is supplied.
+    """
+    ci_base = '8' * 40
+    if prior_seed_delta:
+        case.world.files[(candidate, tr.policy.SEEDS)] += b'\n'
+    for (sha, path), raw in list(case.world.files.items()):
+        if sha == candidate:
+            case.world.files[(ci_base, path)] = raw
+    case.world.commits.add(ci_base)
+    root_id = next(name for name in tr.schema_change.MIGRATION_ROOTS
+                   if name.endswith('.runRLSMigration'))
+    root = 'func runRLSMigration(args []string) {\n\tprintln(sourceProbe())\n}'
+    manifests = {}
+    for sha, value in ((origin, 1), (ci_base, 1), (candidate, 2)):
+        helper = 'func sourceProbe() int {\n\treturn ' + str(value) + '\n}'
+        declarations = [dict(File=case.MAIN, ID=root_id, Source=root),
+                        dict(File=case.MAIN, ID=root_id.rsplit('.', 1)[0] + '.sourceProbe', Source=helper)]
+        raw = json.dumps(sorted(declarations, key=lambda row: (row['File'], row['ID'])),
+                         separators=(',', ':'), ensure_ascii=True).encode('ascii')
+        manifest = dict(version=1, roots=tr.schema_change.MIGRATION_ROOTS,
+                        closure_files=[case.MAIN], closure_sha256=hashlib.sha256(raw).hexdigest())
+        case.world.files[(sha, case.MAIN)] = ('package main\n\n' + root + '\n\n' + helper + '\n').encode()
+        case.world.files[(sha, tr.schema_change.MIGRATION_PATH)] = tr.common.canonical_file_bytes(manifest)
+        manifests[sha] = manifest
+    return ci_base, manifests
+
+
 class ResolvedExperimentTests(unittest.TestCase):
     """Real resolved source/catalog and evaluator, fake build/phase transports."""
     @classmethod
@@ -764,6 +798,69 @@ class ResolvedExperimentTests(unittest.TestCase):
         self.assertEqual(self.deadline.end, original_end)
         self.assertEqual(len(self.case.world.trace), trace)
         return json.loads(raw)
+
+    def closure_resolution(self, *, prior_seed_delta=False):
+        origin = self.resolution.database_base_source
+        ci_base, manifests = source_closure_fixture(self.case, origin, SHA,
+                                                   prior_seed_delta=prior_seed_delta)
+        config, work = self.case.root / 'closure-config', self.case.root / 'closure-work'
+        config.mkdir(); work.mkdir()
+        budget = tr.rt.OperationBudget(self.deadline.end, capture=self.case.world,
+                                       clock=self.deadline.clock)
+        client = tr.rt.ReleaseGh(self.case.gh, tr.support.GH_TOKEN, config, work,
+                                 budget=budget, base_env={})
+        result = tr.resolver.resolve_forward(client, self.case.repo, self.case.git, SHA)
+        self.assertTrue(budget.closed)
+        self.assertEqual(result.classification.reasons, ())
+        self.assertEqual(result.classification.migration_changes, ('generated migration closure changed',))
+        self.assertEqual(result.classification.requirements,
+                         ('compat-required', 'generated-migration-closure-ci'))
+        self.assertNotEqual(manifests[origin]['closure_sha256'], manifests[SHA]['closure_sha256'])
+        self.assertEqual(manifests[origin]['roots'], manifests[SHA]['roots'])
+        self.assertEqual(manifests[origin]['closure_files'], manifests[SHA]['closure_files'])
+        for path in tr.policy.SOURCE_PATHS:
+            self.assertEqual(self.case.world.files[(ci_base, path)], self.case.world.files[(SHA, path)])
+        self.resolution = result
+        return ci_base
+
+    def assert_closure_phases(self, result):
+        self.assertEqual(result['catalog_sha256'], self.contract.target_sha256)
+        self.assertEqual(len(self.contract.expected_preexisting_tables), 127)
+        self.assertEqual(self.w.trace.count('migration.compat-fwd'), 2)
+        for phase in ('compat-n1-rw', 'compat-n1-ro'):
+            self.assertIn('migration.' + phase, self.w.trace)
+        self.assertIn('pg.control', self.w.trace)
+        self.assertIn('workers.end', self.w.trace)
+        self.assertEqual(self.w.trace.count('controller.read'), 2)
+        self.assertEqual(self.w.trace[-4:], ['ledger.seal', 'catalog.final', 'manager.close', 'stack.cleanup'])
+        self.assertTrue(self.w.owner._closed)
+
+    def test_source_closure_change_still_runs_complete_real_engine_and_evaluator(self):
+        self.closure_resolution()
+        self.assertEqual((self.resolution.classification.kind, self.resolution.classification.dormant),
+                         ('none', False))
+        result = self.run_resolved()
+        self.assertTrue(result['forward']); self.assertTrue(result['reversible'])
+        self.assertTrue(all(result['old_migrate_ok'].values()))
+        self.assertTrue(all(result['old_server_ok'].values()))
+        self.assert_closure_phases(result)
+
+    def test_source_closure_change_does_not_convert_completed_false_to_success(self):
+        self.closure_resolution()
+        self.w.false_case = 'read'
+        result = self.run_resolved()
+        self.assertFalse(result['old_server_ok']['read'])
+        self.assertFalse(result['old_server_ok']['reverse'])
+        self.assertTrue(result['forward']); self.assertTrue(result['reversible'])
+        self.assert_closure_phases(result)
+
+    def test_source_closure_change_cannot_publish_after_cleanup_refusal(self):
+        self.closure_resolution()
+        self.w.cleanup_fail = True
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'cleanup'):
+            self.run_resolved()
+        self.assertIn('catalog.final', self.w.trace)
+        self.assertEqual(self.w.trace[-1], 'stack.cleanup')
 
     def test_actual_image_record_and_database_origin_remain_three_distinct_sources(self):
         selected = self.resolution.resolved.selected

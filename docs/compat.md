@@ -517,6 +517,23 @@ The separate signing job has a six-minute ceiling: checkout and two downloads
 have one minute each, the two signing steps one minute each, leaving one minute
 for local revalidation and final enforcement. Both signatures are required.
 
+The required Test workflow uses a CI-only source predicate for the sole legacy
+migration-closure endpoint refusal. Its narrow exception requires full valid
+v2 history, class `none` with dormant false, an actually changed closure hash,
+unchanged present active artifacts and complete unchanged pending inventory.
+Legacy public checks and rollback keep their existing decisions. Required Go
+tests independently validate generated closure bytes and reviewed caps.
+The existing compatibility producer still runs its complete experiment; neither
+source classification nor a plausible generated hash supplies measured proof.
+
+Test and Compatibility are separate workflows. Before the planned owner step
+makes `compat` required, the controlled merge gate must bind both successes to
+the current PR head/base/test-merge and exact run/attempt. Actions metadata can
+identify the PR head while result/context identify its synthetic merge; neither
+may be substituted for the actual main commit after merging. Main requires its
+own signed qualification. This change does not configure repository-wide
+enforcement or alter compatibility workflow permissions or source identity.
+
 The bounded PR16 implementation now connects this normal producer to Release
 plan, staging and production admission and schema-v2 records. It authenticates
 the complete mixed record history, retained database origin, actual image

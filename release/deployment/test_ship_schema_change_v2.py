@@ -872,6 +872,219 @@ class PendingSourceHistoryTests(unittest.TestCase):
                 self.assertEqual(len(commands), 1)
 
 
+class CISourceGuardTests(unittest.TestCase):
+    """Source eligibility is separate from actual generated/compatibility proof."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = support.TempRepo(Path(self.temp.name) / "repo")
+        self.profile = "internal/dbcatalog/golden/production-v0.json"
+        self.overlay = "internal/dbcatalog/shape/production-v0.sql"
+        self.active = {
+            sc.CATALOG: text(catalog()), sc.HISTORY: text(history()), sc.GLOBALS: "[]\n",
+            self.profile: '{"fixture":"profile"}\n', self.overlay: "-- synthetic overlay\n",
+            sc.REGISTRY: "[]\n", sc.SEEDS: '{"version":0}\n',
+        }
+        self.files = {**self.active, sc.MIGRATION_PATH: text(migration()),
+                      "cmd/whatomate/main.go": MAIN, "internal/database/tenant.go": TENANT,
+                      "README.md": "synthetic baseline\n"}
+        self.base = self.repo.commit(self.files)
+
+    def closure_head(self, extra=None):
+        return self.repo.commit({sc.MIGRATION_PATH: text(migration(J)), **(extra or {})})
+
+    def check(self, head, base=None):
+        return sc.check_ci_source(self.repo.root, base or self.base, head)
+
+    def test_only_new_ci_predicate_admits_complete_closure_only_source(self):
+        head = self.closure_head({"internal/dbcatalog/capture.go": "package dbcatalog\n"})
+        self.assertEqual(self.check(head), ())
+        self.assertEqual(sc.check(self.repo.root, self.base, head), ("migration-path-changed:closure",))
+        with self.assertRaises(sc.SchemaChangeBlocked):
+            sc.guard(self.repo.root, self.base, head)
+        self.assertEqual(sc.classify_v2(self.repo.root, self.base, head).kind, "none")
+
+    def test_legacy_clean_path_does_not_require_new_material_or_v2(self):
+        base = self.repo.commit({self.profile: None, self.overlay: None})
+        head = self.repo.commit({"README.md": "legacy clean\n"})
+        with mock.patch.object(sc, "_classify_v2", side_effect=AssertionError("not the new exception")):
+            self.assertEqual(self.check(head, base), ())
+        self.assertEqual(sc.check(self.repo.root, base, head), ())
+
+    def test_named_migration_change_is_not_part_of_the_exception(self):
+        head = self.closure_head({"cmd/whatomate/main.go": MAIN.replace("println(1)", "println(7)")})
+        self.assertEqual(self.check(head), sc.check(self.repo.root, self.base, head))
+        self.assertIn("migration-path-changed:cmd/whatomate/main.go#runRLSMigration", self.check(head))
+
+    def test_manifest_file_list_change_without_new_hash_refuses(self):
+        value = migration()
+        value["closure_files"].append("internal/models/new.go")
+        head = self.repo.commit({sc.MIGRATION_PATH: text(value), "internal/models/new.go": "package models\n"})
+        self.assertEqual(self.check(head), ("migration-path-changed:closure",))
+
+    def test_wrong_roots_or_invalid_manifest_remain_refused(self):
+        value = migration(J)
+        value["roots"] = value["roots"][:-1]
+        for raw in (text(value), '{"private":"not a manifest"}\n'):
+            with self.subTest(raw=raw):
+                head = self.repo.commit({sc.MIGRATION_PATH: raw})
+                self.assertTrue(self.check(head))
+
+    def test_removed_intermediate_contract_is_not_laundered(self):
+        self.repo.commit({sc.MIGRATION_PATH: None})
+        head = self.closure_head()
+        self.assertIn("migration-path-changed:contract-removed", self.check(head))
+
+    def test_first_introduction_with_bundled_source_keeps_original_fence(self):
+        absent = self.repo.commit({sc.MIGRATION_PATH: None})
+        head = self.closure_head({"cmd/whatomate/main.go": MAIN + "// bundled change\n"})
+        self.assertTrue(self.check(head, absent))
+        self.assertEqual(self.check(head, absent), sc.check(self.repo.root, absent, head))
+
+    def test_every_active_blob_must_exist_at_both_endpoints(self):
+        for path in self.active:
+            with self.subTest(path=path):
+                base = self.repo.commit({**self.files, path: None})
+                head = self.closure_head()
+                if path == sc.CATALOG:
+                    # The existing pre-catalog policy sees only a manifest
+                    # change. Preserve its clean result, outside the exception.
+                    self.assertEqual(sc.check(self.repo.root, base, head), ())
+                    with mock.patch.object(sc, "_classify_v2",
+                                           side_effect=AssertionError("not the new exception")):
+                        self.assertEqual(self.check(head, base), ())
+                else:
+                    self.assertTrue(self.check(head, base))
+        # A catalog-bearing baseline cannot become a pre-catalog source by
+        # removing the candidate catalog, even with a changed closure hash.
+        base = self.repo.commit(self.files)
+        head = self.closure_head({sc.CATALOG: None})
+        self.assertTrue(sc.check(self.repo.root, base, head))
+        self.assertTrue(self.check(head, base))
+        # Specifically cover one-sided absence where legacy treats shape-only
+        # material as unguarded, so the new equality condition is decisive.
+        base = self.repo.commit(self.files)
+        head = self.closure_head({self.overlay: None})
+        self.assertTrue(self.check(head, base))
+
+    def test_active_blob_equality_is_byte_exact_and_empty_is_not_present(self):
+        for path in self.active:
+            with self.subTest(path=path):
+                base = self.repo.commit(self.files)
+                head = self.closure_head({path: self.active[path] + "\n"})
+                self.assertTrue(self.check(head, base))
+        base = self.repo.commit({**self.files, self.profile: "", self.overlay: ""})
+        self.assertTrue(self.check(self.closure_head(), base))
+
+    def test_regular_modes_per_blob_bound_and_partial_bytes_refuse(self):
+        head = self.closure_head()
+        real_git = sc._git
+        for fault in ("symlink", "gitlink", "size", "partial"):
+            reading_profile = False
+            def capture(root, args):
+                nonlocal reading_profile
+                if args[:2] == ["ls-tree", "-z"]:
+                    reading_profile = args[-1] == self.profile
+                    raw = real_git(root, args)
+                    if reading_profile and fault == "symlink":
+                        return raw.replace(b"100644 blob", b"120000 blob")
+                    if reading_profile and fault == "gitlink":
+                        return raw.replace(b"100644 blob", b"160000 commit")
+                    return raw
+                if reading_profile and args[:2] == ["cat-file", "-s"] and fault == "size":
+                    return str(sc.MAX_ARTIFACT_BYTES + 1).encode()
+                raw = real_git(root, args)
+                if reading_profile and args[:2] == ["cat-file", "blob"] and fault == "partial":
+                    return raw[:-1]
+                return raw
+            with self.subTest(fault=fault), mock.patch.object(sc, "_git", side_effect=capture):
+                self.assertTrue(self.check(head))
+
+    def test_full_v2_validation_cannot_use_weaker_legacy_catalog_shape(self):
+        malformed = catalog()
+        malformed["objects"][0]["attributes"] = {}
+        base = self.repo.commit({sc.CATALOG: text(malformed)})
+        head = self.closure_head()
+        self.assertEqual(sc.check(self.repo.root, base, head), ("migration-path-changed:closure",))
+        self.assertEqual(self.check(head, base), ("migration-path-changed:closure",))
+
+    def test_active_engine_and_dormant_data_do_not_enter_none_exception(self):
+        base = self.repo.commit({sc.HISTORY: text([{"version": 0, "class": "baseline",
+            "min_reader_version": 0, "apply_engine": True}])})
+        self.assertTrue(self.check(self.closure_head(), base))
+        base = self.repo.commit({**self.files, sc.REGISTRY: text([step()])})
+        head = self.closure_head({sc.REGISTRY: text([step(2, J)]),
+                                  sc.SEEDS: '{"version":0,"synthetic":["new"]}\n'})
+        result = sc.classify_v2(self.repo.root, base, head)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("data", True, ()))
+        self.assertTrue(self.check(head, base))
+
+    def test_extra_requirement_or_migration_observation_never_becomes_allowance(self):
+        head = self.closure_head()
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        for changed in (result._replace(requirements=(*result.requirements, "future-authority")),
+                        result._replace(migration_changes=(*result.migration_changes, "other path"))):
+            with self.subTest(changed=changed), mock.patch.object(sc, "_classify_v2", return_value=changed):
+                self.assertTrue(self.check(head))
+
+    def test_retained_pending_is_valid_but_introduction_or_history_removal_is_not(self):
+        args = pending_fixture.fixture()
+        active = {sc.CATALOG: args["active_catalog"].decode(),
+                  sc.GLOBALS: args["active_globals"].decode(), sc.HISTORY: args["active_history"].decode()}
+        files = {path: raw.decode() for path, raw in args["files"].items()}
+        base = self.repo.commit({**self.files, **active})
+        introduced = self.closure_head(files)
+        self.assertTrue(self.check(introduced, base))
+        retained = self.repo.commit({sc.MIGRATION_PATH: text(migration())})
+        head = self.closure_head()
+        self.assertEqual(self.check(head, retained), ())
+        self.repo.commit({path: None for path in files})
+        restored = self.closure_head(files)
+        self.assertTrue(self.check(restored, retained))
+
+    def test_pending_file_mode_change_is_not_an_unchanged_inventory(self):
+        args = pending_fixture.fixture()
+        files = {path: raw.decode() for path, raw in args["files"].items()}
+        base = self.repo.commit({**self.files, **files, sc.CATALOG: args["active_catalog"].decode(),
+                                sc.GLOBALS: args["active_globals"].decode(),
+                                sc.HISTORY: args["active_history"].decode()})
+        self.closure_head()
+        self.repo.git("update-index", "--chmod=+x", sc.pending_plan.PLAN)
+        self.repo.git("commit", "--quiet", "-m", "pending mode only")
+        head = self.repo.head()
+        self.assertTrue(self.check(head, base))
+
+    def test_one_cache_for_both_policies_and_material_then_refetch_next_call(self):
+        head = self.closure_head()
+        real_git = sc._git
+        listings = []
+        def capture(root, args):
+            if args[:2] == ["ls-tree", "-z"]:
+                listings.append((args[2], args[-1]))
+            return real_git(root, args)
+        with mock.patch.object(sc, "_git", side_effect=capture):
+            self.assertEqual(self.check(head), ())
+            first = tuple(listings)
+            self.assertEqual(len(first), len(set(first)))
+            for path in self.active:
+                for sha in (self.base, head):
+                    self.assertIn((sha, path), first)
+            self.assertEqual(self.check(head), ())
+            self.assertEqual(listings, list(first) * 2)
+
+    def test_transport_failure_after_legacy_result_is_not_swallowed(self):
+        head = self.closure_head()
+        real_git = sc._git
+        def capture(root, args):
+            if args[:2] == ["ls-tree", "-z"] and args[-1] == self.profile:
+                raise source_git.SourceGitRefusal("git-failed:source-budget")
+            return real_git(root, args)
+        with mock.patch.object(sc, "_git", side_effect=capture):
+            with self.assertRaises(source_git.SourceGitRefusal):
+                self.check(head)
+
+
 class InvocationArtifactBudgetTests(unittest.TestCase):
     def test_shared_raw_cache_keeps_total_cap_without_charging_cache_hits(self):
         # Reuse one small allocation across sixteen returned blobs; the declared
