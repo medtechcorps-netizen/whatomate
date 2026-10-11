@@ -19,6 +19,7 @@ import compat_adapter as adapter
 import compat_evidence as evidence
 import release_record as records
 import test_compat_evidence as fixtures
+import test_compat_rollback as rollback_fixtures
 import test_ship_support as support
 
 
@@ -270,6 +271,91 @@ class AdapterTests(unittest.TestCase):
                         value[0]["unused"] = "x" * adapter.MAX_VERIFICATION
                 fake.mutate = mutate
                 self.reject(client, archive(), location(), row, root)
+
+
+class RollbackAdapterTests(unittest.TestCase):
+    def reject(self, client, raw, meta, row, root):
+        with self.assertRaises(evidence.CompatRefusal) as caught:
+            adapter.verify_rollback_pair(client, raw, meta, row, root)
+        self.assertEqual(caught.exception.code, "compat-stale")
+        self.assertNotIn("PRIVATE", str(caught.exception))
+        self.assertNotIn(str(root), str(caught.exception))
+
+    def test_exact_dispatch_pair_uses_actual_gh_wrapper_for_both_subjects(self):
+        original = rollback_fixtures.pair()
+        with harness(rollback_fixtures.attempt(measurement=original)) as (root, client, fake, row):
+            pair = adapter.verify_rollback_pair(client, archive(original), location(row), row, root)
+            measured = evidence.parse_authenticated_rollback_pair(pair, row)
+            self.assertTrue(measured.positive)
+            self.assertEqual((pair.result, pair.context), (original.result, original.context))
+            self.assertEqual([Path(args[3]).name for args, _ in fake.calls[1:]], list(adapter.FILES))
+            self.assertNotEqual(pair.result_subject.verification_reference,
+                                pair.context_subject.verification_reference)
+            for args, _ in fake.calls[1:]:
+                for flag, value in (("--signer-digest", row.sha), ("--source-digest", row.sha),
+                        ("--source-ref", evidence.REF), ("--cert-identity", evidence.SIGNER),
+                        ("--cert-oidc-issuer", evidence.ISSUER), ("--predicate-type", evidence.PREDICATE)):
+                    self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_complete_failed_measurement_is_returned_without_success_filter(self):
+        for fields in ({"server_false": "workers"}, {"migration_false": "rw"},
+                       {"forward": False}, {"catalog_sha256": "9" * 64, "forward": False}):
+            original = rollback_fixtures.pair(**fields)
+            with self.subTest(fields=fields), harness(rollback_fixtures.attempt(
+                    measurement=original, conclusion="failure")) as (root, client, fake, row):
+                pair = adapter.verify_rollback_pair(client, archive(original), location(row), row, root)
+                self.assertFalse(evidence.parse_authenticated_rollback_pair(pair, row).positive)
+                self.assertEqual(pair.result, original.result)
+                self.assertEqual(len(fake.calls), 3)
+
+    def test_normal_contexts_and_rollback_context_cannot_cross_named_adapters(self):
+        for version in (1, 2, 3):
+            original = fixtures.pair(version=version, event="workflow_dispatch")
+            with self.subTest(version=version), harness(fixtures.attempt(
+                    event="workflow_dispatch", measurement=original)) as (root, client, fake, row):
+                self.reject(client, archive(original), location(row), row, root)
+                self.assertEqual(len(fake.calls), 3)
+        original = rollback_fixtures.pair()
+        with harness(rollback_fixtures.attempt(measurement=original)) as (root, client, fake, row):
+            with self.assertRaises(evidence.CompatRefusal):
+                adapter.verify_pair(client, archive(original), location(row), row, root)
+            self.assertEqual(len(fake.calls), 3)
+
+    def test_each_signature_and_exact_run_attempt_are_required(self):
+        original = rollback_fixtures.pair()
+        for filename in adapter.FILES:
+            for mode in ("missing", "foreign-attempt"):
+                with self.subTest(file=filename, mode=mode), harness(
+                        rollback_fixtures.attempt(measurement=original)) as (root, client, fake, row):
+                    if mode == "missing":
+                        fake.fail_name = filename
+                    else:
+                        def mutate(value, path):
+                            if path.name == filename:
+                                value[0]["verificationResult"]["signature"]["certificate"].update(
+                                    runInvocationURI=f"https://github.com/{evidence.REPOSITORY}/actions/runs/{row.run_id}/attempts/2")
+                        fake.mutate = mutate
+                    self.reject(client, archive(original), location(row), row, root)
+
+    def test_context_limit_inventory_and_file_custody_still_apply(self):
+        original = rollback_fixtures.pair()
+        cases = [archive(entries=[("compat-result.json", original.result)]),
+                 archive(entries=[("compat-result.json", original.result),
+                                  ("compat-context.json", b"x" * 4097)])]
+        for raw in cases:
+            with harness(rollback_fixtures.attempt(measurement=original)) as (root, client, fake, row):
+                self.reject(client, raw, location(row), row, root)
+                self.assertEqual(len(fake.calls), 1)
+        with harness(rollback_fixtures.attempt(measurement=original)) as (root, client, fake, row):
+            fake.after = lambda path: path.write_bytes(b"PRIVATE changed")
+            self.reject(client, archive(original), location(row), row, root)
+            self.assertEqual(len(fake.calls), 2)
+
+    def test_push_cannot_be_reinterpreted_as_rollback_dispatch(self):
+        original = rollback_fixtures.pair()
+        row = replace(rollback_fixtures.attempt(measurement=original), event="push")
+        with harness(row) as (root, client, fake, row):
+            self.reject(client, archive(original), location(row), row, root)
 
 
 if __name__ == "__main__":
