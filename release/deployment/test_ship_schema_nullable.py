@@ -355,5 +355,257 @@ class NullableSourceTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "nullable-source-invalid")
 
 
+# Source-derived expectations. The exact typed-literal expression template was
+# precommitted and then matched all18 PG17 cases (independent review3c669119).
+# No observation/fixture graph is read to construct these complete catalogs.
+CONSTANT_DECIMALS = ("-9223372036854775808", "-2147483649", "-2147483648", "-1", "0", "1",
+                     "2147483647", "2147483648", "9223372036854775807")
+
+
+def constant_catalogs(*, production=False, decimal="1", nullable=True):
+    before, after, declaration = declared_catalogs(production=production)
+    return constant_variant(before, after, declaration, decimal=decimal, nullable=nullable)
+
+
+def constant_variant(before, after, declaration, *, decimal="1", nullable=True):
+    # Both inputs come from the independently checked source-only blueprint.
+    # This transformation defines expected source intent, never measured output.
+    declaration = copy.deepcopy(declaration)
+    value = json.loads(after)
+    expression = "'" + decimal + "'::bigint"
+    definition = json.loads(declaration["after"]["row_definition_json"])
+    definition[12][-1][3] = not nullable
+    declaration["after"]["row_definition_json"] = pg(definition)
+    declaration["after"]["slots"][-1].update(not_null=not nullable, default_present=True)
+    for row in value["objects"]:
+        if (row["kind"], row["identity"]) == ("types", "organizations"):
+            row["attributes"]["definition_sha256"] = sha(pg(definition).encode())
+        if (row["kind"], row["identity"]) == ("columns", "organizations.extra"):
+            row["attributes"].update(not_null=str(not nullable).lower(), default_sha256=sha(expression.encode()))
+    declaration["purpose"] = "int8-constant-column-source-shape"
+    declaration["operation"].update(kind="add_int8_constant_column", nullable=nullable,
+                                      default={"kind": "int8-literal", "decimal": decimal})
+    declaration["default_expression"] = expression
+    after = catalog_bytes(value)
+    return before, after, bind_documents(declaration, before, after)
+
+
+class ConstantSourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = declared_catalogs()
+        cls.production = declared_catalogs(production=True)
+
+    def inputs(self, *, production=False, decimal="1", nullable=True):
+        return constant_variant(*(self.production if production else self.app), decimal=decimal, nullable=nullable)
+
+    def parse(self, before, after, declaration, **kwargs):
+        return sn.classify_constant_source(wire(declaration), before, after,
+            base_sha=kwargs.get("base_sha", BASE), head_sha=kwargs.get("head_sha", HEAD))
+
+    def refused(self, before, after, declaration, **kwargs):
+        with self.assertRaisesRegex(sn.ConstantSourceRefusal, "^constant-source-invalid$"):
+            self.parse(before, after, declaration, **kwargs)
+
+    def test_all18_prequalified_literal_and_nullability_vectors(self):
+        for decimal in CONSTANT_DECIMALS:
+            for nullable in (True, False):
+                with self.subTest(decimal=decimal, nullable=nullable):
+                    before, after, declaration = self.inputs(decimal=decimal, nullable=nullable)
+                    result = self.parse(before, after, declaration)
+                    expected = ('ALTER TABLE ONLY "public"."organizations" ADD COLUMN "extra" pg_catalog.int8 DEFAULT '
+                        + "'" + decimal + "'::pg_catalog.int8" + ("" if nullable else " NOT NULL") + ";\n").encode()
+                    self.assertEqual(result.statement_sha256, sha(expected))
+                    self.assertEqual(result.operation_sha256, sha(wire(declaration["operation"])))
+                    self.assertEqual(result.residual, ())
+                    self.assertEqual([(x.kind, x.identity) for x in result.explained],
+                                     [("columns", "organizations.extra"), ("types", "organizations")])
+
+    def test_production_order_independently_derived_before_target(self):
+        for nullable in (True, False):
+            before, after, declaration = self.inputs(production=True, decimal="-1", nullable=nullable)
+            self.assertEqual(sha(before), PRODUCTION)
+            self.assertEqual(self.parse(before, after, declaration).before_sha256, PRODUCTION)
+
+    def test_source_identity_exact_and_distinct(self):
+        for key in ("base_sha", "head_sha"):
+            for value in (None, True, "main", "a" * 39, "A" * 40):
+                with self.subTest(key=key, value=value): self.refused(*self.inputs(), **{key: value})
+        self.refused(*self.inputs(), head_sha=BASE)
+
+    def test_closed_top_level_version_purpose_and_no_privilege_fields(self):
+        for key, value in (("format_version", True), ("format_version", 2), ("postgres_major", 18),
+                           ("postgres_major", True), ("purpose", "nullable-source-shape"), ("approved", True)):
+            before, after, declaration = self.inputs(); declaration[key] = value
+            with self.subTest(key=key, value=value): self.refused(before, after, declaration)
+        for key in self.inputs()[2]:
+            before, after, declaration = self.inputs(); del declaration[key]
+            with self.subTest(missing=key): self.refused(before, after, declaration)
+
+    def test_exact_operation_shape_no_alternate_sql(self):
+        for key, value in (("format_version", True), ("id", "bad id"), ("kind", "add_nullable_column"),
+                ("relation", "users"), ("column", "other"), ("type", "pg_catalog.int4"), ("nullable", 1),
+                ("nullable", None), ("sql", "ALTER TABLE private"), ("concurrently", True)):
+            before, after, declaration = self.inputs(); declaration["operation"][key] = value
+            with self.subTest(key=key, value=value): self.refused(before, after, declaration)
+        for key in self.inputs()[2]["operation"]:
+            before, after, declaration = self.inputs(); del declaration["operation"][key]
+            with self.subTest(missing=key): self.refused(before, after, declaration)
+
+    def test_literal_grammar_rejects_expressions_and_noncanonical_numbers(self):
+        for value in (None, True, 1, 1.0, "", "+1", "-0", "01", "-01", " 1", "1 ", "1\n", "1.0", "1e0",
+                      "１", "NULL", "1+0", "nextval('x')", "'1'", "1::int8", "9223372036854775808",
+                      "-9223372036854775809", "9" * 100):
+            before, after, declaration = self.inputs(); declaration["operation"]["default"]["decimal"] = value
+            with self.subTest(value=value): self.refused(before, after, declaration)
+
+    def test_default_object_requires_exact_literal_tag_and_fields(self):
+        for default in (None, True, "1", {}, {"kind": "expression", "decimal": "1"},
+                        {"kind": "int8-literal"}, {"kind": "int8-literal", "decimal": "1", "sql": "1"}):
+            before, after, declaration = self.inputs(); declaration["operation"]["default"] = default
+            with self.subTest(default=default): self.refused(before, after, declaration)
+
+    def test_coherently_hashed_alternate_expression_is_not_a_constant_preimage(self):
+        for expression in ("1::bigint", "'1'::pg_catalog.int8", "'1'::bigint ", "'1'::bigint\n", "(1 + 0)", "NULL::bigint"):
+            before, after, declaration = self.inputs(); value = json.loads(after)
+            declaration["default_expression"] = expression
+            next(r for r in value["objects"] if r["identity"] == "organizations.extra")["attributes"]["default_sha256"] = sha(expression.encode())
+            after = catalog_bytes(value)
+            with self.subTest(expression=expression): self.refused(before, after, bind_documents(declaration, before, after))
+
+    def test_declared_decimal_must_match_expression_not_only_type(self):
+        before, after, declaration = self.inputs(); declaration["operation"]["default"]["decimal"] = "2"
+        self.refused(before, after, declaration)
+
+    def test_missing_or_wrong_default_catalog_hash_refuses(self):
+        for digest in (EMPTY, sha(b"'2'::bigint"), "f" * 64):
+            before, after, declaration = self.inputs(); value = json.loads(after)
+            next(r for r in value["objects"] if r["identity"] == "organizations.extra")["attributes"]["default_sha256"] = digest
+            after = catalog_bytes(value)
+            with self.subTest(digest=digest): self.refused(before, after, bind_documents(declaration, before, after))
+
+    def test_nullable_intent_must_match_complete_slot_column_and_row(self):
+        for nullable in (True, False):
+            before, after, declaration = self.inputs(nullable=nullable)
+            declaration["operation"]["nullable"] = not nullable
+            with self.subTest(nullable=nullable): self.refused(before, after, declaration)
+
+    def test_endpoint_identity_length_and_measurement_version_are_bound(self):
+        for side in ("before", "after"):
+            for key, value in (("role", "observation"), ("path", "../catalog"), ("bytes", True), ("bytes", 1),
+                               ("sha256", "f" * 64), ("catalog_sha256", "0" * 64), ("catalog_version", True), ("catalog_version", 8)):
+                before, after, declaration = self.inputs(); declaration[side][key] = value
+                with self.subTest(side=side, key=key): self.refused(before, after, declaration)
+        before, after, declaration = self.inputs()
+        self.assertNotEqual(declaration["after"]["sha256"], declaration["after"]["catalog_sha256"])
+        self.parse(before, after, declaration)
+
+    def test_swapped_profile_and_noop_endpoints_refuse(self):
+        before, after, declaration = self.inputs(); self.refused(after, before, declaration)
+        pbefore, pafter, _ = self.inputs(production=True)
+        self.refused(pbefore, pafter, bind_documents(declaration, pbefore, pafter))
+        declaration["after"] = copy.deepcopy(declaration["before"]); declaration["after"]["role"] = "head"
+        self.refused(before, before, bind_documents(declaration, before, before))
+
+    def test_complete_slot_inventory_and_fixed_new_shape(self):
+        for mode in ("missing", "duplicate", "reverse", "default-absent", "identity", "generated", "type"):
+            before, after, declaration = self.inputs(); slots = declaration["after"]["slots"]
+            if mode == "missing": slots.pop(0)
+            elif mode == "duplicate": slots[1] = copy.deepcopy(slots[0])
+            elif mode == "reverse": slots.reverse()
+            elif mode == "default-absent": slots[-1]["default_present"] = False
+            elif mode == "identity": slots[-1]["identity"] = "a"
+            elif mode == "generated": slots[-1]["generated"] = "s"
+            else: slots[-1]["type_name"] = "int4"
+            with self.subTest(mode=mode): self.refused(before, after, declaration)
+
+    def test_existing_default_change_is_never_absorbed(self):
+        before, after, declaration = self.inputs(); value = json.loads(after)
+        next(r for r in value["objects"] if r["identity"] == "organizations.id")["attributes"]["default_sha256"] = sha(b"private()")
+        after = catalog_bytes(value); self.refused(before, after, bind_documents(declaration, before, after))
+
+    def test_existing_nullability_change_even_coherent_preimage_refuses(self):
+        before, after, declaration = self.inputs(); value = json.loads(after)
+        definition = json.loads(declaration["after"]["row_definition_json"]); definition[12][0][3] = False
+        declaration["after"]["row_definition_json"] = pg(definition)
+        declaration["after"]["slots"][0]["not_null"] = False
+        next(r for r in value["objects"] if r["identity"] == "organizations.id")["attributes"]["not_null"] = "false"
+        next(r for r in value["objects"] if r["identity"] == "organizations" and r["kind"] == "types")["attributes"]["definition_sha256"] = sha(pg(definition).encode())
+        after = catalog_bytes(value); self.refused(before, after, bind_documents(declaration, before, after))
+
+    def test_security_and_opaque_type_changes_not_explained(self):
+        for kind, name in (("relations", "organizations"), ("types", "organizations"), ("types", "_organizations")):
+            before, after, declaration = self.inputs(); value = json.loads(after)
+            next(r for r in value["objects"] if (r["kind"], r["identity"]) == (kind, name))["attributes"]["acl"] = ""
+            after = catalog_bytes(value)
+            with self.subTest(kind=kind, name=name): self.refused(before, after, bind_documents(declaration, before, after))
+
+    def test_wrong_array_preimage_coherently_bound_refuses(self):
+        before, after, declaration = self.inputs(); values = [json.loads(before), json.loads(after)]
+        for side, value in zip(("before", "after"), values):
+            definition = json.loads(declaration[side]["array_definition_json"]); definition[11] = "public.users"
+            declaration[side]["array_definition_json"] = pg(definition)
+            next(r for r in value["objects"] if r["identity"] == "_organizations")["attributes"]["definition_sha256"] = sha(pg(definition).encode())
+        before, after = map(catalog_bytes, values)
+        self.refused(before, after, bind_documents(declaration, before, after))
+
+    def test_unrelated_changed_object_is_complete_residual(self):
+        before, after, declaration = self.inputs(); value = json.loads(after)
+        next(r for r in value["objects"] if r["identity"] == "users" and r["kind"] == "types")["attributes"]["definition_sha256"] = "f" * 64
+        after = catalog_bytes(value); result = self.parse(before, after, bind_documents(declaration, before, after))
+        self.assertEqual([(r.kind, r.identity) for r in result.residual], [("types", "users")])
+
+    def test_malformed_complete_catalogs_and_declaration_canonicality(self):
+        before, after, declaration = self.inputs(); value = json.loads(after)
+        value["objects"].append(copy.deepcopy(value["objects"][0])); after = catalog_bytes(value)
+        self.refused(before, after, bind_documents(declaration, before, after))
+        before, after, declaration = self.inputs()
+        for raw in (wire(declaration).rstrip(), b'{}\n', b'\xff', b'{"format_version":1,"format_version":1}\n'):
+            with self.subTest(raw=raw[:20]), self.assertRaises(sn.ConstantSourceRefusal):
+                sn.classify_constant_source(raw, before, after, base_sha=BASE, head_sha=HEAD)
+
+    def test_each_document_cap_before_decoding(self):
+        before, after, declaration = self.inputs()
+        for index in range(3):
+            raws = [wire(declaration), before, after]; raws[index] = b" " * (sn.MAX_DOCUMENT + 1)
+            with self.subTest(index=index), mock.patch.object(sn.wire, "_load", side_effect=AssertionError("overcap decoded")):
+                with self.assertRaises(sn.ConstantSourceRefusal): sn.classify_constant_source(*raws, base_sha=BASE, head_sha=HEAD)
+
+    def test_full_bound_documents_over_shared_cap_refuse_before_decode(self):
+        before, after, declaration = self.inputs()
+        before = b" " * (sn.MAX_DOCUMENT - len(before)) + before
+        after = b" " * (sn.MAX_DOCUMENT - len(after)) + after
+        declaration = bind_documents(declaration, before, after)
+        with mock.patch.object(sn.wire, "_load", side_effect=AssertionError("overcap decoded")):
+            with self.assertRaises(sn.ConstantSourceRefusal):
+                sn.classify_constant_source(wire(declaration), before, after, base_sha=BASE, head_sha=HEAD)
+
+    def test_input_mutation_and_forged_output_are_not_authority(self):
+        before, after, declaration = self.inputs(); result = self.parse(before, after, declaration)
+        with self.assertRaises(FrozenInstanceError): result.residual = ()
+        declaration["operation"]["default"]["decimal"] = "2"; self.refused(before, after, declaration)
+        self.assertEqual(result.after_sha256, sha(after))
+        with self.assertRaises(sn.ConstantSourceRefusal): sn.classify_constant_source(result, before, after, base_sha=BASE, head_sha=HEAD)
+
+    def test_no_input_content_in_error(self):
+        before, after, declaration = self.inputs(); declaration["private-marker"] = "sensitive-value"
+        with self.assertRaises(sn.ConstantSourceRefusal) as caught: self.parse(before, after, declaration)
+        self.assertEqual(str(caught.exception), "constant-source-invalid")
+
+    def test_second_added_column_or_operation_refuses(self):
+        before, after, declaration = self.inputs(); declaration["operation"] = [declaration["operation"]]
+        self.refused(before, after, declaration)
+        before, after, declaration = self.inputs(); value = json.loads(after)
+        column = copy.deepcopy(next(r for r in value["objects"] if r["identity"] == "organizations.extra"))
+        column["identity"] = "organizations.other"; column["attributes"]["position"] = "10"; value["objects"].append(column)
+        after = catalog_bytes(value); self.refused(before, after, bind_documents(declaration, before, after))
+
+    def test_normal_nullable_and_constant_parsers_never_cross_accept(self):
+        before, after, declaration = self.inputs()
+        with self.assertRaises(sn.NullableSourceRefusal): sn.classify_source(wire(declaration), before, after, base_sha=BASE, head_sha=HEAD)
+        before, after, declaration = self.app
+        with self.assertRaises(sn.ConstantSourceRefusal): sn.classify_constant_source(wire(declaration), before, after, base_sha=BASE, head_sha=HEAD)
+
+
 if __name__ == "__main__":
     unittest.main()

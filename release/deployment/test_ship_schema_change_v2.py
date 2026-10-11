@@ -1290,5 +1290,283 @@ class CompleteNullableSourcePolicyTests(unittest.TestCase):
 
 
 
+class CompleteColumnIndexSourcePolicyTests(unittest.TestCase):
+    """Complete source-derived catalogs on disposable immutable Git histories.
+
+    These controlled future source declarations are not an activated engine,
+    measured transition, pending plan or operational compatibility proof.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import test_ship_schema_nullable as columns
+        import test_ship_schema_index as indexes
+        cls.columns, cls.indexes = columns, indexes
+        cls.nullable_inputs = columns.declared_catalogs()
+        cls.constant_inputs = columns.constant_variant(*cls.nullable_inputs)
+        cls.index_inputs = indexes.declared_catalogs()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = support.TempRepo(Path(self.temp.name) / "repo")
+        self.before = self.constant_inputs[0]
+        self.base = self.repo.commit({sc.CATALOG: self.before.decode(), sc.HISTORY: text(history()),
+            sc.GLOBALS: "[]\n", sc.MIGRATION_PATH: text(migration()), "cmd/whatomate/main.go": MAIN,
+            "internal/database/tenant.go": TENANT, "README.md": "controlled source-only future intent\n"})
+
+    def inputs(self, family="constant", *, index=False, nullable=True):
+        if family == "index":
+            before, after, declaration = self.index_inputs
+            return before, after, {sc.schema_index.SOURCE_PATH: declaration}
+        before, after, declaration = self.nullable_inputs
+        path = sc.schema_nullable.SOURCE_PATH
+        if family == "constant":
+            before, after, declaration = self.columns.constant_variant(before, after, declaration, nullable=nullable)
+            path = sc.schema_nullable.CONSTANT_SOURCE_PATH
+        declarations = {path: declaration}
+        if index:
+            after, index_declaration = self.indexes.add_index(before, after)
+            declarations[path] = self.columns.bind_documents(declaration, before, after)
+            declarations[sc.schema_index.SOURCE_PATH] = index_declaration
+        return before, after, declarations
+
+    def head(self, inputs=None, *, kind="expand", engine=True, floor=0, changes=None):
+        before, after, declarations = self.inputs() if inputs is None else inputs
+        self.assertEqual(before, self.before)
+        files = {sc.CATALOG: after.decode(), sc.HISTORY: text(history(1, kind, engine, floor))}
+        files.update({path: self.columns.wire(value).decode() for path, value in declarations.items()})
+        files.update(changes or {})
+        return self.repo.commit(files)
+
+    def classify(self, inputs=None, **kwargs):
+        return sc.classify_v2(self.repo.root, self.base, self.head(inputs, **kwargs))
+
+    def rebind(self, inputs, after):
+        before, _, declarations = inputs
+        return before, after, {path: (self.indexes if path == sc.schema_index.SOURCE_PATH else self.columns)
+            .bind_documents(declaration, before, after) for path, declaration in declarations.items()}
+
+    def test_nullable_and_notnull_constant_are_source_expand_with_runtime_holds(self):
+        for nullable in (True, False):
+            with self.subTest(nullable=nullable):
+                result = self.classify(self.inputs(nullable=nullable))
+                self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", False, ()))
+                self.assertTrue({"compat-required", "restore-drills", "producer-class-unsupported",
+                    "catalog-format/profile-unsupported"} <= set(result.requirements))
+                self.assertNotIn("contract-label", result.requirements)
+                self.assertTrue(any(line.startswith("source constant declaration:") for line in result.summary))
+
+    def test_index_source_expand_removes_only_missing_operation_requirement(self):
+        result = self.classify(self.inputs("index"))
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+        self.assertNotIn("index-operation-unsupported", result.requirements)
+        self.assertIn("producer-class-unsupported", result.requirements)
+        self.assertTrue(any(line.startswith("source index declaration:") for line in result.summary))
+
+    def test_nullable_and_index_explanations_compose(self):
+        result = self.classify(self.inputs("nullable", index=True))
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+        self.assertEqual(sum(line.startswith("source ") and " declaration:" in line for line in result.summary), 2)
+        self.assertNotIn("index-operation-unsupported", result.requirements)
+
+    def test_constant_and_index_explanations_compose(self):
+        result = self.classify(self.inputs(index=True, nullable=False))
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+        self.assertEqual(sum(line.startswith("source ") and " declaration:" in line for line in result.summary), 2)
+        self.assertNotIn("index-operation-unsupported", result.requirements)
+
+    def test_missing_constant_declaration_keeps_full_delta_contract(self):
+        result = self.classify(kind="contract", changes={sc.schema_nullable.CONSTANT_SOURCE_PATH: None})
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+
+    def test_missing_index_declaration_still_requires_operation_proof(self):
+        result = self.classify(self.inputs("index"), changes={sc.schema_index.SOURCE_PATH: None})
+        self.assertIn("index-operation-unsupported", result.requirements)
+        self.assertFalse(any(line.startswith("source index declaration:") for line in result.summary))
+
+    def test_index_cannot_hide_unexplained_companion_column_rowtype(self):
+        result = self.classify(self.inputs(index=True), kind="contract",
+                              changes={sc.schema_nullable.CONSTANT_SOURCE_PATH: None})
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+        self.assertNotIn("index-operation-unsupported", result.requirements)
+
+    def test_column_cannot_satisfy_index_operation_requirement(self):
+        result = self.classify(self.inputs(index=True), changes={sc.schema_index.SOURCE_PATH: None})
+        self.assertIn("index-operation-unsupported", result.requirements)
+
+    def test_engine_false_and_missing_engine_keep_active_hold(self):
+        for engine in (False, None):
+            rows = history(1, "expand", False)
+            if engine is None: rows[-1].pop("apply_engine")
+            with self.subTest(engine=engine):
+                result = self.classify(self.inputs(index=True), changes={sc.HISTORY: text(rows)})
+                self.assertEqual((result.kind, result.dormant), ("expand", False))
+                self.assertIn("active-catalog-without-apply-engine", result.reasons)
+
+    def test_missing_all_declarations_preserves_current_none_requirements(self):
+        head = self.repo.commit({"README.md": "current no-delta source\n"})
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("none", False, ()))
+        self.assertEqual(result.requirements, ("compat-required", "generated-migration-closure-ci"))
+
+    def test_malformed_present_constant_or_index_refuses_before_none(self):
+        for path, label in ((sc.schema_nullable.CONSTANT_SOURCE_PATH, "constant-source"), (sc.schema_index.SOURCE_PATH, "index-source")):
+            with self.subTest(path=path):
+                head = self.repo.commit({sc.schema_nullable.CONSTANT_SOURCE_PATH: None, sc.schema_index.SOURCE_PATH: None, path: "{}\n"})
+                result = sc.classify_v2(self.repo.root, self.base, head)
+                self.assertIn("classifier-v2-invalid:" + label, result.reasons)
+
+    def test_malformed_present_refuses_before_dormant_seed_change(self):
+        for path, label in ((sc.schema_nullable.CONSTANT_SOURCE_PATH, "constant-source"), (sc.schema_index.SOURCE_PATH, "index-source")):
+            with self.subTest(path=path):
+                head = self.repo.commit({sc.schema_nullable.CONSTANT_SOURCE_PATH: None, sc.schema_index.SOURCE_PATH: None,
+                    path: "{}\n", sc.SEEDS: text({"version": 0})})
+                self.assertIn("classifier-v2-invalid:" + label, sc.classify_v2(self.repo.root, self.base, head).reasons)
+
+    def test_malformed_present_refuses_precatalog_shortcut(self):
+        base = self.repo.commit({sc.CATALOG: None})
+        head = self.repo.commit({sc.schema_nullable.CONSTANT_SOURCE_PATH: "{}\n"})
+        self.assertIn("classifier-v2-invalid:constant-source", sc.classify_v2(self.repo.root, base, head).reasons)
+
+    def test_old_nullable_plus_constant_is_ambiguous_before_any_new_decode(self):
+        before, after, declarations = self.inputs()
+        head = self.head((before, after, {**declarations, sc.schema_nullable.SOURCE_PATH: self.nullable_inputs[2]}))
+        with mock.patch.object(sc.schema_nullable.wire, "_load", side_effect=AssertionError("ambiguous decoded")):
+            result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertIn("classifier-v2-invalid:source-classification", result.reasons)
+
+    def test_joint_budget_counts_all_three_declarations_before_decode(self):
+        raw = b" " * (3 << 20)
+        with mock.patch.object(sc.schema_nullable.wire, "_load", side_effect=AssertionError("overcap decoded")):
+            with self.assertRaises(sc._Invalid): sc._v2_source_budget((raw, raw, b"{}\n"), raw, raw)
+
+    def test_complete_catalogs_each_family_fits_but_joint_sum_refuses(self):
+        before, after, declarations = self.inputs(index=True)
+        column = declarations[sc.schema_nullable.CONSTANT_SOURCE_PATH]
+        size = (sc.schema_nullable.MAX_TOTAL - len(self.columns.wire(column))) // 2
+        before = b" " * (size - len(before)) + before
+        after = b" " * (size - len(after)) + after
+        column = self.columns.bind_documents(column, before, after)
+        index = self.indexes.bind_documents(declarations[sc.schema_index.SOURCE_PATH], before, after)
+        c, i = self.columns.wire(column), self.columns.wire(index)
+        self.assertLessEqual(len(c) + len(before) + len(after), sc.schema_nullable.MAX_TOTAL)
+        self.assertLessEqual(len(i) + len(before) + len(after), sc.schema_nullable.MAX_TOTAL)
+        self.assertGreater(len(c) + len(i) + len(before) + len(after), sc.schema_nullable.MAX_TOTAL)
+        with mock.patch.object(sc.schema_nullable.wire, "_load", side_effect=AssertionError("joint overcap decoded")):
+            with self.assertRaises(sc._Invalid): sc._v2_catalog_delta(json.loads(before), json.loads(after), [], [], set(), [], set(),
+                constant_source=(c, before, after, "a"*40, "b"*40), index_source=(i, before, after, "a"*40, "b"*40))
+
+    def test_per_input_limits_and_aliased_catalog_roles_are_not_deduplicated(self):
+        before, after, declarations = self.inputs(index=True)
+        with self.assertRaises(sc._Invalid): sc._v2_source_budget((None, None, b" "*(sc.schema_index.MAX_DECLARATION+1)), before, after)
+        with self.assertRaises(sc._Invalid): sc._v2_source_budget((None, b" "*(sc.schema_nullable.MAX_DOCUMENT+1), None), before, after)
+        same = b" " * sc.schema_nullable.MAX_DOCUMENT
+        with self.assertRaises(sc._Invalid): sc._v2_source_budget((None, b"{}\n", None), same, same)
+
+    def test_fixed_family_inputs_require_same_raw_roles_and_source_ids(self):
+        before, after, declarations = self.inputs(index=True)
+        c = self.columns.wire(declarations[sc.schema_nullable.CONSTANT_SOURCE_PATH])
+        i = self.columns.wire(declarations[sc.schema_index.SOURCE_PATH])
+        for right in ((i, b" " + before, after, "a"*40, "b"*40), (i, before, after, "c"*40, "b"*40),
+                      (i, before, after, "a"*40, "c"*40), (i, before, after, True, "b"*40)):
+            with self.subTest(right_sha=right[3:]), self.assertRaises(sc._Invalid):
+                sc._v2_catalog_delta(json.loads(before), json.loads(after), [], [], set(), [], set(),
+                    constant_source=(c, before, after, "a"*40, "b"*40), index_source=right)
+
+    def test_preparsed_or_forged_delta_never_substitutes_for_raw_source(self):
+        before, after, declarations = self.inputs()
+        parsed = sc.schema_nullable.classify_constant_source(self.columns.wire(next(iter(declarations.values()))), before, after,
+                                                            base_sha="a"*40, head_sha="b"*40)
+        with self.assertRaises(sc._Invalid): sc._v2_catalog_delta(json.loads(before), json.loads(after), [], [], set(), [], set(), constant_source=parsed)
+
+    def test_full_catalog_residual_type_contract_dominates_both_rules(self):
+        inputs = self.inputs(index=True); value = json.loads(inputs[1])
+        next(r for r in value["objects"] if (r["kind"], r["identity"]) == ("types", "users"))["attributes"]["definition_sha256"] = J
+        result = self.classify(self.rebind(inputs, self.columns.catalog_bytes(value)), kind="contract")
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+
+    def test_full_security_residual_contract_dominates_data_and_expand(self):
+        inputs = self.inputs(index=True); value = json.loads(inputs[1])
+        next(r for r in value["objects"] if r["kind"] == "policies")["attributes"]["using_sha256"] = J
+        result = self.classify(self.rebind(inputs, self.columns.catalog_bytes(value)), kind="contract", changes={sc.SEEDS: text({"version": 0})})
+        self.assertEqual(result.kind, "contract")
+
+    def test_existing_unrelated_default_edit_remains_contract(self):
+        inputs = self.inputs(index=True); value = json.loads(inputs[1])
+        next(r for r in value["objects"] if (r["kind"], r["identity"]) == ("columns", "users.id"))["attributes"]["default_sha256"] = J
+        result = self.classify(self.rebind(inputs, self.columns.catalog_bytes(value)), kind="contract")
+        self.assertEqual(result.kind, "contract")
+
+    def test_data_and_min_floor_precedence_remain(self):
+        result = self.classify(self.inputs(index=True), changes={sc.SEEDS: text({"version": 0})})
+        self.assertEqual((result.kind, result.dormant), ("data", False))
+        result = self.classify(self.inputs(index=True), kind="contract", floor=1)
+        self.assertEqual(result.kind, "contract")
+
+    def test_history_append_only_and_catalog_version_remain_enforced(self):
+        rows = history(1, "expand", True); rows[0]["apply_engine"] = True
+        self.assertIn("history-rewritten", self.classify(self.inputs(index=True), changes={sc.HISTORY: text(rows)}).reasons)
+        self.assertIn("history-catalog-version-mismatch", self.classify(self.inputs(index=True), changes={sc.HISTORY: text(history())}).reasons)
+
+    def test_unprotected_new_relation_is_not_hidden_by_explanations(self):
+        inputs = self.inputs(index=True); value = json.loads(inputs[1])
+        value["objects"].append(row("relations", "unprotected", rls="false", force_rls="false"))
+        result = self.classify(self.rebind(inputs, self.columns.catalog_bytes(value)), kind="contract")
+        self.assertIn("unprotected-new-relation:unprotected", result.reasons)
+
+    def test_stale_index_or_constant_complete_document_binding_refuses(self):
+        for path in (sc.schema_nullable.CONSTANT_SOURCE_PATH, sc.schema_index.SOURCE_PATH):
+            inputs = self.inputs(index=True)
+            declarations = json.loads(self.columns.wire(inputs[2])); declarations[path]["after"]["sha256"] = J
+            with self.subTest(path=path):
+                self.assertIn("classifier-v2-invalid:source-classification", self.classify((inputs[0], inputs[1], declarations)).reasons)
+
+    def test_real_scope_passes_exact_refs_to_both_fixed_interpreters(self):
+        inputs = self.inputs(index=True); head = self.head(inputs); calls = []
+        column, index = sc.schema_nullable.classify_constant_source, sc.schema_index.classify_source
+        def c(raw, before, after, **kwargs):
+            calls.append(("column", kwargs, before, after)); return column(raw, before, after, **kwargs)
+        def i(raw, before, after, **kwargs):
+            calls.append(("index", kwargs, before, after)); return index(raw, before, after, **kwargs)
+        reader = source_git.ImmutableGit(self.repo.root, Path(shutil.which("git")))
+        with reader.operation(), mock.patch.object(sc.schema_nullable, "classify_constant_source", side_effect=c), mock.patch.object(sc.schema_index, "classify_source", side_effect=i):
+            result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual((result.kind, result.reasons), ("expand", ()))
+        self.assertEqual(calls, [(label, {"base_sha": self.base, "head_sha": head}, inputs[0], inputs[1]) for label in ("column", "index")])
+        self.assertTrue(reader.closed)
+
+    def test_transport_deadline_and_call_failures_stay_hard_refusals(self):
+        head = self.head(self.inputs(index=True)); real_git = sc._git
+        for path in (sc.schema_nullable.CONSTANT_SOURCE_PATH, sc.schema_index.SOURCE_PATH):
+            def refuse(root, args):
+                if args[:2] == ["ls-tree", "-z"] and args[-1] == path: raise source_git.SourceGitRefusal("git-failed:source-deadline")
+                return real_git(root, args)
+            with self.subTest(path=path), mock.patch.object(sc, "_git", side_effect=refuse):
+                with self.assertRaises(source_git.SourceGitRefusal): sc.classify_v2(self.repo.root, self.base, head)
+
+    def test_nonregular_new_declaration_blobs_refuse(self):
+        head = self.head(self.inputs(index=True)); real_git = sc._git
+        for path, label in ((sc.schema_nullable.CONSTANT_SOURCE_PATH, "constant-source"), (sc.schema_index.SOURCE_PATH, "index-source")):
+            def invalid(root, args):
+                if args[:2] == ["ls-tree", "-z"] and args[-1] == path: return b"120000 blob " + b"a"*40 + b"\t" + path.encode() + b"\0"
+                return real_git(root, args)
+            with self.subTest(path=path), mock.patch.object(sc, "_git", side_effect=invalid):
+                self.assertIn("classifier-v2-invalid:" + label, sc.classify_v2(self.repo.root, self.base, head).reasons)
+
+    def test_catalog_raw_failure_keeps_catalog_diagnostic_with_or_without_declaration(self):
+        for changes in ({}, {sc.schema_nullable.CONSTANT_SOURCE_PATH: None}):
+            head = self.head(changes=changes); original = sc._Repository.blob
+            def oversized(repo, sha, path):
+                if sha == self.base and path == sc.CATALOG: raise sc._Invalid()
+                return original(repo, sha, path)
+            with self.subTest(present=not changes), mock.patch.object(sc._Repository, "blob", oversized):
+                result = sc.classify_v2(self.repo.root, self.base, head)
+            self.assertIn("classifier-v2-invalid:catalog", result.reasons)
+
+
 if __name__ == "__main__":
     unittest.main()
