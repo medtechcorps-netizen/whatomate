@@ -760,4 +760,36 @@ class ObservationTests(unittest.TestCase):
         self.manager.close(); self.owner.cleanup()
 
 
+class RollbackObservationTests(unittest.TestCase):
+    """Actual observation/process code over controlled Docker output only."""
+    terminal = ObservationTests.terminal
+    old_observer = ObservationTests.old_observer
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.world = World()
+        self.owner = o.processes.stack.OwnedStack("docker", Path(self.tmp.name), test_stack.SOURCE,
+            o.processes.stack.GraphImage(test_stack.GRAPH, test_stack.SOURCE), token=test_stack.TOKEN,
+            capture=self.world.capture)
+        self.owner.start()
+        previous, live, controller, control = tp.rollback_bindings(self.world)
+        self.manager = o.processes.OwnedProcesses(self.owner, previous, live, controller, catalog_control=control)
+        self.handle = self.manager.start_web("previous", tp.INPUTS)
+        self.fixture = replace(test_controller.fixture(), namespace=self.owner.namespace,
+            product_origin=self.owner.planned_web_origin, stub_origin=self.owner.graph_origin,
+            account_name=self.owner.namespace + "-wa", email=self.owner.namespace + "-client@example.test")
+        self.clock = Clock()
+
+    def test_bound_terminal_keeps_h_evidence_and_t_actual_source(self):
+        self.terminal()
+        value = self.old_observer().wait_old_boot()
+        self.assertEqual(value["binding"]["sha"], self.owner.source_sha)
+        self.assertNotEqual(value["binding"]["sha"], self.manager.bindings["candidate"].source_sha)
+        self.assertEqual(value["binding"]["previous_source_sha"], self.manager.bindings["previous"].source_sha)
+        self.assertEqual(value["binding"]["container_id"], self.handle.container_id)
+        self.assertEqual(self.world.log_calls, 2)
+        self.assertNotIn("controller", self.manager._ids)
+        self.manager.remove(self.handle); self.manager.close(); self.owner.cleanup()
+
+
 if __name__ == "__main__": unittest.main()

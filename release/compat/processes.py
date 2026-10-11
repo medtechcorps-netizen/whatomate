@@ -127,13 +127,21 @@ class OwnedProcesses:
     A process or controller ambiguity poisons further actions without retry.
     """
     def __init__(self, owner: stack.OwnedStack, previous: ImageBinding,
-                 candidate: ImageBinding, controller: ImageBinding):
+                 candidate: ImageBinding, controller: ImageBinding, *,
+                 catalog_control: ImageBinding | None = None):
         need(type(owner) is stack.OwnedStack and not owner._closed and not owner._ambiguous)
         need(set(owner._handles) == {"pg", "redis", "graph"} and owner._process_manager is None)
         need(all(type(v) is ImageBinding for v in (previous, candidate, controller)))
         need(runtime._WEB.fullmatch(previous.reference) is not None)
         need(controller.reference == controller.image_id)
         self.owner, self.bindings = owner, {"previous": previous, "candidate": candidate, "controller": controller}
+        if catalog_control is not None:
+            need(type(catalog_control) is ImageBinding
+                 and runtime._WEB.fullmatch(candidate.reference) is not None
+                 and catalog_control.reference == catalog_control.image_id
+                 and catalog_control.source_sha == controller.source_sha == owner.source_sha,
+                 "process-catalog-control-invalid")
+            self.bindings["catalog-control"] = catalog_control
         self._network = owner._network
         self._ids, self._specs, self._handles, self._events = {}, {}, {}, []
         self._images, self._ambiguous, self._closed = {}, False, False
@@ -145,6 +153,15 @@ class OwnedProcesses:
             self._validate_image(role, binding, image)
             self._images[role] = image
         owner._process_manager = self
+
+    @property
+    def catalog_binding(self):
+        return self.bindings["catalog-control" if "catalog-control" in self.bindings else "candidate"]
+
+    @property
+    def evidence_source_sha(self):
+        # The producer/control source H is distinct from the tested live image L.
+        return self.catalog_binding.source_sha
 
     def _validate_image(self, role, binding, row):
         cfg = row.get("Config", {})
@@ -177,6 +194,12 @@ class OwnedProcesses:
             # bind that source's recipe through the existing release verifier.
             need(stack.RECIPE_LABEL not in labels or labels[stack.RECIPE_LABEL] == binding.recipe_sha256,
                  "process-source-invalid")
+            if role == "catalog-control":
+                # This local web image is built under the existing fixed
+                # candidate recipe/receipt. Signed endpoint images are separate.
+                need(labels.get(stack.ROLE_LABEL) == "candidate"
+                     and labels.get(stack.RECIPE_LABEL) == binding.recipe_sha256,
+                     "process-source-invalid")
         need(not cfg.get("Volumes") and not cfg.get("OnBuild") and not cfg.get("Healthcheck"),
              "process-image-invalid")
 
@@ -329,8 +352,9 @@ class OwnedProcesses:
         return code  # Not a migration or compatibility verdict.
 
     def start_catalog(self, inputs):
-        """Fixed candidate CLI enforces runtime read-only; no active peers."""
-        return self._start("catalog", "candidate", "compat-control", inputs)
+        """Fixed producer CLI enforces runtime read-only; no active peers."""
+        version = "catalog-control" if "catalog-control" in self.bindings else "candidate"
+        return self._start("catalog", version, "compat-control", inputs)
 
     def wait_catalog(self, handle):
         """Return actual complete CLI bytes, not an accepted catalog result."""

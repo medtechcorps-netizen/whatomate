@@ -155,7 +155,7 @@ class OwnedObservation:
         else:
             need(type(_old_boot) is tuple and len(_old_boot) == 3 and _old_boot[0] is _OLD_BOOT
                  and handle.version == "previous", "observation-old-boot-context")
-            proof.artifact_name(manager.bindings["candidate"].source_sha, _old_boot[2])
+            proof.artifact_name(manager.evidence_source_sha, _old_boot[2])
             need(type(_old_boot[1]) is int and 1 <= _old_boot[1] < 10**16, "observation-old-boot-context")
             self._checked_state(running=None)
 
@@ -240,7 +240,7 @@ class OwnedObservation:
                     panic += 1
         counts = self._period_counts(logs)
         previous = self.manager.bindings["previous"]
-        binding = {"sha": self.manager.bindings["candidate"].source_sha,
+        binding = {"sha": self.manager.evidence_source_sha,
                    "previous_source_sha": previous.source_sha, "previous_web_digest": previous.reference.rsplit("@", 1)[-1],
                    "run_id": self._old_boot[1], "run_attempt": self._old_boot[2], "owner_token": self.manager.owner.token,
                    "container_id": self.handle.container_id, "started_at": self.handle.started_at}
