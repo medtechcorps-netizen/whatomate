@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, NamedTuple, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ship_common as common
@@ -64,6 +64,20 @@ BOOTSTRAP_KEYS = frozenset(
 )
 ACTIVE_RUN_STATUSES = ("in_progress", "pending", "queued", "requested", "waiting")
 SOURCE_REF = "refs/heads/main"
+
+
+class _AuthenticatedRecord(NamedTuple):
+    """Immutable authenticated wire bytes, not linked policy or image authority.
+
+    Only the collector produces these internally. A caller must consume the
+    complete iterator and apply its own chain/source policy before using a
+    selection; one yielded item is not proof of a valid complete chain.
+    """
+
+    raw: bytes
+    release: str
+    sha: str
+    manifest_sha256: str
 
 
 class Entry(NamedTuple):
@@ -811,14 +825,19 @@ def require_link(entries: Sequence[Entry], entry: Entry, repo_dir: Path | None) 
         common.fail(code)
 
 
-def resolve_chain(
+def collect_authenticated_records(
     gh: Gh,
-    repo_dir: Path | None,
     *,
-    bootstrap: Mapping[str, Any],
     work_dir: Path,
-) -> Chain:
-    """Section 7.2: every record verified, linked and tag-bound, or nothing."""
+) -> Iterator[_AuthenticatedRecord]:
+    """Validate inventory now, then authenticate each sorted wire record lazily.
+
+    This deliberately does not normalize policy, verify images or supply a
+    bootstrap/live-contract origin. Inventory refusal is eager; download and
+    signature checks happen on each advance, so consumers can reject a link
+    before fetching the next record. Exceptions terminate the iterator without
+    retry. Immutable inventory values and wire bytes are private to this call.
+    """
     releases = gh.releases()
     refs = gh.prod_tags()
     published: dict[str, dict[str, Any]] = {}
@@ -869,29 +888,53 @@ def resolve_chain(
         common.fail("record-chain-invalid:tag-release-parity")
     if len(published) > MAX_RECORDS:
         common.fail("record-chain-invalid:too-many")
+    inventory = tuple(
+        (tag, tags[tag], published[tag]["assets"][0]["size"])
+        for tag in sorted(published)
+    )
+
+    def authenticated() -> Iterator[_AuthenticatedRecord]:
+        for index, (tag, target_sha, size) in enumerate(inventory):
+            directory = work_dir / f"record-{index}"
+            try:
+                raw = gh.download_manifest(tag, directory)
+            except common.ReleaseError as exc:
+                raise common.ReleaseError("record-chain-invalid:download") from exc
+            if len(raw) != size:
+                common.fail("record-chain-invalid:asset-size")
+            try:
+                manifest = validate_manifest(common.loads_strict(raw, code="record-invalid"))
+            except common.ReleaseError as exc:
+                raise common.ReleaseError("record-chain-invalid:manifest") from exc
+            if raw != common.canonical_file_bytes(manifest):
+                common.fail("record-chain-invalid:manifest")
+            if manifest["release"] != tag or target_sha != manifest["sha"]:
+                common.fail("record-chain-invalid:tag-binding")
+            workflow_sha = manifest["signer"]["workflow_sha"]
+            try:
+                gh.verify_file(directory / MANIFEST_ASSET, signer_digest=workflow_sha, source_digest=workflow_sha)
+            except common.ReleaseError as exc:
+                raise common.ReleaseError("record-chain-invalid:attestation") from exc
+            yield _AuthenticatedRecord(raw, tag, manifest["sha"], common.sha256_bytes(raw))
+
+    return authenticated()
+
+
+def resolve_chain(
+    gh: Gh,
+    repo_dir: Path | None,
+    *,
+    bootstrap: Mapping[str, Any],
+    work_dir: Path,
+) -> Chain:
+    """Section 7.2: every record verified, linked and tag-bound, or nothing."""
+    records = collect_authenticated_records(gh, work_dir=work_dir)
     entries: list[Entry] = [bootstrap_entry(bootstrap)]
-    for index, tag in enumerate(sorted(published)):
-        directory = work_dir / f"record-{index}"
-        try:
-            raw = gh.download_manifest(tag, directory)
-        except common.ReleaseError as exc:
-            raise common.ReleaseError("record-chain-invalid:download") from exc
-        if len(raw) != published[tag]["assets"][0]["size"]:
-            common.fail("record-chain-invalid:asset-size")
-        try:
-            manifest = validate_manifest(common.loads_strict(raw, code="record-invalid"))
-        except common.ReleaseError as exc:
-            raise common.ReleaseError("record-chain-invalid:manifest") from exc
-        if raw != common.canonical_file_bytes(manifest):
-            common.fail("record-chain-invalid:manifest")
-        if manifest["release"] != tag or tags[tag] != manifest["sha"]:
-            common.fail("record-chain-invalid:tag-binding")
-        workflow_sha = manifest["signer"]["workflow_sha"]
-        try:
-            gh.verify_file(directory / MANIFEST_ASSET, signer_digest=workflow_sha, source_digest=workflow_sha)
-        except common.ReleaseError as exc:
-            raise common.ReleaseError("record-chain-invalid:attestation") from exc
-        entry = manifest_entry(manifest, raw)
+    for record in records:
+        # Reparse immutable, already validated canonical bytes into a fresh
+        # legacy document; no mutable document escapes the collector.
+        manifest = common.loads_strict(record.raw, code="record-invalid")
+        entry = manifest_entry(manifest, record.raw)
         require_link(entries, entry, repo_dir)
         entries.append(entry)
     return Chain(tuple(entries))
