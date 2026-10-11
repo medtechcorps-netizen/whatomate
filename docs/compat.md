@@ -746,11 +746,27 @@ and complete repeated inventories. Fatal collection issues require incomplete
 coverage and cannot qualify. Coverage remains `complete-visible`; whole-run
 deletion detection is explicitly unavailable.
 
-This is pure source/evidence preparation, not an all-head collector, signature
-authority or operational rollback permission. The fixed recognized workflow
-layout, concrete collection and immutable per-head source custody remain separate
-requirements. Public rollback across two or more non-none intermediates still
-refuses. Existing normal collection predicates remain unchanged.
+The preparatory concrete collector now uses the fixed repository and workflow
+API, enumerates all visible main push/dispatch heads without head/status/date
+filters, and reads each head's immutable workflow through the owned Git reader.
+It retains every attempt's closed raw run/job/check/artifact envelope and verifies
+both exact artifact subjects once through the fixed verifier. A second complete
+inventory must match; drift or unavailable coverage cannot qualify. Unknown
+workflow source never borrows the current producer's execution window.
+
+The collector shares one already-open caller allowance across Git, API and
+signature subprocesses, binds its returned observation to actual captured
+transcripts, and closes that collection phase on return or refusal. It does not
+activate an operational caller. The later preflight must resolve complete signed
+source before and after collection under the original outer allowance; closed
+resolver budgets cannot be reused. Public rollback across two or more non-none
+intermediates still refuses. Existing normal collection predicates are unchanged.
+
+The concrete collector and shared verifier/GET seams passed 99 synthetic cases;
+the existing pure history/request bridge passed 43 more. Controlled immutable
+Git, API and signature transcripts exercise the actual transport paths, including
+resolve/collect/fresh-resolve composition. These 142 checks do not establish
+hosted permissions, actual signatures or operational rollback qualification.
 
 Saved synthetic checks cover 396 unique cases: 76 initial passes plus three
 repaired fixture cases, 163 normal-collection cases and 154 custody/workflow cases.

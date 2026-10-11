@@ -683,5 +683,24 @@ class PureEnvelopeParityTests(unittest.TestCase):
                 self.assertEqual(replace(replayed.attempt,measurement=original.measurement),original)
 
 
+class NormalGetPolicyTests(unittest.TestCase):
+    def test_normal_client_still_refuses_all_head_inventory_before_capture(self):
+        with harness() as (world, client, scratch):
+            before = len(world.calls)
+            with self.assertRaises(evidence.CompatRefusal):
+                client.get(collect.API + '/actions/workflows/900/runs?branch=main&event=push&per_page=100&page=1')
+            self.assertEqual(len(world.calls), before)
+
+    def test_fixed_normal_query_and_arbitrary_url_boundary_remain(self):
+        with harness() as (world, client, scratch):
+            rows = client.get(collect.API + f'/actions/workflows/900/runs?head_sha={fixture.SHA}&branch=main&event=push&per_page=100&page=1')
+            self.assertEqual(len(rows['workflow_runs']), 1)
+            before = len(world.calls)
+            for path in ('https://PRIVATE.invalid', collect.API + '/actions/runs/100/jobs',
+                         collect.API + '/actions/workflows/900/runs?per_page=100&page=1'):
+                with self.assertRaises(evidence.CompatRefusal): client.get(path)
+            self.assertEqual(len(world.calls), before)
+
+
 if __name__=='__main__':
     unittest.main()

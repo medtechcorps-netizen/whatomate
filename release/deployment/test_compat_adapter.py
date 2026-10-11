@@ -358,5 +358,50 @@ class RollbackAdapterTests(unittest.TestCase):
             self.reject(client, archive(original), location(row), row, root)
 
 
+class HistoryAdapterTests(unittest.TestCase):
+    def test_each_closed_protocol_authenticates_each_subject_once(self):
+        for version in (1, 2, 3, 4):
+            original = (rollback_fixtures.pair(server_false="workers") if version == 4
+                        else fixtures.pair(version=version, event="workflow_dispatch", server_false="workers"))
+            row = (rollback_fixtures.attempt(measurement=original, conclusion="failure") if version == 4
+                   else fixtures.attempt(event="workflow_dispatch", measurement=original, conclusion="failure"))
+            with self.subTest(version=version), harness(row) as (root, client, fake, row):
+                pair = adapter.verify_history_pair(client, archive(original), location(row), row, root)
+                parser = (evidence.parse_authenticated_rollback_pair if version == 4
+                          else evidence.parse_authenticated_pair)
+                self.assertFalse(parser(pair, row).positive)
+                self.assertEqual((pair.result, pair.context), (original.result, original.context))
+                self.assertEqual([Path(args[3]).name for args, _ in fake.calls[1:]], list(adapter.FILES))
+
+    def test_unknown_bool_and_malformed_protocols_never_retry_a_signature(self):
+        for version in (0, 5, True, "4"):
+            original = rollback_fixtures.pair()
+            context = json.loads(original.context); context["version"] = version
+            original = replace(original, context=fixtures.canonical(context))
+            with self.subTest(version=version), harness(rollback_fixtures.attempt()) as (root, client, fake, row):
+                with self.assertRaises(evidence.CompatRefusal):
+                    adapter.verify_history_pair(client, archive(original), location(row), row, root)
+                self.assertEqual(len(fake.calls), 3)
+
+    def test_named_normal_and_rollback_adapters_keep_namespace_restriction(self):
+        original = fixtures.pair(version=3, event="workflow_dispatch")
+        with harness(fixtures.attempt(event="workflow_dispatch")) as (root, client, fake, row):
+            pair = adapter.verify_history_pair(client, archive(original), location(row), row, root)
+            self.assertTrue(evidence.parse_authenticated_pair(pair, row).positive)
+            with self.assertRaises(evidence.CompatRefusal):
+                evidence.parse_authenticated_rollback_pair(pair, row)
+            self.assertEqual(len(fake.calls), 3)
+
+    def test_history_verifier_preserves_both_signature_requirements(self):
+        original = rollback_fixtures.pair()
+        for filename in adapter.FILES:
+            with self.subTest(file=filename), harness(rollback_fixtures.attempt()) as (root, client, fake, row):
+                fake.fail_name = filename
+                with self.assertRaises(evidence.CompatRefusal) as caught:
+                    adapter.verify_history_pair(client, archive(original), location(row), row, root)
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.assertLessEqual(len(fake.calls), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

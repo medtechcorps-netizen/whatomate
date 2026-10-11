@@ -208,3 +208,29 @@ def verify_rollback_pair(gh: records.Gh, archive: bytes, location: ArtifactLocat
     except (common.ReleaseError, OSError, ValueError, TypeError, KeyError, AttributeError,
             RecursionError, OverflowError):
         raise evidence.CompatRefusal("compat-stale", "adapter-verification") from None
+
+
+def verify_history_pair(gh: records.Gh, archive: bytes, location: ArtifactLocation,
+                        attempt: evidence.Attempt, scratch: Path) -> evidence.AuthenticatedPair:
+    """Authenticate once, then parse one closed normal or rollback protocol.
+
+    History retains complete negatives from either namespace. A normal positive
+    remains normal evidence; this function never decides rollback eligibility.
+    No caller callback or supplied verification transcript is accepted.
+    """
+    try:
+        pair = _verify_pair_subjects(gh, archive, location, attempt, scratch)
+        context = common.loads_strict(pair.context)
+        _need(type(context) is dict and type(context.get("version")) is int,
+              "adapter-protocol")
+        if context["version"] == 4:
+            evidence.parse_authenticated_rollback_pair(pair, attempt)
+        else:
+            _need(context["version"] in (1, 2, 3), "adapter-protocol")
+            evidence.parse_authenticated_pair(pair, attempt)
+        return pair
+    except evidence.CompatRefusal:
+        raise
+    except (common.ReleaseError, OSError, ValueError, TypeError, KeyError, AttributeError,
+            RecursionError, OverflowError):
+        raise evidence.CompatRefusal("compat-stale", "adapter-verification") from None
