@@ -649,13 +649,17 @@ def _migration_contract(repo: _Repository, base: str, head: str, reasons: set[st
 
 
 def classify(repo_dir: Path, base: str, head: str, *, mode: str = "forward") -> Classification:
+    return _classify(_Repository(repo_dir), base, head, mode=mode)
+
+
+def _classify(repo: _Repository, base: str, head: str, *, mode: str = "forward") -> Classification:
+    repo_dir = repo.root
     common.require_sha1(base, "internal-error:schema-base")
     common.require_sha1(head, "internal-error:schema-head")
     if mode not in {"forward", "rollback"}:
         common.fail("input-invalid:schema-mode")
     release_record.require_commit(repo_dir, base, "git-failed:schema-guard")
     release_record.require_commit(repo_dir, head, "git-failed:schema-guard")
-    repo = _Repository(repo_dir)
     reasons: set[str] = set()
     summary: list[str] = []
     section = "catalog"
@@ -1039,13 +1043,13 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
     future catalogs, pending history/steps and additive >=2 producers remain
     explicitly unsupported. REQUIRE_COMPAT shipping must be adopted atomically.
     """
-    legacy = classify(repo_dir, base, head)
+    repo = _Repository(repo_dir)
+    legacy = _classify(repo, base, head)
     reasons = set(legacy.reasons)
     summary = [line for line in legacy.summary if not line.startswith(("history apply_engine:", "classification:"))]
     requirements = {"compat-required", "generated-migration-closure-ci"}
     migrations: tuple[str, ...] = ()
     kind, dormant = legacy.kind, legacy.dormant
-    repo = _Repository(repo_dir)
     section = "catalog"
     try:
         if repo.blob(base, CATALOG) is None:

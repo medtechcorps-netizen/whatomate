@@ -306,6 +306,84 @@ class SourceHistoryPolicyTests(unittest.TestCase):
         head = self.repo.commit(files)
         return sc.classify_v2(self.repo.root, base or self.base, head)
 
+    def test_shared_blob_reads_are_once_per_invocation_and_refetched_next_time(self):
+        middle = self.repo.commit({"README.md": "middle\n"})
+        head = self.repo.commit({"README.md": "head\n"})
+        real_git = sc._git
+        listings = []
+
+        def count(root, args):
+            if args[:2] == ["ls-tree", "-z"]:
+                listings.append((args[2], args[-1]))
+            return real_git(root, args)
+
+        with mock.patch.object(sc, "_git", side_effect=count):
+            first = sc.classify_v2(self.repo.root, self.base, head)
+            self.assertEqual((first.kind, first.dormant, first.reasons), ("none", False, ()))
+            self.assertEqual(len(listings), len(set(listings)))
+            for revision in (self.base, middle, head):
+                self.assertEqual(listings.count((revision, sc.MIGRATION_PATH)), 1)
+            self.assertEqual(listings.count((head, sc.REGISTRY)), 1)  # Successful absence is reusable.
+            first_keys = set(listings)
+            second = sc.classify_v2(self.repo.root, self.base, head)
+            self.assertEqual(second, first)
+            self.assertEqual(set(listings), first_keys)
+            self.assertTrue(all(listings.count(key) == 2 for key in first_keys))
+
+    def test_cached_missing_intermediate_contract_still_blocks_restored_endpoint(self):
+        removed = self.repo.commit({sc.MIGRATION_PATH: None})
+        head = self.repo.commit({sc.MIGRATION_PATH: text(migration())})
+        real_git = sc._git
+        missing_reads = []
+
+        def count(root, args):
+            if args == ["ls-tree", "-z", removed, "--", sc.MIGRATION_PATH]:
+                missing_reads.append(removed)
+            return real_git(root, args)
+
+        with mock.patch.object(sc, "_git", side_effect=count):
+            result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual(missing_reads, [removed])
+        self.assertIn("migration-path-changed:contract-removed", result.reasons)
+        self.assertEqual(result.migration_changes, ())
+
+    def test_cached_legacy_catalog_still_receives_stricter_v2_validation(self):
+        invalid = catalog()
+        invalid["objects"][0]["attributes"] = {}
+        head = self.repo.commit({sc.CATALOG: text(invalid)})
+        legacy = sc.classify(self.repo.root, self.base, head)
+        self.assertNotIn("classifier-invalid:catalog", legacy.reasons)
+        real_git = sc._git
+        reads = []
+
+        def count(root, args):
+            if args == ["ls-tree", "-z", head, "--", sc.CATALOG]:
+                reads.append(head)
+            return real_git(root, args)
+
+        with mock.patch.object(sc, "_git", side_effect=count):
+            result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual(reads, [head])
+        self.assertIn("classifier-v2-invalid:catalog", result.reasons)
+
+    def test_second_ancestry_transport_failure_is_not_hidden_by_blob_cache(self):
+        head = self.repo.commit({"README.md": "head\n"})
+        real_git = sc._git
+        ancestry = []
+
+        def fail_second(root, args):
+            if args == ["merge-base", self.base, head]:
+                ancestry.append(tuple(args))
+                if len(ancestry) == 2:
+                    raise sc.common.ReleaseError("git-failed:schema-guard")
+            return real_git(root, args)
+
+        with mock.patch.object(sc, "_git", side_effect=fail_second):
+            with self.assertRaises(sc.common.ReleaseError) as caught:
+                sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual(caught.exception.code, "git-failed:schema-guard")
+        self.assertEqual(len(ancestry), 2)
+
     def test_unchanged_catalog_and_unrelated_body(self):
         result = self.result({"cmd/whatomate/main.go": MAIN.replace("println(2)", "println(3)")})
         self.assertEqual((result.kind, result.dormant, result.reasons, result.migration_changes), ("none", False, (), ()))
@@ -527,6 +605,38 @@ class SourceHistoryPolicyTests(unittest.TestCase):
         self.repo.checkout(self.base)
         result = self.result({"README.md": "right\n"}, left)
         self.assertIn("classifier-v2-invalid:history-range", result.reasons)
+
+
+class InvocationArtifactBudgetTests(unittest.TestCase):
+    def test_shared_raw_cache_keeps_total_cap_without_charging_cache_hits(self):
+        # Reuse one small allocation across sixteen returned blobs; the declared
+        # total is 64 MiB, but this test need not allocate sixteen large bodies.
+        body = b"x" * (4 * 1024 * 1024)
+        object_id = "a" * 40
+        commands = []
+
+        def capture(root, args):
+            commands.append(tuple(args))
+            if args[:2] == ["ls-tree", "-z"]:
+                return ("100644 blob " + object_id + "\t" + args[-1] + "\0").encode()
+            if args[:2] == ["cat-file", "-s"]:
+                return str(len(body)).encode()
+            if args[:2] == ["cat-file", "blob"]:
+                return body
+            self.fail("unexpected synthetic Git command")
+
+        repo = sc._Repository(Path("synthetic-bounded-cache"))
+        with mock.patch.object(sc, "_git", side_effect=capture):
+            for index in range(16):
+                self.assertIs(repo.blob("b" * 40, f"part-{index}.json"), body)
+            before = len(commands)
+            self.assertIs(repo.blob("b" * 40, "part-0.json"), body)
+            self.assertEqual(len(commands), before)
+            self.assertEqual(repo.total, 64 * 1024 * 1024)
+            with self.assertRaises(sc._Invalid):
+                repo.blob("b" * 40, "one-more.json")
+        self.assertEqual(sum(command[:2] == ("cat-file", "blob") for command in commands), 16)
+        self.assertNotIn(("b" * 40, "one-more.json"), repo.cache)
 
 
 if __name__ == "__main__":
