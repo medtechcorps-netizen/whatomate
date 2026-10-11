@@ -1115,6 +1115,12 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
     """
     repo = _Repository(repo_dir)
     legacy = _classify(repo, base, head)
+    return _classify_v2(repo, base, head, legacy)
+
+
+def _classify_v2(repo: _Repository, base: str, head: str,
+                 legacy: Classification) -> PolicyClassification:
+    repo_dir = repo.root
     reasons = set(legacy.reasons)
     summary = [line for line in legacy.summary if not line.startswith(("history apply_engine:", "classification:"))]
     requirements = {"compat-required", "generated-migration-closure-ci"}
@@ -1197,6 +1203,45 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
         if section == "history":
             requirements.add("history-format-unsupported")
     return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), migrations, tuple(sorted(requirements)))
+
+
+def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
+    """CI source eligibility only; generated tests AND exact compat must pass.
+
+    Preserve legacy clean/refused decisions except the sole endpoint closure
+    reason under the existing none-class source contract. This does not grant
+    experiment, merge or release authority, or change check()/guard().
+    """
+    repo = _Repository(repo_dir)
+    legacy = _classify(repo, base, head)
+    if legacy.reasons != ("migration-path-changed:closure",):
+        return legacy.reasons
+    policy = _classify_v2(repo, base, head, legacy)
+    if (policy.reasons or policy.kind != "none" or policy.dormant is not False
+            or policy.requirements != ("compat-required", "generated-migration-closure-ci")
+            or policy.migration_changes != ("generated migration closure changed",)):
+        return legacy.reasons
+    try:
+        # _classify_v2 has validated both manifests and the complete history.
+        # File-list-only edits cannot stand in for an actual new closure hash.
+        old = repo.document(base, MIGRATION_PATH, lambda _: None)
+        new = repo.document(head, MIGRATION_PATH, lambda _: None)
+        _valid(old["roots"] == new["roots"] == MIGRATION_ROOTS
+               and old["closure_sha256"] != new["closure_sha256"])
+        for path in (CATALOG, HISTORY, GLOBALS, GOLDEN + "production-v0.json",
+                     "internal/dbcatalog/shape/production-v0.sql", REGISTRY, SEEDS):
+            before, after = repo.blob(base, path), repo.blob(head, path)
+            # blob() enforces regular mode, per-file and shared total bounds.
+            # Absence or two empty blobs are not the active source contract.
+            _valid(type(before) is bytes and type(after) is bytes
+                   and 0 < len(before) <= MAX_ARTIFACT_BYTES and before == after)
+        changes = changed_paths(repo.root, base, head)
+        _valid(len(changes) <= 10000 and all(_changed_path(path) for _, path in changes)
+               and not any(path == _V2_PENDING.rstrip("/") or path.startswith(_V2_PENDING)
+                           for _, path in changes))
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return legacy.reasons
+    return ()
 
 
 if __name__ == "__main__":

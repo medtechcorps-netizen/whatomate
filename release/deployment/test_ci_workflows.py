@@ -26,12 +26,13 @@ negative cases that break the property and must make the checker fail:
     security runs govulncheck, rejects ambient Trivy suppression files right
     before its scans, and fails on any CRITICAL or HIGH finding in each image
     it builds from the release Dockerfiles, using exactly ship.trivyignore.
-12. the Test workflow runs Stage 1's schema guard (schema_change.py) on every
+12. the Test workflow runs the CI-only source guard (schema_change.py) on every
     pull request, from its merge base with main, and on every push to main,
     from the first parent, right after a full-history checkout, in a job the
     test aggregator needs. Its embedded script runs against a synthetic
-    repository: it must refuse exactly the guarded changes, judge a pull
-    request only by its own changes, and fail closed on anything unexpected.
+    repository: it binds the exact job SHA, preserves guarded refusals, admits
+    only the narrow closure transition, judges the PR's own changes, and fails
+    closed on anything unexpected. It does not establish compatibility proof.
 13. the Test workflow proves Part A's staging database bootstrap
     (release/staging/bootstrap) in a required job: on DigitalOcean's role
     shape it builds the database, this commit's rls-migrate accepts it twice
@@ -574,7 +575,7 @@ def assert_frontend_audit_policy(sources: dict[str, str]) -> None:
 SCHEMA_GUARD_TIMEOUT = 10
 SCHEMA_GUARD_CHECKOUT = {"fetch-depth": 0, "persist-credentials": False}
 SCHEMA_GUARD_OPENER = ["set -euo pipefail", "python3 -B - <<'GUARD'"]
-SCHEMA_GUARD_MESSAGE = "guarded database code changed; it cannot be promoted in Part A; split or revert"
+SCHEMA_GUARD_MESSAGE = "source change is outside the CI admission policy; compatibility does not override this refusal"
 GUARD_HANDLERS = "package handlers\n\nfunc send() {}\n"
 GUARD_MODELS = {"internal/models/models.go": "package models\n\ntype Note struct{}\n"}
 GUARD_REPLY = {"internal/handlers/messages.go": GUARD_HANDLERS + "\nfunc reply() {}\n"}
@@ -603,10 +604,21 @@ GUARD_SCENARIOS: dict[str, tuple[str, str | None, str | None, bool]] = {
     "push to main merging handlers only": ("push-handlers", "head", "push", False),
     "push of a commit without a parent": ("root", "head", "push", True),
     "run without an event name": ("handlers", "main", None, True),
+    "pull request with wrong checkout SHA": ("handlers", "main", "pull_request", True),
+    "pull request without job SHA": ("handlers", "main", "pull_request", True),
+    "push with malformed job SHA": ("push-handlers", "head", "push", True),
+    "pull request with a closure-only merge": ("merge-closure", "schema-main", "pull_request", False),
+    "push with a closure-only merge": ("merge-closure", "head", "push", False),
+    "pull request with a named migration edit": ("named-migration", "schema-main", "pull_request", True),
 }
 # Scenarios whose checkout also has a tag named origin/main, at this commit:
 # the short name would resolve to the tag instead of the remote branch.
 GUARD_TAGS = {"pull request beside a tag named origin/main at its head": "models"}
+GUARD_SHA_OVERRIDES = {
+    "pull request with wrong checkout SHA": "f" * 40,
+    "pull request without job SHA": None,
+    "push with malformed job SHA": "refs/heads/main",
+}
 
 
 class GuardFixture:
@@ -657,6 +669,37 @@ class GuardFixture:
             "push-models": self.merge(main, models),
             "root": repo.git("commit-tree", "-m", "root", main + "^{tree}").strip(),
         }
+        # Reuse the v2 wire examples, not a policy mock. These synthetic source
+        # manifests test the CI decision only; actual generation/caps remain
+        # the independently required Go contract tests.
+        import test_ship_schema_change_v2 as source_fixtures
+
+        sc = source_fixtures.sc
+        repo.checkout(main)
+        schema_main = repo.commit({
+            sc.CATALOG: source_fixtures.text(source_fixtures.catalog()),
+            sc.HISTORY: source_fixtures.text(source_fixtures.history()),
+            sc.GLOBALS: "[]\n", sc.REGISTRY: "[]\n", sc.SEEDS: '{"version":0}\n',
+            sc.MIGRATION_PATH: source_fixtures.text(source_fixtures.migration()),
+            "internal/dbcatalog/golden/production-v0.json":
+                (ROOT / "internal/dbcatalog/golden/production-v0.json").read_text(encoding="utf-8"),
+            "internal/dbcatalog/shape/production-v0.sql":
+                (ROOT / "internal/dbcatalog/shape/production-v0.sql").read_text(encoding="utf-8"),
+            "cmd/whatomate/main.go": source_fixtures.MAIN,
+            "internal/database/tenant.go": source_fixtures.TENANT,
+        }, "synthetic source policy baseline")
+        closure = repo.commit({
+            "cmd/whatomate/main.go": source_fixtures.MAIN.replace("println(2)", "println(3)"),
+            sc.MIGRATION_PATH: source_fixtures.text(source_fixtures.migration(source_fixtures.J)),
+        }, "synthetic transitive closure change")
+        merge_closure = self.merge(schema_main, closure)
+        repo.checkout(schema_main)
+        named = repo.commit({
+            "cmd/whatomate/main.go": source_fixtures.MAIN.replace("println(1)", "println(9)"),
+            sc.MIGRATION_PATH: source_fixtures.text(source_fixtures.migration(source_fixtures.J)),
+        }, "named migration remains outside CI exception")
+        self.commits.update({"schema-main": schema_main, "merge-closure": merge_closure,
+                             "named-migration": named})
 
     def merge(self, onto: str, branch: str) -> str:
         """A merge commit whose first parent is ``onto``, as GitHub makes."""
@@ -671,7 +714,7 @@ class GuardFixture:
             self.repo.git("update-ref", "-d", ref)
 
     def run(self, script: str, head: str, main: str | None, event: str | None,
-            tag: str | None = None) -> tuple[int, str, str]:
+            tag: str | None = None, github_sha: str | None = "checkout") -> tuple[int, str, str]:
         """Run the step's script the way the step does, from the checkout."""
         sha = self.commits[head]
         self.repo.checkout(sha)
@@ -682,6 +725,8 @@ class GuardFixture:
         # GITHUB_* variables (its event, its step summary) may leak in.
         env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GITHUB_")}
         env["GITHUB_STEP_SUMMARY"] = str(self.summary)
+        if github_sha is not None:
+            env["GITHUB_SHA"] = sha if github_sha == "checkout" else github_sha
         if event is not None:
             env["GITHUB_EVENT_NAME"] = event
         result = subprocess.run(
@@ -699,7 +744,8 @@ def guard_fixture() -> GuardFixture:
 @functools.lru_cache(maxsize=None)
 def run_guard(script: str, scenario: str) -> tuple[int, str, str]:
     head, main, event, _refused = GUARD_SCENARIOS[scenario]
-    return guard_fixture().run(script, head, main, event, GUARD_TAGS.get(scenario))
+    return guard_fixture().run(script, head, main, event, GUARD_TAGS.get(scenario),
+                               GUARD_SHA_OVERRIDES.get(scenario, "checkout"))
 
 
 def schema_guard_script(sources: dict[str, str]) -> str:
@@ -1260,7 +1306,16 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     "check a push like a pull request": ("schema-guard", lambda: replaced(
         "test.yml", 'if event == "pull_request":', 'if event in ("pull_request", "push"):')),
     "skip the check": ("schema-guard", lambda: replaced(
-        "test.yml", "reasons = schema_change.check(REPO, base, head)", "reasons = ()")),
+        "test.yml", "reasons = schema_change.check_ci_source(REPO, base, head)", "reasons = ()")),
+    "use the legacy guard instead of the CI transition": ("schema-guard", lambda: replaced(
+        "test.yml", "schema_change.check_ci_source(REPO, base, head)", "schema_change.check(REPO, base, head)")),
+    "ignore the job SHA": ("schema-guard", lambda: replaced(
+        "test.yml", 'expected = common.require_sha1(os.environ.get("GITHUB_SHA", ""), "context-invalid:sha")',
+        "expected = head")),
+    "ignore a checkout mismatch": ("schema-guard", lambda: replaced(
+        "test.yml", '              if head != expected:\n                  common.fail("context-invalid:sha")\n', "")),
+    "infer a missing job SHA from checkout": ("schema-guard", lambda: replaced(
+        "test.yml", 'os.environ.get("GITHUB_SHA", "")', 'os.environ.get("GITHUB_SHA", head)')),
     "pass a refused change": ("schema-guard", lambda: replaced(
         "test.yml", "          sys.exit(1)\n          GUARD\n", "          sys.exit(0)\n          GUARD\n")),
     "pass an unknown event": ("schema-guard", lambda: replaced(
@@ -1413,7 +1468,7 @@ class CiWorkflowTests(unittest.TestCase):
             "test.yml", "      - name: Build\n        run: go build -mod=readonly -v ./...\n",
             "      - name: Build\n        run: go build -mod=readonly -v ./...\n\n"
             "      - name: Vet\n        run: go vet -mod=readonly ./...\n"))
-        check_ci_workflows(replaced("test.yml", 'split or revert"', 'split it or revert it"'))
+        check_ci_workflows(replaced("test.yml", 'compatibility does not override this refusal"', 'compatibility cannot override this refusal"'))
 
     def test_every_negative_case_fails_its_check(self) -> None:
         labels = {label for label, _ in CHECKS}
@@ -1504,6 +1559,13 @@ class SchemaGuardScriptTests(unittest.TestCase):
         self.assert_refused("push to main merging an internal/models edit", "main", "push-models",
                             ["guarded-tree:internal/models/models.go"])
 
+    def test_closure_only_source_admission_does_not_waive_named_migrations(self) -> None:
+        self.assert_clean("pull request with a closure-only merge", "schema-main", "merge-closure")
+        self.assert_clean("push with a closure-only merge", "schema-main", "merge-closure")
+        self.assert_refused("pull request with a named migration edit", "schema-main", "named-migration",
+                            ["migration-path-changed:closure",
+                             "migration-path-changed:cmd/whatomate/main.go#runRLSMigration"])
+
     def test_only_public_reasons_are_printed(self) -> None:
         self.assert_refused("pull request adding a non-ASCII path under internal/models", "main", "non-ascii",
                             ["(path withheld)"])
@@ -1514,6 +1576,9 @@ class SchemaGuardScriptTests(unittest.TestCase):
             "pull request without origin/main": "git-failed:schema-guard",
             "workflow_dispatch run": "context-invalid:event",
             "run without an event name": "context-invalid:event",
+            "pull request with wrong checkout SHA": "context-invalid:sha",
+            "pull request without job SHA": "context-invalid:sha",
+            "push with malformed job SHA": "context-invalid:sha",
         }
         for scenario, code in cases.items():
             with self.subTest(scenario=scenario):
