@@ -192,6 +192,27 @@ class ProcessTests(unittest.TestCase):
             with self.assertRaises(p.proof.EvidenceError):m.controller(request)
         self.assertEqual(len(self.world.calls), count)
 
+    def test_controller_journal_exact_cursor_contract_and_deadline(self):
+        m = self.manager(); m.start_web("previous", INPUTS)
+        journal = {"after": 8, "cursor": 9, "discard_baseline": False, "entries": [{"seq": 9}], "requests": 1}
+        response = {"version": 1, "status": "ok", "operation": "journal", "journal": journal}
+        self.world.response = json.dumps(response).encode()
+        request = self.frame("journal", after=8, discard_baseline=False)
+        self.assertEqual(json.loads(m.controller(request)), response)
+        invoked = [opts for args, opts in self.world.calls if args[:4] == ["container", "start", "--attach", "--interactive"]]
+        self.assertEqual(invoked[-1]["timeout"], 190)
+        self.assertNotIn("cases", response)
+        self.assertFalse(m._protocol_failed)
+        m.close(); self.owner.cleanup()
+
+    def test_controller_journal_foreign_window_latches_and_preserves_cleanup(self):
+        m = self.manager(); m.start_web("previous", INPUTS)
+        self.world.response = json.dumps({"version": 1, "status": "ok", "operation": "journal", "journal":
+            {"after": 0, "cursor": 8, "discard_baseline": True, "entries": [{"seq": 8}], "requests": 1}}).encode()
+        with self.assertRaises(p.proof.EvidenceError): m.controller(self.frame("journal", after=7, discard_baseline=False))
+        self.assertTrue(m._protocol_failed)
+        m.close(); self.owner.cleanup()
+
     def test_controller_setup_invalid_ack_latches_without_favorable_case_flags(self):
         for change in ({"registered": 1}, {"registered": False}, {"cases": {"flow": True}}):
             with self.subTest(change=change):

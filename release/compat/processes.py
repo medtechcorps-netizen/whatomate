@@ -336,7 +336,7 @@ class OwnedProcesses:
         # This blocks new work but leaves exact owned cleanup available when
         # Docker outcomes are known; transport ambiguity remains stricter.
         self._protocol_failed = True
-        timeout = {"setup": 100, "readiness": 30, "write": 600, "read": 400}[parsed["operation"]]
+        timeout = {"setup": 100, "readiness": 30, "journal": 190, "write": 600, "read": 400}[parsed["operation"]]
         value = self._call(["container", "start", "--attach", "--interactive", identifier],
                            input_bytes=request, timeout=timeout)
         need(value.returncode in (0, 1) and not value.stderr, "process-controller-incomplete")
@@ -364,13 +364,16 @@ class OwnedProcesses:
                 raise controller.sweep.SemanticFailure("process-controller-semantic-failure")
             raise proof.EvidenceError("process-controller-evidence-failure")
         operation = parsed["operation"]
-        payload = {"setup": "registered", "readiness": "ready"}.get(operation, "cases")
+        payload = {"setup": "registered", "readiness": "ready", "journal": "journal"}.get(operation, "cases")
         keys = {"version", "status", "operation", payload}
         if operation == "write":
             keys.add("record")
         need(set(response) == keys and response.get("status") == "ok" and response.get("operation") == operation
              and value.returncode == 0, "process-controller-response-invalid")
-        if operation == "setup":
+        if operation == "journal":
+            controller.journal_result(response["journal"], after=parsed["after"],
+                                      discard_baseline=parsed["discard_baseline"])
+        elif operation == "setup":
             need(response["registered"] is True, "process-controller-response-invalid")
         elif operation == "readiness":
             need(response["ready"] == {"web": True, "graph": True}

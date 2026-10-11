@@ -133,6 +133,34 @@ def _setup(fixture, business_account_id, sweep_factory):
     return True
 
 
+def journal_result(value, *, after, discard_baseline):
+    """Validate the private complete cursor window, on both sides of the pipe."""
+    _need(type(value) is dict and set(value) == {"after", "cursor", "discard_baseline", "entries", "requests"})
+    _need(type(after) is int and 0 <= after < 2**64 and type(discard_baseline) is bool
+          and (not discard_baseline or after == 0))
+    _need(type(value["after"]) is int and value["after"] == after
+          and value["discard_baseline"] is discard_baseline)
+    rows, cursor, requests = value["entries"], value["cursor"], value["requests"]
+    _need(type(rows) is list and len(rows) <= 20_000 and type(cursor) is int and after <= cursor < 2**64
+          and type(requests) is int and 1 <= requests <= 20)
+    current = after
+    for index, row in enumerate(rows):
+        _need(type(row) is dict and type(row.get("seq")) is int and current < row["seq"] <= cursor
+              and (row["seq"] == current + 1 or (discard_baseline and index == 0)))
+        current = row["seq"]
+    _need(current == cursor)
+    return value
+
+
+def _journal(fixture, after, discard_baseline, sweep_factory):
+    client = sweep_factory(fixture)
+    client._begin()
+    rows, cursor = client._journal(after, discard_baseline=discard_baseline)
+    return journal_result({"after": after, "cursor": cursor, "discard_baseline": discard_baseline,
+                           "entries": rows, "requests": client._requests},
+                          after=after, discard_baseline=discard_baseline)
+
+
 def parse_request(raw: bytes) -> dict:
     """Pure preflight for the owner, before creating any controller resource.
 
@@ -143,9 +171,11 @@ def parse_request(raw: bytes) -> dict:
     request = _parse(raw)
     _need(type(request.get("version")) is int and request["version"] == 1)
     operation = request.get("operation")
-    _need(type(operation) is str and operation in {"setup", "readiness", "write", "read"})
+    _need(type(operation) is str and operation in {"setup", "readiness", "write", "read", "journal"})
     keys = {"version", "operation", "fixture"}
-    if operation == "setup":
+    if operation == "journal":
+        keys.update({"after", "discard_baseline"})
+    elif operation == "setup":
         keys.add("business_account_id")
     elif operation == "write":
         keys.add("nonce")
@@ -153,7 +183,11 @@ def parse_request(raw: bytes) -> dict:
         keys.add("record")
     _need(set(request) == keys)
     fixture = _fixture(request["fixture"])
-    if operation == "setup":
+    if operation == "journal":
+        _need(type(request["after"]) is int and 0 <= request["after"] < 2**64
+              and type(request["discard_baseline"]) is bool
+              and (not request["discard_baseline"] or request["after"] == 0))
+    elif operation == "setup":
         _need(type(request["business_account_id"]) is str
               and sweep._DIGITS.fullmatch(request["business_account_id"]) is not None
               and request["business_account_id"] != fixture.phone_number_id)
@@ -169,7 +203,7 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
     """One bounded private frame; fixed failures never retain exception text.
 
     The owning process adapter must enforce a wall deadline: setup 100s,
-    readiness 30s, write 600s and read 400s. Setup uses two <=45s requests;
+    readiness 30s, journal 190s, write 600s and read 400s. Setup uses two <=45s requests;
     Sweep retains its existing per-operation budgets.
     A success response is protocol completion, not compatibility qualification.
     """
@@ -183,7 +217,9 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
         elif operation == "read":
             record = sweep.RecordSet(**request["record"])
         response = {"version": 1, "status": "ok", "operation": operation}
-        if operation == "setup":
+        if operation == "journal":
+            response["journal"] = _journal(fixture, request["after"], request["discard_baseline"], sweep_factory)
+        elif operation == "setup":
             response["registered"] = _setup(fixture, request["business_account_id"], sweep_factory)
         elif operation == "readiness":
             response["ready"] = _readiness(fixture, http_factory, clock)

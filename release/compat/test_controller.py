@@ -112,6 +112,45 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual([x[0] for x in self.fake.calls], ["fixture", "login", "write", "read"])
         self.assertNotIn("password", json.dumps(value))
 
+    def test_journal_uses_real_signed_bounded_pages_without_login_or_cases(self):
+        world = SetupWorld()
+        world.stub = lambda method, path, value: {"entries": [{"seq": 8}], "latest": 8}
+        value = json.loads(c.handle(raw(request("journal", after=7, discard_baseline=False)), sweep_factory=world.factory))
+        self.assertEqual(value, {"version": 1, "status": "ok", "operation": "journal", "journal":
+            {"after": 7, "cursor": 8, "discard_baseline": False, "entries": [{"seq": 8}], "requests": 1}})
+        self.assertEqual([(r[0], r[1]) for r in world.calls], [("GET", "/_control/journal?after=7&limit=1000")])
+        self.assertNotIn("cases", value)
+        self.assertNotIn(fixture().control_key, json.dumps(value))
+
+    def test_journal_explicit_truncated_baseline_allowed_measured_zero_refused(self):
+        for baseline, expected in ((True, "ok"), (False, "error")):
+            world = SetupWorld()
+            world.stub = lambda method, path, value: {"entries": [{"seq": 50}], "latest": 50}
+            result = json.loads(c.handle(raw(request("journal", after=0, discard_baseline=baseline)), sweep_factory=world.factory))
+            self.assertEqual(result["status"], expected)
+            self.assertEqual(len(world.calls), 1)
+
+    def test_journal_multpage_counts_requests_and_refuses_missing_cursor(self):
+        world = SetupWorld()
+        pages = iter([{"entries": [{"seq": 2}], "latest": 3},
+                      {"entries": [{"seq": 3}, {"seq": 4}], "latest": 4}])
+        world.stub = lambda method, path, value: next(pages)
+        result = json.loads(c.handle(raw(request("journal", after=1, discard_baseline=False)), sweep_factory=world.factory))
+        self.assertEqual(result["journal"]["requests"], 2)
+        self.assertEqual([r[1] for r in world.calls], ["/_control/journal?after=1&limit=1000", "/_control/journal?after=2&limit=1000"])
+        result["journal"]["cursor"] = 5
+        with self.assertRaises(c.sweep.proof.EvidenceError):
+            c.journal_result(result["journal"], after=1, discard_baseline=False)
+
+    def test_journal_request_boundaries_are_pure_and_no_arbitrary_routes(self):
+        variants = [request("journal", after=x, discard_baseline=False) for x in (-1, True, 2**64, "0")]
+        variants += [request("journal", after=1, discard_baseline=True), request("journal", after=0),
+                     request("journal", after=0, discard_baseline=1),
+                     request("journal", after=0, discard_baseline=False, path="/_control/reset")]
+        for value in variants:
+            with self.assertRaises(c.sweep.proof.EvidenceError): c.parse_request(raw(value))
+        self.assertFalse(self.fake.calls)
+
     def test_read_uses_retained_record_without_write(self):
         value = self.handle(request("read", record=asdict(record())))
         self.assertEqual(value["cases"], self.fake.flags)
