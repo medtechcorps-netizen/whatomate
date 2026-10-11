@@ -900,7 +900,12 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
             iid=_regular(role_work/'image.id',128).decode('ascii','strict').strip()
             need(stack._IMAGE.fullmatch(iid),'admission-iid-invalid')
             metadata=common.loads_strict(_regular(role_work/'build-metadata.json',runtime.MIB))
-            need(type(metadata) is dict and metadata.get('containerimage.config.digest')==iid,'admission-iid-unbound')
+            need(type(metadata) is dict,'admission-iid-unbound')
+            # Pinned Buildx getImageID prefers the config key when present;
+            # containerd's prefer-image-digest exporter deliberately omits it.
+            identity_key=('containerimage.config.digest' if 'containerimage.config.digest' in metadata
+                          else 'containerimage.digest')
+            need(metadata.get(identity_key)==iid,'admission-iid-unbound')
             rows[role]=_role_inspect(binary,config,transport,role,iid,candidate)
             bindings[role]=iid
             role_receipt.update(image_id=iid,metadata_sha256=sha((role_work/'build-metadata.json').read_bytes()))

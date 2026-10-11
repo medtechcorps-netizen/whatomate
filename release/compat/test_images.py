@@ -224,6 +224,7 @@ class AdmissionRoundtripTests(unittest.TestCase):
         self.binary=self.root/'docker';self.binary.write_bytes(b'not executed')
         self.candidate='b'*40;self.old='a'*40;self.previous=SimpleNamespace(sha=self.old,images={'web':'sha256:'+'6'*64})
         self.clock=Clock();self.deadline=m._Deadline(clock=self.clock);self.builds=[];self.calls=[];self.drift=None
+        self.metadata_factory=lambda iid:{'containerimage.config.digest':iid}
         self.blobs,self.pins=source_blobs();self.rows={};self.images={role:'sha256:'+str(i+1)*64 for i,role in enumerate(m._RECIPES)}
         self.previous_ref=m.common.IMAGE_REPOSITORY['web']+'@'+self.previous.images['web']
         self.rows[self.previous_ref]=self.web(self.old,'sha256:'+'7'*64,m.sha(b'previous-recipe'))
@@ -281,7 +282,7 @@ class AdmissionRoundtripTests(unittest.TestCase):
         work=Path(args[args.index('--iidfile')+1]).parent;role=work.name
         self.builds.append((role,seconds));self.clock.value+=100
         iid=self.images[role];(work/'image.id').write_text(iid+'\n')
-        (work/'build-metadata.json').write_text(json.dumps({'containerimage.config.digest':iid}))
+        (work/'build-metadata.json').write_text(json.dumps(self.metadata_factory(iid)))
         if self.drift=='unknown':raise m.proof.InfrastructureFailure('admission-build-unknown')
         if self.drift=='context':(work/'context/go.mod').write_bytes(b'changed')
         if self.drift=='plugin':self.plugin.write_bytes(b'changed')
@@ -317,6 +318,56 @@ class AdmissionRoundtripTests(unittest.TestCase):
         result=json.loads((self.work/('candidate-'+self.candidate)/'result.json').read_bytes())
         self.assertEqual(result['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
         self.assertNotIn('candidate',result['roles'])
+
+    def test_containerd_manifest_iid_builds_and_inspects_all_four_roles(self):
+        # Shape observed from the pinned Buildx/Engine pair; config key absent.
+        self.metadata_factory=lambda iid:{'containerimage.digest':iid,
+            'containerimage.descriptor':{'mediaType':'application/vnd.oci.image.manifest.v1+json',
+                'digest':iid,'size':1048,'platform':{'architecture':'amd64','os':'linux'}}}
+        result=self.admit()
+        self.assertIs(result.seal,m._SEAL)
+        self.assertEqual([x[0] for x in self.builds],['graph','controller','fixture','candidate'])
+        for iid in self.images.values():
+            self.assertEqual(sum(args[5:8]==['image','inspect',iid] for args in self.calls),2)
+
+    def test_config_key_takes_precedence_over_different_manifest_digest(self):
+        self.metadata_factory=lambda iid:{'containerimage.config.digest':iid,
+                                          'containerimage.digest':'sha256:'+'9'*64}
+        self.assertIs(self.admit().seal,m._SEAL)
+
+    def test_present_bad_config_never_falls_back_to_matching_manifest(self):
+        for bad in (None,False,'','sha256:'+'9'*64,[],{}):
+            child=AdmissionRoundtripTests('test_complete_four_builds_same_source_and_monotonic_shared_cap');child.setUp()
+            try:
+                child.metadata_factory=lambda iid:{'containerimage.config.digest':bad,'containerimage.digest':iid}
+                with self.subTest(bad=bad),self.assertRaisesRegex(m.proof.EvidenceError,'admission-iid-unbound'):
+                    child.admit()
+                self.assertEqual([x[0] for x in child.builds],['graph'])
+                self.assertFalse(any(args[5:8]==['image','inspect',child.images['graph']] for args in child.calls))
+            finally:child.doCleanups()
+
+    def test_absent_or_wrong_manifest_identity_refuses(self):
+        for metadata in ({},[],None,{'containerimage.digest':None},
+                         {'containerimage.digest':'sha256:'+'9'*64}):
+            child=AdmissionRoundtripTests('test_complete_four_builds_same_source_and_monotonic_shared_cap');child.setUp()
+            try:
+                child.metadata_factory=lambda iid:metadata
+                with self.subTest(metadata=metadata),self.assertRaisesRegex(m.proof.EvidenceError,'admission-iid-unbound'):
+                    child.admit()
+                self.assertEqual([x[0] for x in child.builds],['graph'])
+            finally:child.doCleanups()
+
+    def test_manifest_identity_still_requires_loaded_image_and_source_binding(self):
+        for field in ('Id','source'):
+            child=AdmissionRoundtripTests('test_complete_four_builds_same_source_and_monotonic_shared_cap');child.setUp()
+            try:
+                child.metadata_factory=lambda iid:{'containerimage.digest':iid}
+                row=child.rows[child.images['graph']]
+                if field=='Id':row['Id']='sha256:'+'9'*64
+                else:row['Config']['Labels'][m.stack.SOURCE_LABEL]='0'*40
+                with self.subTest(field=field),self.assertRaises(m.proof.EvidenceError):child.admit()
+                self.assertEqual([x[0] for x in child.builds],['graph'])
+            finally:child.doCleanups()
 
     def test_unknown_never_adopts_existing_valid_iid_or_retries(self):
         self.drift='unknown'
