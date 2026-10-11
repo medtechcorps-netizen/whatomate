@@ -1,8 +1,8 @@
-"""Preparatory authenticated record/source resolution; no deployment authority.
+"""Authenticated record/source resolution; no deployment authority.
 
 The concrete transport owns signature verification. The immutable projections
 below retain that operation's inputs, not a transferable cryptographic receipt.
-Selection does not invoke rollback policy or fabricate a legacy live catalog.
+Plain selection does not invoke rollback policy or fabricate a live catalog.
 Only the reviewed v0 source format and authenticated v1-prefix reader0 exist.
 """
 from dataclasses import dataclass
@@ -77,6 +77,21 @@ class ForwardResolution:
     previous_recipe: WebRecipe
 
 
+@dataclass(frozen=True, slots=True)
+class RollbackResolution:
+    """Source-bound transition data, never permission to mutate a provider.
+
+    Before the first measured v2 promotion, legacy_chain contains only genuine
+    authenticated v1 documents and retains the old rollback guard. Thereafter
+    it is absent and decision retains the current database origin and reader
+    floor. The two routes cannot be mixed or used to append v1 after v2.
+    """
+    resolved: ResolvedChain
+    legacy_chain: records.Chain | None
+    legacy_classification: schema_change.Classification | None
+    decision: policy.RollbackDecision | None
+
+
 def _selection(chain, index):
     entry = chain.entries[index]
     return ReleaseSelection(index, entry.release, entry.sha, entry.record.manifest_sha256,
@@ -130,6 +145,36 @@ def resolve_forward(client: transport.ReleaseGh, repo_dir: Path,
     An explicit tag selects an exact historical image; it grants no rollback.
     """
     return _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, forward=True)
+
+
+def resolve_rollback(client: transport.ReleaseGh, repo_dir: Path,
+                     git_binary: Path, selected_tag: str) -> RollbackResolution:
+    """Authenticate an exact target and evaluate its rollback policy.
+
+    Both legacy source guard and mixed-chain rules run inside the original
+    source operation, before final Git metadata and complete inventory checks.
+    A multi-span proof is still unavailable and never replaced with normal
+    forward evidence. Live provider state is deliberately not inferred here.
+    """
+    return _resolve(client, repo_dir, git_binary, selected_tag, None,
+                    forward=False, rollback=True)
+
+
+def _rollback_source(chain, repo_dir, selected_tag):
+    if chain.entries[-1].live is not None:
+        return None, None, policy.rollback_plan(chain, selected_tag)
+    # Keep the pre-v2 emergency route available without inventing a measured
+    # live tuple. These are the original canonical v1 bytes, not v2 coercions.
+    if any(entry.facts.schema_version != 1 for entry in chain.entries):
+        raise policy.PolicyRefusal("record-policy-legacy-live-unavailable")
+    documents = tuple(common.loads_strict(item.raw) for item in chain.inputs)
+    entries = (records.bootstrap_entry(documents[0], chain.inputs[0].manifest_sha256),
+               *(records.manifest_entry(document, item.raw)
+                 for document, item in zip(documents[1:], chain.inputs[1:], strict=True)))
+    legacy = records.Chain(entries)
+    target, _intermediates = records.rollback_plan(legacy, selected_tag)
+    classification = schema_change.guard(repo_dir, target.sha, legacy.latest.sha, mode="rollback")
+    return legacy, classification, None
 
 
 def _catalog_material(reader, latest, selected, candidate):
@@ -194,11 +239,13 @@ def _forward_source(reader, repo_dir, latest, candidate):
     return candidate, classification, workflow, database_base
 
 
-def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward):
+def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
     try:
+        if rollback and (forward or selected_tag is None):
+            budget.fail("resolver-selection")
         if forward and (type(candidate_sha) is not str or common.SHA1_RE.fullmatch(candidate_sha) is None):
             budget.fail("resolver-candidate")
         if selected_tag is not None and (type(selected_tag) is not str or
@@ -270,6 +317,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                     reader, repo_dir, latest, candidate)
                 material = _catalog_material(reader, latest, selected, candidate)
                 recipe = _web_recipe(reader, selected)
+            if rollback:
+                legacy_chain, legacy_classification, decision = _rollback_source(chain, repo_dir, tag)
             budget.check()
         # Git's final metadata preflight happens before the final complete
         # GitHub snapshot. Neither creates a new allowance or resets the clock.
@@ -280,7 +329,16 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             return ForwardResolution(resolved, candidate, classification, workflow,
                 common.sha256_bytes(workflow), selected.actual_web_source_sha, database_base,
                 material, recipe)
+        if rollback:
+            return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)
         return resolved
+    except (policy.PolicyRefusal, schema_change.SchemaChangeBlocked):
+        if rollback:
+            # These two reviewed policy classes carry fixed refusal codes or
+            # structured classifier reasons, never arbitrary driver output.
+            budget.failed = True
+            raise
+        budget.fail("resolver")
     except Exception:
         # Neither source/CLI errors nor arbitrary driver messages are public.
         budget.fail("resolver")
