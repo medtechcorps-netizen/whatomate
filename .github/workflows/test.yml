@@ -320,6 +320,9 @@ jobs:
           set -euo pipefail
           go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/bootstrap" ./release/staging/bootstrap
           go build -mod=readonly -o "$RUNNER_TEMP/staging-bootstrap/rereply" ./cmd/whatomate
+          mkdir -p "$RUNNER_TEMP/staging-bootstrap/production-shape"
+          cp internal/dbcatalog/golden/production-v0.json "$RUNNER_TEMP/staging-bootstrap/production-shape/production-v0.json"
+          cp internal/dbcatalog/shape/production-v0.sql "$RUNNER_TEMP/staging-bootstrap/production-shape/production-v0.sql"
 
       - name: Bootstrap the staging database
         run: |

@@ -1,7 +1,7 @@
 // Disposable local/CI setup only. Nothing accepts a remote database or reads
 // production configuration. All generated credentials stay in RUNNER_TEMP.
 import { randomBytes } from 'node:crypto'
-import { mkdirSync, openSync, readFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, openSync, readFileSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -97,6 +97,27 @@ url = ${quote(databaseURL('runtime'))}
   console.log('Local private configuration created')
 }
 
+async function bootstrap() {
+  assertPrivatePermissions(directory)
+  const config = join(directory, 'migrate.toml')
+  assertPrivateLocation(config, { mustExist: true })
+  assertPrivatePermissions(config)
+  // The bootstrap loader requires fixed, executable-relative profile files.
+  // A go-run temporary executable cannot carry those siblings. Use the same
+  // private disposable layout for local developers and GitHub-hosted canaries.
+  const toolDirectory = mkdtempSync(join(directory, 'bootstrap-'))
+  secureWindowsPath(toolDirectory, true)
+  assertPrivatePermissions(toolDirectory)
+  const executable = join(toolDirectory, process.platform === 'win32' ? 'bootstrap.exe' : 'bootstrap')
+  const profileDirectory = join(toolDirectory, 'production-shape')
+  mkdirSync(profileDirectory, { mode: 0o700 })
+  copyFileSync(join(root, 'internal/dbcatalog/golden/production-v0.json'), join(profileDirectory, 'production-v0.json'))
+  copyFileSync(join(root, 'internal/dbcatalog/shape/production-v0.sql'), join(profileDirectory, 'production-v0.sql'))
+  const options = { cwd: root, env: childEnvironment(), stdio: 'inherit', windowsHide: true }
+  execFileSync('go', ['build', '-mod=readonly', '-o', executable, './release/staging/bootstrap'], options)
+  execFileSync(executable, ['-config', config], options)
+}
+
 async function start() {
   for (const path of [directory, privateFile, join(directory, 'server.toml')]) {
     assertPrivateLocation(path, { mustExist: true })
@@ -146,12 +167,7 @@ async function start() {
 const mode = process.argv[2]
 try {
   if (mode === 'configure') await configure()
-  else if (mode === 'bootstrap') {
-    assertPrivatePermissions(directory)
-    assertPrivateLocation(join(directory, 'migrate.toml'), { mustExist: true })
-    assertPrivatePermissions(join(directory, 'migrate.toml'))
-    execFileSync('go', ['run', './release/staging/bootstrap', '-config', join(directory, 'migrate.toml')], { cwd: root, env: childEnvironment(), stdio: 'inherit', windowsHide: true })
-  }
+  else if (mode === 'bootstrap') await bootstrap()
   else if (mode === 'start') await start()
   else throw new Error('Expected configure, bootstrap or start')
 } catch (error) { console.error(error.code ? 'Local setup failed: ' + error.code : error.message); process.exitCode = 1 }

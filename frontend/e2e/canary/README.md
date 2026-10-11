@@ -66,7 +66,8 @@ node frontend/e2e/canary/local-stack.mjs start
 On Windows, build the two binaries with `.exe` suffixes. The launcher uses hidden
 windows. `processes.json` records the process IDs; stop those processes and remove
 only this run's disposable containers after use. Private logs stay beside it.
-The wrapper invokes `go run ./release/staging/bootstrap`. It refuses ambient
+The wrapper builds a stable private bootstrap executable with both pinned
+production profile files beside it, then invokes that executable. It refuses ambient
 `WHATOMATE_*`, `STUB_*`, `META_RELAY_*` and `GMAIL_RELAY_*` variables before any
 operation and strips them again from child environments. Configuration refuses existing database roles, so rerunning `configure` requires
 a new disposable PostgreSQL instance. It never drops a database or replaces roles.
