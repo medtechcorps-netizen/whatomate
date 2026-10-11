@@ -21,9 +21,11 @@ postgres, processes = catalog.postgres, catalog.processes
 proof, runtime = catalog.proof, catalog.runtime
 
 _UPDATE = "UPDATE public.permissions SET description=description WHERE resource='users' AND action='read' RETURNING 1;"
-_ACTOR = "\\set ON_ERROR_STOP off\n" + _UPDATE + "\n\\echo COMPAT_ADVISORY_ACTOR_FINISHED\n\\quit 0\n"
+# PostgreSQL 17's \quit takes no argument; an extra 0 produces a stderr warning.
+# With ON_ERROR_STOP off, its ordinary successful exit preserves this faulty actor.
+_ACTOR = "\\set ON_ERROR_STOP off\n" + _UPDATE + "\n\\echo COMPAT_ADVISORY_ACTOR_FINISHED\n\\quit\n"
 _UPDATE_SHA = "abc599a7aeb21a7a7cbdfdca05775a94dc3e31f94ba73d4a619d87dfb493a69a"
-_ACTOR_SHA = "cf67bf5c47c5632da951cb0fb8c3d1b2119746aa844c70f5a5aef8e2678eaa07"
+_ACTOR_SHA = "5aa17473d9b1b64ab50b64ea6b1e4c0c8d95e98e844f3dbb3a773b37d6757b3e"
 _SESSION = """SELECT json_build_array('advisory-session',current_user,current_database(),
  current_setting('transaction_read_only'),
  (SELECT NOT rolsuper AND NOT rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=current_user),
@@ -140,8 +142,10 @@ class OwnedSwallowedUpdate:
         result = self._call(application, readonly, _ACTOR)
         need(result.returncode == 0, "advisory-actor-exit")
         expected = b"COMPAT_ADVISORY_ACTOR_FINISHED\n" if readonly else b"1\nCOMPAT_ADVISORY_ACTOR_FINISHED\n"
-        need(result.stdout == expected and (bool(result.stderr) if readonly else not result.stderr),
-             "advisory-actor-framing")
+        need(result.stdout == expected,
+             "advisory-actor-ro-stdout" if readonly else "advisory-actor-rw-stdout")
+        need(bool(result.stderr) if readonly else not result.stderr,
+             "advisory-actor-ro-stderr" if readonly else "advisory-actor-rw-stderr")
         captured = self.pg.finish_phase(phase)
         self._idle()
         log = proof.parse_pg_log(**captured["log"], application=application)
