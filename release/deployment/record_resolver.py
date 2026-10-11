@@ -161,6 +161,80 @@ class RollbackProofResolution:
     live_recipe: WebRecipe
 
 
+def rollback_material_digest(resolution: RollbackProofResolution) -> str:
+    """Commit exact bounded raw observations; never authenticate or admit them.
+
+    The producer must first apply the complete source/catalog validator. This
+    serializer cannot establish material completeness, current-v0 eligibility,
+    ancestry, freshness, or the authority for an observed absence. Empty bytes
+    and null have distinct commitments; only that stronger validator can admit
+    either. Both recipe roles remain present when their observations are equal.
+    """
+    def need(value):
+        if not value:
+            raise policy.PolicyRefusal("rollback-material-invalid")
+
+    def valid_sha(value):
+        return type(value) is str and common.SHA1_RE.fullmatch(value) is not None
+
+    need(type(resolution) is RollbackProofResolution
+         and type(resolution.producer) is policy.SourceFacts
+         and valid_sha(resolution.producer.sha)
+         and type(resolution.resolved) is ResolvedChain)
+    selected, latest = resolution.resolved.selected, resolution.resolved.latest
+    need(type(selected) is ReleaseSelection and type(latest) is ReleaseSelection
+         and valid_sha(selected.actual_web_source_sha) and valid_sha(latest.actual_web_source_sha))
+    total = 0
+
+    def raw_value(raw, *, nonempty=False):
+        nonlocal total
+        need(type(raw) is bytes and len(raw) <= policy.MAX_SOURCE_FILE_BYTES
+             and (not nonempty or len(raw) > 0))
+        total += len(raw)
+        need(total <= transport.MAX_BYTES)
+        return {"bytes": len(raw), "sha256": common.sha256_bytes(raw)}
+
+    workflow = raw_value(resolution.workflow, nonempty=True)
+    need(type(resolution.workflow_sha256) is str
+         and common.SHA256_RE.fullmatch(resolution.workflow_sha256) is not None
+         and workflow["sha256"] == resolution.workflow_sha256)
+    workflow["path"] = ".github/workflows/compat.yml"
+    need(type(resolution.materials) is tuple
+         and 1 <= len(resolution.materials) <= 2 * (records.MAX_RECORDS + 1))
+    materials, previous_sha = [], None
+    for material in resolution.materials:
+        need(type(material) is RollbackSourceMaterial and valid_sha(material.source_sha)
+             and (previous_sha is None or previous_sha < material.source_sha)
+             and type(material.provenance) is str
+             and material.provenance in {"equal-reviewed-v0", "legacy-e001-absent-overlay"}
+             and type(material.blobs) is tuple and len(material.blobs) == len(policy.SOURCE_PATHS))
+        blobs, material_bytes = [], 0
+        for path, blob in zip(policy.SOURCE_PATHS, material.blobs, strict=True):
+            need(type(blob) is BlobObservation and type(blob.path) is str and blob.path == path)
+            if blob.raw is None:
+                value = None
+            else:
+                need(type(blob.raw) is bytes)
+                material_bytes += len(blob.raw)
+                need(material_bytes <= policy.MAX_SOURCE_BYTES)
+                value = raw_value(blob.raw)
+            blobs.append([path, value])
+        materials.append({"source_sha": material.source_sha, "provenance": material.provenance, "blobs": blobs})
+        previous_sha = material.source_sha
+    recipes = {}
+    for role, recipe, source_sha in (("target", resolution.target_recipe, selected.actual_web_source_sha),
+                                     ("live", resolution.live_recipe, latest.actual_web_source_sha)):
+        need(type(recipe) is WebRecipe and valid_sha(recipe.source_sha) and recipe.source_sha == source_sha
+             and type(recipe.path) is str and recipe.path == _WEB_RECIPE)
+        value = raw_value(recipe.raw, nonempty=True)
+        need(type(recipe.sha256) is str and common.SHA256_RE.fullmatch(recipe.sha256) is not None
+             and value["sha256"] == recipe.sha256)
+        recipes[role] = {"source_sha": recipe.source_sha, "path": recipe.path, **value}
+    payload = {"purpose": "rollback-v0-material-v1", "producer_sha": resolution.producer.sha,
+               "workflow": workflow, "materials": materials, "recipes": recipes}
+    return common.sha256_bytes(common.canonical_payload_bytes(payload))
+
+
 def _selection(chain, index):
     entry = chain.entries[index]
     return ReleaseSelection(index, entry.release, entry.sha, entry.record.manifest_sha256,

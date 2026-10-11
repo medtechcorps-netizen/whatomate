@@ -474,6 +474,28 @@ does not activate a CLI command or change snapshot4/context3, signed proof
 collection, release admission or retry custody. Controlled tests of the path are
 not actual database or hosted rollback qualification.
 
+Private rollback preview/run helpers now bind that experiment to a separate
+version-1 snapshot with purpose `rollback-v0` and context version 4. They require
+an explicit target on current-main workflow dispatch, re-resolve the full source
+projection inside the original deadline, and compare the fresh snapshot before
+image admission. The binding retains both endpoint identities and actual image
+sources, the retained database origin, the full ordered span commitment and a
+digest derived from raw workflow, source material and both endpoint recipes.
+That compact digest does not replace complete source validation or custody.
+
+The separately named rollback adapter verifies both subjects through the same
+pinned verifier and file-ownership checks as normal evidence. Its pure parser
+accepts only the closed context4 shape; normal parsers reject it, and contexts1-3
+cannot enter the rollback parser. Complete negative measurements retain their
+actual flags and final catalog hash. Parsing or signing them does not make them
+successful. File limits remain 16 KiB for results and 4 KiB for context.
+
+These helpers are not connected to CLI dispatch, workflow publication, the
+compatibility collector, release admission or retry custody. The public target
+and multi-span holds remain. The pending normal snapshot4/context3 contract is
+unchanged, and rollback context4 makes no claim about unapplied pending plans.
+Synthetic protocol tests do not qualify an actual hosted rollback.
+
 The resolution format is version 4. Both `latest` and `selected` contain the
 verified release tag, signed manifest SHA-256, source SHA and web digest.
 `database_base` separately binds the supported legacy source or retained v2
@@ -517,7 +539,7 @@ The current normal admission requires the source-bound context-v3 pair;
 historical context-v1/v2 positives do not establish this newer contract. Their
 actual false flags remain available for negative auditing. Exact old context-v2
 record retries retain a separate closed historical replay path.
-Explicit rollback-target proof and active schema changes remain unsupported.
+Operational rollback-target proof and active schema changes remain unsupported.
 
 After successful upload, a separate guarded `evidence_ready` output permits
 the `attest` job on push or dispatch, including a complete measured negative.

@@ -75,6 +75,14 @@ entrypoint, signed evidence, fresh consumer and retry custody must be connected
 and qualified before the multi-span restriction can change; a private producer
 result does not authorize a release.
 
+Private rollback helpers now prepare and recheck a separate exact-span snapshot
+and context4 pair. The pair binds current-main tooling, both signed endpoints,
+their actual image sources, the retained database origin and raw source-material
+commitment. A dedicated adapter authenticates both subjects and a separate parser
+preserves measured failures. Normal snapshot4/context3 and its consumers remain
+unchanged. These private APIs are not wired into dispatch, collection, admission
+or retry custody; neither a parsed pair nor its digest authorizes rollback.
+
 Before any production provider request, the process serializes and replays the
 complete verified promotion inputs within a fixed output-size bound. Only a
 successful deployment emits those inputs to the same run's record job. The

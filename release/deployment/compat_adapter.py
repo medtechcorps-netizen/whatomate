@@ -144,40 +144,65 @@ def _subject(gh, path, raw, attempt):
         attempt.run_id, attempt.run_attempt, _digest(transcript))
 
 
+def _verify_pair_subjects(gh, archive, location, attempt, scratch):
+    """Authenticate the fixed two-file archive without selecting a protocol."""
+    _identity(location, attempt)
+    _need(gh.repo == evidence.REPOSITORY, "adapter-repository")
+    files = _archive(archive)
+    _directory(scratch)
+    with tempfile.TemporaryDirectory(prefix="compat-verify-", dir=scratch) as temporary:
+        directory = Path(temporary)
+        identities = {}
+        for name, raw in files.items():
+            path = directory / name
+            with path.open("xb") as handle:
+                handle.write(raw)
+            info = path.lstat()
+            identities[name] = (info.st_dev, info.st_ino)
+        _unchanged(directory, files, identities)
+        subjects = {}
+        for name in FILES:
+            subjects[name] = _subject(gh, directory / name, files[name], attempt)
+            _unchanged(directory, files, identities)
+        artifact = evidence.Artifact(location.artifact_id, location.name, location.run_id,
+            location.run_attempt, location.sha, False,
+            tuple(evidence.ArtifactFile(name, _digest(files[name])) for name in FILES))
+        pair = evidence.AuthenticatedPair(files["compat-result.json"], files["compat-context.json"],
+            subjects["compat-result.json"], subjects["compat-context.json"], artifact)
+        return pair
+
+
 def verify_pair(gh: records.Gh, archive: bytes, location: ArtifactLocation,
                 attempt: evidence.Attempt, scratch: Path) -> evidence.AuthenticatedPair:
-    """Verify both actual files; a valid negative pair is returned as negative.
+    """Verify both actual files; a valid normal negative pair stays negative.
 
     Only a reviewed Actions metadata collector may establish ``location`` and
     ``attempt``. This API accepts no preverified JSON transcript or boolean.
     It does not turn the artifact into a successful qualification decision.
     """
     try:
-        _identity(location, attempt)
-        _need(gh.repo == evidence.REPOSITORY, "adapter-repository")
-        files = _archive(archive)
-        _directory(scratch)
-        with tempfile.TemporaryDirectory(prefix="compat-verify-", dir=scratch) as temporary:
-            directory = Path(temporary)
-            identities = {}
-            for name, raw in files.items():
-                path = directory / name
-                with path.open("xb") as handle:
-                    handle.write(raw)
-                info = path.lstat()
-                identities[name] = (info.st_dev, info.st_ino)
-            _unchanged(directory, files, identities)
-            subjects = {}
-            for name in FILES:
-                subjects[name] = _subject(gh, directory / name, files[name], attempt)
-                _unchanged(directory, files, identities)
-            artifact = evidence.Artifact(location.artifact_id, location.name, location.run_id,
-                location.run_attempt, location.sha, False,
-                tuple(evidence.ArtifactFile(name, _digest(files[name])) for name in FILES))
-            pair = evidence.AuthenticatedPair(files["compat-result.json"], files["compat-context.json"],
-                subjects["compat-result.json"], subjects["compat-context.json"], artifact)
-            evidence.parse_authenticated_pair(pair, attempt)
-            return pair
+        pair = _verify_pair_subjects(gh, archive, location, attempt, scratch)
+        evidence.parse_authenticated_pair(pair, attempt)
+        return pair
+    except evidence.CompatRefusal:
+        raise
+    except (common.ReleaseError, OSError, ValueError, TypeError, KeyError, AttributeError,
+            RecursionError, OverflowError):
+        raise evidence.CompatRefusal("compat-stale", "adapter-verification") from None
+
+
+def verify_rollback_pair(gh: records.Gh, archive: bytes, location: ArtifactLocation,
+                         attempt: evidence.Attempt, scratch: Path) -> evidence.AuthenticatedPair:
+    """Authenticate only the closed rollback protocol, without release authority.
+
+    Both subjects use the same pinned verifier and custody as normal evidence.
+    Complete negative measurements remain evidence; normal contexts cannot be
+    reinterpreted as a rollback result.
+    """
+    try:
+        pair = _verify_pair_subjects(gh, archive, location, attempt, scratch)
+        evidence.parse_authenticated_rollback_pair(pair, attempt)
+        return pair
     except evidence.CompatRefusal:
         raise
     except (common.ReleaseError, OSError, ValueError, TypeError, KeyError, AttributeError,
