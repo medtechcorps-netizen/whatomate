@@ -8,12 +8,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import catalog as c
 import test_processes
 import test_postgres
 import test_stack
+import test_record_resolver
 
 REPO=Path(__file__).resolve().parents[2]
 HEAD="e"*40
@@ -327,6 +329,148 @@ class CatalogTests(unittest.TestCase):
                 self.assertTrue(self.manager._protocol_failed)
                 self.assertFalse(self.manager._ids)
                 self.assertFalse(self.world.data_calls)
+
+
+class MaterialCatalogTests(unittest.TestCase):
+    """Real resolver/consumer with synthetic bounded Git/GitHub captures only."""
+    @classmethod
+    def setUpClass(cls):
+        test_record_resolver.ForwardResolverTests.setUpClass()
+
+    def scenario(self, *, legacy=False, explicit=False, e001=False):
+        case = test_record_resolver.ForwardResolverTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        images = {"web": ENTRY.images["web"], "meta-relay": "sha256:" + "8" * 64,
+                  "gmail-relay": "sha256:" + "9" * 64}
+        old = case.add(version=1, sha=c._BASE if e001 else "1" * 40, images=images)
+        case.profile(old["sha"], body=0)
+        if e001:
+            for path in (c._PROFILE, c._OVERLAY):
+                del case.world.files[(old["sha"], path)]
+        if legacy:
+            latest = case.add(version=1)
+            case.profile(latest["sha"])
+        else:
+            origin = case.add()
+            case.profile(origin["sha"])
+            case.add(kind="rollback", target=old)
+        result = case.forward(case.candidate(HEAD), selected_tag=old["release"] if explicit or legacy else None)
+        self.case = case
+        return result
+
+    def consume(self, result):
+        trace = len(self.case.world.trace)
+        self.assertTrue(self.case.client.budget.closed)
+        # Construction must consume bytes already inside the closed operation;
+        # it cannot silently extend that operation through a second Git read.
+        with mock.patch.object(c.runtime, "bounded_command", side_effect=AssertionError("unexpected I/O")), \
+             mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected process")), \
+             mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unexpected file read")):
+            actual = c.CatalogContract.from_resolution(result)
+        self.assertEqual(len(self.case.world.trace), trace)
+        return actual
+
+    def test_rollback_uses_retained_catalog_and_actual_old_image(self):
+        result = self.scenario()
+        actual = self.consume(result)
+        self.assertEqual(actual.previous_sha, "1" * 40)
+        self.assertEqual(actual.database_base_source, "2" * 40)
+        self.assertEqual(actual.catalog_baseline_sha, "2" * 40)
+        self.assertEqual(actual.baseline_provenance, "retained-live-v2")
+        self.assertEqual(actual.previous_web, test_processes.PREV)
+        self.assertEqual(actual.candidate_sha, HEAD)
+        self.assertEqual(len(actual.expected_preexisting_tables), 127)
+        self.assertEqual(actual.target_sha256, c.record_resolver.policy.V0_MEASUREMENT)
+        self.assertEqual(actual.parse_compare((json.dumps(compare(actual)) + "\n").encode()), actual.target_sha256)
+
+    def test_exact_historical_target_does_not_change_retained_origin(self):
+        result = self.scenario(explicit=True)
+        self.assertNotEqual(result.resolved.latest.release, result.resolved.selected.release)
+        actual = self.consume(result)
+        self.assertEqual((actual.previous_sha, actual.catalog_baseline_sha), ("1" * 40, "2" * 40))
+
+    def test_legacy_selected_catalog_is_not_invented_live_contract(self):
+        result = self.scenario(legacy=True)
+        actual = self.consume(result)
+        self.assertIsNone(result.resolved.latest.live)
+        self.assertEqual(actual.database_base_source, "2" * 40)
+        self.assertEqual(actual.catalog_baseline_sha, "1" * 40)
+        self.assertEqual(actual.baseline_provenance, "legacy-equal-reviewed-v0")
+
+    def test_only_exact_e001_legacy_source_admits_both_absent(self):
+        result = self.scenario(legacy=True, e001=True)
+        actual = self.consume(result)
+        self.assertEqual(actual.catalog_baseline_sha, c._BASE)
+        self.assertEqual(actual.public()["base_overlay"], "explicit-empty-first-baseline")
+        for path in (c._PROFILE, c._OVERLAY):
+            altered = tuple(replace(row, raw=BLOBS[path]) if row.path == path else row
+                            for row in result.catalog_material.baseline_blobs)
+            with self.subTest(path=path), self.assertRaises(c.proof.EvidenceError):
+                self.consume(replace(result, catalog_material=replace(result.catalog_material, baseline_blobs=altered)))
+
+    def test_retained_origin_never_uses_selected_image_absence_exception(self):
+        result = self.scenario(e001=True)
+        self.assertEqual(self.consume(result).public()["base_overlay"], "equal-reviewed-v0-nop")
+        for provenance in ("legacy-e001-absent-overlay", "legacy-equal-reviewed-v0"):
+            changed = replace(result.catalog_material, baseline_sha=c._BASE, baseline_provenance=provenance)
+            with self.subTest(provenance=provenance), self.assertRaises(c.proof.EvidenceError):
+                self.consume(replace(result, catalog_material=changed))
+
+    def test_missing_reordered_duplicated_or_changed_material_refuses(self):
+        result = self.scenario()
+        for field in ("candidate_blobs", "baseline_blobs"):
+            original = getattr(result.catalog_material, field)
+            changed = original[0]._replace(raw=original[0].raw + b" ") if field == "candidate_blobs" else replace(original[0], raw=None)
+            for rows in (original[:-1], tuple(reversed(original)), (original[0],) * len(original),
+                         (changed, *original[1:]), list(original)):
+                with self.subTest(field=field), self.assertRaises(c.proof.EvidenceError):
+                    self.consume(replace(result, catalog_material=replace(result.catalog_material, **{field: rows})))
+
+    def test_source_identity_and_fact_disagreements_refuse(self):
+        result = self.scenario()
+        material = result.catalog_material
+        cases = [replace(result, previous_web_source_sha="2" * 40),
+                 replace(result, database_base_source="1" * 40),
+                 replace(result, catalog_material=replace(material, candidate_sha="f" * 40)),
+                 replace(result, catalog_material=replace(material, baseline_sha="1" * 40)),
+                 replace(result, candidate=replace(result.candidate, mode="synthetic-policy")),
+                 replace(result, candidate=replace(result.candidate, artifacts=())),
+                 replace(result, catalog_material=object())]
+        for changed in cases:
+            with self.subTest(changed=cases.index(changed)), self.assertRaises(c.proof.EvidenceError):
+                self.consume(changed)
+
+    def test_non_e001_legacy_cannot_claim_absence(self):
+        result = self.scenario(legacy=True)
+        material = result.catalog_material
+        for path in (c._PROFILE, c._OVERLAY):
+            rows = tuple(replace(row, raw=None) if row.path == path else row for row in material.baseline_blobs)
+            with self.subTest(path=path), self.assertRaises(c.proof.EvidenceError):
+                self.consume(replace(result, catalog_material=replace(material, baseline_blobs=rows)))
+
+    def test_owned_catalog_binds_actual_image_not_retained_database_source(self):
+        result = self.scenario(e001=True)
+        actual = self.consume(result)
+        legacy = CatalogTests()
+        legacy.setUp()
+        self.addCleanup(legacy.doCleanups)
+        legacy.setup_owned()
+        observer = c.OwnedCatalog(legacy.manager, legacy.pg, actual)
+        self.assertIs(observer.contract, actual)
+        previous = legacy.manager.bindings["previous"]
+        legacy.manager.bindings["previous"] = replace(previous, source_sha=actual.database_base_source)
+        with self.assertRaisesRegex(c.proof.EvidenceError, "catalog-image-source-mismatch"):
+            c.OwnedCatalog(legacy.manager, legacy.pg, actual)
+
+    def test_malformed_selected_digest_or_component_inventory_refuses(self):
+        result = self.scenario()
+        selected = result.resolved.selected
+        for images in (selected.images[:-1], tuple(reversed(selected.images)),
+                       tuple((key, test_processes.PREV if key == "web" else digest) for key, digest in selected.images)):
+            changed = replace(result, resolved=replace(result.resolved, selected=replace(selected, images=images)))
+            with self.subTest(images=images), self.assertRaises(c.proof.EvidenceError):
+                self.consume(changed)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

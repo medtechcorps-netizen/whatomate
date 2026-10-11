@@ -24,6 +24,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import postgres
 import processes
+import record_resolver
 
 runtime, proof = processes.runtime, processes.proof
 _BASE = "e0016b3595114728e7864da2adb44c29065f25ef"
@@ -102,6 +103,86 @@ class CatalogContract:
                 need(git(["ls-tree", "-z", self.previous_sha, "--", name],1024) == b"", "catalog-base-overlay-unsupported")
         self._base_overlay = ("explicit-empty-first-baseline" if previous.sha == _BASE
                               else "equal-reviewed-v0-nop")
+        self._load_pinned(blobs)
+
+    @classmethod
+    def from_resolution(cls, resolution: record_resolver.ForwardResolution):
+        """Consume already gathered source bytes without opening a new budget.
+
+        This is a pure consistency check, not authentication or permission to
+        deploy. The future operational caller must create its own resolution
+        through the concrete resolver. The previous image source remains
+        separate from the retained database origin after an image rollback.
+        The legacy constructor and live callers are unchanged by this method.
+        """
+        need(cls is CatalogContract and type(resolution) is record_resolver.ForwardResolution)
+        policy = record_resolver.policy
+        resolved, candidate, material = resolution.resolved, resolution.candidate, resolution.catalog_material
+        need(type(resolved) is record_resolver.ResolvedChain
+             and type(candidate) is policy.SourceFacts
+             and type(material) is record_resolver.CatalogMaterial)
+        latest, selected = resolved.latest, resolved.selected
+        need(type(latest) is record_resolver.ReleaseSelection
+             and type(selected) is record_resolver.ReleaseSelection)
+        need(all(type(sha) is str and _SHA.fullmatch(sha) for sha in
+                 (candidate.sha, latest.record_sha, selected.actual_web_source_sha, material.baseline_sha)))
+        need(resolution.previous_web_source_sha == selected.actual_web_source_sha
+             and material.candidate_sha == candidate.sha, "catalog-image-source-mismatch")
+        try:
+            policy._source(candidate)
+        except policy.PolicyRefusal:
+            raise proof.EvidenceError("catalog-contract-invalid") from None
+        need(candidate.mode == "reviewed-v0", "catalog-progression-unsupported")
+        paths = tuple(sorted(_PINS))
+        need(type(material.candidate_blobs) is tuple and len(material.candidate_blobs) == len(paths)
+             and all(type(row) is policy.SourceBlob for row in material.candidate_blobs)
+             and tuple(row.path for row in material.candidate_blobs) == paths)
+        need(type(material.baseline_blobs) is tuple and len(material.baseline_blobs) == len(paths)
+             and all(type(row) is record_resolver.BlobObservation for row in material.baseline_blobs)
+             and tuple(row.path for row in material.baseline_blobs) == paths)
+        blobs = {row.path: row.raw for row in material.candidate_blobs}
+        need(all(type(raw) is bytes and hashlib.sha256(raw).hexdigest() == _PINS[path]
+                 for path, raw in blobs.items()), "catalog-progression-unsupported")
+        need(all(dict(candidate.artifacts)[path] == _PINS[path] for path in paths))
+        absent = set()
+        if latest.live is not None:
+            live = latest.live
+            need(type(live) is policy.LiveContract and type(live.origin_source) is policy.SourceFacts)
+            try:
+                policy._source(live.origin_source)
+            except policy.PolicyRefusal:
+                raise proof.EvidenceError("catalog-contract-invalid") from None
+            need(live.origin_source.mode == "reviewed-v0" and live.catalog == live.origin_source.catalog
+                 and material.baseline_sha == live.origin_source.sha
+                 and resolution.database_base_source == live.origin_source.sha
+                 and material.baseline_provenance == "retained-live-v2", "catalog-fallback-not-equal")
+        else:
+            need(material.baseline_sha == selected.actual_web_source_sha
+                 and resolution.database_base_source == latest.record_sha, "catalog-fallback-not-equal")
+            if material.baseline_sha == _BASE:
+                need(material.baseline_provenance == "legacy-e001-absent-overlay")
+                absent = {_PROFILE, _OVERLAY}
+            else:
+                need(material.baseline_provenance == "legacy-equal-reviewed-v0")
+        for row in material.baseline_blobs:
+            need(row.raw is None if row.path in absent else type(row.raw) is bytes and row.raw == blobs[row.path],
+                 "catalog-fallback-not-equal")
+        need(type(selected.images) is tuple and len(selected.images) == len(runtime.common.COMPONENTS)
+             and all(type(row) is tuple and len(row) == 2 for row in selected.images)
+             and tuple(row[0] for row in selected.images) == runtime.common.COMPONENTS)
+        digest = dict(selected.images)["web"]
+        need(type(digest) is str and runtime.common.DIGEST_RE.fullmatch(digest))
+        contract = cls.__new__(cls)
+        contract.previous_sha, contract.candidate_sha = selected.actual_web_source_sha, candidate.sha
+        contract.previous_web = runtime.common.IMAGE_REPOSITORY["web"] + "@" + digest
+        contract.database_base_source = resolution.database_base_source
+        contract.catalog_baseline_sha = material.baseline_sha
+        contract.baseline_provenance = material.baseline_provenance
+        contract._base_overlay = "explicit-empty-first-baseline" if absent else "equal-reviewed-v0-nop"
+        contract._load_pinned(blobs)
+        return contract
+
+    def _load_pinned(self, blobs):
         golden, profile = _json(blobs[_GOLDEN]), _json(blobs[_PROFILE])
         need(type(golden) is dict and set(golden) == {"version","objects"} and golden["version"] == 0)
         need(profile["released_source"] == _BASE and profile["golden_sha256"] == _PINS[_GOLDEN]
