@@ -22,7 +22,7 @@ e, c, p, r, t, d = (writer.evidence, writer.collect, writer.policy,
                     writer.resolver, writer.transport, writer.records)
 s = r.schema_change
 
-VERSION = "2"
+VERSION = "3"
 CHUNK_SIZE = 8192
 CHUNK_SLOTS = tuple(f"handoff_{i:02d}" for i in range(1, 33))
 MAX_ENCODED = CHUNK_SIZE * len(CHUNK_SLOTS)
@@ -33,6 +33,7 @@ MAX_EXPANDED_BYTES = 16 * 1024 * 1024
 MAX_BLOBS = 4096
 MAX_NODES = 100_000
 MAX_DEPTH = 48
+XZ_MEMORY_LIMIT = 64 * 1024 * 1024
 MAX_INTEGER = 10 ** 20 - 1
 METADATA = ("handoff_version", "handoff_sha256", "handoff_raw_length",
             "handoff_compressed_length", "handoff_encoded_length", "handoff_chunk_count")
@@ -177,7 +178,7 @@ _MISSING = {
 
 
 class _Budget:
-    def __init__(self, blobs=None, *, version=2):
+    def __init__(self, blobs=None, *, version=3):
         self.version = version
         self.nodes = 0
         self.scalars = 0
@@ -365,7 +366,7 @@ def _replay(handoff, candidate_sha, workflow_sha, run_id, record_attempt, *, ver
     if version == 1:
         _need(resolution.audit is None)
     else:
-        _need(version == 2)
+        _need(version in (2, 3))
         r.validate_forward_audit(resolution.audit, candidate_sha=resolution.candidate.sha,
             database_base_source=resolution.database_base_source,
             latest_record_sha=resolution.resolved.latest.record_sha,
@@ -387,6 +388,81 @@ def _inflate(compressed, maximum):
     raw = inflater.decompress(compressed, maximum + 1)
     _need(len(raw) <= maximum and inflater.eof and not inflater.unused_data and not inflater.unconsumed_tail)
     return raw
+
+
+def _xz_module():
+    # Optional standard-library support is needed only for the new wire. A
+    # runtime without liblzma must still decode historical v1/v2 custody.
+    try:
+        import lzma
+    except ImportError:
+        raise HandoffRefusal("record-handoff-invalid") from None
+    _need(lzma.is_check_supported(lzma.CHECK_CRC64))
+    return lzma
+
+
+def _xz_compress(raw):
+    xz = _xz_module()
+    try:
+        return xz.compress(raw, format=xz.FORMAT_XZ, check=xz.CHECK_CRC64, preset=6)
+    except xz.LZMAError:
+        raise HandoffRefusal("record-handoff-invalid") from None
+
+
+def _xz_inflate(compressed, maximum):
+    xz = _xz_module()
+    try:
+        inflater = xz.LZMADecompressor(format=xz.FORMAT_XZ, memlimit=XZ_MEMORY_LIMIT)
+        raw = inflater.decompress(compressed, max_length=maximum + 1)
+    except xz.LZMAError:
+        raise HandoffRefusal("record-handoff-invalid") from None
+    _need(len(raw) <= maximum and inflater.eof and not inflater.unused_data
+          and inflater.check == xz.CHECK_CRC64)
+    return raw
+
+
+def _frame(encoded, blobs):
+    # Only bytes are deduplicated. Every typed node and history row remains in
+    # the canonical header; raw blobs follow in exact digest order. The outer
+    # metadata binds the complete frame's size and SHA256, including this prefix.
+    rows = sorted(blobs.items())
+    header = _canonical({"version": 3, "handoff": encoded,
+        "blobs": [{"sha256": digest, "length": len(raw)} for digest, raw in rows]})
+    size = 4 + len(header) + sum(len(raw) for _, raw in rows)
+    _need(0 < len(header) <= MAX_RAW - 4 and size <= MAX_RAW)
+    return len(header).to_bytes(4, "big") + header + b"".join(raw for _, raw in rows)
+
+
+def _json(raw):
+    _scan(raw)
+    value = json.loads(raw, object_pairs_hook=_pairs, parse_int=_integer,
+                       parse_float=_invalid_constant, parse_constant=_invalid_constant)
+    _exact(value, ("version", "handoff", "blobs"))
+    _need(_canonical(value) == raw)
+    return value
+
+
+def _unframe(raw):
+    _need(4 < len(raw) <= MAX_RAW)
+    size = int.from_bytes(raw[:4], "big")
+    _need(0 < size <= MAX_RAW - 4 and 4 + size <= len(raw))
+    value = _json(raw[4:4 + size])
+    _need(type(value["version"]) is int and value["version"] == 3)
+    rows = value["blobs"]
+    _need(type(rows) is list and 1 <= len(rows) <= MAX_BLOBS)
+    offset, total, previous, blobs = 4 + size, 0, "", {}
+    for row in rows:
+        _exact(row, ("sha256", "length"))
+        digest, length = row["sha256"], row["length"]
+        _need(type(digest) is str and writer.common.SHA256_RE.fullmatch(digest)
+              and digest > previous and type(length) is int and 0 <= length <= MAX_BLOB
+              and total + length <= MAX_EXPANDED_BYTES and offset + length <= len(raw))
+        blob = raw[offset:offset + length]
+        _need(writer.common.sha256_bytes(blob) == digest)
+        blobs[digest] = blob
+        offset += length; total += length; previous = digest
+    _need(offset == len(raw))
+    return value, blobs
 
 
 def _decode_blobs(rows):
@@ -412,7 +488,7 @@ def _decode_blobs(rows):
 def _unpack(outputs):
     _exact(outputs, OUTPUT_KEYS)
     _need(all(type(value) is str and len(value) <= CHUNK_SIZE and value.isascii() for value in outputs.values())
-          and outputs["handoff_version"] in ("1", VERSION)
+          and outputs["handoff_version"] in ("1", "2", VERSION)
           and writer.common.SHA256_RE.fullmatch(outputs["handoff_sha256"]))
     encoded_size = _length(outputs["handoff_encoded_length"], MAX_ENCODED)
     compressed_size = _length(outputs["handoff_compressed_length"], MAX_COMPRESSED)
@@ -426,7 +502,8 @@ def _unpack(outputs):
     _need(len(text) == encoded_size)
     compressed = _unb64(text, MAX_COMPRESSED)
     _need(len(compressed) == compressed_size)
-    raw = _inflate(compressed, raw_size)
+    raw = (_xz_inflate(compressed, raw_size) if outputs["handoff_version"] == "3"
+           else _inflate(compressed, raw_size))
     _need(len(raw) == raw_size
           and writer.common.sha256_bytes(raw) == outputs["handoff_sha256"])
     return raw
@@ -439,16 +516,18 @@ def decode(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
     record_attempt may increase on a record-only rerun; original production
     execution stays attempt1. V1 decodes only historical record custody with
     audit=None; it cannot be encoded again or supply future operational gates.
+    V2 retains its exact zlib/JSON wire. New writes use bounded XZ framing (v3).
     A hash cannot authenticate hostile substituted data.
     """
     raw = _unpack(outputs)
-    _scan(raw)
-    value = json.loads(raw, object_pairs_hook=_pairs, parse_int=_integer,
-                       parse_float=_invalid_constant, parse_constant=_invalid_constant)
-    _exact(value, ("version", "handoff", "blobs"))
     version = int(outputs["handoff_version"])
-    _need(type(value["version"]) is int and value["version"] == version and _canonical(value) == raw)
-    budget = _Budget(_decode_blobs(value["blobs"]), version=version)
+    if version == 3:
+        value, blobs = _unframe(raw)
+    else:
+        value = _json(raw)
+        blobs = _decode_blobs(value["blobs"])
+    _need(type(value["version"]) is int and value["version"] == version)
+    budget = _Budget(blobs, version=version)
     handoff = _value(value["handoff"], writer.PromotionHandoff, budget, 0, encoding=False)
     _need(budget.used == budget.blobs.keys())
     return _replay(handoff, candidate_sha, workflow_sha, run_id, record_attempt, version=version)
@@ -463,15 +542,8 @@ def encode(handoff):
     """
     budget = _Budget()
     encoded = _value(handoff, writer.PromotionHandoff, budget, 0, encoding=True)
-    # Each unique bytes value has its own bounded stream. Compressing binary
-    # source before base64 avoids expansion from duplicate multi-MiB catalog
-    # leaves while retaining every original byte and every history entry.
-    blobs = [{"sha256": digest, "length": len(raw), "value": _b64(zlib.compress(raw, 9))}
-             for digest, raw in sorted(budget.blobs.items())]
-    value = {"version": 2, "handoff": encoded, "blobs": blobs}
-    raw = _canonical(value)
-    _need(0 < len(raw) <= MAX_RAW)
-    compressed = zlib.compress(raw, level=9)
+    raw = _frame(encoded, budget.blobs)
+    compressed = _xz_compress(raw)
     _need(0 < len(compressed) <= MAX_COMPRESSED)
     text = _b64(compressed); _need(len(text) <= MAX_ENCODED)
     count = (len(text) + CHUNK_SIZE - 1) // CHUNK_SIZE

@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import lzma
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -40,9 +41,15 @@ class HandoffTests(unittest.TestCase):
         cls.handoff = w.prepare_promotion(cls.resolution, cls.history,
             fixture.images(cls.resolution), fixture.execution(), staging='passed')
         cls.outputs = codec.encode(cls.handoff)
-        text = ''.join(cls.outputs[f'handoff_{i:02d}'] for i in range(1, 33))
-        cls.raw = zlib.decompress(base64.b64decode(text))
-        cls.wire = json.loads(cls.raw)
+        # Retain a separately built historical v2 wire for all inherited JSON,
+        # per-blob zlib and closed-type adversarial cases. Public success uses v3.
+        budget = codec._Budget(version=2)
+        node = codec._value(cls.handoff, w.PromotionHandoff, budget, 0, encoding=True)
+        cls.wire = {'version': 2, 'handoff': node, 'blobs': [
+            {'sha256': digest, 'length': len(raw),
+             'value': base64.b64encode(zlib.compress(raw, 9)).decode()}
+            for digest, raw in sorted(budget.blobs.items())]}
+        cls.raw = raw_json(cls.wire)
 
     def decode(self, outputs=None, **changes):
         args = dict(candidate_sha=self.handoff.candidate_images.sha,
@@ -121,7 +128,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIs(json.loads(negative.result)['old_server_ok']['workers'], False)
 
     def test_hash_lengths_counts_versions_and_slots_are_not_optional(self):
-        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '3'),
+        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '4'),
                            ('handoff_raw_length', '1'), ('handoff_compressed_length', '1'),
                            ('handoff_encoded_length', '1'), ('handoff_chunk_count', '0'),
                            ('handoff_chunk_count', '01'), ('handoff_raw_length', True)]:
@@ -278,8 +285,8 @@ class HandoffTests(unittest.TestCase):
         return envelope(raw_json(wire), version='1')
 
     def test_version2_preserves_all_audit_ranges_and_drill_source_bytes(self):
-        restored = self.decode(record_attempt=2)
-        self.assertEqual(self.outputs['handoff_version'], '2')
+        restored = self.decode(envelope(self.raw), record_attempt=2)
+        self.assertEqual(self.outputs['handoff_version'], '3')
         self.assertEqual(self.wire['version'], 2)
         self.assertEqual(restored.resolution.audit, self.resolution.audit)
         self.assertEqual(len(restored.resolution.audit.changes), 3)
@@ -337,6 +344,198 @@ class HandoffTests(unittest.TestCase):
         with mock.patch.object(w.common.Output, 'set_outputs', side_effect=AssertionError('partial output')), \
              mock.patch.object(w.transport.runtime, 'bounded_command', side_effect=AssertionError('provider/command')):
             with self.assertRaises(codec.HandoffRefusal): codec.encode(changed)
+
+
+def xz_envelope(raw, *, compressed=None):
+    packed = (lzma.compress(raw, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=6)
+              if compressed is None else compressed)
+    return envelope(raw, compressed=packed, version='3')
+
+
+def frame(header, payload):
+    raw = raw_json(header)
+    return len(raw).to_bytes(4, 'big') + raw + payload
+
+
+class XZTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        HandoffTests.setUpClass.__func__(cls)
+        encoded = ''.join(cls.outputs[key] for key in codec.CHUNK_SLOTS)
+        cls.frame = lzma.decompress(base64.b64decode(encoded), format=lzma.FORMAT_XZ)
+        size = int.from_bytes(cls.frame[:4], 'big')
+        cls.header = json.loads(cls.frame[4:4 + size])
+        cls.payload = cls.frame[4 + size:]
+        cls.measurements = {'baseline': {
+            'raw_bytes': len(cls.frame), 'header_bytes': size,
+            'compressed_bytes': int(cls.outputs['handoff_compressed_length']),
+            'encoded_bytes': int(cls.outputs['handoff_encoded_length']),
+            'chunks': int(cls.outputs['handoff_chunk_count']),
+            'raw_sha256': cls.outputs['handoff_sha256'],
+            'history_attempts': len(cls.handoff.collected.history.attempts),
+            'public_roundtrip': True}}
+
+    decode = HandoffTests.decode
+    refuse = HandoffTests.refuse
+
+    def test_v3_complete_history_public_roundtrip_and_historical_reencoding(self):
+        restored = self.decode(record_attempt=4)
+        self.assertEqual(restored, self.handoff)
+        self.assertEqual(restored.collected.history, self.history.history)
+        self.assertEqual(self.header['version'], 3)
+        self.assertEqual(int(self.outputs['handoff_raw_length']), len(self.frame))
+        self.assertEqual(self.outputs['handoff_sha256'], hashlib.sha256(self.frame).hexdigest())
+        self.assertGreater(len(self.frame), 1762225)
+        old = self.decode(envelope(self.raw), record_attempt=2)
+        self.assertEqual(codec.encode(old), self.outputs)
+        # Hash-bound transport does not admit a different operation identity.
+        self.refuse(run_id=self.handoff.execution.run_id + 1)
+
+    def test_lzma_absence_is_fixed_refusal_only_for_new_wire(self):
+        import builtins
+        original = builtins.__import__
+        def without_lzma(name, *args, **kwargs):
+            if name == 'lzma': raise ImportError('PRIVATE unsupported runtime')
+            return original(name, *args, **kwargs)
+        with mock.patch('builtins.__import__', side_effect=without_lzma):
+            self.refuse()
+            with self.assertRaisesRegex(codec.HandoffRefusal, '^record-handoff-invalid$'):
+                codec.encode(self.handoff)
+            self.assertEqual(self.decode(envelope(self.raw)), self.handoff)
+            self.assertIsNone(self.decode(HandoffTests.legacy_outputs(self)).resolution.audit)
+        with mock.patch.object(lzma, 'is_check_supported', return_value=False):
+            self.refuse()
+
+    def test_xz_requires_crc64_one_complete_stream_and_bounded_expansion(self):
+        packed = base64.b64decode(''.join(self.outputs[key] for key in codec.CHUNK_SLOTS))
+        for bad in (packed[:-1], packed + b'PRIVATE', packed + packed,
+                    packed + b'\0' * 4, packed[:30] + bytes([packed[30] ^ 1]) + packed[31:],
+                    zlib.compress(self.frame), b'PRIVATE'):
+            with self.subTest(kind='stream'): self.refuse(xz_envelope(self.frame, compressed=bad))
+        for check in (lzma.CHECK_NONE, lzma.CHECK_CRC32, lzma.CHECK_SHA256):
+            self.refuse(xz_envelope(self.frame, compressed=lzma.compress(self.frame, check=check)))
+        self.refuse(xz_envelope(self.frame,
+            compressed=lzma.compress(self.frame, format=lzma.FORMAT_ALONE)))
+        with mock.patch.object(codec, 'XZ_MEMORY_LIMIT', 1024 * 1024): self.refuse()
+        bomb = xz_envelope(b'x' * 1025); bomb['handoff_raw_length'] = '1024'
+        with mock.patch.object(codec, 'MAX_RAW', 1024): self.refuse(bomb)
+
+    def test_header_prefix_json_and_total_frame_framing_are_exact(self):
+        header = raw_json(self.header)
+        for raw in (b'\0' * 4, b'\0\0\0', (0xffffffff).to_bytes(4, 'big') + header,
+                    (len(header) - 1).to_bytes(4, 'big') + header + self.payload,
+                    (len(header) + 1).to_bytes(4, 'big') + header + self.payload,
+                    self.frame[:-1], self.frame + b'PRIVATE'):
+            self.refuse(xz_envelope(raw))
+        for bad in (b'{"version":3,"version":3,"handoff":null,"blobs":[]}\n',
+                    b'{"version":NaN,"handoff":null,"blobs":[]}\n',
+                    b'[' * 49 + b'0' + b']' * 49,
+                    header + b' ', json.dumps(self.header, indent=2).encode()):
+            self.refuse(xz_envelope(len(bad).to_bytes(4, 'big') + bad + self.payload))
+        for version in (True, 1, 2, 4):
+            changed = copy.deepcopy(self.header); changed['version'] = version
+            self.refuse(xz_envelope(frame(changed, self.payload)))
+        changed = dict(self.outputs); changed['handoff_version'] = '2'; self.refuse(changed)
+        old = envelope(self.raw); old['handoff_version'] = '3'; self.refuse(old)
+
+    def test_raw_blob_descriptors_and_payload_require_complete_sorted_exact_bytes(self):
+        for modify in (lambda rows: rows.reverse(), lambda rows: rows.append(rows[-1]),
+                       lambda rows: rows.pop(), lambda rows: rows[0].update(length=True),
+                       lambda rows: rows[0].update(length=-1),
+                       lambda rows: rows[0].update(length=codec.MAX_BLOB + 1),
+                       lambda rows: rows[0].update(sha256='f' * 64),
+                       lambda rows: rows[0].update(value='PRIVATE'),
+                       lambda rows: rows.clear()):
+            changed = copy.deepcopy(self.header); modify(changed['blobs'])
+            self.refuse(xz_envelope(frame(changed, self.payload)))
+        self.refuse(xz_envelope(frame(self.header, b'!' + self.payload[1:])))
+        value, blobs = codec._unframe(self.frame)
+        # A correctly hashed unused blob is still not admitted.
+        blobs[hashlib.sha256(b'extra').hexdigest()] = b'extra'
+        self.refuse(xz_envelope(codec._frame(value['handoff'], blobs)))
+        for limit in ('MAX_BLOBS', 'MAX_BLOB', 'MAX_EXPANDED_BYTES', 'MAX_NODES'):
+            with self.subTest(limit=limit), mock.patch.object(codec, limit, 1): self.refuse()
+
+    def test_v3_replay_and_complete_audit_are_not_bypassed_by_rehashed_frames(self):
+        for modify in (lambda f: f['resolution']['fields'].pop('audit'),
+                       lambda f: f['resolution']['fields'].update(audit=None),
+                       lambda f: f['facts']['fields'].update(compat_run_id=123),
+                       lambda f: f['collected']['fields']['history']['fields'].update(enumeration='incomplete'),
+                       lambda f: f['execution']['fields'].update(run_attempt=2),
+                       lambda f: f.update(PRIVATE=None)):
+            changed = copy.deepcopy(self.header); modify(changed['handoff']['fields'])
+            self.refuse(xz_envelope(frame(changed, self.payload)))
+
+    def test_exact_frame_and_reference_caps_refuse_without_truncation(self):
+        value, blobs = codec._unframe(self.frame)
+        with mock.patch.object(codec, 'MAX_RAW', len(self.frame)):
+            self.assertEqual(codec._frame(value['handoff'], blobs), self.frame)
+            self.assertEqual(self.decode(), self.handoff)
+        with mock.patch.object(codec, 'MAX_RAW', len(self.frame) - 1):
+            self.refuse()
+            with self.assertRaises(codec.HandoffRefusal): codec._frame(value['handoff'], blobs)
+        # Each typed occurrence consumes expanded-reference capacity, even if
+        # the raw blob appears only once in the frame.
+        budget = codec._Budget(blobs)
+        with mock.patch.object(codec, 'MAX_EXPANDED_BYTES', sum(map(len, blobs.values()))):
+            with self.assertRaises(codec.HandoffRefusal):
+                codec._value(value['handoff'], w.PromotionHandoff, budget, 0, encoding=False)
+
+    def test_full_pending_catalog_capacity_is_lossless_projection_not_admission(self):
+        import pending_plan as pending
+        import test_pending_plan as pending_fixture
+        args = pending_fixture.fixture()
+        root = fixture.composition.source.ROOT
+        active = dict(active_catalog=(root / codec.p.GOLDEN).read_bytes(),
+                      active_globals=(root / codec.p.GLOBALS).read_bytes(),
+                      active_history=(root / codec.p.HISTORY).read_bytes())
+        target_path = pending.PREFIX + 'catalog-v1.json'
+        target = json.loads(args['files'][target_path])
+        target['objects'] = json.loads(active['active_catalog'])['objects'] + [row for row in target['objects']
+            if row['identity'] not in ('organizations', 'organizations.id')]
+        globals_ = json.loads(active['active_globals']) + [row for row in json.loads(args['files'][pending.GLOBALS])
+            if row['name'] != 'organizations']
+        args.update(active)
+        args['files'][target_path] = pending.canonical(target)
+        args['files'][pending.GLOBALS] = pending.canonical(globals_)
+        plan = json.loads(args['files'][pending.PLAN])
+        plan.update({key + '_file_sha256': pending.digest(raw) for key, raw in active.items()})
+        plan['globals_file_sha256'] = pending.digest(args['files'][pending.GLOBALS])
+        plan['entries'][0].update(catalog_file_sha256=pending.digest(args['files'][target_path]),
+                                  globals_sha256=plan['globals_file_sha256'])
+        args['files'][pending.PLAN] = pending.canonical(plan)
+        parsed = pending.parse_bundle(**args)
+        self.assertEqual(len(parsed.entries[0].objects), 4452)
+        material = self.handoff.resolution.catalog_material
+        added = tuple(codec.p.SourceBlob(path, raw) for path, raw in sorted(args['files'].items()))
+        projected = replace(self.handoff, resolution=replace(self.resolution,
+            catalog_material=replace(material, candidate_blobs=material.candidate_blobs + added)))
+        budget = codec._Budget()
+        node = codec._value(projected, w.PromotionHandoff, budget, 0, encoding=True)
+        binary = codec._frame(node, budget.blobs)
+        packed = codec._xz_compress(binary)
+        outputs = xz_envelope(binary, compressed=packed)
+        self.assertLessEqual(int(outputs['handoff_encoded_length']), codec.MAX_ENCODED)
+        self.assertEqual(codec._unpack(outputs), binary)
+        value, blobs = codec._unframe(binary)
+        restored_budget = codec._Budget(blobs)
+        restored = codec._value(value['handoff'], w.PromotionHandoff, restored_budget, 0, encoding=False)
+        self.assertEqual(restored, projected)
+        self.assertEqual(restored.collected, self.handoff.collected)
+        self.assertEqual(restored_budget.used, blobs.keys())
+        # The current source/writer contract deliberately still rejects pending
+        # files. Capacity does not grant SQL, source or operational authority.
+        self.refuse(outputs)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(projected)
+        type(self).measurements['pending_projection'] = {
+            'raw_bytes': len(binary), 'header_bytes': int.from_bytes(binary[:4], 'big'),
+            'compressed_bytes': len(packed), 'encoded_bytes': int(outputs['handoff_encoded_length']),
+            'chunks': int(outputs['handoff_chunk_count']), 'raw_sha256': outputs['handoff_sha256'],
+            'history_attempts': len(restored.collected.history.attempts),
+            'target_objects': len(parsed.entries[0].objects),
+            'pending_files': [{'path': row.path, 'bytes': len(row.raw),
+                               'sha256': hashlib.sha256(row.raw).hexdigest()} for row in added],
+            'wire_roundtrip': True, 'public_admission': False}
 
 
 if __name__ == '__main__':
