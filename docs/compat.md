@@ -757,10 +757,20 @@ workflow source never borrows the current producer's execution window.
 The collector shares one already-open caller allowance across Git, API and
 signature subprocesses, binds its returned observation to actual captured
 transcripts, and closes that collection phase on return or refusal. It does not
-activate an operational caller. The later preflight must resolve complete signed
-source before and after collection under the original outer allowance; closed
-resolver budgets cannot be reused. Public rollback across two or more non-none
+activate an operational caller. The preparatory rollback preflight now resolves
+complete signed source before and after collection using three fresh, closed
+phase budgets under one original outer allowance. It requires complete source
+equality, exact history qualification and a final check of the selected artifact's
+expiry. It preserves the original history observation time rather than treating
+the final source read as a fresh Actions observation. The returned result is data,
+not operational permission. Public rollback across two or more non-none
 intermediates still refuses. Existing normal collection predicates are unchanged.
+
+The preflight and unchanged normal preflight passed 63 synthetic cases (22 new
+rollback cases and 41 normal cases), including source and inventory drift,
+foreign-head vetoes, expiry, shared deadlines and aggregate command/byte limits.
+These checks do not establish hosted signatures, permissions, deleted-run
+coverage or future freshness, and do not activate the rollback workflow.
 
 The concrete collector and shared verifier/GET seams passed 99 synthetic cases;
 the existing pure history/request bridge passed 43 more. Controlled immutable
