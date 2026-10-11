@@ -1,0 +1,149 @@
+"""Preparatory authenticated record/source resolution; no deployment authority.
+
+The concrete transport owns signature verification. The immutable projections
+below retain that operation's inputs, not a transferable cryptographic receipt.
+Selection does not invoke rollback policy or fabricate a legacy live catalog.
+Only the reviewed v0 source format and authenticated v1-prefix reader0 exist.
+"""
+from dataclasses import dataclass
+from pathlib import Path
+
+import record_policy as policy
+import record_transport as transport
+import release_record as records
+import ship_common as common
+import source_git
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseSelection:
+    index: int
+    release: str
+    record_sha: str
+    manifest_sha256: str
+    images: tuple[tuple[str, str], ...]
+    actual_web_source_sha: str
+    reader: policy.SourceFacts
+    live: policy.LiveContract | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedChain:
+    chain: policy.PolicyChain
+    inventory: transport.InventorySnapshot
+    image_bindings: tuple[transport.VerifiedImages, ...]
+    latest: ReleaseSelection
+    selected: ReleaseSelection
+
+
+def _selection(chain, index):
+    entry = chain.entries[index]
+    return ReleaseSelection(index, entry.release, entry.sha, entry.record.manifest_sha256,
+                            entry.images, entry.record.web_source_sha, entry.reader, entry.live)
+
+
+def _source_requirements(documents, images):
+    """Plan every source before decoding; complete wins for a repeated SHA."""
+    legacy, required, readers, commits = set(), set(), set(), set()
+    seen_v2 = False
+    for document, binding in zip(documents, images, strict=True):
+        sources = dict(binding.source_shas)
+        web = sources["web"]
+        readers.add(web)
+        commits.update(sources.values())
+        commits.add(document["sha"])
+        if document["schema_version"] == 1:
+            if seen_v2:
+                raise policy.PolicyRefusal("record-policy-invalid")
+            legacy.add(web)
+        else:
+            seen_v2 = True
+            if document["kind"] == "promote":
+                required.add(document["sha"])
+            if web not in legacy:
+                required.add(web)
+    return legacy, required, readers, commits
+
+
+def resolve_authenticated(client: transport.ReleaseGh, repo_dir: Path,
+                          git_binary: Path, selected_tag: str | None = None) -> ResolvedChain:
+    """Resolve one complete chain using one shared deadline/capture allowance.
+
+    Requires a fresh exact ReleaseGh. No supplied wire facts, sources, baseline,
+    Entry objects or alternative verifier callbacks are accepted here. Testing
+    seams live in the concrete transport's bounded capture, not this API.
+    Future callers must independently choose forward/rollback policy and repeat
+    freshness checks immediately before effects; this function enables none.
+    """
+    if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
+        raise transport.TransportRefusal("record-chain-invalid:resolver-client")
+    budget = client.budget
+    try:
+        if selected_tag is not None and (type(selected_tag) is not str or
+                (selected_tag != common.BOOTSTRAP_TAG and common.RECORD_TAG_RE.fullmatch(selected_tag) is None)):
+            budget.fail("resolver-selection")
+        snapshot = client.capture_snapshot()
+        bootstrap = records.load_bootstrap()
+        bootstrap_raw = common.canonical_file_bytes(bootstrap)
+        # Consume the entire inventory before deriving policy. Each yielded
+        # value has already passed the existing canonical/signature checks.
+        raw_records = tuple(records.collect_authenticated_records(client, work_dir=client.work_dir))
+        documents = (bootstrap, *(records.validate_manifest(common.loads_strict(row.raw)) for row in raw_records))
+        images = (client.verify_selected_images(None),
+                  *(client.verify_selected_images(row) for row in raw_records))
+        for document, binding in zip(documents, images, strict=True):
+            expected_images = tuple((key, document["images"][key]) for key in common.COMPONENTS)
+            expected_sources = tuple((key, bootstrap["legacy_signer"]["source_commit"]
+                if document["images"][key] == bootstrap["images"][key] else document["sha"])
+                for key in common.COMPONENTS)
+            if (type(binding) is not transport.VerifiedImages or binding.release != document["release"]
+                    or binding.record_sha != document["sha"] or binding.images != expected_images
+                    or binding.source_shas != expected_sources):
+                budget.fail("resolver-images")
+        legacy, required, readers, commits = _source_requirements(documents, images)
+        reader = source_git.ImmutableGit(repo_dir, git_binary,
+            limits=source_git.Limits(seconds=budget.remaining()), capture=budget.capture, clock=budget.clock)
+        with reader.operation():
+            for sha in sorted(commits):
+                if reader.output(repo_dir, ["cat-file", "-t", sha], code="git-failed:source-commit") != b"commit\n":
+                    budget.fail("resolver-commit")
+            facts = []
+            for sha in sorted(readers | required):
+                if sha in required:
+                    # A missing/unsupported complete contract cannot fall back
+                    # to reader0, even if this SHA also appears in the v1 prefix.
+                    facts.append(reader.reviewed_v0(sha))
+                elif sha in legacy:
+                    facts.append(policy.legacy_reader0(sha))
+                else:
+                    budget.fail("resolver-source")
+            ancestors = []
+            for prior, current in zip(documents, documents[1:]):
+                pair = prior["sha"], current["sha"]
+                if current["kind"] == "promote" and pair[0] != pair[1] and pair not in ancestors:
+                    if reader.output(repo_dir, ["merge-base", *pair], code="git-failed:source-ancestry") != (pair[0] + "\n").encode("ascii"):
+                        budget.fail("resolver-ancestry")
+                    ancestors.append(pair)
+            raw = (bootstrap_raw, *(row.raw for row in raw_records))
+            inputs = tuple(policy.RecordInput(data, common.sha256_bytes(data), dict(binding.source_shas)["web"])
+                           for data, binding in zip(raw, images, strict=True))
+            chain = policy.normalize_chain(inputs, tuple(facts), tuple(ancestors))
+            if not chain.runtime_source_supported or chain.baseline is not None:
+                budget.fail("resolver-source")
+            latest = _selection(chain, len(chain.entries) - 1)
+            tag = latest.release if selected_tag is None else selected_tag
+            matches = [index for index, entry in enumerate(chain.entries) if entry.release == tag]
+            if len(matches) != 1:
+                budget.fail("resolver-selection")
+            selected = _selection(chain, matches[0])
+            budget.check()
+        # Git's final metadata preflight happens before the final complete
+        # GitHub snapshot. Neither creates a new allowance or resets the clock.
+        client.recheck(snapshot, selected_tag=selected.release, latest_tag=latest.release)
+        budget.check()
+        return ResolvedChain(chain, snapshot, images, latest, selected)
+    except Exception:
+        # Neither source/CLI errors nor arbitrary driver messages are public.
+        budget.fail("resolver")
+    finally:
+        budget.close()
