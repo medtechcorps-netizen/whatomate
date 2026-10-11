@@ -215,6 +215,48 @@ def source_blobs():
     return blobs,{'_RECIPES':recipes,'_IGNORE_SHA':m.sha(b'ignore'),'_GRAPH_IGNORE_SHA':m.sha(b'graph-ignore')}
 
 
+class LinuxEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.root=Path(self.tmp.name).resolve();self.config=self.root/'config';self.config.mkdir()
+        self.work=self.root/'work';self.work.mkdir()
+
+    def test_private_path_excludes_ambient_helpers_and_inherited_overrides(self):
+        # Model the hosted runner's system helper without requiring Linux or
+        # reading the real host's system directories.
+        system={Path('/usr/bin'),Path('/bin')};visited=[]
+        absolute,directory,entries=Path.is_absolute,Path.is_dir,Path.iterdir
+        def listing(path):
+            visited.append(path)
+            return iter([path/'docker-credential-ecr-login']) if path in system else entries(path)
+        with patch.object(m,'_host_linux',return_value=True), \
+             patch.object(Path,'is_absolute',lambda path:path in system or absolute(path)), \
+             patch.object(Path,'is_dir',lambda path:path in system or directory(path)), \
+             patch.object(Path,'iterdir',listing), \
+             patch.dict(os.environ,{'PATH':'/usr/bin:/bin','DOCKER_HOST':'hostile','DOCKER_AUTH_CONFIG':'secret',
+                                    'HTTPS_PROXY':'hostile','BUILDX_GIT_INFO':'true','BUILDX_GIT_LABELS':'true'}):
+            env=m._build_environment(self.config,self.work)
+        self.assertEqual(env,{'PATH':str(self.work),'DOCKER_CONFIG':str(self.config),'DOCKER_CONTEXT':'default',
+                              'BUILDX_GIT_INFO':'false','BUILDX_GIT_LABELS':'false'})
+        self.assertEqual(set(visited),{self.work})
+
+    def test_private_work_helper_still_refuses(self):
+        for name in ('docker-credential-ecr-login','DOCKER-CREDENTIAL-custom'):
+            with self.subTest(name=name):
+                helper=self.work/name;helper.write_bytes(b'not executed')
+                try:
+                    with patch.object(m,'_host_linux',return_value=True), \
+                         self.assertRaisesRegex(m.proof.EvidenceError,'credential-helper-available'):
+                        m._build_environment(self.config,self.work)
+                finally:helper.unlink()
+
+    def test_work_must_be_an_existing_absolute_directory(self):
+        for work in (Path('relative'),self.root/'missing'):
+            with self.subTest(work=work),patch.object(m,'_host_linux',return_value=True), \
+                 self.assertRaisesRegex(m.proof.EvidenceError,'build-search-path'):
+                m._build_environment(self.config,work)
+
+
 class AdmissionRoundtripTests(unittest.TestCase):
     """Real exports/validators and mocked Git/Docker/build edges; no daemon."""
     def setUp(self):
@@ -252,8 +294,12 @@ class AdmissionRoundtripTests(unittest.TestCase):
             def clean(inner):
                 if outer.builds and outer.drift=='head':raise m.proof.EvidenceError('admission-head-changed')
             def git(inner,args,*unused):return b'previous-recipe' if args[0]=='cat-file' else b'c'*40+b'\n'
+        # This fixture models the default backend with mocked build/daemon
+        # edges. Mock its environment edge too: selecting that backend must
+        # not call a Windows API when these tests run on a Linux host.
         patches=[(m,'_Source',Source),(m,'_builder_plugin',lambda *a:self.plugin),(m,'_PLUGIN_SHA',m.sha(b'plugin')),
-                 (m,'_host_linux',lambda:False),(m,'_build_capture',self.capture)]
+                 (m,'_host_linux',lambda:False),(m,'_build_capture',self.capture),
+                 (m,'_build_environment',self.environment)]
         patches += [(m,key,value) for key,value in self.pins.items()]
         for target,name,value in patches:
             active=patch.object(target,name,value);active.start();self.addCleanup(active.stop)
@@ -263,6 +309,11 @@ class AdmissionRoundtripTests(unittest.TestCase):
             'Labels':{m.stack.SOURCE_LABEL:source,m.stack.RECIPE_LABEL:recipe,
                       'org.opencontainers.image.source':m._SOURCE_URL,'org.opencontainers.image.title':'rereply-release-web'},
             'Entrypoint':['./rereply'],'User':'rereply','WorkingDir':'/app','Env':[]}}
+
+    def environment(self,config,work):
+        self.assertTrue(config.is_relative_to(self.root));self.assertTrue(work.is_relative_to(self.root))
+        return {'DOCKER_CONFIG':str(config),'DOCKER_CONTEXT':'default','PATH':str(self.root/'synthetic-bin'),
+                'BUILDX_GIT_INFO':'false','BUILDX_GIT_LABELS':'false'}
 
     def capture(self,args,env,seconds,deadline,**kwargs):
         self.calls.append(args);self.assertIs(deadline,self.deadline)
@@ -309,6 +360,14 @@ class AdmissionRoundtripTests(unittest.TestCase):
         self.assertEqual(pulls,[self.previous_ref,m.runtime.POSTGRES,m.runtime.REDIS])
         with self.assertRaises(m.proof.EvidenceError):self.admit()
         self.assertEqual(len(self.builds),4)
+
+    def test_mock_admission_never_uses_native_windows_environment(self):
+        import ctypes
+        with patch.object(ctypes,'WinDLL',side_effect=AttributeError('native API unavailable'),create=True) as native:
+            result=self.admit()
+        native.assert_not_called()
+        self.assertIs(result.seal,m._SEAL)
+        self.assertEqual([role for role,_ in self.builds],['graph','controller','fixture','candidate'])
 
     def test_partial_failure_never_builds_later_roles_or_retries(self):
         self.drift='controller-failure'

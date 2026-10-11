@@ -127,9 +127,11 @@ jobs:
             "$PINNED_BUILDX_URL" -o "$tools/docker-buildx"
           printf '%s  %s\n' "$PINNED_BUILDX_SHA256" "$tools/docker-buildx" | sha256sum --check --strict
           chmod 0755 "$tools/docker-buildx"
-          printf 'COMPAT_GH_BIN=%s\n' "$tools/gh" >> "$GITHUB_ENV"
-          printf 'COMPAT_BUILDX_BIN=%s\n' "$tools/docker-buildx" >> "$GITHUB_ENV"
-          printf 'COMPAT_DOCKER_BIN=%s\n' "$(readlink -f "$(command -v docker)")" >> "$GITHUB_ENV"
+          {
+            printf 'COMPAT_GH_BIN=%s\n' "$tools/gh"
+            printf 'COMPAT_BUILDX_BIN=%s\n' "$tools/docker-buildx"
+            printf 'COMPAT_DOCKER_BIN=%s\n' "$(readlink -f "$(command -v docker)")"
+          } >> "$GITHUB_ENV"
 
       - name: Enforce the shared setup allocation
         run: |
