@@ -5,7 +5,7 @@ below retain that operation's inputs, not a transferable cryptographic receipt.
 Plain selection does not invoke rollback policy or fabricate a live catalog.
 Only the reviewed v0 source format and authenticated v1-prefix reader0 exist.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +18,7 @@ import source_git
 import pending_source
 import contract_authorization as contract
 import contract_collect
+import nullable_profile as nullable
 
 _CATALOG_PINS = dict(policy.V0_PINS)
 _CATALOG_PATHS = tuple(sorted(_CATALOG_PINS))
@@ -119,6 +120,27 @@ class ForwardAdmission:
     """Exact-main source observation, not semantic or deployment permission."""
     resolution: ForwardResolution
     contract_observation: contract.ContractObservation | None
+
+
+@dataclass(frozen=True, slots=True)
+class NullableSourceObservation:
+    slot: str
+    source_sha: str
+    path: str
+    raw: bytes | None = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class NullableProfilePreparation:
+    """Private source intent, never an active catalog or execution receipt."""
+    forward: ForwardResolution
+    before_lookup_sha: str
+    before_provenance: str
+    observations: tuple[NullableSourceObservation, ...]
+    unavailable: tuple[str, ...]
+    planned_target: nullable.CatalogCoordinates | None
+    material: nullable.ProfileMaterial | None
+    bound: nullable.BoundNullableProfile | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,12 +631,114 @@ def _forward_pending(reader, repo_dir, latest_sha, candidate_sha, database_base,
     return pending, classification
 
 
+# These endpoint pins come from the reviewed source-only production blueprint,
+# not from an observed graph or application-golden catalog. Version 1 below is
+# planned source intent only; active source and live coordinates stay at v0.
+_NULLABLE_PREFIX = "internal/dbcatalog/profiles/nullable-column-v1/"
+_NULLABLE_BEFORE = "1c85a9ad0b9bb652ea21b51faa2ee887592dacb00c7f4b388de5ef5d6085a4e7"
+_NULLABLE_AFTER = "a8f15ea159883aacdeecd3c55100f3b589f10ca18708ba113a393805cbf9948e"
+_NULLABLE_OPERATION = "c775d31243e85e933598b06d3828cc329460902b27d1f0f1a9b2b62a022424d2"
+_NULLABLE_DESCRIPTOR = "0d20f14c144d0230d4afb2b98b9bf106bc08577c69160af41dc014d8ebafa946"
+_NULLABLE_SLOTS = (
+    ("before", "catalog-v0.json", 4 << 20, _NULLABLE_BEFORE),
+    ("candidate_baseline", "catalog-v0.json", 4 << 20, _NULLABLE_BEFORE),
+    ("candidate_probe", "probe-operation.json", 2 << 10, _NULLABLE_OPERATION),
+    ("descriptor", "transition-v1.json", 16 << 10, _NULLABLE_DESCRIPTOR),
+    ("operation", "operation-v1.json", 2 << 10, _NULLABLE_OPERATION),
+    ("after", "catalog-v1.json", 4 << 20, _NULLABLE_AFTER),
+)
+
+
+def _nullable_sources(reader, budget, latest, candidate):
+    """Collect six fixed slots without manufacturing legacy live metadata.
+
+    Every present slot is validated, even on an unavailable path. Endpoint
+    pins do not assert profile namespace history or a named migration step.
+    """
+    def need(condition):
+        if not condition:
+            raise policy.PolicyRefusal("nullable-profile-incomplete")
+
+    def current_v0(source):
+        return (source.mode == "reviewed-v0" and source.catalog is not None
+                and source.catalog.catalog_version == 0
+                and source.catalog.min_reader_version == 0
+                and source.catalog.catalog_sha256 == _NULLABLE_BEFORE)
+
+    budget.check()
+    need(current_v0(candidate))
+    live = latest.live
+    if live is not None:
+        need(current_v0(live.origin_source) and live.catalog == live.origin_source.catalog)
+    before_sha = latest.record_sha if live is None else live.origin_source.sha
+    provenance = "legacy-record-only" if live is None else "live-origin"
+    observations, total = [], 0
+    for slot, suffix, limit, _pin in _NULLABLE_SLOTS:
+        sha = before_sha if slot == "before" else candidate.sha
+        path = _NULLABLE_PREFIX + suffix
+        raw = reader.read_blob(sha, path)
+        if raw is not None:
+            need(type(raw) is bytes and 0 < len(raw) <= limit)
+            total += len(raw)
+            # Count logical roles including duplicate SHA/path/raw before any
+            # decoding. AG independently retains its own four-slot limit.
+            need(total <= 8 << 20)
+        observations.append(NullableSourceObservation(slot, sha, path, raw))
+    budget.check()
+    for row, (_slot, _suffix, _limit, pin) in zip(observations, _NULLABLE_SLOTS, strict=True):
+        if row.raw is None:
+            continue
+        need(common.sha256_bytes(row.raw) == pin)
+        if row.slot in ("before", "candidate_baseline", "after"):
+            nullable._catalog(row.raw)
+        elif row.slot in ("candidate_probe", "operation"):
+            nullable.semantic.parse_operation(row.raw)
+        else:
+            # Canonical closed document decoding plus the exact reviewed pin
+            # validates this present descriptor without inventing an origin.
+            nullable._fields(nullable.wire._load(row.raw, nullable.MAX_DESCRIPTOR),
+                ("format_version", "profile", "postgres_major", "observation_version",
+                 "default_acl_contract_sha256", "renderer", "operation", "before", "after"))
+    before, baseline, probe, descriptor, operation, after = observations
+    plans = (descriptor.raw is not None, operation.raw is not None, after.raw is not None)
+    need(all(plans) or not any(plans))
+    need((baseline.raw is None) == (probe.raw is None))
+    need(not any(plans) or baseline.raw is not None)
+    if before.raw is not None and baseline.raw is not None:
+        need(before.raw == baseline.raw)
+    unavailable = tuple(code for code, absent in (
+        ("legacy-live-unavailable", live is None),
+        ("origin-profile-missing", before.raw is None),
+        ("candidate-plan-missing", not any(plans))) if absent)
+    target = nullable.CatalogCoordinates(1, 0, _NULLABLE_AFTER) if all(plans) else None
+    material = bound = None
+    if all(plans) and before.raw is not None:
+        material = nullable.ProfileMaterial(*(nullable.SourceBlob(row.source_sha, row.path, row.raw)
+            for row in (descriptor, operation, before, after)))
+    if not unavailable:
+        origin = nullable.RetainedOrigin(live.origin_release, live.origin_manifest_sha256,
+            before_sha, nullable.CatalogCoordinates(0, 0, live.catalog.catalog_sha256))
+        bound = nullable.bind_source_profile(origin,
+            nullable.CandidateSource(candidate.sha, target), material)
+    budget.check()
+    return before_sha, provenance, tuple(observations), unavailable, target, material, bound
+
+
+def _resolve_nullable_profile(client: transport.ReleaseGh, repo_dir: Path,
+                              git_binary: Path, candidate_sha: str) -> NullableProfilePreparation:
+    """Private source preparation; no observations, transition or main authority."""
+    return _resolve(client, repo_dir, git_binary, None, candidate_sha,
+                    forward=True, nullable_profile=True)
+
+
 def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False,
-             admission=False, rollback_proof=False):
+             admission=False, rollback_proof=False, nullable_profile=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
     try:
+        if nullable_profile and (not forward or rollback or admission or rollback_proof or selected_tag is not None):
+            budget.fail("resolver-selection")
         if admission and (not forward or rollback or selected_tag is not None):
             budget.fail("resolver-selection")
         if rollback and (forward or selected_tag is None):
@@ -716,6 +840,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                 producer = next(fact for fact in facts if fact.sha == candidate_sha)
                 requirements, workflow, materials, target_recipe, live_recipe = _rollback_proof_source(
                     reader, repo_dir, chain, latest, selected, producer)
+            if nullable_profile:
+                nullable_sources = _nullable_sources(reader, budget, latest, candidate)
             budget.check()
         # Git's final metadata preflight happens before the final complete
         # GitHub snapshot. Neither creates a new allowance or resets the clock.
@@ -726,6 +852,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             result = ForwardResolution(resolved, candidate, classification, workflow,
                 common.sha256_bytes(workflow), selected.actual_web_source_sha, database_base,
                 material, recipe, audit, pending)
+            if nullable_profile:
+                return NullableProfilePreparation(result, *nullable_sources)
             return ForwardAdmission(result, observation) if admission else result
         if rollback:
             return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)
