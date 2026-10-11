@@ -11,6 +11,8 @@ verified before any record is trusted, and any anomaly fails closed.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import datetime as dt
 import os
 import re
@@ -477,7 +479,33 @@ def git(repo_dir: Path, args: Sequence[str], *, code: str, runner: Callable[...,
         raise common.ReleaseError(code) from exc
 
 
+_GIT_OUTPUT_TRANSPORT: ContextVar[Callable[..., bytes] | None] = ContextVar("release_git_output_transport", default=None)
+
+
+@contextmanager
+def scoped_git_output(transport: Callable[..., bytes]):
+    """Explicit operation-local reader; never a process-global override.
+
+    Callers must supply their reviewed bounded read-only transport. Ordinary
+    git()/git_output() behavior is unchanged outside this scope. Direct git()
+    calls are deliberately not redirected. Nested overrides are refused.
+    """
+    if not callable(transport) or _GIT_OUTPUT_TRANSPORT.get() is not None:
+        common.fail("git-failed:transport-scope")
+    token = _GIT_OUTPUT_TRANSPORT.set(transport)
+    try:
+        yield
+    finally:
+        _GIT_OUTPUT_TRANSPORT.reset(token)
+
+
 def git_output(repo_dir: Path, args: Sequence[str], *, code: str) -> bytes:
+    transport = _GIT_OUTPUT_TRANSPORT.get()
+    if transport is not None:
+        result = transport(repo_dir, args, code=code)
+        if type(result) is not bytes:
+            common.fail("git-failed:transport-result")
+        return result
     result = git(repo_dir, args, code=code)
     if result.returncode != 0:
         common.fail(code)
