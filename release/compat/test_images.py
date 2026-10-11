@@ -490,6 +490,37 @@ class AdmissionRoundtripTests(unittest.TestCase):
         self.assertFalse(result['cleanup_complete']);self.assertEqual(result['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
 
 
+    def test_cleanup_refusal_retains_original_cause_without_self_cycle_or_retry(self):
+        for mode in ('distinct','same','cleanup-only'):
+            child=AdmissionRoundtripTests('test_complete_four_builds_same_source_and_monotonic_shared_cap');child.setUp()
+            try:
+                primary=m.proof.EvidenceError('admission-builder-bootstrap')
+                cleanup=primary if mode=='same' else m.proof.InfrastructureFailure('admission-builder-ownership-unresolved')
+                events=[]
+                class Backend:
+                    def __init__(inner,*args):inner.closed=False;inner.name='compat-'+'9'*32
+                    def start(inner):
+                        events.append('start')
+                        if mode!='cleanup-only':raise primary
+                    def check(inner):pass
+                    def close(inner):events.append('close');raise cleanup
+                    def summary(inner):return {'closed':False}
+                with self.subTest(mode=mode),patch.object(m,'_host_linux',return_value=True), \
+                     patch.object(m,'_LinuxBuilder',Backend),patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')):
+                    with self.assertRaises((m.proof.EvidenceError,m.proof.InfrastructureFailure)) as raised:
+                        child.admit()
+                    self.assertIs(raised.exception,cleanup)
+                    self.assertIs(cleanup.__cause__,primary if mode=='distinct' else None)
+                    with self.assertRaises(m.proof.EvidenceError):child.admit()
+                self.assertEqual(events,['start','close'])
+                self.assertEqual(len(child.builds),4 if mode=='cleanup-only' else 0)
+                result=json.loads((child.work/('candidate-'+child.candidate)/'result.json').read_bytes())
+                self.assertEqual(result['status'],'REFUSED_NO_RETRY_OR_IMAGE_ADOPTION')
+                self.assertFalse(result['cleanup_complete'])
+                self.assertNotIn('cause',result)
+            finally:child.doCleanups()
+
+
 class LinuxWorld:
     """Mock daemon plus actual private node metadata. Never executes Docker."""
     def __init__(self,root,clock):
@@ -515,6 +546,7 @@ class LinuxWorld:
                 return self.result(raw=b.name.encode()+b'\n')
             assert argv[1:3]==['inspect','--bootstrap']
             if self.mode=='bootstrap-fail':return self.result(code=1,raw=b'')
+            if self.mode=='oom-unsupported':self.container['HostConfig']['OomKillDisable']=None
             self.container['State']={'Running':True,'StartedAt':'2026-10-11T01:00:00Z'}
             return self.result(raw=b'not a proof')
         args=argv[5:];op=args[:2]
@@ -534,6 +566,7 @@ class LinuxWorld:
                 'Config':{'Image':m._BUILDKIT,'Labels':{**self.image['Config']['Labels'],**b.labels},
                           'Entrypoint':['buildkitd'],'Cmd':['--debug'],'Env':['PATH=/usr/bin']},
                 'HostConfig':{'Privileged':True,'Init':True,'NetworkMode':'bridge',
+                              'OomKillDisable':False,
                               'RestartPolicy':{'Name':'no','MaximumRetryCount':0}},
                 'Mounts':[{'Type':'volume','Name':b.volume,'Destination':'/var/lib/buildkit','RW':True}],
                 'RestartCount':0,'State':{'Running':False,'StartedAt':'0001-01-01T00:00:00Z'}}
@@ -575,6 +608,51 @@ class LinuxBuilderTests(unittest.TestCase):
         create=next(call for call in calls if call[5:7]==['container','create'])
         self.assertIn(m._BUILDKIT,create);self.assertEqual(create[-1],'--debug')
         self.assertEqual(len([call for call in calls if call[0]==str(self.b.plugin)]),2)
+
+    def test_kernel_unsupported_oom_false_to_null_allows_owned_start_and_cleanup(self):
+        self.world.mode='oom-unsupported'
+        self.b.start();self.b.check()
+        self.assertIsNone(self.b.container_row['HostConfig']['OomKillDisable'])
+        self.world.container['HostConfig']['OomKillDisable']=False
+        self.b.check()
+        self.assertIsNone(self.b.container_row['HostConfig']['OomKillDisable'])
+        self.b.close()
+        self.assertTrue(self.b.closed);self.assertIsNone(self.world.container);self.assertIsNone(self.world.volume)
+        self.assertEqual(sum(call[5:7]==['container','create'] for call in self.world.calls),1)
+        self.assertEqual(sum(call[5:7]==['container','stop'] for call in self.world.calls),1)
+        self.assertEqual(sum(call[5:7]==['container','rm'] for call in self.world.calls),1)
+
+    def test_oom_true_and_foreign_types_refuse_even_before_snapshot_binding(self):
+        self.b.start();bound=self.b.container_row
+        for value in (True,0,1,'false','private-value',[],{}):
+            for initial in (False,True):
+                self.b.container_row=None if initial else bound
+                self.world.container['HostConfig']['OomKillDisable']=value
+                with self.subTest(value=value,initial=initial),self.assertRaisesRegex(m.proof.EvidenceError,'admission-builder-container$'):
+                    self.b._container()
+        self.b.container_row=bound
+        before=len(self.world.calls)
+        with self.assertRaises(m.proof.EvidenceError):self.b.close()
+        self.assertFalse(any('stop' in call or 'rm' in call for call in self.world.calls[before:]))
+        self.world.container['HostConfig']['OomKillDisable']=False;self.b.close()
+
+    def test_oom_normalization_keeps_key_presence_and_other_host_fields_exact(self):
+        import copy
+        self.b.start();bound=copy.deepcopy(self.b.container_row);original=copy.deepcopy(self.world.container)
+        cases=(
+            lambda: self.world.container['HostConfig'].pop('OomKillDisable'),
+            lambda: self.b.container_row['HostConfig'].pop('OomKillDisable'),
+            lambda: self.world.container['HostConfig'].update(Unexpected=None),
+            lambda: self.world.container['HostConfig'].update(Memory=1024),
+        )
+        for index,change in enumerate(cases):
+            self.b.container_row=copy.deepcopy(bound);self.world.container=copy.deepcopy(original)
+            self.world.container['HostConfig']['OomKillDisable']=None;change()
+            before=len(self.world.calls)
+            with self.subTest(case=index),self.assertRaisesRegex(m.proof.EvidenceError,'container-changed'):self.b.check()
+            with self.assertRaisesRegex(m.proof.EvidenceError,'container-changed'):self.b.close()
+            self.assertFalse(any('stop' in call or 'rm' in call for call in self.world.calls[before:]))
+        self.b.container_row=bound;self.world.container=original;self.b.close()
 
     def test_absence_command_failure_is_not_absence_authority(self):
         self.world.mode='list-fail'

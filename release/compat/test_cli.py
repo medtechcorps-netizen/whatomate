@@ -5,6 +5,7 @@ import json
 import hashlib
 from pathlib import Path
 import tempfile
+import types
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -251,7 +252,8 @@ class FileAndEntryTests(unittest.TestCase):
              mock.patch.object(cli, "_scratch") as scratch, \
              mock.patch.object(cli, "_client") as client, contextlib.redirect_stderr(io.StringIO()) as stderr:
             self.assertEqual(cli.main(["run"]), 1)
-        self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n")
+        self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n"
+            "compatibility-diagnostic: phase=cli-entry family=evidence code=cli-experiment-disabled; chain=complete\n")
         scratch.assert_not_called(); client.assert_not_called()
 
     def test_bad_or_extra_arguments_never_echo_input_or_exit_parser(self):
@@ -259,7 +261,8 @@ class FileAndEntryTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()) as stderr, \
                  contextlib.redirect_stdout(io.StringIO()) as stdout:
                 self.assertEqual(cli.main(args), 1)
-            self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n")
+            self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n"
+                "compatibility-diagnostic: phase=cli-entry family=evidence code=cli-command-invalid; chain=complete\n")
             self.assertEqual(stdout.getvalue(), "")
 
     def test_aggregator_requires_both_real_job_outcomes_before_result_read(self):
@@ -289,7 +292,8 @@ class FileAndEntryTests(unittest.TestCase):
                  mock.patch.object(cli, "_write_public") as write, contextlib.redirect_stderr(io.StringIO()) as stderr:
                 self.assertEqual(cli.main(["run"]), 1)
             write.assert_not_called()
-            self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n")
+            self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n"
+                "compatibility-diagnostic: phase=cli-entry family=infrastructure code=unknown; chain=complete\n")
 
     def test_safe_diagnostic_never_publishes_a_result_or_formats_private_errors(self):
         class PrivateError(cli.proof.InfrastructureFailure):
@@ -320,7 +324,12 @@ class FileAndEntryTests(unittest.TestCase):
                      contextlib.redirect_stderr(io.StringIO()) as stderr:
                     self.assertEqual(cli.main(["run"]), 1)
                 write.assert_not_called(); mark.assert_not_called()
-                self.assertEqual(stderr.getvalue(), expected)
+                lines = stderr.getvalue().splitlines()
+                self.assertEqual(lines[0] + "\n", expected)
+                self.assertEqual(len(lines), 2)
+                self.assertTrue(lines[1].startswith("compatibility-diagnostic: phase=cli-entry family="))
+                self.assertLess(len(lines[1]), 1024)
+                self.assertNotIn("private", lines[1])
 
     def test_partial_public_write_never_marks_complete(self):
         env = environment(); env.update(COMPAT_PREVIEW_OUTCOME="success", COMPAT_RUN_OUTCOME="success")
@@ -525,6 +534,139 @@ class EvidenceEntryTests(unittest.TestCase):
             with mock.patch.object(Path, "is_junction", lambda p: p == inputs, create=True):
                 self.assertEqual(cli.main(["validate-evidence"]), 1)
             self.assertEqual(output.read_bytes(), b"")
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_runtime_and_cli_codes_are_type_approved_only(self):
+        for code in ("network", "pull", "capture", "container", "process", "boot-timeout",
+                     "release-verification-failed", "cli-path-invalid", "cli-token-unavailable"):
+            with self.subTest(code=code):
+                error = cli.proof.InfrastructureFailure(code)
+                self.assertIn("code=" + code + ";", cli._failure_diagnostic(error))
+                self.assertEqual(cli._diagnostic_code(ValueError(code)), "unknown")
+                self.assertEqual(cli._diagnostic_code(cli.common.ReleaseError(code)), "unknown")
+        for code in ("record-chain-invalid:attestation", "attestation-unverified:image",
+                     "gh-failed:version", "input-invalid:json"):
+            self.assertEqual(cli._diagnostic_code(cli.common.ReleaseError(code)), code)
+            self.assertEqual(cli._diagnostic_code(cli.proof.EvidenceError(code)), "unknown")
+
+    def test_suppressed_real_verifier_context_is_visible_without_private_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = object.__new__(cli.runtime.ReadOnlyGh)
+            client.work_dir = Path(temp)
+            with mock.patch.object(cli.records, "load_bootstrap",
+                                   side_effect=cli.common.ReleaseError("record-chain-invalid:bootstrap")):
+                try:
+                    cli.runtime.verified_previous(client, Path(temp))
+                except cli.proof.EvidenceError as error:
+                    self.assertTrue(error.__suppress_context__)
+                    text = cli._failure_diagnostic(error)
+                else:
+                    self.fail("the verifier must refuse")
+        self.assertIn("phase=release-verify family=evidence code=release-verification-failed", text)
+        self.assertIn("family=release code=record-chain-invalid:bootstrap", text)
+        self.assertNotIn(temp, text)
+
+    def test_real_owned_pull_and_inspect_phases_survive_generic_transport(self):
+        with tempfile.TemporaryDirectory() as temp:
+            docker = cli.runtime.Docker("synthetic-docker", Path(temp).resolve(),
+                capture=lambda *args, **kwargs: cli.runtime.Capture(1, b"", b"private"))
+            for method, phase, code in ((docker.pull, "docker-pull", "pull"),
+                                        (docker.inspect, "docker-inspect", "container")):
+                try:
+                    method(cli.runtime.POSTGRES)
+                except cli.proof.InfrastructureFailure as error:
+                    self.assertIn("phase=" + phase + " family=infrastructure code=" + code,
+                                  cli._failure_diagnostic(error))
+                else:
+                    self.fail("nonzero synthetic transport must refuse")
+
+    def test_exact_code_identity_not_equal_code_or_name_and_frame_bound(self):
+        clone = types.FunctionType(cli.context.__code__.replace(), cli.context.__globals__)
+        self.assertEqual(clone.__code__, cli.context.__code__)
+        self.assertIsNot(clone.__code__, cli.context.__code__)
+        for function, expected in ((cli.context, "cli-context"), (clone, "unknown")):
+            try:
+                function({})
+            except cli.proof.EvidenceError as error:
+                self.assertEqual(cli._diagnostic_phase(error), expected)
+        def deep(count):
+            if count:
+                return deep(count - 1)
+            cli.context({})
+        try:
+            deep(70)
+        except cli.proof.EvidenceError as error:
+            self.assertEqual(cli._diagnostic_phase(error), "trace-limit")
+
+    def test_hostile_exception_slots_strings_and_unknown_suffix_never_render(self):
+        class Hostile(cli.proof.InfrastructureFailure):
+            def __getattribute__(self, name):
+                if name in {"args", "__cause__", "__context__", "__traceback__"}:
+                    raise AssertionError("custom exception property used")
+                return super().__getattribute__(name)
+            def __str__(self):
+                raise AssertionError("private text rendered")
+            def __repr__(self):
+                raise AssertionError("private text rendered")
+        class String(str):
+            def __hash__(self):
+                raise AssertionError("untrusted string hashed")
+        cases = (Hostile("/private/token"), Hostile("pull", "secret"), Hostile(String("pull")),
+                 cli.common.ReleaseError("record-chain-invalid:private-token"),
+                 OSError("/private/path"), Exception("pull"))
+        for error in cases:
+            text = cli._failure_diagnostic(error)
+            self.assertIn("code=unknown", text)
+            self.assertNotIn("private", text)
+            self.assertNotIn("secret", text)
+            self.assertLess(len(text), 1024)
+        self.assertEqual(cli._failure_message(Hostile("admission-build-failed")),
+                         "compatibility-entrypoint-refused: admission-build-failed")
+
+    def test_chain_cycle_limit_and_explicit_cause_precedence_are_bounded(self):
+        error = cli.proof.EvidenceError("release-verification-failed")
+        error.__context__ = error
+        self.assertTrue(cli._failure_diagnostic(error).endswith("chain=cycle"))
+        for _ in range(8):
+            outer = cli.common.ReleaseError("record-chain-invalid:attestation")
+            outer.__context__ = error
+            error = outer
+        text = cli._failure_diagnostic(error)
+        self.assertEqual(text.count("phase="), 4)
+        self.assertTrue(text.endswith("chain=limit")); self.assertLess(len(text), 1024)
+        error.__cause__ = cli.proof.InfrastructureFailure("network")
+        error.__context__ = ValueError("private")
+        text = cli._failure_diagnostic(error)
+        self.assertIn("family=infrastructure code=network", text)
+        self.assertNotIn("family=value", text)
+
+    def test_entry_refusal_reports_known_suppressed_cause_without_result_or_marker(self):
+        env = environment(); ctx = cli.context(env)
+        def fail(*args, **kwargs):
+            try:
+                raise cli.common.ReleaseError("attestation-unverified:record")
+            except cli.common.ReleaseError:
+                raise cli.proof.EvidenceError("release-verification-failed") from None
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve(); env["RUNNER_TEMP"] = str(root)
+            for name in ("docker", "buildx"):
+                (root / name).touch()
+                env["COMPAT_" + ("DOCKER" if name == "docker" else "BUILDX") + "_BIN"] = str(root / name)
+            with mock.patch.dict(cli.os.environ, env, clear=True), \
+                 mock.patch.object(cli, "_read_public", return_value=cli.canonical(snapshot(ctx))), \
+                 mock.patch.object(cli, "_scratch", return_value=root), mock.patch.object(cli, "_client"), \
+                 mock.patch.object(cli, "execute", side_effect=fail), \
+                 mock.patch.object(cli, "_write_public") as write, mock.patch.object(cli, "_mark_complete") as mark, \
+                 contextlib.redirect_stderr(io.StringIO()) as stderr, contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(cli.main(["run"]), 1)
+            write.assert_not_called(); mark.assert_not_called()
+            self.assertFalse((root / "public" / "compat-result.json").exists())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue().splitlines()[0], "compatibility-entrypoint-refused")
+        self.assertIn("code=release-verification-failed", stderr.getvalue())
+        self.assertIn("family=release code=attestation-unverified:record", stderr.getvalue())
+        self.assertLess(len(stderr.getvalue()), 1024)
 
 
 if __name__ == "__main__":

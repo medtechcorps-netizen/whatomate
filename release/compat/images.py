@@ -694,6 +694,7 @@ class _LinuxBuilder:
              and not hc.get('DeviceRequests') and not hc.get('VolumesFrom')
              and not hc.get('PidMode') and not hc.get('UTSMode') and not hc.get('UsernsMode')
              and not hc.get('ExtraHosts') and not hc.get('Links')
+             and ('OomKillDisable' not in hc or hc['OomKillDisable'] is None or hc['OomKillDisable'] is False)
              and row.get('RestartCount',0)==0,'admission-builder-container')
         mounts=row.get('Mounts')
         need(type(mounts) is list and len(mounts)==1 and mounts[0].get('Type')=='volume'
@@ -703,7 +704,18 @@ class _LinuxBuilder:
         if running is not None:need(state.get('Running') is running,'admission-builder-state')
         if self.container_row is not None:
             for key in ('Id','Created','Image','Name','Config','HostConfig','Mounts'):
-                need(row.get(key)==self.container_row.get(key),'admission-builder-container-changed')
+                current,prior=row.get(key),self.container_row.get(key)
+                if key=='HostConfig':
+                    current,prior=dict(current),dict(prior)
+                    # Docker 28 defaults false at create, then clears it at
+                    # start when the kernel lacks OomKillDisable support.
+                    # Keep absent keys and every other inspect field exact.
+                    for snapshot in (current,prior):
+                        if 'OomKillDisable' in snapshot:
+                            value=snapshot['OomKillDisable']
+                            need(value is None or value is False,'admission-builder-container')
+                            snapshot['OomKillDisable']=None
+                need(current==prior,'admission-builder-container-changed')
             if self.container_row['State'].get('Running'):
                 need(state.get('StartedAt')==self.container_row['State'].get('StartedAt'),'admission-builder-restarted')
         return row
@@ -927,7 +939,9 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
     finally:
         if backend is not None:
             try:backend.close()
-            except BaseException as caught:error=caught
+            except BaseException as caught:
+                if error is not None and caught is not error:caught.__cause__=error
+                error=caught
             receipt['builder']=backend.summary()
         receipt['cleanup_complete']=backend is None or backend.closed
     try:

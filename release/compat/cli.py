@@ -340,11 +340,96 @@ _PUBLIC_FAILURE_CODES = frozenset({
 
 
 def _failure_message(error):
-    if isinstance(error, proof.EvidenceError) and len(error.args) == 1:
-        code = error.args[0]
+    args = BaseException.args.__get__(error)
+    if isinstance(error, proof.EvidenceError) and len(args) == 1:
+        code = args[0]
         if type(code) is str and code in _PUBLIC_FAILURE_CODES:
             return "compatibility-entrypoint-refused: " + code
     return "compatibility-entrypoint-refused"
+
+
+# Diagnostic-only additions. Keep the original first-line contract above.
+# These are reviewed literals, never prefixes, exception text or runtime
+# discovery of code strings. ReleaseError accepts arbitrary bounded suffixes,
+# so its type alone is insufficient authority to publish its args/code.
+_DIAGNOSTIC_EVIDENCE_CODES = _PUBLIC_FAILURE_CODES | frozenset({
+    "release-verification-failed", "rollback-target-missing", "gh-read-command-refused", "gh-write-refused",
+    "network", "pull", "capture", "container", "process", "boot-timeout", "image-admission-invalid",
+    "cli-input-invalid", "cli-repository-invalid", "cli-runner-invalid", "cli-source-invalid",
+    "cli-ref-invalid", "cli-event-invalid", "cli-workflow-invalid", "cli-run-invalid",
+    "cli-attempt-invalid", "cli-target-invalid", "cli-path-invalid", "cli-snapshot-invalid",
+    "cli-snapshot-context", "cli-snapshot-identity", "cli-snapshot-selection", "cli-snapshot-preview",
+    "cli-target-missing", "cli-result-invalid", "cli-result-noncanonical", "cli-result-context",
+    "cli-preview-blocked", "cli-public-bound", "cli-public-exists", "cli-output-path-invalid",
+    "cli-scratch-overlap", "cli-already-attempted", "cli-token-unavailable", "cli-constructor-command-invalid",
+    "cli-command-invalid", "cli-experiment-disabled", "cli-snapshot-noncanonical", "cli-upstream-failed",
+})
+_DIAGNOSTIC_RELEASE_CODES = frozenset({
+    "gh-failed:binary", "gh-failed:token", "gh-failed:repository", "gh-failed:version",
+    "gh-failed:releases", "gh-failed:tags", "gh-failed:download",
+    "attestation-unverified:record", "attestation-unverified:image", "attestation-unverified:legacy-predicate",
+    "record-chain-invalid:bootstrap", "record-chain-invalid:link", "record-chain-invalid:release",
+    "record-chain-invalid:tag-format", "record-chain-invalid:release-state", "record-chain-invalid:duplicate",
+    "record-chain-invalid:assets", "record-chain-invalid:asset-inventory", "record-chain-invalid:asset-size",
+    "record-chain-invalid:tag", "record-chain-invalid:tag-release-parity", "record-chain-invalid:too-many",
+    "record-chain-invalid:download", "record-chain-invalid:manifest", "record-chain-invalid:tag-binding",
+    "record-chain-invalid:attestation", "record-invalid", "downgrade-refused:unknown-commit",
+    "git-failed:merge-base", "input-invalid:json", "input-invalid:json-duplicate-key", "input-invalid:json-number",
+})
+
+
+def _diagnostic_code(error):
+    args = BaseException.args.__get__(error)
+    allowed = (_DIAGNOSTIC_EVIDENCE_CODES if isinstance(error, proof.EvidenceError)
+               else _DIAGNOSTIC_RELEASE_CODES if isinstance(error, common.ReleaseError) else ())
+    return args[0] if len(args) == 1 and type(args[0]) is str and args[0] in allowed else "unknown"
+
+
+def _diagnostic_family(error):
+    for kind, family in ((proof.InfrastructureFailure, "infrastructure"), (proof.EvidenceError, "evidence"),
+                         (common.ReleaseError, "release"), (OSError, "os"), (ValueError, "value"),
+                         (TypeError, "type"), (KeyError, "key")):
+        if isinstance(error, kind):
+            return family
+    return "other"
+
+
+def _diagnostic_phase(error):
+    phase = "unknown"
+    trace = BaseException.__traceback__.__get__(error)
+    for _ in range(64):
+        if trace is None:
+            return phase
+        # Identity, not function name, filename, source text or code equality.
+        # The deepest explicitly mapped owner wins; generic transports do not
+        # erase the surrounding verification/pull/build/measurement phase.
+        for code, label in _DIAGNOSTIC_PHASES:
+            if trace.tb_frame.f_code is code:
+                phase = label
+                break
+        trace = trace.tb_next
+    return "trace-limit" if trace is not None else phase
+
+
+def _failure_diagnostic(error):
+    parts, seen = [], set()
+    for _ in range(4):
+        if error is None:
+            parts.append("chain=complete")
+            break
+        if id(error) in seen:
+            parts.append("chain=cycle")
+            break
+        seen.add(id(error))
+        parts.append("phase=" + _diagnostic_phase(error) + " family=" + _diagnostic_family(error)
+                     + " code=" + _diagnostic_code(error))
+        # A suppressed context still carries a fixed diagnostic cause. Read
+        # BaseException slots directly: no custom properties, str or repr.
+        cause = BaseException.__cause__.__get__(error)
+        error = cause if cause is not None else BaseException.__context__.__get__(error)
+    else:
+        parts.append("chain=complete" if error is None else "chain=limit")
+    return "compatibility-diagnostic: " + "; ".join(parts)
 
 
 def main(argv=None):
@@ -391,7 +476,36 @@ def main(argv=None):
         return 0
     except (proof.EvidenceError, common.ReleaseError, OSError, ValueError, TypeError, KeyError) as error:
         print(_failure_message(error), file=sys.stderr)
+        print(_failure_diagnostic(error), file=sys.stderr)
         return 1
+
+
+# Freeze code identities at import; do not inspect traceback filenames/locals
+# or dynamically enumerate modules. New owners require an explicit review.
+_DIAGNOSTIC_PHASES = tuple((function.__code__, phase) for function, phase in (
+    (main, "cli-entry"), (context, "cli-context"), (_scratch, "cli-scratch"), (_client, "cli-client"),
+    (regular_path, "cli-path"), (_read_public, "cli-read"), (_write_public, "cli-write"),
+    (_mark_complete, "cli-complete"), (validate_snapshot, "cli-snapshot"), (validate_result, "cli-result"),
+    (preview, "preview"), (execute, "execute"),
+    (runtime.verified_previous, "release-verify"), (runtime.ReadOnlyGh.__init__, "release-client"),
+    (runtime.ReadOnlyGh._run, "release-transport"), (runtime.ReadOnlyGh.download_manifest, "release-download"),
+    (runtime.ReadOnlyGh.verify_file, "release-record-attestation"),
+    (runtime.ReadOnlyGh.verify_image, "release-image-attestation"),
+    (records.resolve_chain, "release-chain"), (records.load_bootstrap, "release-bootstrap"),
+    (records.verify_images, "release-images"), (schema_change.classify, "classification"),
+    (compat.catalog.CatalogContract.__init__, "catalog-contract"),
+    (compat.catalog.OwnedCatalog.observe, "catalog-observe"),
+    (images._Source.clean, "source-clean"), (images._Source.inventory, "source-inventory"),
+    (images._Source.blobs, "source-export"), (images._admit, "image-admission"),
+    (images._build_environment, "build-environment"), (images._build_capture, "image-build"),
+    (images._LinuxBuilder.start, "builder-start"), (images._LinuxBuilder.close, "builder-cleanup"),
+    (images._role_inspect, "image-inspect"), (runtime.Docker.pull, "docker-pull"),
+    (runtime.Docker.inspect, "docker-inspect"), (compat.run_experiment, "experiment-entry"),
+    (compat._Engine.run, "experiment"), (compat._Engine._measure, "measurement"),
+    (compat._Engine._server, "server"), (compat._Engine._old_server, "old-server"),
+    (compat._Engine._migration, "migration"), (compat._Engine._settle, "journal-settle"),
+    (compat._Engine._cleanup, "cleanup"), (compat._wait_pg, "pg-readiness"),
+))
 
 
 if __name__ == "__main__":
