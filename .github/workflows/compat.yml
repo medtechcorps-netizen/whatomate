@@ -1,7 +1,7 @@
 name: Compatibility
 
 # Advisory until the later owner step makes compat a required check.
-# The source-built experiment remains disabled in release/compat/images.py.
+# The reviewed source-built experiment retains an explicit readiness switch.
 on:
   push:
     branches:

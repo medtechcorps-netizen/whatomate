@@ -611,7 +611,8 @@ class AdmissionTests(unittest.TestCase):
              patch.object(c.schema_change,'classify',return_value=classification) as classify, \
              patch.object(c.catalog,'CatalogContract',return_value=FakeContract()), \
              patch.object(c.stack,'OwnedStack') as docker:
-            with self.assertRaisesRegex(c.proof.EvidenceError,'source-build-admission-unreviewed'):
+            with patch.object(c.image_admission,'_READY_FOR_EXECUTION',False), \
+                 self.assertRaisesRegex(c.proof.EvidenceError,'source-build-admission-unreviewed'):
                 c.run_experiment(self.p,SHA,123,2,object(),docker_binary='docker',config_dir=self.p)
             verify.assert_not_called();classify.assert_not_called()
             docker.assert_not_called()

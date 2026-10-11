@@ -1,4 +1,4 @@
-"""Source-built image admission, disabled pending independent review.
+"""Reviewed source-built image admission for compatibility qualification.
 
 The selected candidate is a clean immutable commit, exported from Git objects.
 All four fixed roles are built from that same source, on Linux/amd64. Receipts
@@ -30,7 +30,7 @@ import runtime
 import stack
 
 proof, common = runtime.proof, runtime.common
-_READY_FOR_EXECUTION = False
+_READY_FOR_EXECUTION = True
 _TOTAL = 2400  # Leaves300s inside the canonical45-minute workflow job.
 _BUILD = 1500
 _EXPERIMENT_MIN = 720
