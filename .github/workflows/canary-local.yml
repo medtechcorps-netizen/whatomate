@@ -69,8 +69,8 @@ jobs:
       - name: Configure disposable local database roles and private files
         run: node frontend/e2e/canary/local-stack.mjs configure
       - name: Bootstrap production-equivalent tenant RLS with synthetic data
-        # The wrapper executes go run ./release/staging/bootstrap with an
-        # environment that refuses/scrubs ambient application/relay overrides.
+        # The wrapper builds a private bootstrap binary with its two pinned
+        # profile siblings and refuses/scrubs ambient application/relay overrides.
         run: node frontend/e2e/canary/local-stack.mjs bootstrap
       - name: Build the product and isolated stub
         run: |
