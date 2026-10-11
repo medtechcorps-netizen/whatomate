@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
@@ -14,6 +15,7 @@ import test_controller as tc
 import test_processes as tp
 import test_stack as ts
 import test_sweep as sw
+import test_observation as to
 
 TIME = '2026-10-11T00:00:02Z'
 
@@ -81,15 +83,30 @@ class GraphWorld(sw.World):
 
 class DockerWorld(tp.World):
     def __init__(self):
-        super().__init__();self.http=GraphWorld();self.change_response=lambda x:x
+        super().__init__();self.http=GraphWorld();self.change_response=lambda x:x;self.raw=to.startup()
 
     def capture(self, argv, **options):
+        if argv[5:7] == ['logs','--timestamps']:
+            self.calls.append((argv[5:],options))
+            return j.processes.runtime.Capture(0,b'',self.raw)
         if argv[5:9] == ['container','start','--attach','--interactive']:
-            raw=j.controller.handle(options['input_bytes'],sweep_factory=self.http.factory)
+            def ready(origin, namespace, role):
+                assert namespace == self.http.f.namespace
+                assert origin == (self.http.f.product_origin if role=='web' else self.http.f.stub_origin)
+                def request(method,path,headers,body,timeout):
+                    assert method=='GET' and path==('/ready' if role=='web' else '/readyz')
+                    return j.controller.sweep.Reply(200,(),b'{}')
+                return SimpleNamespace(origin=origin,request=request)
+            raw=j.controller.handle(options['input_bytes'],sweep_factory=self.http.factory,http_factory=ready)
             value=self.change_response(json.loads(raw))
             self.response=json.dumps(value).encode()
             self.response_exit=0 if value['status']=='ok' else 1
-        return super().capture(argv,**options)
+        result=super().capture(argv,**options)
+        if argv[5:7] == ['container','create'] and result.returncode==0:
+            row=self.containers[result.stdout.decode()]
+            row['HostConfig']['LogConfig']={'Type':'json-file','Config':{}}
+            row['Config']['Tty']=False
+        return result
 
 
 class JournalTests(unittest.TestCase):
@@ -121,6 +138,207 @@ class JournalTests(unittest.TestCase):
 
     def write(self):
         return self.request('write',nonce=sw.NONCE)
+
+    def old_period(self, *, sleep=None):
+        self.ledger.capture();self.web();self.write();self.ledger.capture()
+        self.manager.remove(self.handle);self.ledger.capture()
+        self.ledger.open_old_period()
+        self.handle=self.manager.start_web('previous',tp.INPUTS)
+        self.clock=to.Clock()
+        self.observer=j.observation.OwnedObservation.for_old_boot(self.manager,self.handle,self.f,
+            run_id=123,run_attempt=1,clock=self.clock,sleep=sleep or self.clock.sleep)
+        self.assertIsNone(self.observer.wait_old_boot())
+        self.assertTrue(self.observer.boot()['ready'])
+        self.ledger.bind_old_period(self.handle,self.observer)
+
+    def extra_send(self, *, suffix='z', statuses=True, status_first=False, **changed):
+        shape=next(dict(v) for v in self.world.http.entries if v.get('kind')=='graph')
+        for key in ('seq','time'):shape.pop(key)
+        shape.update(message_id='wamid.'+suffix*40,**changed)
+        if statuses and status_first:
+            self.world.http.status(shape['message_id'],'sent');self.world.http.status(shape['message_id'],'delivered')
+        self.world.http.add(**shape)
+        if statuses and not status_first:
+            self.world.http.status(shape['message_id'],'sent');self.world.http.status(shape['message_id'],'delivered')
+        return shape['message_id']
+
+    def finish_old_period(self, workers):
+        self.ledger.capture()
+        self.observer.finish_period()
+        self.manager.remove(self.handle)
+        return self.ledger.close_old_period(self.observer,workers)
+
+    def test_exact_extra_send_before_quiet_is_false_once_after_actual_complete_period(self):
+        self.old_period();self.extra_send()
+        self.assertEqual(self.ledger.capture().pending,1)
+        workers=self.observer.workers()
+        self.assertEqual(workers['unexpected_stub_entries'],0)
+        complete=self.finish_old_period(workers)
+        self.assertEqual(complete['unexpected_stub_entries'],1)
+        self.assertEqual(workers['unexpected_stub_entries'],0) # No caller row mutation.
+        self.assertEqual(complete['observed_seconds'],60)
+        self.assertFalse(self.manager._protocol_failed);self.assertFalse(self.ledger._failed)
+        self.assertTrue(self.ledger.seal().sealed)
+        self.manager.close();self.owner.cleanup()
+        public=json.dumps(self.ledger.evidence())
+        for private in (self.f.phone_number_id,tc.BUSINESS,sw.NONCE,'wamid.'+'z'*40):
+            self.assertNotIn(private,public)
+
+    def test_quiet_extra_send_and_two_statuses_reconcile_to_one_send_not_three(self):
+        def sleep(seconds):
+            if self.clock.now==10:self.extra_send(status_first=True)
+            self.clock.sleep(seconds)
+        self.old_period(sleep=sleep)
+        workers=self.observer.workers()
+        self.assertEqual(workers['unexpected_stub_entries'],3)
+        self.assertEqual(self.finish_old_period(workers)['unexpected_stub_entries'],1)
+        self.assertTrue(self.ledger.seal().sealed)
+
+    def test_postquiet_pre_stop_extra_is_in_whole_period(self):
+        self.old_period();workers=self.observer.workers();self.extra_send()
+        self.assertEqual(self.finish_old_period(workers)['unexpected_stub_entries'],1)
+        self.assertTrue(self.ledger.seal().sealed)
+
+    def test_expected_old_write_remains_expected_and_does_not_count_as_extra(self):
+        self.old_period()
+        self.request('write',nonce='abcdef0123456789abcdef0123456789')
+        self.assertEqual(self.ledger.capture().pending,1)
+        workers=self.observer.workers()
+        self.assertEqual(self.finish_old_period(workers)['unexpected_stub_entries'],0)
+        self.assertTrue(self.ledger.seal().sealed)
+
+    def test_residual_statuses_can_cross_capture_but_missing_never_complete(self):
+        self.old_period();wamid=self.extra_send(statuses=False)
+        self.assertEqual(self.ledger.capture().pending,3)
+        self.world.http.status(wamid,'sent')
+        self.assertEqual(self.ledger.capture().pending,2)
+        self.world.http.status(wamid,'delivered')
+        self.assertEqual(self.ledger.capture().pending,1)
+        workers=self.observer.workers()
+        self.assertEqual(self.finish_old_period(workers)['unexpected_stub_entries'],1)
+
+    def test_missing_expected_or_residual_status_refuses_close_and_latches(self):
+        self.old_period();self.extra_send(statuses=False)
+        workers=self.observer.workers()
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-old-period-incomplete'):
+            self.finish_old_period(workers)
+        self.assertTrue(self.ledger._failed);self.assertTrue(self.manager._protocol_failed)
+
+    def test_residual_may_not_hide_missing_expected_send_or_foreign_fields(self):
+        for changed in ({'to':'999000000009999'},{'phone_number_id':'999000000009998'},
+                        {'business_account_id':'999000000009997'},{'text_sha256':'c'*64},
+                        {'status':201},{'message_type':'image'},{'route':'other'},{'unknown':'private'}):
+            with self.subTest(changed=changed):
+                self.setUp();self.old_period();self.extra_send(**changed)
+                with self.assertRaises(j.proof.EvidenceError):self.ledger.capture()
+                self.assertTrue(self.manager._protocol_failed)
+
+    def test_extra_send_outside_bound_period_and_after_close_stays_refusal(self):
+        self.ledger.capture();self.web();self.write();self.ledger.capture();self.extra_send()
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-unexpected-send'):self.ledger.capture()
+        self.setUp();self.old_period();workers=self.observer.workers()
+        self.finish_old_period(workers);self.extra_send()
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-unexpected-send'):self.ledger.seal()
+
+    def test_old_boundary_pending_receipts_foreign_handle_and_new_app_refuse(self):
+        self.ledger.capture();self.web();self.world.http.auto_statuses=False;self.write()
+        self.manager.remove(self.handle)
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-old-period-unsettled'):self.ledger.open_old_period()
+        self.setUp();self.old_period()
+        self.manager.remove(self.handle);self.handle=self.manager.start_web('candidate',tp.INPUTS)
+        with self.assertRaises(j.proof.EvidenceError):self.ledger.capture()
+
+    def test_window_tampering_and_unattributed_control_remain_refusal(self):
+        self.old_period();workers=self.observer.workers()
+        self.observer._journal_rows[0]['time']='2026-10-11T00:00:03Z'
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-worker-window-binding'):
+            self.finish_old_period(workers)
+        self.setUp();self.old_period()
+        self.world.http.add(kind='control',method='POST',route='reset',status=200)
+        with self.assertRaises(j.proof.EvidenceError):self.ledger.capture()
+
+    def test_rejected_traffic_wrong_status_order_duplicate_and_gap_stay_refusal(self):
+        for defect in ('rejected','status-order','duplicate','gap','attempt'):
+            with self.subTest(defect=defect):
+                self.setUp();self.old_period();wamid=self.extra_send()
+                rows=self.world.http.entries
+                statuses=[v for v in rows if v.get('message_id')==wamid and v.get('route')=='status']
+                if defect=='rejected':self.world.http.rejected=[{'seq':1,'time':TIME,'status':401}]
+                elif defect=='status-order':statuses[0]['delivery_status']='delivered'
+                elif defect=='duplicate':self.world.http.status(wamid,'sent')
+                elif defect=='attempt':statuses[0]['attempt']=2
+                else:rows[-1]['seq']+=1
+                with self.assertRaises(j.proof.EvidenceError):self.ledger.capture()
+
+    def test_unclosed_period_and_unknown_status_never_seal(self):
+        self.old_period();self.manager.remove(self.handle)
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-old-period-unclosed'):self.ledger.seal()
+        self.setUp();self.old_period();self.world.http.status('wamid.'+'q'*40,'sent')
+        self.assertGreater(self.ledger.capture().pending,1)
+        workers=self.observer.workers()
+        with self.assertRaises(j.proof.EvidenceError):self.finish_old_period(workers)
+
+    def test_pending_status_before_send_is_not_evidence_until_complete_and_mixed_refuses(self):
+        self.old_period();wamid='wamid.'+'z'*40
+        self.world.http.status(wamid,'sent');self.world.http.status(wamid,'delivered')
+        self.assertEqual(self.ledger.capture().pending,3)
+        self.extra_send(statuses=False)
+        self.assertEqual(self.ledger.capture().pending,1)
+        workers=self.observer.workers()
+        workers['panic_count']=1
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-mixed-worker-failure-unsupported'):
+            self.finish_old_period(workers)
+
+    def test_other_known_extra_does_not_consume_missing_expected_send(self):
+        self.old_period()
+        self.request('write',nonce='abcdef0123456789abcdef0123456789')
+        rows=self.world.http.entries
+        missing=next(v['message_id'] for v in reversed(rows) if v.get('kind')=='graph')
+        self.world.http.entries=[v for v in rows if v.get('message_id')!=missing]
+        for seq,row in enumerate(self.world.http.entries,1):row['seq']=seq
+        self.extra_send()
+        self.assertGreater(self.ledger.capture().pending,1)
+        workers=self.observer.workers()
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-old-period-incomplete'):
+            self.finish_old_period(workers)
+
+    def test_binding_cannot_be_replayed_or_replace_handle_image_or_observer(self):
+        self.old_period()
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-old-period-order'):
+            self.ledger.bind_old_period(self.handle,self.observer)
+        self.setUp();self.old_period()
+        self.manager.bindings['previous']=replace(self.manager.bindings['previous'],source_sha='a'*40)
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-old-period-binding'):self.ledger.capture()
+        self.setUp();self.old_period();workers=self.observer.workers()
+        self.ledger.capture();self.observer.finish_period();self.manager.remove(self.handle)
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-old-period-order'):
+            self.ledger.close_old_period(object(),workers)
+
+    def test_bounded_residual_count_cannot_turn_unbounded_traffic_into_result(self):
+        self.old_period()
+        for index in range(33):
+            self.extra_send(suffix='abcdefghijklmnopqrstuvwxyz0123456'[index])
+        with self.assertRaisesRegex(j.proof.EvidenceError,'journal-unexpected-send'):self.ledger.capture()
+        self.assertEqual(len(self.ledger._residual_sends),32)
+        self.assertTrue(self.manager._protocol_failed)
+
+    def test_terminal_period_can_close_without_worker_fabrication_only_with_zero_residual(self):
+        self.ledger.capture();self.web();self.write();self.ledger.capture()
+        self.manager.remove(self.handle);self.ledger.capture();self.ledger.open_old_period()
+        self.handle=self.manager.start_web('previous',tp.INPUTS)
+        self.world.raw=to.startup()+(to.TIME+' panic: synthetic old defect\n').encode()
+        self.world.containers[self.handle.container_id]['State'].update(Running=False,Status='exited',ExitCode=2,
+            FinishedAt='2026-10-11T00:00:03Z',OOMKilled=False,Error='')
+        clock=to.Clock()
+        observer=j.observation.OwnedObservation.for_old_boot(self.manager,self.handle,self.f,
+            run_id=123,run_attempt=1,clock=clock,sleep=clock.sleep)
+        terminal=observer.wait_old_boot()
+        self.assertEqual(terminal['state'],'observed-semantic-failure')
+        self.ledger.bind_old_period(self.handle,observer)
+        self.manager.remove(self.handle)
+        self.assertIsNone(self.ledger.close_old_period(observer,None))
+        self.assertFalse(observer._workers_done);self.assertFalse(observer._booted)
+        self.assertTrue(self.ledger.seal().sealed)
 
     def test_fresh_preboot_two_writes_read_and_poststop_seal(self):
         initial=self.ledger.capture()

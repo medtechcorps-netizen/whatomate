@@ -34,6 +34,7 @@ class World:
         self.codes={}; self.logs={}; self.markers={}; self.catalogs={}; self.digests={}
         self.false_case=None; self.worker_panic=0; self.bad_control=False
         self.worker_unknown=0
+        self.residual_sends=0
         self.terminal_old_boot=False
         self.terminal_previous_source=BASE
         self.pending=1; self.rows=0; self.readiness=[b'[17,"*","postgres"]\n']
@@ -191,6 +192,14 @@ class FakeLedger:
     def seal(self):
         self.w.event('ledger.seal');assert not self.manager._ids
         return c.journal.JournalSnapshot(self.w.ledger_reads,0,self.w.ledger_reads,1,'a'*64,True)
+    def open_old_period(self):
+        self.w.event('ledger.old.open');assert not self.manager._ids
+    def bind_old_period(self,handle,observer):
+        self.w.event('ledger.old.bind');assert self.manager._ids.get('web') is handle
+        assert handle.version=='previous' and observer.handle is handle
+    def close_old_period(self,observer,workers):
+        self.w.event('ledger.old.close');assert not self.manager._ids
+        return None if workers is None else {**workers,'unexpected_stub_entries':self.w.residual_sends}
 
 
 def images():
@@ -201,6 +210,27 @@ def images():
 
 
 class EngineTests(unittest.TestCase):
+    def test_complete_old_period_residual_is_false_with_all_reverse_and_cleanup_phases(self):
+        self.w.residual_sends=2
+        result=json.loads(self.engine().run())
+        self.assertFalse(result['old_server_ok']['workers'])
+        self.assertTrue(result['old_server_ok']['reverse'])
+        self.assertTrue(result['reversible'])
+        trace=self.w.trace
+        self.assertLess(trace.index('pg.control'),trace.index('ledger.old.open'))
+        self.assertLess(trace.index('ledger.old.open'),trace.index('ledger.old.bind'))
+        self.assertLess(trace.index('workers.end'),trace.index('ledger.old.close'))
+        self.assertLess(trace.index('ledger.old.close'),trace.index('ledger.seal'))
+        self.assertLess(trace.index('ledger.seal'),trace.index('catalog.final'))
+        self.assertLess(trace.index('catalog.final'),trace.index('stack.cleanup'))
+
+    def test_old_period_residual_does_not_bypass_later_required_failures(self):
+        for phase in ('ledger.old.close','ledger.seal','catalog.final','manager.close','stack.cleanup'):
+            with self.subTest(phase=phase):
+                self.w.residual_sends=1;self.w.fail=phase
+                with self.assertRaises(c.proof.InfrastructureFailure):self.engine().run()
+                self.w.fail=None
+
     def setUp(self):
         global _WORLD
         self.w=_WORLD=World();self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
