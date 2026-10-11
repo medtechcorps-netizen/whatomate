@@ -11,6 +11,7 @@ from pathlib import Path
 import record_policy as policy
 import record_transport as transport
 import release_record as records
+import schema_change
 import ship_common as common
 import source_git
 
@@ -34,6 +35,17 @@ class ResolvedChain:
     image_bindings: tuple[transport.VerifiedImages, ...]
     latest: ReleaseSelection
     selected: ReleaseSelection
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardResolution:
+    resolved: ResolvedChain
+    candidate: policy.SourceFacts
+    classification: schema_change.PolicyClassification
+    workflow: bytes
+    workflow_sha256: str
+    previous_web_source_sha: str
+    database_base_source: str
 
 
 def _selection(chain, index):
@@ -75,10 +87,42 @@ def resolve_authenticated(client: transport.ReleaseGh, repo_dir: Path,
     Future callers must independently choose forward/rollback policy and repeat
     freshness checks immediately before effects; this function enables none.
     """
+    return _resolve(client, repo_dir, git_binary, selected_tag, None, forward=False)
+
+
+def resolve_forward(client: transport.ReleaseGh, repo_dir: Path,
+                    git_binary: Path, candidate_sha: str) -> ForwardResolution:
+    """Gather candidate facts within the closed authenticated source operation.
+
+    This is not a NormalRequest or deployment authorization. In particular a
+    production caller must require candidate == inventory.main_sha, and the
+    signed producer/context must support a divergent image/database origin
+    before such a result may qualify. All-v1 comparison leaves live=None.
+    """
+    return _resolve(client, repo_dir, git_binary, None, candidate_sha, forward=True)
+
+
+def _forward_source(reader, repo_dir, latest, candidate):
+    candidate_sha = candidate.sha
+    database_base = latest.live.origin_source.sha if latest.live is not None else latest.record_sha
+    for base in sorted({latest.record_sha, database_base}):
+        if base != candidate_sha and reader.output(repo_dir, ["merge-base", base, candidate_sha],
+                code="git-failed:source-ancestry") != (base + "\n").encode("ascii"):
+            raise policy.PolicyRefusal("record-policy-invalid")
+    classification = schema_change.classify_v2(repo_dir, database_base, candidate_sha)
+    workflow = reader.read_blob(candidate_sha, ".github/workflows/compat.yml")
+    if not workflow:
+        raise policy.PolicyRefusal("record-source-invalid")
+    return candidate, classification, workflow, database_base
+
+
+def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
     try:
+        if forward and (type(candidate_sha) is not str or common.SHA1_RE.fullmatch(candidate_sha) is None):
+            budget.fail("resolver-candidate")
         if selected_tag is not None and (type(selected_tag) is not str or
                 (selected_tag != common.BOOTSTRAP_TAG and common.RECORD_TAG_RE.fullmatch(selected_tag) is None)):
             budget.fail("resolver-selection")
@@ -101,6 +145,12 @@ def resolve_authenticated(client: transport.ReleaseGh, repo_dir: Path,
                     or binding.source_shas != expected_sources):
                 budget.fail("resolver-images")
         legacy, required, readers, commits = _source_requirements(documents, images)
+        if forward:
+            # Plan this before any facts are decoded: the candidate may be a
+            # SHA already seen in the historical v1 prefix. Its complete
+            # contract must win there too, with one consistent SourceFacts.
+            required.add(candidate_sha)
+            commits.add(candidate_sha)
         reader = source_git.ImmutableGit(repo_dir, git_binary,
             limits=source_git.Limits(seconds=budget.remaining()), capture=budget.capture, clock=budget.clock)
         with reader.operation():
@@ -136,12 +186,20 @@ def resolve_authenticated(client: transport.ReleaseGh, repo_dir: Path,
             if len(matches) != 1:
                 budget.fail("resolver-selection")
             selected = _selection(chain, matches[0])
+            if forward:
+                candidate = next(fact for fact in facts if fact.sha == candidate_sha)
+                candidate, classification, workflow, database_base = _forward_source(
+                    reader, repo_dir, latest, candidate)
             budget.check()
         # Git's final metadata preflight happens before the final complete
         # GitHub snapshot. Neither creates a new allowance or resets the clock.
         client.recheck(snapshot, selected_tag=selected.release, latest_tag=latest.release)
         budget.check()
-        return ResolvedChain(chain, snapshot, images, latest, selected)
+        resolved = ResolvedChain(chain, snapshot, images, latest, selected)
+        if forward:
+            return ForwardResolution(resolved, candidate, classification, workflow,
+                common.sha256_bytes(workflow), latest.actual_web_source_sha, database_base)
+        return resolved
     except Exception:
         # Neither source/CLI errors nor arbitrary driver messages are public.
         budget.fail("resolver")

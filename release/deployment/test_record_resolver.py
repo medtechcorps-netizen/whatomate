@@ -6,6 +6,7 @@ only this fake Git object store and are never represented as hosted evidence.
 """
 import copy
 from dataclasses import FrozenInstanceError
+import difflib
 import hashlib
 from pathlib import Path
 import tempfile
@@ -16,6 +17,7 @@ import record_policy as policy
 import record_resolver as resolver
 import record_transport as rt
 import release_record as records
+import schema_change
 import ship_common as common
 import test_record_transport as transport_tests
 import test_ship_support as support
@@ -30,6 +32,8 @@ class ControlledWorld(transport_tests.World):
         self.repo, self.binary, self.clock = repo, binary, clock
         self.commits, self.files, self.blobs = set(), {}, {}
         self.bad_ancestor = False
+        self.bad_pairs = set()
+        self.history = {}
         self.before = self.after = None
         self.trace = []
 
@@ -76,7 +80,28 @@ class ControlledWorld(transport_tests.World):
         elif args[:2] == ["cat-file", "blob"]:
             data = self.blobs[args[2]]
         elif args[0] == "merge-base":
-            data = (("f" * 40 if self.bad_ancestor else args[1]) + "\n").encode()
+            data = (("f" * 40 if self.bad_ancestor or tuple(args[1:]) in self.bad_pairs else args[1]) + "\n").encode()
+        elif args[:3] == ["rev-list", "--first-parent", "--reverse"]:
+            base, head = args[3].split("..")
+            revisions = self.history.get((base, head), [] if base == head else [head])
+            data = b"".join((revision + "\n").encode() for revision in revisions)
+        elif args[:4] == ["ls-tree", "-r", "--name-only", "-z"]:
+            data = b"".join(path.encode() + b"\0" for revision, path in sorted(self.files)
+                            if revision == args[4] and any(path.startswith(prefix) for prefix in args[6:]))
+        elif args[0] == "diff" and "--name-status" in args:
+            base, head = args[-3:-1]
+            paths = sorted({path for revision, path in self.files if revision in (base, head)})
+            for path in paths:
+                before, after = self.files.get((base, path)), self.files.get((head, path))
+                if before != after:
+                    status = "A" if before is None else "D" if after is None else "M"
+                    data += (status + "\0" + path + "\0").encode()
+        elif args[0] == "diff" and "-U0" in args:
+            base, head, _, path = args[-4:]
+            before = self.files.get((base, path), b"").decode().splitlines(keepends=True)
+            after = self.files.get((head, path), b"").decode().splitlines(keepends=True)
+            data = "".join(difflib.unified_diff(before, after, fromfile="a/" + path,
+                                             tofile="b/" + path, n=0)).encode()
         else:
             raise AssertionError("unmodeled synthetic Git command")
         return rt.runtime.Capture(code, data, b"")
@@ -433,6 +458,295 @@ class ResolverTests(unittest.TestCase):
             self.assertLessEqual(options["timeout"], 60)
         self.assertEqual(self.client.budget.commands, len(self.world.trace))
         self.assertGreater(self.client.budget.captured_bytes, len(self.source_bytes[policy.GOLDEN]))
+
+
+class ForwardResolverTests(unittest.TestCase):
+    # Reuse only scenario setup; the original 35 test methods remain singly
+    # discovered and unchanged. No classifier or authentication call is mocked.
+    setUpClass = ResolverTests.__dict__["setUpClass"]
+    setUp = ResolverTests.setUp
+    add = ResolverTests.add
+    WORKFLOW = ".github/workflows/compat.yml"
+    MAIN = "cmd/whatomate/main.go"
+
+    def profile(self, sha, *, closure="a" * 64, body=1):
+        self.world.commits.add(sha)
+        files = dict(self.source_bytes)
+        files[self.WORKFLOW] = (ROOT / self.WORKFLOW).read_bytes()
+        files[self.MAIN] = f"package main\n\nfunc runRLSMigration(args []string) {{\n\tprintln({body})\n}}\n".encode()
+        files[schema_change.MIGRATION_PATH] = common.canonical_file_bytes({
+            "version": 1, "roots": schema_change.MIGRATION_ROOTS,
+            "closure_files": [self.MAIN], "closure_sha256": closure})
+        self.world.files.update({(sha, path): raw for path, raw in files.items()})
+        return sha
+
+    def candidate(self, sha="7" * 40, **kwargs):
+        return self.profile(sha, **kwargs)
+
+    def forward(self, sha):
+        self.assertIsNone(self.client)
+        config, work = self.root / "config", self.root / "work"
+        config.mkdir(); work.mkdir()
+        budget = rt.OperationBudget(700, capture=self.world, clock=self.clock)
+        self.client = rt.ReleaseGh(self.gh, support.GH_TOKEN, config, work, budget=budget,
+                                  base_env={"SHIP_DO_TOKEN": "private-do-token"})
+        return resolver.resolve_forward(self.client, self.repo, self.git, sha)
+
+    def refused(self, sha):
+        with self.assertRaisesRegex(rt.TransportRefusal, "record-chain-invalid:transport-resolver$"):
+            self.forward(sha)
+        self.assertTrue(self.client.budget.closed)
+        self.assertTrue(self.client.budget.failed)
+        self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+
+    def test_forward_returns_full_classification_and_source_bound_workflow(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        result = self.forward(sha)
+        self.assertEqual((result.candidate.sha, result.candidate.mode), (sha, "reviewed-v0"))
+        self.assertEqual((result.classification.kind, result.classification.dormant, result.classification.reasons),
+                         ("none", False, ()))
+        self.assertEqual(result.classification.requirements, ("compat-required", "generated-migration-closure-ci"))
+        self.assertEqual(result.workflow, (ROOT / self.WORKFLOW).read_bytes())
+        self.assertEqual(result.workflow_sha256, hashlib.sha256(result.workflow).hexdigest())
+        self.assertEqual(result.previous_web_source_sha, old["sha"])
+        self.assertEqual(result.database_base_source, old["sha"])
+        self.assertTrue(self.client.budget.closed)
+        self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+
+    def test_rollback_classifies_from_retained_origin_even_when_candidate_equals_origin(self):
+        old = self.add(version=1)
+        self.profile(old["sha"], body=0)
+        origin = self.add()
+        self.profile(origin["sha"])
+        self.add(kind="rollback", target=old)
+        result = self.forward(origin["sha"])
+        self.assertEqual(result.database_base_source, origin["sha"])
+        self.assertEqual(result.previous_web_source_sha, old["sha"])
+        self.assertEqual(result.resolved.latest.record_sha, old["sha"])
+        self.assertEqual((result.classification.kind, result.classification.reasons), ("none", ()))
+        ranges = [args[-1] for args, _ in self.world.trace if "rev-list" in args]
+        self.assertTrue(ranges)
+        self.assertEqual(set(ranges), {origin["sha"] + ".." + origin["sha"]})
+
+    def test_candidate_must_descend_from_both_record_and_retained_origin(self):
+        for which in ("record", "origin"):
+            with self.subTest(which=which):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    old = case.add(version=1)
+                    origin = case.add()
+                    case.profile(origin["sha"])
+                    case.add(kind="rollback", target=old)
+                    sha = case.candidate()
+                    base = old["sha"] if which == "record" else origin["sha"]
+                    case.world.bad_pairs.add((base, sha))
+                    case.refused(sha)
+                finally:
+                    case.doCleanups()
+
+    def test_all_v1_uses_record_base_without_inventing_live_or_decoding_absent_profile(self):
+        old = self.add(version=1, images=self.boot["images"])
+        # Real early source could have a catalog but no production profile. It
+        # remains reader0/live=None; comparison does not invent those bytes.
+        for path in (policy.GOLDEN, policy.HISTORY, policy.GLOBALS):
+            self.world.files[(old["sha"], path)] = self.source_bytes[path]
+        result = self.forward(self.candidate())
+        self.assertEqual(result.database_base_source, old["sha"])
+        self.assertEqual(result.previous_web_source_sha, self.boot["sha"])
+        self.assertIsNone(result.resolved.latest.live)
+        self.assertIsNone(result.resolved.chain.baseline)
+        self.assertEqual(result.resolved.latest.reader.mode, "legacy-reader0")
+        old_reads = {args[-1] for args, _ in self.world.trace if "ls-tree" in args and old["sha"] in args}
+        self.assertNotIn(policy.PROFILE, old_reads)
+        self.assertNotIn(policy.OVERLAY, old_reads)
+
+    def test_pre_catalog_comparison_retains_blocking_reason(self):
+        self.add(version=1)
+        result = self.forward(self.candidate())
+        self.assertIn("catalog-baseline-required", result.classification.reasons)
+        self.assertIn("compat-required", result.classification.requirements)
+        self.assertIsNone(result.resolved.latest.live)
+
+    def test_dormant_seed_change_keeps_explanation_and_no_favorable_shortcut(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        # Whitespace is source-visible but structurally valid; the real
+        # classifier must retain its bounded public seed diff and obligations.
+        self.world.files[(sha, policy.SEEDS)] += b"\n"
+        result = self.forward(sha)
+        self.assertEqual((result.classification.kind, result.classification.dormant), ("data", True))
+        self.assertTrue(any(line.startswith("seeds diff ") for line in result.classification.summary))
+        self.assertNotEqual(result.candidate.catalog.seeds_sha256, self.v0.catalog.seeds_sha256)
+
+    def test_migration_changes_and_requirements_are_not_erased(self):
+        old = self.add()
+        self.profile(old["sha"])
+        result = self.forward(self.candidate(closure="b" * 64, body=2))
+        self.assertIn("generated migration closure changed", result.classification.migration_changes)
+        self.assertIn("migration path changed: " + self.MAIN + "#runRLSMigration",
+                      result.classification.migration_changes)
+        self.assertIn("generated-migration-closure-ci", result.classification.requirements)
+
+    def test_stale_migration_hash_remains_blocking(self):
+        old = self.add()
+        self.profile(old["sha"])
+        result = self.forward(self.candidate(body=2))
+        self.assertIn("migration-contract-stale", result.classification.reasons)
+
+    def test_pending_format_remains_explicitly_unsupported(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        self.world.files[(sha, "internal/dbcatalog/golden/pending/catalog-v1.json")] = b"{}\n"
+        result = self.forward(sha)
+        self.assertIn("pending-format-unsupported", result.classification.reasons)
+        self.assertIn("pending-format-unsupported", result.classification.requirements)
+
+    def test_generic_preview_is_not_production_main_authority(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        result = self.forward(sha)
+        self.assertNotEqual(result.candidate.sha, result.resolved.inventory.main_sha)
+        self.assertNotIsInstance(result, records.Entry)
+        self.assertFalse(hasattr(result, "normal_request"))
+
+    def test_candidate_identifier_must_be_full_immutable_sha(self):
+        for value in (None, "main", "7" * 39, "A" * 40, "7" * 40 + ":private", True):
+            with self.subTest(value=value):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    case.refused(value)
+                    self.assertEqual(len(case.world.trace), 1)
+                finally:
+                    case.doCleanups()
+
+    def test_missing_candidate_commit_refuses(self):
+        sha = self.candidate()
+        self.world.commits.remove(sha)
+        self.refused(sha)
+
+    def test_missing_candidate_profile_cannot_reuse_historical_legacy_reader0(self):
+        old = self.add(version=1)
+        self.refused(old["sha"])
+
+    def test_candidate_repeated_in_v1_prefix_has_one_consistent_complete_source(self):
+        old = self.add(version=1)
+        self.profile(old["sha"])
+        result = self.forward(old["sha"])
+        sources = [fact for fact in result.resolved.chain.sources if fact.sha == old["sha"]]
+        self.assertEqual(sources, [result.candidate])
+        self.assertEqual(result.resolved.latest.reader, result.candidate)
+        self.assertEqual(result.resolved.latest.reader.mode, "reviewed-v0")
+        self.assertIsNone(result.resolved.latest.live)
+        candidate_profiles = [args for args, _ in self.world.trace
+                              if args[-5:] == ["ls-tree", "-z", old["sha"], "--", policy.PROFILE]]
+        self.assertEqual(len(candidate_profiles), 1)
+
+    def test_unsupported_candidate_profile_refuses_before_classification(self):
+        old = self.add()
+        sha = self.candidate()
+        self.world.files[(sha, policy.PROFILE)] += b" "
+        self.refused(sha)
+        self.assertFalse(any("diff" in args for args, _ in self.world.trace))
+        self.assertEqual(self.documents[-1], old)
+
+    def test_missing_or_empty_workflow_refuses_after_classification(self):
+        for value in (None, b""):
+            with self.subTest(value=value):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    old = case.add()
+                    case.profile(old["sha"])
+                    sha = case.candidate()
+                    if value is None:
+                        del case.world.files[(sha, self.WORKFLOW)]
+                    else:
+                        case.world.files[(sha, self.WORKFLOW)] = value
+                    case.refused(sha)
+                    self.assertTrue(any("diff" in args for args, _ in case.world.trace))
+                finally:
+                    case.doCleanups()
+
+    def test_workflow_bytes_are_source_bound_but_admission_is_separate(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        exact = b"name: Unreviewed synthetic workflow\n"
+        self.world.files[(sha, self.WORKFLOW)] = exact
+        result = self.forward(sha)
+        self.assertEqual(result.workflow, exact)
+        self.assertEqual(result.workflow_sha256, hashlib.sha256(exact).hexdigest())
+        self.assertFalse(hasattr(result, "workflow_admitted"))
+
+    def test_symlink_workflow_is_rejected_as_not_regular_source(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        real_git = self.world.git
+        def symlink(args):
+            result = real_git(args)
+            if args == ["ls-tree", "-z", sha, "--", self.WORKFLOW]:
+                return rt.runtime.Capture(0, result.stdout.replace(b"100644", b"120000", 1), b"")
+            return result
+        self.world.git = symlink
+        self.refused(sha)
+
+    def test_workflow_work_consumes_same_remaining_deadline(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        def expire(args):
+            if args[-5:] == ["ls-tree", "-z", sha, "--", self.WORKFLOW]:
+                self.clock.now = 701
+        self.world.after = expire
+        self.refused(sha)
+
+    def test_shared_bound_includes_classifier_calls(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        def exhaust(args):
+            if "diff" in args:
+                self.client.budget.commands = rt.MAX_COMMANDS
+        self.world.after = exhaust
+        self.refused(sha)
+
+    def test_final_snapshot_occurs_after_candidate_work_and_final_git_preflight(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        workflow_read = False
+        def drift(args):
+            nonlocal workflow_read
+            if args[-5:] == ["ls-tree", "-z", sha, "--", self.WORKFLOW]:
+                workflow_read = True
+            if workflow_read and "--show-toplevel" in args:
+                self.world.main = "b" * 40
+        self.world.after = drift
+        self.refused(sha)
+        self.assertTrue(workflow_read)
+        tops = [args for args, _ in self.world.trace if "--show-toplevel" in args]
+        self.assertEqual(len(tops), 2)
+
+    def test_full_forward_projection_is_immutable_and_closed(self):
+        old = self.add()
+        self.profile(old["sha"])
+        result = self.forward(self.candidate())
+        with self.assertRaises(FrozenInstanceError):
+            result.database_base_source = "f" * 40
+        with self.assertRaises(AttributeError):
+            result.classification.kind = "none"
+        before = len(self.world.trace)
+        with self.assertRaises(rt.TransportRefusal):
+            self.client.capture_snapshot()
+        self.assertEqual(len(self.world.trace), before)
 
 
 if __name__ == "__main__":
