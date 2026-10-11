@@ -14,6 +14,7 @@ import release_record as records
 import schema_change
 import ship_common as common
 import source_git
+import pending_source
 
 _CATALOG_PINS = dict(policy.V0_PINS)
 _CATALOG_PATHS = tuple(sorted(_CATALOG_PINS))
@@ -103,6 +104,11 @@ class ForwardResolution:
     # None is exclusively historical codec-v1 custody, never complete audit
     # evidence. Every concrete forward source operation below supplies it.
     audit: ForwardAuditMaterial | None = None
+    # Historical custody can lack the observation. A concrete forward result
+    # always has the complete raw inventory, including explicit empty tuples.
+    # A blocked preview can retain captured invalid source bytes; consumers
+    # must replay them, not treat this type alone as validated plan authority.
+    pending: pending_source.PendingMaterial | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +341,76 @@ def _forward_audit(reader, repo_dir, latest, selected, candidate_sha, database_b
         latest_record_sha=latest.record_sha, selected_web_source_sha=selected.actual_web_source_sha)
 
 
+def _forward_pending(reader, repo_dir, latest_sha, candidate_sha, database_base, material, classification):
+    """Retain complete observations; malformed plans stay blocked previews.
+
+    Endpoint capture/framing/mode/bounds failures are hard resolver refusals.
+    Complete observed invalid plans and intermediate history remain explicitly
+    blocked previews; no raw endpoint bytes are omitted or replaced by absence.
+    """
+    active = {row.path: row.raw for row in material.candidate_blobs}
+    active_args = dict(active_catalog=active[policy.GOLDEN], active_globals=active[policy.GLOBALS],
+                       active_history=active[policy.HISTORY])
+    inventories = {}
+    for sha in sorted({candidate_sha, latest_sha}):
+        raw = reader.output(repo_dir, ["ls-tree", "-r", "--name-only", "-z", sha, "--",
+                            pending_source.plan.PREFIX.rstrip("/")], code="git-failed:source-pending")
+        if type(raw) is not bytes or len(raw) > pending_source.MAX_FILE_BYTES or (raw and not raw.endswith(b"\0")):
+            raise policy.PolicyRefusal("record-source-invalid")
+        names = raw[:-1].decode("utf-8").split("\0") if raw else []
+        if (len(names) > 3 or names != sorted(set(names))
+                or any(pending_source._FILE.fullmatch(name) is None for name in names)):
+            raise policy.PolicyRefusal("record-source-invalid")
+        files = []
+        for path in names:
+            body = reader.read_blob(sha, path)
+            if type(body) is not bytes or not 0 < len(body) <= pending_source.MAX_FILE_BYTES:
+                raise policy.PolicyRefusal("record-source-invalid")
+            files.append(pending_source.PendingBlob(path, body))
+        inventories[sha] = tuple(files)
+    pending = pending_source.PendingMaterial(candidate_sha, latest_sha,
+        inventories[candidate_sha], inventories[latest_sha])
+    if (sum(len(raw) for raw in active_args.values())
+            + sum(len(row.raw) for rows in (pending.candidate_files, pending.previous_files) for row in rows)
+            > pending_source.MAX_MATERIAL_BYTES):
+        raise policy.PolicyRefusal("record-source-invalid")
+    reasons, requirements = set(classification.reasons), set(classification.requirements)
+    summary = [line for line in classification.summary if not line.startswith("policy classification:")]
+    kind, dormant = classification.kind, classification.dormant
+    if latest_sha != database_base:
+        # Rollback can separate latest source from database origin. Endpoint
+        # hashes cannot reveal a transient plan removal/replacement on this
+        # second range. Reuse only the bounded pending traversal, not a second
+        # complete classifier. Its reads share the original Git/outer budgets.
+        range_reasons, range_requirements, range_summary = set(), set(), []
+        try:
+            introduced = schema_change._v2_pending(schema_change._Repository(repo_dir), latest_sha,
+                candidate_sha, range_reasons, range_summary, range_requirements)
+            if introduced and kind == "none":
+                kind, dormant = "expand", True
+        except (schema_change._Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+            reasons.add("classifier-v2-invalid:pending-latest-record")
+            requirements.update(("pending-format-unsupported", "producer-class-unsupported"))
+        reasons.update(range_reasons)
+        requirements.update(range_requirements)
+        summary.extend(line for line in range_summary if line not in summary)
+    try:
+        pending_source.replay(pending, candidate_sha=candidate_sha, previous_sha=latest_sha, **active_args)
+    except pending_source.PendingSourceRefusal:
+        reasons.update(("pending-format-unsupported", "classifier-v2-invalid:pending-material"))
+        requirements.update(("pending-format-unsupported", "producer-class-unsupported"))
+    if pending.candidate_files:
+        requirements.add("producer-class-unsupported")
+    summary.append("policy classification: " + kind + (" (dormant)" if dormant else ""))
+    if len(summary) > 25000:
+        raise policy.PolicyRefusal("record-source-invalid")
+    for line in (*reasons, *summary):
+        common.require_public_text(line)
+    classification = schema_change.PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary),
+        classification.migration_changes, tuple(sorted(requirements)))
+    return pending, classification
+
+
 def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
@@ -414,6 +490,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                 material = _catalog_material(reader, latest, selected, candidate)
                 recipe = _web_recipe(reader, selected)
                 audit = _forward_audit(reader, repo_dir, latest, selected, candidate_sha, database_base)
+                pending, classification = _forward_pending(reader, repo_dir, latest.record_sha, candidate_sha,
+                    database_base, material, classification)
             if rollback:
                 legacy_chain, legacy_classification, decision = _rollback_source(chain, repo_dir, tag)
             budget.check()
@@ -425,7 +503,7 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
         if forward:
             return ForwardResolution(resolved, candidate, classification, workflow,
                 common.sha256_bytes(workflow), selected.actual_web_source_sha, database_base,
-                material, recipe, audit)
+                material, recipe, audit, pending)
         if rollback:
             return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)
         return resolved
