@@ -75,7 +75,8 @@ def attempt(run=100, number=10, rerun=1, latest_attempt=None, minute=10, *, meas
     return evidence.Attempt(evidence.REPOSITORY, evidence.WORKFLOW, SHA, SHA, event, evidence.REF, run, number,
         rerun, latest_attempt or rerun, status, conclusion, T0 + timedelta(minutes=minute),
         T0 + timedelta(minutes=minute + 1), T0 + timedelta(minutes=minute + 2), jobs,
-        pair(run, rerun, event=event) if measurement is None else measurement)
+        pair(run, rerun, event=event) if measurement is None else measurement,
+        evidence.ExecutionWindow(T0 + timedelta(minutes=minute + 1), T0 + timedelta(minutes=minute + 2), True))
 
 
 def history(*rows, **changes):
@@ -205,9 +206,9 @@ class QualificationTests(unittest.TestCase):
     def test_overlapping_negative_and_unknown_timing_refuse(self):
         other = attempt(run=101, number=11, minute=9, measurement=pair(101, migration_false="ro"), conclusion="failure")
         self.refuse((attempt(), other), code="irreversible-needs-fix-forward-mode")
-        for field in ("requested_at", "started_at", "completed_at"):
+        for field in ("started_at", "completed_at", "execution_window"):
             self.refuse((attempt(), replace(other, **{field: None})))
-        self.refuse((replace(attempt(), requested_at=None),))
+        self.refuse((replace(attempt(), execution_window=None),))
 
     def test_older_unknown_or_unqualified_evidence_can_be_superseded(self):
         old = attempt(run=99, number=9, minute=1, measurement=evidence.MissingEvidence.EXPIRED, conclusion="failure")
@@ -215,7 +216,7 @@ class QualificationTests(unittest.TestCase):
         bad = replace(pair(99), context=b"PRIVATE not JSON")
         old = replace(old, measurement=bad)
         self.assertEqual(evidence.require_compat(request(), history(old, attempt())).run_id, 100)
-        for field in ("requested_at", "started_at", "completed_at"):
+        for field in ("started_at", "completed_at", "execution_window"):
             with self.subTest(missing=field): self.refuse((replace(old, **{field: None}), attempt()))
 
     def test_later_positive_may_coexist_but_canonical_candidate_selection_stays_numbered(self):

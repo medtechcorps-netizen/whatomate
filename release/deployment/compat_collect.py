@@ -1,9 +1,8 @@
 """Bounded visible Actions collection, not ship activation or deletion coverage.
 
-Only the reviewed paired producer is supported. Rerun request time is unknown:
-its signed evidence is retained, but the current pure consumer cannot qualify
-a rerun positive. A later explicit execution-interval policy must lift that
-preparatory limitation; run_started_at is never called a human request time.
+Only the reviewed paired producer is supported. Rerun request time remains
+unknown. Complete current-attempt job intervals establish execution windows;
+run_started_at remains a processing boundary, never a human request time.
 """
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -339,7 +338,8 @@ def _job(row, checks, attempt, sha, expected, observed):
     end = _date(row["completed_at"], observed) if row.get("completed_at") is not None else None
     fresh = attempt["started"] is not None and start is not None and attempt["started"] <= created <= start
     if conclusion == "skipped":
-        _need(row.get("steps") == [] and name in ("compat-run", "compat-attest"), "collect-skipped-job")
+        cancelled = attempt["status"] == "completed" and attempt["conclusion"] == "cancelled"
+        _need(row.get("steps") == [] and (name in ("compat-run", "compat-attest") or cancelled), "collect-skipped-job")
         # A recognized skipped dependent does no work. Its synthetic interval
         # is never success evidence or the completion envelope's endpoint.
         complete, positive, steps, fresh = True, False, (), False
@@ -350,7 +350,8 @@ def _job(row, checks, attempt, sha, expected, observed):
     typed = evidence.Job(name, jid, cid, 15368, rid, a, sha, status, conclusion)
     eligible = fresh and (conclusion != "success" or positive)
     terminal_known = status == "completed" and complete and (conclusion == "skipped" or fresh)
-    return typed, eligible, terminal_known, end if conclusion != "skipped" else None, (created, start, end, steps)
+    executed = (start, end) if terminal_known and conclusion != "skipped" else None
+    return typed, eligible, terminal_known, executed, (created, start, end, steps)
 
 
 def _artifact(row, run, sha, observed):
@@ -405,23 +406,25 @@ def _snapshot(client, request, steps, observed):
             raw_checks = _pages(client, API + f"/check-suites/{run['suite']}/check-runs?filter=all", "check_runs", 4*latest["attempt"])
             checks = {c["id"]:c for c in raw_checks}
             listed_checks.update(checks)
-            jobs, details, names, known, ends = [], [], set(), True, []
+            jobs, details, names, known, intervals = [], [], set(), True, []
             for job in raw_jobs:
-                typed, eligible, terminal, end, detail = _job(job, checks, run, request.sha, steps, observed)
+                typed, eligible, terminal, executed, detail = _job(job, checks, run, request.sha, steps, observed)
                 _need(typed.name not in names and typed.job_id not in all_jobs and typed.check_run_id not in all_checks, "collect-job-duplicate")
                 names.add(typed.name); all_jobs.add(typed.job_id); all_checks.add(typed.check_run_id)
                 known &= terminal
                 if eligible or typed.conclusion == "skipped": jobs.append(typed)
-                if end is not None: ends.append(end)
+                if executed is not None: intervals.append(executed)
                 details.append((typed, eligible, terminal, detail))
-            known &= names == set(evidence.JOBS) and run["status"] == "completed" and bool(ends)
-            completion = max(ends) if known else None
+            known &= names == set(evidence.JOBS) and run["status"] == "completed" and bool(intervals)
+            completion = max(end for _, end in intervals) if known else None
+            window = evidence.ExecutionWindow(min(start for start, _ in intervals), completion, True) if known and len(jobs) == 4 else None
             attempt = evidence.Attempt(evidence.REPOSITORY, evidence.WORKFLOW, request.sha, request.sha,
                 run["event"], evidence.REF, rid, run["number"], number, latest["attempt"], run["status"],
                 run["conclusion"], run["created"] if number == 1 else None, run["started"], completion,
-                tuple(sorted(jobs,key=lambda j:j.name)), evidence.MissingEvidence.ACTIVE if run["status"] != "completed" else evidence.MissingEvidence.MISSING)
+                tuple(sorted(jobs,key=lambda j:j.name)), evidence.MissingEvidence.ACTIVE if run["status"] != "completed" else evidence.MissingEvidence.MISSING,
+                execution_window=window)
             attempts.append(attempt)
-            projections.append((run, tuple(sorted(details,key=lambda d:d[0].name))))
+            projections.append((run, tuple(sorted(details,key=lambda d:d[0].name)), window))
     _need(all_checks == listed_checks, "collect-check-inventory")
     return attempts, (wid, runs, projections, artifacts), artifacts
 
@@ -429,6 +432,7 @@ def _snapshot(client, request, steps, observed):
 def _safe_projection(value):
     if isinstance(value, datetime): return value.isoformat()
     if type(value) is evidence.Job: return tuple(getattr(value,k) for k in value.__slots__)
+    if type(value) is evidence.ExecutionWindow: return [_safe_projection(value.started_at), _safe_projection(value.completed_at), value.fresh]
     if type(value) in (tuple,list): return [_safe_projection(v) for v in value]
     if type(value) is dict: return {str(k):_safe_projection(v) for k,v in value.items()}
     return value

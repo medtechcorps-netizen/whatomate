@@ -175,6 +175,18 @@ class Job:
     conclusion: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionWindow:
+    """Actual accounted job execution, supplied by the metadata adapter.
+
+    Neither an attempt number nor run_started_at alone proves this window.
+    These are data facts, not a signature or a collector capability.
+    """
+    started_at: datetime
+    completed_at: datetime
+    fresh: bool
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class Attempt:
     repository: str
@@ -194,6 +206,7 @@ class Attempt:
     completed_at: datetime | None
     jobs: tuple[Job, ...]
     measurement: AuthenticatedPair | MissingEvidence
+    execution_window: ExecutionWindow | None = None
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -235,7 +248,7 @@ class QualifiedCompat:
     run_id: int
     run_number: int
     run_attempt: int
-    requested_at: datetime
+    requested_at: datetime | None
     started_at: datetime
     completed_at: datetime
     artifact_id: int
@@ -252,6 +265,7 @@ class QualifiedCompat:
     old_server_ok: tuple[bool, ...]
     reversible: bool
     observation_id: str
+    execution_window: ExecutionWindow
 
     @property
     def old_server(self):
@@ -328,6 +342,15 @@ def _attempt(value, sha, observed_at):
               and job.sha == sha and _state(job.status, job.conclusion), "job-identity")
         names.add(job.name); identifiers.add(job.job_id); checks.add(job.check_run_id)
     _need(type(value.measurement) in (AuthenticatedPair, MissingEvidence), "measurement-shape")
+    window = value.execution_window
+    _need(window is None or type(window) is ExecutionWindow, "execution-window-shape")
+    if window is not None:
+        _need(type(window.fresh) is bool and _time(window.started_at) and _time(window.completed_at)
+              and window.started_at <= window.completed_at <= observed_at, "execution-window-timing")
+        _need(value.status == "completed" and value.started_at is not None and value.completed_at is not None
+              and value.started_at <= window.started_at and window.completed_at == value.completed_at
+              and names == set(JOBS) and all(j.status == "completed" for j in value.jobs)
+              and any(j.conclusion != "skipped" for j in value.jobs), "execution-window-incomplete")
 
 
 def _history(value, sha, observation_id=None):
@@ -362,6 +385,12 @@ def _history(value, sha, observation_id=None):
                   "history-attempt-gap")
             requested = [a.requested_at for a in attempts if a.requested_at is not None]
             _need(requested == sorted(requested), "history-attempt-order")
+            started = [a.started_at for a in attempts if a.started_at is not None]
+            _need(started == sorted(started), "history-attempt-order")
+            windows = [a.execution_window for a in attempts
+                       if a.execution_window is not None and a.execution_window.fresh]
+            for moments in ([w.started_at for w in windows], [w.completed_at for w in windows]):
+                _need(moments == sorted(moments), "history-window-order")
 
 
 def _request(value):
@@ -474,7 +503,7 @@ def _current(measured, request):
 
 def _successful(attempt):
     return (attempt.status == "completed" and attempt.conclusion == "success"
-            and all(t is not None for t in (attempt.requested_at, attempt.started_at, attempt.completed_at))
+            and attempt.execution_window is not None and attempt.execution_window.fresh
             and {j.name for j in attempt.jobs} == set(JOBS)
             and all(j.status == "completed" and j.conclusion == "success" for j in attempt.jobs))
 
@@ -505,11 +534,12 @@ def require_compat(request: NormalRequest, history: VisibleHistory) -> Qualified
         # Even a larger run_number failure may predate a fresh older-run rerun.
         # Conversely an older run's rerun may execute later. Actual interval
         # evidence, not list order or IDs, controls the negative/incomplete veto.
-        earlier = (all(t is not None for t in (other.requested_at, other.started_at, other.completed_at))
-                   and other.completed_at < selected.requested_at)
+        window = other.execution_window
+        earlier = (window is not None and window.fresh
+                   and window.completed_at < selected.execution_window.started_at)
         if earlier:
             continue
-        _need(other.requested_at is not None and other.started_at is not None and other.completed_at is not None,
+        _need(window is not None and window.fresh,
               "later-or-unknown-timing")
         if observation is not None and not observation.positive:
             _negative(observation)
@@ -521,7 +551,7 @@ def require_compat(request: NormalRequest, history: VisibleHistory) -> Qualified
         pair.artifact.artifact_id, pair.artifact.name, measured.result_sha256, measured.context_sha256,
         pair.result_subject.signer_uri, pair.result_subject.signer_sha, measured.classification,
         measured.catalog_sha256, request.source.catalog_authority, measured.forward, measured.migrations,
-        measured.servers, measured.reversible, request.observation_id)
+        measured.servers, measured.reversible, request.observation_id, selected.execution_window)
 
 
 def assess_bypass_history(sha: str, history: VisibleHistory) -> BypassHistory:

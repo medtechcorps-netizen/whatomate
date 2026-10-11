@@ -225,13 +225,123 @@ class CollectorTests(unittest.TestCase):
             self.assertNotIn('release-preview',[j.name for j in rerun.jobs])
             with self.assertRaises(evidence.CompatRefusal): qualify(result)
 
-    def test_fresh_rerun_still_has_explicit_unknown_request_limitation(self):
+    def test_fresh_rerun_qualifies_from_actual_execution_not_unknown_request(self):
         world=World();world.add(attempts=2)
         with harness(world) as (w,c,s):
             result=execute(c,s)
-            self.assertIsNone(result.history.attempts[1].requested_at)
-            self.assertIsNotNone(result.history.attempts[1].completed_at)
-            with self.assertRaises(evidence.CompatRefusal): qualify(result)
+            rerun=result.history.attempts[1];qualified=qualify(result)
+            self.assertIsNone(rerun.requested_at)
+            self.assertEqual(qualified.run_attempt,2)
+            self.assertIsNone(qualified.requested_at)
+            self.assertEqual(qualified.started_at,collect._date(w.attempts[100,2]['run_started_at']))
+            self.assertEqual(qualified.execution_window,rerun.execution_window)
+            self.assertTrue(rerun.execution_window.fresh)
+            self.assertEqual(rerun.execution_window.started_at,min(collect._date(j['started_at']) for j in w.jobs[100,2]))
+            self.assertEqual(rerun.execution_window.completed_at,max(collect._date(j['completed_at']) for j in w.jobs[100,2]))
+            self.assertLess(qualified.started_at,qualified.execution_window.started_at)
+
+    def test_same_run_fresh_rerun_recovers_after_complete_negative_but_bypass_keeps_it(self):
+        world=World();world.add(attempts=2)
+        world.attempts[100,1]['conclusion']='failure'
+        world.set_job(100,1,'compat',conclusion='failure')
+        world.archives[10001]=(signature.archive(fixture.pair(100,1,server_false='workers')),(100,1))
+        with harness(world) as (w,c,s):
+            result=execute(c,s)
+            self.assertEqual(qualify(result).run_attempt,2)
+            self.assertEqual(evidence.assess_bypass_history(fixture.SHA,result.history).state,
+                             evidence.BypassState.VETO_AUTHENTICATED_NEGATIVE)
+
+    def test_success_label_with_failed_or_missing_step_cannot_create_window(self):
+        for mode in ('failed','missing'):
+            world=World();world.add();world.add(200,20,minute=60)
+            rows=world.jobs[100,1][0]['steps']
+            if mode=='failed':rows[1]['conclusion']='failure'
+            else:rows.pop(1)
+            with self.subTest(mode=mode),harness(world) as (w,c,s):
+                result=execute(c,s)
+                self.assertIsNone(result.history.attempts[0].execution_window)
+                with self.assertRaises(evidence.CompatRefusal):qualify(result)
+
+    def test_fully_accounted_cancelled_work_can_be_superseded_without_fabricating_skipped_times(self):
+        for executed_name in evidence.JOBS:
+            world=World();world.add(failure=True)
+            world.runs[100]['conclusion']='cancelled'
+            for name in evidence.JOBS:
+                if name==executed_name:
+                    world.set_job(100,1,name,conclusion='cancelled')
+                else:
+                    world.set_job(100,1,name,conclusion='skipped',steps=[],
+                        started_at=stamp(NOW-timedelta(seconds=1)),completed_at=stamp(NOW-timedelta(seconds=2)))
+            world.add(200,20,minute=60,event='workflow_dispatch')
+            with self.subTest(executed=executed_name),harness(world) as (w,c,s):
+                result=execute(c,s);cancelled=result.history.attempts[0]
+                actual=next(j for j in w.jobs[100,1] if j['name']==executed_name)
+                self.assertEqual(len(cancelled.jobs),4)
+                self.assertEqual(cancelled.execution_window,evidence.ExecutionWindow(
+                    collect._date(actual['started_at']),collect._date(actual['completed_at']),True))
+                self.assertEqual(qualify(result).run_id,200)
+
+    def test_cancelled_without_actual_work_or_with_reused_work_stays_unknown(self):
+        for mode in ('none','reused','missing'):
+            world=World();world.add(failure=True)
+            world.runs[100]['conclusion']='cancelled'
+            original=copy.deepcopy(world.jobs[100,1][0])
+            for name in evidence.JOBS:world.set_job(100,1,name,conclusion='skipped',steps=[])
+            if mode=='reused':
+                for step in original['steps']:
+                    for key in ('started_at','completed_at'):
+                        step[key]=stamp(collect._date(step[key])-timedelta(minutes=1))
+                world.set_job(100,1,'release-preview',conclusion='cancelled',steps=original['steps'],
+                    started_at=stamp(collect._date(original['started_at'])-timedelta(minutes=1)),
+                    completed_at=stamp(collect._date(original['completed_at'])-timedelta(minutes=1)))
+            if mode=='missing':
+                world.jobs[100,1].pop();world.checks[100001].pop()
+            world.add(200,20,minute=60,event='workflow_dispatch')
+            with self.subTest(mode=mode),harness(world) as (w,c,s):
+                result=execute(c,s)
+                self.assertIsNone(result.history.attempts[0].execution_window)
+                with self.assertRaises(evidence.CompatRefusal):qualify(result)
+
+    def test_cancellation_skip_allowance_requires_terminal_cancelled_attempt_and_empty_steps(self):
+        for mode in ('failure','active','nonempty'):
+            with self.subTest(mode=mode),harness() as (w,c,s):
+                w.runs[100]['conclusion']='cancelled'
+                changes={'conclusion':'skipped'}
+                if mode!='nonempty':changes['steps']=[]
+                w.set_job(100,1,'compat',**changes)
+                if mode=='failure':w.runs[100]['conclusion']='failure'
+                elif mode=='active':w.runs[100].update(status='in_progress',conclusion=None)
+                with self.assertRaises(evidence.CompatRefusal):execute(c,s)
+
+    def test_cancelled_skip_keeps_exact_check_publisher_and_identity_requirements(self):
+        with harness() as (w,c,s):
+            w.runs[100]['conclusion']='cancelled'
+            w.set_job(100,1,'compat',conclusion='skipped',steps=[])
+            next(j for j in w.checks[100001] if j['name']=='compat')['app']['id']=1
+            with self.assertRaises(evidence.CompatRefusal):execute(c,s)
+
+    def test_same_run_reversed_processing_boundaries_refuse_even_if_jobs_are_fresh(self):
+        world=World();world.add(attempts=2)
+        world.attempts[100,2]['run_started_at']=world.attempts[100,1]['created_at']
+        with harness(world) as (w,c,s):
+            with self.assertRaises(evidence.CompatRefusal):execute(c,s)
+
+    def test_same_run_reversed_fresh_windows_refuse_despite_ordered_processing_starts(self):
+        world=World();world.add(attempts=2)
+        shift=timedelta(minutes=30)
+        for job in world.jobs[100,1]:
+            for step in job['steps']:
+                for key in ('started_at','completed_at'):
+                    step[key]=stamp(collect._date(step[key])+shift)
+            world.set_job(100,1,job['name'],**{
+                key:stamp(collect._date(job[key])+shift)
+                for key in ('created_at','started_at','completed_at')})
+        world.attempts[100,1]['updated_at']=stamp(collect._date(world.attempts[100,1]['updated_at'])+shift)
+        for key in ('created_at','updated_at'):
+            world.artifacts[100][0][key]=stamp(collect._date(world.artifacts[100][0][key])+shift)
+        self.assertLess(world.attempts[100,1]['run_started_at'],world.attempts[100,2]['run_started_at'])
+        with harness(world) as (w,c,s):
+            with self.assertRaisesRegex(evidence.CompatRefusal,'compat-stale'):execute(c,s)
 
     def test_authentic_negative_retained_when_second_inventory_changes(self):
         world=World();world.add(negative=True)
