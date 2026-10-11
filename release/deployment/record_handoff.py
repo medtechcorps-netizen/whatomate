@@ -21,8 +21,9 @@ import record_writer as writer
 e, c, p, r, t, d = (writer.evidence, writer.collect, writer.policy,
                     writer.resolver, writer.transport, writer.records)
 s = r.schema_change
+pending = r.pending_source
 
-VERSION = "4"
+VERSION = "5"
 CHUNK_SIZE = 8192
 CHUNK_SLOTS = tuple(f"handoff_{i:02d}" for i in range(1, 33))
 MAX_ENCODED = CHUNK_SIZE * len(CHUNK_SLOTS)
@@ -133,11 +134,15 @@ _SCHEMAS = {
         ("roles", _STRINGS), ("base_sha", str), ("head_sha", str), ("rows", _many(r.ChangedPath)))),
     r.ForwardAuditMaterial: ("record_resolver.ForwardAuditMaterial", (
         ("candidate_sha", str), ("drills", r.BlobObservation), ("changes", _many(r.ChangedRange)))),
+    pending.PendingBlob: ("pending_source.PendingBlob", (("path", str), ("raw", bytes))),
+    pending.PendingMaterial: ("pending_source.PendingMaterial", (
+        ("candidate_sha", str), ("previous_sha", str), ("candidate_files", _many(pending.PendingBlob)),
+        ("previous_files", _many(pending.PendingBlob)))),
     r.ForwardResolution: ("record_resolver.ForwardResolution", (
         ("resolved", r.ResolvedChain), ("candidate", p.SourceFacts), ("classification", s.PolicyClassification),
         ("workflow", bytes), ("workflow_sha256", str), ("previous_web_source_sha", str),
         ("database_base_source", str), ("catalog_material", r.CatalogMaterial), ("previous_recipe", r.WebRecipe),
-        ("audit", r.ForwardAuditMaterial))),
+        ("audit", r.ForwardAuditMaterial), ("pending", pending.PendingMaterial))),
     r.ReleaseSelection: ("record_resolver.ReleaseSelection", (
         ("index", int), ("release", str), ("record_sha", str), ("manifest_sha256", str), ("images", _PAIRS),
         ("actual_web_source_sha", str), ("reader", p.SourceFacts), ("live", _optional(p.LiveContract)))),
@@ -182,7 +187,7 @@ _MISSING = {
 
 
 class _Budget:
-    def __init__(self, blobs=None, *, version=4):
+    def __init__(self, blobs=None, *, version=5):
         self.version = version
         self.nodes = 0
         self.scalars = 0
@@ -295,10 +300,10 @@ def _value(value, schema, budget, depth, *, encoding):
         _need(value["type"] == "missing" and type(value["value"]) is str and value["value"] in _MISSING)
         return _MISSING[value["value"]]
     tag, fields = _SCHEMAS[schema]
-    if budget.version == 1 and schema is r.ForwardResolution:
-        # Exact historical field set only. The dataclass default is None; old
-        # custody never receives manufactured complete operational evidence.
-        fields = fields[:-1]
+    if schema is r.ForwardResolution and budget.version in (1, 2, 3, 4):
+        # Old versions never observed pending; v1 also predates source audit.
+        # Literal omissions retain exact historical fields, never empty synthesis.
+        fields = fields[:-2] if budget.version == 1 else fields[:-1]
     if budget.version in (1, 2, 3) and schema is writer.PromotionHandoff:
         fields = fields[:-1]
     if encoding:
@@ -372,15 +377,21 @@ def _replay(handoff, candidate_sha, workflow_sha, run_id, record_attempt, *, ver
     if version == 1:
         _need(resolution.audit is None)
     else:
-        _need(version in (2, 3, 4))
+        _need(version in (2, 3, 4, 5))
         r.validate_forward_audit(resolution.audit, candidate_sha=resolution.candidate.sha,
             database_base_source=resolution.database_base_source,
             latest_record_sha=resolution.resolved.latest.record_sha,
             selected_web_source_sha=resolution.resolved.selected.actual_web_source_sha)
-    _need((version == 4 and type(handoff.drills) is writer.forward_gates.DrillGate)
+    _need((version in (4, 5) and type(handoff.drills) is writer.forward_gates.DrillGate)
           or (version in (1, 2, 3) and handoff.drills is None))
-    rebuilt = writer.prepare_promotion(handoff.resolution, handoff.collected,
-        handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
+    if version == 5:
+        _need(type(resolution.pending) is pending.PendingMaterial)
+        rebuilt = writer.prepare_promotion(handoff.resolution, handoff.collected,
+            handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
+    else:
+        _need(resolution.pending is None)
+        rebuilt = writer._prepare_promotion_context2_custody(handoff.resolution, handoff.collected,
+            handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
     _need(rebuilt == handoff)
     return handoff
 
@@ -429,12 +440,12 @@ def _xz_inflate(compressed, maximum):
     return raw
 
 
-def _frame(encoded, blobs, *, version=4):
+def _frame(encoded, blobs, *, version=5):
     # Only bytes are deduplicated. Every typed node and history row remains in
     # the canonical header; raw blobs follow in exact digest order. The outer
     # metadata binds the complete frame's size and SHA256, including this prefix.
     rows = sorted(blobs.items())
-    _need(type(version) is int and version in (3, 4))
+    _need(type(version) is int and version in (3, 4, 5))
     header = _canonical({"version": version, "handoff": encoded,
         "blobs": [{"sha256": digest, "length": len(raw)} for digest, raw in rows]})
     size = 4 + len(header) + sum(len(raw) for _, raw in rows)
@@ -451,12 +462,12 @@ def _json(raw):
     return value
 
 
-def _unframe(raw, *, version=4):
+def _unframe(raw, *, version=5):
     _need(4 < len(raw) <= MAX_RAW)
     size = int.from_bytes(raw[:4], "big")
     _need(0 < size <= MAX_RAW - 4 and 4 + size <= len(raw))
     value = _json(raw[4:4 + size])
-    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4))
+    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4, 5))
     rows = value["blobs"]
     _need(type(rows) is list and 1 <= len(rows) <= MAX_BLOBS)
     offset, total, previous, blobs = 4 + size, 0, "", {}
@@ -497,7 +508,7 @@ def _decode_blobs(rows):
 def _unpack(outputs):
     _exact(outputs, OUTPUT_KEYS)
     _need(all(type(value) is str and len(value) <= CHUNK_SIZE and value.isascii() for value in outputs.values())
-          and outputs["handoff_version"] in ("1", "2", "3", VERSION)
+          and outputs["handoff_version"] in ("1", "2", "3", "4", VERSION)
           and writer.common.SHA256_RE.fullmatch(outputs["handoff_sha256"]))
     encoded_size = _length(outputs["handoff_encoded_length"], MAX_ENCODED)
     compressed_size = _length(outputs["handoff_compressed_length"], MAX_COMPRESSED)
@@ -511,7 +522,7 @@ def _unpack(outputs):
     _need(len(text) == encoded_size)
     compressed = _unb64(text, MAX_COMPRESSED)
     _need(len(compressed) == compressed_size)
-    raw = (_xz_inflate(compressed, raw_size) if outputs["handoff_version"] in ("3", "4")
+    raw = (_xz_inflate(compressed, raw_size) if outputs["handoff_version"] in ("3", "4", "5")
            else _inflate(compressed, raw_size))
     _need(len(raw) == raw_size
           and writer.common.sha256_bytes(raw) == outputs["handoff_sha256"])
@@ -526,13 +537,19 @@ def decode(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
     execution stays attempt1. V1 decodes only historical record custody with
     audit=None; it cannot be encoded again or supply future operational gates.
     V2 retains its exact zlib/JSON wire; v3 retains XZ with no drill observation.
-    New v4 writes preserve the original drill observation in the same XZ frame.
-    Historical v1/v2/v3 data cannot be encoded again without that observation.
+    V4 retains its original drill observation. V5 additionally requires complete
+    raw pending material and current context3 evidence. Historical versions
+    cannot be re-encoded as v5 or enter current normal preparation.
     A hash cannot authenticate hostile substituted data.
     """
+    return _decode_versioned(outputs, candidate_sha=candidate_sha, workflow_sha=workflow_sha,
+        run_id=run_id, record_attempt=record_attempt)[1]
+
+
+def _decode_versioned(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
     raw = _unpack(outputs)
     version = int(outputs["handoff_version"])
-    if version in (3, 4):
+    if version in (3, 4, 5):
         value, blobs = _unframe(raw, version=version)
     else:
         value = _json(raw)
@@ -541,7 +558,22 @@ def decode(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
     budget = _Budget(blobs, version=version)
     handoff = _value(value["handoff"], writer.PromotionHandoff, budget, 0, encoding=False)
     _need(budget.used == budget.blobs.keys())
-    return _replay(handoff, candidate_sha, workflow_sha, run_id, record_attempt, version=version)
+    return version, _replay(handoff, candidate_sha, workflow_sha, run_id, record_attempt, version=version)
+
+
+@_public
+def build_record(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt,
+                 publication, current_resolution):
+    """Preserve validated wire version through the closed record-only replay.
+
+    External same-run production custody and a freshly authenticated exact
+    current parent remain caller obligations. No flag selects a legacy policy.
+    """
+    version, handoff = _decode_versioned(outputs, candidate_sha=candidate_sha,
+        workflow_sha=workflow_sha, run_id=run_id, record_attempt=record_attempt)
+    if version == 5:
+        return writer.build_promotion(handoff, publication, current_resolution)
+    return writer._build_promotion_context2_custody(handoff, publication, current_resolution)
 
 
 @_public

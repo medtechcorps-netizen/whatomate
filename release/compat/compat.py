@@ -479,10 +479,13 @@ def _run_resolved_experiment(repo: Path, resolution: catalog.record_resolver.For
     need(type(classification) is schema_change.PolicyClassification
          and type(classification.dormant) is bool and type(classification.reasons) is tuple
          and not classification.reasons
+         and classification.requirements == ("compat-required", "generated-migration-closure-ci")
          and ((classification.kind == "none" and not classification.dormant)
-              or (classification.kind == "data" and classification.dormant)),
+              or (classification.kind in {"data", "expand"} and classification.dormant)),
          "experiment-classification-unsupported")
     contract = catalog.CatalogContract.from_resolution(resolution)
+    need(classification.kind != "expand" or contract.pending_binding.target_version is not None,
+         "experiment-classification-unsupported")
     deadline.remaining()
     value = image_admission._admit_resolved(repo, resolution, docker_binary, config_dir, image_work_dir, deadline,
                                             buildx_binary=buildx_binary)

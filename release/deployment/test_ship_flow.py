@@ -228,7 +228,9 @@ class FlowTests(unittest.TestCase):
 
     def test_original_output_preflight_roundtrips_complete_handoff(self):
         self.assertEqual(set(self.encoded), set(flow.record_handoff.OUTPUT_KEYS))
+        self.assertEqual(self.encoded['handoff_version'], '5')
         self.assertEqual(self.handoff.resolution, self.forward)
+        self.assertIs(type(self.handoff.resolution.pending), flow.record_resolver.pending_source.PendingMaterial)
         self.assertEqual(self.handoff.collected, self.history)
         self.assertTrue(all(len(value) <= 8192 for value in self.encoded.values()))
 
@@ -259,8 +261,25 @@ class FlowTests(unittest.TestCase):
     def test_exact_published_retry_does_not_decode_old_handoff(self):
         current = fixture.appended(self.forward.resolved, self.raw, self.forward.candidate)
         self.ctx.env.clear()
-        with mock.patch.object(flow.record_handoff, 'decode', side_effect=AssertionError('expired evidence')):
+        with mock.patch.object(flow.record_handoff, 'decode', side_effect=AssertionError('expired evidence')), \
+             mock.patch.object(flow.record_handoff, 'build_record', side_effect=AssertionError('expired evidence')):
             self.assertEqual(self.record(current=current), (self.raw, 'published'))
+
+    def test_historical_v4_record_only_retry_uses_closed_original_context2_custody(self):
+        from test_record_handoff import xz_envelope
+        codec = flow.record_handoff
+        old = fixture.historical_handoff(self.forward, observation=self.preflight.drills,
+                                         workflow_execution=flow._execution(self.control))
+        budget = codec._Budget(version=4)
+        node = codec._value(old, w.PromotionHandoff, budget, 0, encoding=True)
+        outputs = xz_envelope(codec._frame(node, budget.blobs, version=4), version='4')
+        self.ctx.env.update(('REC_' + key.upper(), value) for key, value in outputs.items())
+        self.assertEqual(self.record(control={**self.control, 'run_attempt': 4}), (self.raw, 'absent'))
+        with self.assertRaises(w.WriterRefusal):
+            w.build_promotion(old, self.publication, self.current)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(old)
+        self.ctx.env['REC_HANDOFF_VERSION'] = '5'
+        with self.assertRaisesRegex(c.ReleaseError, '^record-invalid:handoff$'): self.record()
 
     def test_exact_published_retry_rejects_changed_production_metadata(self):
         current = fixture.appended(self.forward.resolved, self.raw, self.forward.candidate)

@@ -3,6 +3,8 @@ import copy
 import io
 import json
 import hashlib
+from functools import lru_cache
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import types
@@ -30,14 +32,32 @@ def environment(event="push", ref="refs/heads/main", attempt="1"):
             "RUNNER_ENVIRONMENT": "github-hosted"}
 
 
+@lru_cache(maxsize=1)
+def active_source():
+    """Real immutable v0 bytes for pure protocol fixtures, not authentication."""
+    root = Path(__file__).resolve().parents[2]
+    return tuple(cli.record_resolver.policy.SourceBlob(path, (root / path).read_bytes())
+                 for path in cli.record_resolver.policy.SOURCE_PATHS)
+
+
+def empty_pending(ctx, previous_sha):
+    source, policy = cli.pending_binding.source, cli.record_resolver.policy
+    blobs = {row.path: row.raw for row in active_source()}
+    material = source.PendingMaterial(ctx.sha, previous_sha, (), ())
+    return source.replay(material, candidate_sha=ctx.sha, previous_sha=previous_sha,
+        active_catalog=blobs[policy.GOLDEN], active_globals=blobs[policy.GLOBALS],
+        active_history=blobs[policy.HISTORY]).binding
+
+
 def snapshot(ctx):
     old = {"release": TAG, "manifest_sha256": "1" * 64, "sha": OLD, "web_digest": DIGEST}
     latest = dict(old) if ctx.target is None else {"release": LATEST_TAG, "manifest_sha256": "2" * 64, "sha": LATEST, "web_digest": "sha256:" + "e" * 64}
-    return {"version": 3, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
+    return {"version": 4, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
             "requested_rollback_target": ctx.target, "latest": latest, "selected": old,
             "database_base": {"mode": "legacy-source-only", "source_sha": latest["sha"],
                               "origin": None, "catalog": None},
             "selected_web_source_sha": OLD,
+            "pending": cli.pending_binding.to_wire(empty_pending(ctx, latest["sha"])),
             "preview": {"kind": "none", "dormant": False, "blocked": False}}
 
 
@@ -55,9 +75,17 @@ def resolved(ctx, *, blocked=False):
     selected = latest if ctx.target is None else selection("selected", 0)
     chain = r.ResolvedChain(None, None, (), latest, selected)
     classification = cli.schema_change.PolicyClassification("none", False,
-        ("synthetic-block",) if blocked else (), (), (), ())
-    return r.ForwardResolution(chain, p.legacy_reader0(ctx.sha), classification,
-        b"synthetic", "0" * 64, selected.actual_web_source_sha, latest.record_sha, None, None)
+        ("synthetic-block",) if blocked else (), (), (),
+        ("compat-required", "generated-migration-closure-ci"))
+    blobs = {row.path: row.raw for row in active_source()}
+    material = r.CatalogMaterial(ctx.sha,
+        tuple(p.SourceBlob(path, blobs[path]) for path in sorted(cli.compat.catalog._PINS)),
+        selected.actual_web_source_sha, "legacy-equal-reviewed-v0",
+        tuple(r.BlobObservation(path, blobs[path]) for path in sorted(cli.compat.catalog._PINS)))
+    pending = cli.pending_binding.source.PendingMaterial(ctx.sha, latest.record_sha, (), ())
+    return r.ForwardResolution(chain, p.reviewed_v0_source(ctx.sha, active_source()), classification,
+        b"synthetic", "0" * 64, selected.actual_web_source_sha, latest.record_sha, material, None,
+        pending=pending)
 
 
 def result(ctx):
@@ -127,7 +155,7 @@ class SnapshotTests(unittest.TestCase):
         resolve.assert_called_once_with(client, Path("/repo"), binary, SHA, selected_tag=TAG)
         self.assertEqual(value["latest"]["sha"], LATEST)
         self.assertEqual(value["selected"]["sha"], OLD)
-        self.assertEqual(value["version"], 3)
+        self.assertEqual(value["version"], 4)
         self.assertEqual(value["selected"]["manifest_sha256"], "1" * 64)
         self.assertEqual(value["database_base"]["source_sha"], LATEST)
         self.assertEqual(value["selected_web_source_sha"], OLD)
@@ -139,6 +167,44 @@ class SnapshotTests(unittest.TestCase):
         with mock.patch.object(cli.record_resolver, "resolve_forward", side_effect=cli.common.ReleaseError("synthetic")):
             with self.assertRaises(cli.common.ReleaseError):
                 cli.preview(Path("/repo"), ctx, object(), git_binary=Path("/git"), deadline=cli.images._Deadline())
+
+    def test_pending_is_mandatory_exact_source_bound_and_never_historical_absence(self):
+        original = snapshot(self.ctx)
+        mutations = [lambda v: v.pop("pending"), lambda v: v.update(pending=None),
+                     lambda v: v.update(version=3),
+                     lambda v: v["pending"].update(candidate_sha=OLD),
+                     lambda v: v["pending"].update(previous_sha=LATEST),
+                     lambda v: v["pending"].update(candidate_digest="f" * 64),
+                     lambda v: v["pending"]["active_artifacts"][0].__setitem__(1, "f" * 64),
+                     lambda v: v["pending"].update(target_version=1),
+                     lambda v: v["pending"].update(extra="private")]
+        for index, mutate in enumerate(mutations):
+            changed = copy.deepcopy(original); mutate(changed)
+            with self.subTest(index=index), self.assertRaises(cli.proof.EvidenceError):
+                cli.validate_snapshot(changed, self.ctx)
+        self.assertEqual(original["pending"]["candidate_files"], [])
+        self.assertEqual(original["pending"]["previous_files"], [])
+
+    def test_unknown_requirements_and_marker_block_preview_even_without_reasons(self):
+        resolution = resolved(self.ctx)
+        for requirements in ((), (*resolution.classification.requirements, "producer-class-unsupported"),
+                             (*resolution.classification.requirements, "future-unproven-gate")):
+            classification = resolution.classification._replace(requirements=requirements)
+            snap = cli._resolved_snapshot(replace(resolution, classification=classification), self.ctx)
+            self.assertTrue(snap["preview"]["blocked"])
+            with mock.patch.object(cli.record_resolver, "resolve_forward") as read, \
+                 mock.patch.object(cli.compat, "_run_resolved_experiment") as run:
+                with self.assertRaisesRegex(cli.proof.EvidenceError, "cli-preview-blocked"):
+                    cli.execute(Path("/repo"), self.ctx, object(), snap, git_binary=Path("/git"),
+                        deadline=cli.images._Deadline(), docker_binary="/docker", config_dir=Path("/config"),
+                        image_work_dir=Path("/images"), buildx_binary=Path("/buildx"))
+            read.assert_not_called(); run.assert_not_called()
+
+    def test_absent_or_invalid_raw_material_cannot_create_snapshot(self):
+        resolution = resolved(self.ctx)
+        for material in (None, replace(resolution.pending, previous_sha=LATEST)):
+            with self.assertRaisesRegex(cli.proof.EvidenceError, "catalog-pending-invalid"):
+                cli._resolved_snapshot(replace(resolution, pending=material), self.ctx)
 
 
 class RunTests(unittest.TestCase):
@@ -418,13 +484,14 @@ class EvidenceContextTests(unittest.TestCase):
                 value["reversible"] = False
             raw = cli.proof.result_bytes(value)
             bound = cli.evidence_context(raw, self.snap, self.ctx)
-            self.assertEqual(bound, {"version": 2, "repository": cli.common.REPOSITORY,
+            self.assertEqual(bound, {"version": 3, "repository": cli.common.REPOSITORY,
                 "workflow_path": ".github/workflows/compat.yml", "workflow_sha": SHA,
                 "event": "push", "ref": "refs/heads/main", "sha": SHA,
                 "run_id": self.ctx.run_id, "run_attempt": 2, "requested_rollback_target": None,
                 "latest": self.snap["latest"], "selected": self.snap["selected"],
                 "preview": self.snap["preview"], "database_base": self.snap["database_base"],
                 "selected_web_source_sha": self.snap["selected_web_source_sha"],
+                "pending": self.snap["pending"],
                 "result_sha256": hashlib.sha256(raw).hexdigest()})
             encoded = cli.canonical(bound)
             self.assertLess(len(encoded), 4096)
@@ -463,7 +530,7 @@ class EvidenceContextTests(unittest.TestCase):
     def test_strict_context_bytes_and_digest_do_not_accept_equivalent_or_foreign_input(self):
         raw = cli.canonical(cli.evidence_context(self.raw, self.snap, self.ctx))
         cases = [b" " + raw, raw[:-1], raw + b" " * 4096, b"\xff", b'{"version":1,"version":1}',
-                 b'{"value":NaN}', b'{"value":Infinity}', b'[]\n', raw.replace(b'"version":2', b'"version":2.0')]
+                 b'{"value":NaN}', b'{"value":Infinity}', b'[]\n', raw.replace(b'"version":3', b'"version":3.0')]
         for case in cases:
             with self.subTest(raw=case[:32]), self.assertRaises((cli.proof.EvidenceError, cli.common.ReleaseError)):
                 cli.validate_evidence(case, self.raw, self.snap, self.ctx)

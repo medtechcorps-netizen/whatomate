@@ -22,8 +22,8 @@ reversible, catalog_sha256, run_id, run_attempt
 ```
 
 `classification` contains only `{kind, dormant}`. Current classifier outputs
-are `none/false` and `data/true`; future `expand` (with either dormant value) and
-`contract/false` are representable for their planned proof rules. This module
+are `none/false`, `data/true` and source-bound pending `expand/true`; active
+`expand/false` and `contract/false` are representable for their planned proof rules. This module
 does not make or authorize a classification. The runner must bind the actual
 verified classifier output, including rejection reasons, before evaluating a
 proof. It must not substitute a more permissive kind. Source paths/reasons and
@@ -442,16 +442,19 @@ database origin and actual web-image source from one authenticated source
 operation. Normal classification compares that database origin to the candidate;
 after an image rollback, it need not equal the latest record's source. `cli.py run`
 authenticates the sources again and requires exact agreement of the canonical
-version-3 snapshot with the preview before image admission or an experiment.
+version-4 snapshot with the preview before image admission or an experiment.
 An explicit rollback target
 can be previewed but cannot run or publish proof yet (`cli-target-proof-unsupported`):
 the dedicated exact-span rollback experiment remains a separate PR16 requirement.
 
-The resolution format is version 3. Both `latest` and `selected` contain the
+The resolution format is version 4. Both `latest` and `selected` contain the
 verified release tag, signed manifest SHA-256, source SHA and web digest.
 `database_base` separately binds the supported legacy source or retained v2
 origin record and measured catalog; `selected_web_source_sha` identifies the
-actual selected image source. Older resolutions are rejected, not silently
+actual selected image source. Mandatory `pending` binds candidate and latest
+record sources, active-three hashes and complete pending file inventories. The
+producer derives it from freshly replayed raw source; the planned target never
+replaces the measured active catalog. Older resolutions are rejected, not silently
 upgraded. The manifest digest comes from the verified record bytes, not a GitHub
 metadata identifier. A legacy source has no invented measured live catalog.
 
@@ -466,7 +469,7 @@ cannot become an artifact by continuing after an error.
 
 The final artifact name is `compat-result-<sha>-<run_attempt>` and contains
 exactly `compat-result.json` and `compat-context.json`. The result schema and
-verdict are unchanged. The current normal producer emits context version 2
+verdict are unchanged. The current normal producer emits context version 3
 with exactly these fields:
 
 - `version`, `repository`, `workflow_path`, `workflow_sha`, `event`, `ref`,
@@ -476,13 +479,17 @@ with exactly these fields:
 - `preview`, with `kind`, `dormant` and `blocked`;
 - `database_base`, with `mode`, `source_sha`, `origin` and `catalog`, and
   `selected_web_source_sha`, copied from the authenticated resolution;
+- `pending`, the closed source binding from the authenticated resolution,
+  including explicit observed empty inventories when no plan exists;
 - `result_sha256`, covering the exact canonical result bytes, including LF.
 
 Both files are sorted compact ASCII JSON with a final LF. The result remains
 bounded to 16 KiB and the context to 4 KiB. Normal selection requires the
 result classification to equal the frozen database-origin-to-candidate preview.
-The current normal admission requires the source-bound context-v2 pair;
-historical context-v1 qualification does not establish this newer contract.
+The current normal admission requires the source-bound context-v3 pair;
+historical context-v1/v2 positives do not establish this newer contract. Their
+actual false flags remain available for negative auditing. Exact old context-v2
+record retries retain a separate closed historical replay path.
 Explicit rollback-target proof and active schema changes remain unsupported.
 
 After successful upload, a separate guarded `evidence_ready` output permits
@@ -518,11 +525,16 @@ incomplete attempts or authenticated negative results; a fresh later
 positive may supersede older infrastructure gaps. The original collection
 window and full visible attempt history cross to the record job unchanged.
 
-The source classifier recognizes valid dormant pending plans, while their
-operational producers remain blocked. Release now preserves its original drill
-observation through handoff format 4; the supported none/dormant changes remain
+The source classifier, producer and consumer recognize complete immutable
+all-expand dormant pending plans. Both forward passes, N-1 read-write/read-only
+checks, the independent 25006 control, old-server sweeps, worker observation,
+reverse sweep and cleanup still run. The active catalog, 127-table inventory
+and empty modification allowlists remain unchanged. Pending gates are source
+metadata, not assertions that a migration ran or a gate passed.
+Release preserves complete raw pending material, original drill observation and
+full visible compatibility history through handoff format 5; the supported none/dormant changes remain
 exempt. Owner-label collection and policy are preparatory and are not selected
-by the release caller. Pending producer integration, active semantic expansion,
+by the release caller. Actual pending-fixture hosted qualification, active semantic expansion,
 contract admission, dedicated multi-span rollback proof and compatibility-outage
 bypass remain unfinished PR16 work. Visible API
 pagination cannot establish absence of entirely deleted runs, so it does not

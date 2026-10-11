@@ -25,6 +25,7 @@ import schema_change
 import compat_evidence
 import record_resolver
 import record_transport
+import pending_binding
 
 common, records = runtime.common, runtime.release_record
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -113,19 +114,22 @@ def _resolved_snapshot(resolution, ctx):
                        "manifest_sha256": live.origin_manifest_sha256},
             "catalog": None if live is None else live.catalog._asdict()}
     classification = resolution.classification
-    value = {"version": 3, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
+    contract = compat.catalog.CatalogContract.from_resolution(resolution)
+    value = {"version": 4, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
              "requested_rollback_target": ctx.target, "latest": _identity(latest), "selected": _identity(selected),
              "database_base": base, "selected_web_source_sha": resolution.previous_web_source_sha,
+             "pending": pending_binding.to_wire(contract.pending_binding),
              "preview": {"kind": classification.kind, "dormant": classification.dormant,
-                         "blocked": bool(classification.reasons) or ctx.target is not None}}
+                         "blocked": bool(classification.reasons) or ctx.target is not None
+                         or classification.requirements != ("compat-required", "generated-migration-closure-ci")}}
     return validate_snapshot(value, ctx)
 
 
 def validate_snapshot(value, ctx):
     need(type(value) is dict and set(value) == {"version", "sha", "run_id", "run_attempt",
          "requested_rollback_target", "latest", "selected", "preview", "database_base",
-         "selected_web_source_sha"}, "cli-snapshot-invalid")
-    need(type(value["version"]) is int and value["version"] == 3
+         "selected_web_source_sha", "pending"}, "cli-snapshot-invalid")
+    need(type(value["version"]) is int and value["version"] == 4
          and value["sha"] == ctx.sha and type(value["run_id"]) is int and value["run_id"] == ctx.run_id
          and type(value["run_attempt"]) is int and value["run_attempt"] == ctx.attempt
          and value["requested_rollback_target"] == ctx.target, "cli-snapshot-context")
@@ -150,11 +154,18 @@ def validate_snapshot(value, ctx):
         raise proof.EvidenceError("cli-snapshot-base") from None
     need(type(value["selected_web_source_sha"]) is str and _SHA.fullmatch(value["selected_web_source_sha"]),
          "cli-snapshot-source")
+    try:
+        binding = pending_binding.validate_against(pending_binding.parse_wire(value["pending"]),
+            candidate_sha=ctx.sha, previous_sha=value["latest"]["sha"],
+            active_artifacts=compat.catalog.PENDING_ACTIVE_ARTIFACTS)
+    except pending_binding.PendingBindingRefusal:
+        raise proof.EvidenceError("cli-snapshot-pending") from None
     preview = value["preview"]
     need(type(preview) is dict and set(preview) == {"kind", "dormant", "blocked"}
-         and preview["kind"] in {"none", "data"}
+         and preview["kind"] in {"none", "data", "expand"}
          and type(preview["dormant"]) is bool and type(preview["blocked"]) is bool
-         and preview["dormant"] == (preview["kind"] == "data"), "cli-snapshot-preview")
+         and preview["dormant"] == (preview["kind"] != "none")
+         and (preview["kind"] != "expand" or binding.target_version is not None), "cli-snapshot-preview")
     return value
 
 
@@ -191,13 +202,14 @@ def evidence_context(result, snapshot, ctx):
     """
     validate_result(result, snapshot, ctx)
     need(ctx.target is None, "cli-target-proof-unsupported")
-    return {"version": 2, "repository": common.REPOSITORY, "workflow_path": _WORKFLOW_PATH,
+    return {"version": 3, "repository": common.REPOSITORY, "workflow_path": _WORKFLOW_PATH,
             "workflow_sha": ctx.sha, "event": ctx.event, "ref": ctx.ref, "sha": ctx.sha,
             "run_id": ctx.run_id, "run_attempt": ctx.attempt,
             "requested_rollback_target": ctx.target, "latest": snapshot["latest"],
             "selected": snapshot["selected"], "preview": snapshot["preview"],
             "database_base": snapshot["database_base"],
             "selected_web_source_sha": snapshot["selected_web_source_sha"],
+            "pending": snapshot["pending"],
             "result_sha256": hashlib.sha256(result).hexdigest()}
 
 
@@ -354,6 +366,7 @@ _PUBLIC_FAILURE_CODES = frozenset({
     "catalog-cli-failed", "catalog-cli-invalid-arguments", "catalog-cli-output-failed",
     "catalog-contract-invalid", "catalog-fallback-not-equal", "catalog-image-source-mismatch",
     "catalog-json-invalid", "catalog-output-invalid", "catalog-ownership-invalid",
+    "catalog-pending-invalid", "catalog-pending-unsupported",
     "catalog-pg-binding-invalid", "catalog-phase-active", "catalog-progression-unsupported",
     "catalog-quiescence-diagnostics", "catalog-source", "catalog-source-invalid",
     "catalog-table-inventory-mismatch", "catalog-unknown-unsupported", "experiment-already-attempted",
@@ -396,7 +409,7 @@ _DIAGNOSTIC_EVIDENCE_CODES = _PUBLIC_FAILURE_CODES | frozenset({
     "cli-preview-blocked", "cli-public-bound", "cli-public-exists", "cli-output-path-invalid",
     "cli-scratch-overlap", "cli-already-attempted", "cli-token-unavailable", "cli-constructor-command-invalid",
     "cli-command-invalid", "cli-experiment-disabled", "cli-snapshot-noncanonical", "cli-upstream-failed",
-    "cli-snapshot-base", "cli-snapshot-source", "cli-resolution-changed", "cli-deadline-invalid",
+    "cli-snapshot-base", "cli-snapshot-source", "cli-snapshot-pending", "cli-resolution-changed", "cli-deadline-invalid",
     "cli-git-unavailable", "cli-target-proof-unsupported",
 })
 _DIAGNOSTIC_RELEASE_CODES = frozenset({

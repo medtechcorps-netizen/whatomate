@@ -169,10 +169,31 @@ def _resolved(value):
 
 @_public
 def prepare_promotion(resolution, collected, candidate_images, execution, *, staging, drills=None):
-    """Qualify the original production capture, never an arbitrary receipt."""
+    """Current production requires observed pending material and context3."""
+    _need(type(resolution) is resolver.ForwardResolution
+          and type(resolution.pending) is resolver.pending_source.PendingMaterial
+          and type(drills) is forward_gates.DrillGate)
+    qualified = request.qualify(resolution, collected)
+    return _promotion_handoff(resolution, collected, candidate_images, execution,
+                              qualified, staging=staging, drills=drills)
+
+
+@_public
+def _prepare_promotion_context2_custody(resolution, collected, candidate_images, execution, *, staging, drills=None):
+    """Historical record replay only; the closed codec selects this route.
+
+    No operational caller may use this instead of current source admission.
+    These immutable values are data, not a transferable custody capability.
+    """
+    _need(type(resolution) is resolver.ForwardResolution and resolution.pending is None)
+    qualified = request._qualify_context2_custody(resolution, collected)
+    return _promotion_handoff(resolution, collected, candidate_images, execution,
+                              qualified, staging=staging, drills=drills)
+
+
+def _promotion_handoff(resolution, collected, candidate_images, execution, qualified, *, staging, drills):
     _execution(execution)
     _need(type(staging) is str and staging in ("passed", "bypassed"))
-    qualified = request.qualify(resolution, collected)
     if drills is None:
         # Exact historical custody only. Current production/encoder requires an
         # observation; an old exempt handoff is not upgraded during record retry.
@@ -265,6 +286,20 @@ def build_promotion(handoff, publication, current_resolution):
     expected = prepare_promotion(handoff.resolution, handoff.collected, handoff.candidate_images,
                                  handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
     _need(handoff == expected, "record-writer-handoff-changed")
+    return _append_promotion(handoff, publication, current_resolution)
+
+
+@_public
+def _build_promotion_context2_custody(handoff, publication, current_resolution):
+    """Only exact decoded historical custody can select this private path."""
+    _need(type(handoff) is PromotionHandoff)
+    expected = _prepare_promotion_context2_custody(handoff.resolution, handoff.collected,
+        handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
+    _need(handoff == expected, "record-writer-handoff-changed")
+    return _append_promotion(handoff, publication, current_resolution)
+
+
+def _append_promotion(handoff, publication, current_resolution):
     _publication(publication)
     _need(publication.execution == handoff.execution, "record-writer-execution-changed")
     chain = _resolved(current_resolution)

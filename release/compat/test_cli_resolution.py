@@ -16,6 +16,7 @@ class ResolutionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source_tests.ForwardResolverTests.setUpClass()
+        source_tests.ForwardPendingTests.setUpClass()
 
     def setUp(self):
         self.case = source_tests.ForwardResolverTests()
@@ -55,6 +56,7 @@ class ResolutionTests(unittest.TestCase):
         value = test_cli.result(self.ctx)
         value.update(previous_release=snap["selected"]["release"],
                      previous_web_digest=snap["selected"]["web_digest"])
+        value["classification"] = {key: snap["preview"][key] for key in ("kind", "dormant")}
         if negative:
             value["old_server_ok"]["reverse"] = False
         return cli.proof.result_bytes(value)
@@ -78,12 +80,15 @@ class ResolutionTests(unittest.TestCase):
 
     def test_concrete_preview_keeps_record_image_and_retained_origin_distinct(self):
         snap = self.preview()
-        self.assertEqual(snap["version"], 3)
+        self.assertEqual(snap["version"], 4)
         self.assertEqual(snap["latest"]["sha"], "1" * 40)
         self.assertEqual(snap["selected_web_source_sha"], self.case.boot["sha"])
         self.assertEqual(snap["database_base"]["source_sha"], "2" * 40)
         self.assertEqual(snap["database_base"]["origin"]["release"], self.origin["release"])
         self.assertEqual(snap["preview"], {"kind":"none", "dormant":False, "blocked":False})
+        self.assertEqual(snap["pending"]["previous_sha"], snap["latest"]["sha"])
+        self.assertNotEqual(snap["pending"]["previous_sha"], snap["database_base"]["source_sha"])
+        self.assertEqual(snap["pending"]["candidate_files"], [])
         self.assertIsNone(cli.records._GIT_OUTPUT_TRANSPORT.get())
 
     def test_concrete_reresolution_matches_then_preserves_actual_negative(self):
@@ -91,12 +96,13 @@ class ResolutionTests(unittest.TestCase):
         raw = self.execute(snap, negative=True)
         self.assertFalse(cli.accepted(json.loads(raw)))
         context = cli.evidence_context(raw, snap, self.ctx)
-        self.assertEqual(context["version"], 2)
+        self.assertEqual(context["version"], 3)
         pair = policy_tests.pack(raw, context)
         measured = cli.compat_evidence.parse_authenticated_pair(pair, policy_tests.attempt())
         self.assertFalse(measured.positive)
         self.assertEqual(measured.selected_web_source_sha, snap["selected_web_source_sha"])
         self.assertEqual(measured.database_base.source_sha, self.origin["sha"])
+        self.assertEqual(measured.pending_binding, cli.pending_binding.parse_wire(snap["pending"]))
 
     def test_each_preview_origin_or_actual_source_disagreement_refuses_before_engine(self):
         snap = self.preview()
@@ -127,27 +133,55 @@ class ResolutionTests(unittest.TestCase):
 
     def test_legacy_snapshot_cannot_be_silently_upgraded(self):
         snap = self.preview()
-        for version in (1, 2, True):
+        for version in (1, 2, 3, True):
             changed = copy.deepcopy(snap); changed["version"] = version
             with self.assertRaises(cli.proof.EvidenceError): cli.validate_snapshot(changed, self.ctx)
-        for field in ("database_base", "selected_web_source_sha"):
+        for field in ("database_base", "selected_web_source_sha", "pending"):
             changed = copy.deepcopy(snap); del changed[field]
             with self.assertRaises(cli.proof.EvidenceError): cli.validate_snapshot(changed, self.ctx)
 
-    def test_context2_positive_roundtrip_qualifies_only_matching_origin(self):
+    def test_context3_positive_roundtrip_qualifies_only_matching_origin_and_inventory(self):
         snap = self.preview(); raw = self.execute(snap)
         context = cli.evidence_context(raw, snap, self.ctx)
         pair = policy_tests.pack(raw, context)
         latest = cli.compat_evidence.ReleaseIdentity(**snap["latest"])
         base = cli.compat_evidence._database_base_dict(snap["database_base"], latest)
         req = policy_tests.request(latest=latest, base=base, web_source=snap["selected_web_source_sha"])
-        req = replace(req, source=replace(req.source, expected_after_catalog_sha256=json.loads(raw)["catalog_sha256"]))
+        binding = cli.pending_binding.parse_wire(snap["pending"])
+        req = replace(req, source=replace(req.source,
+            expected_after_catalog_sha256=json.loads(raw)["catalog_sha256"], pending_binding=binding,
+            catalog_authority=tuple(cli.compat_evidence.CatalogBlob(path, digest)
+                for path, digest in sorted(cli.compat.catalog._PINS.items()))))
         hist = policy_tests.history(policy_tests.attempt(measurement=pair))
         qualified = cli.compat_evidence.require_compat(req, hist)
         self.assertEqual(qualified.database_base, base)
+        self.assertEqual(qualified.pending_binding, binding)
         stale = replace(req, source=replace(req.source, previous_web_source_sha=latest.sha))
         with self.assertRaises(cli.compat_evidence.CompatRefusal):
             cli.compat_evidence.require_compat(stale, hist)
+
+    def test_valid_pending_preview_and_fresh_resolution_retain_supported_dormant_class(self):
+        files = source_tests.ForwardPendingTests.pending_files
+        self.case.world.files.update({(self.ctx.sha, path): raw for path, raw in files.items()})
+        snap = self.preview()
+        self.assertEqual(snap["preview"], {"kind": "expand", "dormant": True, "blocked": False})
+        self.assertEqual(snap["pending"]["target_version"], 1)
+        self.assertEqual(snap["pending"]["previous_sha"], snap["latest"]["sha"])
+        self.assertEqual(len(snap["pending"]["candidate_files"]), 3)
+        self.assertEqual(snap["pending"]["previous_files"], [])
+        raw = self.execute(snap)
+        context = cli.evidence_context(raw, snap, self.ctx)
+        measured = cli.compat_evidence.parse_authenticated_pair(
+            policy_tests.pack(raw, context), policy_tests.attempt())
+        self.assertEqual(measured.classification, cli.compat_evidence.Classification("expand", True))
+        self.assertEqual(measured.pending_binding, cli.pending_binding.parse_wire(snap["pending"]))
+
+    def test_complete_malformed_pending_never_becomes_empty_snapshot_binding(self):
+        files = dict(source_tests.ForwardPendingTests.pending_files)
+        files[cli.pending_binding.source.plan.PLAN] = b"PRIVATE_INVALID_JSON"
+        self.case.world.files.update({(self.ctx.sha, path): raw for path, raw in files.items()})
+        with self.assertRaisesRegex(cli.proof.EvidenceError, "^catalog-pending-invalid$"):
+            self.preview()
 
 
 if __name__ == "__main__": unittest.main(verbosity=2)

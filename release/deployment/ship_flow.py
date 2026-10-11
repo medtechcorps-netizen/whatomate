@@ -283,9 +283,9 @@ def record_bytes(ctx, control, fields, *, deadline):
     publication = _publication(control, fields)
     if fields['kind'] == 'promote':
         outputs = {key: ctx.env.get('REC_' + key.upper(), '') for key in record_handoff.OUTPUT_KEYS}
-        handoff = record_handoff.decode(outputs, workflow_sha=control['workflow_sha'],
-            candidate_sha=fields['sha'], run_id=int(control['run_id']), record_attempt=control['run_attempt'])
-        raw = record_writer.build_promotion(handoff, publication, resolved)
+        raw = record_handoff.build_record(outputs, workflow_sha=control['workflow_sha'],
+            candidate_sha=fields['sha'], run_id=int(control['run_id']), record_attempt=control['run_attempt'],
+            publication=publication, current_resolution=resolved)
     else:
         tag = ctx.env.get('SHIP_TARGET_RELEASE', '')
         _need(tag == fields['previous'] if fields['kind'] == 'restore' else tag != fields['previous'],

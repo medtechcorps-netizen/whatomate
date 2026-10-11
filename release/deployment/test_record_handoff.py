@@ -42,9 +42,10 @@ class HandoffTests(unittest.TestCase):
             fixture.images(cls.resolution), fixture.execution(), staging='passed', drills=fixture.drills(cls.resolution))
         cls.outputs = codec.encode(cls.handoff)
         # Retain a separately built historical v2 wire for all inherited JSON,
-        # per-blob zlib and closed-type adversarial cases. Public success uses v4.
+        # per-blob zlib and closed-type adversarial cases. Public success uses v5.
+        cls.historical = fixture.historical_handoff(cls.resolution)
         budget = codec._Budget(version=2)
-        node = codec._value(cls.handoff, w.PromotionHandoff, budget, 0, encoding=True)
+        node = codec._value(cls.historical, w.PromotionHandoff, budget, 0, encoding=True)
         cls.wire = {'version': 2, 'handoff': node, 'blobs': [
             {'sha256': digest, 'length': len(raw),
              'value': base64.b64encode(zlib.compress(raw, 9)).decode()}
@@ -57,6 +58,14 @@ class HandoffTests(unittest.TestCase):
                     run_id=self.handoff.execution.run_id, record_attempt=1)
         args.update(changes)
         return codec.decode(self.outputs if outputs is None else outputs, **args)
+
+    def build_record(self, outputs=None, **changes):
+        args = dict(candidate_sha=self.handoff.candidate_images.sha,
+                    workflow_sha=self.handoff.execution.workflow_sha,
+                    run_id=self.handoff.execution.run_id, record_attempt=1,
+                    publication=fixture.publication(), current_resolution=self.resolution.resolved)
+        args.update(changes)
+        return codec.build_record(self.outputs if outputs is None else outputs, **args)
 
     def refuse(self, outputs=None, **changes):
         with self.assertRaises(codec.HandoffRefusal) as caught:
@@ -128,7 +137,7 @@ class HandoffTests(unittest.TestCase):
         self.assertIs(json.loads(negative.result)['old_server_ok']['workers'], False)
 
     def test_hash_lengths_counts_versions_and_slots_are_not_optional(self):
-        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '5'),
+        for key, value in [('handoff_sha256', 'f' * 64), ('handoff_version', '6'),
                            ('handoff_raw_length', '1'), ('handoff_compressed_length', '1'),
                            ('handoff_encoded_length', '1'), ('handoff_chunk_count', '0'),
                            ('handoff_chunk_count', '01'), ('handoff_raw_length', True)]:
@@ -286,7 +295,7 @@ class HandoffTests(unittest.TestCase):
 
     def test_version2_preserves_all_audit_ranges_and_drill_source_bytes(self):
         restored = self.decode(envelope(self.raw), record_attempt=2)
-        self.assertEqual(self.outputs['handoff_version'], '4')
+        self.assertEqual(self.outputs['handoff_version'], '5')
         self.assertEqual(self.wire['version'], 2)
         self.assertEqual(restored.resolution.audit, self.resolution.audit)
         self.assertEqual(len(restored.resolution.audit.changes), 3)
@@ -300,8 +309,9 @@ class HandoffTests(unittest.TestCase):
         self.assertIsNone(restored.resolution.audit)
         fresh = replace(self.resolution.resolved,
             inventory=replace(self.resolution.resolved.inventory, main_sha='f' * 40))
-        self.assertEqual(w.build_promotion(restored, fixture.publication(), fresh),
+        self.assertEqual(self.build_record(self.legacy_outputs(), current_resolution=fresh, record_attempt=3),
             w.build_promotion(self.handoff, fixture.publication(), fresh))
+        with self.assertRaises(w.WriterRefusal): w.build_promotion(restored, fixture.publication(), fresh)
         with self.assertRaises(codec.HandoffRefusal): codec.encode(restored)
         with self.assertRaises(codec.p.PolicyRefusal):
             codec.r.validate_forward_audit(restored.resolution.audit,
@@ -346,7 +356,7 @@ class HandoffTests(unittest.TestCase):
             with self.assertRaises(codec.HandoffRefusal): codec.encode(changed)
 
 
-def xz_envelope(raw, *, compressed=None, version='4'):
+def xz_envelope(raw, *, compressed=None, version='5'):
     packed = (lzma.compress(raw, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, preset=6)
               if compressed is None else compressed)
     return envelope(raw, compressed=packed, version=version)
@@ -376,19 +386,20 @@ class XZTests(unittest.TestCase):
             'public_roundtrip': True}}
 
     decode = HandoffTests.decode
+    build_record = HandoffTests.build_record
     refuse = HandoffTests.refuse
 
     def test_v3_exact_historical_frame_has_no_observation_or_reencode_authority(self):
         budget = codec._Budget(version=3)
-        node = codec._value(self.handoff, w.PromotionHandoff, budget, 0, encoding=True)
+        node = codec._value(self.historical, w.PromotionHandoff, budget, 0, encoding=True)
         raw = codec._frame(node, budget.blobs, version=3)
         old = self.decode(xz_envelope(raw, version='3'), record_attempt=17)
-        self.assertEqual(old, replace(self.handoff, drills=None))
+        self.assertEqual(old, self.historical)
         with self.assertRaises(codec.HandoffRefusal): codec.encode(old)
-        self.assertEqual(w.build_promotion(old, fixture.publication(), self.resolution.resolved),
+        self.assertEqual(self.build_record(xz_envelope(raw, version='3')),
                          w.build_promotion(self.handoff, fixture.publication(), self.resolution.resolved))
 
-    def test_v4_requires_complete_original_observation_without_wire_upgrade(self):
+    def test_v5_requires_complete_original_observation_without_wire_upgrade(self):
         self.assertEqual(self.decode(record_attempt=99).drills, self.handoff.drills)
         for change in (lambda fields: fields.pop('drills'), lambda fields: fields.update(drills=None),
                        lambda fields: fields['drills']['fields'].update(required=1),
@@ -400,11 +411,11 @@ class XZTests(unittest.TestCase):
             self.refuse(xz_envelope(frame(header, self.payload)))
         with self.assertRaises(codec.HandoffRefusal): codec.encode(replace(self.handoff, drills=None))
 
-    def test_v4_complete_history_public_roundtrip_and_historical_no_upgrade(self):
+    def test_v5_complete_history_public_roundtrip_and_historical_no_upgrade(self):
         restored = self.decode(record_attempt=4)
         self.assertEqual(restored, self.handoff)
         self.assertEqual(restored.collected.history, self.history.history)
-        self.assertEqual(self.header['version'], 4)
+        self.assertEqual(self.header['version'], 5)
         self.assertEqual(int(self.outputs['handoff_raw_length']), len(self.frame))
         self.assertEqual(self.outputs['handoff_sha256'], hashlib.sha256(self.frame).hexdigest())
         self.assertGreater(len(self.frame), 1762225)
@@ -424,7 +435,7 @@ class XZTests(unittest.TestCase):
             self.refuse()
             with self.assertRaisesRegex(codec.HandoffRefusal, '^record-handoff-invalid$'):
                 codec.encode(self.handoff)
-            self.assertEqual(self.decode(envelope(self.raw)), replace(self.handoff, drills=None))
+            self.assertEqual(self.decode(envelope(self.raw)), self.historical)
             self.assertIsNone(self.decode(HandoffTests.legacy_outputs(self)).resolution.audit)
         with mock.patch.object(lzma, 'is_check_supported', return_value=False):
             self.refuse()
@@ -455,7 +466,7 @@ class XZTests(unittest.TestCase):
                     b'[' * 49 + b'0' + b']' * 49,
                     header + b' ', json.dumps(self.header, indent=2).encode()):
             self.refuse(xz_envelope(len(bad).to_bytes(4, 'big') + bad + self.payload))
-        for version in (True, 1, 2, 3, 5):
+        for version in (True, 1, 2, 3, 4, 6):
             changed = copy.deepcopy(self.header); changed['version'] = version
             self.refuse(xz_envelope(frame(changed, self.payload)))
         changed = dict(self.outputs); changed['handoff_version'] = '2'; self.refuse(changed)
@@ -479,7 +490,7 @@ class XZTests(unittest.TestCase):
         for limit in ('MAX_BLOBS', 'MAX_BLOB', 'MAX_EXPANDED_BYTES', 'MAX_NODES'):
             with self.subTest(limit=limit), mock.patch.object(codec, limit, 1): self.refuse()
 
-    def test_v4_replay_and_complete_audit_are_not_bypassed_by_rehashed_frames(self):
+    def test_v5_replay_and_complete_audit_are_not_bypassed_by_rehashed_frames(self):
         for modify in (lambda f: f['resolution']['fields'].pop('audit'),
                        lambda f: f['resolution']['fields'].update(audit=None),
                        lambda f: f['facts']['fields'].update(compat_run_id=123),
@@ -504,61 +515,170 @@ class XZTests(unittest.TestCase):
             with self.assertRaises(codec.HandoffRefusal):
                 codec._value(value['handoff'], w.PromotionHandoff, budget, 0, encoding=False)
 
-    def test_full_pending_catalog_capacity_is_lossless_projection_not_admission(self):
-        import pending_plan as pending
-        import test_pending_plan as pending_fixture
-        args = pending_fixture.fixture()
-        root = fixture.composition.source.ROOT
-        active = dict(active_catalog=(root / codec.p.GOLDEN).read_bytes(),
-                      active_globals=(root / codec.p.GLOBALS).read_bytes(),
-                      active_history=(root / codec.p.HISTORY).read_bytes())
-        target_path = pending.PREFIX + 'catalog-v1.json'
-        target = json.loads(args['files'][target_path])
-        target['objects'] = json.loads(active['active_catalog'])['objects'] + [row for row in target['objects']
-            if row['identity'] not in ('organizations', 'organizations.id')]
-        globals_ = json.loads(active['active_globals']) + [row for row in json.loads(args['files'][pending.GLOBALS])
-            if row['name'] != 'organizations']
-        args.update(active)
-        args['files'][target_path] = pending.canonical(target)
-        args['files'][pending.GLOBALS] = pending.canonical(globals_)
-        plan = json.loads(args['files'][pending.PLAN])
-        plan.update({key + '_file_sha256': pending.digest(raw) for key, raw in active.items()})
-        plan['globals_file_sha256'] = pending.digest(args['files'][pending.GLOBALS])
-        plan['entries'][0].update(catalog_file_sha256=pending.digest(args['files'][target_path]),
-                                  globals_sha256=plan['globals_file_sha256'])
-        args['files'][pending.PLAN] = pending.canonical(plan)
-        parsed = pending.parse_bundle(**args)
-        self.assertEqual(len(parsed.entries[0].objects), 4452)
-        material = self.handoff.resolution.catalog_material
-        added = tuple(codec.p.SourceBlob(path, raw) for path, raw in sorted(args['files'].items()))
-        projected = replace(self.handoff, resolution=replace(self.resolution,
-            catalog_material=replace(material, candidate_blobs=material.candidate_blobs + added)))
-        budget = codec._Budget()
-        node = codec._value(projected, w.PromotionHandoff, budget, 0, encoding=True)
-        binary = codec._frame(node, budget.blobs)
-        packed = codec._xz_compress(binary)
-        outputs = xz_envelope(binary, compressed=packed)
-        self.assertLessEqual(int(outputs['handoff_encoded_length']), codec.MAX_ENCODED)
-        self.assertEqual(codec._unpack(outputs), binary)
-        value, blobs = codec._unframe(binary)
-        restored_budget = codec._Budget(blobs)
-        restored = codec._value(value['handoff'], w.PromotionHandoff, restored_budget, 0, encoding=False)
-        self.assertEqual(restored, projected)
-        self.assertEqual(restored.collected, self.handoff.collected)
-        self.assertEqual(restored_budget.used, blobs.keys())
-        # The current source/writer contract deliberately still rejects pending
-        # files. Capacity does not grant SQL, source or operational authority.
-        self.refuse(outputs)
-        with self.assertRaises(codec.HandoffRefusal): codec.encode(projected)
-        type(self).measurements['pending_projection'] = {
+    def test_v4_historical_context2_retains_original_observation_and_closed_retry(self):
+        historical = fixture.historical_handoff(self.resolution, observation=fixture.drills(self.resolution))
+        budget = codec._Budget(version=4)
+        node = codec._value(historical, w.PromotionHandoff, budget, 0, encoding=True)
+        raw = codec._frame(node, budget.blobs, version=4)
+        outputs = xz_envelope(raw, version='4')
+        restored = self.decode(outputs, record_attempt=5)
+        self.assertEqual(restored, historical)
+        self.assertIsNone(restored.resolution.pending)
+        self.assertEqual(restored.drills, historical.drills)
+        self.assertEqual(self.build_record(outputs, record_attempt=5),
+                         w.build_promotion(self.handoff, fixture.publication(), self.resolution.resolved))
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(restored)
+        with self.assertRaises(w.WriterRefusal):
+            w.build_promotion(restored, fixture.publication(), self.resolution.resolved)
+        # The envelope version is part of the validated closed graph. Neither
+        # an omitted observation nor a caller-relabelled version grants v5.
+        changed = dict(outputs); changed['handoff_version'] = '5'; self.refuse(changed)
+
+    def test_v5_pending_field_is_closed_mandatory_and_raw_replayed(self):
+        def pending(fields): return fields['resolution']['fields']['pending']['fields']
+        for modify in (lambda f: f['resolution']['fields'].pop('pending'),
+                       lambda f: f['resolution']['fields'].update(pending=None),
+                       lambda f: pending(f).update(previous_sha='f' * 40),
+                       lambda f: pending(f).update(candidate_sha='f' * 40),
+                       lambda f: pending(f).update(PRIVATE=None),
+                       lambda f: pending(f)['candidate_files']['items'].append(
+                           {'type':'pending_source.PendingBlob','fields':{'path':'../PRIVATE','raw':None}})):
+            changed = copy.deepcopy(self.header); modify(changed['handoff']['fields'])
+            self.refuse(xz_envelope(frame(changed, self.payload)))
+        with self.assertRaises(codec.HandoffRefusal):
+            codec.encode(replace(self.handoff, resolution=replace(self.resolution, pending=None)))
+
+    def retained_plan(self, *, variant=None, large=False):
+        value = fixture.retained_pending_resolution()
+        actions = fixture.composition.actions
+        world = actions.World()
+        if large:
+            for index in range(400):
+                world.add(run=100 + index, number=10 + index, minute=3 * index,
+                          negative=index == 0)
+        else:
+            world.add(negative=True)
+            world.add(run=101, number=11, minute=30)
+            if variant == 'missing':
+                world.add(run=102, number=12, minute=60, failure=True)
+            elif variant == 'overlap':
+                # A later-numbered complete negative executes concurrently with
+                # the positive. Its actual window veto is retained in custody.
+                world.add(run=102, number=12, minute=30, negative=True)
+        history = fixture.composition.collected(value, world)
+        return value, history
+
+    def test_full_retained_pending_multiple_attempt_public_custody_and_record_replay(self):
+        value, history = self.retained_plan()
+        observation = fixture.drills(value)
+        plan = w.prepare_promotion(value, history, fixture.images(value), fixture.execution(),
+                                   staging='passed', drills=observation)
+        outputs = codec.encode(plan)
+        restored = self.decode(outputs, record_attempt=7)
+        self.assertEqual(restored, plan)
+        self.assertEqual(restored.resolution.pending.candidate_files, restored.resolution.pending.previous_files)
+        self.assertEqual(restored.drills, observation)
+        self.assertEqual(restored.collected, history)
+        self.assertEqual(len(history.history.attempts), 2)
+        earlier = restored.collected.history.attempts[0].measurement
+        later = restored.collected.history.attempts[1].measurement
+        self.assertIs(json.loads(earlier.result)['old_server_ok']['workers'], False)
+        self.assertTrue(all(json.loads(later.result)['old_server_ok'].values()))
+        self.assertEqual(json.loads(earlier.context)['version'], 3)
+        self.assertEqual(json.loads(later.context)['pending'], json.loads(earlier.context)['pending'])
+        future_main = replace(value.resolved, inventory=replace(value.resolved.inventory, main_sha='f' * 40))
+        raw = self.build_record(outputs, record_attempt=7, current_resolution=future_main)
+        self.assertEqual(raw, w.build_promotion(plan, fixture.publication(), value.resolved))
+        self.assertEqual(w.common.loads_strict(raw)['compat_run_id'], 101)
+        binary = codec._unpack(outputs)
+        type(self).measurements['pending_public_custody'] = {
             'raw_bytes': len(binary), 'header_bytes': int.from_bytes(binary[:4], 'big'),
-            'compressed_bytes': len(packed), 'encoded_bytes': int(outputs['handoff_encoded_length']),
+            'compressed_bytes': int(outputs['handoff_compressed_length']),
+            'encoded_bytes': int(outputs['handoff_encoded_length']),
             'chunks': int(outputs['handoff_chunk_count']), 'raw_sha256': outputs['handoff_sha256'],
-            'history_attempts': len(restored.collected.history.attempts),
-            'target_objects': len(parsed.entries[0].objects),
+            'history_attempts': len(history.history.attempts), 'target_objects': 4452,
+            'collected_command_count': history.command_count, 'collected_captured_bytes': history.captured_bytes,
+            'both_endpoints_equal': True, 'original_drills_retained': True,
+            'public_encode_decode_build_record': True,
             'pending_files': [{'path': row.path, 'bytes': len(row.raw),
-                               'sha256': hashlib.sha256(row.raw).hexdigest()} for row in added],
-            'wire_roundtrip': True, 'public_admission': False}
+                               'sha256': hashlib.sha256(row.raw).hexdigest()}
+                              for row in value.pending.candidate_files]}
+        self.assertLessEqual(int(outputs['handoff_encoded_length']), codec.MAX_ENCODED)
+        # Exact raw projection changes cannot be papered over by recomputing
+        # transport hashes or retaining only the successful history tail.
+        bad = replace(plan, resolution=replace(value, pending=replace(value.pending, previous_files=())))
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(bad)
+
+    def test_full_pending_missing_or_overlapping_later_attempt_refuses_before_custody(self):
+        for variant in ('missing', 'overlap'):
+            value, history = self.retained_plan(variant=variant)
+            with self.subTest(variant=variant), \
+                 mock.patch.object(w.common.Output, 'set_outputs', side_effect=AssertionError('partial output')), \
+                 mock.patch.object(w.transport.runtime, 'bounded_command', side_effect=AssertionError('provider')):
+                with self.assertRaises(w.WriterRefusal):
+                    w.prepare_promotion(value, history, fixture.images(value), fixture.execution(),
+                                        staging='passed', drills=fixture.drills(value))
+
+    def test_real_pending_introduction_appends_dormant_expand_without_activating_target(self):
+        source = fixture.composition.source
+        source.ForwardPendingTests.setUpClass()
+        case = source.ForwardPendingTests(); case.setUp()
+        self.addCleanup(case.doCleanups)
+        previous = case.add(); case.profile(previous['sha'])
+        sha = case.candidate(fixture.composition.fixtures.SHA); case.install(sha)
+        value = case.forward(sha)
+        self.assertEqual((value.classification.kind, value.classification.dormant, value.classification.reasons),
+                         ('expand', True, ()))
+        self.assertEqual(value.classification.requirements, ('compat-required', 'generated-migration-closure-ci'))
+        self.assertEqual(value.pending.previous_files, ())
+        projection = case.replay(value)
+        self.assertEqual(len(projection.plan.entries[0].objects), 4452)
+        self.assertEqual(projection.binding.target_version, 1)
+        active = value.resolved.latest.live.catalog
+        self.assertEqual(value.candidate.catalog, active)
+        history = fixture.composition.collected(value)
+        observation = fixture.drills(value)
+        self.assertFalse(observation.required)
+        plan = w.prepare_promotion(value, history, fixture.images(value), fixture.execution(),
+                                   staging='passed', drills=observation)
+        outputs = codec.encode(plan)
+        restored = self.decode(outputs, record_attempt=4)
+        self.assertEqual(restored, plan)
+        self.assertEqual(restored.drills, observation)
+        self.assertEqual(restored.resolution.pending, value.pending)
+        raw = self.build_record(outputs, record_attempt=4, current_resolution=value.resolved)
+        manifest = w.common.loads_strict(raw)
+        self.assertEqual((manifest['schema_version'], manifest['db_change'], manifest['dormant']), (2, 'expand', True))
+        self.assertEqual({key: manifest[key] for key in active._fields}, active._asdict())
+        self.assertEqual((manifest['catalog_version'], manifest['min_reader_version']), (0, 0))
+        after = fixture.appended(value.resolved, raw, value.candidate)
+        self.assertEqual(after.latest.live.catalog, active)
+        self.assertEqual(after.latest.live.origin_source.catalog, active)
+        self.assertNotEqual(after.latest.live.catalog.catalog_version, projection.binding.target_version)
+        type(self).measurements['pending_introduction_public_custody'] = {
+            'target_objects': 4452, 'target_version': 1, 'classification': 'expand', 'dormant': True,
+            'previous_inventory_observed_empty': True, 'public_encode_decode_build_record': True,
+            'original_drills_retained': True, 'live_catalog_version': manifest['catalog_version'],
+            'live_min_reader_version': manifest['min_reader_version'], 'active_catalog_unchanged': True,
+            'manifest_sha256': hashlib.sha256(raw).hexdigest(),
+            'encoded_bytes': int(outputs['handoff_encoded_length']),
+            'chunks': int(outputs['handoff_chunk_count']),
+            'collected_command_count': history.command_count, 'collected_captured_bytes': history.captured_bytes}
+
+    def test_complete_large_pending_history_refuses_unchanged_caps_without_truncation(self):
+        value, history = self.retained_plan(large=True)
+        self.assertEqual(len(history.history.attempts), 400)
+        plan = w.prepare_promotion(value, history, fixture.images(value), fixture.execution(),
+                                   staging='passed', drills=fixture.drills(value))
+        self.assertEqual(plan.facts.compat_run_id, 499)
+        with mock.patch.object(w.common.Output, 'set_outputs', side_effect=AssertionError('partial output')), \
+             mock.patch.object(w.transport.runtime, 'bounded_command', side_effect=AssertionError('provider')):
+            with self.assertRaises(codec.HandoffRefusal): codec.encode(plan)
+        self.assertEqual(len(plan.collected.history.attempts), 400)
+        type(self).measurements['pending_complete_history_over_cap'] = {
+            'history_attempts': 400, 'qualification_completed': True,
+            'collected_command_count': history.command_count, 'collected_captured_bytes': history.captured_bytes,
+            'encode_refused': True, 'caps_unchanged': True, 'no_truncation': True}
 
 
 if __name__ == '__main__':

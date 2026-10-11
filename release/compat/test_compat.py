@@ -683,6 +683,7 @@ class ResolvedExperimentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         tr.ForwardResolverTests.setUpClass()
+        tr.ForwardPendingTests.setUpClass()
 
     def setUp(self):
         EngineTests.setUp(self)
@@ -845,6 +846,58 @@ class ResolvedExperimentTests(unittest.TestCase):
         value = self.resolution.classification._replace(kind='data', dormant=True)
         result = self.run_resolved(replace(self.resolution, classification=value))
         self.assertEqual(result['classification'], {'kind': 'data', 'dormant': True})
+
+    def test_unknown_missing_or_producer_requirements_refuse_before_image_build(self):
+        original = self.resolution.classification
+        for requirements in ((), tuple(reversed(original.requirements)),
+                             (*original.requirements, 'producer-class-unsupported'),
+                             (*original.requirements, 'unobserved-gate')):
+            classification = original._replace(requirements=requirements)
+            with self.subTest(requirements=requirements), self.assertRaisesRegex(
+                    c.proof.EvidenceError, 'classification-unsupported'):
+                self.run_resolved(replace(self.resolution, classification=classification))
+        self.assertEqual(self.w.trace, [])
+        self.assertFalse(hasattr(self.w, 'owner'))
+
+    def test_historical_absence_and_pending_role_mismatch_refuse_before_admission(self):
+        pending = self.resolution.pending
+        for material in (None, replace(pending, candidate_sha='f' * 40),
+                         replace(pending, previous_sha=self.resolution.database_base_source)):
+            with self.subTest(material=material), self.assertRaisesRegex(c.proof.EvidenceError, 'catalog-pending-invalid'):
+                self.run_resolved(replace(self.resolution, pending=material))
+        self.assertEqual(self.w.trace, [])
+
+    def test_expand_cannot_claim_an_observed_empty_pending_inventory(self):
+        classification = self.resolution.classification._replace(kind='expand', dormant=True)
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'classification-unsupported'):
+            self.run_resolved(replace(self.resolution, classification=classification))
+        self.assertEqual(self.w.trace, [])
+
+    def test_supported_pending_projection_keeps_every_measured_phase_and_live_v0(self):
+        # Component composition with explicit upstream classification. The
+        # concrete classifier-to-producer path is covered by CLI resolution tests.
+        source = c.catalog.pending_source
+        material = source.PendingMaterial(SHA, self.resolution.resolved.latest.record_sha,
+            tuple(source.PendingBlob(path, raw) for path, raw in sorted(tr.ForwardPendingTests.pending_files.items())), ())
+        classification = self.resolution.classification._replace(kind='expand', dormant=True)
+        resolution = replace(self.resolution, pending=material, classification=classification)
+        contract = c.catalog.CatalogContract.from_resolution(resolution)
+        self.assertEqual(contract.pending_binding.target_version, 1)
+        self.assertEqual(contract.expected_preexisting_tables, self.contract.expected_preexisting_tables)
+        self.assertEqual(contract.target_sha256, self.contract.target_sha256)
+        result = self.run_resolved(resolution)
+        self.assertEqual(result['classification'], {'kind': 'expand', 'dormant': True})
+        self.assertEqual(result['catalog_sha256'], self.contract.target_sha256)
+        self.assertTrue(result['forward']); self.assertTrue(result['reversible'])
+        self.assertTrue(all(result['old_migrate_ok'].values()))
+        self.assertTrue(all(result['old_server_ok'].values()))
+        self.assertEqual(self.w.trace.count('migration.compat-fwd'), 2)
+        for phase in ('compat-n1-rw', 'compat-n1-ro'):
+            self.assertIn('migration.' + phase, self.w.trace)
+        self.assertIn('pg.control', self.w.trace)
+        self.assertIn('workers.end', self.w.trace)
+        self.assertEqual(self.w.trace.count('controller.read'), 2)
+        self.assertEqual(self.w.trace[-3:], ['catalog.final', 'manager.close', 'stack.cleanup'])
 
     def test_unsealed_admission_or_wrong_actual_image_source_refuses_before_stack(self):
         wrong = replace(self.admission.previous, source_sha=self.resolution.resolved.selected.record_sha)
