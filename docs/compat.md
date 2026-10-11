@@ -799,8 +799,46 @@ The combined source regression run passed 243 cases: 53 column, 25 index and
 165 v2 classifier/history cases. The earlier nullable change passed 268 distinct
 cases including the legacy classifier; unchanged legacy definitions were also
 independently checked during the combined review. These source rules retain
-the current producer, apply-engine and active-profile holds. Full relation/RLS
-bundles and versioned additive tenant profiles remain separate PR16 work.
+the current producer, apply-engine and active-profile holds. The following
+section describes the additional bounded relation and tenant-profile rules.
+
+## New relation and additive tenant-profile source rules
+
+The classifier also understands a fixed declaration for one new ordinary
+relation. The global form has one nullable bigint column and one new exact
+global-table entry. The direct-tenant form has a nullable organization UUID and
+bigint value, ENABLE and FORCE RLS, and the complete fixed pair of tenant
+policies. Both forms replay the full relation, columns, row/array types,
+definition hashes and closed creation-time ACLs. A new public relation without
+the required RLS bundle or allowlist remains blocked. Existing privileges and
+unexplained catalog changes retain their contract/security precedence.
+
+A separate fixed declaration appends exactly the next additive profile version
+(at least 2), with one newly declared direct-tenant member. Its symbolic
+fingerprint binds canonical policy content independently of PostgreSQL role
+OIDs. Core and version-1 fingerprints remain unchanged. All retained versions,
+source declarations, policies and functions are checked at both endpoints;
+later changes to old tables still pass through the ordinary residual classifier.
+The bounded source grammar admits literal inventories and known read forms;
+it refuses aliases, shadowed builtin calls and unsupported syntax rather than
+evaluating arbitrary Go source.
+
+All five optional declaration roles, both catalogs, both global inventories and
+both tenant sources share the original 8 MiB comparison allowance. Explanations
+must be disjoint, and the full unexplained remainder is recomputed. First-parent
+history checks retained tenant inventory declarations, policies and fingerprint
+identities for replacement or change-then-revert. New invoker
+functions require the migration owner and one exact reviewed creation ACL;
+empty, extra or altered privilege bundles cannot be classified as safe additions.
+
+The relation SQL renderer describes CREATE TABLE and ENABLE/FORCE only. The
+policy rows and symbolic function are separately validated source evidence;
+this is not a complete executable migration or proof that a live migration ran.
+An isolated PostgreSQL 17.11 probe verified the fixed global and direct-tenant
+catalog templates and identical symbolic policy content under two different
+role-OID assignments. All database changes were rolled back and the original
+Docker resources restored. Runtime application, active declarations and engine
+activation remain separate planned work.
 
 ## Validation still required
 

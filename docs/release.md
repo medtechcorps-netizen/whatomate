@@ -147,10 +147,11 @@ bundle describes a 4,452-object expand target. The active measured v0 catalog
 stayed unchanged and the declarations remained unapplied. This non-main-base
 PR result is not signed main qualification or release authority.
 
-The remaining PR16 work includes positive active and additive classifier rules,
-active-contract semantic proof
-and hosted permission qualification, actual exact-span rollback qualification,
-authenticated compatibility-outage bypass, and their validation. Active forward
+The classifier has bounded source rules for the planned expansion families.
+Active database execution remains disabled; the dormant engine (PR22) and its
+activation (PR23) are later steps. Remaining PR16 work includes active-contract
+semantic proof and hosted permission qualification, actual exact-span rollback
+qualification, authenticated compatibility-outage bypass, and their validation. Active forward
 database changes require both restore-drill dates within 90 days, but active
 producers remain disabled. The null timestamps are not successful drill evidence.
 Existing staging failure-injection drills do not substitute for database
