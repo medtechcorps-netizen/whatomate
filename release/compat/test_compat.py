@@ -4,6 +4,7 @@ No Docker, GitHub, database, image builds or real compatibility runs occur.
 The public production admission refusal is tested separately from mock runs.
 """
 from dataclasses import asdict
+from contextlib import nullcontext
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -340,6 +341,44 @@ class EngineTests(unittest.TestCase):
                 c._Engine(self.p,PREVIOUS,SHA,1,1,None,FakeContract(),value,'docker',self.p)
         self.assertEqual(self.w.trace,[])
 
+    def test_overall_reserved_cleanup_and_result_share_absolute_deadline(self):
+        overall=c.image_admission._Deadline(clock=self.w.clock)
+        self.w.clock.now+=1500
+        engine=c._Engine(self.p,PREVIOUS,SHA,1,1,c.schema_change.Classification('none',False,(),()),
+            FakeContract(),images(),'docker',self.p,clock=self.w.clock,sleep=self.w.clock.sleep,overall=overall)
+        self.assertEqual(engine.seconds,720)
+        # Use the real overall wrapper with the existing fake Docker boundary.
+        with patch.object(c.runtime,'bounded_command',side_effect=engine.owner.raw_capture):
+            result=json.loads(engine.run())
+        self.assertTrue(result['forward']);self.assertTrue(engine.owner._closed)
+        self.assertLessEqual(overall.remaining(),840)
+
+    def test_elapsed_overall_never_invokes_cleanup_or_publishes(self):
+        overall=c.image_admission._Deadline(clock=self.w.clock)
+        engine=c._Engine(self.p,PREVIOUS,SHA,1,1,c.schema_change.Classification('none',False,(),()),
+            FakeContract(),images(),'docker',self.p,clock=self.w.clock,sleep=self.w.clock.sleep,overall=overall)
+        def measure():
+            engine.owner.start();self.w.clock.now+=2401
+            raise c.proof.InfrastructureFailure('synthetic-incomplete')
+        with patch.object(engine,'_measure',side_effect=measure),patch.object(c.proof,'result_bytes') as encode:
+            with self.assertRaisesRegex(c.proof.InfrastructureFailure,'admission-deadline'):engine.run()
+            encode.assert_not_called()
+        self.assertNotIn('stack.cleanup',self.w.trace);self.assertFalse(engine.owner._closed)
+
+    def test_overall_cleanup_foreign_replacement_never_called(self):
+        overall=c.image_admission._Deadline(clock=self.w.clock)
+        engine=c._Engine(self.p,PREVIOUS,SHA,1,1,c.schema_change.Classification('none',False,(),()),
+            FakeContract(),images(),'docker',self.p,clock=self.w.clock,sleep=self.w.clock.sleep,overall=overall)
+        foreign_calls=[]
+        def foreign(*args,**kwargs):foreign_calls.append(1)
+        def close(manager):manager.owner.capture=foreign
+        with patch.object(c.runtime,'bounded_command',side_effect=engine.owner.raw_capture), \
+             patch.object(FakeManager,'close',close),patch.object(c.proof,'result_bytes') as encode:
+            with self.assertRaisesRegex(c.proof.EvidenceError,'concurrent-transport'):engine.run()
+            encode.assert_not_called()
+        self.assertEqual(foreign_calls,[]);self.assertIs(engine.owner.capture,foreign)
+        self.assertNotIn('stack.cleanup',self.w.trace)
+
 
 class AdmissionTests(unittest.TestCase):
     def setUp(self):
@@ -351,9 +390,9 @@ class AdmissionTests(unittest.TestCase):
              patch.object(c.schema_change,'classify',return_value=classification) as classify, \
              patch.object(c.catalog,'CatalogContract',return_value=FakeContract()), \
              patch.object(c.stack,'OwnedStack') as docker:
-            with self.assertRaisesRegex(c.proof.EvidenceError,'source-build-admission-unimplemented'):
+            with self.assertRaisesRegex(c.proof.EvidenceError,'source-build-admission-unreviewed'):
                 c.run_experiment(self.p,SHA,123,2,object(),docker_binary='docker',config_dir=self.p)
-            verify.assert_called_once();classify.assert_called_once_with(self.p,BASE,SHA,mode='forward')
+            verify.assert_not_called();classify.assert_not_called()
             docker.assert_not_called()
             with self.assertRaises(TypeError):
                 c.run_experiment(self.p,SHA,123,2,object(),docker_binary='docker',config_dir=self.p,images=images())
@@ -362,9 +401,11 @@ class AdmissionTests(unittest.TestCase):
         for kind,dormant,reasons in [('expand',False,()),('contract',False,()),('data',False,()),('none',False,('blocked',))]:
             with patch.object(c.runtime,'verified_previous',return_value=PREVIOUS), \
                  patch.object(c.schema_change,'classify',return_value=c.schema_change.Classification(kind,dormant,reasons,())), \
+                 patch.object(c.image_admission,'_READY_FOR_EXECUTION',True), \
+                 patch.object(c.image_admission,'_verification_transport',return_value=nullcontext()), \
                  patch.object(c,'_admit_images') as admission:
-                with self.assertRaises(c.proof.EvidenceError):
-                    c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p)
+                with self.assertRaisesRegex(c.proof.EvidenceError,'classification-unsupported'):
+                    c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,image_receipts_dir=self.p)
                 admission.assert_not_called()
 
     def test_source_run_attempt_and_rollback_inputs_validate_before_verification(self):
@@ -373,6 +414,29 @@ class AdmissionTests(unittest.TestCase):
                 with self.assertRaises(c.proof.EvidenceError):
                     c.run_experiment(self.p,sha,run,attempt,object(),docker_binary='docker',config_dir=self.p,rollback_target=target)
             verify.assert_not_called()
+
+    def test_same_deadline_spans_verification_catalog_admission_engine(self):
+        clock=to.Clock();deadline=c.image_admission._Deadline(clock=clock);seen={}
+        def verify(*args,**kwargs):clock.now+=100;return PREVIOUS
+        def admission(*args):
+            self.assertIs(args[-1],deadline);clock.now+=1400;return images()
+        def contract(*args,**kwargs):
+            seen['capture']=kwargs['capture'];return FakeContract()
+        class Engine:
+            def __init__(inner,*args,**kwargs):
+                self.assertIs(kwargs['overall'],deadline)
+                self.assertEqual(deadline.experiment_seconds(),720)
+            def run(inner):return b'mock-result'
+        with patch.object(c.image_admission,'_Deadline',return_value=deadline), \
+             patch.object(c.image_admission,'_READY_FOR_EXECUTION',True), \
+             patch.object(c.image_admission,'_verification_transport',return_value=nullcontext()), \
+             patch.object(c.runtime,'verified_previous',side_effect=verify), \
+             patch.object(c.schema_change,'classify',return_value=c.schema_change.Classification('none',False,(),())), \
+             patch.object(c.catalog,'CatalogContract',side_effect=contract), \
+             patch.object(c,'_admit_images',side_effect=admission),patch.object(c,'_Engine',Engine):
+            self.assertEqual(c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,
+                                             image_receipts_dir=self.p),b'mock-result')
+        self.assertIs(seen['capture'].__self__,deadline)
 
 
 class BudgetTests(unittest.TestCase):

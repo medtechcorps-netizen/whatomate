@@ -1,10 +1,10 @@
 """Ordered first-baseline experiment; public execution is not enabled yet.
 
-The source/build admission adapter is deliberately absent. run_experiment()
-refuses before creating resources rather than trusting image labels supplied
-by a caller. The private engine composes the reviewed adapters; its tests use
-mock admission and transports, not live images or a caller proof dictionary.
-No CLI, workflow, build, publication or production mode is implemented here.
+The initial local source/build admission adapter remains disabled pending
+review. run_experiment() refuses before live work until deliberately enabled;
+image labels supplied by a caller never substitute for source/build evidence.
+The private engine tests use mock admission and transports, not live images.
+No CLI, hosted workflow, publication or production mode is implemented here.
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ import proof
 import runtime
 import stack
 import schema_change
+import images as image_admission
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _IMAGE_SEAL = object()
@@ -48,7 +49,7 @@ def _completed(code=0):
 
 @dataclass(frozen=True, repr=False)
 class _Images:
-    """Internal result of a future verifier, never a public input format."""
+    """Internal result of the source/build verifier, never a public input."""
     seal: object
     previous: processes.ImageBinding
     candidate: processes.ImageBinding
@@ -57,11 +58,12 @@ class _Images:
     fixture: fixture.ExportImage
 
 
-def _admit_images(repo, previous, candidate_sha):
-    # No production factory can issue _Images yet. Tests replace this private
-    # hook explicitly. A tag, label, JSON manifest or arbitrary object is not
-    # evidence of a source build and is not accepted by run_experiment.
-    raise proof.EvidenceError("experiment-source-build-admission-unimplemented")
+def _admit_images(repo, previous, candidate_sha, docker_binary, config_dir, receipts_dir, deadline):
+    need(image_admission._READY_FOR_EXECUTION, "experiment-source-build-admission-unreviewed")
+    value = image_admission._admit(repo, previous, candidate_sha, docker_binary, config_dir, receipts_dir, deadline)
+    need(type(value) is image_admission._Admitted and value.seal is image_admission._SEAL,
+         "experiment-source-build-unproven")
+    return _Images(_IMAGE_SEAL, value.previous, value.candidate, value.controller, value.graph, value.fixture)
 
 
 class _Budget:
@@ -186,7 +188,7 @@ def _wait_pg(owner, budget, sleep):
 
 class _Engine:
     def __init__(self, repo, previous, candidate_sha, run_id, run_attempt, classification, contract,
-                 images, docker_binary, config_dir, *, clock=time.monotonic, sleep=time.sleep):
+                 images, docker_binary, config_dir, *, clock=time.monotonic, sleep=time.sleep, overall=None):
         need(type(images) is _Images and images.seal is _IMAGE_SEAL,
              "experiment-source-build-unproven")
         need(all(type(value) is processes.ImageBinding for value in
@@ -199,6 +201,11 @@ class _Engine:
         self.classification, self.contract, self.images = classification, contract, images
         self.clock, self.sleep = clock, sleep
         self.owner = stack.OwnedStack(docker_binary, config_dir, images.graph.source_sha, images.graph)
+        need(overall is None or type(overall) is image_admission._Deadline, "experiment-overall-invalid")
+        self.overall = overall
+        self.seconds = 2400 if overall is None else overall.experiment_seconds()
+        if overall is not None:
+            self.owner.capture = overall.capture
         self._original_capture = self.owner.capture
         self._owner_token, self._owner_source = self.owner.token, self.owner.source_sha
         self.inputs = processes.ConfigInputs(*(secrets.token_hex(32) for _ in range(4)), str(uuid.uuid4()))
@@ -341,23 +348,35 @@ class _Engine:
     def _cleanup(self):
         self._cleanup_transport()
         try:
-            if self.manager is not None and not self.manager._closed:
-                self.manager.close()
-            elif self.exporter is not None and not self.exporter._closed:
-                self.exporter.close()
-            self._cleanup_transport()
-            self.owner.cleanup()
+            if self.overall is None:
+                self._close_owned()
+                self._cleanup_transport()
+                self.owner.cleanup()
+            else:
+                # Cleanup consumes the reserved part of the SAME2400s clock.
+                # The global capture also clamps every actual command.
+                seconds = min(image_admission._CLEANUP, self.overall.remaining())
+                with _Budget(self.owner, clock=self.clock, seconds=seconds) as cleanup:
+                    self._close_owned()
+                    cleanup.remaining()  # Do not invoke a replacement capture.
+                    self.owner.cleanup()
         except proof.EvidenceError:
             raise
         except Exception:
             raise proof.InfrastructureFailure("experiment-cleanup") from None
+
+    def _close_owned(self):
+        if self.manager is not None and not self.manager._closed:
+            self.manager.close()
+        elif self.exporter is not None and not self.exporter._closed:
+            self.exporter.close()
 
     def run(self):
         need(not self._attempted, "experiment-already-attempted")
         self._attempted = True
         try:
             self._cleanup_transport()
-            with _Budget(self.owner, clock=self.clock) as self.budget:
+            with _Budget(self.owner, clock=self.clock, seconds=self.seconds) as self.budget:
                 result = self._measure()
         except Exception as error:
             # Budget restoration precedes cleanup, whose existing fixed command
@@ -367,27 +386,39 @@ class _Engine:
                 raise
             raise proof.InfrastructureFailure("experiment-operation") from None
         self._cleanup()
-        return proof.result_bytes(result)  # Never published before cleanup.
+        if self.overall is not None:
+            self.overall.remaining()
+        raw = proof.result_bytes(result)  # Never published before cleanup.
+        if self.overall is not None:
+            self.overall.remaining()
+        return raw
 
 
 def run_experiment(repo: Path, candidate_sha: str, run_id: int, run_attempt: int,
-                   release_client, *, docker_binary: str, config_dir: Path, rollback_target=None):
-    """Validate immutable inputs; currently refuse unsupported image admission.
+                   release_client, *, docker_binary: str, config_dir: Path,
+                   image_receipts_dir: Path | None = None, rollback_target=None):
+    """Validate immutable inputs; disabled pending first-local admission review.
 
     No arbitrary images, observations, successful flags, phase dictionaries,
     command callbacks, SQL or private fixture inputs are accepted here.
     """
+    deadline = image_admission._Deadline()
     need(isinstance(repo, Path) and repo.is_dir() and isinstance(config_dir, Path))
     need(type(candidate_sha) is str and _SHA.fullmatch(candidate_sha) is not None)
     proof.artifact_name(candidate_sha, run_attempt)
     need(type(run_id) is int and 1 <= run_id < 10**16)
     if rollback_target is not None:
         proof.validate_rollback_target(rollback_target)
-    previous = runtime.verified_previous(release_client, repo, rollback_target=rollback_target)
-    classification = schema_change.classify(repo, previous.sha, candidate_sha, mode="forward")
-    need(not classification.reasons and ((classification.kind == "none" and not classification.dormant)
-         or (classification.kind == "data" and classification.dormant)), "experiment-classification-unsupported")
-    contract = catalog.CatalogContract(repo, previous, candidate_sha)
-    images = _admit_images(repo, previous, candidate_sha)
+    # Review must enable the complete adapter deliberately; accidental public
+    # calls cannot launch a build while this slice is still under review.
+    need(image_admission._READY_FOR_EXECUTION, "experiment-source-build-admission-unreviewed")
+    need(isinstance(image_receipts_dir, Path), "experiment-receipts-required")
+    with image_admission._verification_transport(release_client, deadline):
+        previous = runtime.verified_previous(release_client, repo, rollback_target=rollback_target)
+        classification = schema_change.classify(repo, previous.sha, candidate_sha, mode="forward")
+        need(not classification.reasons and ((classification.kind == "none" and not classification.dormant)
+             or (classification.kind == "data" and classification.dormant)), "experiment-classification-unsupported")
+        contract = catalog.CatalogContract(repo, previous, candidate_sha, capture=deadline.capture)
+    admitted = _admit_images(repo, previous, candidate_sha, docker_binary, config_dir, image_receipts_dir, deadline)
     return _Engine(repo, previous, candidate_sha, run_id, run_attempt, classification, contract,
-                   images, docker_binary, config_dir).run()
+                   admitted, docker_binary, config_dir, clock=deadline.clock, overall=deadline).run()
