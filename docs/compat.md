@@ -991,3 +991,26 @@ Saved synthetic checks cover 396 unique cases: 76 initial passes plus three
 repaired fixture cases, 163 normal-collection cases and 154 custody/workflow cases.
 The initial three fixture failures are retained; there was no fresh all-green
 79-case rerun. These tests do not establish hosted rollback qualification.
+
+### Disabled negative-intent index preparation
+
+The preparatory negative-index modules have no installed producer or consumer
+configuration and are not called by a workflow or release gate. Unconfigured
+entry points refuse before reading operational paths, credentials or network
+state. They do not grant compatibility-outage admission.
+
+The publisher validates the actual two public signature subjects against the
+fixed resolution snapshot. A complete measured negative derives an exact
+commit/run/attempt/result/context marker, reads the protected rule, creates at
+most one exact ref and reads it back before returning. An existing exact marker
+is idempotent. Ambiguous creation, changed subject or snapshot files or rules, budget expiry,
+partial measurements and malformed responses refuse; they never delete an
+intent. A validated positive makes no index write. Publication receipts are
+ordinary data, not signatures or coverage proof.
+
+The fixed transport shares its caller's original allowance, pins its executable,
+uses a private configuration and permits only its closed API operations. Pure
+replay keeps complete raw rule/ref/HTTP observations with strict bounds. Future
+activation still requires reviewed producer/workflow source, preserved historical
+custody, hosted permissions and signatures, a separate consumer policy tied to
+the real producer revision, and the complete release preflight/custody path.
