@@ -15,6 +15,10 @@ import schema_change
 import ship_common as common
 import source_git
 
+_CATALOG_PINS = dict(policy.V0_PINS)
+_CATALOG_PATHS = tuple(sorted(_CATALOG_PINS))
+_WEB_RECIPE = "docker/release/web.Dockerfile"
+
 
 @dataclass(frozen=True, slots=True)
 class ReleaseSelection:
@@ -38,6 +42,29 @@ class ResolvedChain:
 
 
 @dataclass(frozen=True, slots=True)
+class BlobObservation:
+    path: str
+    raw: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogMaterial:
+    candidate_sha: str
+    candidate_blobs: tuple[policy.SourceBlob, ...]
+    baseline_sha: str
+    baseline_provenance: str
+    baseline_blobs: tuple[BlobObservation, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WebRecipe:
+    source_sha: str
+    path: str
+    raw: bytes
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class ForwardResolution:
     resolved: ResolvedChain
     candidate: policy.SourceFacts
@@ -46,6 +73,8 @@ class ForwardResolution:
     workflow_sha256: str
     previous_web_source_sha: str
     database_base_source: str
+    catalog_material: CatalogMaterial
+    previous_recipe: WebRecipe
 
 
 def _selection(chain, index):
@@ -91,15 +120,64 @@ def resolve_authenticated(client: transport.ReleaseGh, repo_dir: Path,
 
 
 def resolve_forward(client: transport.ReleaseGh, repo_dir: Path,
-                    git_binary: Path, candidate_sha: str) -> ForwardResolution:
+                    git_binary: Path, candidate_sha: str, *, selected_tag: str | None = None) -> ForwardResolution:
     """Gather candidate facts within the closed authenticated source operation.
 
     This is not a NormalRequest or deployment authorization. In particular a
     production caller must require candidate == inventory.main_sha, and the
     signed producer/context must support a divergent image/database origin
     before such a result may qualify. All-v1 comparison leaves live=None.
+    An explicit tag selects an exact historical image; it grants no rollback.
     """
-    return _resolve(client, repo_dir, git_binary, None, candidate_sha, forward=True)
+    return _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, forward=True)
+
+
+def _catalog_material(reader, latest, selected, candidate):
+    def observations(sha, absent=()):
+        result = []
+        for path in _CATALOG_PATHS:
+            raw = reader.read_blob(sha, path)
+            if path in absent:
+                valid = raw is None
+            else:
+                valid = type(raw) is bytes and common.sha256_bytes(raw) == _CATALOG_PINS[path]
+            if not valid:
+                raise policy.PolicyRefusal("record-source-unsupported")
+            result.append(BlobObservation(path, raw))
+        return tuple(result)
+
+    candidate_observations = observations(candidate.sha)
+    candidate_hashes = dict(candidate.artifacts)
+    if any(candidate_hashes.get(row.path) != common.sha256_bytes(row.raw) for row in candidate_observations):
+        raise policy.PolicyRefusal("record-source-invalid")
+    candidate_blobs = tuple(policy.SourceBlob(row.path, row.raw) for row in candidate_observations)
+    if latest.live is not None:
+        origin = latest.live.origin_source
+        if origin.mode != "reviewed-v0" or latest.live.catalog != origin.catalog:
+            raise policy.PolicyRefusal("record-source-unsupported")
+        baseline_sha, provenance = origin.sha, "retained-live-v2"
+        baseline = observations(baseline_sha)
+        origin_hashes = dict(origin.artifacts)
+        if any(origin_hashes.get(row.path) != common.sha256_bytes(row.raw) for row in baseline):
+            raise policy.PolicyRefusal("record-source-invalid")
+    else:
+        # Source comparison and selected image catalog fallback are distinct.
+        # This proves fixed source observations, never a legacy live contract.
+        baseline_sha = selected.actual_web_source_sha
+        if baseline_sha == policy.V0_RELEASED_SOURCE:
+            provenance = "legacy-e001-absent-overlay"
+            baseline = observations(baseline_sha, (policy.PROFILE, policy.OVERLAY))
+        else:
+            provenance = "legacy-equal-reviewed-v0"
+            baseline = observations(baseline_sha)
+    return CatalogMaterial(candidate.sha, candidate_blobs, baseline_sha, provenance, baseline)
+
+
+def _web_recipe(reader, selected):
+    raw = reader.read_blob(selected.actual_web_source_sha, _WEB_RECIPE)
+    if not raw:
+        raise policy.PolicyRefusal("record-source-invalid")
+    return WebRecipe(selected.actual_web_source_sha, _WEB_RECIPE, raw, common.sha256_bytes(raw))
 
 
 def _forward_source(reader, repo_dir, latest, candidate):
@@ -190,6 +268,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                 candidate = next(fact for fact in facts if fact.sha == candidate_sha)
                 candidate, classification, workflow, database_base = _forward_source(
                     reader, repo_dir, latest, candidate)
+                material = _catalog_material(reader, latest, selected, candidate)
+                recipe = _web_recipe(reader, selected)
             budget.check()
         # Git's final metadata preflight happens before the final complete
         # GitHub snapshot. Neither creates a new allowance or resets the clock.
@@ -198,7 +278,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
         resolved = ResolvedChain(chain, snapshot, images, latest, selected)
         if forward:
             return ForwardResolution(resolved, candidate, classification, workflow,
-                common.sha256_bytes(workflow), latest.actual_web_source_sha, database_base)
+                common.sha256_bytes(workflow), selected.actual_web_source_sha, database_base,
+                material, recipe)
         return resolved
     except Exception:
         # Neither source/CLI errors nor arbitrary driver messages are public.

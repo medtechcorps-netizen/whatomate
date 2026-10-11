@@ -468,11 +468,13 @@ class ForwardResolverTests(unittest.TestCase):
     add = ResolverTests.add
     WORKFLOW = ".github/workflows/compat.yml"
     MAIN = "cmd/whatomate/main.go"
+    RECIPE = "docker/release/web.Dockerfile"
 
     def profile(self, sha, *, closure="a" * 64, body=1):
         self.world.commits.add(sha)
         files = dict(self.source_bytes)
         files[self.WORKFLOW] = (ROOT / self.WORKFLOW).read_bytes()
+        files[self.RECIPE] = b"FROM scratch\n# immutable synthetic recipe\n"
         files[self.MAIN] = f"package main\n\nfunc runRLSMigration(args []string) {{\n\tprintln({body})\n}}\n".encode()
         files[schema_change.MIGRATION_PATH] = common.canonical_file_bytes({
             "version": 1, "roots": schema_change.MIGRATION_ROOTS,
@@ -483,18 +485,18 @@ class ForwardResolverTests(unittest.TestCase):
     def candidate(self, sha="7" * 40, **kwargs):
         return self.profile(sha, **kwargs)
 
-    def forward(self, sha):
+    def forward(self, sha, *, selected_tag=None):
         self.assertIsNone(self.client)
         config, work = self.root / "config", self.root / "work"
         config.mkdir(); work.mkdir()
         budget = rt.OperationBudget(700, capture=self.world, clock=self.clock)
         self.client = rt.ReleaseGh(self.gh, support.GH_TOKEN, config, work, budget=budget,
                                   base_env={"SHIP_DO_TOKEN": "private-do-token"})
-        return resolver.resolve_forward(self.client, self.repo, self.git, sha)
+        return resolver.resolve_forward(self.client, self.repo, self.git, sha, selected_tag=selected_tag)
 
-    def refused(self, sha):
+    def refused(self, sha, *, selected_tag=None):
         with self.assertRaisesRegex(rt.TransportRefusal, "record-chain-invalid:transport-resolver$"):
-            self.forward(sha)
+            self.forward(sha, selected_tag=selected_tag)
         self.assertTrue(self.client.budget.closed)
         self.assertTrue(self.client.budget.failed)
         self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
@@ -548,27 +550,30 @@ class ForwardResolverTests(unittest.TestCase):
                     case.doCleanups()
 
     def test_all_v1_uses_record_base_without_inventing_live_or_decoding_absent_profile(self):
-        old = self.add(version=1, images=self.boot["images"])
+        old = self.add(version=1, sha=policy.V0_RELEASED_SOURCE)
         # Real early source could have a catalog but no production profile. It
         # remains reader0/live=None; comparison does not invent those bytes.
         for path in (policy.GOLDEN, policy.HISTORY, policy.GLOBALS):
             self.world.files[(old["sha"], path)] = self.source_bytes[path]
+        self.world.files[(old["sha"], self.RECIPE)] = b"FROM scratch\n"
         result = self.forward(self.candidate())
         self.assertEqual(result.database_base_source, old["sha"])
-        self.assertEqual(result.previous_web_source_sha, self.boot["sha"])
+        self.assertEqual(result.previous_web_source_sha, old["sha"])
         self.assertIsNone(result.resolved.latest.live)
         self.assertIsNone(result.resolved.chain.baseline)
         self.assertEqual(result.resolved.latest.reader.mode, "legacy-reader0")
         old_reads = {args[-1] for args, _ in self.world.trace if "ls-tree" in args and old["sha"] in args}
-        self.assertNotIn(policy.PROFILE, old_reads)
-        self.assertNotIn(policy.OVERLAY, old_reads)
+        self.assertIn(policy.PROFILE, old_reads)  # explicit absence observations
+        self.assertIn(policy.OVERLAY, old_reads)
+        material = result.catalog_material
+        self.assertEqual(material.baseline_provenance, "legacy-e001-absent-overlay")
+        missing = {row.path for row in material.baseline_blobs if row.raw is None}
+        self.assertEqual(missing, {policy.PROFILE, policy.OVERLAY})
 
-    def test_pre_catalog_comparison_retains_blocking_reason(self):
+    def test_pre_catalog_without_supported_baseline_material_refuses(self):
         self.add(version=1)
-        result = self.forward(self.candidate())
-        self.assertIn("catalog-baseline-required", result.classification.reasons)
-        self.assertIn("compat-required", result.classification.requirements)
-        self.assertIsNone(result.resolved.latest.live)
+        self.refused(self.candidate())
+        self.assertTrue(any("diff" in args for args, _ in self.world.trace))
 
     def test_dormant_seed_change_keeps_explanation_and_no_favorable_shortcut(self):
         old = self.add()
@@ -644,9 +649,8 @@ class ForwardResolverTests(unittest.TestCase):
         self.assertEqual(result.resolved.latest.reader, result.candidate)
         self.assertEqual(result.resolved.latest.reader.mode, "reviewed-v0")
         self.assertIsNone(result.resolved.latest.live)
-        candidate_profiles = [args for args, _ in self.world.trace
-                              if args[-5:] == ["ls-tree", "-z", old["sha"], "--", policy.PROFILE]]
-        self.assertEqual(len(candidate_profiles), 1)
+        self.assertEqual(tuple((row.path, row.raw) for row in result.catalog_material.baseline_blobs),
+                         result.catalog_material.candidate_blobs)
 
     def test_unsupported_candidate_profile_refuses_before_classification(self):
         old = self.add()
@@ -747,6 +751,193 @@ class ForwardResolverTests(unittest.TestCase):
         with self.assertRaises(rt.TransportRefusal):
             self.client.capture_snapshot()
         self.assertEqual(len(self.world.trace), before)
+
+    def test_material_is_exact_five_sorted_pin_bytes_and_live_origin(self):
+        old = self.add()
+        self.profile(old["sha"])
+        result = self.forward(self.candidate())
+        material = result.catalog_material
+        pins = dict(policy.V0_PINS)
+        self.assertEqual(material.candidate_sha, result.candidate.sha)
+        self.assertEqual(tuple(row.path for row in material.candidate_blobs), tuple(sorted(pins)))
+        self.assertEqual(tuple(row.path for row in material.baseline_blobs), tuple(sorted(pins)))
+        self.assertEqual(material.baseline_sha, result.resolved.latest.live.origin_source.sha)
+        self.assertEqual(material.baseline_provenance, "retained-live-v2")
+        for row in (*material.candidate_blobs, *material.baseline_blobs):
+            self.assertIs(type(row.raw), bytes)
+            self.assertEqual(hashlib.sha256(row.raw).hexdigest(), pins[row.path])
+        self.assertEqual(result.resolved.latest.live.catalog,
+                         result.resolved.latest.live.origin_source.catalog)
+
+    def test_explicit_target_keeps_latest_database_origin_and_actual_selected_recipe(self):
+        selected = self.add(version=1, images=self.boot["images"])
+        self.world.files[(self.boot["sha"], self.RECIPE)] = b"FROM scratch\n# actual image source\n"
+        self.world.files[(selected["sha"], self.RECIPE)] = b"FROM scratch\n# wrong manifest source\n"
+        latest = self.add()
+        self.profile(latest["sha"])
+        result = self.forward(self.candidate(), selected_tag=selected["release"])
+        self.assertEqual(result.resolved.selected.release, selected["release"])
+        self.assertEqual(result.resolved.latest.release, latest["release"])
+        self.assertEqual(result.previous_web_source_sha, self.boot["sha"])
+        self.assertEqual(result.database_base_source, latest["sha"])
+        self.assertEqual(result.catalog_material.baseline_sha, latest["sha"])
+        self.assertEqual(result.previous_recipe.source_sha, self.boot["sha"])
+        self.assertEqual(result.previous_recipe.path, self.RECIPE)
+        self.assertIn(b"actual image source", result.previous_recipe.raw)
+        self.assertEqual(result.previous_recipe.sha256, hashlib.sha256(result.previous_recipe.raw).hexdigest())
+        self.assertFalse(hasattr(result, "rollback_decision"))
+
+    def test_all_v1_explicit_target_uses_selected_catalog_but_latest_comparison(self):
+        selected = self.add(version=1)
+        self.profile(selected["sha"])
+        latest = self.add(version=1)
+        self.profile(latest["sha"])
+        result = self.forward(self.candidate(), selected_tag=selected["release"])
+        self.assertEqual(result.catalog_material.baseline_sha, selected["sha"])
+        self.assertEqual(result.catalog_material.baseline_provenance, "legacy-equal-reviewed-v0")
+        self.assertEqual(result.database_base_source, latest["sha"])
+        self.assertEqual(result.previous_web_source_sha, selected["sha"])
+        self.assertIsNone(result.resolved.latest.live)
+        self.assertIsNone(result.resolved.chain.baseline)
+        self.assertEqual((result.classification.kind, result.classification.reasons), ("none", ()))
+
+    def test_explicit_bootstrap_target_has_no_general_legacy_catalog_exception(self):
+        old = self.add(version=1)
+        self.profile(old["sha"])
+        self.refused(self.candidate(), selected_tag=common.BOOTSTRAP_TAG)
+
+    def test_unknown_or_mutable_target_never_silently_selects_latest(self):
+        for tag in ("main", "prod-20261004T120000Z-aaaaaaaa"):
+            with self.subTest(tag=tag):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    old = case.add()
+                    case.profile(old["sha"])
+                    case.refused(case.candidate(), selected_tag=tag)
+                finally:
+                    case.doCleanups()
+
+    def test_e001_legacy_requires_both_absent_not_equal_or_single_absent(self):
+        for present in ((policy.PROFILE,), (policy.OVERLAY,), (policy.PROFILE, policy.OVERLAY)):
+            with self.subTest(present=present):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    old = case.add(version=1, sha=policy.V0_RELEASED_SOURCE)
+                    case.profile(old["sha"])
+                    for path in {policy.PROFILE, policy.OVERLAY} - set(present):
+                        del case.world.files[(old["sha"], path)]
+                    case.refused(case.candidate())
+                finally:
+                    case.doCleanups()
+
+    def test_e001_legacy_still_requires_all_three_existing_pins(self):
+        for path in (policy.GOLDEN, policy.HISTORY, policy.GLOBALS):
+            with self.subTest(path=path):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    old = case.add(version=1, sha=policy.V0_RELEASED_SOURCE)
+                    case.profile(old["sha"])
+                    for missing in (policy.PROFILE, policy.OVERLAY):
+                        del case.world.files[(old["sha"], missing)]
+                    case.world.files[(old["sha"], path)] += b" "
+                    case.refused(case.candidate())
+                finally:
+                    case.doCleanups()
+
+    def test_non_e001_legacy_absence_is_never_generalized(self):
+        for path in (policy.PROFILE, policy.OVERLAY):
+            with self.subTest(path=path):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    old = case.add(version=1)
+                    case.profile(old["sha"])
+                    del case.world.files[(old["sha"], path)]
+                    case.refused(case.candidate())
+                finally:
+                    case.doCleanups()
+
+    def test_v2_e001_source_requires_complete_pins_without_legacy_absence(self):
+        old = self.add(sha=policy.V0_RELEASED_SOURCE)
+        self.profile(old["sha"])
+        result = self.forward(self.candidate())
+        self.assertEqual(result.catalog_material.baseline_provenance, "retained-live-v2")
+        self.assertTrue(all(row.raw is not None for row in result.catalog_material.baseline_blobs))
+
+    def test_candidate_bytes_changed_after_facts_refuse_material(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        def drift(args):
+            if args[-5:] == ["ls-tree", "-z", sha, "--", self.WORKFLOW]:
+                self.world.files[(sha, policy.OVERLAY)] += b"-- changed bytes\n"
+        self.world.after = drift
+        self.refused(sha)
+
+    def test_live_origin_bytes_changed_after_facts_refuse_material(self):
+        old = self.add()
+        self.profile(old["sha"])
+        sha = self.candidate()
+        def drift(args):
+            if args[-5:] == ["ls-tree", "-z", sha, "--", self.WORKFLOW]:
+                self.world.files[(old["sha"], policy.PROFILE)] += b" "
+        self.world.after = drift
+        self.refused(sha)
+
+    def test_selected_recipe_missing_or_empty_refuses(self):
+        for raw in (None, b""):
+            with self.subTest(raw=raw):
+                case = ForwardResolverTests()
+                case.setUp()
+                try:
+                    old = case.add()
+                    case.profile(old["sha"])
+                    if raw is None:
+                        del case.world.files[(old["sha"], self.RECIPE)]
+                    else:
+                        case.world.files[(old["sha"], self.RECIPE)] = raw
+                    case.refused(case.candidate())
+                finally:
+                    case.doCleanups()
+
+    def test_selected_recipe_nonregular_refuses(self):
+        old = self.add()
+        self.profile(old["sha"])
+        real_git = self.world.git
+        def symlink(args):
+            result = real_git(args)
+            if args == ["ls-tree", "-z", old["sha"], "--", self.RECIPE]:
+                return rt.runtime.Capture(0, result.stdout.replace(b"100644", b"120000", 1), b"")
+            return result
+        self.world.git = symlink
+        self.refused(self.candidate())
+
+    def test_recipe_consumes_original_budget_and_precedes_final_refresh(self):
+        old = self.add()
+        self.profile(old["sha"])
+        def expire(args):
+            if args[-5:] == ["ls-tree", "-z", old["sha"], "--", self.RECIPE]:
+                self.clock.now = 701
+        self.world.after = expire
+        self.refused(self.candidate())
+        main_gets = [args for args, _ in self.world.trace if rt.API + "/git/ref/heads/main" in args]
+        self.assertEqual(len(main_gets), 1)
+
+    def test_material_and_recipe_are_deeply_immutable(self):
+        old = self.add()
+        self.profile(old["sha"])
+        result = self.forward(self.candidate())
+        with self.assertRaises(FrozenInstanceError):
+            result.catalog_material.baseline_sha = "f" * 40
+        with self.assertRaises(FrozenInstanceError):
+            result.catalog_material.baseline_blobs[0].raw = b"foreign"
+        with self.assertRaises(AttributeError):
+            result.catalog_material.candidate_blobs[0].raw = b"foreign"
+        with self.assertRaises(FrozenInstanceError):
+            result.previous_recipe.raw = b"foreign"
 
 
 if __name__ == "__main__":
