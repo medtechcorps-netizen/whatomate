@@ -118,7 +118,8 @@ class CallerTests(unittest.TestCase):
         self.assertEqual(custody.drills.observed_at, self.now)
         self.assertGreater(custody.drills.observed_at, plan_time)
         self.assertFalse(custody.drills.required)
-        self.assertEqual(outputs['handoff_version'], '5')
+        self.assertEqual(outputs['handoff_version'], '6')
+        self.assertIsNone(custody.contract_observation)
         self.assertIs(type(custody.resolution.pending), flow.record_resolver.pending_source.PendingMaterial)
         self.assertEqual(custody.resolution.pending, self.fixture.expected.pending)
         self.assertEqual(outputs['previous'], self.fixture.expected.resolved.latest.release)
@@ -159,7 +160,7 @@ class CallerTests(unittest.TestCase):
         client.assert_not_called()
         self.assertEqual(self.do.requests, [])
         self.assertEqual(self.outputs(), {})
-        self.assertIn('candidate-invalid:compat-stale', self.output.getvalue())
+        self.assertIn('record-chain-invalid:transport-resolver', self.output.getvalue())
 
     def test_signed_old_server_failure_refuses_before_provider_client(self):
         self.fixture.rebind(server_false='read')

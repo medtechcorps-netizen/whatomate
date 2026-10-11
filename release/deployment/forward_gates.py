@@ -1,8 +1,10 @@
-"""Source-bound restore-drill observation; no reads or deployment authority.
+"""Source-bound drill and preserved owner policy; no reads or deployment authority.
 
-The caller must obtain drills.json from reviewed immutable source and pass an
-actual UTC observation time. Dates are reviewed claims, not proof of a restore
-by themselves. Production preserves its observation for same-run record retry.
+The caller obtains drills.json from reviewed immutable source and passes an
+actual UTC observation time. Dates are reviewed claims, not proof of a restore.
+The owner validator replays complete original facts at their preserved UTC time;
+only concrete source collection and external custody establish their provenance.
+Production retains both observations for same-run retry, without a new clock.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import hashlib
 
 import ship_common as common
 import record_resolver as resolver
+import contract_authorization as contract
 
 
 MAX_DRILL_BYTES = 4096
@@ -109,3 +112,34 @@ def validate_preserved_drills(resolution, observation: DrillGate) -> DrillGate:
     if expected != observation:
         raise DrillRefusal("restore-drills-observation-invalid")
     return observation
+
+
+def validate_preserved_contract(resolution, observation) -> contract.ContractReceipt | None:
+    """Rederive the class-dependent owner gate at its original capture time.
+
+    No clock or collection occurs here. Operational custody must separately
+    bind this complete observation to its source operation and chronology.
+    """
+    if (type(resolution) is not resolver.ForwardResolution
+            or type(resolution.classification) is not resolver.schema_change.PolicyClassification):
+        raise contract.ContractRefusal("contract-label-classification")
+    change = resolution.classification
+    if (type(change.kind) is not str or change.kind not in {"none", "expand", "data", "contract"}
+            or type(change.dormant) is not bool
+            or change.dormant and change.kind not in {"expand", "data"}):
+        raise contract.ContractRefusal("contract-label-classification")
+    if change.kind != "contract":
+        if observation is not None:
+            raise contract.ContractRefusal("contract-label-unexpected")
+        return None
+    if (type(observation) is not contract.ContractObservation
+            or type(observation.observed_at) is not datetime
+            or observation.observed_at.tzinfo is not timezone.utc or observation.observed_at.fold != 0):
+        raise contract.ContractRefusal("contract-label-observation-time")
+    if (type(resolution.candidate) is not resolver.policy.SourceFacts
+            or type(resolution.resolved) is not resolver.ResolvedChain
+            or type(resolution.resolved.inventory) is not resolver.transport.InventorySnapshot
+            or resolution.resolved.inventory.main_sha != resolution.candidate.sha):
+        raise contract.ContractRefusal("contract-label-source")
+    return contract.require_contract_label(observation, candidate_sha=resolution.candidate.sha,
+        repository_id=resolver.transport.REPOSITORY_ID, now=observation.observed_at)

@@ -38,6 +38,32 @@ def drills(value, *, now=composition.actions.NOW):
     return writer.forward_gates.observe_forward_drills(value, now=now)
 
 
+def contract_observation(value, *, at=composition.actions.NOW, events=1):
+    """Synthetic complete owner facts; never a live collector receipt."""
+    a = writer.contract_authorization
+    repo = transport.REPOSITORY_ID
+    label = a.LabelIdentity('LABEL_contract', repo, a.LABEL_NAME,
+        at - timedelta(days=10), at - timedelta(days=2))
+    event = a.LabelEvent('EVENT_contract', 'labeled', 'PULL_contract', label,
+        'User', 'OWNER_contract', common.APPROVER_LOGIN, at - timedelta(minutes=1))
+    labels, rows = [label], [event]
+    if events > 1:
+        # Deterministic high entropy within the actual policy's name/id bounds.
+        for i in range(99):
+            token = hashlib.shake_256(('label-' + str(i)).encode()).hexdigest(120)
+            labels.append(a.LabelIdentity(token, repo, 'fixture-' + token[:40],
+                at - timedelta(days=10), at - timedelta(days=2)))
+        for i in range(events - 1):
+            token = hashlib.shake_256(('event-' + str(i)).encode()).hexdigest(120)
+            actor = hashlib.shake_256(('actor-' + str(i)).encode()).hexdigest(120)
+            rows.append(a.LabelEvent(token, 'labeled', 'PULL_contract', labels[1 + i % 99],
+                'User', actor, 'actor-' + actor[:30], at - timedelta(seconds=i + 2)))
+    pull = a.MergedPull('PULL_contract', 30, repo, common.REPOSITORY, 'main',
+        value.candidate.sha, 'b' * 40, True, False, at - timedelta(hours=1), tuple(labels), tuple(rows))
+    return a.ContractObservation(repo, common.REPOSITORY, value.candidate.sha,
+        'User', 'OWNER_contract', common.APPROVER_LOGIN, (pull,), at, 'complete-visible')
+
+
 def historical_handoff(value, *, observation=None, workflow_execution=None):
     """Synthetic historical context2 custody, never a current admission."""
     history = composition.collected(value, version=2)
@@ -485,6 +511,43 @@ class WriterTests(unittest.TestCase):
             writer.build_image_only(self.forward.resolved, publication(built=False))
             self.assertEqual(records.build_manifest(fields), original)
         self.assertEqual(common.loads_strict(original)['schema_version'], 1)
+
+
+    def test_contract_original_time_policy_and_chronology_are_replayed_without_clock(self):
+        value = replace(self.forward, classification=self.forward.classification._replace(kind='contract', dormant=False))
+        at = self.history.history.observed_at
+        observation = contract_observation(value, at=at)
+        original_drills = replace(drills(self.forward), observed_at=at + timedelta(seconds=1))
+        with mock.patch.object(transport.runtime, 'bounded_command', side_effect=AssertionError('no command')):
+            receipt = writer._contract_custody(value, self.history, original_drills, observation)
+        self.assertEqual(receipt.observed_at, at)
+        self.assertEqual(receipt.candidate_sha, value.candidate.sha)
+        for moment in (at - timedelta(seconds=1), at + timedelta(seconds=2)):
+            with self.subTest(moment=moment), self.assertRaises(writer.WriterRefusal):
+                writer._contract_custody(value, self.history, original_drills, contract_observation(value, at=moment))
+        with self.assertRaises(writer.WriterRefusal):
+            writer._contract_custody(value, self.history, None, observation)
+
+    def test_owner_observation_none_rule_and_invalid_owner_remain_refusals(self):
+        value = replace(self.forward, classification=self.forward.classification._replace(kind='contract', dormant=False))
+        observation = contract_observation(value)
+        a = writer.contract_authorization
+        for invalid in (None, replace(observation, main_sha='f' * 40),
+                        replace(observation, owner_login='other'), replace(observation, enumeration='partial')):
+            with self.subTest(invalid=invalid), self.assertRaises(a.ContractRefusal):
+                writer._contract_custody(value, self.history, drills(self.forward), invalid)
+        with self.assertRaises(a.ContractRefusal):
+            writer._contract_custody(self.forward, self.history, drills(self.forward), observation)
+        self.assertIsNone(writer._contract_custody(self.forward, self.history, drills(self.forward), None))
+
+    def test_valid_owner_data_does_not_lift_active_contract_compatibility_hold(self):
+        value = replace(self.forward, classification=self.forward.classification._replace(kind='contract', dormant=False))
+        observation = contract_observation(value)
+        writer.forward_gates.validate_preserved_contract(value, observation)
+        with self.assertRaises(writer.WriterRefusal):
+            writer.prepare_promotion(value, self.history, images(value), execution(), staging='passed',
+                drills=drills(self.forward), contract_observation=observation)
+        self.assertIsNone(self.prepare().contract_observation)
 
 
 if __name__ == '__main__':

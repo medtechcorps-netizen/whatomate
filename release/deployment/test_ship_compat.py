@@ -1,5 +1,6 @@
 """Real preflight composition with synthetic command edges, never live tools."""
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+from datetime import timedelta
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -9,6 +10,8 @@ import test_compat_collect as actions
 import test_compat_evidence as fixtures
 import test_compat_request as bridge_tests
 import test_record_resolver as source
+import test_contract_collect as contract_world
+import test_ship_forward_gates as gate_fixtures
 
 
 class PreflightTests(unittest.TestCase):
@@ -49,6 +52,7 @@ class PreflightTests(unittest.TestCase):
         self.after = lambda phase, argv: None
         self.scratch = self.case.root / 'preflight'
         self.deadline = 1000.0
+        self.graph = None
 
     def capture(self, argv, **options):
         config = options['env'].get('GH_CONFIG_DIR', '')
@@ -60,6 +64,8 @@ class PreflightTests(unittest.TestCase):
         if self.phase == 'actions':
             raw = self.world.capture(argv, **options)
             result = ship.runtime.Capture(raw.returncode, raw.stdout, raw.stderr)
+        elif self.graph is not None and argv[1:5] == ['api', '--method', 'POST', 'graphql']:
+            result = self.graph(argv, **options)
         else:
             result = self.case.world(argv, **options)
         self.case.clock.now += 0.001
@@ -107,6 +113,8 @@ class PreflightTests(unittest.TestCase):
         result = self.run_preflight()
         self.assertIs(type(result), ship.NormalPreflight)
         self.assertEqual(result.resolution, self.expected)
+        self.assertIsNone(result.contract_observation)
+        self.assertFalse(any('graphql' in args for _, args, _ in self.calls))
         self.assertEqual(result.qualified.candidate_sha, fixtures.SHA)
         self.assertEqual(len({result.qualified.previous.sha,
                              result.qualified.database_base.source_sha,
@@ -175,7 +183,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_current_main_mismatch_stops_before_actions(self):
         self.case.world.main = 'f' * 40
-        self.assertEqual(self.refuse().detail, 'preflight-main-changed')
+        self.refuse('record-chain-invalid:transport-resolver')
         self.assertEqual({p for p, _, _ in self.calls}, {'source-before'})
 
     def change_after_collection(self, change):
@@ -191,7 +199,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_main_drift_after_collection_prevents_qualification(self):
         self.change_after_collection(lambda: setattr(self.case.world, 'main', 'f' * 40))
-        self.assertEqual(self.refuse().detail, 'preflight-source-changed')
+        self.refuse('record-chain-invalid:transport-resolver')
         self.assertIn('source-after', [p for p, _, _ in self.calls])
 
     def test_new_record_with_same_images_is_still_source_drift(self):
@@ -327,6 +335,108 @@ class PreflightTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(TypeError):
                 ship.preflight(self.case.repo, fixtures.SHA, **options, **{key:object()})
         self.assertFalse(self.scratch.exists())
+
+    def contract_scenario(self):
+        path = source.schema_change._V2_TENANT
+        self.case.world.files[self.origin['sha'], path] = b'package database\nconst tenantRLSRoutingVersion = 0\n'
+        self.case.world.files[fixtures.SHA, path] = b'package database\nconst tenantRLSRoutingVersion = 1\n'
+        self.graph = contract_world.World()
+
+    def test_actual_owner_collection_never_repairs_active_semantic_producer_hold(self):
+        self.contract_scenario()
+        # Source, double GraphQL captures, signatures and Actions are parsed by
+        # real adapters. No classifier or positive compatibility gate is mocked.
+        with mock.patch.object(ship.resolver, '_contract_now', return_value=actions.NOW + timedelta(seconds=5)):
+            self.assertEqual(self.refuse().detail, 'request-resolution-invalid')
+        self.assertEqual(len(self.graph.graph_calls), 16)
+        self.assertEqual({p for p, _, _ in self.calls}, {'source-before', 'actions', 'source-after'})
+
+    def test_failed_owner_policy_stops_before_actions_with_specific_safe_code(self):
+        self.contract_scenario()
+        self.graph.events[0]['actor']['id'] = 'OTHER_USER'
+        with mock.patch.object(ship.resolver, '_contract_now', return_value=actions.NOW):
+            self.refuse('schema-change-blocked:contract-label-owner')
+        self.assertEqual({p for p, _, _ in self.calls}, {'source-before'})
+
+    def test_full_owner_observation_drift_across_source_operations_refuses(self):
+        self.contract_scenario()
+        def hook(stage, count, variables, payload):
+            if stage == 'events' and count >= 3:
+                payload['data']['repository']['pullRequest']['timelineItems']['edges'][0]['node']['id'] = 'EVENT_NEW'
+        self.graph.hook = hook
+        with mock.patch.object(ship.resolver, '_contract_now', return_value=actions.NOW + timedelta(seconds=5)):
+            self.assertEqual(self.refuse().detail, 'preflight-contract-changed')
+        self.assertEqual(len(self.graph.graph_calls), 16)
+
+    def test_owner_collection_consumes_the_original_aggregate_deadline(self):
+        self.contract_scenario()
+        def expire(phase, argv):
+            if 'graphql' in argv: self.case.clock.now = self.deadline
+        self.after = expire
+        with mock.patch.object(ship.resolver, '_contract_now', return_value=actions.NOW): self.refuse()
+        self.assertEqual(len(self.graph.graph_calls), 1)
+        self.assertEqual({p for p, _, _ in self.calls}, {'source-before'})
+
+
+class ContractComparisonTests(unittest.TestCase):
+    """Direct chronology/equality rules; these do not qualify an active build."""
+    @classmethod
+    def setUpClass(cls):
+        gate_fixtures.SourceObservationTests.setUpClass()
+        cls.resolution, cls.observation = gate_fixtures.contract_fixture(
+            gate_fixtures.SourceObservationTests.resolution)
+
+    def pair(self, first=None, last=None):
+        first = self.observation if first is None else first
+        last = replace(self.observation, observed_at=self.observation.observed_at + timedelta(seconds=5)) if last is None else last
+        return (ship.resolver.ForwardAdmission(self.resolution, first),
+                ship.resolver.ForwardAdmission(self.resolution, last))
+
+    def test_only_observation_time_may_advance(self):
+        first, last = self.pair()
+        self.assertIs(ship._contract_pair(first, last, self.observation.observed_at + timedelta(seconds=1)),
+                      last.contract_observation)
+
+    def test_all_stable_fields_are_compared_even_if_each_policy_still_passes(self):
+        observed = self.observation
+        pull = observed.pulls[0]
+        changed = [replace(observed, pulls=(replace(pull, head_sha='f' * 40),)),
+                   gate_fixtures.owner_fixture.change_event(observed, node_id='EVENT_NEW'),
+                   gate_fixtures.owner_fixture.change_label(observed, updated_at=pull.labels[0].updated_at - timedelta(seconds=1)),
+                   replace(observed, owner_node_id='NEW_OWNER', pulls=(replace(pull,
+                       events=(replace(pull.events[0], actor_node_id='NEW_OWNER'),)),))]
+        for value in changed:
+            with self.subTest(value=value.pulls[0].head_sha):
+                # Each observation passes the same pure rule on its own.
+                ship.forward_gates.validate_preserved_contract(self.resolution, value)
+                first, last = self.pair(last=value)
+                with self.assertRaisesRegex(ship.evidence.CompatRefusal, 'compat-stale') as caught:
+                    ship._contract_pair(first, last, observed.observed_at)
+                self.assertEqual(caught.exception.detail, 'preflight-contract-changed')
+
+    def test_actions_and_source_chronology_are_not_normalized_away(self):
+        observed = self.observation
+        for first_time, last_time, history_time in (
+                (observed.observed_at, observed.observed_at - timedelta(seconds=1), observed.observed_at - timedelta(seconds=2)),
+                (observed.observed_at, observed.observed_at, observed.observed_at + timedelta(seconds=1))):
+            first, last = self.pair(replace(observed, observed_at=first_time), replace(observed, observed_at=last_time))
+            with self.assertRaises(ship.evidence.CompatRefusal) as caught:
+                ship._contract_pair(first, last, history_time)
+            self.assertEqual(caught.exception.detail, 'preflight-contract-clock')
+
+    def test_missing_non_utc_folded_or_changed_source_refuses(self):
+        first, last = self.pair()
+        for changed in (replace(last, contract_observation=None),
+                replace(last, contract_observation=replace(last.contract_observation,
+                    observed_at=last.contract_observation.observed_at.replace(tzinfo=None))),
+                replace(last, contract_observation=replace(last.contract_observation,
+                    observed_at=last.contract_observation.observed_at.replace(fold=1)))):
+            with self.assertRaises(ship.contract.ContractRefusal):
+                ship._contract_pair(first, changed, self.observation.observed_at)
+        with self.assertRaises(ship.evidence.CompatRefusal) as caught:
+            ship._contract_pair(first, replace(last, resolution=replace(last.resolution,
+                workflow=last.resolution.workflow + b'\n')), self.observation.observed_at)
+        self.assertEqual(caught.exception.detail, 'preflight-source-changed')
 
 
 class AggregateBudgetTests(unittest.TestCase):

@@ -228,7 +228,7 @@ class FlowTests(unittest.TestCase):
 
     def test_original_output_preflight_roundtrips_complete_handoff(self):
         self.assertEqual(set(self.encoded), set(flow.record_handoff.OUTPUT_KEYS))
-        self.assertEqual(self.encoded['handoff_version'], '5')
+        self.assertEqual(self.encoded['handoff_version'], '6')
         self.assertEqual(self.handoff.resolution, self.forward)
         self.assertIs(type(self.handoff.resolution.pending), flow.record_resolver.pending_source.PendingMaterial)
         self.assertEqual(self.handoff.collected, self.history)
@@ -353,6 +353,41 @@ class FlowTests(unittest.TestCase):
             flow.record_bytes(self.ctx, self.control, self.fields, deadline=self.deadline, current=self.current)
 
 
+    def test_current_none_custody_and_summary_never_invent_owner_observation(self):
+        self.assertEqual(self.encoded['handoff_version'], '6')
+        self.assertIsNone(self.handoff.contract_observation)
+        self.assertIn('- Contract owner label: not required for this change', flow.details(self.gate))
+        invalid = replace(self.preflight, contract_observation=fixture.contract_observation(self.forward))
+        bad_gate = replace(self.gate, normal=invalid)
+        with self.assertRaises(c.ReleaseError): flow.details(bad_gate)
+        with self.assertRaises(c.ReleaseError):
+            flow.promotion_outputs(bad_gate, self.control, dict(fixture.images(self.forward).images), staging='passed')
+
+    def test_contract_summary_uses_original_policy_receipt_and_bounded_ids_only(self):
+        # Pure summary of synthetic facts, not an active qualifying preflight.
+        resolution = replace(self.forward, classification=self.forward.classification._replace(kind='contract', dormant=False))
+        observation = fixture.contract_observation(resolution)
+        normal = replace(self.preflight, resolution=resolution, contract_observation=observation)
+        lines = flow._contract_details(normal)
+        stamp = observation.observed_at.isoformat().replace('+00:00', 'Z')
+        self.assertEqual(lines, [f'- Contract owner label: observed at {stamp}; PR 30; '
+            'event EVENT_contract (original observation; no DDL authority)'])
+        self.assertNotIn(observation.owner_login, lines[0])
+        bad = replace(normal, contract_observation=replace(observation, enumeration='unknown'))
+        with self.assertRaises(c.ReleaseError): flow._contract_details(bad)
+
+    def test_v5_record_retry_retains_pending_drills_and_absent_owner_without_fetch(self):
+        codec = flow.record_handoff
+        budget = codec._Budget(version=5)
+        node = codec._value(self.handoff, w.PromotionHandoff, budget, 0, encoding=True)
+        raw = codec._frame(node, budget.blobs, version=5)
+        import test_record_handoff as codec_cases
+        output = codec_cases.xz_envelope(raw, version='5')
+        self.ctx.env.update({'REC_' + key.upper(): text for key, text in output.items()})
+        with mock.patch.object(flow.ship_compat, 'preflight', side_effect=AssertionError('no new admission')):
+            self.assertEqual(self.record(), (self.raw, 'absent'))
+
+
 class ForwardSummaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -365,7 +400,7 @@ class ForwardSummaryTests(unittest.TestCase):
     def lines(self, resolution):
         # Real resolver-derived source audit; qualification is already covered
         # by the normal gate composition. No fabricated authority is exercised.
-        normal = SimpleNamespace(resolution=resolution, drills=None,
+        normal = SimpleNamespace(resolution=resolution, drills=None, contract_observation=None,
             qualified=SimpleNamespace(reversible=True, old_server=True, run_id=38100000001))
         return flow.details(flow.Gate(resolution.resolved, normal, None))
 

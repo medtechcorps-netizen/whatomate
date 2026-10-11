@@ -24,6 +24,7 @@ import test_record_transport as transport_tests
 import test_ship_support as support
 import pending_source
 import test_pending_plan
+import test_contract_collect as contract_world
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1423,6 +1424,145 @@ class ForwardPendingTests(unittest.TestCase):
                         else: case.world.main = "b" * 40
                 case.world.after = after; case.refused(sha)
             finally: case.doCleanups()
+
+
+class AdmissionResolverTests(unittest.TestCase):
+    """Actual source and owner parsers; only command edges and clocks are fake."""
+    setUpClass = ForwardResolverTests.__dict__["setUpClass"]
+    setUp = ForwardResolverTests.setUp
+    add = ForwardResolverTests.add
+    profile = ForwardResolverTests.profile
+    candidate = ForwardResolverTests.candidate
+    forward = ForwardResolverTests.forward
+    WORKFLOW, MAIN, RECIPE = (ForwardResolverTests.WORKFLOW, ForwardResolverTests.MAIN,
+                              ForwardResolverTests.RECIPE)
+
+    def scenario(self, kind="contract"):
+        old = self.add(); self.profile(old["sha"])
+        sha = self.candidate(contract_world.SHA)
+        if kind == "contract":
+            path = schema_change._V2_TENANT
+            self.world.files[old["sha"], path] = b"package database\nconst tenantRLSRoutingVersion = 0\n"
+            self.world.files[sha, path] = b"package database\nconst tenantRLSRoutingVersion = 1\n"
+        if kind == "data": self.world.files[sha, policy.SEEDS] += b"\n"
+        self.world.main = sha
+        self.graph = contract_world.World()
+        return sha
+
+    def capture(self, argv, **options):
+        if argv[1:5] != ["api", "--method", "POST", "graphql"]:
+            return self.world(argv, **options)
+        self.world.trace.append((list(argv), dict(options)))
+        if self.world.before: self.world.before(argv)
+        result = self.graph(argv, **options)
+        if self.world.after: self.world.after(argv)
+        return result
+
+    def admit(self, sha):
+        self.assertIsNone(self.client)
+        config, work = self.root / "config", self.root / "work"
+        config.mkdir(); work.mkdir()
+        budget = rt.OperationBudget(700, capture=self.capture, clock=self.clock)
+        self.client = rt.ReleaseGh(self.gh, support.GH_TOKEN, config, work, budget=budget,
+                                  base_env={"SHIP_DO_TOKEN": "PRIVATE"})
+        with mock.patch.object(resolver, "_contract_now", return_value=contract_world.NOW):
+            return resolver.resolve_admission_forward(self.client, self.repo, self.git, sha)
+
+    def test_actual_contract_collection_finishes_before_original_final_checks(self):
+        value = self.admit(self.scenario())
+        self.assertIs(type(value), resolver.ForwardAdmission)
+        self.assertEqual(value.resolution.classification.kind, "contract")
+        self.assertIn("producer-class-unsupported", value.resolution.classification.requirements)
+        self.assertEqual(value.contract_observation.pulls[0].events[0].node_id, "EVENT_0000")
+        self.assertEqual(len(self.graph.graph_calls), 8)
+        trace = [args for args, _ in self.world.trace]
+        graph = [i for i, args in enumerate(trace) if "graphql" in args]
+        pending = [i for i, args in enumerate(trace) if "--name-only" in args
+                   and args[-1] == pending_source.plan.PREFIX.rstrip("/")]
+        self.assertLess(max(pending), min(graph))
+        final_git = [i for i, args in enumerate(trace) if "--show-toplevel" in args and i > max(graph)]
+        self.assertTrue(final_git)
+        self.assertTrue(any(args[0] == str(self.gh) for args in trace[max(final_git) + 1:]))
+        self.assertTrue(self.client._finished and self.client.budget.closed)
+        self.assertFalse(self.client.budget.failed)
+        self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+        with self.assertRaises(FrozenInstanceError): value.contract_observation = None
+
+    def test_noncontract_has_no_owner_calls_or_observation(self):
+        for kind in ("none", "data"):
+            case = AdmissionResolverTests(); case.setUp()
+            try:
+                value = case.admit(case.scenario(kind))
+                self.assertEqual(value.resolution.classification.kind, kind)
+                self.assertIsNone(value.contract_observation)
+                self.assertEqual(case.graph.graph_calls, [])
+            finally: case.doCleanups()
+
+    def test_generic_nonmain_contract_preview_does_not_collect_or_authorize(self):
+        sha = self.scenario(); self.world.main = "b" * 40
+        value = self.forward(sha)
+        self.assertIs(type(value), resolver.ForwardResolution)
+        self.assertEqual(value.classification.kind, "contract")
+        self.assertFalse(hasattr(value, "contract_observation"))
+        self.assertFalse(any("graphql" in args for args, _ in self.world.trace))
+
+    def test_admission_main_mismatch_refuses_before_source_or_owner_work(self):
+        sha = self.scenario(); self.world.main = "b" * 40
+        with self.assertRaises(rt.TransportRefusal): self.admit(sha)
+        self.assertFalse(any(args[0] == str(self.git) for args, _ in self.world.trace))
+        self.assertEqual(self.graph.graph_calls, [])
+        self.assertTrue(self.client.budget.closed and self.client.budget.failed)
+
+    def test_owner_policy_refusal_survives_and_poisoned_client_cannot_retry(self):
+        sha = self.scenario()
+        self.graph.events[0]["actor"]["id"] = "OTHER_USER"
+        with self.assertRaisesRegex(resolver.contract.ContractRefusal, "contract-label-owner"):
+            self.admit(sha)
+        self.assertTrue(self.client.budget.failed and self.client.budget.closed)
+        count = len(self.world.trace)
+        with self.assertRaises(rt.TransportRefusal):
+            resolver.resolve_admission_forward(self.client, self.repo, self.git, sha)
+        self.assertEqual(len(self.world.trace), count)
+        self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+
+    def test_collection_drift_or_private_bad_response_keeps_fixed_refusal(self):
+        for mode in ("drift", "private"):
+            case = AdmissionResolverTests(); case.setUp()
+            try:
+                sha = case.scenario()
+                if mode == "private": case.graph.raw = b"PRIVATE token invalid JSON"
+                else:
+                    def hook(stage, count, variables, payload):
+                        if stage == "events" and count == 2:
+                            payload["data"]["repository"]["pullRequest"]["timelineItems"]["edges"][0]["node"]["id"] = "EVENT_NEW"
+                    case.graph.hook = hook
+                with self.assertRaises(resolver.contract.ContractRefusal) as caught: case.admit(sha)
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.assertTrue(case.client.budget.failed and case.client.budget.closed)
+            finally: case.doCleanups()
+
+    def test_expired_graph_call_or_final_source_drift_never_returns_admission(self):
+        for mode in ("deadline", "git", "main"):
+            case = AdmissionResolverTests(); case.setUp()
+            try:
+                sha = case.scenario()
+                def hook(stage, count, variables, payload):
+                    if stage == "associations" and count == 4:
+                        if mode == "deadline": case.clock.now = 701
+                        elif mode == "git": (case.repo / ".git" / "shallow").write_bytes(b"changed")
+                        else: case.world.main = "b" * 40
+                case.graph.hook = hook
+                with self.assertRaises((resolver.contract.ContractRefusal, rt.TransportRefusal)): case.admit(sha)
+                self.assertTrue(case.client.budget.closed and case.client.budget.failed)
+                self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+            finally: case.doCleanups()
+
+    def test_admission_public_api_has_no_selection_or_observation_override(self):
+        sha = self.scenario()
+        for key in ("selected_tag", "observation", "skip_contract", "wall_clock", "capture"):
+            with self.assertRaises(TypeError):
+                resolver.resolve_admission_forward(None, self.repo, self.git, sha, **{key: object()})
+        self.assertEqual(self.graph.graph_calls, [])
 
 
 if __name__ == "__main__":

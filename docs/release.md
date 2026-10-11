@@ -51,27 +51,51 @@ snapshot even if `main` has advanced. An exact already-published signed record
 is reused on a record-only retry; missing unpublished handoff evidence refuses.
 Oversized evidence refuses before deployment rather than omitting history.
 
-Current handoff format 5 uses bounded, lossless XZ framing and retains complete
-raw pending observations and the drill observation made after the final source
-and compatibility checks. Explicitly observed empty inventories differ from
-missing historical observations. Record retries
-replay that original observation instead of evaluating drill age at retry time.
-Historical formats 1-4 retain their exact older fields and original context-v2
-record-only replay. They cannot be upgraded into new current admission by
-inventing observations; older positive context-v1/v2 evidence cannot qualify a
-new release. Authenticated old negative results retain their audit meaning.
-The currently supported changes
-are exempt from the restore-drill requirement; their observation says so.
+Current handoff format 6 uses the same bounded, lossless XZ framing. It retains
+complete raw pending material, compatibility history and the original drill
+observation, and has a closed field for the complete original owner-label
+observation when the class requires it. For supported `none` and dormant changes,
+that owner field must be `None`. Explicitly observed empty inventories differ
+from missing historical observations. A record retry replays preserved policy
+at the original UTC times; it neither fetches labels nor reevaluates drill age
+at retry time. This transport change leaves snapshot version 4, compatibility
+context version 3 and the result schema unchanged.
 
-The remaining PR16 work includes actual pending-fixture hosted qualification,
-positive active and additive classifier rules, operational contract-label admission,
-exact-span rollback compatibility, authenticated compatibility-outage bypass,
-and their validation. A bounded owner-label collector and pure authorization
-policy are preparatory only; workflow permissions and the release caller do not
-select them yet. Active forward database changes require both restore-drill dates
-within 90 days, but active producers remain disabled. The null timestamps are
-not successful drill evidence. Existing staging failure-injection drills do not
-substitute for database restore/fork drills.
+Historical formats 1-5 retain their exact field sets and same-run record-only
+replay. Formats 1-4 retain their original context-v2 route; format 5 retains
+context-v3 pending/drill custody without an owner observation. Missing historical
+fields never invent current authorization, and an old handoff cannot be upgraded
+into a new admission. Older positive context-v1/v2 evidence cannot qualify a new
+release; authenticated old negatives retain their audit meaning. The currently
+supported changes are exempt from restore drills, as their observation records.
+
+For a classified active `contract`, normal source admission now collects the
+complete visible owner-label facts inside each of its two original source
+operations, using the same client and budget before the final source rechecks.
+It requires an exact-current-main candidate and the supported post-merge owner
+`db:contract` event. Before/after facts must match except for their ordered UTC
+observation times; missing, revoked, renamed, changed or ambiguous evidence
+refuses. Generic PR preview and rollback do not collect this authorization.
+These source checks and format-6 custody do not lift the active-contract semantic
+hold: even a valid owner observation cannot produce a qualifying active release.
+They make no workflow permission change or hosted-token permission claim, and
+neither a label nor environment approval grants production DDL/data authority.
+
+The complete pending fixture passed unsigned PR270 Compatibility
+[run 38145640684, attempt 1](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38145640684).
+The full release-to-candidate range classified as dormant `data`; its pending
+bundle describes a 4,452-object expand target. The active measured v0 catalog
+stayed unchanged and the declarations remained unapplied. This non-main-base
+PR result is not signed main qualification or release authority.
+
+The remaining PR16 work includes positive active and additive classifier rules,
+active-contract semantic proof
+and hosted permission qualification, exact-span rollback compatibility,
+authenticated compatibility-outage bypass, and their validation. Active forward
+database changes require both restore-drill dates within 90 days, but active
+producers remain disabled. The null timestamps are not successful drill evidence.
+Existing staging failure-injection drills do not substitute for database
+restore/fork drills.
 
 ## Release jobs
 

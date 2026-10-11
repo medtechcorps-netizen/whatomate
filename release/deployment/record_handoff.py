@@ -3,8 +3,10 @@
 Only protected same-workflow needs.production.outputs custody can authorize the
 decoded data. An unkeyed hash and reconstructed immutable types do not verify
 signatures. Full evidence history is retained; no current-main reconstruction or
-old artifact download occurs. There is no output emitter or operational caller.
-The caller must encode/roundtrip before effects and emit only after success.
+old artifact download occurs. The operational caller encodes/roundtrips before
+effects and emits only after success. Format6 adds complete original owner
+observations; historical1-5 retain their exact field sets and absence semantics.
+No record-time label collection, new clock or active-contract proof is supplied.
 Some otherwise valid upstream-max histories exceed these transport limits;
 they refuse before effects. No attempt or source bytes are dropped to make room.
 """
@@ -22,8 +24,9 @@ e, c, p, r, t, d = (writer.evidence, writer.collect, writer.policy,
                     writer.resolver, writer.transport, writer.records)
 s = r.schema_change
 pending = r.pending_source
+contract = writer.contract_authorization
 
-VERSION = "5"
+VERSION = "6"
 CHUNK_SIZE = 8192
 CHUNK_SLOTS = tuple(f"handoff_{i:02d}" for i in range(1, 33))
 MAX_ENCODED = CHUNK_SIZE * len(CHUNK_SLOTS)
@@ -161,10 +164,26 @@ _SCHEMAS = {
     writer.forward_gates.DrillGate: ("forward_gates.DrillGate", (
         ("required", bool), ("observed_at", datetime), ("source_sha256", _optional(str)),
         ("staging_restore", _optional(datetime)), ("production_fork", _optional(datetime)))),
+    contract.LabelIdentity: ("contract_authorization.LabelIdentity", (
+        ("node_id", str), ("repository_id", int), ("name", str),
+        ("created_at", datetime), ("updated_at", datetime))),
+    contract.LabelEvent: ("contract_authorization.LabelEvent", (
+        ("node_id", str), ("kind", str), ("pull_node_id", str), ("label", contract.LabelIdentity),
+        ("actor_type", str), ("actor_node_id", str), ("actor_login", str), ("occurred_at", datetime))),
+    contract.MergedPull: ("contract_authorization.MergedPull", (
+        ("node_id", str), ("number", int), ("repository_id", int), ("repository", str),
+        ("base_ref", str), ("merge_sha", str), ("head_sha", str), ("merged", bool), ("draft", bool),
+        ("merged_at", datetime), ("labels", _many(contract.LabelIdentity)),
+        ("events", _many(contract.LabelEvent)))),
+    contract.ContractObservation: ("contract_authorization.ContractObservation", (
+        ("repository_id", int), ("repository", str), ("main_sha", str), ("owner_type", str),
+        ("owner_node_id", str), ("owner_login", str), ("pulls", _many(contract.MergedPull)),
+        ("observed_at", datetime), ("enumeration", str))),
     writer.PromotionHandoff: ("record_writer.PromotionHandoff", (
         ("resolution", r.ForwardResolution), ("collected", c.CollectedHistory),
         ("candidate_images", writer.CandidateImages), ("execution", writer.WorkflowExecution), ("facts", d.ManifestFacts),
-        ("drills", writer.forward_gates.DrillGate))),
+        ("drills", writer.forward_gates.DrillGate),
+        ("contract_observation", _optional(contract.ContractObservation)))),
     writer.WorkflowExecution: ("record_writer.WorkflowExecution", (
         ("repository", str), ("workflow", str), ("workflow_sha", str), ("run_id", int), ("run_attempt", int))),
     d.DocumentCatalog: ("release_record.DocumentCatalog", (
@@ -187,7 +206,7 @@ _MISSING = {
 
 
 class _Budget:
-    def __init__(self, blobs=None, *, version=5):
+    def __init__(self, blobs=None, *, version=6):
         self.version = version
         self.nodes = 0
         self.scalars = 0
@@ -304,8 +323,11 @@ def _value(value, schema, budget, depth, *, encoding):
         # Old versions never observed pending; v1 also predates source audit.
         # Literal omissions retain exact historical fields, never empty synthesis.
         fields = fields[:-2] if budget.version == 1 else fields[:-1]
-    if budget.version in (1, 2, 3) and schema is writer.PromotionHandoff:
+    if schema is writer.PromotionHandoff and budget.version in (1, 2, 3, 4, 5):
+        # Literal historical omission; absence never invents owner authority.
         fields = fields[:-1]
+        if budget.version in (1, 2, 3):
+            fields = fields[:-1]
     if encoding:
         _need(type(value) is schema)
         return {"type": tag, "fields": {name: _value(getattr(value, name), field, budget, depth + 1, encoding=True)
@@ -377,17 +399,20 @@ def _replay(handoff, candidate_sha, workflow_sha, run_id, record_attempt, *, ver
     if version == 1:
         _need(resolution.audit is None)
     else:
-        _need(version in (2, 3, 4, 5))
+        _need(version in (2, 3, 4, 5, 6))
         r.validate_forward_audit(resolution.audit, candidate_sha=resolution.candidate.sha,
             database_base_source=resolution.database_base_source,
             latest_record_sha=resolution.resolved.latest.record_sha,
             selected_web_source_sha=resolution.resolved.selected.actual_web_source_sha)
-    _need((version in (4, 5) and type(handoff.drills) is writer.forward_gates.DrillGate)
+    _need((version in (4, 5, 6) and type(handoff.drills) is writer.forward_gates.DrillGate)
           or (version in (1, 2, 3) and handoff.drills is None))
-    if version == 5:
+    if version != 6:
+        _need(handoff.contract_observation is None)
+    if version in (5, 6):
         _need(type(resolution.pending) is pending.PendingMaterial)
         rebuilt = writer.prepare_promotion(handoff.resolution, handoff.collected,
-            handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
+            handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills,
+            contract_observation=handoff.contract_observation)
     else:
         _need(resolution.pending is None)
         rebuilt = writer._prepare_promotion_context2_custody(handoff.resolution, handoff.collected,
@@ -440,12 +465,12 @@ def _xz_inflate(compressed, maximum):
     return raw
 
 
-def _frame(encoded, blobs, *, version=5):
+def _frame(encoded, blobs, *, version=6):
     # Only bytes are deduplicated. Every typed node and history row remains in
     # the canonical header; raw blobs follow in exact digest order. The outer
     # metadata binds the complete frame's size and SHA256, including this prefix.
     rows = sorted(blobs.items())
-    _need(type(version) is int and version in (3, 4, 5))
+    _need(type(version) is int and version in (3, 4, 5, 6))
     header = _canonical({"version": version, "handoff": encoded,
         "blobs": [{"sha256": digest, "length": len(raw)} for digest, raw in rows]})
     size = 4 + len(header) + sum(len(raw) for _, raw in rows)
@@ -462,12 +487,12 @@ def _json(raw):
     return value
 
 
-def _unframe(raw, *, version=5):
+def _unframe(raw, *, version=6):
     _need(4 < len(raw) <= MAX_RAW)
     size = int.from_bytes(raw[:4], "big")
     _need(0 < size <= MAX_RAW - 4 and 4 + size <= len(raw))
     value = _json(raw[4:4 + size])
-    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4, 5))
+    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4, 5, 6))
     rows = value["blobs"]
     _need(type(rows) is list and 1 <= len(rows) <= MAX_BLOBS)
     offset, total, previous, blobs = 4 + size, 0, "", {}
@@ -508,7 +533,7 @@ def _decode_blobs(rows):
 def _unpack(outputs):
     _exact(outputs, OUTPUT_KEYS)
     _need(all(type(value) is str and len(value) <= CHUNK_SIZE and value.isascii() for value in outputs.values())
-          and outputs["handoff_version"] in ("1", "2", "3", "4", VERSION)
+          and outputs["handoff_version"] in ("1", "2", "3", "4", "5", VERSION)
           and writer.common.SHA256_RE.fullmatch(outputs["handoff_sha256"]))
     encoded_size = _length(outputs["handoff_encoded_length"], MAX_ENCODED)
     compressed_size = _length(outputs["handoff_compressed_length"], MAX_COMPRESSED)
@@ -522,7 +547,7 @@ def _unpack(outputs):
     _need(len(text) == encoded_size)
     compressed = _unb64(text, MAX_COMPRESSED)
     _need(len(compressed) == compressed_size)
-    raw = (_xz_inflate(compressed, raw_size) if outputs["handoff_version"] in ("3", "4", "5")
+    raw = (_xz_inflate(compressed, raw_size) if outputs["handoff_version"] in ("3", "4", "5", "6")
            else _inflate(compressed, raw_size))
     _need(len(raw) == raw_size
           and writer.common.sha256_bytes(raw) == outputs["handoff_sha256"])
@@ -539,7 +564,9 @@ def decode(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
     V2 retains its exact zlib/JSON wire; v3 retains XZ with no drill observation.
     V4 retains its original drill observation. V5 additionally requires complete
     raw pending material and current context3 evidence. Historical versions
-    cannot be re-encoded as v5 or enter current normal preparation.
+    1-4 cannot enter current normal preparation. V6 preserves complete owner
+    observations when required; historical absence never supplies one.
+    Current active contract qualification remains unsupported.
     A hash cannot authenticate hostile substituted data.
     """
     return _decode_versioned(outputs, candidate_sha=candidate_sha, workflow_sha=workflow_sha,
@@ -549,7 +576,7 @@ def decode(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
 def _decode_versioned(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
     raw = _unpack(outputs)
     version = int(outputs["handoff_version"])
-    if version in (3, 4, 5):
+    if version in (3, 4, 5, 6):
         value, blobs = _unframe(raw, version=version)
     else:
         value = _json(raw)
@@ -571,7 +598,7 @@ def build_record(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt
     """
     version, handoff = _decode_versioned(outputs, candidate_sha=candidate_sha,
         workflow_sha=workflow_sha, run_id=run_id, record_attempt=record_attempt)
-    if version == 5:
+    if version in (5, 6):
         return writer.build_promotion(handoff, publication, current_resolution)
     return writer._build_promotion_context2_custody(handoff, publication, current_resolution)
 

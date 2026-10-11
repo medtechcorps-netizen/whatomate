@@ -1,5 +1,5 @@
 """Synthetic date-boundary policy checks; no real drill, clock or provider I/O."""
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -7,6 +7,7 @@ from pathlib import Path
 import unittest
 
 import forward_gates as gates
+import test_contract_authorization as owner_fixture
 
 
 NOW = datetime(2026, 10, 11, 8, 0, 0, tzinfo=timezone.utc)
@@ -183,6 +184,75 @@ class SourceObservationTests(unittest.TestCase):
                            (raw(NOW + timedelta(seconds=1), NOW), 'future')):
             with self.assertRaisesRegex(gates.DrillRefusal, 'restore-drills-' + code):
                 gates.observe_forward_drills(self.policy_projection(data), now=NOW)
+
+
+def contract_fixture(resolution):
+    """Direct-rule synthetic policy data, never operational source admission."""
+    value = owner_fixture.fixture()
+    repo = gates.resolver.transport.REPOSITORY_ID
+    label = replace(value.pulls[0].labels[0], repository_id=repo)
+    event = replace(value.pulls[0].events[0], label=label)
+    pull = replace(value.pulls[0], repository_id=repo, merge_sha=resolution.candidate.sha,
+                   labels=(label,), events=(event,))
+    observed = replace(value, repository_id=repo, main_sha=resolution.candidate.sha, pulls=(pull,))
+    resolved = replace(resolution.resolved, inventory=replace(resolution.resolved.inventory,
+                                                            main_sha=resolution.candidate.sha))
+    return replace(resolution, resolved=resolved,
+                   classification=resolution.classification._replace(kind="contract", dormant=False)), observed
+
+
+class ContractObservationTests(unittest.TestCase):
+    setUpClass = SourceObservationTests.__dict__["setUpClass"]
+
+    def test_original_policy_is_rederived_at_preserved_time_without_new_clock(self):
+        value, observed = contract_fixture(self.resolution)
+        receipt = gates.validate_preserved_contract(value, observed)
+        expected = gates.contract.require_contract_label(observed, candidate_sha=value.candidate.sha,
+            repository_id=gates.resolver.transport.REPOSITORY_ID, now=observed.observed_at)
+        self.assertEqual(receipt, expected)
+        self.assertEqual(receipt.observed_at, observed.observed_at)
+        self.assertIs(type(receipt), gates.contract.ContractReceipt)
+        with self.assertRaises(TypeError): gates.validate_preserved_contract(value, observed, now=NOW)
+
+    def test_only_contract_requires_owner_and_noncontract_rejects_unsolicited_observation(self):
+        _, observed = contract_fixture(self.resolution)
+        for kind, dormant in (("none", False), ("expand", False), ("expand", True),
+                              ("data", False), ("data", True)):
+            value = replace(self.resolution, classification=self.resolution.classification._replace(
+                kind=kind, dormant=dormant))
+            self.assertIsNone(gates.validate_preserved_contract(value, None))
+            with self.assertRaisesRegex(gates.contract.ContractRefusal, "contract-label-unexpected"):
+                gates.validate_preserved_contract(value, observed)
+
+    def test_invalid_classification_and_missing_contract_observation_refuse(self):
+        value, observed = contract_fixture(self.resolution)
+        for kind, dormant in (("contract", True), ("none", True), ("PRIVATE", False), ("contract", 0)):
+            changed = replace(value, classification=value.classification._replace(kind=kind, dormant=dormant))
+            with self.assertRaisesRegex(gates.contract.ContractRefusal, "contract-label-classification"):
+                gates.validate_preserved_contract(changed, observed)
+        with self.assertRaises(gates.contract.ContractRefusal): gates.validate_preserved_contract(value, None)
+
+    def test_original_time_must_be_exact_utc_and_complete_owner_history_is_retained(self):
+        value, observed = contract_fixture(self.resolution)
+        for stamp_ in (observed.observed_at.replace(tzinfo=None),
+                       observed.observed_at.replace(tzinfo=timezone(timedelta(hours=1))),
+                       observed.observed_at.replace(fold=1)):
+            with self.assertRaisesRegex(gates.contract.ContractRefusal, "contract-label-observation-time"):
+                gates.validate_preserved_contract(value, replace(observed, observed_at=stamp_))
+        for changed in (replace(observed, pulls=()),
+                        owner_fixture.change_pull(observed, events=()),
+                        owner_fixture.change_event(observed, actor_node_id="OTHER_USER"),
+                        owner_fixture.change_label(observed, updated_at=observed.observed_at)):
+            with self.assertRaises(gates.contract.ContractRefusal): gates.validate_preserved_contract(value, changed)
+
+    def test_observation_and_original_source_main_must_both_bind_exact_candidate(self):
+        value, observed = contract_fixture(self.resolution)
+        with self.assertRaises(gates.contract.ContractRefusal):
+            gates.validate_preserved_contract(value, replace(observed, main_sha="f" * 40))
+        drift = replace(value, resolved=replace(value.resolved,
+            inventory=replace(value.resolved.inventory, main_sha="f" * 40)))
+        with self.assertRaisesRegex(gates.contract.ContractRefusal, "contract-label-source"):
+            gates.validate_preserved_contract(drift, observed)
 
 
 if __name__ == "__main__":
