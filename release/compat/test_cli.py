@@ -568,6 +568,33 @@ class EvidenceContextTests(unittest.TestCase):
 
 
 class EvidenceEntryTests(unittest.TestCase):
+    def test_normal_pair_keeps_snapshot4_context3_without_rollback_fallback(self):
+        with self.workspace(negative=True) as state:
+            runner, inputs, output, ctx, snap, raw, _, _ = state
+            with mock.patch.object(cli, 'validate_rollback_snapshot', side_effect=AssertionError('rollback snapshot')), \
+                 mock.patch.object(cli, 'validate_rollback_result', side_effect=AssertionError('rollback result')), \
+                 mock.patch.object(cli, '_write_rollback_evidence', side_effect=AssertionError('rollback writer')):
+                self.assertEqual(cli.main(['check']), 1)
+                context_raw = (runner / ('compat-check-' + ctx.suffix) / 'public/compat-context.json').read_bytes()
+                self.assertEqual(snap['version'], 4)
+                self.assertEqual(json.loads(context_raw)['version'], 3)
+                self.assertEqual(output.read_text(), 'complete=true\n')
+                (inputs / 'compat-context.json').write_bytes(context_raw)
+                output.write_bytes(b'')
+                self.assertEqual(cli.main(['validate-evidence']), 0)
+                self.assertEqual(output.read_text(), 'complete=true\n')
+
+    def test_context4_never_selects_rollback_lane_when_validated_target_absent(self):
+        with self.workspace() as state:
+            runner, inputs, output, ctx, snap, raw, _, _ = state
+            value = cli.evidence_context(raw, snap, ctx)
+            value.update(version=4, purpose='rollback-v0')
+            (inputs / 'compat-context.json').write_bytes(cli.canonical(value))
+            with mock.patch.object(cli, 'validate_rollback_evidence', side_effect=AssertionError('namespace fallback')):
+                self.assertEqual(cli.main(['validate-evidence']), 1)
+            self.assertEqual(output.read_bytes(), b'')
+            self.assertFalse((runner / ('compat-validate-evidence-' + ctx.suffix)).exists())
+
     @contextlib.contextmanager
     def workspace(self, negative=False):
         with tempfile.TemporaryDirectory() as temp:

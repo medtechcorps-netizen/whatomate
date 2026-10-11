@@ -4,8 +4,10 @@ Captured signatures and immutable source responses are synthetic. The tests do
 not authenticate a real release, run Docker, or authorize an operational gate.
 """
 from dataclasses import replace
+import contextlib
 import copy
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -17,6 +19,7 @@ import cli
 import test_compat as engine_tests
 import test_compat_evidence as pair_tests
 import test_compat_adapter as adapter_tests
+import test_cli as normal_tests
 
 
 class RollbackCLITests(unittest.TestCase):
@@ -291,6 +294,384 @@ class RollbackCLITests(unittest.TestCase):
         with self.assertRaisesRegex(cli.record_transport.TransportRefusal, 'transport-deadline'):
             client.budget.close()
         self.assertTrue(client.budget.closed)
+
+
+class PublicRollbackCLITests(unittest.TestCase):
+    """Public files/commands with real source, engine, proof and verifier code.
+
+    Only the clock, capture, build and owned-service boundaries are controlled.
+    Synthetic certificates and service evidence are not hosted qualification.
+    Existing private-helper tests above remain independently discoverable.
+    """
+    @classmethod
+    def setUpClass(cls):
+        RollbackCLITests.setUpClass()
+
+    def setUp(self):
+        RollbackCLITests.setUp(self)
+        self.runner = self.case.root / 'runner'
+        self.runner.mkdir()
+        self.inputs = self.runner / 'compat-input'
+        self.inputs.mkdir()
+        self.output = self.runner / 'step-output'
+        self.output.touch()
+        self.docker, self.plugin = self.case.root / 'docker.exe', self.case.root / 'buildx.exe'
+        self.docker.write_bytes(b'controlled boundary'); self.plugin.write_bytes(b'controlled boundary')
+        self.env = normal_tests.environment('workflow_dispatch', attempt='2')
+        self.env.update(GITHUB_SHA=self.ctx.sha, GITHUB_WORKFLOW_SHA=self.ctx.sha,
+            GITHUB_RUN_ID=str(self.ctx.run_id), COMPAT_ROLLBACK_TARGET=self.ctx.target,
+            RUNNER_TEMP=str(self.runner), GITHUB_OUTPUT=str(self.output),
+            COMPAT_PREVIEW_OUTCOME='success', COMPAT_RUN_OUTCOME='success',
+            COMPAT_GIT_BIN=str(self.case.git), COMPAT_GH_BIN=str(self.case.gh),
+            COMPAT_DOCKER_BIN=str(self.docker), COMPAT_BUILDX_BIN=str(self.plugin),
+            GH_TOKEN=engine_tests.tr.support.GH_TOKEN)
+        self.public_clients, self.public_deadlines, self.admissions = [], [], []
+
+    def public(self, command, **changes):
+        env = {**self.env, **changes}
+        self.output.write_bytes(b'')
+        init, make_client = cli.images._Deadline.__init__, cli._client
+        def clock_init(deadline):
+            init(deadline, clock=self.w.clock)
+            self.public_deadlines.append((deadline, self.w.clock.now))
+        def client(work, actual_env, deadline):
+            self.assertIs(deadline, self.public_deadlines[-1][0])
+            value = make_client(work, actual_env, deadline)
+            self.public_clients.append(value)
+            return value
+        def capture(argv, **options):
+            if argv[0] in (str(self.case.gh), str(self.case.git)):
+                return self.case.world(argv, **options)
+            return self.w.owner.raw_capture(argv, **options)
+        def build(repo, resolution, binary, config, work, deadline, *, buildx_binary):
+            self.assertIs(deadline, self.public_deadlines[-1][0])
+            self.assertEqual(deadline.end, self.public_deadlines[-1][1] + 2400)
+            self.assertEqual(resolution, self.resolution)
+            self.assertTrue(self.public_clients[-1].budget.closed)
+            self.assertIsNone(cli.records._GIT_OUTPUT_TRANSPORT.get())
+            self.admissions.append((resolution, deadline.end))
+            self.w.event('admission.rollback')
+            return self.admission
+        with mock.patch.dict(cli.os.environ, env, clear=True), \
+             mock.patch.object(Path, 'cwd', return_value=self.case.repo), \
+             mock.patch.object(cli.images._Deadline, '__init__', clock_init), \
+             mock.patch.object(cli, '_client', side_effect=client), \
+             mock.patch.object(cli.runtime, 'bounded_command', side_effect=capture), \
+             mock.patch.object(cli.images, '_admit_rollback_resolved', side_effect=build), \
+             mock.patch.object(cli.images, '_admit_resolved', side_effect=AssertionError('normal admission')), \
+             mock.patch.object(cli, 'preview', side_effect=AssertionError('normal preview fallback')), \
+             mock.patch.object(cli, 'execute', side_effect=AssertionError('normal execution fallback')), \
+             mock.patch.object(cli, '_write_evidence', side_effect=AssertionError('normal writer fallback')), \
+             contextlib.redirect_stdout(io.StringIO()) as stdout, \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
+            status = cli.main([command])
+        self.last_stdout, self.last_stderr = stdout.getvalue(), stderr.getvalue()
+        self.assertNotIn('PRIVATE', self.last_stderr)
+        self.assertNotIn(engine_tests.tr.support.GH_TOKEN, self.last_stderr)
+        self.assertTrue(all(client.budget.closed for client in self.public_clients))
+        self.assertIsNone(cli.records._GIT_OUTPUT_TRANSPORT.get())
+        return status
+
+    def directory(self, command):
+        return self.runner / ('compat-' + command + '-' + self.ctx.suffix) / 'public'
+
+    def stage_preview(self):
+        self.assertEqual(self.public('preview'), 0, self.last_stderr)
+        raw = (self.directory('preview') / 'resolution.json').read_bytes()
+        self.assertEqual(self.output.read_bytes(), b'')
+        self.assertEqual(self.public_deadlines[-1][0].end, self.public_deadlines[-1][1] + 600)
+        (self.inputs / 'resolution.json').write_bytes(raw)
+        return json.loads(raw)
+
+    def stage_run(self):
+        snapshot = self.stage_preview()
+        self.assertEqual(self.public('run'), 0, self.last_stderr)
+        raw = (self.directory('run') / 'compat-result.json').read_bytes()
+        (self.inputs / 'compat-result.json').write_bytes(raw)
+        self.assertEqual(self.output.read_bytes(), b'')
+        self.assertEqual(len(self.admissions), 1)
+        self.assertEqual(self.w.trace[-4:], ['ledger.seal', 'catalog.final', 'manager.close', 'stack.cleanup'])
+        return snapshot, raw
+
+    def published(self, negative=False):
+        snapshot, raw = self.stage_run()
+        calls = len(self.case.world.trace)
+        self.assertEqual(self.public('check'), int(negative), self.last_stderr)
+        self.assertEqual(self.output.read_text(), 'complete=true\n')
+        directory = self.directory('check')
+        self.assertEqual({p.name for p in directory.iterdir()}, {'compat-result.json', 'compat-context.json'})
+        self.assertEqual((directory / 'compat-result.json').read_bytes(), raw)
+        context_raw = (directory / 'compat-context.json').read_bytes()
+        self.assertEqual(json.loads(context_raw)['version'], 4)
+        self.assertEqual(json.loads(context_raw)['result_sha256'], hashlib.sha256(raw).hexdigest())
+        (self.inputs / 'compat-context.json').write_bytes(context_raw)
+        self.assertEqual(self.public('validate-evidence'), 0, self.last_stderr)
+        self.assertEqual(self.output.read_text(), 'complete=true\n')
+        self.assertEqual({p.name: p.read_bytes() for p in self.directory('validate-evidence').iterdir()},
+                         {p.name: p.read_bytes() for p in directory.iterdir()})
+        self.assertEqual(len(self.case.world.trace), calls)  # No source/engine work in either file-only command.
+        measurement, pair, attempt = RollbackCLITests.measured(self, raw, snapshot)
+        self.assertEqual(pair.context, context_raw)
+        self.assertEqual(measurement.positive, not negative)
+        return measurement, pair, attempt
+
+    def refuse(self, command, **changes):
+        self.assertEqual(self.public(command, **changes), 1)
+        self.assertEqual(self.output.read_bytes(), b'')
+        self.assertFalse((self.directory(command) / 'compat-result.json').exists())
+
+    def test_public_positive_crosses_all_commands_and_both_real_subject_verifiers(self):
+        measured, pair, _ = self.published()
+        self.assertEqual(measured.binding.producer_sha, self.ctx.sha)
+        self.assertEqual(measured.binding.database_base.source_sha, '3' * 40)
+        self.assertEqual(measured.binding.selected_web_source_sha, self.case.boot['sha'])
+        self.assertEqual(measured.binding.live_web_source_sha, '4' * 40)
+        self.assertLessEqual(len(pair.context), 4096)
+        self.assertEqual(self.last_stderr, '')
+        with self.assertRaisesRegex(cli.record_resolver.policy.PolicyRefusal, 'rollback-qualification-unavailable'):
+            cli.record_resolver.policy.rollback_plan(self.resolution.resolved.chain, self.ctx.target)
+
+    def test_public_actual_old_migration_false_is_complete_signable_and_failed_check(self):
+        self.w.codes['compat-n1-rw'] = 1
+        measured, pair, _ = self.published(negative=True)
+        self.assertFalse(json.loads(pair.result)['old_migrate_ok']['rw'])
+        self.assertFalse(measured.reversible)
+
+    def test_public_actual_read_and_reverse_false_are_complete_signable_and_failed_check(self):
+        self.w.false_case = 'read'
+        _, pair, _ = self.published(negative=True)
+        value = json.loads(pair.result)
+        self.assertFalse(value['old_server_ok']['read']); self.assertFalse(value['old_server_ok']['reverse'])
+        self.assertTrue(value['reversible'])
+
+    def test_public_actual_worker_false_is_complete_signable_and_failed_check(self):
+        self.w.worker_panic = 1
+        _, pair, _ = self.published(negative=True)
+        self.assertFalse(json.loads(pair.result)['old_server_ok']['workers'])
+
+    def test_public_actual_catalog_false_retains_measured_hash(self):
+        original = cli.compat.catalog.OwnedCatalog
+        class ChangedFinal(original):
+            def observe(inner, inputs):
+                super().observe(inputs)
+                return inner.observation('e' * 64)
+        with mock.patch.object(cli.compat.catalog, 'OwnedCatalog', ChangedFinal):
+            measured, pair, _ = self.published(negative=True)
+        self.assertEqual(measured.catalog_sha256, 'e' * 64)
+        self.assertEqual(json.loads(pair.result)['catalog_sha256'], 'e' * 64)
+        self.assertNotEqual(measured.catalog_sha256, measured.binding.database_base.catalog.catalog_sha256)
+
+    def test_public_terminal_target_panic_is_H_bound_measured_negative(self):
+        self.w.terminal_old_boot = True
+        measured, _, _ = self.published(negative=True)
+        self.assertFalse(any(measured.servers))
+        self.assertEqual(self.w.trace.count('controller.read'), 0)
+
+    def test_cleanup_failure_does_not_publish_or_mark_complete(self):
+        self.stage_preview(); self.w.cleanup_fail = True
+        self.refuse('run')
+        self.assertEqual(self.w.trace[-1], 'stack.cleanup')
+
+    def test_incomplete_capture_does_not_publish_a_semantic_negative(self):
+        self.stage_preview(); self.w.false_case = 'read'; self.w.fail = 'catalog.final'
+        self.refuse('run')
+        self.assertTrue(self.w.owner._closed)
+
+    def test_target_rejected_on_push_PR_or_nonmain_dispatch_before_any_effect(self):
+        calls = len(self.case.world.trace)
+        for event, ref in (('push', 'refs/heads/main'), ('pull_request', 'refs/pull/9/merge'),
+                           ('workflow_dispatch', 'refs/heads/other')):
+            for command in ('preview', 'run', 'check', 'validate-evidence'):
+                with self.subTest(event=event, command=command):
+                    self.refuse(command, GITHUB_EVENT_NAME=event, GITHUB_REF=ref,
+                                GITHUB_WORKFLOW_REF=cli._WORKFLOW + ref)
+        self.assertEqual(len(self.case.world.trace), calls)
+        self.assertEqual(self.public_deadlines, [])
+        self.assertEqual(set(self.runner.iterdir()), {self.inputs, self.output})
+
+    def test_disabled_target_route_precedes_context_and_source(self):
+        calls = len(self.case.world.trace)
+        with mock.patch.object(cli.images, '_READY_FOR_EXECUTION', False):
+            self.refuse('preview', GITHUB_SHA='PRIVATE invalid')
+        self.assertEqual(len(self.case.world.trace), calls)
+        self.assertEqual(self.public_deadlines, [])
+
+    def test_wrong_workflow_identity_refuses_before_client(self):
+        calls = len(self.case.world.trace)
+        self.refuse('preview', GITHUB_WORKFLOW_SHA='b' * 40)
+        self.assertEqual(len(self.case.world.trace), calls)
+        self.assertEqual(self.public_deadlines, [])
+
+    def test_foreign_run_snapshot_refuses_before_fresh_source(self):
+        self.stage_preview(); calls = len(self.case.world.trace)
+        self.refuse('run', GITHUB_RUN_ID='12346')
+        self.assertEqual(len(self.case.world.trace), calls)
+
+    def test_foreign_attempt_snapshot_refuses_before_fresh_source(self):
+        self.stage_preview(); calls = len(self.case.world.trace)
+        self.refuse('run', GITHUB_RUN_ATTEMPT='3')
+        self.assertEqual(len(self.case.world.trace), calls)
+
+    def test_fresh_latest_drift_refuses_before_image_admission(self):
+        self.stage_preview(); latest = self.case.add(); self.case.profile(latest['sha'])
+        self.refuse('run'); self.assertEqual(self.admissions, [])
+        self.assertEqual(self.w.trace, [])
+
+    def test_fresh_main_drift_refuses_before_image_admission(self):
+        self.stage_preview(); self.case.world.main = 'b' * 40
+        self.refuse('run'); self.assertEqual(self.admissions, [])
+
+    def test_fresh_endpoint_recipe_drift_refuses_before_image_admission(self):
+        self.stage_preview()
+        self.case.world.files[self.case.boot['sha'], self.case.RECIPE] += b'# changed source\n'
+        self.refuse('run'); self.assertEqual(self.admissions, [])
+
+    def test_span_commitment_tamper_refuses_after_real_fresh_resolution(self):
+        snapshot = self.stage_preview(); calls = len(self.case.world.trace)
+        snapshot['span']['sha256'] = 'f' * 64
+        (self.inputs / 'resolution.json').write_bytes(cli.canonical(snapshot))
+        self.refuse('run'); self.assertEqual(self.admissions, [])
+        self.assertGreater(len(self.case.world.trace), calls)
+
+    def test_source_material_commitment_tamper_refuses_after_real_fresh_resolution(self):
+        snapshot = self.stage_preview(); snapshot['source_material_sha256'] = 'f' * 64
+        (self.inputs / 'resolution.json').write_bytes(cli.canonical(snapshot))
+        self.refuse('run'); self.assertEqual(self.admissions, [])
+
+    def test_unknown_target_is_not_a_normal_preview_fallback(self):
+        self.refuse('preview', COMPAT_ROLLBACK_TARGET='prod-20261011T000000Z-ffffffff')
+        self.assertFalse((self.directory('preview') / 'resolution.json').exists())
+        self.assertEqual(self.admissions, [])
+
+    def test_zero_change_target_does_not_create_a_proof_or_admission(self):
+        self.refuse('preview', COMPAT_ROLLBACK_TARGET=self.case.documents[4]['release'])
+        self.assertFalse((self.directory('preview') / 'resolution.json').exists())
+        self.assertEqual(self.admissions, [])
+
+    def test_one_change_target_does_not_create_a_proof_or_admission(self):
+        self.refuse('preview', COMPAT_ROLLBACK_TARGET=self.case.documents[3]['release'])
+        self.assertFalse((self.directory('preview') / 'resolution.json').exists())
+        self.assertEqual(self.admissions, [])
+
+    def test_all_v1_history_does_not_invent_retained_live_authority(self):
+        case = engine_tests.trb.RollbackProofResolverTests()
+        case.setUp(); self.addCleanup(case.doCleanups)
+        target = case.add(version=1); latest = case.add(version=1)
+        for source in (target['sha'], latest['sha'], self.ctx.sha):
+            case.profile(source)
+        self.case = case
+        self.env.update(COMPAT_GIT_BIN=str(case.git), COMPAT_GH_BIN=str(case.gh),
+                        COMPAT_ROLLBACK_TARGET=target['release'])
+        self.refuse('preview'); self.assertEqual(self.admissions, [])
+        self.assertFalse((self.directory('preview') / 'resolution.json').exists())
+
+    def test_unequal_seven_file_source_material_refuses_before_engine(self):
+        self.case.world.files[self.ctx.sha, cli.record_resolver.policy.STEPS] += b'\n'
+        self.refuse('preview'); self.assertEqual(self.admissions, [])
+
+    def test_constructor_work_consumes_original_preview_deadline(self):
+        def elapsed(argv):
+            if argv == [str(self.case.gh), '--version']:
+                self.w.clock.sleep(601)
+        self.case.world.before = elapsed
+        self.refuse('preview')
+        self.assertEqual(self.public_deadlines[0][0].end, self.public_deadlines[0][1] + 600)
+        self.assertEqual(self.admissions, [])
+
+    def test_run_constructor_cannot_reset_original_deadline(self):
+        self.stage_preview()
+        def elapsed(argv):
+            if argv == [str(self.case.gh), '--version']:
+                self.w.clock.sleep(2401)
+        self.case.world.before = elapsed
+        self.refuse('run'); self.assertEqual(self.admissions, [])
+        self.assertEqual(self.public_deadlines[-1][0].end, self.public_deadlines[-1][1] + 2400)
+
+    def test_normal_snapshot_does_not_select_normal_parser_for_explicit_target(self):
+        snapshot = normal_tests.snapshot(self.ctx)
+        (self.inputs / 'resolution.json').write_bytes(cli.canonical(snapshot))
+        calls = len(self.case.world.trace)
+        self.refuse('run'); self.assertEqual(len(self.case.world.trace), calls)
+
+    def test_rollback_snapshot_cannot_select_lane_when_target_absent(self):
+        self.stage_preview(); calls = len(self.case.world.trace)
+        self.refuse('run', COMPAT_ROLLBACK_TARGET='')
+        self.assertEqual(len(self.case.world.trace), calls)
+
+    def test_upstream_failure_or_cancel_never_publishes_complete_measurement(self):
+        self.stage_run()
+        for outcome in ('failure', 'cancelled', 'skipped', ''):
+            with self.subTest(outcome=outcome):
+                self.refuse('check', COMPAT_RUN_OUTCOME=outcome)
+
+    def test_partial_context_write_never_marks_complete(self):
+        self.stage_run(); original = cli._write_public
+        def partial(path, raw):
+            if path.name == 'compat-context.json':
+                path.write_bytes(raw[:1]); raise OSError('PRIVATE partial capture')
+            return original(path, raw)
+        with mock.patch.object(cli, '_write_public', side_effect=partial):
+            self.assertEqual(self.public('check'), 1)
+        self.assertEqual(self.output.read_bytes(), b'')
+        self.assertEqual((self.directory('check') / 'compat-context.json').read_bytes(), b'{')
+
+    def test_readback_tamper_never_marks_complete(self):
+        self.stage_run(); original = cli._write_public
+        def tamper(path, raw):
+            original(path, raw)
+            if path.name == 'compat-context.json':
+                (path.parent / 'compat-result.json').write_bytes(b'{}\n')
+        with mock.patch.object(cli, '_write_public', side_effect=tamper):
+            self.assertEqual(self.public('check'), 1)
+        self.assertEqual(self.output.read_bytes(), b'')
+
+    def test_extra_public_file_never_marks_complete(self):
+        self.stage_run(); original = cli._write_public
+        def extra(path, raw):
+            original(path, raw)
+            if path.name == 'compat-context.json':
+                (path.parent / 'extra.json').write_bytes(b'{}\n')
+        with mock.patch.object(cli, '_write_public', side_effect=extra):
+            self.assertEqual(self.public('check'), 1)
+        self.assertEqual(self.output.read_bytes(), b'')
+
+    def test_signer_rejects_missing_foreign_or_noncanonical_context_without_readiness(self):
+        snapshot, raw = self.stage_run()
+        context_raw = cli.canonical(cli.rollback_evidence_context(raw, snapshot, self.ctx))
+        path = self.inputs / 'compat-context.json'
+        self.refuse('validate-evidence')
+        for changes in ({'version': 3}, {'result_sha256': 'f' * 64}, {'run_attempt': 3}, {'extra': True}):
+            value = json.loads(context_raw); value.update(changes)
+            path.write_bytes(cli.canonical(value))
+            with self.subTest(changes=changes): self.refuse('validate-evidence')
+        for data in (context_raw[:-1], context_raw + b' ', b' ' * 4097):
+            path.write_bytes(data); self.refuse('validate-evidence')
+        path.write_bytes(context_raw); (self.inputs / 'extra.json').write_bytes(b'{}\n')
+        self.refuse('validate-evidence')
+
+    def test_signed_public_bytes_require_both_exact_subjects_and_invocation(self):
+        _, pair, attempt = self.published()
+        for mutation in ('missing', 'digest', 'attempt'):
+            with self.subTest(mutation=mutation), adapter_tests.harness(attempt) as (root, client, fake, row):
+                archive = adapter_tests.archive(pair)
+                if mutation == 'missing':
+                    archive = adapter_tests.archive(pair, [('compat-result.json', pair.result)])
+                else:
+                    def mutate(value, path):
+                        if path.name != 'compat-context.json': return
+                        if mutation == 'digest':
+                            value[0]['verificationResult']['statement']['subject'][0]['digest']['sha256'] = 'f' * 64
+                        else:
+                            value[0]['verificationResult']['signature']['certificate']['runInvocationURI'] += '9'
+                    fake.mutate = mutate
+                with self.assertRaises(cli.compat_evidence.CompatRefusal):
+                    adapter_tests.adapter.verify_rollback_pair(client, archive, adapter_tests.location(row), row, root)
+
+    def test_same_attempt_scratch_replay_refuses_before_another_source_read(self):
+        self.stage_preview(); calls = len(self.case.world.trace)
+        self.assertEqual(self.public('preview'), 1)
+        self.assertEqual(self.output.read_bytes(), b'')
+        self.assertEqual(len(self.case.world.trace), calls)
 
 
 if __name__ == '__main__':
