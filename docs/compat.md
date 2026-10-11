@@ -28,15 +28,24 @@ proof. It must not substitute a more permissive kind. Source paths/reasons and
 summaries are not copied into the public result.
 
 Only **completed semantic failures** yield false flags. Infrastructure failures
-(pull, network, boot timeout, capture, container or process failure) raise
-`InfrastructureFailure` with a fixed code, and there is no result. Missing,
-not-run, incomplete, malformed or ambiguous evidence raises `EvidenceError`.
+(pull, network, boot timeout, capture or unclassified container/process failure)
+refuse with fixed error codes and no result. Missing, not-run, incomplete,
+malformed or ambiguous evidence raises `EvidenceError`.
 A boot without its first log is infrastructure failure. A control whose
 failure cannot be proved also raises; it is never a favorable partial result.
 Every phase is validated even when an earlier semantic check fails.
-In particular, a real semantic boot failure followed by unrun dependent sweeps
-fails the job as incomplete evidence in this version. The runner must not
-fabricate completed false sweep rows. There is no semantic-blocked encoding.
+
+One narrow postmigration terminal case can causally block dependent phases.
+After the actual migration and independent read-only control observations,
+`start_web` must return the bound previous-server handle. Complete append-only
+logs must contain the source's start and RLS markers before an anchored Go
+`panic:` in the same stream, with exit 2 and stable exited, non-OOM state.
+Structured fatal records, runtime `fatal error:` lines (including mixed panic
+windows), pre-RLS failures and missing or ambiguous evidence still refuse.
+The private proof then binds blocked old read/write/workers and reverse
+boot/read nodes to that observed cause; it does not invent completed sweeps.
+Dependent public flags become false only after actual server removal, complete
+journal sealing, final catalog capture and verified owned-resource cleanup.
 
 `reversible` is derived solely from all three `old_migrate_ok` values. It is
 not derived from forward or old-server results. Those other results remain
@@ -463,11 +472,13 @@ composition have not yet passed. The workflow is not yet published or enabled.
 
 Completed retained-record read mismatches now yield actual per-case false
 flags. Writes still require all record identities and readbacks to be valid.
-A terminal server failure that prevents dependent phases remains incomplete
-evidence in this version; causal blocked-phase support and the complete
-semantic-negative orchestration are not implemented. Missing startup contract
-evidence also refuses: the FORCE RLS negative-control fallback is not yet
-implemented. These cases must never be represented by invented observations.
+The narrow postmigration panic path above has mocked coverage; it does not
+establish a complete actual semantic-negative experiment or support arbitrary
+terminal failures and blocked phases. Living-worker failures, incomplete writes
+and unexpected stub traffic still have separate orchestration gaps and refuse.
+Missing startup contract evidence also refuses: the FORCE RLS negative-control
+fallback is not yet implemented.
+These cases must never be represented by invented observations.
 
 The current catalog adapter supports only the first released baseline
 `e0016b3595114728e7864da2adb44c29065f25ef`. It requires the exact equal v0
