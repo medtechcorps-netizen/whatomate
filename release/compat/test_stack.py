@@ -399,6 +399,152 @@ class StackTests(unittest.TestCase):
         self.assertEqual(len(self.world.mutations), count)
         self.assertFalse(self.stack.evidence()["closed"])
 
+    def test_endpoint_diagnostic_matches_prior_inspection_but_never_admits_peer(self):
+        endpoint = "a" * 64
+        def shape(args, value):
+            if args[:2] == ["container", "inspect"] and value[0]["State"]["Running"]:
+                next(iter(value[0]["NetworkSettings"]["Networks"].values()))["EndpointID"] = endpoint
+            return value
+        self.world.transform = shape; self.stack.start()
+        before = len(self.world.mutations)
+        self.world.network["Containers"]["ep-" + endpoint] = {"Name": "private-name", "IPv4Address": "private-address"}
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-foreign-attachment"):
+            self.stack._network_check()
+        diagnostic = self.stack.evidence()["network_attachment_failure"]
+        self.assertEqual(diagnostic["unknown_samples"], [{"kind": "endpoint_id",
+            "id_sha256": hashlib.sha256(endpoint.encode()).hexdigest(),
+            "matches_prior_shared_owned_endpoint": True,
+            "prior_container_id_sha256": hashlib.sha256(self.stack._ids["pg"].encode()).hexdigest()}])
+        self.assertFalse(diagnostic["ownership_or_acceptance_inferred"])
+        self.assertEqual(diagnostic["peer_map_type"], "object")
+        self.assertEqual(diagnostic["peer_count"], 4)
+        self.assertFalse(self.stack._ambiguous); self.assertFalse(self.stack._closed)
+        # Returned evidence is not a mutable capability to erase the first failure.
+        diagnostic["unknown_samples"].clear()
+        del self.world.network["Containers"]["ep-" + endpoint]
+        self.world.network["Containers"]["f" * 64] = {}
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-foreign-attachment"):
+            self.stack.cleanup()
+        saved = self.stack.evidence()["network_attachment_failure"]
+        self.assertEqual(saved["unknown_samples"][0]["kind"], "endpoint_id")
+        self.assertEqual(len(self.world.mutations), before)
+        self.assertTrue(self.stack._cleanup_attempted); self.assertFalse(self.stack._closed)
+        text = json.dumps(saved)
+        for private in (endpoint, "ep-" + endpoint, "private-name", "private-address"):
+            self.assertNotIn(private, text)
+
+    def test_peer_diagnostic_only_hashes_canonical_ids_never_arbitrary_keys_or_values(self):
+        self.stack.start()
+        keys = ["f" * 64, "ep-" + "e" * 64, "private-customer-name", "ep-private-host",
+                "A" * 64, "ep-" + "a" * 63, "private\ncontrol\u001b", "g" * 64]
+        for key in keys:
+            self.world.network["Containers"][key] = {"Name": "secret-name", "Labels": {"secret": "password"}}
+        before = len(self.world.calls)
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-foreign-attachment"):
+            self.stack._network_check()
+        self.assertEqual(len(self.world.calls), before + 1)  # Diagnostic performs no follow-up I/O.
+        d = self.stack.evidence()["network_attachment_failure"]
+        self.assertEqual(d["examined_key_kinds"], {"container_id": 4, "endpoint_id": 1, "other": 6})
+        self.assertEqual([v["kind"] for v in d["unknown_samples"]], ["container_id", "endpoint_id"] + ["other"] * 6)
+        self.assertTrue(all(v["id_sha256"] is None for v in d["unknown_samples"][2:]))
+        text = json.dumps(d)
+        for private in keys + ["secret-name", "password"]:
+            self.assertNotIn(private, text)
+        for private in keys[2:]:
+            self.assertNotIn(hashlib.sha256(private.encode()).hexdigest(), text)
+
+    def test_malformed_peer_maps_preserve_original_refusal_without_private_output(self):
+        self.stack.start()
+        for value, kind in ((["private"], "array"), ("private", "string"), (7, "number"), (True, "boolean")):
+            self.stack._attachment_failure = None  # Independent first-failure fixtures.
+            self.world.network["Containers"] = value
+            before = len(self.world.calls)
+            with self.assertRaisesRegex(s.proof.EvidenceError, "stack-foreign-attachment"):
+                self.stack._network_check()
+            d = self.stack.evidence()["network_attachment_failure"]
+            self.assertEqual(d["peer_map_type"], kind)
+            self.assertIsNone(d["peer_count"]); self.assertEqual(d["unknown_samples"], [])
+            self.assertEqual(d["examined_keys"], 0)
+            self.assertNotIn("private", json.dumps(d))
+            self.assertEqual(len(self.world.calls), before + 1)
+        # Preserve the existing falsy-to-empty behavior exactly; no new acceptance rule.
+        for value in (None, [], "", 0, False, {}):
+            self.stack._attachment_failure = None
+            self.world.network["Containers"] = value
+            self.stack._network_check()
+            self.assertIsNone(self.stack.evidence()["network_attachment_failure"])
+
+    def test_attachment_diagnostic_scan_and_samples_are_bounded_and_sticky(self):
+        self.stack.start()
+        self.world.network["Containers"] = {"private-" + str(i): {"Name": "secret"} for i in range(500)}
+        with self.assertRaises(s.proof.EvidenceError): self.stack._network_check()
+        d = self.stack.evidence()["network_attachment_failure"]
+        self.assertEqual(d["peer_count"], 128); self.assertEqual(d["examined_keys"], 128)
+        self.assertTrue(d["peer_scan_truncated"]); self.assertEqual(d["examined_unknown_keys"], 128)
+        self.assertEqual(len(d["unknown_samples"]), 8); self.assertTrue(d["unknown_samples_truncated"])
+        self.assertLess(len(json.dumps(d)), 4096)
+        self.world.network["Containers"] = {"ep-" + "f" * 64: {}}
+        with self.assertRaises(s.proof.EvidenceError): self.stack._network_check()
+        self.assertEqual(self.stack.evidence()["network_attachment_failure"], d)
+
+    def test_endpoint_history_requires_successful_owned_shared_check_and_is_bounded(self):
+        self.stack.start(); ident = self.stack._ids["pg"]
+        row = self.world.containers[ident]
+        peer = next(iter(row["NetworkSettings"]["Networks"].values()))
+        peer["EndpointID"] = "a" * 64
+        row["Config"]["Labels"][s.LABEL] = "c" * 32
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-container-changed"):
+            self.stack._container_check("pg")
+        self.assertEqual(self.stack._endpoint_observations, {})
+        row["Config"]["Labels"][s.LABEL] = TOKEN
+        for malformed in (None, "", "private-host", "A" * 64, "f" * 63):
+            peer["EndpointID"] = malformed; self.stack._container_check("pg")
+            self.assertEqual(self.stack._endpoint_observations, {})
+        for i in range(257):
+            peer["EndpointID"] = f"{i:064x}"
+            self.stack._container_check("pg")
+        self.assertEqual(len(self.stack._endpoint_observations), 256)
+        self.assertTrue(self.stack._endpoint_history_capped)
+        self.assertIsNone(self.stack.evidence()["network_attachment_failure"])
+
+    def test_wrong_network_metadata_still_refuses_before_diagnostic(self):
+        self.stack.start()
+        self.world.network["Labels"] = {"private": "wrong"}
+        self.world.network["Containers"]["private"] = {}
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-network-changed"):
+            self.stack._network_check()
+        self.assertIsNone(self.stack.evidence()["network_attachment_failure"])
+
+    def test_shared_process_endpoint_is_diagnostic_only_and_catalog_still_refuses(self):
+        import test_processes as tp
+        world = tp.World()
+        def endpoint(args, value):
+            if args[:2] == ["container", "inspect"] and value[0]["State"]["Running"]:
+                next(iter(value[0]["NetworkSettings"]["Networks"].values()))["EndpointID"] = hashlib.sha256(
+                    (value[0]["Id"] + "endpoint").encode()).hexdigest()
+            return value
+        world.transform = endpoint
+        owner = s.OwnedStack("docker", Path(self.tmp.name), SOURCE, s.GraphImage(GRAPH, SOURCE),
+                             token=TOKEN, capture=world.capture)
+        owner.start()
+        manager = tp.p.OwnedProcesses(owner, tp.p.ImageBinding(tp.PREV, "sha256:" + "4" * 64, "d" * 40, tp.RECIPE),
+            tp.p.ImageBinding(tp.CAND, tp.CAND, "e" * 40, tp.RECIPE),
+            tp.p.ImageBinding(tp.CONTROL, tp.CONTROL, "f" * 40, tp.RECIPE))
+        handle = manager.start_catalog(tp.INPUTS)
+        observed = hashlib.sha256((handle.container_id + "endpoint").encode()).hexdigest()
+        world.network["Containers"]["ep-" + observed] = {"Name": "private-catalog"}
+        count = len(world.mutations)
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-foreign-attachment"):
+            manager.wait_catalog(handle)
+        d = owner.evidence()["network_attachment_failure"]
+        self.assertEqual(d["last_process_operation"], {"operation": "configure", "slot": "catalog", "outcome": "acknowledged"})
+        self.assertTrue(d["unknown_samples"][0]["matches_prior_shared_owned_endpoint"])
+        self.assertEqual(d["unknown_samples"][0]["prior_container_id_sha256"], hashlib.sha256(handle.container_id.encode()).hexdigest())
+        self.assertEqual(len(world.mutations), count)
+        self.assertFalse(manager._protocol_failed); self.assertFalse(manager._ambiguous)
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-foreign-attachment"): manager.close()
+        self.assertEqual(len(world.mutations), count); self.assertFalse(manager._closed)
+
     def test_changed_ownership_or_isolation_refuses_before_any_cleanup(self):
         self.stack.start()
         identifier = self.stack._ids["pg"]

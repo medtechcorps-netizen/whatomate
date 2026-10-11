@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import copy
+import hashlib
 import re
 import secrets
 import sys
@@ -122,6 +124,9 @@ class OwnedStack:
         self._events = []
         self._process_ids = {}
         self._process_manager = None
+        self._endpoint_observations = {}  # Validated ID hashes only; diagnostic, never authority.
+        self._endpoint_history_capped = False
+        self._attachment_failure = None
         self._attempted = self._closed = self._ambiguous = self._cleanup_attempted = False
 
     @property
@@ -146,7 +151,71 @@ class OwnedStack:
                 "operations": [dict(row) for row in self._events],
                 "ambiguous": self._ambiguous, "closed": self._closed,
                 "cleanup_attempted": self._cleanup_attempted,
+                "network_attachment_failure": copy.deepcopy(self._attachment_failure),
                 "complete_compatibility_proof": False}
+
+    def _remember_endpoint(self, identifier, endpoint):
+        # Called only after the shared owned-container inspection succeeded.
+        # Process-specific checks may still refuse later; this is not admission.
+        if not (type(identifier) is str and len(identifier) == 64 and _ID.fullmatch(identifier)
+                and type(endpoint) is str and len(endpoint) == 64 and _ID.fullmatch(endpoint)):
+            return
+        key = hashlib.sha256(endpoint.encode("ascii")).hexdigest()
+        if key not in self._endpoint_observations and len(self._endpoint_observations) >= 256:
+            self._endpoint_history_capped = True
+            return
+        self._endpoint_observations.setdefault(key, hashlib.sha256(identifier.encode("ascii")).hexdigest())
+
+    def _record_attachment_failure(self, raw_peers, peers):
+        # First failure only. Never store peer values, names, addresses, labels,
+        # arbitrary key text or its hash. Bound both scan work and saved samples.
+        if self._attachment_failure is not None:
+            return
+        operation = None
+        manager = self._process_manager
+        if manager is not None and type(getattr(manager, "_events", None)) is list and manager._events:
+            last = manager._events[-1]
+            if type(last) is dict and last.get("operation") in {"create", "start", "configure", "controller", "stop", "remove"} and (
+                    last.get("slot") in {"web", "migration", "catalog", "controller"}
+                    and last.get("outcome") in {"unknown", "acknowledged"}):
+                operation = {key: last[key] for key in ("operation", "slot", "outcome")}
+        kinds = {"container_id": 0, "endpoint_id": 0, "other": 0}
+        samples = []
+        known = set(self._ids.values()) | set(self._process_ids.values())
+        examined = unknown = 0
+        if type(peers) is dict:
+            for key in peers:
+                if examined == 128:
+                    break
+                examined += 1
+                canonical = None
+                kind = "other"
+                if type(key) is str and len(key) == 64 and _ID.fullmatch(key):
+                    kind, canonical = "container_id", key
+                elif type(key) is str and len(key) == 67 and key.startswith("ep-") and _ID.fullmatch(key[3:]):
+                    kind, canonical = "endpoint_id", key[3:]
+                kinds[kind] += 1
+                if key not in known:
+                    unknown += 1
+                    if len(samples) < 8:
+                        digest = hashlib.sha256(canonical.encode("ascii")).hexdigest() if canonical is not None else None
+                        prior = self._endpoint_observations.get(digest) if kind == "endpoint_id" else None
+                        samples.append({"kind": kind, "id_sha256": digest,
+                            "matches_prior_shared_owned_endpoint": prior is not None,
+                            "prior_container_id_sha256": prior})
+        self._attachment_failure = {
+            "stage": "network-inspect-peer-guard",
+            "last_process_operation": operation,
+            "peer_map_type": {dict: "object", list: "array", str: "string", int: "number",
+                              float: "number", bool: "boolean", type(None): "null"}.get(type(raw_peers), "other"),
+            "peer_count": min(len(peers), 128) if type(peers) is dict else None,
+            "peer_scan_truncated": type(peers) is dict and len(peers) > examined,
+            "examined_keys": examined, "examined_key_kinds": kinds,
+            "examined_unknown_keys": unknown, "unknown_samples": samples,
+            "unknown_samples_truncated": unknown > len(samples),
+            "prior_endpoint_count": len(self._endpoint_observations),
+            "prior_endpoint_history_capped": self._endpoint_history_capped,
+            "ownership_or_acceptance_inferred": False}
 
     def _call(self, args, *, private_env=None):
         # Docker's name-only --env form obtains these generated values from
@@ -234,8 +303,12 @@ class OwnedStack:
              and not row.get("EnableIPv6") and row.get("Labels") == self._labels("network"),
              "stack-network-changed")
         peers = row.get("Containers") or {}
-        need(type(peers) is dict and set(peers) <= set(self._ids.values()) | set(self._process_ids.values()),
-             "stack-foreign-attachment")
+        try:
+            need(type(peers) is dict and set(peers) <= set(self._ids.values()) | set(self._process_ids.values()),
+                 "stack-foreign-attachment")
+        except proof.EvidenceError:
+            self._record_attachment_failure(row.get("Containers"), peers)
+            raise
         return row
 
     def _spec(self, role):
@@ -320,6 +393,12 @@ class OwnedStack:
                  and not state.get("Paused") and not state.get("Dead")
                  and (running is None or state["Running"] is running), "stack-service-not-running")
             need(started_at is None or state.get("StartedAt") == started_at, "stack-service-restarted")
+            # OwnedProcesses reuses this shared checker. Record only this
+            # successful shared inspection, after all its existing guards.
+            owner = self if type(self) is OwnedStack else getattr(self, "owner", None)
+            if type(owner) is OwnedStack and state["Running"] is True and (
+                    self is owner or (owner._process_manager is self and owner._process_ids.get(role) == identifier)):
+                owner._remember_endpoint(identifier, peer.get("EndpointID"))
             return row
         except (KeyError, TypeError, AttributeError):
             raise proof.EvidenceError("stack-inspect-invalid") from None
