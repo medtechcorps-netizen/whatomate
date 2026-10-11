@@ -1,4 +1,4 @@
-"""Bounded visible owner-label observations; no caller or permission activation.
+"""Bounded visible owner-label observations; no permission or DDL authority.
 
 Only an already-open ReleaseGh is accepted. Two matching full captures share
 its existing operation allowance. The returned immutable data is not a token

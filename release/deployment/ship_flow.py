@@ -16,6 +16,7 @@ import record_handoff
 import record_resolver
 import record_writer
 import forward_gates
+import contract_authorization
 import ship_compat
 import ship_records
 import ship_common as common
@@ -43,6 +44,8 @@ def _fixed(function):
         except policy.PolicyRefusal:
             common.fail('record-chain-invalid:policy')
         except forward_gates.DrillRefusal as exc:
+            common.fail('schema-change-blocked:' + str(exc))
+        except contract_authorization.ContractRefusal as exc:
             common.fail('schema-change-blocked:' + str(exc))
         except record_writer.WriterRefusal:
             common.fail('record-invalid:writer')
@@ -152,6 +155,16 @@ def _drill_details(normal):
         f'production fork {observation.production_fork.isoformat().replace("+00:00", "Z")}']
 
 
+@_fixed
+def _contract_details(normal):
+    receipt = forward_gates.validate_preserved_contract(normal.resolution, normal.contract_observation)
+    if receipt is None:
+        return ['- Contract owner label: not required for this change']
+    observed = receipt.observed_at.isoformat().replace('+00:00', 'Z')
+    return [f'- Contract owner label: observed at {observed}; PR {receipt.pull_number}; '
+            f'event {receipt.event_node_id} (original observation; no DDL authority)']
+
+
 def details(value):
     """Public summary values derived from the already checked gate."""
     latest = value.resolved.latest
@@ -174,7 +187,7 @@ def details(value):
             f'- Database source: {resolution.database_base_source}',
             f'- Changed database artifact paths: {changed}',
             *_forward_paths(resolution),
-            *_drill_details(value.normal)]
+            *_drill_details(value.normal), *_contract_details(value.normal)]
     if latest.live is None:
         return ['- Database history: legacy source checks; measured catalog unavailable',
                 '- Database change: none (image-only decision); dormant: false',
@@ -235,7 +248,8 @@ def promotion_outputs(value, control, verified_images, *, staging, private=()):
         tuple((part, verified_images[part]) for part in common.COMPONENTS),
         tuple((part, sha) for part in common.COMPONENTS))
     handoff = record_writer.prepare_promotion(value.normal.resolution, value.normal.collected,
-        images, _execution(control), staging=staging, drills=value.normal.drills)
+        images, _execution(control), staging=staging, drills=value.normal.drills,
+        contract_observation=value.normal.contract_observation)
     outputs = record_handoff.encode(handoff)
     for key, text in outputs.items():
         _need(common.OUTPUT_KEY_RE.fullmatch(key) and common.OUTPUT_VALUE_RE.fullmatch(text),

@@ -531,17 +531,44 @@ checks, the independent 25006 control, old-server sweeps, worker observation,
 reverse sweep and cleanup still run. The active catalog, 127-table inventory
 and empty modification allowlists remain unchanged. Pending gates are source
 metadata, not assertions that a migration ran or a gate passed.
-Release preserves complete raw pending material, original drill observation and
-full visible compatibility history through handoff format 5; the supported none/dormant changes remain
-exempt. Owner-label collection and policy are preparatory and are not selected
-by the release caller. Actual pending-fixture hosted qualification, active semantic expansion,
-contract admission, dedicated multi-span rollback proof and compatibility-outage
-bypass remain unfinished PR16 work. Visible API
+Release handoff format 6 preserves complete raw pending material, original drill
+observation and full visible compatibility history, plus the complete original
+owner-label observation when required by the class. Supported none/dormant
+changes require that owner field to be `None` and remain exempt from restore
+drills. Historical formats 1-5 keep their exact field sets for same-run record
+retry: formats 1-4 use the closed context-v2 route; format 5 retains context-v3
+pending/drill custody without an owner observation. Retry replays preserved UTC
+policy observations without fresh label collection or a new drill clock.
+Snapshot version 4, context version 3 and the result schema are unchanged.
+
+Normal source admission conditionally collects owner-label facts for an active
+contract inside both original source operations, before their final source
+rechecks and under the same client/budget. It binds an exact-main post-merge
+owner event and compares every before/after observation field except ordered
+UTC capture time. Generic PR preview and rollback do not perform this collection.
+Current active semantic proof remains unsupported: valid label facts and a
+closed custody schema do not make an active contract pass compatibility.
+No workflow permissions changed, hosted token read access is not qualified by
+synthetic tests, and these observations do not authorize production DDL/data.
+The complete pending fixture passed unsigned PR270 Compatibility
+[run 38145640684, attempt 1](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38145640684)
+at merge source `345571b51fdc7b6e6b45cb0a7fffe7ecd7b55865`. The verified artifacts
+bind the actual empty latest-release inventory to all three candidate pending
+files and the 4,452-object expand target. The full comparison classified as
+`data/dormant`; all measured compatibility flags passed and the active v0 catalog
+hash stayed `1c85a9ad0b9bb652ea21b51faa2ee887592dacb00c7f4b388de5ef5d6085a4e7`.
+The pending declarations remained unapplied. Signing was skipped as required
+for this non-main-base PR; it supplies no main-release authority or active
+DDL/data proof.
+
+Active semantic expansion and contract proof, hosted permission qualification,
+dedicated multi-span rollback
+proof and compatibility-outage bypass remain unfinished PR16 work. Visible API
 pagination cannot establish absence of entirely deleted runs, so it does not
 authorize an outage bypass. This partial implementation does not complete the
 canonical plan or enable active DDL/data. The PR8 qualification prerequisite and
 three distinct signed main runs are accepted; this new source/context contract
-still requires its own hosted qualification and protected release validation.
+still requires its own signed main qualification and protected release validation.
 See [the Release runbook](release.md) for the current operational boundary.
 
 ## Validation still required

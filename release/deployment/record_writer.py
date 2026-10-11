@@ -3,8 +3,10 @@
 The operational caller must create source/image/evidence inputs with concrete
 adapters and preserve authenticated same-workflow/run custody after deployment.
 These immutable models are only consistency projections. There is deliberately
-no cross-job serializer, arbitrary v2-field mapping, network access, or active
-ship caller here. Existing schema1 writing and its legacy-only route are intact.
+no arbitrary v2-field mapping or network access here. The separate closed
+handoff codec and ship caller preserve custody; these models alone grant none.
+Original drill/owner policy is replayed at preserved UTC times, never recollected.
+Existing schema1 writing and its legacy-only route are intact.
 
 New promotion qualification uses the preserved predeployment capture. It never
 reinterprets later main as the deployed candidate or fetches expired evidence.
@@ -20,6 +22,7 @@ import compat_evidence as evidence
 import compat_request as request
 import record_resolver as resolver
 import forward_gates
+import contract_authorization
 
 policy, records, common, transport = resolver.policy, resolver.records, resolver.common, resolver.transport
 
@@ -40,7 +43,7 @@ def _public(function):
             return function(*args, **kwargs)
         except WriterRefusal:
             raise
-        except (evidence.CompatRefusal, policy.PolicyRefusal, common.ReleaseError, forward_gates.DrillRefusal,
+        except (evidence.CompatRefusal, policy.PolicyRefusal, common.ReleaseError, forward_gates.DrillRefusal, contract_authorization.ContractRefusal,
                 ValueError, TypeError, AttributeError, KeyError, IndexError,
                 RecursionError, OverflowError):
             raise WriterRefusal("record-writer-invalid") from None
@@ -92,6 +95,7 @@ class PromotionHandoff:
     execution: WorkflowExecution
     facts: records.ManifestFacts
     drills: forward_gates.DrillGate | None = None
+    contract_observation: contract_authorization.ContractObservation | None = None
 
 
 def _execution(value):
@@ -168,14 +172,16 @@ def _resolved(value):
 
 
 @_public
-def prepare_promotion(resolution, collected, candidate_images, execution, *, staging, drills=None):
+def prepare_promotion(resolution, collected, candidate_images, execution, *, staging, drills=None,
+                      contract_observation=None):
     """Current production requires observed pending material and context3."""
     _need(type(resolution) is resolver.ForwardResolution
           and type(resolution.pending) is resolver.pending_source.PendingMaterial
           and type(drills) is forward_gates.DrillGate)
     qualified = request.qualify(resolution, collected)
     return _promotion_handoff(resolution, collected, candidate_images, execution,
-                              qualified, staging=staging, drills=drills)
+                              qualified, staging=staging, drills=drills,
+                              contract_observation=contract_observation)
 
 
 @_public
@@ -188,10 +194,19 @@ def _prepare_promotion_context2_custody(resolution, collected, candidate_images,
     _need(type(resolution) is resolver.ForwardResolution and resolution.pending is None)
     qualified = request._qualify_context2_custody(resolution, collected)
     return _promotion_handoff(resolution, collected, candidate_images, execution,
-                              qualified, staging=staging, drills=drills)
+                              qualified, staging=staging, drills=drills, contract_observation=None)
 
 
-def _promotion_handoff(resolution, collected, candidate_images, execution, qualified, *, staging, drills):
+def _contract_custody(resolution, collected, drills, observation):
+    """Pure original-time replay; no current label read or retry-time clock."""
+    receipt = forward_gates.validate_preserved_contract(resolution, observation)
+    if observation is not None:
+        _need(type(drills) is forward_gates.DrillGate
+              and collected.history.observed_at <= observation.observed_at <= drills.observed_at)
+    return receipt
+
+
+def _promotion_handoff(resolution, collected, candidate_images, execution, qualified, *, staging, drills, contract_observation):
     _execution(execution)
     _need(type(staging) is str and staging in ("passed", "bypassed"))
     if drills is None:
@@ -203,6 +218,7 @@ def _promotion_handoff(resolution, collected, candidate_images, execution, quali
     else:
         forward_gates.validate_preserved_drills(resolution, drills)
         _need(drills.observed_at >= collected.history.observed_at)
+    _contract_custody(resolution, collected, drills, contract_observation)
     candidate = resolution.candidate
     _candidate_images(candidate_images, candidate.sha)
     # The bridge binds the profile measurement and exact source-authority pins.
@@ -214,7 +230,7 @@ def _promotion_handoff(resolution, collected, candidate_images, execution, quali
           and qualified.catalog_sha256 == candidate.catalog.catalog_sha256)
     facts = records.ManifestFacts(2, resolution.classification.kind, resolution.classification.dormant,
         reversible, qualified.old_server, candidate.catalog, "ok", qualified.run_id, staging)
-    return PromotionHandoff(resolution, collected, candidate_images, execution, facts, drills)
+    return PromotionHandoff(resolution, collected, candidate_images, execution, facts, drills, contract_observation)
 
 
 def _serialize(kind, sha, images, previous, publication, facts, *, reconciled=False):
@@ -284,7 +300,8 @@ def build_promotion(handoff, publication, current_resolution):
     """
     _need(type(handoff) is PromotionHandoff)
     expected = prepare_promotion(handoff.resolution, handoff.collected, handoff.candidate_images,
-                                 handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
+                                 handoff.execution, staging=handoff.facts.staging, drills=handoff.drills,
+                                 contract_observation=handoff.contract_observation)
     _need(handoff == expected, "record-writer-handoff-changed")
     return _append_promotion(handoff, publication, current_resolution)
 
