@@ -42,6 +42,9 @@ negative cases that break the property and must make the checker fail:
     staging code (release/staging, the graph stub): the Dockerfiles under
     docker/ outside docker/staging/, the production/build/record jobs in
     ship.yml, e2e-tests.yml, and every Test job except staging-bootstrap.
+15. the required race suite includes every Go package, so the generated
+    migration, data-step and seed contracts are checked without regeneration;
+    their files must still match the checkout after the tests.
 
 The workflows are read with test_ship_workflow's YAML-subset reader plus the
 folded scalars the CI workflows use; when PyYAML happens to be importable the
@@ -103,6 +106,8 @@ PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
 DIGEST_IMAGE = re.compile(r"[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}")
 TENANT_TEST = "go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'"
 RACE_TEST = "-- -mod=readonly -race -p 1 -timeout 150m -skip '^TestTenantRLS_Catalog' -coverprofile=coverage.out \"${packages[@]}\""
+CONTRACT_DIFF = "git diff --exit-code -- go.mod go.sum internal/dbcatalog/registry internal/dbcatalog/golden/seeds.json"
+CONTRACT_UPDATE_VARS = ("REREPLY_UPDATE_MIGRATION_PATH", "REREPLY_UPDATE_REGISTRY", "REREPLY_UPDATE_SEEDS")
 ACTIONLINT_INSTALL = "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7"
 # Exactly the test discovery the release tests job runs. A new release test
 # directory is added here and to the job together.
@@ -328,6 +333,30 @@ def assert_concurrency_and_timeouts(sources: dict[str, str]) -> None:
     # The per-package cap stays below the job's ceiling (GitHub's 360 minutes).
     if race.get("timeout-minutes") != 360 or RACE_TEST not in run_lines(step_named(race, "Run tests")):
         raise AssertionError("go-race does not run with the 150-minute package timeout under a 360-minute job")
+
+
+def assert_generated_contracts(sources: dict[str, str]) -> None:
+    """Do not let a narrowed package list or regeneration fake closure proof."""
+    race = jobs(parse(sources)["test.yml"])["go-race"]
+    step = step_named(race, "Run tests")
+    if any(step.get("env", {}).get(name) != "0" for name in CONTRACT_UPDATE_VARS):
+        raise AssertionError("the race suite must disable source-contract regeneration")
+    expected = [
+        "set -euo pipefail",
+        'package_output="$(go list -mod=readonly ./...)"',
+        '[[ -n "$package_output" ]]',
+        'mapfile -t packages < <(printf \'%s\\n\' "$package_output")',
+        '[[ "${#packages[@]}" -gt 0 ]]',
+        "gotestsum \\",
+        "--format testname \\",
+        "--hide-summary=skipped \\",
+        RACE_TEST,
+        CONTRACT_DIFF,
+    ]
+    if run_lines(step) != expected:
+        raise AssertionError("the race suite must check every package and preserve generated contracts")
+    if any(name in step for name in ("if", "continue-on-error", "working-directory", "shell")):
+        raise AssertionError("the generated contract check must run unconditionally in its checkout")
 
 
 def assert_environments_and_secrets(sources: dict[str, str]) -> None:
@@ -896,6 +925,7 @@ CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
     ("unique-context-names", assert_context_names_unique),
     ("triggers-and-pins", assert_triggers_and_pins),
     ("concurrency-and-timeouts", assert_concurrency_and_timeouts),
+    ("generated-contracts", assert_generated_contracts),
     ("environments-and-secrets", assert_environments_and_secrets),
     ("workflow-lint", assert_workflow_lint),
     ("release-tests", assert_release_tests),
@@ -1072,6 +1102,22 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "test.yml", "-skip '^TestTenantRLS_Catalog'", "-skip '^TestTenantRLS_'")),
     "skip catalog tests in tenant-isolation": ("concurrency-and-timeouts", lambda: replaced(
         "test.yml", TENANT_TEST, TENANT_TEST + " -skip '^TestTenantRLS_Catalog'")),
+    # The classifier's migration-path allowance depends on generated closure
+    # tests actually running; the final go test flags alone cannot prove that.
+    "omit registry from race packages": ("generated-contracts", lambda: replaced(
+        "test.yml", "go list -mod=readonly ./...", "go list -mod=readonly ./cmd/...")),
+    "filter the race package list": ("generated-contracts", lambda: replaced(
+        "test.yml", '          gotestsum \\\n', '          packages=(./internal/database)\n          gotestsum \\\n')),
+    "regenerate migration closure during CI": ("generated-contracts", lambda: replaced(
+        "test.yml", 'REREPLY_UPDATE_MIGRATION_PATH: "0"', 'REREPLY_UPDATE_MIGRATION_PATH: "1"')),
+    "drop data-step regeneration guard": ("generated-contracts", lambda: replaced(
+        "test.yml", '          REREPLY_UPDATE_REGISTRY: "0"\n', "")),
+    "regenerate seed manifest during CI": ("generated-contracts", lambda: replaced(
+        "test.yml", 'REREPLY_UPDATE_SEEDS: "0"', 'REREPLY_UPDATE_SEEDS: "1"')),
+    "ignore generated contract rewrites": ("generated-contracts", lambda: replaced(
+        "test.yml", CONTRACT_DIFF, "git diff --exit-code -- go.mod go.sum")),
+    "tolerate generated contract rewrite": ("generated-contracts", lambda: replaced(
+        "test.yml", CONTRACT_DIFF, CONTRACT_DIFF + " || true")),
     # 5. Environments and secrets.
     "add an environment outside ship.yml": ("environments-and-secrets", lambda: replaced(
         "test.yml", "  lint:\n    name: lint\n", "  lint:\n    name: lint\n    environment: production\n")),
