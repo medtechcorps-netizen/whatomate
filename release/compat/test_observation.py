@@ -28,6 +28,7 @@ def log(message, *, fields="", caller="github.com/shridarpatil/whatomate/cmd/wha
 def startup():
     return (log("Starting ReReply server...", color=True)
             + log("PostgreSQL tenant RLS verified", fields="runtime_role=compat_runtime")
+            + log("Server listening", fields="address=0.0.0.0:8080")
             + log("Worker started", fields="worker_num=1")
             + log("Worker starting", caller="github.com/shridarpatil/whatomate/internal/worker/worker.go:103")
             + log("Embedded workers started", fields="count=1"))
@@ -227,6 +228,219 @@ class ObservationTests(unittest.TestCase):
         self.manager._protocol_failed = False
         observed = self.observer(); observed.boot(); observed.workers()
         with self.assertRaises(o.proof.EvidenceError): observed.workers()
+
+    def test_wait_startup_reads_only_until_all_markers_then_boot_once(self):
+        def progress(world):
+            world.raw = (b"" if world.log_calls == 1 else
+                         startup().split(b"\n", 1)[0] + b"\n" if world.log_calls == 2 else startup())
+        self.world.mutate_log = progress
+        observed = self.observer()
+        original = self.owner.capture
+        count = len(self.world.calls)
+        events = copy.deepcopy(self.manager._events)
+        result = observed.wait_startup(timeout=5)
+        self.assertEqual(result, {"execution": o._completed(), "startup_markers_observed": True,
+                                 "http_readiness_checked": False, "lines": 6})
+        self.assertEqual(self.clock.now, 12)
+        self.assertIs(self.owner.capture, original)
+        self.assertEqual(self.manager._events, events)
+        self.assertTrue(all(args[:2] in (["network", "inspect"], ["container", "inspect"],
+                                       ["logs", "--timestamps"]) for args, _ in self.world.calls[count:]))
+        self.assertFalse(observed._booted)
+        self.assertTrue(observed.boot()["ready"])
+        self.assertEqual(sum(args[:4] == ["container", "start", "--attach", "--interactive"]
+                             for args, _ in self.world.calls[count:]), 1)
+        with self.assertRaises(o.proof.EvidenceError): observed.boot()
+        self.manager.close(); self.owner.cleanup()
+
+    def test_wait_requires_exact_caller_role_listener_worker_contract(self):
+        variants = [startup().replace(b"runtime_role=compat_runtime", b"runtime_role=postgres"),
+                    startup().replace(b"address=0.0.0.0:8080", b"address=127.0.0.1:8080"),
+                    startup().replace(b"cmd/whatomate/main.go", b"internal/handlers/customer.go"),
+                    startup().replace(b"internal/worker/worker.go", b"internal/handlers/customer.go"),
+                    startup().replace(b"count=1", b"count=0"),
+                    startup().replace(b"worker_num=1", b"worker_num=2"),
+                    startup().replace(b"Server listening", b"almost listening"),
+                    startup() + log("Server listening", fields="address=0.0.0.0:8080")]
+        for raw in variants:
+            with self.subTest(raw_sha=o.hashlib.sha256(raw).hexdigest()):
+                self.world.raw = raw
+                observed = self.observer()
+                original = self.owner.capture
+                with self.assertRaises(o.proof.EvidenceError): observed.wait_startup(timeout=1)
+                self.assertIs(self.owner.capture, original)
+                self.assertTrue(observed.evidence()["failed"])
+                self.assertFalse(observed._startup_ready)
+                self.manager._protocol_failed = False
+        self.assertFalse(any(args[:4] == ["container", "start", "--attach", "--interactive"]
+                             for args, _ in self.world.calls))
+
+    def test_wait_empty_missing_frozen_and_reversed_clock_are_bounded(self):
+        self.world.raw = b""
+        observed = self.observer()
+        with self.assertRaisesRegex(o.proof.InfrastructureFailure, "startup-no-log"):
+            observed.wait_startup(timeout=2)
+        self.assertEqual(self.world.log_calls, 2)
+        self.manager._protocol_failed = False
+        self.world.raw = log("Starting ReReply server...")
+        observed = self.observer(sleep=lambda _seconds: None)
+        before = self.world.log_calls
+        with self.assertRaisesRegex(o.proof.EvidenceError, "startup-incomplete"):
+            observed.wait_startup(timeout=2)
+        self.assertEqual(self.world.log_calls - before, 3)
+        self.manager._protocol_failed = False
+        observed = self.observer(sleep=lambda _seconds: setattr(self.clock, "now", self.clock.now - 1))
+        with self.assertRaisesRegex(o.proof.EvidenceError, "clock-invalid"):
+            observed.wait_startup(timeout=2)
+
+    def test_wait_order_and_bounds_refuse_without_readiness(self):
+        for timeout, poll in [(0, 1), (91, 1), (True, 1), (float("nan"), 1),
+                              (float("inf"), 1), (1, 0), (1, True), (1, 2)]:
+            observed = self.observer()
+            before = len(self.world.calls)
+            with self.assertRaisesRegex(o.proof.EvidenceError, "startup-bounds"):
+                observed.wait_startup(timeout=timeout, poll_interval=poll)
+            self.assertEqual(len(self.world.calls), before)
+            self.manager._protocol_failed = False
+        observed = self.observer(); observed.wait_startup()
+        with self.assertRaisesRegex(o.proof.EvidenceError, "startup-order"): observed.wait_startup()
+        self.manager._protocol_failed = False
+        observed = self.observer(); observed.boot()
+        with self.assertRaisesRegex(o.proof.EvidenceError, "startup-order"): observed.wait_startup()
+
+    def test_read_deadline_caps_all_inspects_and_preserves_transport_options(self):
+        original = self.owner.capture
+        captured = []
+        def timed(argv, **options):
+            captured.append((self.clock.now, list(argv), copy.deepcopy(options)))
+            self.clock.now += 0.01
+            return original(argv, **options)
+        self.owner.capture = timed
+        observed = self.observer()
+        captured.clear()
+        start = self.clock.now
+        observed.wait_startup(timeout=2)
+        self.assertIs(self.owner.capture, timed)
+        self.assertTrue(captured)
+        for at, argv, options in captured:
+            self.assertLessEqual(options["timeout"], start + 2 - at + 1e-9)
+            self.assertEqual(options["stdout_limit"], o.processes.runtime.MIB)
+            self.assertEqual(options["stderr_limit"], o.processes.runtime.MIB)
+            self.assertEqual(options["env"], self.owner.env)
+            self.assertIsNone(options.get("input_bytes"))
+            self.assertEqual(argv[:5], [self.owner.binary, "--config", str(self.owner.config), "--context", "default"])
+
+    def test_late_read_or_capture_failure_restores_original_and_allows_cleanup(self):
+        for kind in ("late", "exception"):
+            self.manager._protocol_failed = False
+            observed = self.observer()
+            original = self.owner.capture
+            def broken(argv, **options):
+                if kind == "exception":
+                    raise o.proof.InfrastructureFailure("timeout")
+                result = original(argv, **options)
+                self.clock.now += 3
+                return result
+            self.owner.capture = broken
+            with self.assertRaises(o.proof.InfrastructureFailure): observed.wait_startup(timeout=2)
+            self.assertIs(self.owner.capture, broken)
+            self.assertFalse(observed._startup_ready)
+            self.owner.capture = original
+        self.manager.close(); self.owner.cleanup()
+
+    def test_read_window_rejects_mutation_and_concurrent_transport_replacement(self):
+        observed = self.observer()
+        original = self.owner.capture
+        before = len(self.world.calls)
+        with self.assertRaisesRegex(o.proof.EvidenceError, "read-command-invalid"):
+            with observed._readonly_budget(2):
+                self.owner.capture([self.owner.binary, "--config", str(self.owner.config), "--context", "default",
+                                    "container", "stop", self.handle.container_id], timeout=1)
+        self.assertEqual(len(self.world.calls), before)
+        self.assertIs(self.owner.capture, original)
+        replacement = lambda *_args, **_options: None
+        self.world.raw = log("Starting ReReply server...")
+        observed = self.observer(sleep=lambda _seconds: setattr(self.owner, "capture", replacement))
+        with self.assertRaisesRegex(o.proof.EvidenceError, "capture-replaced"): observed.wait_startup(timeout=2)
+        self.assertIs(self.owner.capture, replacement)  # Never silently overwrite another transport.
+        self.assertTrue(observed.evidence()["failed"])
+        self.owner.capture = original
+        self.manager.close(); self.owner.cleanup()
+
+    def test_read_window_rejects_changed_operation_or_id_set(self):
+        for change in (lambda: self.manager._events.append({"operation": "foreign"}),
+                       lambda: self.owner._process_ids.update(foreign="a" * 64)):
+            observed = self.observer(sleep=lambda _seconds: change())
+            self.world.raw = log("Starting ReReply server...")
+            with self.assertRaises(o.proof.EvidenceError): observed.wait_startup(timeout=2)
+            self.manager._protocol_failed = False
+            self.owner._process_ids.pop("foreign", None)
+
+    def test_finish_whole_period_after_api_work_is_read_only_and_not_worker_verdict(self):
+        observed = self.observer(); observed.wait_startup(); observed.boot()
+        self.world.raw += log("synthetic API completed")
+        before = len(self.world.calls)
+        result = observed.finish_period()
+        self.assertEqual(result, {"execution": o._completed(), "alive": True, "whole_logs_observed": True,
+            "panic_count": 0, "unknown_type_count": 0, "fatal_count": 0, "stopped_or_error_count": 0})
+        self.assertTrue(all(args[:2] in (["network", "inspect"], ["container", "inspect"],
+                                       ["logs", "--timestamps"]) for args, _ in self.world.calls[before:]))
+        self.assertFalse(observed._workers_done)
+        self.assertIsNone(observed.evidence()["journal"])
+        self.assertEqual(observed.evidence()["period"]["lines"], 7)
+        self.assertNotIn(self.fixture.password, json.dumps(observed.evidence()))
+        self.manager.close(); self.owner.cleanup()
+
+    def test_finish_retains_late_failure_counts_and_never_emits_success(self):
+        for text, level, key in [("Panic recovered", "error", "panic_count"),
+                                 ("unknown job type", "error", "unknown_type_count"),
+                                 ("synthetic failure", "fatal", "fatal_count"),
+                                 ("Worker error", "error", "stopped_or_error_count")]:
+            self.world.raw = startup()
+            observed = self.observer(); observed.wait_startup(); observed.boot()
+            self.world.raw += log(text, level=level)
+            with self.assertRaisesRegex(o.proof.EvidenceError, "period-failed"): observed.finish_period()
+            self.assertEqual(observed.evidence()["period"][key], 1)
+            self.assertTrue(observed.evidence()["failed"])
+            self.manager._protocol_failed = False
+        self.manager.close(); self.owner.cleanup()
+
+    def test_finish_requires_order_alive_complete_stream_and_single_use(self):
+        observed = self.observer()
+        with self.assertRaisesRegex(o.proof.EvidenceError, "period-order"): observed.finish_period()
+        self.manager._protocol_failed = False
+        observed = self.observer(); observed.wait_startup()
+        with self.assertRaisesRegex(o.proof.EvidenceError, "period-order"): observed.finish_period()
+        self.manager._protocol_failed = False
+        observed = self.observer(); observed.wait_startup(); observed.boot(); observed.finish_period()
+        with self.assertRaisesRegex(o.proof.EvidenceError, "period-order"): observed.finish_period()
+        self.manager._protocol_failed = False
+        for mutation in (lambda: setattr(self.world, "raw", self.world.raw.split(b"\n", 1)[1]),
+                         lambda: self.world.containers[self.handle.container_id]["State"].update(Running=False)):
+            self.world.raw = startup()
+            observed = self.observer(); observed.wait_startup(); observed.boot()
+            mutation()
+            with self.assertRaises(o.proof.EvidenceError): observed.finish_period()
+            self.assertTrue(observed.evidence()["failed"])
+            self.manager._protocol_failed = False
+            self.world.containers[self.handle.container_id]["State"]["Running"] = True
+
+    def test_finish_bounds_and_io_deadline_restore_without_favorable_default(self):
+        observed = self.observer(); observed.wait_startup(); observed.boot()
+        with self.assertRaisesRegex(o.proof.EvidenceError, "period-bounds"): observed.finish_period(timeout=31)
+        self.manager._protocol_failed = False
+        observed = self.observer(); observed.wait_startup(); observed.boot()
+        original = self.owner.capture
+        def late(argv, **options):
+            result = original(argv, **options)
+            self.clock.now += 2
+            return result
+        self.owner.capture = late
+        with self.assertRaises(o.proof.InfrastructureFailure): observed.finish_period(timeout=1)
+        self.assertIs(self.owner.capture, late)
+        self.assertIsNone(observed.evidence()["period"])
+        self.owner.capture = original
+        self.manager.close(); self.owner.cleanup()
 
 
 if __name__ == "__main__": unittest.main()

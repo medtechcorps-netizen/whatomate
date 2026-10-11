@@ -16,8 +16,10 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime
+from contextlib import contextmanager
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -130,6 +132,8 @@ class OwnedObservation:
         self.manager, self.handle, self.fixture = manager, handle, fixture
         self._clock, self._sleep = clock, sleep
         self._failed, self._booted, self._workers_done = False, False, False
+        self._startup_attempted, self._startup_ready, self._period_attempted = False, False, False
+        self._startup_summary, self._period_summary = None, None
         self._streams = (b"", b"")
         self._journal_rows = []
         self._journal_counts = None
@@ -179,6 +183,148 @@ class OwnedObservation:
         if isinstance(error, (proof.EvidenceError, proof.InfrastructureFailure, controller.sweep.SemanticFailure)):
             raise error
         raise proof.InfrastructureFailure("observation-operation") from None
+
+    @contextmanager
+    def _readonly_budget(self, timeout):
+        """Cap all inherited inspect/log I/O, restoring transport even on failure.
+
+        The single manager is exclusively owned for this synchronous read
+        window. No controller, process mutation, new ID or changed capture is
+        admitted. Killing/reaping a timed-out CLI retains runtime's small
+        bounded teardown overhead; timeout is not a hard scheduler guarantee.
+        """
+        owner = self.manager.owner
+        original = owner.capture
+        manager_events, owner_events = len(self.manager._events), len(owner._events)
+        ids = frozenset((*owner._ids.values(), *self.manager._ids.values()))
+        process_ids = dict(owner._process_ids)
+        network = owner._network
+        previous = self._clock()
+        need(type(previous) in (int, float) and math.isfinite(previous) and previous >= 0,
+             "observation-clock-invalid")
+        deadline = previous + timeout
+
+        def remaining():
+            nonlocal previous
+            now = self._clock()
+            need(type(now) in (int, float) and math.isfinite(now) and now >= previous,
+                 "observation-clock-invalid")
+            previous = now
+            need(len(self.manager._events) == manager_events and len(owner._events) == owner_events
+                 and frozenset((*owner._ids.values(), *self.manager._ids.values())) == ids
+                 and owner._process_ids == process_ids and owner._process_manager is self.manager
+                 and owner._network == network and owner.capture is bounded, "observation-concurrent-action")
+            return deadline - now
+
+        def bounded(argv, **options):
+            need(argv[:5] == [owner.binary, "--config", str(owner.config), "--context", "default"],
+                 "observation-read-command-invalid")
+            args = argv[5:]
+            need(args == ["network", "inspect", network]
+                 or (len(args) == 3 and args[:2] == ["container", "inspect"] and args[2] in ids)
+                 or args == ["logs", "--timestamps", self.handle.container_id],
+                 "observation-read-command-invalid")
+            budget = remaining()
+            if budget <= 0:
+                raise proof.InfrastructureFailure("observation-read-timeout")
+            options["timeout"] = min(options["timeout"], budget)
+            value = original(argv, **options)
+            if remaining() <= 0:
+                raise proof.InfrastructureFailure("observation-read-timeout")
+            return value
+
+        owner.capture = bounded
+        try:
+            yield remaining
+        finally:
+            # Never overwrite a concurrently installed transport.
+            need(owner.capture is bounded, "observation-capture-replaced")
+            owner.capture = original
+
+    @staticmethod
+    def _period_counts(logs):
+        records = logs["records"]
+        return {"lines": logs["lines"], "panic_count": logs["panic_count"],
+                "unknown_type_count": logs["unknown_type_count"],
+                "fatal_count": sum(r["level"] == "fatal" for r in records),
+                "stopped_or_error_count": sum(r.get("message") in
+                    {"Worker error", "Worker stopped", "Channel outbox worker error", "Channel AI reply worker error",
+                     "Threads credential refresh worker error", "Shutting down...", "Embedded workers disabled, run workers separately"}
+                    for r in records),
+                "markers": {
+                    "start": _marker(records, "Starting ReReply server..."),
+                    "rls": _marker(records, "PostgreSQL tenant RLS verified", runtime_role="compat_runtime"),
+                    "listening": _marker(records, "Server listening", address="0.0.0.0:8080"),
+                    "embedded_workers": _marker(records, "Embedded workers started", count="1"),
+                    "worker": _marker(records, "Worker started", worker_num="1"),
+                    "worker_starting": sum(r.get("level") == "info" and r.get("message") == "Worker starting"
+                        and r.get("app") == "rereply" and _WORKER.search(r.get("caller", "")) is not None for r in records)}}
+
+    @staticmethod
+    def _healthy_counts(value):
+        need(not any(value[k] for k in ("panic_count", "unknown_type_count", "fatal_count", "stopped_or_error_count")),
+             "observation-period-failed")
+        need(all(n <= 1 for n in value["markers"].values()), "observation-startup-ambiguous")
+
+    def wait_startup(self, timeout=90, poll_interval=1):
+        """Only bounded log/aliveness reads; success never means HTTP readiness.
+
+        Server listening is emitted before ListenAndServe, so boot() must
+        still perform its one separate readiness request. Unknown/missing
+        source markers never fall back to invented FORCE-RLS evidence.
+        """
+        try:
+            need(not self._startup_attempted and not self._booted and not self._period_attempted,
+                 "observation-startup-order")
+            self._startup_attempted = True
+            need(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 90
+                 and type(poll_interval) in (int, float) and poll_interval == 1, "observation-startup-bounds")
+            with self._readonly_budget(timeout) as remaining:
+                for _ in range(math.ceil(timeout) + 1):
+                    if remaining() <= 0:
+                        break
+                    logs = self._logs()
+                    self._startup_summary = self._period_counts(logs)
+                    self._healthy_counts(self._startup_summary)
+                    if all(n == 1 for n in self._startup_summary["markers"].values()):
+                        self._startup_ready = True
+                        return {"execution": _completed(), "startup_markers_observed": True,
+                                "http_readiness_checked": False, "lines": logs["lines"]}
+                    budget = remaining()
+                    if budget <= 0:
+                        break
+                    self._sleep(min(poll_interval, budget))
+            if self._startup_summary is None or not self._startup_summary["lines"]:
+                raise proof.InfrastructureFailure("observation-startup-no-log")
+            raise proof.EvidenceError("observation-startup-incomplete")
+        except Exception as error:
+            self._fail(error)
+
+    def finish_period(self, timeout=30):
+        """Final whole-log/aliveness capture before stop, not a worker verdict.
+
+        API actions may have happened since boot; every original log byte
+        must still be present. Failures retain observed counts in evidence()
+        and poison dependent work while exact owned cleanup remains possible.
+        """
+        try:
+            need(self._startup_ready and self._booted and not self._period_attempted
+                 and self.handle.version == "previous", "observation-period-order")
+            self._period_attempted = True
+            need(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 30,
+                 "observation-period-bounds")
+            with self._readonly_budget(timeout):
+                logs = self._logs()
+                self._period_summary = self._period_counts(logs)
+                self._healthy_counts(self._period_summary)
+                need(all(n == 1 for n in self._period_summary["markers"].values()), "observation-startup-incomplete")
+            return {"execution": _completed(), "alive": True, "whole_logs_observed": True,
+                    "panic_count": self._period_summary["panic_count"],
+                    "unknown_type_count": self._period_summary["unknown_type_count"],
+                    "fatal_count": self._period_summary["fatal_count"],
+                    "stopped_or_error_count": self._period_summary["stopped_or_error_count"]}
+        except Exception as error:
+            self._fail(error)
 
     def boot(self):
         """One readiness check after startup; no guessed polling/retry policy."""
@@ -260,5 +406,6 @@ class OwnedObservation:
         """Sanitized collection metadata, not public compatibility result flags."""
         return {"stream_sha256": [hashlib.sha256(raw).hexdigest() for raw in self._streams],
                 "stream_bytes": [len(raw) for raw in self._streams], "journal": self._journal_counts,
+                "startup_wait": self._startup_summary, "period": self._period_summary,
                 "failed": self._failed, "force_rls_control_implemented": False,
                 "full_compatibility_proof": False}
