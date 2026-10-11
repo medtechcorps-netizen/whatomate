@@ -233,6 +233,71 @@ def _client(work, env):
     return client
 
 
+# Only fixed reviewed error identifiers may leave the experiment. Unknown
+# exceptions retain the generic refusal; never format exception text, paths,
+# subprocess streams, credentials, or SQL into public diagnostics.
+_PUBLIC_FAILURE_CODES = frozenset({
+    "admission-already-attempted", "admission-blob-changed", "admission-blob-frame",
+    "admission-build-capture", "admission-build-config-changed", "admission-build-containment",
+    "admission-build-descendants", "admission-build-environment-changed", "admission-build-failed",
+    "admission-build-handle-inherited", "admission-build-job-close", "admission-build-job-exists",
+    "admission-build-job-inventory", "admission-build-job-query", "admission-build-job-terminate",
+    "admission-build-output-bound", "admission-build-pipe", "admission-build-process-handle",
+    "admission-build-process-membership", "admission-build-process-wait", "admission-build-reserve",
+    "admission-build-search-path", "admission-build-start", "admission-build-teardown-unresolved",
+    "admission-build-unknown", "admission-builder-already-exists", "admission-builder-bootstrap",
+    "admission-builder-capture", "admission-builder-changed", "admission-builder-cleanup-deadline",
+    "admission-builder-cleanup-unresolved", "admission-builder-command", "admission-builder-container",
+    "admission-builder-container-changed", "admission-builder-created", "admission-builder-id",
+    "admission-builder-image", "admission-builder-location", "admission-builder-metadata",
+    "admission-builder-mode", "admission-builder-mount", "admission-builder-mutation-unbound",
+    "admission-builder-node", "admission-builder-ownership-unresolved", "admission-builder-removal-unproven",
+    "admission-builder-restarted", "admission-builder-state", "admission-builder-unbound",
+    "admission-builder-unproven", "admission-builder-volume", "admission-builder-volume-changed",
+    "admission-built-image-changed", "admission-clock-invalid", "admission-context-changed",
+    "admission-context-exists", "admission-controller-inputs", "admission-credential-helper-available",
+    "admission-deadline", "admission-docker-capture", "admission-docker-location", "admission-docker-prefix",
+    "admission-engine-changed", "admission-engine-invalid", "admission-engine-unavailable",
+    "admission-experiment-reserve", "admission-file-bound", "admission-file-invalid",
+    "admission-git-override", "admission-graph-inputs", "admission-head-changed",
+    "admission-ignore-override", "admission-ignore-unsupported", "admission-iid-invalid",
+    "admission-iid-unbound", "admission-image-unavailable", "admission-incomplete",
+    "admission-infrastructure-image-changed", "admission-path-invalid", "admission-platform-unsupported",
+    "admission-previous-invalid", "admission-recipe-unsupported", "admission-release-client-invalid",
+    "admission-role-image-invalid", "admission-role-label-invalid", "admission-source-changed",
+    "admission-source-dirty", "admission-source-mode", "admission-source-read", "admission-system-directory",
+    "admission-transport-in-use", "admission-transport-replaced", "admission-tree-invalid",
+    "catalog-base-overlay-unsupported", "catalog-baseline-already-attempted", "catalog-baseline-mismatch",
+    "catalog-baseline-missing", "catalog-cli-capture-failed", "catalog-cli-configuration-unavailable",
+    "catalog-cli-failed", "catalog-cli-invalid-arguments", "catalog-cli-output-failed",
+    "catalog-contract-invalid", "catalog-fallback-not-equal", "catalog-image-source-mismatch",
+    "catalog-json-invalid", "catalog-output-invalid", "catalog-ownership-invalid",
+    "catalog-pg-binding-invalid", "catalog-phase-active", "catalog-progression-unsupported",
+    "catalog-quiescence-diagnostics", "catalog-source", "catalog-source-invalid",
+    "catalog-table-inventory-mismatch", "catalog-unknown-unsupported", "experiment-already-attempted",
+    "experiment-budget-in-use", "experiment-builder-location-invalid",
+    "experiment-classification-unsupported", "experiment-cleanup", "experiment-cleanup-transport-unowned",
+    "experiment-clock-invalid", "experiment-concurrent-transport", "experiment-deadline",
+    "experiment-exit-invalid", "experiment-fixture-binding", "experiment-image-binding",
+    "experiment-image-work-required", "experiment-input-invalid", "experiment-journal-unsealed",
+    "experiment-observer-bridge-invalid", "experiment-old-period-incomplete", "experiment-operation",
+    "experiment-overall-invalid", "experiment-pg-not-ready", "experiment-previous-expectation-invalid",
+    "experiment-previous-expectation-mismatch", "experiment-previous-seed-failed",
+    "experiment-process-still-present", "experiment-readiness-invalid",
+    "experiment-source-build-admission-unreviewed", "experiment-source-build-unproven",
+    "experiment-status-settle-incomplete", "experiment-terminal-source", "experiment-transport-invalid",
+    "runtime-input-invalid",
+})
+
+
+def _failure_message(error):
+    if isinstance(error, proof.EvidenceError) and len(error.args) == 1:
+        code = error.args[0]
+        if type(code) is str and code in _PUBLIC_FAILURE_CODES:
+            return "compatibility-entrypoint-refused: " + code
+    return "compatibility-entrypoint-refused"
+
+
 def main(argv=None):
     try:
         args = sys.argv[1:] if argv is None else argv
@@ -267,9 +332,8 @@ def main(argv=None):
             config_dir=work / "docker-config", image_work_dir=work / "images", buildx_binary=plugin)
         _write_public(work / "public" / "compat-result.json", result)
         return 0
-    except (proof.EvidenceError, common.ReleaseError, OSError, ValueError, TypeError, KeyError):
-        # No exception strings, paths, headers, tokens, SQL or subprocess bytes.
-        print("compatibility-entrypoint-refused", file=sys.stderr)
+    except (proof.EvidenceError, common.ReleaseError, OSError, ValueError, TypeError, KeyError) as error:
+        print(_failure_message(error), file=sys.stderr)
         return 1
 
 

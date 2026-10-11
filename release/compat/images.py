@@ -340,8 +340,10 @@ def _build_command(plugin,context,work,candidate,role,builder):
 def _build_environment(config, work):
     # Docker's empty config still auto-discovers credential helpers. Bind both
     # Windows search locations, not merely the config, and never inherit PATH.
+    # Linux uses only the owned work directory; Docker/Buildx argv are absolute,
+    # so host-installed helpers are unnecessary and must not be discoverable.
     if _host_linux():
-        search=[Path('/usr/bin'),Path('/bin')]
+        search=[work]
     else:
         import ctypes
         from ctypes import wintypes

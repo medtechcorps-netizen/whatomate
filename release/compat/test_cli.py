@@ -305,6 +305,37 @@ class FileAndEntryTests(unittest.TestCase):
             write.assert_not_called()
             self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n")
 
+    def test_safe_diagnostic_never_publishes_a_result_or_formats_private_errors(self):
+        class PrivateError(cli.proof.InfrastructureFailure):
+            def __str__(self):
+                raise AssertionError("private exception text must not be formatted")
+        cases = [
+            (cli.proof.EvidenceError("admission-credential-helper-available"),
+             "compatibility-entrypoint-refused: admission-credential-helper-available\n"),
+            (cli.proof.InfrastructureFailure("admission-builder-ownership-unresolved"),
+             "compatibility-entrypoint-refused: admission-builder-ownership-unresolved\n"),
+            (PrivateError("admission-private-secret"), "compatibility-entrypoint-refused\n"),
+            (PrivateError("admission-build-failed", "private-token"), "compatibility-entrypoint-refused\n"),
+            (ValueError("admission-build-failed"), "compatibility-entrypoint-refused\n"),
+        ]
+        env = environment(); ctx = cli.context(env)
+        for error, expected in cases:
+            with self.subTest(kind=type(error).__name__), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve(); env["RUNNER_TEMP"] = str(root)
+                for name in ("docker", "buildx"):
+                    (root / name).touch()
+                    env["COMPAT_" + ("DOCKER" if name == "docker" else "BUILDX") + "_BIN"] = str(root / name)
+                with mock.patch.dict(cli.os.environ, env, clear=True), \
+                     mock.patch.object(cli, "_read_public", return_value=cli.canonical(snapshot(ctx))), \
+                     mock.patch.object(cli, "_scratch", return_value=root), mock.patch.object(cli, "_client"), \
+                     mock.patch.object(cli, "execute", side_effect=error), \
+                     mock.patch.object(cli, "_write_public") as write, \
+                     mock.patch.object(cli, "_mark_complete") as mark, \
+                     contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(cli.main(["run"]), 1)
+                write.assert_not_called(); mark.assert_not_called()
+                self.assertEqual(stderr.getvalue(), expected)
+
     def test_partial_public_write_never_marks_complete(self):
         env = environment(); env.update(COMPAT_PREVIEW_OUTCOME="success", COMPAT_RUN_OUTCOME="success")
         ctx = cli.context(env); raw = cli.proof.result_bytes(result(ctx))
