@@ -189,16 +189,35 @@ def _wait_pg(owner, budget, sleep):
 
 class _Engine:
     def __init__(self, repo, previous, candidate_sha, run_id, run_attempt, classification, contract,
-                 images, docker_binary, config_dir, *, clock=time.monotonic, sleep=time.sleep, overall=None):
+                 images, docker_binary, config_dir, *, clock=time.monotonic, sleep=time.sleep, overall=None,
+                 resolution=None):
         need(type(images) is _Images and images.seal is _IMAGE_SEAL,
              "experiment-source-build-unproven")
         need(all(type(value) is processes.ImageBinding for value in
                  (images.previous, images.candidate, images.controller))
              and type(images.graph) is stack.GraphImage and type(images.fixture) is fixture.ExportImage,
              "experiment-source-build-unproven")
-        need(images.previous.source_sha == previous.sha and images.previous.reference == contract.previous_web
+        if resolution is None:
+            previous_source, previous_digest = previous.sha, previous.images["web"]
+        else:
+            need(type(resolution) is catalog.record_resolver.ForwardResolution
+                 and type(resolution.resolved) is catalog.record_resolver.ResolvedChain
+                 and type(previous) is catalog.record_resolver.ReleaseSelection
+                 and previous is resolution.resolved.selected
+                 and previous == resolution.resolved.latest
+                 and candidate_sha == resolution.candidate.sha
+                 and classification is resolution.classification,
+                 "experiment-resolution-binding")
+            previous_source, previous_digest = previous.actual_web_source_sha, dict(previous.images)["web"]
+            need(type(contract) is catalog.CatalogContract
+                 and contract.previous_sha == previous_source
+                 and contract.candidate_sha == candidate_sha
+                 and contract.database_base_source == resolution.database_base_source,
+                 "experiment-resolution-binding")
+        need(images.previous.source_sha == previous_source and images.previous.reference == contract.previous_web
              and images.candidate.source_sha == candidate_sha, "experiment-image-binding")
         self.previous, self.sha, self.run_id, self.attempt = previous, candidate_sha, run_id, run_attempt
+        self.previous_source_sha, self.previous_web_digest = previous_source, previous_digest
         self.classification, self.contract, self.images = classification, contract, images
         self.clock, self.sleep = clock, sleep
         self.owner = stack.OwnedStack(docker_binary, config_dir, images.graph.source_sha, images.graph)
@@ -259,9 +278,9 @@ class _Engine:
         terminal = self.budget.observer_call(observer.wait_old_boot)
         if terminal is None:
             return handle, observer, observer.boot(), False
-        proof._terminal_old_boot(terminal, {"sha": self.sha, "previous_web_digest": self.previous.images["web"],
+        proof._terminal_old_boot(terminal, {"sha": self.sha, "previous_web_digest": self.previous_web_digest,
                                            "run_id": self.run_id, "run_attempt": self.attempt})
-        need(terminal["binding"]["previous_source_sha"] == self.previous.sha, "experiment-terminal-source")
+        need(terminal["binding"]["previous_source_sha"] == self.previous_source_sha, "experiment-terminal-source")
         return handle, observer, terminal, True
 
     def _migration(self, application, *, original_columns):
@@ -357,7 +376,7 @@ class _Engine:
         need(sealed.sealed and sealed.pending == 1, "experiment-journal-unsealed")
         final = self.catalog.observe(self.inputs)
         private = {"identity": {"sha": self.sha, "previous_release": self.previous.release,
-                    "previous_web_digest": self.previous.images["web"], "run_id": self.run_id, "run_attempt": self.attempt},
+                    "previous_web_digest": self.previous_web_digest, "run_id": self.run_id, "run_attempt": self.attempt},
             "classification": {"kind": self.classification.kind, "dormant": self.classification.dormant},
             "previous_boot": previous_boot, "expected_catalog_sha256": self.contract.target_sha256,
             "expected_preexisting_tables": list(self.contract.expected_preexisting_tables), "before_tables": before.public(),
@@ -426,6 +445,54 @@ class _Engine:
         if self.overall is not None:
             self.overall.remaining()
         return raw
+
+
+def _run_resolved_experiment(repo: Path, resolution: catalog.record_resolver.ForwardResolution,
+                             run_id: int, run_attempt: int, *, deadline,
+                             docker_binary: str, config_dir: Path, image_work_dir: Path,
+                             buildx_binary: Path | None = None):
+    """Preparatory normal route; no CLI or public caller activates it yet.
+
+    The operational caller must create the one deadline BEFORE its ReleaseGh
+    constructor, obtain this resolution internally from the concrete resolver,
+    and compare its complete fresh snapshot with preview. A projection's type
+    is not authentication authority. This method neither resolves again nor
+    reclassifies selected image source as the retained database origin.
+    """
+    need(type(deadline) is image_admission._Deadline, "experiment-overall-invalid")
+    deadline.remaining()
+    need(isinstance(repo, Path) and repo.is_dir() and isinstance(config_dir, Path))
+    need(type(resolution) is catalog.record_resolver.ForwardResolution
+         and type(resolution.resolved) is catalog.record_resolver.ResolvedChain
+         and type(resolution.resolved.selected) is catalog.record_resolver.ReleaseSelection
+         and resolution.resolved.selected == resolution.resolved.latest,
+         "experiment-resolution-normal-only")
+    need(type(resolution.candidate) is catalog.record_resolver.policy.SourceFacts)
+    candidate_sha = resolution.candidate.sha
+    need(type(candidate_sha) is str and _SHA.fullmatch(candidate_sha) is not None)
+    proof.artifact_name(candidate_sha, run_attempt)
+    need(type(run_id) is int and 1 <= run_id < 10**16)
+    need(image_admission._READY_FOR_EXECUTION, "experiment-source-build-admission-unreviewed")
+    need(isinstance(image_work_dir, Path), "experiment-image-work-required")
+    need(buildx_binary is None or isinstance(buildx_binary, Path), "experiment-builder-location-invalid")
+    classification = resolution.classification
+    need(type(classification) is schema_change.PolicyClassification
+         and type(classification.dormant) is bool and type(classification.reasons) is tuple
+         and not classification.reasons
+         and ((classification.kind == "none" and not classification.dormant)
+              or (classification.kind == "data" and classification.dormant)),
+         "experiment-classification-unsupported")
+    contract = catalog.CatalogContract.from_resolution(resolution)
+    deadline.remaining()
+    value = image_admission._admit_resolved(repo, resolution, docker_binary, config_dir, image_work_dir, deadline,
+                                            buildx_binary=buildx_binary)
+    need(type(value) is image_admission._Admitted and value.seal is image_admission._SEAL,
+         "experiment-source-build-unproven")
+    admitted = _Images(_IMAGE_SEAL, value.previous, value.candidate, value.controller, value.graph, value.fixture)
+    deadline.remaining()
+    return _Engine(repo, resolution.resolved.selected, candidate_sha, run_id, run_attempt, classification, contract,
+                   admitted, docker_binary, config_dir, clock=deadline.clock, overall=deadline,
+                   resolution=resolution).run()
 
 
 def run_experiment(repo: Path, candidate_sha: str, run_id: int, run_attempt: int,

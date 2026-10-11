@@ -19,6 +19,7 @@ import test_controller as tc
 import test_observation as to
 import test_proof as tp
 import test_stack as ts
+import test_record_resolver as tr
 
 _WORLD = None
 BASE = c.catalog._BASE
@@ -675,6 +676,206 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,
                                              image_work_dir=self.p,expected_previous_sha=PREVIOUS.sha),b'mock-result')
         self.assertIs(seen['capture'].__self__,deadline)
+
+
+class ResolvedExperimentTests(unittest.TestCase):
+    """Real resolved source/catalog and evaluator, fake build/phase transports."""
+    @classmethod
+    def setUpClass(cls):
+        tr.ForwardResolverTests.setUpClass()
+
+    def setUp(self):
+        EngineTests.setUp(self)
+        self.started = self.w.clock.now
+        self.deadline = c.image_admission._Deadline(clock=self.w.clock)
+        case = tr.ForwardResolverTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        self.case = case
+        old = case.add(version=1, sha='1' * 40, images=case.boot['images'])
+        case.world.files[(case.boot['sha'], case.RECIPE)] = b'FROM scratch\n# selected image source\n'
+        origin = case.add(sha='2' * 40)
+        case.profile(origin['sha'])
+        case.add(kind='rollback', target=old)
+        candidate = case.candidate(SHA)
+        config, work = case.root / 'config', case.root / 'work'
+        config.mkdir(); work.mkdir()
+        # The caller owns this clock before the actual client version check.
+        def elapsed(args):
+            if args == [str(case.gh), '--version']:
+                self.w.clock.sleep(40)
+        case.world.before = elapsed
+        budget = tr.rt.OperationBudget(self.deadline.end, capture=case.world, clock=self.deadline.clock)
+        case.client = tr.rt.ReleaseGh(case.gh, tr.support.GH_TOKEN, config, work, budget=budget, base_env={})
+        self.resolution = tr.resolver.resolve_forward(case.client, case.repo, case.git, candidate)
+        self.contract = c.catalog.CatalogContract.from_resolution(self.resolution)
+        selected = self.resolution.resolved.selected
+        digest = dict(selected.images)['web']
+        self.w.terminal_previous_source = selected.actual_web_source_sha
+        admitted = images()
+        self.admitted = replace(admitted, previous=replace(admitted.previous,
+            source_sha=selected.actual_web_source_sha,
+            reference=c.runtime.common.IMAGE_REPOSITORY['web'] + '@' + digest))
+        self.admission = c.image_admission._Admitted(c.image_admission._SEAL, self.admitted.previous,
+            self.admitted.candidate, self.admitted.controller, self.admitted.graph, self.admitted.fixture, {})
+        contract = self.contract
+        class Catalog(FakeCatalog):
+            @staticmethod
+            def observation(value=None):
+                return c.catalog.CatalogObservation(contract.target_sha256 if value is None or value == tp.CATALOG else value,
+                                                    'a' * 64, 123)
+            @staticmethod
+            def tables(value):
+                return c.postgres.TableCapture(object(), {}, dict.fromkeys(contract.expected_preexisting_tables, value), True)
+        class Fixture(FakeFixture):
+            def run(inner, inputs, **kwargs):
+                return replace(super().run(inputs, **kwargs), catalog_sha256=contract.target_sha256)
+        class Observation(FakeObservation):
+            @classmethod
+            def for_old_boot(cls, manager, handle, fixture, *, run_id, run_attempt, **kwargs):
+                value = cls(manager, handle, fixture, **kwargs)
+                value.identity = {'sha': SHA, 'previous_web_digest': digest,
+                                  'run_id': run_id, 'run_attempt': run_attempt}
+                return value
+        for module, name, value in [(c.catalog, 'OwnedCatalog', Catalog), (c.fixture, 'OwnedFixture', Fixture),
+                                     (c.observation, 'OwnedObservation', Observation)]:
+            active = patch.object(module, name, value); active.start(); self.addCleanup(active.stop)
+
+    def run_resolved(self, resolution=None, *, deadline=None, admitted=None):
+        resolution = self.resolution if resolution is None else resolution
+        original_end = self.deadline.end
+        trace = len(self.case.world.trace)
+        def build(repo, actual, binary, config, work, actual_deadline, *, buildx_binary):
+            self.assertIs(actual, resolution)
+            self.assertIs(actual_deadline, self.deadline)
+            self.assertEqual(actual_deadline.end, original_end)
+            self.w.event('admission.resolved')
+            return self.admission if admitted is None else admitted
+        with patch.object(c.image_admission, '_admit_resolved', side_effect=build), \
+             patch.object(c.image_admission, '_verification_transport', side_effect=AssertionError('legacy verification')), \
+             patch.object(c.runtime, 'verified_previous', side_effect=AssertionError('legacy verification')), \
+             patch.object(c.schema_change, 'classify', side_effect=AssertionError('image classification')), \
+             patch.object(c.schema_change, 'classify_v2', side_effect=AssertionError('repeat classification')), \
+             patch.object(c.runtime, 'bounded_command', side_effect=lambda *a, **kw: self.w.owner.raw_capture(*a, **kw)):
+            raw = c._run_resolved_experiment(self.p, resolution, 12345, 2,
+                deadline=self.deadline if deadline is None else deadline,
+                docker_binary='docker', config_dir=self.p, image_work_dir=self.p)
+        self.assertEqual(self.deadline.end, original_end)
+        self.assertEqual(len(self.case.world.trace), trace)
+        return json.loads(raw)
+
+    def test_actual_image_record_and_database_origin_remain_three_distinct_sources(self):
+        selected = self.resolution.resolved.selected
+        self.assertEqual(len({selected.record_sha, selected.actual_web_source_sha,
+                              self.resolution.database_base_source}), 3)
+        result = self.run_resolved()
+        self.assertTrue(result['forward'])
+        self.assertTrue(result['reversible'])
+        self.assertTrue(all(result['old_server_ok'].values()))
+        self.assertEqual(result['sha'], SHA)
+        self.assertEqual(result['previous_release'], selected.release)
+        self.assertEqual(result['previous_web_digest'], dict(selected.images)['web'])
+        self.assertEqual(result['classification'], {'kind': 'none', 'dormant': False})
+        self.assertLess(self.w.trace.index('catalog.final'), self.w.trace.index('stack.cleanup'))
+        self.assertEqual(self.w.trace.count('migration.compat-fwd'), 2)
+        self.assertEqual(self.w.trace.count('controller.read'), 2)
+
+    def test_deadline_begins_before_real_client_constructor_and_never_restarts(self):
+        self.assertEqual(self.w.clock.now, self.started + 40)
+        self.assertEqual(self.deadline.remaining(), 2360)
+        self.assertTrue(self.case.client.budget.closed)
+        self.run_resolved()
+        self.assertEqual(self.deadline.end, self.started + 2400)
+        self.assertEqual(self.w.clock.now, self.started + 100)  # Mocked worker interval consumed.
+        self.assertTrue(self.w.owner._closed)
+
+    def test_terminal_old_boot_uses_actual_web_source_not_record_or_database_origin(self):
+        self.w.terminal_old_boot = True
+        result = self.run_resolved()
+        self.assertFalse(result['old_server_ok']['boot'])
+        self.assertFalse(any(result['old_server_ok'].values()))
+        self.assertTrue(result['reversible'])
+        self.assertIn('catalog.final', self.w.trace)
+        self.assertTrue(self.w.owner._closed)
+
+    def test_substituted_record_or_origin_terminal_source_never_produces_result(self):
+        self.w.terminal_old_boot = True
+        for sha in (self.resolution.resolved.selected.record_sha, self.resolution.database_base_source):
+            self.w.terminal_previous_source = sha
+            with self.subTest(sha=sha), self.assertRaisesRegex(c.proof.EvidenceError, 'terminal-source'):
+                self.run_resolved()
+            self.assertTrue(self.w.owner._closed)
+
+    def test_complete_false_retains_reverse_final_catalog_and_cleanup(self):
+        self.w.false_case = 'read'
+        result = self.run_resolved()
+        self.assertFalse(result['old_server_ok']['read'])
+        self.assertFalse(result['old_server_ok']['reverse'])
+        self.assertTrue(result['reversible'])
+        self.assertEqual(self.w.trace.count('controller.read'), 2)
+        self.assertEqual(self.w.trace[-3:], ['catalog.final', 'manager.close', 'stack.cleanup'])
+
+    def test_later_failure_never_becomes_completed_false_artifact(self):
+        self.w.false_case = 'read'
+        self.w.fail = 'catalog.final'
+        with self.assertRaises(c.proof.InfrastructureFailure):
+            self.run_resolved()
+        self.assertTrue(self.w.owner._closed)
+
+    def test_explicit_historical_selection_refuses_before_admission(self):
+        earlier = self.resolution.resolved.chain.entries[1]
+        selected = tr.resolver._selection(self.resolution.resolved.chain, 1)
+        self.assertNotEqual(selected.release, self.resolution.resolved.latest.release)
+        altered = replace(self.resolution, resolved=replace(self.resolution.resolved, selected=selected))
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'normal-only'):
+            self.run_resolved(altered)
+        self.assertEqual(self.w.trace, [])
+        self.assertEqual(selected.release, earlier.release)
+
+    def test_unsupported_or_blocked_plans_refuse_without_image_reclassification(self):
+        for values in [('expand', False, ()), ('contract', False, ()), ('data', False, ()),
+                       ('none', True, ()), ('none', False, ('blocked',)), ('none', 0, ())]:
+            kind, dormant, reasons = values
+            classification = self.resolution.classification._replace(kind=kind, dormant=dormant, reasons=reasons)
+            with self.subTest(values=values), self.assertRaisesRegex(c.proof.EvidenceError, 'classification-unsupported'):
+                self.run_resolved(replace(self.resolution, classification=classification))
+        self.assertEqual(self.w.trace, [])
+
+    def test_dormant_plan_is_retained_without_deriving_it_from_selected_image(self):
+        value = self.resolution.classification._replace(kind='data', dormant=True)
+        result = self.run_resolved(replace(self.resolution, classification=value))
+        self.assertEqual(result['classification'], {'kind': 'data', 'dormant': True})
+
+    def test_unsealed_admission_or_wrong_actual_image_source_refuses_before_stack(self):
+        wrong = replace(self.admission.previous, source_sha=self.resolution.resolved.selected.record_sha)
+        for value in (object(), replace(self.admission, seal=object()), replace(self.admission, previous=wrong)):
+            with self.subTest(value=type(value)), self.assertRaises(c.proof.EvidenceError):
+                self.run_resolved(admitted=value)
+        self.assertFalse(hasattr(self.w, 'owner'))
+
+    def test_expired_or_foreign_deadline_never_allocates_a_new_clock(self):
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'overall-invalid'):
+            self.run_resolved(deadline=object())
+        self.w.clock.now = self.deadline.end
+        with self.assertRaises(c.proof.InfrastructureFailure):
+            self.run_resolved()
+        self.assertEqual(self.w.trace, [])
+
+    def test_no_experiment_reserve_or_cleanup_success_is_invented(self):
+        self.w.clock.now = self.deadline.end - 899
+        with self.assertRaisesRegex(c.proof.InfrastructureFailure, 'experiment-reserve'):
+            self.run_resolved()
+        self.assertNotIn('stack.start', self.w.trace)
+
+    def test_material_or_engine_selection_disagreement_refuses_before_stack(self):
+        altered = replace(self.resolution, database_base_source=self.resolution.resolved.selected.record_sha)
+        with self.assertRaises(c.proof.EvidenceError):
+            self.run_resolved(altered)
+        self.assertEqual(self.w.trace, [])
+        with self.assertRaisesRegex(c.proof.EvidenceError, 'resolution-binding'):
+            c._Engine(self.p, PREVIOUS, SHA, 1, 1, self.resolution.classification, self.contract,
+                self.admitted, 'docker', self.p, resolution=self.resolution)
+        self.assertFalse(hasattr(self.w, 'owner'))
 
 
 class BudgetTests(unittest.TestCase):
