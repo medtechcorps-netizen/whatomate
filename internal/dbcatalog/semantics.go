@@ -351,8 +351,18 @@ func nullableDefinition(raw string, row bool) ([]any, error) {
 }
 
 func validateNullableObservation(v nullableObservation) error {
-	s, g := v.Snapshot, v.Graph
-	if v.FormatVersion != 1 || v.PostgresMajor != 17 || s.Version != Version || len(s.Objects) == 0 || s.Unknown == nil || len(s.Unknown) != 0 || len(s.unknownIdentities) != 0 || len(s.Seeds) != 0 || !s.Ownership.MigrationOwnerOwnsDatabase || !s.Ownership.MigrationOwnerOwnsPublicSchema {
+	if v.FormatVersion != 1 || v.PostgresMajor != 17 {
+		return refuse("nullable-snapshot")
+	}
+	if err := validateNullableParts(v.Snapshot, v.Graph, 1, 0); err != nil {
+		return err
+	}
+	_, err := nullableCanonical(v.Graph, nullableGraphLimit)
+	return err
+}
+
+func validateNullableParts(s Snapshot, g nullableGraph, version int, expectedDefaults int64) error {
+	if s.Version != Version || len(s.Objects) == 0 || s.Unknown == nil || len(s.Unknown) != 0 || len(s.unknownIdentities) != 0 || len(s.Seeds) != 0 || !s.Ownership.MigrationOwnerOwnsDatabase || !s.Ownership.MigrationOwnerOwnsPublicSchema {
 		return refuse("nullable-snapshot")
 	}
 	if len(s.CountOnly) != len(countKeys) {
@@ -392,7 +402,7 @@ func validateNullableObservation(v nullableObservation) error {
 			return refuse("nullable-snapshot")
 		}
 	}
-	if g.FormatVersion != 1 || g.CatalogSHA256 != s.SHA256 || !nullableTopRef(g.Relation.Object, "relations") || !nullableTopRef(g.RowType.Object, "types") || !nullableTopRef(g.ArrayType.Object, "types") || g.RowType.Object == g.ArrayType.Object || g.Relation.RowType != g.RowType.Object || g.RowType.Relation != g.Relation.Object || g.RowType.Array != g.ArrayType.Object || g.ArrayType.Element != g.RowType.Object {
+	if g.FormatVersion != version || g.CatalogSHA256 != s.SHA256 || !nullableTopRef(g.Relation.Object, "relations") || !nullableTopRef(g.RowType.Object, "types") || !nullableTopRef(g.ArrayType.Object, "types") || g.RowType.Object == g.ArrayType.Object || g.Relation.RowType != g.RowType.Object || g.RowType.Relation != g.Relation.Object || g.RowType.Array != g.ArrayType.Object || g.ArrayType.Element != g.RowType.Object {
 		return refuse("nullable-graph")
 	}
 	r := g.Relation
@@ -448,11 +458,8 @@ func validateNullableObservation(v nullableObservation) error {
 		}
 	}
 	sec := g.Security
-	if !shaPattern.MatchString(sec.DatabaseACL) || !shaPattern.MatchString(sec.PublicSchemaACL) || sec.DefaultACLCount != 0 || sec.OtherACLEntries != 0 || sec.OtherPolicyRoles != 0 || s.CountOnly["default_acls"] != 0 || s.CountOnly["other_acl_entries"] != 0 || s.CountOnly["other_policy_roles"] != 0 {
+	if !shaPattern.MatchString(sec.DatabaseACL) || !shaPattern.MatchString(sec.PublicSchemaACL) || sec.DefaultACLCount != expectedDefaults || sec.OtherACLEntries != 0 || sec.OtherPolicyRoles != 0 || s.CountOnly["default_acls"] != expectedDefaults || s.CountOnly["other_acl_entries"] != 0 || s.CountOnly["other_policy_roles"] != 0 {
 		return refuse("nullable-security")
-	}
-	if _, err := nullableCanonical(g, nullableGraphLimit); err != nil {
-		return err
 	}
 	return nil
 }
@@ -488,56 +495,64 @@ func ExplainNullableColumnV1(op NullableColumnOperationV1, before, after Nullabl
 	if err != nil {
 		return NullableExplanationV1{}, err
 	}
-	bg, ag := before.value.Graph, after.value.Graph
+	explained, err := explainNullableParts(op, before.value.Snapshot, after.value.Snapshot, before.value.Graph, after.value.Graph)
+	if err != nil {
+		return NullableExplanationV1{}, err
+	}
+	operation, _ := nullableCanonical(op.value, nullableOperationLimit)
+	return NullableExplanationV1{nullableExplanation{1, digest(operation), digest(statement), before.value.Snapshot.SHA256, after.value.Snapshot.SHA256, digest(b), digest(a), explained}}, nil
+}
+
+func explainNullableParts(op NullableColumnOperationV1, before, after Snapshot, bg, ag nullableGraph) ([]nullableRef, error) {
 	n := len(bg.Slots)
-	if bg.Relation.Object.Identity != op.value.Relation || !reflect.DeepEqual(bg.Relation, ag.Relation) || bg.RowType.Object != ag.RowType.Object || bg.RowType.Relation != ag.RowType.Relation || bg.RowType.Array != ag.RowType.Array || bg.ArrayType != ag.ArrayType || bg.Security != ag.Security || !reflect.DeepEqual(before.value.Snapshot.CountOnly, after.value.Snapshot.CountOnly) || n < 1 || n >= nullableSlotLimit || len(ag.Slots) != n+1 || !reflect.DeepEqual(bg.Slots, ag.Slots[:n]) {
-		return NullableExplanationV1{}, refuse("nullable-transition")
+	if bg.Relation.Object.Identity != op.value.Relation || !reflect.DeepEqual(bg.Relation, ag.Relation) || bg.RowType.Object != ag.RowType.Object || bg.RowType.Relation != ag.RowType.Relation || bg.RowType.Array != ag.RowType.Array || bg.ArrayType != ag.ArrayType || bg.Security != ag.Security || !reflect.DeepEqual(before.CountOnly, after.CountOnly) || n < 1 || n >= nullableSlotLimit || len(ag.Slots) != n+1 || !reflect.DeepEqual(bg.Slots, ag.Slots[:n]) {
+		return nil, refuse("nullable-transition")
 	}
 	for _, s := range bg.Slots {
 		if s.Name == op.value.Column {
-			return NullableExplanationV1{}, refuse("nullable-transition")
+			return nil, refuse("nullable-transition")
 		}
 	}
 	wantSlot := nullableSlot{Number: n + 1, Name: op.value.Column, TypeNamespace: "pg_catalog", TypeName: "int8", TypeModifier: -1, TypeText: "bigint", Local: true}
 	if ag.Slots[n] != wantSlot {
-		return NullableExplanationV1{}, refuse("nullable-transition")
+		return nil, refuse("nullable-transition")
 	}
 	bd, _ := nullableDefinition(bg.RowType.DefinitionJSON, true)
 	ad, _ := nullableDefinition(ag.RowType.DefinitionJSON, true)
 	for i := range bd {
 		if i != 12 && !reflect.DeepEqual(bd[i], ad[i]) {
-			return NullableExplanationV1{}, refuse("nullable-transition")
+			return nil, refuse("nullable-transition")
 		}
 	}
 	bf, af := bd[12].([]any), ad[12].([]any)
 	if !reflect.DeepEqual(bf, af[:n]) || !reflect.DeepEqual(af[n], []any{json.Number(strconv.Itoa(n + 1)), op.value.Column, "bigint", false, ""}) {
-		return NullableExplanationV1{}, refuse("nullable-transition")
+		return nil, refuse("nullable-transition")
 	}
 	added := nullableRef{"columns", op.value.Relation + "." + op.value.Column, op.value.Relation}
 	old := map[string]Object{}
-	for _, o := range before.value.Snapshot.Objects {
+	for _, o := range before.Objects {
 		old[o.Kind+":"+o.Identity] = o
 	}
-	if len(after.value.Snapshot.Objects) != len(old)+1 {
-		return NullableExplanationV1{}, refuse("nullable-transition")
+	if len(after.Objects) != len(old)+1 {
+		return nil, refuse("nullable-transition")
 	}
 	addedSeen, rowChanged := false, false
-	for _, o := range after.value.Snapshot.Objects {
+	for _, o := range after.Objects {
 		key := o.Kind + ":" + o.Identity
 		if key == nullableObjectKey(added) {
 			if _, exists := old[key]; exists || o.Parent != added.Parent {
-				return NullableExplanationV1{}, refuse("nullable-transition")
+				return nil, refuse("nullable-transition")
 			}
 			want := map[string]string{"position": strconv.Itoa(n + 1), "type_sha256": digest([]byte("bigint")), "not_null": "false", "default_sha256": digest(nil), "identity": "", "generated": "", "collation_sha256": digest(nil), "acl": ""}
 			if !reflect.DeepEqual(o.Attributes, want) {
-				return NullableExplanationV1{}, refuse("nullable-transition")
+				return nil, refuse("nullable-transition")
 			}
 			addedSeen = true
 			continue
 		}
 		prior, ok := old[key]
 		if !ok || prior.Kind != o.Kind || prior.Identity != o.Identity || prior.Parent != o.Parent || prior.Missing != o.Missing {
-			return NullableExplanationV1{}, refuse("nullable-transition")
+			return nil, refuse("nullable-transition")
 		}
 		for k, v := range prior.Attributes {
 			if key == nullableObjectKey(bg.RowType.Object) && k == "definition_sha256" {
@@ -545,16 +560,15 @@ func ExplainNullableColumnV1(op NullableColumnOperationV1, before, after Nullabl
 				continue
 			}
 			if v != o.Attributes[k] {
-				return NullableExplanationV1{}, refuse("nullable-transition")
+				return nil, refuse("nullable-transition")
 			}
 		}
 		delete(old, key)
 	}
 	if !addedSeen || !rowChanged || len(old) != 0 {
-		return NullableExplanationV1{}, refuse("nullable-transition")
+		return nil, refuse("nullable-transition")
 	}
-	operation, _ := nullableCanonical(op.value, nullableOperationLimit)
-	return NullableExplanationV1{nullableExplanation{1, digest(operation), digest(statement), before.value.Snapshot.SHA256, after.value.Snapshot.SHA256, digest(b), digest(a), []nullableRef{added, bg.RowType.Object}}}, nil
+	return []nullableRef{added, bg.RowType.Object}, nil
 }
 
 func CanonicalNullableExplanationV1(value NullableExplanationV1) ([]byte, error) {
@@ -571,8 +585,10 @@ func CanonicalNullableExplanationV1(value NullableExplanationV1) ([]byte, error)
 }
 
 type nullableGraphCapture struct {
-	operation   nullableOperation
-	observation NullableObservationV1
+	version       int
+	observationV2 NullableObservationV2
+	operation     nullableOperation
+	observation   NullableObservationV1
 }
 
 func CaptureNullableGraphV1(ctx context.Context, runtimeDSN string, opt Options, op NullableColumnOperationV1) (NullableObservationV1, error) {
@@ -582,7 +598,7 @@ func CaptureNullableGraphV1(ctx context.Context, runtimeDSN string, opt Options,
 	if opt.IncludeSeeds {
 		return NullableObservationV1{}, refuse("nullable-capture")
 	}
-	request := &nullableGraphCapture{operation: op.value}
+	request := &nullableGraphCapture{version: 1, operation: op.value}
 	if _, err := captureWithNullableGraph(ctx, runtimeDSN, opt, request); err != nil {
 		return NullableObservationV1{}, err
 	}
@@ -658,6 +674,25 @@ func nullableACL(raw string, roles symbols) (string, error) {
 }
 
 func captureNullableGraphInTx(ctx context.Context, tx pgx.Tx, roles symbols, snapshot Snapshot, op nullableOperation, remaining int) (NullableObservationV1, error) {
+	g, remaining, err := captureNullablePartsInTx(ctx, tx, roles, snapshot, op, remaining, 1)
+	if err != nil {
+		return NullableObservationV1{}, err
+	}
+	graphWire, err := nullableCanonical(g, nullableGraphLimit)
+	if err != nil {
+		return NullableObservationV1{}, err
+	}
+	if len(graphWire) > remaining {
+		return NullableObservationV1{}, refuse("nullable-limit")
+	}
+	v := NullableObservationV1{nullableObservation{1, 17, snapshot, g}}
+	if _, err := CanonicalNullableObservationV1(v); err != nil {
+		return NullableObservationV1{}, err
+	}
+	return v, nil
+}
+
+func captureNullablePartsInTx(ctx context.Context, tx pgx.Tx, roles symbols, snapshot Snapshot, op nullableOperation, remaining, version int) (nullableGraph, int, error) {
 	charge := func(n int) error {
 		if n < 0 || n > remaining {
 			return refuse("nullable-limit")
@@ -669,150 +704,139 @@ func captureNullableGraphInTx(ctx context.Context, tx pgx.Tx, roles symbols, sna
 	var partition, reciprocal bool
 	var typed, parents, children int64
 	if tx.QueryRow(ctx, nullableRelationSQL, op.Relation).Scan(&relation, &row, &array, &kind, &persistence, &partition, &typed, &parents, &children, &reciprocal) != nil {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	if err := charge(len(relation) + len(row) + len(array) + len(kind) + len(persistence) + 64); err != nil {
-		return NullableObservationV1{}, err
+		return nullableGraph{}, remaining, err
 	}
 	if relation != op.Relation || !identifier.MatchString(row) || !identifier.MatchString(array) || row == array || kind != "r" || persistence != "p" || partition || typed != 0 || parents != 0 || children != 0 || !reciprocal {
-		return NullableObservationV1{}, refuse("nullable-relation")
+		return nullableGraph{}, remaining, refuse("nullable-relation")
 	}
 	rref, tref, aref := nullableRef{"relations", relation, ""}, nullableRef{"types", row, ""}, nullableRef{"types", array, ""}
-	g := nullableGraph{FormatVersion: 1, CatalogSHA256: snapshot.SHA256, Relation: nullableRelation{rref, kind, persistence, false, nil, []nullableRef{}, []nullableRef{}, tref}, RowType: nullableRowType{Object: tref, Relation: rref, Array: aref}, ArrayType: nullableArrayType{Object: aref, Element: tref}, Slots: []nullableSlot{}}
+	g := nullableGraph{FormatVersion: version, CatalogSHA256: snapshot.SHA256, Relation: nullableRelation{rref, kind, persistence, false, nil, []nullableRef{}, []nullableRef{}, tref}, RowType: nullableRowType{Object: tref, Relation: rref, Array: aref}, ArrayType: nullableArrayType{Object: aref, Element: tref}, Slots: []nullableSlot{}}
 	// The expression hashed by normal capture has one authority: queries/types.
 	typeSQL := ""
 	for _, q := range queries {
 		if q.kind == "types" {
 			if typeSQL != "" {
-				return NullableObservationV1{}, refuse("nullable-read")
+				return nullableGraph{}, remaining, refuse("nullable-read")
 			}
 			typeSQL = q.sql
 		}
 	}
 	if typeSQL == "" {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	types, err := tx.Query(ctx, "SELECT name,parent,payload FROM ("+typeSQL+") AS graph_type(name,parent,payload) WHERE name=$1 OR name=$2 ORDER BY name LIMIT 3", row, array)
 	if err != nil {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	definitions := map[string]string{}
 	for types.Next() {
 		var name, parent, payload string
 		if types.Scan(&name, &parent, &payload) != nil || len(payload) > maxAttributeBytes {
 			types.Close()
-			return NullableObservationV1{}, refuse("nullable-read")
+			return nullableGraph{}, remaining, refuse("nullable-read")
 		}
 		if err := charge(len(name) + len(parent) + len(payload)); err != nil {
 			types.Close()
-			return NullableObservationV1{}, err
+			return nullableGraph{}, remaining, err
 		}
 		if parent != "" || (name != row && name != array) || len(definitions) >= 2 {
 			types.Close()
-			return NullableObservationV1{}, refuse("nullable-read")
+			return nullableGraph{}, remaining, refuse("nullable-read")
 		}
 		if _, exists := definitions[name]; exists {
 			types.Close()
-			return NullableObservationV1{}, refuse("nullable-read")
+			return nullableGraph{}, remaining, refuse("nullable-read")
 		}
 		var fields map[string]json.RawMessage
 		var definition string
 		if json.Unmarshal([]byte(payload), &fields) != nil || json.Unmarshal(fields["definition"], &definition) != nil || len(definition) > nullableDefinitionLimit {
 			types.Close()
-			return NullableObservationV1{}, refuse("nullable-read")
+			return nullableGraph{}, remaining, refuse("nullable-read")
 		}
 		definitions[name] = definition
 	}
 	err = types.Err()
 	types.Close()
 	if err != nil || len(definitions) != 2 {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	g.RowType.DefinitionJSON, g.ArrayType.DefinitionJSON = definitions[row], definitions[array]
 	rows, err := tx.Query(ctx, nullableSlotsSQL, relation)
 	if err != nil {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	for rows.Next() {
 		if len(g.Slots) >= nullableSlotLimit {
 			rows.Close()
-			return NullableObservationV1{}, refuse("nullable-limit")
+			return nullableGraph{}, remaining, refuse("nullable-limit")
 		}
 		var slot nullableSlot
 		var acl string
 		if rows.Scan(&slot.Number, &slot.Name, &slot.TypeNamespace, &slot.TypeName, &slot.TypeModifier, &slot.TypeText, &slot.NotNull, &slot.Dropped, &slot.Local, &slot.InheritedCount, &slot.DefaultPresent, &slot.Identity, &slot.Generated, &slot.CollationNamespace, &slot.CollationName, &acl) != nil || len(acl) > maxAttributeBytes {
 			rows.Close()
-			return NullableObservationV1{}, refuse("nullable-read")
+			return nullableGraph{}, remaining, refuse("nullable-read")
 		}
 		// Charge complete retained row and original ACL payload before append.
 		wire, e := nullableCanonical(slot, nullableGraphLimit)
 		if e != nil {
 			rows.Close()
-			return NullableObservationV1{}, e
+			return nullableGraph{}, remaining, e
 		}
 		if e = charge(len(wire) + len(acl)); e != nil {
 			rows.Close()
-			return NullableObservationV1{}, e
+			return nullableGraph{}, remaining, e
 		}
 		slot.ACL, e = nullableACL(acl, roles)
 		if e != nil {
 			rows.Close()
-			return NullableObservationV1{}, e
+			return nullableGraph{}, remaining, e
 		}
 		g.Slots = append(g.Slots, slot)
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	security, err := tx.Query(ctx, nullableSecuritySQL)
 	if err != nil {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	hashes := map[string]string{}
 	for security.Next() {
 		var surface, owner, raw string
 		if security.Scan(&surface, &owner, &raw) != nil || len(raw) > maxAttributeBytes {
 			security.Close()
-			return NullableObservationV1{}, refuse("nullable-read")
+			return nullableGraph{}, remaining, refuse("nullable-read")
 		}
 		if e := charge(len(surface) + len(owner) + len(raw)); e != nil {
 			security.Close()
-			return NullableObservationV1{}, e
+			return nullableGraph{}, remaining, e
 		}
 		if (surface != "database" && surface != "public") || hashes[surface] != "" || roles.role(owner) != "MIGRATION_OWNER" {
 			security.Close()
-			return NullableObservationV1{}, refuse("nullable-security")
+			return nullableGraph{}, remaining, refuse("nullable-security")
 		}
 		acl, e := nullableACL(raw, roles)
 		if e != nil {
 			security.Close()
-			return NullableObservationV1{}, e
+			return nullableGraph{}, remaining, e
 		}
 		wire, e := nullableCanonical(map[string]string{"owner": "MIGRATION_OWNER", "acl": acl}, nullableGraphLimit)
 		if e != nil {
 			security.Close()
-			return NullableObservationV1{}, e
+			return nullableGraph{}, remaining, e
 		}
 		hashes[surface] = digest(wire)
 	}
 	err = security.Err()
 	security.Close()
 	if err != nil || len(hashes) != 2 {
-		return NullableObservationV1{}, refuse("nullable-read")
+		return nullableGraph{}, remaining, refuse("nullable-read")
 	}
 	g.Security = nullableSecurity{hashes["database"], hashes["public"], snapshot.CountOnly["default_acls"], snapshot.CountOnly["other_acl_entries"], snapshot.CountOnly["other_policy_roles"]}
-	graphWire, err := nullableCanonical(g, nullableGraphLimit)
-	if err != nil {
-		return NullableObservationV1{}, err
-	}
-	if err := charge(len(graphWire)); err != nil {
-		return NullableObservationV1{}, err
-	}
-	v := NullableObservationV1{nullableObservation{1, 17, snapshot, g}}
-	if _, err := CanonicalNullableObservationV1(v); err != nil {
-		return NullableObservationV1{}, err
-	}
-	return v, nil
+	return g, remaining, nil
 }

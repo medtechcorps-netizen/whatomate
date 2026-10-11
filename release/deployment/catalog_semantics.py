@@ -194,7 +194,7 @@ def _catalog_bytes(objects):
     return _json_bytes({"version": 0, "objects": rows}, sorted_keys=False)
 
 
-def _snapshot(value):
+def _snapshot(value, *, expected_defaults=0):
     _fields(value, ("version", "sha256", "objects", "unknown", "count_only", "ownership"))
     _need(type(value["version"]) is int and value["version"] == 0
           and type(value["unknown"]) is list and value["unknown"] == []
@@ -217,8 +217,10 @@ def _snapshot(value):
     _need(_digest(_catalog_bytes(objects)) == value["sha256"], "catalog-digest")
     _fields(value["count_only"], _COUNTS)
     _need(all(_integer(n) for n in value["count_only"].values()), "counts")
-    _need(all(value["count_only"][k] == 0 for k in
-              ("default_acls", "other_acl_entries", "other_policy_roles")), "security")
+    _need(_integer(expected_defaults, 0, 32)
+          and value["count_only"]["default_acls"] == expected_defaults
+          and all(value["count_only"][k] == 0 for k in
+                  ("other_acl_entries", "other_policy_roles")), "security")
     _fields(value["ownership"], ("migration_owner_owns_database", "migration_owner_owns_public_schema"))
     _need(all(v is True for v in value["ownership"].values()), "ownership")
     return {f.ref: dict(f.attributes) for f in facts}
@@ -264,11 +266,12 @@ def _slot(value, number):
     return "" if pair == ("", "") else '"default"'
 
 
-def _graph(graph, snapshot, facts):
+def _graph(graph, snapshot, facts, *, version=1, expected_defaults=0):
+    _need(type(version) is int and version in (1, 2), "version")
     _fields(graph, ("format_version", "catalog_sha256", "relation", "row_type",
                     "array_type", "slots", "security"))
     _need(len(_json_bytes(graph)) <= MAX_GRAPH and type(graph["format_version"]) is int
-          and graph["format_version"] == 1 and graph["catalog_sha256"] == snapshot["sha256"], "graph")
+          and graph["format_version"] == version and graph["catalog_sha256"] == snapshot["sha256"], "graph")
     relation = _fields(graph["relation"], ("object", "relkind", "persistence", "is_partition",
                     "of_type", "parents", "children", "row_type"))
     relation_ref = _reference(relation["object"], "relations")
@@ -311,12 +314,17 @@ def _graph(graph, snapshot, facts):
               and row_definition[12][number-1] == [number, slot["name"], slot["type_text"], slot["not_null"], collation], "slot-binding")
     _need({ref.identity for ref in facts if ref.kind == "columns" and ref.parent == relation_ref.identity}
           == {relation_ref.identity + "." + name for name in names}, "slot-inventory")
-    security = _fields(graph["security"], ("database_acl_sha256", "public_schema_acl_sha256",
-                    "default_acl_count", "other_acl_entries", "other_policy_roles"))
+    security_keys = ("database_acl_sha256", "public_schema_acl_sha256",
+                     "default_acl_count", "other_acl_entries", "other_policy_roles")
+    if version == 2:
+        security_keys += ("default_acl_rows",)
+    security = _fields(graph["security"], security_keys)
     _need(all(_hash(security[k]) for k in ("database_acl_sha256", "public_schema_acl_sha256")), "security")
     for key, count in (("default_acl_count", "default_acls"), ("other_acl_entries", "other_acl_entries"),
                        ("other_policy_roles", "other_policy_roles")):
-        _need(type(security[key]) is int and security[key] == snapshot["count_only"][count] == 0, "security")
+        wanted = expected_defaults if key == "default_acl_count" else 0
+        _need(_integer(wanted, 0, 32) and type(security[key]) is int
+              and security[key] == snapshot["count_only"][count] == wanted, "security")
     return row_definition
 
 
@@ -340,12 +348,7 @@ def canonical_observation(observation):
     return observation.raw
 
 
-def explain_transition(operation, before, after):
-    _need(type(operation) is NullableColumnOperationV1
-          and type(before) is NullableObservationV1 and type(after) is NullableObservationV1)
-    op = _operation(operation.raw)
-    old, left, old_type = _observation(before.raw)
-    new, right, new_type = _observation(after.raw)
+def _nullable_delta(op, old, left, old_type, new, right, new_type):
     a, b = old["graph"], new["graph"]
     _need(a["relation"] == b["relation"] and a["relation"]["object"]["identity"] == op["relation"]
           and a["security"] == b["security"] and a["array_type"] == b["array_type"]
@@ -376,6 +379,16 @@ def explain_transition(operation, before, after):
                   == {k: v for k, v in right[ref].items() if k != "definition_sha256"}, "row-type")
         else:
             _need(attrs == right[ref], "unexplained-change")
+    return column, row_type
+
+
+def explain_transition(operation, before, after):
+    _need(type(operation) is NullableColumnOperationV1
+          and type(before) is NullableObservationV1 and type(after) is NullableObservationV1)
+    op = _operation(operation.raw)
+    old, left, old_type = _observation(before.raw)
+    new, right, new_type = _observation(after.raw)
+    column, row_type = _nullable_delta(op, old, left, old_type, new, right, new_type)
     value = {"format_version": 1, "operation_sha256": _digest(operation.raw),
         "statement_sha256": _digest(render_statement(operation)),
         "before_catalog_sha256": old["snapshot"]["sha256"],

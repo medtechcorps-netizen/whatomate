@@ -645,6 +645,42 @@ Saved validation covers 21 actual catalog test groups across the original run an
 
 The corrected negative requires a stored non-null default and rejects it. A separate actual test shows that PostgreSQL17 normalizes `SET DEFAULT NULL::bigint` on this ordinary column to no stored default and no change in the complete observation. Endpoint evidence cannot establish whether that catalog no-op SQL was issued. The real application bootstrap remains unsupported by v1 because its default ACLs are nonempty. This qualification does not enable active DDL, classifier/producer admission, constant defaults, concurrent indexes or full old-binary compatibility.
 
+## Nullable-column observation v2: application default ACLs
+
+The separate v2 observer retains complete PostgreSQL17 default-ACL rows,
+including normalized owner, namespace, object kind, grantor, grantee, privilege
+and grant option. Explanation requires the fixed application contract at both
+endpoints: runtime SELECT/USAGE for sequences and DELETE/INSERT/SELECT/UPDATE for
+tables, granted by the migration owner in public. Unexpected complete rows may
+be parsed diagnostically but cannot qualify. Physical ACL shape, raw role and
+namespace evidence, bounded inventory and transaction consistency are checked;
+v1 still requires no default ACLs.
+
+Actual synthetic PostgreSQL17 validation passed 27 catalog test groups and 58
+test/subtest events, with no skips. The separate positive export repeats one of
+those groups. Pure Go passed 34 test roots plus two fuzz seed groups (160 events),
+and the independent Python v1/v2 validators passed 25 cases. Source-contract
+mutation checks and 10 no-update registry groups passed. The reviewed generated
+migration closure is exactly 230 files; all 21 data-step rows, seed declarations
+and the closure-cap manifest remain unchanged. An initial source-contract test
+assumed the wrong transaction signature; that test-only correction and its
+original failure remain recorded separately from these final passing runs.
+
+The 3,537,014-byte actual fixture starts at the complete 4,432-object source
+golden and ends at 4,433 objects. Only organizations.extra and the existing
+organizations row-type definition change. Both expected default-ACL rows, the
+other security observations, old columns and unrelated objects remain equal.
+The positive test asserts runtime DDL rejection, owner DDL success, unchanged old
+row values and NULL in the new column. Every phase retained stable source bytes;
+cleanup verified the original 12 containers, 12 networks and 540 volume names.
+
+This source-golden bootstrap differs from the production-v0 profile and does not
+qualify that live database shape. Complete source/profile and admitted-image
+binding, active classification, named migration-path admission, the apply engine,
+old-binary compatibility and ordered multi-operation proof remain prerequisites.
+V2 supplies no active DDL permission and adds no constant-default, concurrent-index
+or other operation support.
+
 ## Validation still required
 
 The complete local synthetic experiment passed on candidate

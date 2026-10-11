@@ -298,7 +298,14 @@ func captureWithNullableGraph(ctx context.Context, dsn string, opt Options, grap
 		if major != 17 || opt.IncludeSeeds {
 			return Snapshot{}, refuse("nullable-capture")
 		}
-		graph.observation, err = captureNullableGraphInTx(ctx, tx, roles, snapshot, graph.operation, maxCatalogBytes-totalBytes)
+		switch graph.version {
+		case 1:
+			graph.observation, err = captureNullableGraphInTx(ctx, tx, roles, snapshot, graph.operation, maxCatalogBytes-totalBytes)
+		case 2:
+			graph.observationV2, err = captureNullableGraphV2InTx(ctx, tx, roles, snapshot, graph.operation, maxCatalogBytes-totalBytes)
+		default:
+			return Snapshot{}, refuse("nullable-capture")
+		}
 		if err != nil {
 			return Snapshot{}, err
 		}
