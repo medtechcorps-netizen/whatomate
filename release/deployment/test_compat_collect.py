@@ -662,5 +662,26 @@ class PaginationTests(unittest.TestCase):
             self.assertFalse(any('/attempts/' in str(a) for a,_ in w.calls))
 
 
+class PureEnvelopeParityTests(unittest.TestCase):
+    def test_actual_normal_collection_and_pure_replay_keep_the_same_windows(self):
+        from dataclasses import replace
+        import compat_envelope as envelope
+        for failure in (False, True):
+            world = World()
+            world.add(event='workflow_dispatch', negative=failure)
+            with self.subTest(failure=failure), harness(world) as (w,c,s):
+                collected = execute(c,s)
+                original = collected.history.attempts[0]
+                run = copy.deepcopy(w.attempts[100,1])
+                run['latest_run_attempt'] = 1
+                raw = fixture.canonical({'version':1, 'run':run,
+                    'jobs':sorted(w.jobs[100,1],key=lambda v:v['id']),
+                    'checks':sorted(w.checks[run['check_suite_id']],key=lambda v:v['id']),
+                    'artifacts':sorted(w.artifacts[100],key=lambda v:v['id'])})
+                replayed = envelope.replay(envelope.WorkflowObservation(fixture.SHA,WORKFLOW),
+                    envelope.EnvelopeFacts(raw), observed_at=collected.history.observed_at)
+                self.assertEqual(replace(replayed.attempt,measurement=original.measurement),original)
+
+
 if __name__=='__main__':
     unittest.main()

@@ -12,6 +12,8 @@ import compat_collect as collect
 import compat_evidence as evidence
 import pending_source
 import record_resolver as resolver
+import compat_rollback_history as rollback_history
+import catalog as compat_catalog
 
 policy, common = resolver.policy, resolver.common
 
@@ -202,3 +204,56 @@ def _qualify_context2_custody(resolution, collected) -> evidence.QualifiedCompat
     """
     request = _fixed_build(_build_context2_custody_request, resolution, collected)
     return evidence._require_context2_custody(request, collected.history)
+
+
+def _build_rollback_request(resolution, collected):
+    # Reuse the complete source/material validator before deriving a compact
+    # commitment. Neither the digest nor a typed resolution authenticates the
+    # source, signed chain, or its currentness outside the concrete operation.
+    contract = compat_catalog.CatalogContract.from_rollback_resolution(resolution)
+    material = resolver.rollback_material_digest(resolution)
+    latest, selected = resolution.resolved.latest, resolution.resolved.selected
+    required = resolution.requirements
+    live = required.live
+    identity = lambda row: evidence.ReleaseIdentity(row.release, row.manifest_sha256,
+                                                    row.record_sha, dict(row.images)['web'])
+    binding = evidence.RollbackBinding(resolution.producer.sha, identity(latest), identity(selected),
+        evidence.DatabaseBase('retained-live-v2', live.origin_source.sha,
+            evidence.OriginIdentity(live.origin_release, live.origin_manifest_sha256),
+            evidence.CatalogTuple(*live.catalog)), selected.actual_web_source_sha,
+        latest.actual_web_source_sha,
+        evidence.RollbackSpan(len(required.span), required.non_none_count, required.span_sha256), material)
+    # This complete pure replay also validates all-head coverage, raw history
+    # bounds and the collected metadata. Artifact issues stay available to the
+    # qualification policy; they are not a blanket veto on earlier known work.
+    rollback_history.validate_collected(collected)
+    history = collected.history
+    _need(history.producer_sha == binding.producer_sha
+          and contract.catalog_control_sha == binding.producer_sha
+          and contract.target_sha256 == binding.database_base.catalog.catalog_sha256)
+    observed = next((row for row in history.workflows if row.sha == binding.producer_sha), None)
+    _need(observed is not None and observed.raw == resolution.workflow)
+    return rollback_history.validate_request(rollback_history.RollbackRequest(
+        binding, resolution.workflow, history.observation_id))
+
+
+def build_rollback_request(resolution, collected) -> rollback_history.RollbackRequest:
+    """Project a fresh internally resolved exact rollback span, without I/O.
+
+    The future caller must own concrete resolution/collection and final source
+    freshness before effects. This function adds no operational permission or
+    deleted-history coverage and never treats context bytes as source input.
+    """
+    try:
+        return _build_rollback_request(resolution, collected)
+    except evidence.CompatRefusal:
+        raise
+    except (compat_catalog.proof.EvidenceError, policy.PolicyRefusal, common.ReleaseError,
+            ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError, OverflowError):
+        raise evidence.CompatRefusal('compat-stale', 'rollback-request-resolution-invalid') from None
+
+
+def qualify_rollback(resolution, collected) -> rollback_history.QualifiedRollback:
+    """Apply dedicated all-head policy; never return a RollbackDecision."""
+    request = build_rollback_request(resolution, collected)
+    return rollback_history.require_rollback_compat(request, collected.history)

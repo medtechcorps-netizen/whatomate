@@ -719,3 +719,32 @@ source-bound result above. Canonical qualification still requires a green PR
 compatibility run and three accepted consecutive main runs before PR16. Unit
 tests and local probes do not replace those hosted outcomes or any existing
 release protection.
+
+### Preparatory all-head rollback history
+
+The pure rollback history and request bridge retain closed raw run, job, check,
+artifact and per-head workflow observations. They derive execution windows only
+from that head's exact reviewed workflow bytes. Missing or unrecognized source
+has no supersedable window. Qualification requires an exact current-H context4
+positive matching the target, live image, retained database origin, complete span
+and source-material binding. Foreign, wrong-binding or unknown evidence that
+cannot be proved finished before the selected execution vetoes qualification.
+Only another complete exact-H, same-binding positive may overlap.
+
+Validation covers at most 500 attempts across all visible push/dispatch main
+heads, 501 workflow observations including H, and 12 MiB of retained workflow,
+envelope and paired raw bytes. It checks contiguous attempts, global identities
+and complete repeated inventories. Fatal collection issues require incomplete
+coverage and cannot qualify. Coverage remains `complete-visible`; whole-run
+deletion detection is explicitly unavailable.
+
+This is pure source/evidence preparation, not an all-head collector, signature
+authority or operational rollback permission. The fixed recognized workflow
+layout, concrete collection and immutable per-head source custody remain separate
+requirements. Public rollback across two or more non-none intermediates still
+refuses. Existing normal collection predicates remain unchanged.
+
+Saved synthetic checks cover 396 unique cases: 76 initial passes plus three
+repaired fixture cases, 163 normal-collection cases and 154 custody/workflow cases.
+The initial three fixture failures are retained; there was no fresh all-green
+79-case rerun. These tests do not establish hosted rollback qualification.
