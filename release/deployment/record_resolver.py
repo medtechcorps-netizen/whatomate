@@ -18,6 +18,9 @@ import source_git
 _CATALOG_PINS = dict(policy.V0_PINS)
 _CATALOG_PATHS = tuple(sorted(_CATALOG_PINS))
 _WEB_RECIPE = "docker/release/web.Dockerfile"
+_DRILLS = "release/deployment/drills.json"
+MAX_CHANGED_PATHS = 10_000
+MAX_AUDIT_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,28 @@ class WebRecipe:
 
 
 @dataclass(frozen=True, slots=True)
+class ChangedPath:
+    status: str
+    path: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChangedRange:
+    roles: tuple[str, ...]
+    base_sha: str
+    head_sha: str
+    rows: tuple[ChangedPath, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardAuditMaterial:
+    """Complete source observations, not drill/label/pending authorization."""
+    candidate_sha: str
+    drills: BlobObservation
+    changes: tuple[ChangedRange, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ForwardResolution:
     resolved: ResolvedChain
     candidate: policy.SourceFacts
@@ -75,6 +100,9 @@ class ForwardResolution:
     database_base_source: str
     catalog_material: CatalogMaterial
     previous_recipe: WebRecipe
+    # None is exclusively historical codec-v1 custody, never complete audit
+    # evidence. Every concrete forward source operation below supplies it.
+    audit: ForwardAuditMaterial | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +267,74 @@ def _forward_source(reader, repo_dir, latest, candidate):
     return candidate, classification, workflow, database_base
 
 
+def _audit_roles(database_base, latest_sha, web_sha):
+    grouped = {}
+    for role, sha in (("database-origin", database_base), ("latest-record", latest_sha),
+                      ("selected-web", web_sha)):
+        if type(sha) is not str or common.SHA1_RE.fullmatch(sha) is None:
+            raise policy.PolicyRefusal("record-source-invalid")
+        grouped.setdefault(sha, []).append(role)
+    return tuple((sha, tuple(roles)) for sha, roles in sorted(grouped.items()))
+
+
+def validate_forward_audit(audit, *, candidate_sha, database_base_source,
+                           latest_record_sha, selected_web_source_sha):
+    """Check a complete immutable projection; this cannot authenticate bytes.
+
+    The diff cap covers the complete canonical range projection. Drill bytes
+    retain the existing source-file cap and are not interpreted here: malformed
+    irrelevant drill metadata must not accidentally become a required gate.
+    """
+    def need(ok):
+        if not ok:
+            raise policy.PolicyRefusal("record-source-invalid")
+
+    need(type(candidate_sha) is str and common.SHA1_RE.fullmatch(candidate_sha) is not None)
+    need(type(audit) is ForwardAuditMaterial and audit.candidate_sha == candidate_sha)
+    need(type(audit.drills) is BlobObservation and audit.drills.path == _DRILLS
+         and (audit.drills.raw is None or (type(audit.drills.raw) is bytes
+              and len(audit.drills.raw) <= policy.MAX_SOURCE_FILE_BYTES)))
+    expected = _audit_roles(database_base_source, latest_record_sha, selected_web_source_sha)
+    need(type(audit.changes) is tuple and len(audit.changes) == len(expected))
+    projection = []
+    for row, (base, roles) in zip(audit.changes, expected, strict=True):
+        need(type(row) is ChangedRange and type(row.roles) is tuple and row.roles == roles
+             and row.base_sha == base and row.head_sha == candidate_sha
+             and type(row.rows) is tuple and len(row.rows) <= MAX_CHANGED_PATHS)
+        paths = []
+        for item in row.rows:
+            need(type(item) is ChangedPath and type(item.status) is str
+                 and item.status in ("A", "D", "M", "T", "U", "X")
+                 and source_git._path(item.path))
+            paths.append(item.path)
+        need(paths == sorted(set(paths)))
+        need(base != candidate_sha or not row.rows)
+        projection.append({"roles": roles, "base_sha": base, "head_sha": candidate_sha,
+                           "rows": [(item.status, item.path) for item in row.rows]})
+    need(len(common.canonical_file_bytes(projection)) <= MAX_AUDIT_BYTES)
+    return audit
+
+
+def _forward_audit(reader, repo_dir, latest, selected, candidate_sha, database_base):
+    drills = BlobObservation(_DRILLS, reader.read_blob(candidate_sha, _DRILLS))
+    changes = []
+    for base, roles in _audit_roles(database_base, latest.record_sha, selected.actual_web_source_sha):
+        raw = reader.output(repo_dir, ["diff", "--no-renames", "--name-status", "-z",
+                            base, candidate_sha, "--"], code="git-failed:source-audit")
+        if type(raw) is not bytes or (raw and not raw.endswith(b"\0")):
+            raise policy.PolicyRefusal("record-source-invalid")
+        fields = raw.split(b"\0")[:-1] if raw else []
+        if len(fields) % 2 or len(fields) > MAX_CHANGED_PATHS * 2:
+            raise policy.PolicyRefusal("record-source-invalid")
+        rows = tuple(ChangedPath(fields[i].decode("ascii"), fields[i + 1].decode("utf-8"))
+                     for i in range(0, len(fields), 2))
+        changes.append(ChangedRange(roles, base, candidate_sha,
+                                    tuple(sorted(rows, key=lambda item: item.path))))
+    return validate_forward_audit(ForwardAuditMaterial(candidate_sha, drills, tuple(changes)),
+        candidate_sha=candidate_sha, database_base_source=database_base,
+        latest_record_sha=latest.record_sha, selected_web_source_sha=selected.actual_web_source_sha)
+
+
 def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
@@ -317,6 +413,7 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                     reader, repo_dir, latest, candidate)
                 material = _catalog_material(reader, latest, selected, candidate)
                 recipe = _web_recipe(reader, selected)
+                audit = _forward_audit(reader, repo_dir, latest, selected, candidate_sha, database_base)
             if rollback:
                 legacy_chain, legacy_classification, decision = _rollback_source(chain, repo_dir, tag)
             budget.check()
@@ -328,7 +425,7 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
         if forward:
             return ForwardResolution(resolved, candidate, classification, workflow,
                 common.sha256_bytes(workflow), selected.actual_web_source_sha, database_base,
-                material, recipe)
+                material, recipe, audit)
         if rollback:
             return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)
         return resolved

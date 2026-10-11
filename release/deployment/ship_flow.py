@@ -15,6 +15,7 @@ import compat_evidence
 import record_handoff
 import record_resolver
 import record_writer
+import forward_gates
 import ship_compat
 import ship_records
 import ship_common as common
@@ -41,6 +42,8 @@ def _fixed(function):
             common.fail('candidate-invalid:' + code)
         except policy.PolicyRefusal:
             common.fail('record-chain-invalid:policy')
+        except forward_gates.DrillRefusal as exc:
+            common.fail('schema-change-blocked:' + str(exc))
         except record_writer.WriterRefusal:
             common.fail('record-invalid:writer')
         except record_handoff.HandoffRefusal:
@@ -113,6 +116,42 @@ def gate(ctx, control, mode, target, *, deadline):
     return Gate(result.resolution.resolved, result, None)
 
 
+@_fixed
+def _forward_paths(resolution):
+    """Render the complete checked projection; never discover source here."""
+    if type(resolution) is not record_resolver.ForwardResolution:
+        raise policy.PolicyRefusal('record-source-invalid')
+    if resolution.audit is None:
+        return ['- Other changed source paths: unavailable (historical source audit absent)']
+    audit = record_resolver.validate_forward_audit(resolution.audit,
+        candidate_sha=resolution.candidate.sha, database_base_source=resolution.database_base_source,
+        latest_record_sha=resolution.resolved.latest.record_sha,
+        selected_web_source_sha=resolution.resolved.selected.actual_web_source_sha)
+    lines = []
+    for change in audit.changes:
+        lines.append(f'- Changed source range ({", ".join(change.roles)}): '
+            f'{change.base_sha} -> {change.head_sha}; paths: {len(change.rows)}')
+        lines.extend(f'  - {row.status} {row.path}' for row in change.rows)
+    # Row text is shorter than its canonical representation; reserve a small
+    # fixed margin for the at-most-three headers. Never omit a path to fit.
+    _need(sum(len(line) + 1 for line in lines) <= record_resolver.MAX_AUDIT_BYTES + 2048,
+          'output-unsafe:text')
+    return [common.require_public_text(line) for line in lines]
+
+
+@_fixed
+def _drill_details(normal):
+    if normal.drills is None:
+        return ['- Restore drills: unobserved (historical custody)']
+    observation = forward_gates.validate_preserved_drills(normal.resolution, normal.drills)
+    observed = observation.observed_at.isoformat().replace('+00:00', 'Z')
+    if not observation.required:
+        return [f'- Restore drills: not required for none or dormant changes; observed at {observed}']
+    return [f'- Restore drills: current at original observation {observed}; '
+        f'staging restore {observation.staging_restore.isoformat().replace("+00:00", "Z")}; '
+        f'production fork {observation.production_fork.isoformat().replace("+00:00", "Z")}']
+
+
 def details(value):
     """Public summary values derived from the already checked gate."""
     latest = value.resolved.latest
@@ -134,8 +173,8 @@ def details(value):
             f'- Measured catalog SHA256: {candidate.catalog.catalog_sha256}',
             f'- Database source: {resolution.database_base_source}',
             f'- Changed database artifact paths: {changed}',
-            '- Other changed source paths: unavailable in the retained preflight projection',
-            '- Restore drills: not required for none or dormant changes']
+            *_forward_paths(resolution),
+            *_drill_details(value.normal)]
     if latest.live is None:
         return ['- Database history: legacy source checks; measured catalog unavailable',
                 '- Database change: none (image-only decision); dormant: false',
@@ -190,12 +229,13 @@ def promotion_outputs(value, control, verified_images, *, staging, private=()):
     mapping after a successful deployment; failed deployments write no record.
     """
     _need(value.normal is not None and control['run_attempt'] == 1, 'record-invalid:production-handoff')
+    _need(type(value.normal.drills) is forward_gates.DrillGate, 'record-invalid:production-handoff')
     sha = control['sha']
     images = record_writer.CandidateImages(sha,
         tuple((part, verified_images[part]) for part in common.COMPONENTS),
         tuple((part, sha) for part in common.COMPONENTS))
     handoff = record_writer.prepare_promotion(value.normal.resolution, value.normal.collected,
-        images, _execution(control), staging=staging)
+        images, _execution(control), staging=staging, drills=value.normal.drills)
     outputs = record_handoff.encode(handoff)
     for key, text in outputs.items():
         _need(common.OUTPUT_KEY_RE.fullmatch(key) and common.OUTPUT_VALUE_RE.fullmatch(text),

@@ -122,5 +122,68 @@ class RestoreDrillTests(unittest.TestCase):
         self.assertFalse(hasattr(result, "allow_deploy"))
 
 
+class SourceObservationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import test_compat_request as concrete
+        concrete.source.ForwardResolverTests.setUpClass()
+        cls.resolution = concrete.resolution()
+
+    def policy_projection(self, data, kind='expand', dormant=False):
+        # Direct-rule policy cases only: no claim that the operational bridge
+        # admits active changes or that a synthetic timestamp proves a drill.
+        from dataclasses import replace
+        value = self.resolution
+        return replace(value, audit=replace(value.audit,
+            drills=replace(value.audit.drills, raw=data)),
+            classification=value.classification._replace(kind=kind, dormant=dormant))
+
+    def test_actual_resolver_audit_exempt_with_null_or_missing_or_invalid_dates(self):
+        for raw_bytes in (None, raw(None, None), b'not-json'):
+            for kind, dormant in (('none', False), ('data', True)):
+                result = gates.observe_forward_drills(self.policy_projection(raw_bytes, kind, dormant), now=NOW)
+                self.assertEqual(result, gates.DrillGate(False, NOW, None, None, None))
+
+    def test_full_audit_partition_and_exact_candidate_still_required_when_exempt(self):
+        from dataclasses import replace
+        value = self.resolution
+        for audit in (None, replace(value.audit, candidate_sha='f' * 40),
+                      replace(value.audit, changes=value.audit.changes[:-1]),
+                      replace(value.audit, drills=replace(value.audit.drills, path='PRIVATE'))):
+            with self.assertRaisesRegex(gates.DrillRefusal, '^restore-drills-input-invalid$'):
+                gates.observe_forward_drills(replace(value, audit=audit), now=NOW)
+
+    def test_direct_policy_source_hash_and_original_time_replay(self):
+        data = raw(NOW - timedelta(days=90), NOW)
+        value = self.policy_projection(data)
+        observation = gates.observe_forward_drills(value, now=NOW)
+        self.assertEqual(observation.source_sha256, hashlib.sha256(data).hexdigest())
+        self.assertEqual(gates.validate_preserved_drills(value, observation), observation)
+        with self.assertRaisesRegex(gates.DrillRefusal, 'restore-drills-stale'):
+            gates.observe_forward_drills(value, now=NOW + timedelta(microseconds=1))
+        # No retry clock is accepted: the stored observation is still valid.
+        self.assertEqual(gates.validate_preserved_drills(value, observation), observation)
+
+    def test_receipt_mutations_and_source_date_change_refuse(self):
+        from dataclasses import replace
+        value = self.policy_projection(raw())
+        original = gates.observe_forward_drills(value, now=NOW)
+        for changed in (replace(original, required=1), replace(original, required=False),
+                        replace(original, source_sha256='f' * 64),
+                        replace(original, staging_restore=None),
+                        replace(original, production_fork=NOW - timedelta(seconds=1)),
+                        replace(original, observed_at=NOW.replace(tzinfo=None))):
+            with self.assertRaises(gates.DrillRefusal): gates.validate_preserved_drills(value, changed)
+        with self.assertRaisesRegex(gates.DrillRefusal, 'restore-drills-observation-invalid'):
+            gates.validate_preserved_drills(self.policy_projection(raw(NOW - timedelta(seconds=1), NOW)), original)
+
+    def test_direct_active_policy_keeps_closed_age_and_missing_rules(self):
+        for data, code in ((None, 'missing'), (raw(None, NOW), 'missing'), (b'PRIVATE', 'invalid'),
+                           (raw(NOW - timedelta(days=91), NOW), 'stale'),
+                           (raw(NOW + timedelta(seconds=1), NOW), 'future')):
+            with self.assertRaisesRegex(gates.DrillRefusal, 'restore-drills-' + code):
+                gates.observe_forward_drills(self.policy_projection(data), now=NOW)
+
+
 if __name__ == "__main__":
     unittest.main()

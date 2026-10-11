@@ -475,6 +475,7 @@ class ForwardResolverTests(unittest.TestCase):
         files = dict(self.source_bytes)
         files[self.WORKFLOW] = (ROOT / self.WORKFLOW).read_bytes()
         files[self.RECIPE] = b"FROM scratch\n# immutable synthetic recipe\n"
+        files[resolver._DRILLS] = (ROOT / resolver._DRILLS).read_bytes()
         files[self.MAIN] = f"package main\n\nfunc runRLSMigration(args []string) {{\n\tprintln({body})\n}}\n".encode()
         files[schema_change.MIGRATION_PATH] = common.canonical_file_bytes({
             "version": 1, "roots": schema_change.MIGRATION_ROOTS,
@@ -938,6 +939,156 @@ class ForwardResolverTests(unittest.TestCase):
             result.catalog_material.candidate_blobs[0].raw = b"foreign"
         with self.assertRaises(FrozenInstanceError):
             result.previous_recipe.raw = b"foreign"
+
+
+class ForwardAuditTests(unittest.TestCase):
+    setUpClass = ResolverTests.__dict__["setUpClass"]
+    setUp = ResolverTests.setUp
+    add = ResolverTests.add
+    profile = ForwardResolverTests.profile
+    candidate = ForwardResolverTests.candidate
+    forward = ForwardResolverTests.forward
+    refused = ForwardResolverTests.refused
+    WORKFLOW = ForwardResolverTests.WORKFLOW
+    MAIN = ForwardResolverTests.MAIN
+    RECIPE = ForwardResolverTests.RECIPE
+
+    def ordinary(self):
+        old = self.add()
+        self.profile(old["sha"])
+        return old["sha"], self.candidate()
+
+    def audit_output(self, raw):
+        original = self.world.git
+        active = False
+        def response(args):
+            nonlocal active
+            if args[:2] == ["ls-tree", "-z"] and args[-1] == resolver._DRILLS:
+                active = True
+            if active and args[0] == "diff" and "--name-status" in args:
+                return rt.runtime.Capture(0, raw, b"")
+            return original(args)
+        patcher = mock.patch.object(self.world, "git", side_effect=response)
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def test_all_equal_bases_have_one_complete_range_and_all_three_roles(self):
+        base, sha = self.ordinary()
+        self.world.files[base, "docs/removed.md"] = b"before"
+        self.world.files[sha, "docs/added.md"] = b"after"
+        self.world.files[base, "docs/changed.md"] = b"before"
+        self.world.files[sha, "docs/changed.md"] = b"after"
+        result = self.forward(sha)
+        audit = result.audit
+        self.assertEqual(audit.candidate_sha, sha)
+        self.assertEqual(audit.drills.raw, (ROOT / resolver._DRILLS).read_bytes())
+        self.assertEqual(audit.changes, (resolver.ChangedRange(
+            ("database-origin", "latest-record", "selected-web"), base, sha,
+            (resolver.ChangedPath("A", "docs/added.md"), resolver.ChangedPath("M", "docs/changed.md"),
+             resolver.ChangedPath("D", "docs/removed.md"))),))
+        with self.assertRaises(FrozenInstanceError): audit.drills.raw = b"other"
+        with self.assertRaises(TypeError): audit.changes[0].rows[0] = None
+
+    def test_three_distinct_bases_keep_origin_record_and_actual_web_labels(self):
+        old = self.add(version=1, images=self.boot["images"])
+        origin = self.add(); self.profile(origin["sha"])
+        self.add(kind="rollback", target=old)
+        self.world.files[self.boot["sha"], self.RECIPE] = b"FROM scratch\n"
+        sha = self.candidate()
+        result = self.forward(sha)
+        self.assertEqual({row.base_sha: row.roles for row in result.audit.changes}, {
+            origin["sha"]: ("database-origin",), old["sha"]: ("latest-record",),
+            self.boot["sha"]: ("selected-web",)})
+        self.assertTrue(all(row.head_sha == sha for row in result.audit.changes))
+        boot = next(row for row in result.audit.changes if row.base_sha == self.boot["sha"])
+        self.assertIn(resolver.ChangedPath("A", policy.GOLDEN), boot.rows)
+        origin_range = next(row for row in result.audit.changes if row.base_sha == origin["sha"])
+        self.assertEqual(origin_range.rows, ())
+
+    def test_two_equal_roles_deduplicate_and_same_commit_diff_is_empty(self):
+        old = self.add(version=1); self.profile(old["sha"])
+        origin = self.add(); self.profile(origin["sha"])
+        self.add(kind="rollback", target=old)
+        result = self.forward(origin["sha"])
+        self.assertEqual({row.base_sha: row.roles for row in result.audit.changes}, {
+            old["sha"]: ("latest-record", "selected-web"), origin["sha"]: ("database-origin",)})
+        self.assertTrue(all(row.rows == () for row in result.audit.changes))
+
+    def test_drills_absence_and_unparsed_irrelevant_bytes_are_preserved(self):
+        for raw in (None, b"malformed but irrelevant source bytes"):
+            with self.subTest(absent=raw is None):
+                case = ForwardAuditTests(); case.setUp()
+                try:
+                    _, sha = case.ordinary()
+                    if raw is None: del case.world.files[sha, resolver._DRILLS]
+                    else: case.world.files[sha, resolver._DRILLS] = raw
+                    self.assertEqual(case.forward(sha).audit.drills, resolver.BlobObservation(resolver._DRILLS, raw))
+                finally: case.doCleanups()
+
+    def test_status_typechange_and_rename_as_add_delete_preserve_complete_rows(self):
+        _, sha = self.ordinary()
+        self.audit_output(b"T\0file.py\0A\0new.py\0D\0old.py\0")
+        self.assertEqual(self.forward(sha).audit.changes[0].rows,
+            (resolver.ChangedPath("T", "file.py"), resolver.ChangedPath("A", "new.py"),
+             resolver.ChangedPath("D", "old.py")))
+
+    def test_bad_framing_utf8_status_unsafe_and_duplicate_paths_refuse(self):
+        for raw in (b"M\0file.py", b"M\0", b"M\0\xff\0", b"R100\0a\0b\0",
+                    b"PRIVATE\0file.py\0", b"M\0../PRIVATE\0", b"M\0a//b\0", b"M\0.git/config\0",
+                    b"M\0C:/PRIVATE\0", b"M\0a\\b\0", b"M\0a\nPRIVATE\0",
+                    b"M\0same.py\0M\0same.py\0", b"A\0same.py\0D\0same.py\0"):
+            with self.subTest(length=len(raw)):
+                case = ForwardAuditTests(); case.setUp()
+                try:
+                    _, sha = case.ordinary(); case.audit_output(raw); case.refused(sha)
+                finally: case.doCleanups()
+
+    def test_count_and_combined_projection_caps_refuse_without_truncating(self):
+        for raw in (b"".join(f"M\0p{i}.py\0".encode() for i in range(10001)),
+                    b"".join(f"M\0{'a' * 490}{i:04d}\0".encode() for i in range(1100))):
+            case = ForwardAuditTests(); case.setUp()
+            try:
+                _, sha = case.ordinary(); case.audit_output(raw); case.refused(sha)
+            finally: case.doCleanups()
+
+    def test_audit_uses_original_budget_and_precedes_final_rechecks(self):
+        _, sha = self.ordinary()
+        self.forward(sha)
+        commands = [args for args, _ in self.world.trace]
+        at = next(i for i, args in enumerate(commands) if "ls-tree" in args and args[-1] == resolver._DRILLS)
+        audit_diffs = [i for i, args in enumerate(commands) if i > at and "--name-status" in args]
+        self.assertEqual(len(audit_diffs), 1)
+        self.assertTrue(any("--show-toplevel" in args for args in commands[audit_diffs[-1] + 1:]))
+        self.assertEqual(self.client.budget.commands, len(commands))
+        self.assertTrue(self.client.budget.closed)
+        self.assertFalse(self.client.budget.failed)
+
+    def test_expiration_during_drill_read_and_late_source_drift_refuse(self):
+        for drift in (False, True):
+            case = ForwardAuditTests(); case.setUp()
+            try:
+                _, sha = case.ordinary()
+                def after(args):
+                    if "ls-tree" in args and args[-1] == resolver._DRILLS:
+                        if drift: (case.repo / ".git" / "shallow").write_bytes(b"changed")
+                        else: case.clock.now += 800
+                case.world.after = after
+                case.refused(sha)
+            finally: case.doCleanups()
+
+    def test_missing_role_range_and_same_source_nonempty_rows_are_not_complete(self):
+        from dataclasses import replace
+        base, sha = self.ordinary(); result = self.forward(sha)
+        for changed in (replace(result.audit, changes=()),
+                        replace(result.audit, changes=(replace(result.audit.changes[0], roles=("database-origin",)),))):
+            with self.assertRaises(policy.PolicyRefusal):
+                resolver.validate_forward_audit(changed, candidate_sha=sha, database_base_source=base,
+                    latest_record_sha=base, selected_web_source_sha=base)
+        same = resolver.ForwardAuditMaterial(base, result.audit.drills, (
+            resolver.ChangedRange(("database-origin", "latest-record", "selected-web"), base, base,
+                (resolver.ChangedPath("M", "file.py"),)),))
+        with self.assertRaises(policy.PolicyRefusal):
+            resolver.validate_forward_audit(same, candidate_sha=base, database_base_source=base,
+                latest_record_sha=base, selected_web_source_sha=base)
 
 
 if __name__ == "__main__":

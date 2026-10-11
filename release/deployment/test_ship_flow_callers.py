@@ -76,8 +76,13 @@ class CallerTests(unittest.TestCase):
             clock_module = SimpleNamespace(monotonic=self.case.clock)
             for module in (ship, flow, flow.ship_compat, flow.ship_records):
                 stack.enter_context(mock.patch.object(module, 'time', clock_module))
-            stack.enter_context(mock.patch.object(flow.ship_compat, 'datetime',
-                SimpleNamespace(now=lambda _tz: self.now)))
+            # Keep the real datetime type and all concrete policy checks. Only
+            # the existing private wall-clock seam receives deterministic UTC.
+            original_preflight = flow.ship_compat._preflight
+            def preflight(*args, **kwargs):
+                kwargs['wall_clock'] = lambda: self.now
+                return original_preflight(*args, **kwargs)
+            stack.enter_context(mock.patch.object(flow.ship_compat, '_preflight', side_effect=preflight))
             stack.enter_context(mock.patch.object(flow.ship_compat.runtime, 'bounded_command', self.fixture.capture))
             stack.enter_context(mock.patch.object(ship, 'first_parent_commits', return_value=(0, [])))
             return ship.main(list(args), self.env, self.deps)
@@ -99,11 +104,20 @@ class CallerTests(unittest.TestCase):
     def test_plan_and_production_each_capture_fresh_complete_evidence_then_write_v2(self):
         self.assertEqual(self.run_command('plan'), ship.EXIT_OK, self.output.getvalue())
         calls = len(self.fixture.calls)
+        plan_time = self.now
+        self.now += timedelta(seconds=1)
         self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
         self.assertGreater(len(self.fixture.calls), 2 * calls - 5)
         self.assertEqual(self.do.put_count(), 1)
         self.assertEqual(len(self.https.calls), 6)
         outputs = self.to_record()
+        custody = flow.record_handoff.decode(
+            {key: outputs[key] for key in flow.record_handoff.OUTPUT_KEYS},
+            candidate_sha=self.sha, workflow_sha=self.sha,
+            run_id=int(self.env['GITHUB_RUN_ID']), record_attempt=1)
+        self.assertEqual(custody.drills.observed_at, self.now)
+        self.assertGreater(custody.drills.observed_at, plan_time)
+        self.assertFalse(custody.drills.required)
         self.assertEqual(outputs['previous'], self.fixture.expected.resolved.latest.release)
         self.assertTrue(all(key in outputs for key in flow.record_handoff.OUTPUT_KEYS))
         self.assertNotIn('SHIP_DO_TOKEN', self.env)

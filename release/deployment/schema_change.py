@@ -21,6 +21,7 @@ from typing import Any, Iterable, NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import release_record
 import ship_common as common
+import pending_plan
 
 
 GUARDED_TREES = ("internal/database/", "internal/models/")
@@ -649,13 +650,17 @@ def _migration_contract(repo: _Repository, base: str, head: str, reasons: set[st
 
 
 def classify(repo_dir: Path, base: str, head: str, *, mode: str = "forward") -> Classification:
+    return _classify(_Repository(repo_dir), base, head, mode=mode)
+
+
+def _classify(repo: _Repository, base: str, head: str, *, mode: str = "forward") -> Classification:
+    repo_dir = repo.root
     common.require_sha1(base, "internal-error:schema-base")
     common.require_sha1(head, "internal-error:schema-head")
     if mode not in {"forward", "rollback"}:
         common.fail("input-invalid:schema-mode")
     release_record.require_commit(repo_dir, base, "git-failed:schema-guard")
     release_record.require_commit(repo_dir, head, "git-failed:schema-guard")
-    repo = _Repository(repo_dir)
     reasons: set[str] = set()
     summary: list[str] = []
     section = "catalog"
@@ -1032,20 +1037,85 @@ def _v2_tenant_declarations(source: str | None) -> dict[str, str]:
     return output
 
 
+def _v2_pending(repo: _Repository, base: str, head: str, reasons: set[str],
+                summary: list[str], requirements: set[str]) -> bool:
+    """Read the complete immutable pending history; never infer execution.
+
+    Format 1 consumption/activation and non-expand plans remain unsupported.
+    An existing plan is immutable, including its active-byte binding. Empty
+    endpoints do not excuse an invalid or removed intermediate introduction.
+    """
+    raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+    _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+    revisions = raw.decode("ascii").splitlines()
+    _valid(len(revisions) <= MAX_HISTORY_COMMITS and len(set(revisions)) == len(revisions)
+           and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+           and ((base == head and not revisions) or (base != head and revisions and revisions[-1] == head)))
+    prior = None
+    plan = None
+    introduced = False
+    active = None
+    for revision in (base, *revisions):
+        # Without the trailing slash, a blob/gitlink masquerading as the
+        # pending directory is visible too and fails the closed path check.
+        raw = _git(repo.root, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING.rstrip("/")])
+        if not raw:
+            _valid(prior is None)
+            continue
+        reasons.add("pending-format-unsupported")
+        requirements.update(("pending-format-unsupported", "producer-class-unsupported"))
+        _valid(len(raw) <= MAX_ARTIFACT_BYTES and raw.endswith(b"\0"))
+        paths = raw[:-1].decode("utf-8", "strict").split("\0")
+        _valid(len(paths) == pending_plan.MAX_ENTRIES + 2 and len(set(paths)) == len(paths)
+               and all(_path(path) and path.startswith(_V2_PENDING) for path in paths))
+        files = {path: repo.blob(revision, path) for path in paths}
+        _valid(all(type(value) is bytes for value in files.values()))
+        current = tuple(repo.blob(revision, path) for path in (CATALOG, GLOBALS, HISTORY))
+        if active is None:
+            active = tuple(repo.blob(base, path) for path in (CATALOG, GLOBALS, HISTORY))
+        _valid(current == active and all(type(value) is bytes for value in active))
+        plan = pending_plan.parse_bundle(active_catalog=current[0], active_globals=current[1],
+                                         active_history=current[2], files=files, prior_files=prior)
+        if prior is None:
+            introduced = revision != base
+        prior = files
+    if plan is None:
+        return False
+    # This is only the source-declared dormant expansion vocabulary. Opaque
+    # target hashes and operation labels are not SQL/CONCURRENTLY proof.
+    supported = all(entry.kind == "expand" for entry in plan.entries)
+    if supported:
+        reasons.discard("pending-format-unsupported")
+        requirements.discard("pending-format-unsupported")
+    summary.append("pending source plan: active=" + str(plan.active_version) + "; target="
+                   + str(plan.entries[0].version) + "; source=" + head)
+    for path, digest in plan.files:
+        summary.append("pending source file: " + path + " sha256=" + digest)
+    for step in plan.steps:
+        summary.append("pending source step: " + step.id + "; operation=" + step.operation
+                       + "; source_sha256=" + step.source_sha256 + "; requires_gates="
+                       + (",".join(step.requires_gates) or "none"))
+    summary.append("pending source plan only; actual ledger/apply state unavailable; gates not evaluated")
+    if len(plan.steps) > 1 and any(step.requires_gates for step in plan.steps):
+        summary.append("pending gates: a failed gate would hold back unrelated steps; holdback review required")
+    return introduced and supported
+
+
 def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
     """Prepare forward policy; does NOT authorize a release or lift guard().
 
     Source catalog labels are not measured DB shape or signed evidence. Active
-    future catalogs, pending history/steps and additive >=2 producers remain
-    explicitly unsupported. REQUIRE_COMPAT shipping must be adopted atomically.
+    future catalogs, pending-plan producers and additive >=2 producers remain
+    explicitly unsupported. Dormant pending source classification is not a
+    producer or SQL-safety claim. REQUIRE_COMPAT adoption remains atomic.
     """
-    legacy = classify(repo_dir, base, head)
+    repo = _Repository(repo_dir)
+    legacy = _classify(repo, base, head)
     reasons = set(legacy.reasons)
     summary = [line for line in legacy.summary if not line.startswith(("history apply_engine:", "classification:"))]
     requirements = {"compat-required", "generated-migration-closure-ci"}
     migrations: tuple[str, ...] = ()
     kind, dormant = legacy.kind, legacy.dormant
-    repo = _Repository(repo_dir)
     section = "catalog"
     try:
         if repo.blob(base, CATALOG) is None:
@@ -1100,17 +1170,8 @@ def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
                 reasons.add("additive-profile-unsupported")
                 requirements.add("additive-profile-unsupported")
         section = "pending"
-        # PR22 names catalog-v1.json, global_tables.pending.json and a pending
-        # history entry/named steps. Their complete producer grammar is not yet
-        # defined. Never treat arbitrary files in this directory as expansion.
-        for revision in (base, head):
-            pending = _git(repo_dir, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING])
-            if pending:
-                reasons.add("pending-format-unsupported")
-                requirements.add("pending-format-unsupported")
-        if any(path.startswith(_V2_PENDING) for _, path in changes):
-            reasons.add("pending-format-unsupported")
-            requirements.add("pending-format-unsupported")
+        if _v2_pending(repo, base, head, reasons, summary, requirements) and kind == "none":
+            kind, dormant = "expand", True
         section = "registry"
         rows = repo.document(head, REGISTRY, _registry, optional=True) or []
         if len(rows) > 1 and any(row["requires_gates"] for row in rows):

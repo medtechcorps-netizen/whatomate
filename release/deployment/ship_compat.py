@@ -18,6 +18,7 @@ import compat_evidence as evidence
 import compat_request as bridge
 import record_resolver as resolver
 import record_transport as transport
+import forward_gates
 
 common, runtime = transport.common, transport.runtime
 MAX_SECONDS = 900
@@ -52,6 +53,7 @@ class NormalPreflight:
     collected: collect.CollectedHistory = field(repr=False)
     command_count: int
     captured_bytes: int
+    drills: forward_gates.DrillGate | None = None
 
 
 class _Budget:
@@ -191,7 +193,15 @@ def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch
         _need(after == before, "source-changed")
         qualified = bridge.qualify(after, history)
         budget.check()
-        return NormalPreflight(after, qualified, history, budget.commands, budget.captured_bytes)
+        observed_at = wall_clock()
+        _need(type(observed_at) is datetime and observed_at.tzinfo is timezone.utc
+              and observed_at.fold == 0 and observed_at >= history.history.observed_at, "drill-clock")
+        drills = forward_gates.observe_forward_drills(after, now=observed_at)
+        budget.check()
+        return NormalPreflight(after, qualified, history, budget.commands, budget.captured_bytes, drills)
+    except forward_gates.DrillRefusal as exc:
+        budget.failed = True
+        common.fail("schema-change-blocked:" + str(exc))
     except (evidence.CompatRefusal, common.ReleaseError):
         budget.failed = True
         raise
