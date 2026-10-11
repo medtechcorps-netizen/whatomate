@@ -757,9 +757,50 @@ Local validation passed 42 catalog tests plus two fuzz seed groups, 12 CLI tests
 recording the one newly reached source file: the migration closure contains
 231 files and 3,158 declarations. Data-step, seed and active catalog manifests
 remain unchanged. The controlled graph fixture is synthetic and keeps the
-source-derived expectation independent; actual source-built image qualification
-is still required. This baseline does not complete PR16 or activate its engine,
-classifier, production migration or multi-span rollback paths.
+source-derived expectation independent. A subsequent local qualification at
+`dc6ba90d650884c7ef40ad4ab4fbfd2d266203c6` built fresh source images and matched
+all 4,432 production-v0 objects and both default-ACL rows. Runtime DDL was denied
+with SQLSTATE 42501; final catalog/table checks and cleanup restored the original
+Docker resources. Independent review accepted this as a baseline qualification,
+not an active transition or complete old-server compatibility result. The first
+refused build attempt is retained separately. This does not complete PR16 or
+activate production migrations.
+
+## Source classification for planned columns and indexes
+
+The classifier now consumes fixed optional declarations for one nullable int8
+column, one int8 column with a canonical constant default, and one non-unique
+concurrent btree index over an existing ordinary int8 column. The latter two
+declarations live under `internal/dbcatalog/source-classification/`; the original
+nullable declaration remains under its fixed profile path. These interpret
+source intent. They do not execute SQL or prove that an index was built
+concurrently.
+
+Every declaration binds complete raw before/head catalogs, immutable source
+identities, catalog versions and independent definition preimages. A column
+explains only its new column and changed row type; an index explains only its
+new index row. Combined rules must describe the same raw comparison and explain
+disjoint objects. All remaining changes retain normal security, contract,
+history and data precedence. Existing columns, table permissions and unrelated
+objects cannot be hidden by a parent-wide exception. Nullable and constant
+declarations together are ambiguous and refuse. All raw input roles share the
+existing 8 MiB allowance before decoding.
+
+The constant grammar is a bounded canonical signed-int64 string and uses a
+fixed quoted PostgreSQL bigint literal. An isolated PG17.11 template test passed
+18 precommitted cases, including both nullability modes and range boundaries,
+with unchanged original Docker resources after cleanup. The index grammar is
+limited to one existing int8 key, ascending order, nulls last and the built-in
+btree operator class. It excludes expressions, predicates, included columns and
+uniqueness. Index-name checks cover tables, indexes, sequences and standalone
+composite types without confusing ordinary scalar/array type namespaces.
+
+The combined source regression run passed 243 cases: 53 column, 25 index and
+165 v2 classifier/history cases. The earlier nullable change passed 268 distinct
+cases including the legacy classifier; unchanged legacy definitions were also
+independently checked during the combined review. These source rules retain
+the current producer, apply-engine and active-profile holds. Full relation/RLS
+bundles and versioned additive tenant profiles remain separate PR16 work.
 
 ## Validation still required
 
