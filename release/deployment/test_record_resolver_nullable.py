@@ -510,8 +510,11 @@ class NullableResolverTests(unittest.TestCase):
         result = self.prepare(sha, normal=True)
         self.assertIs(type(result), resolver.ForwardResolution)
         self.assertFalse(hasattr(result, "planned_target"))
-        self.assertFalse(any("ls-tree" in args and args[-1].startswith(PREFIX)
-                             for args, _ in self.world.trace))
+        # Source classification may probe its one fixed declaration. The
+        # ordinary route still must not collect any of the six profile slots.
+        rows = [(args[-3], args[-1]) for args, _ in self.world.trace
+                if "ls-tree" in args and args[-1].startswith(PREFIX)]
+        self.assertEqual(rows, [(sha, PREFIX + "source-shape-v1.json")])
 
     def test_source_preparation_preserves_real_classifier_blockers(self):
         _old, sha = self.ordinary()
@@ -609,16 +612,31 @@ class NullableResolverTests(unittest.TestCase):
 
     def test_collection_order_is_fixed_and_final_checks_follow_all_six_reads(self):
         old, sha = self.ordinary()
+        declaration = PREFIX + "source-shape-v1.json"
+        def advance(args):
+            if args[-5:] == ["ls-tree", "-z", sha, "--", declaration]:
+                self.clock.now = 500
+        self.world.after = advance
         result = self.prepare(sha)
         rows = [(i, args[-3], args[-1]) for i, (args, _) in enumerate(self.world.trace)
                 if "ls-tree" in args and args[-1].startswith(PREFIX)]
         expected = [(row.source_sha, row.path) for row in result.observations]
-        self.assertEqual([(source_sha, path) for _i, source_sha, path in rows], expected)
-        self.assertEqual(len(rows), 6)
+        self.assertEqual(len(expected), 6)
+        # Check the whole prefix inventory, not a filter that could hide an
+        # extra read: one classifier declaration, then exactly six data slots.
+        self.assertEqual([(source_sha, path) for _i, source_sha, path in rows],
+                         [(sha, declaration), *expected])
+        self.assertEqual(len(rows), 7)
         tops = [i for i, (args, _) in enumerate(self.world.trace) if "--show-toplevel" in args]
+        self.assertLess(tops[0], rows[0][0])
         self.assertLess(rows[-1][0], tops[-1])
         self.assertTrue(any(i > tops[-1] and args[0] == str(self.gh)
                             for i, (args, _) in enumerate(self.world.trace)))
+        later = [options for _args, options in self.world.trace[rows[0][0] + 1:]]
+        self.assertTrue(later)
+        # The operation started with deadline700. The classifier probe must
+        # consume the same allowance as profile reads and final Git/GH checks.
+        self.assertTrue(all(options["timeout"] < 200 for options in later))
         self.assertEqual(result.observations[0].source_sha, old["sha"])
 
     def test_projection_is_deeply_immutable_and_raw_bytes_are_not_repr(self):
