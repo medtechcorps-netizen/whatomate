@@ -496,13 +496,20 @@ Missing startup contract evidence also refuses: the FORCE RLS negative-control
 fallback is not yet implemented.
 These cases must never be represented by invented observations.
 
-The current catalog adapter supports only the first released baseline
-`e0016b3595114728e7864da2adb44c29065f25ef`. It requires the exact equal v0
-source golden pins, no production profile or overlay at that previous commit,
-and the candidate's exact reviewed production profile plus comments-only NOP
-overlay. Other previous releases or catalog progression refuse. The fallback
-uses the test exporter with a loopback-only DSN inside the owned PostgreSQL
-namespace. Bootstrapping through a future previous image's
+The catalog adapter supports the exact reviewed v0 artifacts. The historical
+`e0016b3595114728e7864da2adb44c29065f25ef` baseline alone permits an absent
+production profile and overlay. Later verified previous releases must contain
+the same pinned golden, global-table list, history, production profile and
+comments-only NOP overlay as the candidate. The public catalog evidence
+distinguishes this equal-v0 mode from the historical empty-overlay mode. The
+profile's `released_source` remains the original production observation's
+provenance. Release and image signature verification remains the caller's
+responsibility; source equality does not authenticate a release. Other catalog
+versions, changed or missing artifacts and arbitrary overlays refuse. Focused
+source-admission tests cover this progression; a later-release full experiment
+has not yet validated it. The fallback still uses the test exporter with a
+loopback-only DSN inside the owned PostgreSQL namespace. Bootstrapping through
+a future previous image's
 `rls-bootstrap-empty` command is not implemented. PR7 remains constrained by
 the conservative migration closure independently of its dormant entrypoint
 exemption.
