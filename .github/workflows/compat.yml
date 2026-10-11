@@ -33,7 +33,7 @@ jobs:
   release-preview:
     name: release-preview
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -59,9 +59,12 @@ jobs:
           install -m 0755 "$tools/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools/gh"
           printf 'COMPAT_GH_BIN=%s\n' "$tools/gh" >> "$GITHUB_ENV"
 
+      # One 600s deadline covers full-chain verification and source classification,
+      # including constructor checks and capture cleanup. The step adds 60s;
+      # the job retains 240s outside that step for checkout, install and upload.
       - name: Freeze latest and selected signed release identities
         id: preview
-        timeout-minutes: 5
+        timeout-minutes: 11
         env:
           GH_TOKEN: ${{ github.token }}
         run: /usr/bin/python3 -I -S -B release/compat/cli.py preview
