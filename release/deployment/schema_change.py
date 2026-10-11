@@ -776,5 +776,352 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+# Preparation-only policy API. No operational caller above selects this API.
+# Requirements describe missing capabilities/obligations, not satisfied gates.
+class PolicyClassification(NamedTuple):
+    kind: str
+    dormant: bool
+    reasons: tuple[str, ...]
+    summary: tuple[str, ...]
+    migration_changes: tuple[str, ...]
+    requirements: tuple[str, ...]
+
+
+_V2_ATTRIBUTES = {
+    "relations": {"relkind": "kind", "rls": "bool", "force_rls": "bool", "owner": "role", "acl": "acl", "security_invoker": "bool", "view_sha256": "hash", "partition_key_sha256": "hash", "partition_bound_sha256": "hash", "parents_sha256": "hash"},
+    "columns": {"position": "int", "type_sha256": "hash", "not_null": "bool", "default_sha256": "hash", "identity": "identity", "generated": "generated", "collation_sha256": "hash", "acl": "acl"},
+    "constraints": {"type": "constraint", "definition_sha256": "hash", "validated": "bool", "deferrable": "bool", "deferred": "bool"},
+    "indexes": {"definition_sha256": "hash", "valid": "bool", "ready": "bool", "live": "bool", "unique": "bool", "primary": "bool", "exclusion": "bool"},
+    "triggers": {"definition_sha256": "hash", "enabled": "enabled", "internal": "bool", "function_sha256": "hash"},
+    "functions": {"source_sha256": "hash", "definition_sha256": "hash", "security_definer": "bool", "owner": "role", "acl": "acl", "config_sha256": "hash", "volatility": "volatility", "parallel": "parallel", "strict": "bool", "leakproof": "bool", "language_sha256": "hash"},
+    "policies": {"command": "command", "permissive": "bool", "roles": "roles", "using_sha256": "hash", "check_sha256": "hash"},
+    "sequences": {"type_sha256": "hash", "start": "int", "increment": "int", "min": "int", "max": "int", "cache": "int", "cycle": "bool", "owner": "role", "acl": "acl", "owned_by_sha256": "hash"},
+    "types": {"type": "type", "definition_sha256": "hash", "owner": "role", "acl": "acl", "enum_sha256": "hash"},
+    "extensions": {"version_sha256": "hash", "relocatable": "bool", "owner": "role"},
+}
+_V2_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
+_V2_ROLES = {"MIGRATION_OWNER", "RUNTIME", "PUBLIC", "OTHER"}
+_V2_CHILDREN = {"columns", "constraints", "indexes", "triggers", "policies"}
+_V2_PENDING = GOLDEN + "pending/"
+_V2_TENANT = "internal/database/tenant.go"
+
+
+def _v2_attribute(shape: str, value: str) -> bool:
+    if type(value) is not str:
+        return False
+    if shape == "hash":
+        return re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    if shape == "bool":
+        return value in {"true", "false"}
+    if shape == "int":
+        return re.fullmatch(r"-?[0-9]{1,20}", value) is not None
+    if shape == "role":
+        return value in _V2_ROLES
+    if shape == "roles":
+        items = value.split(",")
+        return len(value) <= 64 and items == sorted(set(items)) and all(x in _V2_ROLES for x in items)
+    if shape == "acl":
+        if not value:
+            return True
+        entries = value.split(";")
+        if len(value) > 8192 or entries != sorted(set(entries)):
+            return False
+        privileges = {"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "EXECUTE", "USAGE", "CREATE", "CONNECT", "TEMPORARY", "SET", "ALTER_SYSTEM", "MAINTAIN"}
+        for entry in entries:
+            match = re.fullmatch(r"(MIGRATION_OWNER|RUNTIME|PUBLIC|OTHER)>(MIGRATION_OWNER|RUNTIME|PUBLIC):([A-Z_]+):(true|false)", entry)
+            if match is None or match[3] not in privileges:
+                return False
+        return True
+    enums = {"kind": "rpvmfS", "identity": ("", "a", "d"), "generated": ("", "s", "v"),
+             "constraint": "cfpuxnt", "enabled": "ODRA", "volatility": "isv",
+             "parallel": "sru", "command": "*rawd", "type": "bcdeprm"}
+    options = enums.get(shape, ())
+    return value in options and (not isinstance(options, str) or len(value) == 1)
+
+
+def _v2_catalog(value: Any) -> None:
+    """Closed current object schema; version policy is checked separately.
+
+    This does not infer SQL semantics from a definition hash. Parents must be
+    represented public relations, not unverified names supplied by a caller.
+    """
+    _catalog(value)
+    relations = {r["identity"] for r in value["objects"] if r["kind"] == "relations"}
+    for row in value["objects"]:
+        kind, name, parent = row["kind"], row["identity"], row.get("parent", "")
+        if kind in _V2_CHILDREN:
+            _valid(parent in relations and _V2_IDENTIFIER.fullmatch(parent) is not None
+                   and name.startswith(parent + ".") and _V2_IDENTIFIER.fullmatch(name[len(parent) + 1:]) is not None)
+        elif kind == "functions":
+            _valid(not parent and re.fullmatch(r"[a-z_][a-z0-9_]{0,62}\([0-9a-f]{64}\)", name) is not None)
+        else:
+            _valid(not parent and _V2_IDENTIFIER.fullmatch(name) is not None)
+        attrs = row["attributes"]
+        _valid(set(attrs) == set(_V2_ATTRIBUTES[kind]))
+        _valid(all(_v2_attribute(shape, attrs[key]) for key, shape in _V2_ATTRIBUTES[kind].items()))
+
+
+def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals: list,
+                      reasons: set[str], summary: list[str], requirements: set[str]) -> str:
+    """Direct current-format rules; full transitions include every companion.
+
+    A relation-only synthetic expand example is not a complete table migration.
+    Row/array types and other opaque companions conservatively raise its class.
+    """
+    _v2_catalog(before)
+    _v2_catalog(after)
+    _globals(old_globals)
+    _globals(new_globals)
+    left = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in before["objects"]}
+    right = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in after["objects"]}
+    old_global = {r["name"]: r for r in old_globals}
+    new_global = {r["name"]: r for r in new_globals}
+    if any(kind == "functions" and re.fullmatch(r"rereply_tenant_policy_additive_fingerprint_v(?:[2-9]|[1-9][0-9]+)\([0-9a-f]{64}\)", name)
+           for kind, name in right):
+        reasons.add("additive-profile-unsupported")
+        requirements.add("additive-profile-unsupported")
+    old_relations = {name for kind, name in left if kind == "relations"}
+    new_relations = {name for kind, name in right if kind == "relations"} - old_relations
+    # An added exemption is expansion only alongside its new relation. Existing
+    # exemptions (including reason/seed-key changes) remain part of the contract.
+    classification = "none"
+    if any(old_global.get(name) != new_global.get(name) for name in old_global.keys() | new_global.keys()
+           if name not in new_relations or name in old_global):
+        classification = "contract"
+        summary.append("global table policy changed")
+    for key in sorted(left.keys() | right.keys()):
+        old, new = left.get(key), right.get(key)
+        if old == new:
+            continue
+        kind, name = key
+        proposed = "contract"
+        if old is not None:
+            summary.append(("removed " if new is None else "changed ") + kind + " " + name)
+        else:
+            parent, attrs = new
+            summary.append("new " + kind + " " + name)
+            if kind == "relations":
+                relation_kind = attrs["relkind"]
+                if relation_kind in {"r", "p", "f"}:
+                    protected = attrs["rls"] == attrs["force_rls"] == "true"
+                    if not protected and name not in new_global:
+                        reasons.add("unprotected-new-relation:" + name)
+                    elif relation_kind in {"r", "p"}:
+                        proposed = "expand"
+                elif relation_kind == "v":
+                    summary.append("new view " + name)
+                    if attrs["security_invoker"] == "true":
+                        requirements.add("view-dependency-unsupported")
+                elif relation_kind == "m":
+                    summary.append("new materialized view " + name)
+            elif kind == "columns":
+                if (parent in old_relations and attrs["not_null"] == "false"
+                        and attrs["identity"] == attrs["generated"] == attrs["acl"] == ""
+                        and attrs["default_sha256"] == hashlib.sha256(b"").hexdigest()):
+                    proposed = "expand"
+            elif kind == "functions":
+                if attrs["security_definer"] == "true":
+                    summary.append("new definer function " + name)
+                else:
+                    proposed = "expand"
+            elif kind == "indexes" and attrs["unique"] == "false":
+                requirements.add("index-operation-unsupported")
+        if proposed == "contract" or classification == "contract":
+            classification = "contract"
+        elif proposed == "expand":
+            classification = "expand"
+    return classification
+
+
+def _v2_history(before: list, after: list, old_catalog: dict, new_catalog: dict,
+                semantic_changed: bool, kind: str, reasons: set[str]) -> bool:
+    _history(before)
+    _history(after)
+    # Absent and explicit false have identical meaning. No other historical
+    # edit, deletion or insertion is an append-only history.
+    normalize = lambda rows: [{**r, "apply_engine": r.get("apply_engine", False)} for r in rows]
+    if normalize(after[:len(before)]) != normalize(before):
+        reasons.add("history-rewritten")
+    if old_catalog["version"] != before[-1]["version"] or new_catalog["version"] != after[-1]["version"]:
+        reasons.add("history-catalog-version-mismatch")
+    rise = new_catalog["version"] > old_catalog["version"]
+    if semantic_changed != rise or new_catalog["version"] < old_catalog["version"]:
+        reasons.add("history-version-change-mismatch")
+    floor = -1
+    for row in after:
+        if row["min_reader_version"] < floor:
+            reasons.add("history-reader-decreased")
+        if row["min_reader_version"] > max(floor, 0) and row["class"] != "contract":
+            reasons.add("history-reader-requires-contract")
+        floor = row["min_reader_version"]
+    if semantic_changed and kind == "contract" and after[-1]["class"] != "contract":
+        reasons.add("history-class-understated")
+    return after[-1].get("apply_engine", False)
+
+
+def _v2_migrations(repo: _Repository, base: str, head: str, changes: list[tuple[str, str]],
+                   reasons: set[str], summary: list[str]) -> tuple[str, ...]:
+    # Reuse the established first-parent/whole-file introduction fences. Only
+    # the exact endpoint closure observation can become nonblocking, and only
+    # after BOTH endpoints validate as existing contracts with unchanged roots.
+    observed: set[str] = set()
+    protected = _migration_contract(repo, base, head, observed, [])
+    old = repo.document(base, MIGRATION_PATH, lambda _: None, optional=True)
+    new = repo.document(head, MIGRATION_PATH, lambda _: None, optional=True)
+    if not protected or new is None:
+        reasons.add("migration-contract-required")
+        return ()
+    fence_failures = observed - {"migration-path-changed:closure"}
+    if fence_failures:
+        reasons.update(fence_failures)
+        return ()
+    if old is None:
+        # A valid first introduction keeps the old full-file anchor result.
+        # It cannot opt a bundled source/endpoint closure change out of a fence.
+        return ()
+    output = []
+    if old != new:
+        reasons.discard("migration-path-changed:closure")
+        output.append("generated migration closure changed")
+    files = set(old["closure_files"]) & set(new["closure_files"])
+    changed = {path for _, path in changes}
+    for path, name in (*GUARDED_FUNCTIONS, *MIGRATION_FUNCTIONS, *GUARDED_DECLS):
+        reason = f"migration-path-changed:{path}#{name}"
+        if reason in reasons and path in changed and path in files:
+            if old["closure_sha256"] == new["closure_sha256"]:
+                reasons.add("migration-contract-stale")
+            else:
+                reasons.remove(reason)
+                output.append("migration path changed: " + path + "#" + name)
+    summary.extend(output)
+    return tuple(output)
+
+
+def _v2_tenant_declarations(source: str | None) -> dict[str, str]:
+    """Recognize only the existing gofmt top-level literal inventory.
+
+    Alternate declaration syntax refuses; there is no parser for a future
+    additive-version grammar and no inference from a fingerprint string.
+    """
+    if source is None:
+        return {}
+    code = _go_code(source)
+    output = {}
+    for name in ("DirectTenantTables", "RelatedTenantTables", "tenantRLSAdditiveProfileV1"):
+        tokens = list(re.finditer(r"\b" + name + r"\b", code))
+        declaration = re.search(r"(?m)^var " + name + r" = (?:\[\]string|map\[string\]string)\{", code)
+        if not tokens:
+            continue
+        _valid(declaration is not None)
+        opening = declaration.end() - 1
+        depth, end = 1, opening + 1
+        while end < len(code) and depth:
+            depth += (code[end] == "{") - (code[end] == "}")
+            end += 1
+        _valid(depth == 0)
+        output[name] = source[declaration.start():end]
+    return output
+
+
+def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
+    """Prepare forward policy; does NOT authorize a release or lift guard().
+
+    Source catalog labels are not measured DB shape or signed evidence. Active
+    future catalogs, pending history/steps and additive >=2 producers remain
+    explicitly unsupported. REQUIRE_COMPAT shipping must be adopted atomically.
+    """
+    legacy = classify(repo_dir, base, head)
+    reasons = set(legacy.reasons)
+    summary = [line for line in legacy.summary if not line.startswith(("history apply_engine:", "classification:"))]
+    requirements = {"compat-required", "generated-migration-closure-ci"}
+    migrations: tuple[str, ...] = ()
+    kind, dormant = legacy.kind, legacy.dormant
+    repo = _Repository(repo_dir)
+    section = "catalog"
+    try:
+        if repo.blob(base, CATALOG) is None:
+            reasons.add("catalog-baseline-required")
+            return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), (), tuple(sorted(requirements)))
+        old = repo.document(base, CATALOG, _v2_catalog)
+        new = repo.document(head, CATALOG, _v2_catalog)
+        section = "global-tables"
+        old_global = repo.document(base, GLOBALS, _globals)
+        new_global = repo.document(head, GLOBALS, _globals)
+        semantic = _v2_catalog_delta(old, new, old_global, new_global, reasons, summary, requirements)
+        section = "history"
+        before = repo.document(base, HISTORY, _history)
+        after = repo.document(head, HISTORY, _history)
+        if after[-1]["min_reader_version"] > before[-1]["min_reader_version"]:
+            semantic = "contract"
+            summary.append("minimum reader version increased")
+        old_sections = ({(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in old["objects"]},
+                        {r["name"]: r for r in old_global})
+        new_sections = ({(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in new["objects"]},
+                        {r["name"]: r for r in new_global})
+        engine = _v2_history(before, after, old, new, old_sections != new_sections, semantic, reasons)
+        for path in (CATALOG, HISTORY, GLOBALS):
+            reasons.discard("catalog-changed:" + path)
+        if semantic == "contract":
+            kind, dormant = "contract", False
+        elif legacy.kind == "data":
+            kind, dormant = "data", not engine
+        elif semantic == "expand":
+            kind, dormant = "expand", False
+        if semantic != "none" and not engine:
+            reasons.add("active-catalog-without-apply-engine")
+        if engine or old["version"] != 0 or new["version"] != 0:
+            requirements.add("catalog-format/profile-unsupported")
+        section = "history-range"
+        _valid(_git(repo_dir, ["merge-base", base, head]).strip() == base.encode())
+        changes = changed_paths(repo_dir, base, head)
+        _valid(len(changes) <= 10000 and all(_path(path) for _, path in changes))
+        section = "migration-path"
+        migrations = _v2_migrations(repo, base, head, changes, reasons, summary)
+        section = "tenant-profile"
+        if any(path == _V2_TENANT for _, path in changes):
+            left, right = repo.text(base, _V2_TENANT), repo.text(head, _V2_TENANT)
+            if _v2_tenant_declarations(left) != _v2_tenant_declarations(right):
+                kind, dormant = "contract", False
+                summary.append("tenant profile declarations changed")
+            for name in ("tenantRLSRoutingVersion", "tenantRLSAdditiveProfileVersion", "tenantPolicyFingerprintSignature", "tenantAdditivePolicyFingerprintSignature"):
+                if _constant_bytes(left, name) != _constant_bytes(right, name):
+                    kind, dormant = "contract", False
+                    requirements.add("additive-profile-unsupported")
+            if re.search(r"\btenantRLSAdditiveProfileV(?:[2-9]|[1-9][0-9]+)\b", _go_code(right or "")):
+                reasons.add("additive-profile-unsupported")
+                requirements.add("additive-profile-unsupported")
+        section = "pending"
+        # PR22 names catalog-v1.json, global_tables.pending.json and a pending
+        # history entry/named steps. Their complete producer grammar is not yet
+        # defined. Never treat arbitrary files in this directory as expansion.
+        for revision in (base, head):
+            pending = _git(repo_dir, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING])
+            if pending:
+                reasons.add("pending-format-unsupported")
+                requirements.add("pending-format-unsupported")
+        if any(path.startswith(_V2_PENDING) for _, path in changes):
+            reasons.add("pending-format-unsupported")
+            requirements.add("pending-format-unsupported")
+        section = "registry"
+        rows = repo.document(head, REGISTRY, _registry, optional=True) or []
+        if len(rows) > 1 and any(row["requires_gates"] for row in rows):
+            summary.append("gated step inventory: holdback review required; pending/apply state unavailable")
+        if kind == "contract":
+            requirements.add("contract-label")
+        if kind in {"expand", "data", "contract"} and not dormant:
+            requirements.add("restore-drills")
+        if kind != "none" and not (kind == "data" and dormant):
+            requirements.add("producer-class-unsupported")
+        summary.append("policy classification: " + kind + (" (dormant)" if dormant else ""))
+        _valid(len(summary) <= 25000)
+        for line in (*reasons, *summary, *migrations):
+            common.require_public_text(line)
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        reasons.add("classifier-v2-invalid:" + section)
+        if section == "history":
+            requirements.add("history-format-unsupported")
+    return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), migrations, tuple(sorted(requirements)))
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

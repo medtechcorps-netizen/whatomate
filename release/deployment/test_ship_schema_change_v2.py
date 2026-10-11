@@ -1,0 +1,511 @@
+"""Preparation-only v2 policy tests; no release/network/DB capability is granted.
+
+Direct-rule fixtures are intentionally small synthetic catalog fragments. The
+paired-table case demonstrates why they do not prove a full real DB expansion.
+Source-history cases use real commits only inside disposable test repositories.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+import schema_change as sc
+import test_ship_support as support
+
+
+ROOT = Path(__file__).resolve().parents[2]
+H = "a" * 64
+J = "b" * 64
+EMPTY = hashlib.sha256(b"").hexdigest()
+MAIN = "package main\n\nfunc runRLSMigration(args []string) {\n\tprintln(1)\n}\n\nfunc unrelated() {\n\tprintln(2)\n}\n"
+TENANT = "package database\n\nvar DirectTenantTables = []string{\n\t\"t\",\n}\n\nvar RelatedTenantTables = map[string]string{}\n\nvar tenantRLSAdditiveProfileV1 = []string{}\n"
+
+
+def row(kind, name, parent="", **changes):
+    # Independent full wire examples, not generated from the implementation's
+    # attribute inventory. These are data fixtures, not expected-policy code.
+    attrs = {
+        "relations": dict(relkind="r", rls="true", force_rls="true", owner="MIGRATION_OWNER", acl="", security_invoker="false", view_sha256=EMPTY, partition_key_sha256=EMPTY, partition_bound_sha256=EMPTY, parents_sha256=H),
+        "columns": dict(position="2", type_sha256=H, not_null="false", default_sha256=EMPTY, identity="", generated="", collation_sha256=EMPTY, acl=""),
+        "constraints": dict(type="c", definition_sha256=H, validated="true", deferrable="false", deferred="false"),
+        "indexes": dict(definition_sha256=H, valid="true", ready="true", live="true", unique="false", primary="false", exclusion="false"),
+        "triggers": dict(definition_sha256=H, enabled="O", internal="false", function_sha256=H),
+        "functions": dict(source_sha256=H, definition_sha256=H, security_definer="false", owner="MIGRATION_OWNER", acl="", config_sha256=H, volatility="v", parallel="u", strict="false", leakproof="false", language_sha256=H),
+        "policies": dict(command="*", permissive="true", roles="PUBLIC", using_sha256=H, check_sha256=H),
+        "sequences": dict(type_sha256=H, start="1", increment="1", min="1", max="999", cache="1", cycle="false", owner="MIGRATION_OWNER", acl="", owned_by_sha256=H),
+        "types": dict(type="c", definition_sha256=H, owner="MIGRATION_OWNER", acl="", enum_sha256=H),
+        "extensions": dict(version_sha256=H, relocatable="true", owner="MIGRATION_OWNER"),
+    }[kind]
+    attrs.update(changes)
+    result = {"kind": kind, "identity": name, "attributes": attrs}
+    if parent:
+        result["parent"] = parent
+    return result
+
+
+def catalog(objects=None, version=0):
+    return {"version": version, "objects": [row("relations", "t")] if objects is None else objects}
+
+
+def history(version=0, kind="contract", engine=False, floor=0):
+    rows = [{"version": 0, "class": "baseline", "min_reader_version": 0}]
+    if version:
+        rows.append({"version": version, "class": kind, "min_reader_version": floor, "apply_engine": engine})
+    return rows
+
+
+def text(value):
+    return json.dumps(value, sort_keys=True, indent=2) + "\n"
+
+
+def migration(digest=H):
+    return {"version": 1, "roots": sc.MIGRATION_ROOTS,
+            "closure_files": ["cmd/whatomate/main.go", "internal/database/tenant.go"], "closure_sha256": digest}
+
+
+def step(rev=1, digest=H, **changes):
+    value = {"id": "seed", "rev": rev, "func": "database.Seed", "kind": "seed-reconciler",
+             "baseline": False, "idempotent": True, "n1_safe": True, "requires_gates": [],
+             "closure_files": ["cmd/whatomate/main.go"], "closure_sha256": digest}
+    value.update(changes)
+    return value
+
+
+class DirectCurrentFormatRuleTests(unittest.TestCase):
+    """Synthetic direct rules; these do not execute or authenticate migrations."""
+
+    def delta(self, before, after, old_global=None, new_global=None):
+        reasons, summary, needs = set(), [], set()
+        kind = sc._v2_catalog_delta(catalog(before), catalog(after), old_global or [], new_global or [], reasons, summary, needs)
+        return kind, reasons, summary, needs
+
+    def added(self, item, **kwargs):
+        return self.delta([row("relations", "t")], [row("relations", "t"), item], **kwargs)
+
+    def test_direct_protected_new_table(self):
+        for relation_kind in ("r", "p"):
+            with self.subTest(kind=relation_kind):
+                result = self.added(row("relations", "new_table", relkind=relation_kind))
+                self.assertEqual(result[:2], ("expand", set()))
+
+    def test_direct_new_global_table_has_reason(self):
+        result = self.added(row("relations", "new_table", rls="false", force_rls="false"),
+                            new_global=[{"name": "new_table", "reason": "Synthetic global control"}])
+        self.assertEqual(result[:2], ("expand", set()))
+
+    def test_incomplete_rls_protection_is_blocked(self):
+        for enable, force in (("false", "false"), ("true", "false"), ("false", "true")):
+            with self.subTest(enable=enable, force=force):
+                result = self.added(row("relations", "new_table", rls=enable, force_rls=force))
+                self.assertIn("unprotected-new-relation:new_table", result[1])
+
+    def test_existing_rls_change_is_contract(self):
+        for field in ("rls", "force_rls"):
+            with self.subTest(field=field):
+                self.assertEqual(self.delta([row("relations", "t")], [row("relations", "t", **{field: "false"})])[0], "contract")
+
+    def test_invoker_view_keeps_dependency_unknown(self):
+        result = self.added(row("relations", "v", relkind="v", security_invoker="true"))
+        self.assertEqual(result[0], "contract")
+        self.assertIn("view-dependency-unsupported", result[3])
+
+    def test_owner_view_has_required_summary(self):
+        result = self.added(row("relations", "v", relkind="v"))
+        self.assertEqual(result[0], "contract")
+        self.assertIn("new view v", result[2])
+
+    def test_materialized_view_allowlist_does_not_waive_contract(self):
+        self.assertEqual(self.added(row("relations", "v", relkind="m"), new_global=[{"name": "v", "reason": "Synthetic"}])[0], "contract")
+
+    def test_changed_view_definition_is_contract(self):
+        self.assertEqual(self.delta([row("relations", "v", relkind="v")], [row("relations", "v", relkind="v", view_sha256=J)])[0], "contract")
+
+    def test_foreign_table_requires_policy_and_remains_opaque(self):
+        item = row("relations", "foreign_table", relkind="f", rls="false", force_rls="false")
+        self.assertIn("unprotected-new-relation:foreign_table", self.added(item)[1])
+        result = self.added(item, new_global=[{"name": "foreign_table", "reason": "Synthetic"}])
+        self.assertEqual(result[:2], ("contract", set()))
+
+    def test_direct_nullable_column_without_default(self):
+        self.assertEqual(self.added(row("columns", "t.new_col", "t"))[:2], ("expand", set()))
+
+    def test_new_column_opaque_default_is_not_constant_proof(self):
+        for not_null in ("true", "false"):
+            with self.subTest(not_null=not_null):
+                self.assertEqual(self.added(row("columns", "t.new_col", "t", default_sha256=H, not_null=not_null))[0], "contract")
+
+    def test_new_column_identity_generated_or_grant_is_contract(self):
+        for change in ({"identity": "a"}, {"generated": "s"}, {"acl": "MIGRATION_OWNER>PUBLIC:SELECT:false"}):
+            with self.subTest(change=change):
+                self.assertEqual(self.added(row("columns", "t.c", "t", **change))[0], "contract")
+
+    def test_existing_column_semantic_changes_are_contract(self):
+        before = [row("relations", "t"), row("columns", "t.c", "t")]
+        for change in ({"type_sha256": J}, {"default_sha256": J}, {"collation_sha256": J}, {"generated": "s"}, {"identity": "d"}, {"not_null": "true"}, {"position": "3"}):
+            with self.subTest(change=change):
+                self.assertEqual(self.delta(before, [before[0], row("columns", "t.c", "t", **change)])[0], "contract")
+
+    def test_nullable_direction_is_also_contract(self):
+        self.assertEqual(self.delta([row("relations", "t"), row("columns", "t.c", "t", not_null="true")], [row("relations", "t"), row("columns", "t.c", "t")])[0], "contract")
+
+    def test_remove_or_rename_is_contract(self):
+        before = [row("relations", "t"), row("columns", "t.c", "t")]
+        for after in ([before[0]], [before[0], row("columns", "t.renamed", "t")]):
+            with self.subTest(after=after):
+                self.assertEqual(self.delta(before, after)[0], "contract")
+
+    def test_nonunique_index_does_not_prove_concurrently(self):
+        result = self.added(row("indexes", "t.idx", "t"))
+        self.assertEqual(result[0], "contract")
+        self.assertIn("index-operation-unsupported", result[3])
+
+    def test_unique_and_exclusion_indexes_are_contract(self):
+        for change in ({"unique": "true"}, {"exclusion": "true"}):
+            with self.subTest(change=change):
+                self.assertEqual(self.added(row("indexes", "t.idx", "t", **change))[0], "contract")
+
+    def test_new_constraints_and_trigger_are_contract(self):
+        for kind, changes in (("constraints", {"type": "c"}), ("constraints", {"type": "u"}), ("constraints", {"type": "f"}), ("constraints", {"type": "x"}), ("triggers", {})):
+            with self.subTest(kind=kind, changes=changes):
+                self.assertEqual(self.added(row(kind, "t.rule", "t", **changes))[0], "contract")
+
+    def test_existing_index_constraint_trigger_change(self):
+        for kind in ("indexes", "constraints", "triggers"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.delta([row("relations", "t"), row(kind, "t.rule", "t")], [row("relations", "t"), row(kind, "t.rule", "t", definition_sha256=J)])[0], "contract")
+
+    def test_direct_new_invoker_function(self):
+        self.assertEqual(self.added(row("functions", "fn(" + H + ")"))[:2], ("expand", set()))
+
+    def test_new_definer_even_without_public_acl(self):
+        result = self.added(row("functions", "fn(" + H + ")", security_definer="true"))
+        self.assertEqual(result[0], "contract")
+        self.assertIn("new definer function fn(" + H + ")", result[2])
+
+    def test_existing_function_and_policy_hash_changes(self):
+        for old, new in ((row("functions", "fn(" + H + ")"), row("functions", "fn(" + H + ")", source_sha256=J)),
+                         (row("policies", "t.policy", "t"), row("policies", "t.policy", "t", using_sha256=J))):
+            with self.subTest(kind=old["kind"]):
+                self.assertEqual(self.delta([row("relations", "t"), old], [row("relations", "t"), new])[0], "contract")
+
+    def test_existing_privileges_and_global_policy(self):
+        for change in ({"owner": "OTHER"}, {"acl": "MIGRATION_OWNER>PUBLIC:SELECT:false"}):
+            with self.subTest(change=change):
+                self.assertEqual(self.delta([row("relations", "t")], [row("relations", "t", **change)])[0], "contract")
+        self.assertEqual(self.delta([row("relations", "t")], [row("relations", "t")], [], [{"name": "t", "reason": "New exemption"}])[0], "contract")
+
+    def test_new_opaque_type_sequence_extension(self):
+        for kind in ("types", "sequences", "extensions"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.added(row(kind, "item"))[0], "contract")
+
+    def test_additive_fingerprint_name_never_proves_membership(self):
+        result = self.added(row("functions", "rereply_tenant_policy_additive_fingerprint_v2(" + H + ")"))
+        self.assertIn("additive-profile-unsupported", result[1])
+        self.assertIn("additive-profile-unsupported", result[3])
+
+    def test_realistic_new_table_companions_do_not_claim_expand(self):
+        # A real regenerated table includes its composite and array types,
+        # columns, indexes, and policies. No implicit companion exemption.
+        before = [row("relations", "t")]
+        after = before + [row("relations", "new_table"), row("columns", "new_table.id", "new_table", not_null="true"),
+                          row("types", "new_table", type="c"), row("types", "_new_table", type="b"),
+                          row("indexes", "new_table.pk", "new_table", unique="true", primary="true"),
+                          row("constraints", "new_table.pk", "new_table", type="p"), row("policies", "new_table.tenant", "new_table")]
+        self.assertEqual(self.delta(before, after)[:2], ("contract", set()))
+
+    def test_actual_current_catalog_loads_and_order_is_semantic_none(self):
+        actual = json.loads((ROOT / sc.CATALOG).read_bytes())
+        globals_ = json.loads((ROOT / sc.GLOBALS).read_bytes())
+        self.assertEqual(len(actual["objects"]), 4432)
+        sc._v2_catalog(actual)
+        result = self.delta(actual["objects"], list(reversed(actual["objects"])), globals_, list(reversed(globals_)))
+        self.assertEqual(result[:2], ("none", set()))
+
+    def test_closed_attribute_and_identity_schema(self):
+        bad = []
+        missing = row("relations", "t"); del missing["attributes"]["acl"]; bad.append(missing)
+        extra = row("relations", "t"); extra["attributes"]["sql"] = "DROP DATABASE anything"; bad.append(extra)
+        bad.extend([row("relations", "t", rls=True), row("relations", "t", relkind="unknown"), row("relations", "not safe"),
+                    row("relations", "t", owner="raw@example.test"), row("relations", "t", acl="OTHER>OTHER:SELECT:false"),
+                    row("relations", "t", view_sha256="raw SQL"), row("relations", "t", acl="MIGRATION_OWNER>PUBLIC:INVALID:false")])
+        for item in bad:
+            with self.subTest(item=item):
+                with self.assertRaises(sc._Invalid): sc._v2_catalog(catalog([item]))
+
+    def test_duplicate_or_unbound_child_refuses(self):
+        for objects in ([row("relations", "t"), row("relations", "t")], [row("columns", "missing.c", "missing")],
+                        [row("relations", "t"), row("columns", "other.c", "t")]):
+            with self.subTest(objects=objects):
+                with self.assertRaises(sc._Invalid): sc._v2_catalog(catalog(objects))
+
+    def test_acl_and_policy_roles_canonical(self):
+        for item in (row("relations", "t", acl="MIGRATION_OWNER>PUBLIC:SELECT:false;MIGRATION_OWNER>PUBLIC:SELECT:false"),
+                     row("policies", "t.p", "t", roles="RUNTIME,PUBLIC")):
+            with self.subTest(item=item):
+                with self.assertRaises(sc._Invalid): sc._v2_catalog(catalog([row("relations", "t"), item]))
+
+
+class HistoryPolicyTests(unittest.TestCase):
+    def check(self, before, after, old_version, new_version, changed, kind):
+        reasons = set()
+        engine = sc._v2_history(before, after, catalog(version=old_version), catalog(version=new_version), changed, kind, reasons)
+        return reasons, engine
+
+    def test_history_append_and_engine(self):
+        self.assertEqual(self.check(history(), history(1, "expand", True), 0, 1, True, "expand"), (set(), True))
+
+    def test_absent_false_is_equivalent(self):
+        after = history(); after[0]["apply_engine"] = False
+        self.assertEqual(self.check(history(), after, 0, 0, False, "none"), (set(), False))
+
+    def test_history_rewrite_and_delete_refuse(self):
+        before = history(1)
+        for after in (history(), [{"version": 0, "class": "baseline", "min_reader_version": 0, "apply_engine": True}, before[1]]):
+            with self.subTest(after=after): self.assertIn("history-rewritten", self.check(before, after, 1, after[-1]["version"], False, "none")[0])
+
+    def test_version_must_change_iff_sections_change(self):
+        self.assertIn("history-version-change-mismatch", self.check(history(), history(1), 0, 1, False, "none")[0])
+        self.assertIn("history-version-change-mismatch", self.check(history(), history(), 0, 0, True, "contract")[0])
+
+    def test_version_matches_history(self):
+        self.assertIn("history-catalog-version-mismatch", self.check(history(), history(), 0, 1, True, "expand")[0])
+
+    def test_floor_only_contract_and_never_decreases(self):
+        self.assertIn("history-reader-requires-contract", self.check(history(), history(1, "expand", True, 1), 0, 1, True, "expand")[0])
+        self.assertEqual(self.check(history(), history(1, "contract", True, 1), 0, 1, True, "contract")[0], set())
+        before = history(1, "contract", True, 1)
+        after = before + [{"version": 2, "class": "contract", "min_reader_version": 0, "apply_engine": True}]
+        self.assertIn("history-reader-decreased", self.check(before, after, 1, 2, True, "contract")[0])
+
+    def test_declared_expand_cannot_understate_contract(self):
+        self.assertIn("history-class-understated", self.check(history(), history(1, "expand", True), 0, 1, True, "contract")[0])
+
+    def test_future_pending_data_and_step_history_grammar_refuses(self):
+        for change in ({"pending": True}, {"steps": ["create_state"]}, {"class": "data"}):
+            after = history(1); after[1].update(change)
+            with self.subTest(change=change):
+                with self.assertRaises(sc._Invalid): self.check(history(), after, 0, 1, True, "contract")
+
+
+class SourceHistoryPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = support.TempRepo(Path(self.temp.name) / "repo")
+        self.base_files = {sc.CATALOG: text(catalog()), sc.HISTORY: text(history()), sc.GLOBALS: "[]\n",
+                           sc.MIGRATION_PATH: text(migration()), "cmd/whatomate/main.go": MAIN,
+                           "internal/database/tenant.go": TENANT, "README.md": "synthetic\n"}
+        self.base = self.repo.commit(self.base_files, "synthetic policy baseline")
+
+    def result(self, files, base=None):
+        head = self.repo.commit(files)
+        return sc.classify_v2(self.repo.root, base or self.base, head)
+
+    def test_unchanged_catalog_and_unrelated_body(self):
+        result = self.result({"cmd/whatomate/main.go": MAIN.replace("println(2)", "println(3)")})
+        self.assertEqual((result.kind, result.dormant, result.reasons, result.migration_changes), ("none", False, (), ()))
+        self.assertIn("compat-required", result.requirements)
+        with self.assertRaises(AttributeError): result.kind = "expand"
+
+    def test_valid_migration_change_only_new_api_is_nonblocking(self):
+        head = self.repo.commit({"cmd/whatomate/main.go": MAIN.replace("println(1)", "println(3)"), sc.MIGRATION_PATH: text(migration(J))})
+        result = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual(result.reasons, ())
+        self.assertIn("generated migration closure changed", result.migration_changes)
+        self.assertIn("migration path changed: cmd/whatomate/main.go#runRLSMigration", result.migration_changes)
+        self.assertIn("migration-path-changed:closure", sc.check(self.repo.root, self.base, head))
+        with self.assertRaises(sc.SchemaChangeBlocked): sc.guard(self.repo.root, self.base, head)
+        self.assertEqual(sc.classify(self.repo.root, self.base, head, mode="rollback").reasons, ())
+
+    def test_transitive_closure_change_does_not_invent_function(self):
+        result = self.result({sc.MIGRATION_PATH: text(migration(J))})
+        self.assertEqual(result.migration_changes, ("generated migration closure changed",))
+
+    def test_named_migration_with_stale_generated_hash_stays_blocked(self):
+        result = self.result({"cmd/whatomate/main.go": MAIN.replace("println(1)", "println(9)")})
+        self.assertIn("migration-contract-stale", result.reasons)
+        self.assertIn("migration-path-changed:cmd/whatomate/main.go#runRLSMigration", result.reasons)
+
+    def test_missing_contract_remains_blocked(self):
+        result = self.result({sc.MIGRATION_PATH: None})
+        self.assertIn("migration-contract-required", result.reasons)
+        self.assertIn("migration-path-changed:contract-removed", result.reasons)
+
+    def test_malformed_contract_and_roots_refuse(self):
+        value = migration(); value["roots"] = value["roots"][:-1]
+        self.assertIn("classifier-v2-invalid:migration-path", self.result({sc.MIGRATION_PATH: text(value)}).reasons)
+
+    def test_valid_introduction_retains_whole_file_fence(self):
+        absent = self.repo.commit({sc.MIGRATION_PATH: None})
+        good = self.repo.commit({sc.MIGRATION_PATH: text(migration())})
+        self.assertEqual(sc.classify_v2(self.repo.root, absent, good).reasons, ())
+        bundled = self.repo.commit({"cmd/whatomate/main.go": MAIN.replace("println(1)", "println(9)")})
+        result = sc.classify_v2(self.repo.root, absent, bundled)
+        self.assertIn("migration-path-changed:cmd/whatomate/main.go#runRLSMigration", result.reasons)
+
+    def test_introduction_with_bundled_file_change_refuses(self):
+        absent = self.repo.commit({sc.MIGRATION_PATH: None})
+        result = self.result({sc.MIGRATION_PATH: text(migration()), "cmd/whatomate/main.go": MAIN + "// bundled\n"}, base=absent)
+        self.assertIn("migration-path-changed:cmd/whatomate/main.go", result.reasons)
+
+    def test_transient_migration_removal_cannot_be_laundered(self):
+        self.repo.commit({sc.MIGRATION_PATH: None})
+        result = self.result({sc.MIGRATION_PATH: text(migration())})
+        self.assertIn("migration-path-changed:contract-removed", result.reasons)
+
+    def test_registry_revision_then_seed_diff_is_dormant_data(self):
+        base = self.repo.commit({sc.REGISTRY: text([step()])})
+        result = self.result({sc.REGISTRY: text([step(2, J)]), sc.SEEDS: text({"version": 0, "synthetic": ["new_key"]})}, base)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("data", True, ()))
+        self.assertTrue(any("new_key" in line for line in result.summary))
+
+    def test_registry_changed_without_revision_refuses(self):
+        base = self.repo.commit({sc.REGISTRY: text([step()])})
+        self.assertIn("data-step-edited-without-rev:seed", self.result({sc.REGISTRY: text([step(digest=J)])}, base).reasons)
+
+    def test_registry_transient_row_removal_refuses(self):
+        base = self.repo.commit({sc.REGISTRY: text([step()])})
+        self.repo.commit({sc.REGISTRY: "[]"})
+        self.assertIn("data-step-removed:seed", self.result({sc.REGISTRY: text([step(2)])}, base).reasons)
+
+    def test_registry_introduction_bundled_source_refuses(self):
+        result = self.result({sc.REGISTRY: text([step()]), "cmd/whatomate/main.go": MAIN + "// changed\n"})
+        self.assertIn("registry-introduction-changed:cmd/whatomate/main.go", result.reasons)
+
+    def test_direct_expand_policy_keeps_future_producer_unavailable(self):
+        result = self.result({sc.CATALOG: text(catalog([row("relations", "t"), row("columns", "t.c", "t")], 1)), sc.HISTORY: text(history(1, "expand", True))})
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", False, ()))
+        self.assertTrue({"compat-required", "restore-drills", "producer-class-unsupported", "catalog-format/profile-unsupported"} <= set(result.requirements))
+        self.assertTrue(sc.check(self.repo.root, self.base, self.repo.head()))
+
+    def test_active_catalog_engine_false_cannot_claim_dormant_pending(self):
+        result = self.result({sc.CATALOG: text(catalog([row("relations", "t"), row("columns", "t.c", "t")], 1)), sc.HISTORY: text(history(1, "expand", False))})
+        self.assertIn("active-catalog-without-apply-engine", result.reasons)
+        self.assertFalse(result.dormant)
+
+    def test_mixed_data_and_expand_takes_data_class(self):
+        result = self.result({sc.CATALOG: text(catalog([row("relations", "t"), row("columns", "t.c", "t")], 1)), sc.HISTORY: text(history(1, "expand", True)), sc.SEEDS: text({"version": 0, "key": "value"})})
+        self.assertEqual((result.kind, result.dormant), ("data", False))
+        self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_contract_dominates_data_and_requires_label(self):
+        result = self.result({sc.CATALOG: text(catalog([row("relations", "t", rls="false")], 1)), sc.HISTORY: text(history(1, "contract", True)), sc.SEEDS: text({"version": 0})})
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("contract-label", result.requirements)
+
+    def test_reader_floor_raises_expand_to_contract(self):
+        result = self.result({sc.CATALOG: text(catalog([row("relations", "t"), row("columns", "t.c", "t")], 1)), sc.HISTORY: text(history(1, "contract", True, 1))})
+        self.assertEqual((result.kind, result.reasons), ("contract", ()))
+        self.assertIn("contract-label", result.requirements)
+
+    def test_current_registry_introduction_all_actual_seed_lines(self):
+        # Actual public artifacts and every declared closure source are copied
+        # into this disposable repo, not read via Git from the workspace.
+        registry = json.loads((ROOT / sc.REGISTRY).read_bytes())
+        contract = json.loads((ROOT / sc.MIGRATION_PATH).read_bytes())
+        paths = set(contract["closure_files"])
+        for item in registry: paths.update(item["closure_files"])
+        files = {p: (ROOT / p).read_text(encoding="utf-8") for p in paths}
+        files.update({p: (ROOT / p).read_text(encoding="utf-8") for p in (sc.CATALOG, sc.HISTORY, sc.GLOBALS)})
+        files[sc.MIGRATION_PATH] = None
+        base = self.repo.commit(files)
+        additions = {p: (ROOT / p).read_text(encoding="utf-8") for p in (sc.REGISTRY, sc.SEEDS, sc.MIGRATION_PATH)}
+        result = self.result(additions, base)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("data", True, ()))
+        self.assertEqual(sum(s.startswith("seeds diff +") for s in result.summary), len(additions[sc.SEEDS].splitlines()))
+        self.assertGreater(sum(s.startswith("seeds diff +") for s in result.summary), 512)
+
+    def test_core_tenant_change_contract_without_catalog_guess(self):
+        result = self.result({"internal/database/tenant.go": TENANT.replace('"t"', '"new_tenant"'), sc.MIGRATION_PATH: text(migration(J))})
+        self.assertEqual(result.kind, "contract")
+        self.assertIn("tenant profile declarations changed", result.summary)
+
+    def test_future_additive_grammar_is_unsupported(self):
+        result = self.result({"internal/database/tenant.go": TENANT + "\nvar tenantRLSAdditiveProfileV2 = []string{\"new_table\"}\n", sc.MIGRATION_PATH: text(migration(J))})
+        self.assertIn("additive-profile-unsupported", result.reasons)
+
+    def test_shape_only_metadata_preserves_current_boundary(self):
+        result = self.result({"internal/dbcatalog/shape/production-v0.sql": "-- synthetic metadata\n"})
+        self.assertEqual((result.kind, result.reasons), ("none", ()))
+
+    def test_canonical_pending_files_are_unsupported_not_guessed(self):
+        path = sc.GOLDEN + "pending/"
+        result = self.result({path + "catalog-v1.json": text(catalog(version=1)), path + "global_tables.pending.json": "[]"})
+        self.assertIn("pending-format-unsupported", result.reasons)
+        self.assertNotEqual((result.kind, result.dormant), ("expand", True))
+        removed = self.repo.commit({path + "catalog-v1.json": None, path + "global_tables.pending.json": None})
+        self.assertIn("pending-format-unsupported", sc.classify_v2(self.repo.root, self.repo.git("rev-parse", removed + "^").strip(), removed).reasons)
+
+    def test_pending_history_named_steps_remain_unsupported(self):
+        future = history(); future.append({"version": 1, "class": "expand", "min_reader_version": 0, "pending": True, "steps": ["create_state"]})
+        result = self.result({sc.HISTORY: text(future)})
+        self.assertIn("classifier-v2-invalid:history", result.reasons)
+        self.assertIn("history-format-unsupported", result.requirements)
+
+    def test_apply_engine_flag_alone_is_not_authority(self):
+        value = history(); value[0]["apply_engine"] = True
+        result = self.result({sc.HISTORY: text(value)})
+        self.assertIn("history-rewritten", result.reasons)
+        self.assertIn("catalog-format/profile-unsupported", result.requirements)
+
+    def test_gated_inventory_reports_holdback_without_evaluation(self):
+        result = self.result({sc.REGISTRY: text([step(requires_gates=["synthetic_gate"]), step(id="second")])})
+        self.assertTrue(any("holdback review required" in line for line in result.summary))
+
+    def test_invalid_dormant_and_new_uncovered_call_still_block(self):
+        result = self.result({"pkg/new/new.go": "package new\nfunc Run() { BackfillSomething(db) }\n", sc.DORMANT: text([{"file": "pkg/new/new.go", "func": "Run"}])})
+        self.assertIn("classifier-invalid:dormant-entrypoints", result.reasons)
+
+    def test_outside_tree_migration_call_is_not_lifted(self):
+        result = self.result({"pkg/new/new.go": "package new\nfunc Run() { BackfillSomething(db) }\n"})
+        self.assertIn("migration-call:pkg/new/new.go", result.reasons)
+
+    def test_duplicate_json_keys_refuse_without_printing_payload(self):
+        result = self.result({sc.CATALOG: '{"version":0,"version":0,"objects":[]}'})
+        self.assertIn("classifier-v2-invalid:catalog", result.reasons)
+
+    def test_artifact_size_and_mode_bounds(self):
+        head = self.repo.commit({"README.md": "changed"})
+        real_git = sc._git
+        def oversized(root, args):
+            if args[:2] == ["cat-file", "-s"]: return str(sc.MAX_ARTIFACT_BYTES + 1).encode()
+            return real_git(root, args)
+        with mock.patch.object(sc, "_git", side_effect=oversized):
+            self.assertIn("classifier-v2-invalid:catalog", sc.classify_v2(self.repo.root, self.base, head).reasons)
+        def symlink(root, args):
+            output = real_git(root, args)
+            if args and args[0] == "ls-tree" and args[-1] == sc.CATALOG:
+                return output.replace(b"100644 blob", b"120000 blob")
+            return output
+        with mock.patch.object(sc, "_git", side_effect=symlink):
+            self.assertIn("classifier-v2-invalid:catalog", sc.classify_v2(self.repo.root, self.base, head).reasons)
+
+    def test_first_parent_history_cap_refuses_before_reading_rows(self):
+        head = self.repo.commit({"README.md": "changed"})
+        real_git = sc._git
+        def capped(root, args):
+            if args and args[0] == "rev-list": return (head.encode() + b"\n") * (sc.MAX_HISTORY_COMMITS + 1)
+            return real_git(root, args)
+        with mock.patch.object(sc, "_git", side_effect=capped):
+            self.assertIn("classifier-v2-invalid:migration-path", sc.classify_v2(self.repo.root, self.base, head).reasons)
+
+    def test_no_catalog_baseline_does_not_lift_freeze(self):
+        base = self.repo.commit({sc.CATALOG: None})
+        result = self.result({"internal/database/new.go": "package database\n"}, base)
+        self.assertIn("catalog-baseline-required", result.reasons)
+        self.assertIn("guarded-tree:internal/database/new.go", result.reasons)
+
+    def test_nonancestral_source_refuses(self):
+        left = self.repo.commit({"README.md": "left\n"})
+        self.repo.checkout(self.base)
+        result = self.result({"README.md": "right\n"}, left)
+        self.assertIn("classifier-v2-invalid:history-range", result.reasons)
+
+
+if __name__ == "__main__":
+    unittest.main()
