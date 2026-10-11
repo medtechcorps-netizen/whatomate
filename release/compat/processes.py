@@ -78,11 +78,15 @@ class ProcessHandle:
 
 def _configuration(owner, inputs, phase):
     need(type(inputs) is ConfigInputs)
-    need(phase in {"compat-prev-server", "compat-cand-server", *_PHASES})
+    need(phase in {"compat-prev-server", "compat-cand-server", "compat-control", *_PHASES})
     host = owner.namespace + "-pg"
     def url(user, password):
         value = f"postgres://{user}:{password}@{host}:5432/compat?sslmode=disable&application_name={phase}"
-        return value + ("&options=-c%20default_transaction_read_only%3Don" if phase == "compat-n1-ro" else "")
+        return value + ("&options=-c%20default_transaction_read_only%3Don" if phase in {"compat-n1-ro", "compat-control"} else "")
+    if phase == "compat-control":
+        # Catalog CLI reads only the runtime connection; no owner credential.
+        return ('[app]\nenvironment = "test"\n[database]\nurl = ' + json.dumps(url("compat_runtime", inputs.runtime_password))
+                + '\nruntime_role = "compat_runtime"\nrls_enabled = true\n').encode()
     sections = {
         "app": {"name": "ReReply", "environment": "test", "encryption_key": inputs.encryption_key},
         "server": {"host": "0.0.0.0", "port": 8080},
@@ -239,13 +243,15 @@ class OwnedProcesses:
         return observed
 
     def _create(self, slot, version, phase):
-        need(slot in {"web", "migration", "controller"} and slot not in self._ids)
+        need(slot in {"web", "migration", "controller", "catalog"} and slot not in self._ids)
+        need(not self._ids if slot == "catalog" else "catalog" not in self._ids, "process-slot-in-use")
         need(not ({"web", "migration"} & set(self._ids)) if slot in {"web", "migration"} else True,
              "process-slot-in-use")
         image, binding = self._images[version], self.bindings[version]
         controller = slot == "controller"
         command = [] if controller else ["-ec", _WAIT_CONFIG +
-            ("server" if slot == "web" else "rls-migrate") + " -config /compat/private/config.toml"]
+            ("server" if slot == "web" else "catalog-snapshot" if slot == "catalog" else "rls-migrate")
+            + " -config /compat/private/config.toml" + (" -mode compare" if slot == "catalog" else "")]
         name = self.owner.namespace + "-" + slot
         labels = dict(image["Config"].get("Labels") or {})
         labels.update({stack.LABEL: self.owner.token, stack.ROLE_LABEL: slot,
@@ -319,6 +325,31 @@ class OwnedProcesses:
         need(code <= 255 and self._check("migration", running=False)["State"].get("ExitCode") == code,
              "process-exit-invalid")
         return code  # Not a migration or compatibility verdict.
+
+    def start_catalog(self, inputs):
+        """Fixed candidate CLI, runtime startup read-only; no active peers."""
+        return self._start("catalog", "candidate", "compat-control", inputs)
+
+    def wait_catalog(self, handle):
+        """Return actual complete CLI bytes, not an accepted catalog result."""
+        need(type(handle) is ProcessHandle and self._handles.get("catalog") is handle)
+        self._assert_all()
+        waited = self._call(["container", "wait", handle.container_id], timeout=90)
+        need(type(waited.returncode) is int and waited.returncode == 0 and not waited.stderr
+             and re.fullmatch(rb"(?:0|[1-9][0-9]{0,2})\n?", waited.stdout) is not None, "catalog-exit-invalid")
+        code = int(waited.stdout)
+        row = self._check("catalog", running=False)
+        state = row["State"]
+        need(row["HostConfig"].get("LogConfig") in ({"Type":"json-file","Config":{}},
+             {"Type":"json-file","Config":{"max-size":"-1"}}) and row["Config"].get("Tty") is False,
+             "catalog-log-driver-unproven")
+        need(code <= 255 and type(state.get("ExitCode")) is int and state["ExitCode"] == code
+             and not state.get("OOMKilled") and not state.get("Error"), "catalog-exit-invalid")
+        streams = self._call(["logs", handle.container_id], timeout=10)
+        need(type(streams.returncode) is int and streams.returncode == 0
+             and type(streams.stdout) is bytes and type(streams.stderr) is bytes, "catalog-log-incomplete")
+        self._check("catalog", running=False)
+        return runtime.Capture(code, streams.stdout, streams.stderr)
 
     def controller(self, request: bytes) -> bytes:
         """One invocation, private bytes only; no transport retry or disk output."""

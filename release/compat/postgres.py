@@ -170,6 +170,7 @@ class SyntheticPostgres:
         self.capture = capture
         self._seal = object()
         self._phase = None
+        self._control_attempted = False
         self._probe_signature = None
         self._binding = self._inspect()
 
@@ -322,6 +323,38 @@ class SyntheticPostgres:
         need(_json_lines(result.stdout) == [['installed']])
         self._probe_signature, _ = self._probe_state()
         self._check()
+
+    def read_only_control(self):
+        """One deliberately failing fixed CREATE, never a privilege grant.
+
+        Separate statements make the server's failed-statement diagnostic bind
+        exactly READ_ONLY_CONTROL_SQL (without a batch prefix or semicolon).
+        Private client stderr is not relied on for the SQLSTATE proof.
+        """
+        need(not self._control_attempted and self._phase is None and self._probe_signature is not None,
+             "pg-control-already-attempted")
+        self._control_attempted = True
+        phase = self.begin_phase("compat-control")
+        args = ['exec', '-i', '--env', 'PGAPPNAME=compat-control', '--env', 'PGCLIENTENCODING=UTF8',
+                '--env', 'PGOPTIONS=-c default_transaction_read_only=on', self.container,
+                'psql', '-X', '-w', '-qAt', '-h', SOCKET_DIRECTORY, '-p', '5432',
+                '-U', 'compat_owner', '-d', 'compat', '-v', 'ON_ERROR_STOP=1']
+        # A separate read validates the startup option under the exact owner.
+        state = self._call(args, input_bytes=b"SELECT json_build_array(current_user,current_setting('transaction_read_only'))")
+        need(type(state.returncode) is int and state.returncode == 0 and not state.stderr
+             and _json_lines(state.stdout) == [['compat_owner', 'on']], 'pg-control-session-invalid')
+        self._check()
+        result = self._call(args, input_bytes=proof.READ_ONLY_CONTROL_SQL.encode())
+        need(type(result.returncode) is int and 1 <= result.returncode <= 255 and not result.stdout,
+             'pg-control-did-not-fail')
+        captured = self.finish_phase(phase)
+        log = proof.parse_pg_log(captured['log']['raw'], application='compat-control', complete=True)
+        expected = sha(proof.READ_ONLY_CONTROL_SQL.encode())
+        need(log.error_states == ('25006',) and log.failed_statements == (('25006', expected),)
+             and log.statement_hashes in ((), (expected,)) and not captured['markers']['hashes'],
+             'pg-control-unproven')
+        return {'execution': {'status': 'completed', 'exit_code': result.returncode, 'failure': None},
+                'sqlstate': '25006', 'log': captured['log']}
 
     def _probe_state(self):
         rows = _json_lines(self._sql(_READ_HEADER + _PROBE_STATE + 'COMMIT;\n').stdout)

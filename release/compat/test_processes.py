@@ -44,6 +44,9 @@ class World(test_stack.DockerWorld):
         self.response = None
         self.response_exit = 0
         self.raise_secret = False
+        self.catalog_response = b"{}\n"
+        self.catalog_stderr = b""
+        self.catalog_exit = 0
 
     @staticmethod
     def flags(args, start):
@@ -67,8 +70,8 @@ class World(test_stack.DockerWorld):
             self.mutations.append(list(args))
             assert args[2:4] == ["--user", "rereply"] and args[5:] == ["/bin/sh", "-ec", p._WRITE_CONFIG]
             self.configs[args[4]] = tomllib.loads(options["input_bytes"].decode())
-            if self.containers[args[4]]["Config"]["Labels"][p.stack.ROLE_LABEL] == "migration":
-                self.containers[args[4]]["State"].update(Running=False, ExitCode=0)
+            if self.containers[args[4]]["Config"]["Labels"][p.stack.ROLE_LABEL] in {"migration","catalog"}:
+                self.containers[args[4]]["State"].update(Running=False, ExitCode=self.catalog_exit if self.containers[args[4]]["Config"]["Labels"][p.stack.ROLE_LABEL]=="catalog" else 0)
             return p.runtime.Capture(0, b"", b"")
         if args[:4] == ["container", "start", "--attach", "--interactive"]:
             self.calls.append((list(args), options)); self.mutations.append(list(args))
@@ -76,6 +79,10 @@ class World(test_stack.DockerWorld):
             raw = self.response if self.response is not None else json.dumps({"version": 1, "status": "ok",
                  "operation": "readiness", "ready": {"web": True, "graph": True}}).encode()
             return p.runtime.Capture(self.response_exit, raw, b"")
+        if args[:1] == ["logs"]:
+            self.calls.append((list(args),options))
+            assert self.containers[args[1]]["Config"]["Labels"][p.stack.ROLE_LABEL]=="catalog"
+            return p.runtime.Capture(0,self.catalog_response,self.catalog_stderr)
         if args[:2] == ["container", "wait"]:
             self.calls.append((list(args), options))
             return p.runtime.Capture(0, str(self.containers[args[2]]["State"]["ExitCode"]).encode(), b"")
@@ -94,6 +101,9 @@ class World(test_stack.DockerWorld):
             if "--entrypoint" in flags:
                 row["Config"]["Entrypoint"] = flags["--entrypoint"]
             row["RestartCount"] = 0
+            if row["Config"]["Labels"][p.stack.ROLE_LABEL]=="catalog":
+                row["Config"]["Tty"]=False
+                row["HostConfig"]["LogConfig"]={"Type":"json-file","Config":{}}
             return p.runtime.Capture(0, identifier.encode(), b"")
         return result
 
@@ -118,6 +128,45 @@ class ProcessTests(unittest.TestCase):
                     product_origin=self.owner.planned_web_origin, stub_origin=self.owner.graph_origin,
                     account_name=self.owner.namespace + "-wa", email=self.owner.namespace + "-client@example.test")
         return json.dumps({"version": 1, "operation": operation, "fixture": asdict(f), **extra}).encode()
+
+    def test_catalog_fixed_runtime_readonly_command_and_complete_exit(self):
+        m=self.manager(); h=m.start_catalog(INPUTS)
+        cfg=self.world.configs[h.container_id]
+        self.assertEqual(set(cfg),{"app","database"})
+        self.assertEqual(set(cfg["database"]),{"url","runtime_role","rls_enabled"})
+        self.assertIn("compat_runtime:"+INPUTS.runtime_password,cfg["database"]["url"])
+        self.assertIn("application_name=compat-control",cfg["database"]["url"])
+        self.assertIn("default_transaction_read_only%3Don",cfg["database"]["url"])
+        self.assertNotIn(INPUTS.owner_password,json.dumps(cfg))
+        command=self.world.containers[h.container_id]["Config"]["Cmd"]
+        self.assertEqual(command,["-ec",p._WAIT_CONFIG+"catalog-snapshot -config /compat/private/config.toml -mode compare"])
+        got=m.wait_catalog(h)
+        self.assertEqual(got,p.runtime.Capture(0,b"{}\n",b""))
+        m.remove(h);m.close();self.owner.cleanup()
+
+    def test_catalog_slot_excludes_web_migration_and_controller(self):
+        m=self.manager(); h=m.start_web("previous",INPUTS); before=len(self.world.mutations)
+        with self.assertRaises(p.proof.EvidenceError):m.start_catalog(INPUTS)
+        self.assertEqual(len(self.world.mutations),before);m.remove(h)
+        cat=m.start_catalog(INPUTS);before=len(self.world.mutations)
+        with self.assertRaises(p.proof.EvidenceError):m.start_web("candidate",INPUTS)
+        with self.assertRaises(p.proof.EvidenceError):m.start_migration("compat-fwd",INPUTS)
+        with self.assertRaises(p.proof.EvidenceError):m._create("controller","controller","compat-control")
+        self.assertEqual(len(self.world.mutations),before)
+        m.remove(cat)
+
+    def test_catalog_rotating_or_non_json_logs_refuse(self):
+        m=self.manager();h=m.start_catalog(INPUTS)
+        for log in ({"Type":"local","Config":{}},{"Type":"json-file","Config":{"max-size":"1m"}},None):
+            self.world.containers[h.container_id]["HostConfig"]["LogConfig"]=log
+            with self.assertRaises(p.proof.EvidenceError):m.wait_catalog(h)
+
+    def test_catalog_wait_preserves_nonzero_stderr_and_rejects_false_exit(self):
+        m=self.manager();self.world.catalog_exit=2;self.world.catalog_stderr=b"fixed-failure"
+        h=m.start_catalog(INPUTS);got=m.wait_catalog(h)
+        self.assertEqual(got.returncode,2);self.assertEqual(got.stderr,b"fixed-failure")
+        self.world.containers[h.container_id]["State"]["ExitCode"]=False
+        with self.assertRaises(p.proof.EvidenceError):m.wait_catalog(h)
 
     def test_owned_versions_swap_same_alias_and_exact_cleanup(self):
         m = self.manager()

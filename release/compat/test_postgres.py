@@ -59,6 +59,11 @@ class FakeDocker:
         self.fail_sql = False
         self.mutate_after_data = False
         self.omit_end = False
+        self.control_code = 3
+        self.control_state = "25006"
+        self.control_sql = proof.READ_ONLY_CONTROL_SQL
+        self.control_missing = False
+        self.control_owner = ["compat_owner","on"]
         self.network = {'Id': 'd'*64, 'Internal': True, 'Labels': {pg.LABEL: TOKEN}}
 
     def __call__(self, argv, **options):
@@ -75,6 +80,17 @@ class FakeDocker:
         script = options['input_bytes'].decode()
         if self.fail_sql:
             return runtime.Capture(3, b'private', b'private')
+        if script == "SELECT json_build_array(current_user,current_setting('transaction_read_only'))":
+            assert args[args.index('-U')+1]=='compat_owner'
+            assert 'PGAPPNAME=compat-control' in args and 'PGOPTIONS=-c default_transaction_read_only=on' in args
+            return runtime.Capture(0,output(self.control_owner),b'')
+        if script == proof.READ_ONLY_CONTROL_SQL:
+            assert args[args.index('-U')+1]=='compat_owner'
+            assert 'PGAPPNAME=compat-control' in args and 'PGOPTIONS=-c default_transaction_read_only=on' in args
+            if not self.control_missing:
+                self.stderr += line('compat-control','ERROR','cannot execute CREATE TABLE in a read-only transaction',self.control_state)
+                self.stderr += line('compat-control','STATEMENT',self.control_sql,self.control_state)
+            return runtime.Capture(self.control_code,b'',b'private client diagnostic')
         if "json_build_array('inventory'" in script:
             token = re.search(r"json_build_array\('complete','([0-9a-f]{32})'\)", script)[1]
             data = output(self.state, ['inventory', self.inventory], *self.rows,
@@ -115,6 +131,29 @@ class CollectorTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_fixed_owner_readonly_control_matches_logged_exact_create(self):
+        self.db.install_probe()
+        result=self.db.read_only_control()
+        self.assertEqual(result['sqlstate'],'25006')
+        self.assertEqual(result['execution'],{'status':'completed','exit_code':3,'failure':None})
+        log=proof.parse_pg_log(result['log']['raw'],application='compat-control',complete=True)
+        self.assertEqual(log.failed_statements,(('25006',pg.sha(proof.READ_ONLY_CONTROL_SQL.encode())),))
+        count=len(self.fake.calls)
+        with self.assertRaises(proof.EvidenceError):self.db.read_only_control()
+        self.assertEqual(len(self.fake.calls),count)
+
+    def test_readonly_control_success_missing_wrong_state_or_sql_refuses(self):
+        for field,value in (('control_code',0),('control_missing',True),('control_state','42501'),
+                            ('control_sql','UPDATE public.contacts SET name=name'),('control_owner',['compat_owner','off'])):
+            with self.subTest(field=field):
+                fake=FakeDocker();setattr(fake,field,value)
+                db=pg.SyntheticPostgres('docker',self.config,ID,TOKEN,'compat_runtime',capture=fake)
+                db.install_probe()
+                with self.assertRaises(proof.EvidenceError):db.read_only_control()
+                count=len(fake.calls)
+                with self.assertRaises(proof.EvidenceError):db.read_only_control()
+                self.assertEqual(len(fake.calls),count)
 
     def test_actual_fixed_transport_and_complete_capture(self):
         capture = self.db.capture_tables()

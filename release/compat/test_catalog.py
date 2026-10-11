@@ -1,0 +1,211 @@
+"""Source/CLI collection contract tests: local Git and fake Docker/PG only."""
+from dataclasses import replace
+import copy
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+import catalog as c
+import test_processes
+import test_postgres
+import test_stack
+
+REPO=Path(__file__).resolve().parents[2]
+HEAD="e"*40
+BLOBS={name:(REPO/name).read_bytes() for name in c._PINS}
+ENTRY=c.runtime.release_record.Entry("prod-20261011T000000Z-e0016b35","promote",c._BASE,
+    {"web":test_processes.PREV},"1"*64,"2026-10-11T00:00:00Z",None,None,False,{})
+
+
+class Git:
+    def __init__(self):
+        self.calls=[];self.changed=None;self.present=False;self.fail=False
+    def __call__(self,argv,**options):
+        self.calls.append((argv,options));args=argv[3:]
+        assert argv[:2]==["git","-C"] and options['timeout']==30
+        if self.fail:return c.runtime.Capture(1,b'',b'private path')
+        if args[:2]==['cat-file','-t']:raw=b'commit\n'
+        elif args[:2]==['merge-base','--is-ancestor']:raw=b''
+        elif args[0]=='ls-tree':raw=b'present' if self.present else b''
+        elif args[:2]==['cat-file','blob']:
+            sha,path=args[2].split(':',1);raw=BLOBS[path]
+            if self.changed and self.changed(sha,path):raw+=b' '
+        else:raise AssertionError('unknown source route')
+        return c.runtime.Capture(0,raw,b'')
+
+
+def compare(contract):
+    profile=json.loads(BLOBS[c._PROFILE])
+    return {'sha256':contract.target_sha256,'match':False,
+        'differences':[{'kind':d['kind'],'identity':d['identity'],'status':'changed'} for d in profile['delta']],
+        'unknown':[],'count_only':{name:0 for name in c._COUNT_KEYS},
+        'ownership':{'migration_owner_owns_database':True,'migration_owner_owns_public_schema':True}}
+
+
+class World(test_processes.World):
+    def __init__(self):
+        super().__init__()
+        self.images[test_processes.PREV]['Config']['Labels'][c.processes.stack.SOURCE_LABEL]=c._BASE
+        self.inventory=[]
+        for row in json.loads(BLOBS[c._GOLDEN])['objects']:
+            if row['kind']=='relations':self.inventory.append([row['identity'],'r',[copy.deepcopy(test_postgres.COLUMN)]])
+        self.state=copy.deepcopy(test_postgres.STATE)
+        self.data_calls=[]
+    def capture(self,argv,**options):
+        args=argv[5:]
+        if args[:1]==['inspect'] or (args[:2]==['network','inspect'] and options['stderr_limit']==c.runtime.MAX_STREAM):
+            self.calls.append((list(args),options))
+            assert options['stdout_limit']<=c.runtime.MAX_STREAM and options['stderr_limit']<=c.runtime.MAX_STREAM
+            value=self.containers[args[1]] if args[0]=='inspect' else self.network
+            return c.runtime.Capture(0,json.dumps([value]).encode(),b'')
+        if args[:2]==['exec','-i'] and '--user' not in args:
+            self.calls.append((list(args),options))
+            script=options['input_bytes'].decode()
+            if "json_build_array('inventory'" in script:
+                import re
+                token=re.search(r"json_build_array\('complete','([0-9a-f]{32})'\)",script)[1]
+                self.data_calls.append(len(self.calls))
+                return c.runtime.Capture(0,test_postgres.output(self.state,['inventory',self.inventory],['complete',token]),b'')
+            assert "json_build_array('state'" in script
+            return c.runtime.Capture(0,test_postgres.output(self.state),b'')
+        return super().capture(argv,**options)
+
+
+class CatalogTests(unittest.TestCase):
+    def setUp(self):
+        self.git=Git()
+        self.contract=c.CatalogContract(REPO,ENTRY,HEAD,base_env={},capture=self.git)
+        self.good=compare(self.contract)
+
+    def encoded(self,value):return (json.dumps(value)+'\n').encode()
+
+    def test_actual_source_bound_127_tables_and_first_baseline_nop(self):
+        self.assertEqual(len(self.contract.expected_preexisting_tables),127)
+        self.assertEqual(self.contract.expected_preexisting_tables,tuple(sorted(set(self.contract.expected_preexisting_tables))))
+        self.assertIn(c.postgres.identity('organizations'),self.contract.expected_preexisting_tables)
+        self.assertEqual(self.contract.public()['base_overlay'],'explicit-empty-first-baseline')
+        self.assertEqual(self.contract.target_sha256,'1c85a9ad0b9bb652ea21b51faa2ee887592dacb00c7f4b388de5ef5d6085a4e7')
+        self.assertTrue(all('HEAD' not in a for a,_ in self.git.calls))
+
+    def test_real_local_git_immutable_bytes_not_working_tree(self):
+        # Git reads only; no branch/ref/worktree mutation and no remote calls.
+        head=subprocess.check_output(['git','-C',str(REPO),'rev-parse','HEAD'],text=True).strip()
+        env={k:v for k,v in os.environ.items() if k in {'PATH','SYSTEMROOT','SystemRoot','TEMP','TMP','COMSPEC','ComSpec'}}
+        actual=c.CatalogContract(REPO,ENTRY,head,base_env=env)
+        self.assertEqual(actual.expected_preexisting_tables,self.contract.expected_preexisting_tables)
+
+    def test_future_source_or_head_mutation_or_existing_base_overlay_refuses(self):
+        with self.assertRaises(c.proof.EvidenceError):c.CatalogContract(REPO,ENTRY._replace(sha='a'*40),HEAD,base_env={},capture=self.git)
+        for sha,path in ((HEAD,c._GOLDEN),(c._BASE,c._GOLDEN),(HEAD,c._PROFILE),(HEAD,c._OVERLAY)):
+            with self.subTest(sha=sha,path=path):
+                fake=Git();fake.changed=lambda a,b:a==sha and b==path
+                with self.assertRaises(c.proof.EvidenceError):c.CatalogContract(REPO,ENTRY,HEAD,base_env={},capture=fake)
+        fake=Git();fake.present=True
+        with self.assertRaises(c.proof.EvidenceError):c.CatalogContract(REPO,ENTRY,HEAD,base_env={},capture=fake)
+
+    def test_source_read_failure_not_empty_overlay(self):
+        fake=Git();fake.fail=True
+        with self.assertRaises(c.proof.EvidenceError) as got:c.CatalogContract(REPO,ENTRY,HEAD,base_env={},capture=fake)
+        self.assertNotIn('private',str(got.exception))
+
+    def test_compare_false_72_is_valid_without_rehashing_catalog(self):
+        self.assertEqual(len(self.good['differences']),72)
+        self.assertEqual(self.contract.parse_compare(self.encoded(self.good)),self.contract.target_sha256)
+        changed=copy.deepcopy(self.good);changed['sha256']='a'*64
+        self.assertEqual(self.contract.parse_compare(self.encoded(changed)),'a'*64)
+        equal=copy.deepcopy(self.good);equal['match']=True;equal['differences']=[]
+        self.assertEqual(self.contract.parse_compare(self.encoded(equal)),self.contract.target_sha256)
+
+    def test_strict_json_and_closed_known_difference_vocabulary(self):
+        original=self.encoded(self.good)
+        cases=[original+b'{}', original.replace(b'"match": false',b'"match": false,"match": false'),
+               original.replace(b'"match": false',b'"match": NaN'),b'notjson\n',original[:-1]]
+        for key,value in (('sha256','bad'),('match',1),('match',True),('unknown',[{'kind':'functions','count':1}]),
+                          ('seeds',[]),('count_only',{}),('ownership',{'migration_owner_owns_database':True,'migration_owner_owns_public_schema':1})):
+            data=copy.deepcopy(self.good);data[key]=value;cases.append(self.encoded(data))
+        for difference in ({'kind':'columns','identity':'private.unknown','status':'changed'},
+                           {'kind':'columns','identity':'organizations.id','status':'anything'},
+                           {'kind':'columns','identity':'organizations.id','status':{}}):
+            data=copy.deepcopy(self.good);data['differences']=[difference];cases.append(self.encoded(data))
+        data=copy.deepcopy(self.good);data['differences'].append(data['differences'][0]);cases.append(self.encoded(data))
+        data=copy.deepcopy(self.good);data['count_only']['oids']=False;cases.append(self.encoded(data))
+        for raw in cases:
+            with self.subTest(size=len(raw)):
+                with self.assertRaises(c.proof.EvidenceError):self.contract.parse_compare(raw)
+
+    def test_inventory_cannot_come_from_incomplete_capture(self):
+        good=dict.fromkeys(self.contract.expected_preexisting_tables,'0'*64)
+        for values in ({},dict(list(good.items())[:-1]),{**good,'a'*64:'0'*64}):
+            capture=c.postgres.TableCapture(object(),{},values,True)
+            with self.assertRaises(c.proof.EvidenceError):self.contract.check_initial_tables(capture)
+        with self.assertRaises(c.proof.EvidenceError):self.contract.check_initial_tables(c.postgres.TableCapture(object(),{},good,False))
+
+    def setup_owned(self):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        self.world=World()
+        self.owner=c.processes.stack.OwnedStack('docker',Path(tmp.name),test_stack.SOURCE,
+            c.processes.stack.GraphImage(test_stack.GRAPH,test_stack.SOURCE),token=test_stack.TOKEN,capture=self.world.capture)
+        self.owner.start()
+        self.manager=c.processes.OwnedProcesses(self.owner,
+            c.processes.ImageBinding(test_processes.PREV,'sha256:'+'4'*64,c._BASE,test_processes.RECIPE),
+            c.processes.ImageBinding(test_processes.CAND,test_processes.CAND,HEAD,test_processes.RECIPE),
+            c.processes.ImageBinding(test_processes.CONTROL,test_processes.CONTROL,'f'*40,test_processes.RECIPE))
+        self.pg=c.postgres.SyntheticPostgres('docker',Path(tmp.name),self.owner._ids['pg'],self.owner.token,'compat_runtime',capture=self.world.capture)
+        self.world.catalog_response=self.encoded(self.good)
+        return c.OwnedCatalog(self.manager,self.pg,self.contract)
+
+    def test_actual_classes_cli_then_digests_and_fixed_projection(self):
+        observer=self.setup_owned()
+        seen,before=observer.initial(test_processes.INPUTS)
+        self.assertEqual(seen.sha256,self.contract.target_sha256)
+        self.assertEqual(before.identities(),list(self.contract.expected_preexisting_tables))
+        self.assertFalse(self.manager._ids)
+        first_data=self.world.data_calls[0]
+        calls=[args for args,_ in self.world.calls]
+        log_index=next(i for i,args in enumerate(calls) if args[:1]==['logs'])
+        self.assertLess(log_index,first_data)
+        self.world.inventory[0][2].append(['added','pg_catalog','text',-1,2])
+        _,forward=observer.after_phase(test_processes.INPUTS,original_columns=True)
+        self.assertEqual(forward.public(),before.public())
+        _,d0=observer.after_phase(test_processes.INPUTS)
+        self.assertNotEqual(d0.public(),before.public())
+        self.assertEqual(set(d0.identities()),set(before.identities()))
+        with self.assertRaises(c.proof.EvidenceError):observer.initial(test_processes.INPUTS)
+        self.manager.close();self.owner.cleanup()
+
+    def test_active_phase_and_missing_inventory_refuse(self):
+        observer=self.setup_owned();self.pg._phase=object();before=len(self.world.mutations)
+        with self.assertRaises(c.proof.EvidenceError):observer.initial(test_processes.INPUTS)
+        self.assertEqual(len(self.world.mutations),before)
+        observer=self.setup_owned();self.world.inventory.pop()
+        with self.assertRaises(c.proof.EvidenceError):observer.initial(test_processes.INPUTS)
+        self.assertTrue(self.manager._protocol_failed)
+
+    def test_cli_nonzero_stderr_malformed_or_catalog_mismatch_never_initial_success(self):
+        for kind in ('nonzero','stderr','malformed','mismatch'):
+            with self.subTest(kind=kind):
+                observer=self.setup_owned()
+                if kind=='nonzero':self.world.catalog_exit=1
+                if kind=='stderr':self.world.catalog_stderr=b'fixed-error'
+                if kind=='malformed':self.world.catalog_response=b'{}\n'
+                if kind=='mismatch':
+                    changed=copy.deepcopy(self.good);changed['sha256']='0'*64;self.world.catalog_response=self.encoded(changed)
+                with self.assertRaises(c.proof.EvidenceError):observer.initial(test_processes.INPUTS)
+                self.assertTrue(self.manager._protocol_failed)
+                self.assertFalse(self.manager._ids)
+                self.assertFalse(self.world.data_calls)
+
+    def test_quiescence_and_image_binding_refuse(self):
+        observer=self.setup_owned();self.world.state[9]=1
+        with self.assertRaises(c.proof.EvidenceError):observer.initial(test_processes.INPUTS)
+        self.assertFalse(self.world.data_calls)
+        observer=self.setup_owned();self.manager.bindings['candidate']=replace(self.manager.bindings['candidate'],source_sha='a'*40)
+        with self.assertRaises(c.proof.EvidenceError):c.OwnedCatalog(self.manager,self.pg,self.contract)
+
+
+if __name__=='__main__':unittest.main(verbosity=2)
