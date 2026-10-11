@@ -5,6 +5,7 @@ the isolated stack, synthetic accounts/entitlements/legacy-reply allowlist,
 stable configuration across versions, and process/worker/SQL evidence. No I/O
 occurs at import. No POST/PUT is retried, even after an ambiguous transport error.
 Completed retained reads preserve bounded value mismatches as false cases.
+Complete write readbacks retain those flags privately across same-client reads.
 Identity, runtime safety and incomplete evidence still raise; an unrun case is
 never manufactured for the future semantic-blocked runner contract.
 """
@@ -239,6 +240,7 @@ class Sweep:
         self._logged_in = False
         self._failed = False
         self._nonces = set()
+        self._write_cases = {}
         self._deadline = 0.0
         self._requests = 0
         self._stub_calls = []
@@ -524,9 +526,11 @@ class Sweep:
             self._call("PUT", "/api/chatbot/settings", {"greeting_message": expected["settings"]})
             record = RecordSet(self._binding(), nonce, contact_id, conversation_id, inbound, outbound,
                                _uuid(template.get("id")), _uuid(flow.get("id")))
-            # A write cannot discard an early readback mismatch and later return
-            # a favorable RecordSet. Keep this precheck strict and same-budget.
-            _same(all(self._read(record).values()))
+            # Complete all six readbacks in the mutation budget. Keep their
+            # actual flags privately, keyed by the exact immutable identities;
+            # a later successful read must not erase an earlier mismatch.
+            cases = self._read(record)
+            self._write_cases[record] = tuple(cases[key] for key in proof.SWEEP_CASES)
             return record
         except Exception:
             self._failed = True
@@ -569,7 +573,15 @@ class Sweep:
     def read(self, record: RecordSet) -> dict[str, bool]:
         self._begin()
         try:
-            return self._read(record)
+            # Always perform every read and safety check before combining flags.
+            # A new client/version has no write history: its read is independent.
+            cases = self._read(record)
+            previous = self._write_cases.get(record)
+            if previous is not None:
+                cases = {key: previous[index] and cases[key]
+                         for index, key in enumerate(proof.SWEEP_CASES)}
+                self._write_cases[record] = tuple(cases[key] for key in proof.SWEEP_CASES)
+            return cases
         except Exception:
             self._failed = True
             raise
