@@ -31,8 +31,13 @@ def digest(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-def request(classification=CLASS, latest=LATEST):
-    return evidence.NormalRequest(evidence.SourceFacts(SHA, latest, classification, CATALOG, AUTHORITY), latest, OBSERVATION)
+def database_base(latest=LATEST):
+    return evidence.DatabaseBase("legacy-source-only", latest.sha, None, None)
+
+
+def request(classification=CLASS, latest=LATEST, *, base=None, web_source=None):
+    return evidence.NormalRequest(evidence.SourceFacts(SHA, latest, classification, CATALOG, AUTHORITY,
+        database_base(latest) if base is None else base, latest.sha if web_source is None else web_source), latest, OBSERVATION)
 
 
 def subject(name, raw, run, attempt):
@@ -52,7 +57,7 @@ def pack(result, context, run=100, attempt=1):
 
 
 def pair(run=100, attempt=1, *, classification=CLASS, latest=LATEST, selected=None, target=None,
-         event="push", server_false=None, migration_false=None, forward=True):
+         event="push", server_false=None, migration_false=None, forward=True, version=2, base=None, web_source=None):
     selected = selected or latest
     result = {"sha": SHA, "previous_release": selected.release, "previous_web_digest": selected.web_digest,
         "classification": {"kind": classification.kind, "dormant": classification.dormant}, "forward": forward,
@@ -60,11 +65,14 @@ def pair(run=100, attempt=1, *, classification=CLASS, latest=LATEST, selected=No
         "old_server_ok": {key: key != server_false for key in evidence.SERVERS},
         "reversible": migration_false is None, "catalog_sha256": CATALOG, "run_id": run, "run_attempt": attempt}
     result_raw = canonical(result)
-    context = {"version": 1, "repository": evidence.REPOSITORY, "workflow_path": evidence.WORKFLOW,
+    context = {"version": version, "repository": evidence.REPOSITORY, "workflow_path": evidence.WORKFLOW,
         "workflow_sha": SHA, "event": event, "ref": evidence.REF, "sha": SHA, "run_id": run, "run_attempt": attempt,
         "requested_rollback_target": target, "latest": asdict(latest), "selected": asdict(selected),
         "preview": {"kind": classification.kind, "dormant": classification.dormant, "blocked": False},
         "result_sha256": digest(result_raw)}
+    if version == 2:
+        context.update(database_base=asdict(database_base(latest) if base is None else base),
+                       selected_web_source_sha=selected.sha if web_source is None else web_source)
     return pack(result_raw, context, run, attempt)
 
 
@@ -244,7 +252,8 @@ class QualificationTests(unittest.TestCase):
 
     def test_explicit_rollback_pair_is_not_forward_qualification(self):
         selected = replace(LATEST, release="prod-20261009T000000Z-cccccccc", sha="c" * 40)
-        row = attempt(event="workflow_dispatch", measurement=pair(event="workflow_dispatch", target=selected.release, selected=selected))
+        row = attempt(event="workflow_dispatch", measurement=pair(event="workflow_dispatch", target=selected.release,
+                                                                 selected=selected, version=1))
         self.assertEqual(evidence.parse_authenticated_pair(row.measurement, row).requested_target, selected.release)
         self.refuse((row,))
 
@@ -324,7 +333,7 @@ class PairBoundaryTests(unittest.TestCase):
             context = json.loads(original.context); context["result_sha256"] = digest(raw)
             with self.subTest(raw=raw[:30]): self.reject(pack(raw, context))
         for raw in (original.context[:-1], b" " + original.context, b"x" * 4097,
-                    original.context.replace(b'"version":1', b'"version":1,"version":1'), b"\xff"):
+                    original.context.replace(b'"version":2', b'"version":2,"version":2'), b"\xff"):
             self.reject(pack(original.result, raw))
 
     def test_direct_parser_rejects_boolean_attempt_identity(self):
@@ -357,7 +366,9 @@ class PairBoundaryTests(unittest.TestCase):
             snap = {"version": 2, "sha": SHA, "run_id": 100, "run_attempt": 1,
                 "requested_rollback_target": None, "latest": asdict(LATEST), "selected": asdict(LATEST),
                 "preview": {"kind": "none", "dormant": False, "blocked": False}}
-            for original in (pair(), pair(server_false="read"), pair(migration_false="rw")):
+            # The current producer remains context1. Preserve its exact audit
+            # contract; this preparation does not activate context2 callers.
+            for original in (pair(version=1), pair(server_false="read", version=1), pair(migration_false="rw", version=1)):
                 raw = producer.canonical(producer.evidence_context(original.result, snap, ctx))
                 self.assertEqual(raw, original.context)
                 rebound = pack(original.result, raw)
@@ -386,7 +397,7 @@ class BypassTests(unittest.TestCase):
     def test_any_exact_sha_authenticated_negative_including_explicit_target_vetoes(self):
         target = replace(LATEST, release="prod-0000")
         row = attempt(event="workflow_dispatch", conclusion="failure", measurement=pair(event="workflow_dispatch",
-            selected=target, target=target.release, forward=False))
+            selected=target, target=target.release, forward=False, version=1))
         decision = evidence.assess_bypass_history(SHA, history(row, enumeration="incomplete"))
         self.assertEqual(decision.state, evidence.BypassState.VETO_AUTHENTICATED_NEGATIVE)
 

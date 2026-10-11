@@ -92,12 +92,38 @@ class CatalogBlob:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogTuple:
+    catalog_version: int
+    min_reader_version: int
+    catalog_sha256: str
+    data_steps_sha256: str
+    seeds_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class OriginIdentity:
+    release: str
+    manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseBase:
+    """Adapter-supplied origin data, never proof of source or live row state."""
+    mode: str
+    source_sha: str
+    origin: OriginIdentity | None
+    catalog: CatalogTuple | None
+
+
+@dataclass(frozen=True, slots=True)
 class SourceFacts:
     sha: str
     base: ReleaseIdentity
     classification: Classification
     expected_after_catalog_sha256: str
     catalog_authority: tuple[CatalogBlob, ...]
+    database_base: DatabaseBase
+    previous_web_source_sha: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,9 +261,14 @@ class BoundMeasurement:
     reversible: bool
     result_sha256: str
     context_sha256: str
+    context_version: int
+    database_base: DatabaseBase | None
+    selected_web_source_sha: str | None
 
     @property
     def positive(self):
+        # Context1 flags remain actual measurements for negative auditing;
+        # protocol eligibility is a separate qualification predicate.
         return self.forward and self.reversible and all(self.migrations) and all(self.servers)
 
 
@@ -266,6 +297,8 @@ class QualifiedCompat:
     reversible: bool
     observation_id: str
     execution_window: ExecutionWindow
+    database_base: DatabaseBase
+    previous_web_source_sha: str
 
     @property
     def old_server(self):
@@ -305,6 +338,43 @@ def _release(value):
 def _release_dict(value):
     _need(type(value) is dict and set(value) == {"release", "manifest_sha256", "sha", "web_digest"}, "release-shape")
     return _release(ReleaseIdentity(**value))
+
+
+def _database_base(value, latest):
+    _need(type(value) is DatabaseBase and type(value.mode) is str
+          and _string(value.source_sha, _SHA), "database-base-shape")
+    if value.mode == "legacy-source-only":
+        _need(value.origin is None and value.catalog is None and value.source_sha == latest.sha,
+              "database-base-legacy")
+    else:
+        _need(value.mode == "retained-live-v2", "database-base-mode")
+        origin, catalog = value.origin, value.catalog
+        _need(type(origin) is OriginIdentity and type(origin.release) is str
+              and common.RECORD_TAG_RE.fullmatch(origin.release) is not None
+              and _string(origin.manifest_sha256, _HASH), "database-base-origin")
+        _need(type(catalog) is CatalogTuple
+              and all(type(v) is int and 0 <= v <= 2_147_483_647
+                      for v in (catalog.catalog_version, catalog.min_reader_version))
+              and catalog.min_reader_version <= catalog.catalog_version
+              and all(_string(v, _HASH) for v in
+                      (catalog.catalog_sha256, catalog.data_steps_sha256, catalog.seeds_sha256)),
+              "database-base-catalog")
+    return value
+
+
+def _database_base_dict(value, latest):
+    _need(type(value) is dict and set(value) == {"mode", "source_sha", "origin", "catalog"},
+          "database-base-shape")
+    origin, catalog = value["origin"], value["catalog"]
+    if origin is not None:
+        _need(type(origin) is dict and set(origin) == {"release", "manifest_sha256"}, "database-base-origin")
+        origin = OriginIdentity(**origin)
+    if catalog is not None:
+        _need(type(catalog) is dict and set(catalog) ==
+              {"catalog_version", "min_reader_version", "catalog_sha256", "data_steps_sha256", "seeds_sha256"},
+              "database-base-catalog")
+        catalog = CatalogTuple(**catalog)
+    return _database_base(DatabaseBase(value["mode"], value["source_sha"], origin, catalog), latest)
 
 
 def _time(value):
@@ -407,6 +477,8 @@ def _request(value):
     _need(type(source.catalog_authority) is tuple and len(source.catalog_authority) == len(CATALOG_PATHS)
           and all(type(b) is CatalogBlob and _string(b.sha256, _HASH) for b in source.catalog_authority)
           and tuple(b.path for b in source.catalog_authority) == CATALOG_PATHS, "catalog-authority")
+    _database_base(source.database_base, value.latest)
+    _need(_string(source.previous_web_source_sha, _SHA), "previous-web-source")
 
 
 def _subject(value, name, raw, attempt):
@@ -444,9 +516,14 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
         context = common.loads_strict(pair.context)
         keys = {"version", "repository", "workflow_path", "workflow_sha", "event", "ref", "sha", "run_id",
                 "run_attempt", "requested_rollback_target", "latest", "selected", "preview", "result_sha256"}
+        _need(type(context) is dict and type(context.get("version")) is int
+              and context["version"] in (1, 2), "context-version")
+        version = context["version"]
+        if version == 2:
+            keys |= {"database_base", "selected_web_source_sha"}
         _need(type(context) is dict and set(context) == keys and common.canonical_file_bytes(context) == pair.context,
               "context-shape")
-        _need(type(context["version"]) is int and context["version"] == 1 and context["repository"] == REPOSITORY
+        _need(context["repository"] == REPOSITORY
               and context["workflow_path"] == WORKFLOW and context["workflow_sha"] == attempt.sha
               and context["sha"] == attempt.sha and context["ref"] == REF and attempt.ref == REF
               and context["event"] == attempt.event and attempt.event in ("push", "workflow_dispatch")
@@ -463,6 +540,15 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
         else:
             _proof.validate_rollback_target(target)
             _need(attempt.event == "workflow_dispatch" and selected.release == target, "context-selection")
+        database_base = actual_source = None
+        if version == 2:
+            # This protocol defines normal forward evidence only. Context1
+            # explicit-target observations remain parseable for audit, not a
+            # newly invented exact-target/live rollback qualification.
+            _need(target is None, "context2-normal-only")
+            database_base = _database_base_dict(context["database_base"], latest)
+            actual_source = context["selected_web_source_sha"]
+            _need(_string(actual_source, _SHA), "previous-web-source")
         _need(result["previous_release"] == selected.release and result["previous_web_digest"] == selected.web_digest,
               "result-selection")
         preview = context["preview"]
@@ -476,7 +562,8 @@ def parse_authenticated_pair(pair: AuthenticatedPair, attempt: Attempt) -> Bound
         return BoundMeasurement(latest, selected, target, classification, preview_class, result["catalog_sha256"],
             result["forward"], tuple(result["old_migrate_ok"][key] for key in MIGRATIONS),
             tuple(result["old_server_ok"][key] for key in SERVERS), result["reversible"],
-            hashlib.sha256(pair.result).hexdigest(), hashlib.sha256(pair.context).hexdigest())
+            hashlib.sha256(pair.result).hexdigest(), hashlib.sha256(pair.context).hexdigest(),
+            version, database_base, actual_source)
     except (common.ReleaseError, _proof.EvidenceError, ValueError, TypeError, KeyError, RecursionError):
         raise CompatRefusal("compat-stale", "pair-invalid") from None
 
@@ -494,11 +581,17 @@ def _measurements(history):
     return result
 
 
-def _current(measured, request):
+def _identity_current(measured, request):
     return (measured is not None and measured.requested_target is None
             and measured.latest == measured.selected == request.latest
             and measured.classification == measured.preview == request.source.classification
             and measured.catalog_sha256 == request.source.expected_after_catalog_sha256)
+
+
+def _current(measured, request):
+    return (_identity_current(measured, request) and measured.context_version == 2
+            and measured.database_base == request.source.database_base
+            and measured.selected_web_source_sha == request.source.previous_web_source_sha)
 
 
 def _successful(attempt):
@@ -523,7 +616,8 @@ def require_compat(request: NormalRequest, history: VisibleHistory) -> Qualified
     rows = _measurements(history)
     positives = [(a, m) for a, m in rows if _current(m, request) and m.positive and _successful(a)]
     if not positives:
-        negatives = [(a, m) for a, m in rows if _current(m, request) and not m.positive]
+        negatives = [(a, m) for a, m in rows if not (m is None or m.positive)
+                     and (_current(m, request) or (m.context_version == 1 and _identity_current(m, request)))]
         if negatives:
             _negative(max(negatives, key=lambda row: (row[0].run_number, row[0].run_attempt))[1])
         raise CompatRefusal("compat-missing" if not rows else "compat-stale", "no-qualified-positive")
@@ -551,7 +645,8 @@ def require_compat(request: NormalRequest, history: VisibleHistory) -> Qualified
         pair.artifact.artifact_id, pair.artifact.name, measured.result_sha256, measured.context_sha256,
         pair.result_subject.signer_uri, pair.result_subject.signer_sha, measured.classification,
         measured.catalog_sha256, request.source.catalog_authority, measured.forward, measured.migrations,
-        measured.servers, measured.reversible, request.observation_id, selected.execution_window)
+        measured.servers, measured.reversible, request.observation_id, selected.execution_window,
+        measured.database_base, measured.selected_web_source_sha)
 
 
 def assess_bypass_history(sha: str, history: VisibleHistory) -> BypassHistory:
