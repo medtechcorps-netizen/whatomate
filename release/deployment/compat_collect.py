@@ -129,12 +129,16 @@ class ActionsGh(records.Gh):
         self._last = now
         return min(maximum, self._deadline - now)
 
+    def _allows_get(self, path):
+        """Fixed normal grammar; purpose-specific collectors supply fixed alternatives."""
+        return any(p.fullmatch(path) for p in _GETS)
+
     def _run(self, args, *, code):
         args = list(args)
         limit, duration = 4 * 1024 * 1024, 30
         allowed = args == ["--version"]
         if len(args) == 8 and args[:3] == ["api", "--method", "GET"] and tuple(args[4:]) == HEADERS:
-            allowed = any(p.fullmatch(args[3]) for p in _GETS)
+            allowed = self._allows_get(args[3])
         if args == self._verification_args and self._scope is not None:
             allowed, limit, duration = True, adapter.MAX_VERIFICATION, 60
         if len(args) == 5 and args[:3] == ["api", "--method", "GET"] and args[4] == "--allow-escape-sequences":
