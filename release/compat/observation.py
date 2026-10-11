@@ -121,6 +121,13 @@ def _completed():
     return {"status": "completed", "exit_code": 0, "failure": None}
 
 
+def _runtime_fatal(streams):
+    # Called only after parse_logs established complete UTF-8/timestamp framing.
+    # A runtime OOM/fatal is not made semantic by an accompanying panic token.
+    return any(_SGR.sub("", _DOCKER_TIME.fullmatch(line)[2]).startswith("fatal error:")
+               for raw in streams for line in raw.decode("utf-8").splitlines())
+
+
 class OwnedObservation:
     def __init__(self, manager: processes.OwnedProcesses, handle: processes.ProcessHandle,
                  fixture: controller.sweep.Fixture, *, clock=time.monotonic, sleep=time.sleep, _old_boot=None):
@@ -142,6 +149,7 @@ class OwnedObservation:
         self._events = len(manager._events)
         self._old_boot = _old_boot
         self._old_boot_done = False
+        self._worker_failure = None
         if _old_boot is None:
             self._check()
         else:
@@ -424,6 +432,8 @@ class OwnedObservation:
         API actions may have happened since boot; every original log byte
         must still be present. Failures retain observed counts in evidence()
         and poison dependent work while exact owned cleanup remains possible.
+        A completed living worker panic/unknown verdict remains false while
+        this final read proves safe continuation to actual stop/reverse reads.
         """
         try:
             need(self._startup_ready and self._booted and not self._period_attempted
@@ -434,7 +444,21 @@ class OwnedObservation:
             with self._readonly_budget(timeout):
                 logs = self._logs()
                 self._period_summary = self._period_counts(logs)
-                self._healthy_counts(self._period_summary)
+                if self._worker_failure is None:
+                    self._healthy_counts(self._period_summary)
+                else:
+                    handle, image, token, finished, seconds, panics, unknown = self._worker_failure
+                    now = self._clock()
+                    need(self._workers_done and self.handle is handle and handle.version == "previous"
+                         and self.manager.bindings["previous"] is image and self.manager.owner.token == token
+                         and 60 <= seconds <= 300 and panics + unknown > 0
+                         and type(now) in (int, float) and math.isfinite(now) and now >= finished,
+                         "observation-worker-outcome-stale")
+                    need(self._period_summary["panic_count"] >= panics
+                         and self._period_summary["unknown_type_count"] >= unknown
+                         and not self._period_summary["fatal_count"]
+                         and not self._period_summary["stopped_or_error_count"]
+                         and not _runtime_fatal(self._streams), "observation-period-failed")
                 need(all(n == 1 for n in self._period_summary["markers"].values()), "observation-startup-incomplete")
             return {"execution": _completed(), "alive": True, "whole_logs_observed": True,
                     "panic_count": self._period_summary["panic_count"],
@@ -497,7 +521,10 @@ class OwnedObservation:
             need(60 <= now - started <= 120, "observation-workers-window-incomplete")
             window = self._controller("journal", after=baseline["cursor"], discard_baseline=False)["journal"]
             logs = self._logs()
-            elapsed = self._clock() - started
+            finished = self._clock()
+            need(type(finished) in (int, float) and math.isfinite(finished) and finished >= now,
+                 "observation-clock-invalid")
+            elapsed = finished - started
             need(60 <= elapsed <= 300, "observation-workers-window-incomplete")
             rows = window["entries"]
             own_reads = sum(_own_journal_read(row) for row in rows)
@@ -509,11 +536,18 @@ class OwnedObservation:
             self._journal_counts = {"baseline_requests": baseline["requests"],
                                     "window_requests": window["requests"], "observed_read_rows": own_reads,
                                     "after": baseline["cursor"], "cursor": window["cursor"]}
-            need(not any(r.get("level") == "fatal" or r.get("message") in
+            need(not _runtime_fatal(self._streams) and not any(r.get("level") == "fatal" or r.get("message") in
                          {"Worker error", "Worker stopped", "Channel outbox worker error", "Channel AI reply worker error",
                           "Threads credential refresh worker error", "Shutting down...", "Embedded workers disabled, run workers separately"}
                          for r in logs["records"]), "observation-worker-stopped")
             self._workers_done = True
+            if (self._startup_ready and len(rows) == own_reads
+                    and logs["panic_count"] + logs["unknown_type_count"] > 0
+                    and all(n == 1 for n in self._period_counts(logs)["markers"].values())):
+                # Immutable private facts, independent of the returned mutable
+                # row. This authorizes no reset/retry or blocked reverse sweep.
+                self._worker_failure = (self.handle, self.manager.bindings["previous"], self.manager.owner.token,
+                                        finished, elapsed, logs["panic_count"], logs["unknown_type_count"])
             return {"execution": _completed(), "observed_seconds": int(elapsed),
                     "panic_count": logs["panic_count"], "unknown_type_count": logs["unknown_type_count"],
                     "unexpected_stub_entries": len(rows) - own_reads}
