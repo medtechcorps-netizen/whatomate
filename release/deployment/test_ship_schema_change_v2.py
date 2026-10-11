@@ -633,12 +633,12 @@ class PendingSourceHistoryTests(unittest.TestCase):
         change(plan)
         return sc.pending_plan.canonical(plan).decode()
 
-    def test_pr22_shaped_introduction_reports_source_only_and_retains_producer_block(self):
+    def test_pr22_shaped_introduction_requires_source_bound_dormant_compatibility(self):
         introduced = self.repo.commit(self.files)
         head = self.repo.commit({"README.md": "after introduction\n"})
         result = self.classify(head)
         self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", True, ()))
-        self.assertEqual(set(result.requirements), {"compat-required", "generated-migration-closure-ci", "producer-class-unsupported"})
+        self.assertEqual(result.requirements, ("compat-required", "generated-migration-closure-ci"))
         self.assertIn("pending source plan: active=0; target=1; source=" + head, result.summary)
         self.assertIn("pending source step: create_ledger; operation=create_relation; source_sha256=" + H + "; requires_gates=schema_ready", result.summary)
         self.assertEqual(sum(line.startswith("pending source file:") for line in result.summary), 3)
@@ -649,14 +649,23 @@ class PendingSourceHistoryTests(unittest.TestCase):
         legacy = sc.classify(self.repo.root, self.base, introduced)
         self.assertEqual((legacy.kind, legacy.dormant, legacy.reasons), ("none", False, ()))
 
-    def test_unchanged_plan_unrelated_change_stays_none_but_producer_is_still_unavailable(self):
+    def test_unchanged_plan_unrelated_change_stays_none_and_requires_compatibility(self):
         base = self.repo.commit(self.files)
         head = self.repo.commit({"README.md": "unrelated\n"})
         for end in (base, head):
             with self.subTest(end=end):
                 result = self.classify(end, base)
                 self.assertEqual((result.kind, result.dormant, result.reasons), ("none", False, ()))
-                self.assertIn("producer-class-unsupported", result.requirements)
+                self.assertEqual(result.requirements, ("compat-required", "generated-migration-closure-ci"))
+
+    def test_supported_pending_does_not_remove_an_existing_producer_refusal(self):
+        head = self.repo.commit(self.files)
+        reasons = {"unrelated-source-refusal"}
+        requirements = {"producer-class-unsupported", "unrelated-requirement"}
+        self.assertTrue(sc._v2_pending(sc._Repository(self.repo.root), self.base, head,
+                                      reasons, [], requirements))
+        self.assertEqual(reasons, {"unrelated-source-refusal"})
+        self.assertEqual(requirements, {"producer-class-unsupported", "unrelated-requirement"})
 
     def test_pending_reads_use_committed_blobs_not_working_tree(self):
         head = self.repo.commit(self.files)
@@ -743,7 +752,10 @@ class PendingSourceHistoryTests(unittest.TestCase):
                 self.repo.checkout(self.base)
                 result = self.classify(self.repo.commit({**self.files, **delta}))
                 self.assertEqual((result.kind, result.dormant), (kind, dormant))
-                self.assertIn("producer-class-unsupported", result.requirements)
+                if dormant:
+                    self.assertEqual(result.requirements, ("compat-required", "generated-migration-closure-ci"))
+                else:
+                    self.assertIn("producer-class-unsupported", result.requirements)
                 if not dormant:
                     # The active-engine refusal occurs before final requirement
                     # collection; its existing refusal remains sufficient.

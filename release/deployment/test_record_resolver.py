@@ -8,6 +8,7 @@ import copy
 from dataclasses import FrozenInstanceError
 import difflib
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -21,6 +22,8 @@ import schema_change
 import ship_common as common
 import test_record_transport as transport_tests
 import test_ship_support as support
+import pending_source
+import test_pending_plan
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -87,7 +90,8 @@ class ControlledWorld(transport_tests.World):
             data = b"".join((revision + "\n").encode() for revision in revisions)
         elif args[:4] == ["ls-tree", "-r", "--name-only", "-z"]:
             data = b"".join(path.encode() + b"\0" for revision, path in sorted(self.files)
-                            if revision == args[4] and any(path.startswith(prefix) for prefix in args[6:]))
+                            if revision == args[4] and any(path == prefix.rstrip("/")
+                                or path.startswith(prefix.rstrip("/") + "/") for prefix in args[6:]))
         elif args[0] == "diff" and "--name-status" in args:
             base, head = args[-3:-1]
             paths = sorted({path for revision, path in self.files if revision in (base, head)})
@@ -530,8 +534,11 @@ class ForwardResolverTests(unittest.TestCase):
         self.assertEqual(result.resolved.latest.record_sha, old["sha"])
         self.assertEqual((result.classification.kind, result.classification.reasons), ("none", ()))
         ranges = [args[-1] for args, _ in self.world.trace if "rev-list" in args]
-        self.assertTrue(ranges)
-        self.assertEqual(set(ranges), {origin["sha"] + ".." + origin["sha"]})
+        self.assertEqual(set(ranges), {origin["sha"] + ".." + origin["sha"],
+                                      old["sha"] + ".." + origin["sha"]})
+        # Only pending continuity uses latest-record here. The complete
+        # classifier and its migration roots still use database origin.
+        self.assertEqual(ranges.count(old["sha"] + ".." + origin["sha"]), 1)
 
     def test_candidate_must_descend_from_both_record_and_retained_origin(self):
         for which in ("record", "origin"):
@@ -611,6 +618,11 @@ class ForwardResolverTests(unittest.TestCase):
         result = self.forward(sha)
         self.assertIn("pending-format-unsupported", result.classification.reasons)
         self.assertIn("pending-format-unsupported", result.classification.requirements)
+        self.assertEqual(result.pending.candidate_files, (
+            pending_source.PendingBlob("internal/dbcatalog/golden/pending/catalog-v1.json", b"{}\n"),))
+        self.assertEqual(result.pending.previous_files, ())
+        self.assertIn("classifier-v2-invalid:pending-material", result.classification.reasons)
+        self.assertIn("producer-class-unsupported", result.classification.requirements)
 
     def test_generic_preview_is_not_production_main_authority(self):
         old = self.add()
@@ -1089,6 +1101,328 @@ class ForwardAuditTests(unittest.TestCase):
         with self.assertRaises(policy.PolicyRefusal):
             resolver.validate_forward_audit(same, candidate_sha=base, database_base_source=base,
                 latest_record_sha=base, selected_web_source_sha=base)
+
+
+class ForwardPendingTests(unittest.TestCase):
+    setUp = ResolverTests.setUp
+    add = ResolverTests.add
+    profile = ForwardResolverTests.profile
+    candidate = ForwardResolverTests.candidate
+    forward = ForwardResolverTests.forward
+    refused = ForwardResolverTests.refused
+    ordinary = ForwardAuditTests.ordinary
+    WORKFLOW = ForwardResolverTests.WORKFLOW
+    MAIN = ForwardResolverTests.MAIN
+    RECIPE = ForwardResolverTests.RECIPE
+
+    @classmethod
+    def setUpClass(cls):
+        ResolverTests.setUpClass.__func__(cls)
+        args = test_pending_plan.fixture()
+        plan = pending_source.plan
+        target_name = plan.PREFIX + "catalog-v1.json"
+        target = json.loads(args["files"][target_name])
+        target["objects"] = [*json.loads(cls.source_bytes[policy.GOLDEN])["objects"],
+            *(row for row in target["objects"] if row["identity"] not in ("organizations", "organizations.id"))]
+        globals_ = [*json.loads(cls.source_bytes[policy.GLOBALS]),
+            *(row for row in json.loads(args["files"][plan.GLOBALS]) if row["name"] != "organizations")]
+        cls.active = dict(active_catalog=cls.source_bytes[policy.GOLDEN],
+                          active_globals=cls.source_bytes[policy.GLOBALS], active_history=cls.source_bytes[policy.HISTORY])
+        files = {target_name: plan.canonical(target), plan.GLOBALS: plan.canonical(globals_)}
+        document = json.loads(args["files"][plan.PLAN])
+        document.update({key + "_file_sha256": plan.digest(raw) for key, raw in cls.active.items()})
+        document["globals_file_sha256"] = plan.digest(files[plan.GLOBALS])
+        document["entries"][0].update(catalog_file_sha256=plan.digest(files[target_name]),
+                                     globals_sha256=plan.digest(files[plan.GLOBALS]))
+        files[plan.PLAN] = plan.canonical(document)
+        cls.pending_files = files
+
+    def install(self, sha, files=None):
+        files = self.pending_files if files is None else files
+        self.world.files.update({(sha, path): raw for path, raw in files.items()})
+
+    def replay(self, result):
+        return pending_source.replay(result.pending, candidate_sha=result.candidate.sha,
+            previous_sha=result.resolved.latest.record_sha, **self.active)
+
+    def material_transport(self, change):
+        # Alter only controlled outputs after the existing source audit starts;
+        # prior classifier reads remain real fixed-source parser inputs.
+        original = self.world.git
+        active = False
+        def response(args):
+            nonlocal active
+            if args[:2] == ["ls-tree", "-z"] and args[-1] == resolver._DRILLS:
+                active = True
+            result = original(args)
+            return change(args, result) if active else result
+        self.world.git = response
+
+    def test_complete_real_v0_target_is_raw_bound_dormant_and_not_live(self):
+        base, sha = self.ordinary(); self.install(sha)
+        result = self.forward(sha)
+        projection = self.replay(result)
+        self.assertEqual(len(projection.plan.entries[0].objects), 4452)
+        self.assertEqual((result.pending.candidate_sha, result.pending.previous_sha), (sha, base))
+        self.assertEqual(result.pending.candidate_files,
+            tuple(pending_source.PendingBlob(path, raw) for path, raw in sorted(self.pending_files.items())))
+        self.assertEqual(result.pending.previous_files, ())
+        self.assertEqual((result.classification.kind, result.classification.dormant, result.classification.reasons),
+                         ("expand", True, ()))
+        self.assertEqual(result.classification.requirements, ("compat-required", "generated-migration-closure-ci"))
+        self.assertEqual(result.candidate.catalog, self.v0.catalog)
+        self.assertEqual(result.resolved.latest.live.origin_source.sha, base)
+        self.assertEqual(result.resolved.latest.live.catalog, self.v0.catalog)
+        with self.assertRaises(FrozenInstanceError): result.pending.previous_sha = sha
+        with self.assertRaises(FrozenInstanceError): result.pending.candidate_files[0].raw = b"other"
+
+    def test_explicit_empty_observation_is_not_historical_none(self):
+        from dataclasses import replace
+        base, sha = self.ordinary()
+        result = self.forward(sha)
+        self.assertEqual(result.pending, pending_source.PendingMaterial(sha, base, (), ()))
+        self.assertIsNone(self.replay(result).plan)
+        historical = replace(result, pending=None)
+        self.assertIsNone(historical.pending)
+        self.assertNotEqual(result, historical)
+        # The old wire lists fields explicitly: it has not acquired this new
+        # observation. Codec/request/producer migration is a separate lease.
+
+    def test_existing_bundle_continuity_and_same_source_observation(self):
+        for same in (False, True):
+            case = ForwardPendingTests(); case.setUp()
+            try:
+                base, candidate = case.ordinary(); case.install(base)
+                sha = base if same else candidate
+                case.install(sha)
+                result = case.forward(sha)
+                self.assertEqual((result.classification.kind, result.classification.reasons), ("none", ()))
+                self.assertEqual(result.classification.requirements,
+                                 ("compat-required", "generated-migration-closure-ci"))
+                self.assertEqual(result.pending.candidate_files, result.pending.previous_files)
+                self.assertEqual(case.replay(result).binding.candidate_digest, case.replay(result).binding.previous_digest)
+                commands = [args for args, _ in case.world.trace]
+                at = next(i for i, args in enumerate(commands) if "ls-tree" in args and args[-1] == resolver._DRILLS)
+                prefixes = [args for args in commands[at + 1:] if "--name-only" in args
+                            and args[-1] == pending_source.plan.PREFIX.rstrip("/")]
+                self.assertEqual(len(prefixes), 1 if same else 2)
+            finally: case.doCleanups()
+
+    def test_removal_replacement_and_malformed_source_keep_bytes_but_block_preview(self):
+        for variant in ("removed", "replacement", "malformed"):
+            with self.subTest(variant=variant):
+                case = ForwardPendingTests(); case.setUp()
+                try:
+                    base, sha = case.ordinary(); case.install(base)
+                    files = dict(case.pending_files)
+                    if variant == "replacement":
+                        doc = json.loads(files[pending_source.plan.PLAN]); doc["steps"][0]["source_sha256"] = "f" * 64
+                        files[pending_source.plan.PLAN] = pending_source.plan.canonical(doc)
+                    elif variant == "malformed": files[pending_source.plan.PLAN] = b"PRIVATE_INVALID_JSON"
+                    if variant != "removed": case.install(sha, files)
+                    result = case.forward(sha)
+                    self.assertEqual(result.pending.previous_files,
+                        tuple(pending_source.PendingBlob(path, raw) for path, raw in sorted(case.pending_files.items())))
+                    expected = () if variant == "removed" else tuple(pending_source.PendingBlob(path, raw) for path, raw in sorted(files.items()))
+                    self.assertEqual(result.pending.candidate_files, expected)
+                    self.assertIn("classifier-v2-invalid:pending-material", result.classification.reasons)
+                    self.assertIn("producer-class-unsupported", result.classification.requirements)
+                    self.assertNotIn("PRIVATE", repr(result.classification))
+                    with self.assertRaises(pending_source.PendingSourceRefusal): case.replay(result)
+                finally: case.doCleanups()
+
+    def test_rollback_material_uses_latest_record_not_origin_or_selected_web(self):
+        old = self.add(version=1, images=self.boot["images"])
+        self.profile(old["sha"]); self.install(old["sha"])
+        origin = self.add(); self.profile(origin["sha"])
+        self.add(kind="rollback", target=old)
+        self.world.files[self.boot["sha"], self.RECIPE] = b"FROM scratch\n"
+        sha = self.candidate(); self.install(sha)
+        result = self.forward(sha)
+        self.assertEqual((result.pending.previous_sha, result.database_base_source, result.previous_web_source_sha),
+                         (old["sha"], origin["sha"], self.boot["sha"]))
+        self.assertEqual(result.pending.previous_files, result.pending.candidate_files)
+        self.assertEqual(self.replay(result).binding.previous_sha, old["sha"])
+        ranges = [args[-1] for args, _ in self.world.trace if "rev-list" in args]
+        self.assertEqual(ranges.count(old["sha"] + ".." + sha), 1)
+        self.assertEqual(ranges.count(origin["sha"] + ".." + sha), 4)
+
+    def test_latest_range_checks_transient_removal_even_when_origin_range_is_empty(self):
+        old = self.add(version=1); self.profile(old["sha"]); self.install(old["sha"])
+        origin = self.add(); self.profile(origin["sha"]); self.install(origin["sha"])
+        self.add(kind="rollback", target=old)
+        missing = self.profile("8" * 40)
+        self.world.history[old["sha"], origin["sha"]] = [missing, origin["sha"]]
+        result = self.forward(origin["sha"])
+        # Equal endpoints alone replay successfully; the independently read
+        # latest-source history is essential and must still block admission.
+        self.assertIsNotNone(self.replay(result).plan)
+        self.assertIn("classifier-v2-invalid:pending-latest-record", result.classification.reasons)
+        self.assertIn("producer-class-unsupported", result.classification.requirements)
+
+    def test_latest_transient_introduction_is_seen_with_both_endpoint_inventories_empty(self):
+        old = self.add(version=1); self.profile(old["sha"])
+        origin = self.add(); self.profile(origin["sha"])
+        self.add(kind="rollback", target=old)
+        transient = self.profile("8" * 40); self.install(transient)
+        self.world.history[old["sha"], origin["sha"]] = [transient, origin["sha"]]
+        result = self.forward(origin["sha"])
+        self.assertEqual((result.pending.candidate_files, result.pending.previous_files), ((), ()))
+        self.assertIn("classifier-v2-invalid:pending-latest-record", result.classification.reasons)
+
+    def test_latest_introduction_upgrades_only_none_and_never_clears_origin_failure(self):
+        for bad_origin in (False, True):
+            case = ForwardPendingTests(); case.setUp()
+            try:
+                old = case.add(version=1); case.profile(old["sha"])
+                origin = case.add(); case.profile(origin["sha"]); case.install(origin["sha"])
+                case.add(kind="rollback", target=old)
+                sha = case.candidate(); case.install(sha)
+                if bad_origin:
+                    removed = case.profile("8" * 40)
+                    case.world.history[origin["sha"], sha] = [removed, sha]
+                result = case.forward(sha)
+                self.assertEqual((result.classification.kind, result.classification.dormant), ("expand", True))
+                if bad_origin:
+                    self.assertIn("classifier-v2-invalid:pending", result.classification.reasons)
+                    self.assertIn("pending-format-unsupported", result.classification.reasons)
+                else: self.assertEqual(result.classification.reasons, ())
+            finally: case.doCleanups()
+
+    def test_unsafe_unknown_duplicate_or_truncated_inventory_is_hard_refusal(self):
+        prefix = pending_source.plan.PREFIX
+        variants = [b"PRIVATE\0", (prefix + "extra.json\0").encode(),
+                    (prefix + "catalog-v1.json").encode(), b"\xff\0",
+                    ((prefix + "catalog-v1.json\0") * 2).encode(),
+                    b"".join((prefix + f"catalog-v{i}.json\0").encode() for i in range(1, 5))]
+        for raw in variants:
+            with self.subTest(length=len(raw)):
+                case = ForwardPendingTests(); case.setUp()
+                try:
+                    _, sha = case.ordinary()
+                    def change(args, result):
+                        if args[:4] == ["ls-tree", "-r", "--name-only", "-z"] and args[-1] == prefix.rstrip("/"):
+                            return rt.runtime.Capture(0, raw, b"")
+                        return result
+                    case.material_transport(change); case.refused(sha)
+                finally: case.doCleanups()
+
+    def test_nonregular_missing_and_oversized_listed_blobs_are_hard_refusal(self):
+        for variant in ("mode", "missing", "oversize"):
+            with self.subTest(variant=variant):
+                case = ForwardPendingTests(); case.setUp()
+                try:
+                    _, sha = case.ordinary(); case.install(sha)
+                    pending_blob = False
+                    def change(args, result):
+                        nonlocal pending_blob
+                        if args[:2] == ["ls-tree", "-z"] and args[-1].startswith(pending_source.plan.PREFIX):
+                            pending_blob = True
+                            if variant == "mode": return rt.runtime.Capture(0, result.stdout.replace(b"100644", b"120000"), b"")
+                            if variant == "missing": return rt.runtime.Capture(0, b"", b"")
+                        if pending_blob and variant == "oversize" and args[:2] == ["cat-file", "-s"]:
+                            return rt.runtime.Capture(0, str(pending_source.MAX_FILE_BYTES + 1).encode(), b"")
+                        return result
+                    case.material_transport(change); case.refused(sha)
+                finally: case.doCleanups()
+
+    def test_combined_material_cap_is_hard_and_counts_both_occurrences(self):
+        base, sha = self.ordinary(); self.install(base); self.install(sha)
+        single = sum(map(len, self.active.values())) + sum(map(len, self.pending_files.values()))
+        with mock.patch.object(pending_source, "MAX_MATERIAL_BYTES", single): self.refused(sha)
+
+    def test_pending_capture_spends_original_budget(self):
+        for failure in ("deadline", "calls", "bytes"):
+            case = ForwardPendingTests(); case.setUp()
+            try:
+                _, sha = case.ordinary(); case.install(sha)
+                active = False
+                def after(args):
+                    nonlocal active
+                    if "ls-tree" in args and args[-1] == resolver._DRILLS: active = True
+                    if active and "--name-only" in args and args[-1] == pending_source.plan.PREFIX.rstrip("/"):
+                        if failure == "deadline": case.clock.now += 800
+                        elif failure == "calls": case.client.budget.commands = rt.MAX_COMMANDS
+                        else: case.client.budget.captured_bytes = rt.MAX_BYTES
+                case.world.after = after; case.refused(sha)
+            finally: case.doCleanups()
+
+    def test_latest_history_spends_original_budget_without_second_classifier(self):
+        old = self.add(version=1); self.profile(old["sha"])
+        origin = self.add(); self.profile(origin["sha"])
+        self.add(kind="rollback", target=old)
+        sha = self.candidate()
+        def after(args):
+            if "rev-list" in args and args[-1] == old["sha"] + ".." + sha:
+                self.clock.now += 800
+        self.world.after = after
+        self.refused(sha)
+        ranges = [args[-1] for args, _ in self.world.trace if "rev-list" in args]
+        self.assertEqual(ranges.count(old["sha"] + ".." + sha), 1)
+
+    def test_latest_pending_introduction_preserves_data_class_precedence(self):
+        old = self.add(version=1); self.profile(old["sha"])
+        origin = self.add(); self.profile(origin["sha"]); self.install(origin["sha"])
+        self.add(kind="rollback", target=old)
+        sha = self.candidate(); self.install(sha)
+        self.world.files[(sha, policy.SEEDS)] += b"\n"
+        result = self.forward(sha)
+        self.assertEqual((result.classification.kind, result.classification.dormant), ("data", True))
+        self.assertEqual(result.classification.reasons, ())
+        self.assertEqual(result.classification.requirements, ("compat-required", "generated-migration-closure-ci"))
+
+    def test_raw_endpoint_unsupported_kind_stays_blocked_after_classifier_capture(self):
+        base, sha = self.ordinary(); self.install(sha)
+        path = pending_source.plan.PLAN
+        original = self.pending_files[path]
+        document = json.loads(original)
+        document["entries"][0]["class"] = "data"
+        changed = pending_source.plan.canonical(document)
+        switched = False
+
+        def after(args, result):
+            nonlocal switched
+            if not switched:
+                self.world.files[(sha, path)] = changed
+                switched = True
+            return result
+
+        self.material_transport(after)
+        result = self.forward(sha)
+        self.assertEqual((result.classification.kind, result.classification.dormant), ("expand", True))
+        self.assertIn("pending-format-unsupported", result.classification.reasons)
+        self.assertIn("producer-class-unsupported", result.classification.requirements)
+        self.assertEqual(dict((row.path, row.raw) for row in result.pending.candidate_files)[path], changed)
+
+    def test_final_git_and_complete_inventory_refresh_follow_pending_capture(self):
+        base, sha = self.ordinary()
+        result = self.forward(sha)
+        commands = [args for args, _ in self.world.trace]
+        audit = next(i for i, args in enumerate(commands) if "ls-tree" in args and args[-1] == resolver._DRILLS)
+        pending = [i for i, args in enumerate(commands) if i > audit and "--name-only" in args
+                   and args[-1] == pending_source.plan.PREFIX.rstrip("/")]
+        self.assertEqual(len(pending), 2)
+        self.assertTrue(any("--show-toplevel" in args for args in commands[pending[-1] + 1:]))
+        self.assertTrue(any(args[0] == str(self.gh) for args in commands[pending[-1] + 1:]))
+        self.assertEqual(self.client.budget.commands, len(commands))
+        self.assertTrue(self.client.budget.closed)
+        self.assertFalse(self.client.budget.failed)
+        self.assertEqual((result.pending.candidate_sha, result.pending.previous_sha), (sha, base))
+
+    def test_source_or_main_drift_after_pending_read_still_refuses(self):
+        for change in ("source", "main"):
+            case = ForwardPendingTests(); case.setUp()
+            try:
+                _, sha = case.ordinary()
+                active = False
+                def after(args):
+                    nonlocal active
+                    if "ls-tree" in args and args[-1] == resolver._DRILLS: active = True
+                    if active and "--name-only" in args and args[-1] == pending_source.plan.PREFIX.rstrip("/"):
+                        if change == "source": (case.repo / ".git" / "shallow").write_bytes(b"changed")
+                        else: case.world.main = "b" * 40
+                case.world.after = after; case.refused(sha)
+            finally: case.doCleanups()
 
 
 if __name__ == "__main__":

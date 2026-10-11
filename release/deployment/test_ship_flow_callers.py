@@ -118,6 +118,9 @@ class CallerTests(unittest.TestCase):
         self.assertEqual(custody.drills.observed_at, self.now)
         self.assertGreater(custody.drills.observed_at, plan_time)
         self.assertFalse(custody.drills.required)
+        self.assertEqual(outputs['handoff_version'], '5')
+        self.assertIs(type(custody.resolution.pending), flow.record_resolver.pending_source.PendingMaterial)
+        self.assertEqual(custody.resolution.pending, self.fixture.expected.pending)
         self.assertEqual(outputs['previous'], self.fixture.expected.resolved.latest.release)
         self.assertTrue(all(key in outputs for key in flow.record_handoff.OUTPUT_KEYS))
         self.assertNotIn('SHIP_DO_TOKEN', self.env)
@@ -205,7 +208,19 @@ class CallerTests(unittest.TestCase):
         self.refused_in_plan_and_production('candidate-invalid:compat-stale')
 
     def test_irreversible_migration_preserves_specific_refusal_before_provider(self):
-        self.fixture.rebind(migration_false='rw')
+        # Change only the measured outcome on the already exact source/context3
+        # pair. The generic preflight fixture's rebind helper builds a fresh
+        # synthetic request and does not carry this real pending binding.
+        world = self.fixture.world
+        def irreversible(row):
+            row['old_migrate_ok']['rw'] = False
+            row['reversible'] = False
+        pair = fixtures.fixtures.edit_pair(world.pairs[100, 1], result=irreversible)
+        identity = world.artifacts[100][0]['id']
+        raw = fixtures.actions.signature.archive(pair)
+        world.pairs[100, 1] = pair
+        world.archives[identity] = raw, (100, 1)
+        world.artifacts[100][0]['size_in_bytes'] = len(raw)
         self.refused_in_plan_and_production('candidate-invalid:irreversible-needs-fix-forward-mode')
 
     def test_dormant_source_with_matching_green_proof_cannot_bypass_staging(self):

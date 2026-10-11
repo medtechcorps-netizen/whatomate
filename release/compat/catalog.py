@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import postgres
 import processes
 import record_resolver
+import pending_source
 
 runtime, proof = processes.runtime, processes.proof
 _BASE = "e0016b3595114728e7864da2adb44c29065f25ef"
@@ -38,6 +39,11 @@ _PINS = {
     _PROFILE: "808e11a5fdab638adc6f0004e9595371d1eee9a51763e12e779b355f7cdd391d",
     _OVERLAY: "48b2558aaa0c54f0de886093c875ff70fbc65231ee80d8b560df91afc97c131d",
 }
+PENDING_ACTIVE_ARTIFACTS = (
+    ("active_catalog", _PINS[_GOLDEN]),
+    ("active_globals", _PINS["internal/dbcatalog/golden/global_tables.json"]),
+    ("active_history", _PINS["internal/dbcatalog/golden/history.json"]),
+)
 _COUNT_KEYS = {"non_public_schemas", "non_public_objects", "other_roles", "default_acls", "oids", "reloptions",
                "statistics", "tablespaces", "other_acl_entries", "other_policy_roles"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -180,6 +186,17 @@ class CatalogContract:
         contract.baseline_provenance = material.baseline_provenance
         contract._base_overlay = "explicit-empty-first-baseline" if absent else "equal-reviewed-v0-nop"
         contract._load_pinned(blobs)
+        # The pending target is source metadata, never this contract's live
+        # catalog, table inventory, SQL allowlist or applied-gate evidence.
+        try:
+            projection = pending_source.replay(resolution.pending, candidate_sha=candidate.sha,
+                previous_sha=latest.record_sha, active_catalog=blobs[_GOLDEN],
+                active_globals=blobs[policy.GLOBALS], active_history=blobs[policy.HISTORY])
+        except pending_source.PendingSourceRefusal:
+            raise proof.EvidenceError("catalog-pending-invalid") from None
+        need(projection.plan is None or all(entry.kind == "expand" for entry in projection.plan.entries),
+             "catalog-pending-unsupported")
+        contract.pending_binding = projection.binding
         return contract
 
     def _load_pinned(self, blobs):

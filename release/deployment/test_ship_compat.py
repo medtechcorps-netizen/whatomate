@@ -87,7 +87,7 @@ class PreflightTests(unittest.TestCase):
     def rebind(self, *, server_false=None, migration_false=None, stale=False, foreign=False):
         latest, base = bridge_tests.identities(self.expected)
         pair = fixtures.pair(latest=latest, base=base,
-            web_source=self.expected.previous_web_source_sha,
+            web_source=self.expected.previous_web_source_sha, pending=bridge_tests.pending(self.expected),
             server_false=server_false, migration_false=migration_false)
         pair = fixtures.edit_pair(pair, result=lambda row: row.update(catalog_sha256=source.policy.V0_MEASUREMENT))
         if stale:
