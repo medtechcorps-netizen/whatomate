@@ -233,6 +233,41 @@ class StackTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), s.GRAPH_RECIPE_SHA256)
         self.assertIn(b"./release/staging/graphstub/cmd/graph-stub", path.read_bytes())
 
+    def test_docker_canonical_capabilities_keep_exact_allowlist_and_cleanup(self):
+        def canonical(args, value):
+            if args[:2] == ["container", "inspect"] and value[0]["Config"]["Image"] == s.runtime.POSTGRES:
+                value[0]["HostConfig"]["CapAdd"] = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER",
+                                                    "CAP_SETGID", "CAP_SETUID"]
+            return value
+        self.world.transform = canonical
+        self.stack.start()
+        self.stack.cleanup()
+        self.assertTrue(self.stack.evidence()["closed"])
+        self.assertFalse(self.world.containers)
+        self.assertIsNone(self.world.network)
+
+    def test_capability_additions_duplicates_missing_or_altered_refuse(self):
+        expected = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_SETGID", "CAP_SETUID"]
+        for observed in (expected + ["CAP_SYS_ADMIN"], expected + ["CAP_CHOWN"], expected[:-1],
+                         ["CHOWN", *expected[1:]], ["cap_chown", *expected[1:]],
+                         ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "CHOWN"]):
+            with self.subTest(observed=observed):
+                world = DockerWorld()
+                def changed(args, value):
+                    if args[:2] == ["container", "inspect"]:
+                        value[0]["HostConfig"]["CapAdd"] = observed
+                    return value
+                world.transform = changed
+                owned = s.OwnedStack("docker", Path(self.tmp.name), SOURCE, s.GraphImage(GRAPH, SOURCE),
+                                     token=TOKEN, capture=world.capture)
+                with self.assertRaises(s.proof.EvidenceError):
+                    owned.start()
+                count = len(world.mutations)
+                self.assertFalse(any(args[:2] == ["container", "start"] for args in world.mutations))
+                with self.assertRaises(s.proof.EvidenceError):
+                    owned.cleanup()
+                self.assertEqual(len(world.mutations), count)
+
     def test_stack_scram_and_collector_local_socket_compose_without_password(self):
         import postgres as pg
         from test_postgres import FakeDocker

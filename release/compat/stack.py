@@ -270,7 +270,9 @@ class OwnedStack:
                  and not host.get("ExtraHosts") and not host.get("Dns")
                  and not host.get("PidMode") and not host.get("UTSMode")
                  and host["RestartPolicy"]["Name"] == "no" and host["CapDrop"] == ["ALL"]
-                 and (host.get("CapAdd") or []) == spec["caps"]
+                 # Docker may canonicalize only these same fixed capabilities.
+                 and (host.get("CapAdd") or []) in
+                     (spec["caps"], sorted("CAP_" + cap for cap in spec["caps"]))
                  and host["SecurityOpt"] == ["no-new-privileges"]
                  and host["PidsLimit"] == 128 and host["Memory"] == spec["memory"]
                  and host["NanoCpus"] == 1000000000 and (host.get("Tmpfs") or {}) == spec["tmpfs"],
