@@ -1,6 +1,7 @@
 """Synthetic Docker/controller byte fixtures only; no live processes or network."""
 from dataclasses import replace
 import copy
+import base64
 import json
 from pathlib import Path
 import sys
@@ -14,6 +15,12 @@ import test_stack
 import test_controller
 
 TIME = "2026-10-11T00:00:02.000000000Z"
+
+
+# Exact synthetic bytes from pinned logf v0.5.5, normal Go build (no trimpath).
+# The separate saved reproduction proves grammar compatibility, not the cause
+# of a historical live refusal. Only the Docker timestamp prefix is added here.
+_LOGF_BYTES = {'empty_last': 'G1szNm10aW1lc3RhbXA9G1swbTIwMjYtMTAtMTEgMTA6MzI6NTAgG1szNm1sZXZlbBtbMG09aW5mbyAbWzM2bW1lc3NhZ2UbWzBtPSJTZXJ2aW5nIGVtYmVkZGVkIGZyb250ZW5kIiAbWzM2bWNhbGxlchtbMG09QzovVGVtcC9yZXJlcGx5LXByOC1sb2dmLWVtcHR5LXZhbHVlLWRpYWdub3Npcy12My0yMDI2MTAxMS9tYWluLmdvOjIxIBtbMzZtYXBwG1swbT1yZXJlcGx5IBtbMzZtYmFzZV9wYXRoG1swbT0gCg==', 'empty_message': 'G1szNm10aW1lc3RhbXA9G1swbTIwMjYtMTAtMTEgMTA6MzI6NTAgG1szNm1sZXZlbBtbMG09aW5mbyAbWzM2bW1lc3NhZ2UbWzBtPSAbWzM2bWNhbGxlchtbMG09QzovVGVtcC9yZXJlcGx5LXByOC1sb2dmLWVtcHR5LXZhbHVlLWRpYWdub3Npcy12My0yMDI2MTAxMS9tYWluLmdvOjIxIBtbMzZtYXBwG1swbT1yZXJlcGx5IBtbMzZtYmFzZV9wYXRoG1swbT0vY29tcGF0IAo=', 'empty_middle': 'G1szNm10aW1lc3RhbXA9G1swbTIwMjYtMTAtMTEgMTA6MzI6NTAgG1szNm1sZXZlbBtbMG09aW5mbyAbWzM2bW1lc3NhZ2UbWzBtPSJTeW50aGV0aWMgZW1wdHkgZmllbGQiIBtbMzZtY2FsbGVyG1swbT1DOi9UZW1wL3JlcmVwbHktcHI4LWxvZ2YtZW1wdHktdmFsdWUtZGlhZ25vc2lzLXYzLTIwMjYxMDExL21haW4uZ286MjEgG1szNm1hcHAbWzBtPXJlcmVwbHkgG1szNm1maXJzdBtbMG09IBtbMzZtbGFzdBtbMG09cHJlc2VudCAK', 'nonempty_last': 'G1szNm10aW1lc3RhbXA9G1swbTIwMjYtMTAtMTEgMTA6MzI6NTAgG1szNm1sZXZlbBtbMG09aW5mbyAbWzM2bW1lc3NhZ2UbWzBtPSJTZXJ2aW5nIGVtYmVkZGVkIGZyb250ZW5kIiAbWzM2bWNhbGxlchtbMG09QzovVGVtcC9yZXJlcGx5LXByOC1sb2dmLWVtcHR5LXZhbHVlLWRpYWdub3Npcy12My0yMDI2MTAxMS9tYWluLmdvOjIxIBtbMzZtYXBwG1swbT1yZXJlcGx5IBtbMzZtYmFzZV9wYXRoG1swbT0vY29tcGF0IAo='}
 
 
 def log(message, *, fields="", caller="github.com/shridarpatil/whatomate/cmd/whatomate/main.go:678", level="info", color=False):
@@ -101,6 +108,76 @@ class ObservationTests(unittest.TestCase):
     def observer(self, **kwargs):
         return o.OwnedObservation(self.manager, self.handle, self.fixture,
                                   clock=self.clock, sleep=kwargs.pop("sleep", self.clock.sleep), **kwargs)
+
+    def test_actual_pinned_logf_empty_values_preserve_record_boundaries(self):
+        expected = {"empty_last": ("Serving embedded frontend", "base_path", ""),
+                    "empty_middle": ("Synthetic empty field", "first", ""),
+                    "empty_message": ("", "base_path", "/compat"),
+                    "nonempty_last": ("Serving embedded frontend", "base_path", "/compat")}
+        for name, (message, key, value) in expected.items():
+            with self.subTest(name=name):
+                raw = b"2026-10-11T10:32:50.000000000Z " + base64.b64decode(_LOGF_BYTES[name], validate=True)
+                parsed = o.parse_logs(b"", raw, started_at=self.handle.started_at)
+                self.assertEqual(len(parsed["records"]), 1)
+                self.assertEqual(parsed["records"][0]["message"], message)
+                self.assertEqual(parsed["records"][0][key], value)
+                if name == "empty_middle": self.assertEqual(parsed["records"][0]["last"], "present")
+                self.assertEqual(o._marker(parsed["records"], "PostgreSQL tenant RLS verified", runtime_role="compat_runtime"), 0)
+
+    def test_empty_value_grammar_still_refuses_malformed_or_duplicate_fields(self):
+        fields = ['first= first=present', 'first= message="duplicate"',
+                  'first= =value', 'first= value', 'first="unterminated',
+                  'first="bad\\q"', 'first=\tlast=present', 'first=  last=present']
+        for value in fields:
+            with self.subTest(value=value), self.assertRaises(o.proof.EvidenceError):
+                o.parse_logs(b"", log("ordinary", fields=value), started_at=self.handle.started_at)
+        raw = log("", fields='first= last=present error="PostgreSQL tenant RLS verified" runtime_role=compat_runtime')
+        parsed = o.parse_logs(b"", raw, started_at=self.handle.started_at)
+        self.assertEqual(parsed["records"][0]["first"], "")
+        self.assertEqual(o._marker(parsed["records"], "PostgreSQL tenant RLS verified", runtime_role="compat_runtime"), 0)
+
+    def test_empty_application_field_does_not_block_bound_startup_or_hide_panic(self):
+        self.world.raw += log("Serving embedded frontend", fields="base_path=")
+        observed = self.observer()
+        observed.wait_startup(); observed.boot()
+        self.world.raw += log("Panic recovered", fields="optional=", level="error")
+        with self.assertRaisesRegex(o.proof.EvidenceError, "observation-period-failed"):
+            observed.finish_period()
+        self.assertEqual(observed.evidence()["period"]["panic_count"], 1)
+        self.manager.close(); self.owner.cleanup()
+
+    def test_candidate_final_period_retains_same_whole_log_guards(self):
+        self.manager.remove(self.handle)
+        self.handle = self.manager.start_web("candidate", tp.INPUTS)
+        observed = self.observer()
+        observed.wait_startup(); observed.boot()
+        result = observed.finish_period()
+        self.assertTrue(result["whole_logs_observed"])
+        self.assertEqual(result["panic_count"], 0)
+        with self.assertRaises(o.proof.EvidenceError): observed.finish_period()
+        self.manager.close(); self.owner.cleanup()
+
+    def test_candidate_final_period_refuses_late_panic(self):
+        self.manager.remove(self.handle)
+        self.handle = self.manager.start_web("candidate", tp.INPUTS)
+        observed = self.observer()
+        observed.wait_startup(); observed.boot()
+        self.world.raw += log("Panic recovered", level="error")
+        with self.assertRaisesRegex(o.proof.EvidenceError, "observation-period-failed"):
+            observed.finish_period()
+        self.assertEqual(observed.evidence()["period"]["panic_count"], 1)
+        self.manager.close(); self.owner.cleanup()
+
+    def test_candidate_final_period_cannot_adopt_replacement_handle(self):
+        self.manager.remove(self.handle)
+        self.handle = self.manager.start_web("candidate", tp.INPUTS)
+        observed = self.observer()
+        observed.wait_startup(); observed.boot()
+        self.manager.remove(self.handle)
+        self.manager.start_web("candidate", tp.INPUTS)
+        with self.assertRaisesRegex(o.proof.EvidenceError, "observation-handle-stale"):
+            observed.finish_period()
+        self.manager.close(); self.owner.cleanup()
 
     def test_positive_owned_boot_and_actual_sixty_second_window(self):
         observed = self.observer()

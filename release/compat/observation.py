@@ -33,7 +33,8 @@ proof = processes.proof
 _SGR = re.compile(r"\x1b\[(?:0|31|33|35|36)m")
 _DOCKER_TIME = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z) (.*)\Z")
 _HEADER = re.compile(r"timestamp=\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ")
-_FIELD = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)=("(?:[^"\\]|\\["\\nrtbf/]|\\u[0-9a-fA-F]{4})*"|[^\s"]+)(?: |$)')
+# Pinned logf writes empty strings as key=, including empty message values.
+_FIELD = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)=("(?:[^"\\]|\\["\\nrtbf/]|\\u[0-9a-fA-F]{4})*"|[^\s"]*)(?: |$)')
 _UNKNOWN = re.compile(r"\bunknown(?:[- ]job)?[- ]type\b", re.IGNORECASE)
 _PANIC = re.compile(r"\bpanic(?:ked)?\b", re.IGNORECASE)
 _MAIN = re.compile(r"(?:^|/)cmd/whatomate/main\.go:[1-9][0-9]*\Z")
@@ -309,7 +310,7 @@ class OwnedObservation:
         """
         try:
             need(self._startup_ready and self._booted and not self._period_attempted
-                 and self.handle.version == "previous", "observation-period-order")
+                 and self.handle.version in {"previous", "candidate"}, "observation-period-order")
             self._period_attempted = True
             need(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 30,
                  "observation-period-bounds")
