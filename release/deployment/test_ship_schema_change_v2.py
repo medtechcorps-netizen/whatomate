@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -15,6 +16,8 @@ from pathlib import Path
 
 import schema_change as sc
 import test_ship_support as support
+import test_pending_plan as pending_fixture
+import source_git
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -605,6 +608,256 @@ class SourceHistoryPolicyTests(unittest.TestCase):
         self.repo.checkout(self.base)
         result = self.result({"README.md": "right\n"}, left)
         self.assertIn("classifier-v2-invalid:history-range", result.reasons)
+
+
+class PendingSourceHistoryTests(unittest.TestCase):
+    """Real immutable commits; planned operations never stand in for SQL proof."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = support.TempRepo(Path(self.temp.name) / "repo")
+        self.args = pending_fixture.fixture()
+        self.files = {name: raw.decode() for name, raw in self.args["files"].items()}
+        self.base = self.repo.commit({sc.CATALOG: self.args["active_catalog"].decode(),
+                                     sc.GLOBALS: self.args["active_globals"].decode(),
+                                     sc.HISTORY: self.args["active_history"].decode(),
+                                     sc.MIGRATION_PATH: text(migration()), "cmd/whatomate/main.go": MAIN,
+                                     "internal/database/tenant.go": TENANT, "README.md": "baseline\n"})
+
+    def classify(self, head, base=None):
+        return sc.classify_v2(self.repo.root, base or self.base, head)
+
+    def changed_plan(self, change):
+        plan = json.loads(self.files[sc.pending_plan.PLAN])
+        change(plan)
+        return sc.pending_plan.canonical(plan).decode()
+
+    def test_pr22_shaped_introduction_reports_source_only_and_retains_producer_block(self):
+        introduced = self.repo.commit(self.files)
+        head = self.repo.commit({"README.md": "after introduction\n"})
+        result = self.classify(head)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", True, ()))
+        self.assertEqual(set(result.requirements), {"compat-required", "generated-migration-closure-ci", "producer-class-unsupported"})
+        self.assertIn("pending source plan: active=0; target=1; source=" + head, result.summary)
+        self.assertIn("pending source step: create_ledger; operation=create_relation; source_sha256=" + H + "; requires_gates=schema_ready", result.summary)
+        self.assertEqual(sum(line.startswith("pending source file:") for line in result.summary), 3)
+        self.assertEqual(sum(line.startswith("pending source step:") for line in result.summary), 4)
+        self.assertIn("pending source plan only; actual ledger/apply state unavailable; gates not evaluated", result.summary)
+        self.assertIn("pending gates: a failed gate would hold back unrelated steps; holdback review required", result.summary)
+        # Legacy behavior remains distinct and cannot claim the new source rule.
+        legacy = sc.classify(self.repo.root, self.base, introduced)
+        self.assertEqual((legacy.kind, legacy.dormant, legacy.reasons), ("none", False, ()))
+
+    def test_unchanged_plan_unrelated_change_stays_none_but_producer_is_still_unavailable(self):
+        base = self.repo.commit(self.files)
+        head = self.repo.commit({"README.md": "unrelated\n"})
+        for end in (base, head):
+            with self.subTest(end=end):
+                result = self.classify(end, base)
+                self.assertEqual((result.kind, result.dormant, result.reasons), ("none", False, ()))
+                self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_pending_reads_use_committed_blobs_not_working_tree(self):
+        head = self.repo.commit(self.files)
+        self.repo.write({sc.pending_plan.PLAN: "private invalid working-tree bytes"})
+        result = self.classify(head)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", True, ()))
+        self.assertNotIn("private", " ".join(result.summary))
+
+    def test_removed_and_reintroduced_bundle_refuses_even_with_equal_endpoints(self):
+        base = self.repo.commit(self.files)
+        self.repo.commit({name: None for name in self.files})
+        head = self.repo.commit(self.files)
+        result = self.classify(head, base)
+        self.assertIn("classifier-v2-invalid:pending", result.reasons)
+        self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_transient_introduction_removed_at_head_cannot_hide_between_empty_endpoints(self):
+        self.repo.commit(self.files)
+        head = self.repo.commit({name: None for name in self.files})
+        result = self.classify(head)
+        self.assertIn("classifier-v2-invalid:pending", result.reasons)
+        self.assertIn("pending-format-unsupported", result.reasons)
+
+    def test_valid_replacement_then_restore_is_not_laundered(self):
+        base = self.repo.commit(self.files)
+        changed = self.changed_plan(lambda doc: doc["steps"][0].update(source_sha256=J))
+        sc.pending_plan.parse_bundle(**{**self.args, "files": {**self.args["files"], sc.pending_plan.PLAN: changed.encode()}})
+        self.repo.commit({sc.pending_plan.PLAN: changed})
+        head = self.repo.commit(self.files)
+        self.assertIn("classifier-v2-invalid:pending", self.classify(head, base).reasons)
+
+    def test_invalid_intermediate_before_valid_introduction_refuses(self):
+        self.repo.commit({sc.pending_plan.PLAN: "{}\n"})
+        head = self.repo.commit(self.files)
+        self.assertIn("classifier-v2-invalid:pending", self.classify(head).reasons)
+
+    def test_bundle_closed_hash_canonical_and_dag_failures_refuse(self):
+        variants = [
+            {sc.pending_plan.PLAN: None},
+            {sc.pending_plan.PREFIX + "extra.json": "{}\n"},
+            {sc.pending_plan.PLAN: json.dumps(json.loads(self.files[sc.pending_plan.PLAN]), indent=2)},
+            {sc.pending_plan.PLAN: self.changed_plan(lambda d: d.update(active_catalog_file_sha256=J))},
+            {sc.pending_plan.PLAN: self.changed_plan(lambda d: d["steps"][0].update(depends_on=["grant_runtime"]))},
+            {sc.pending_plan.PLAN: self.changed_plan(lambda d: d["steps"][0].update(operation="executed_concurrently"))},
+        ]
+        for delta in variants:
+            with self.subTest(delta=list(delta)):
+                self.repo.checkout(self.base)
+                head = self.repo.commit({**self.files, **delta})
+                result = self.classify(head)
+                self.assertIn("classifier-v2-invalid:pending", result.reasons)
+                self.assertIn("pending-format-unsupported", result.reasons)
+                self.assertNotEqual((result.kind, result.dormant), ("expand", True))
+
+    def test_non_expand_declarations_are_not_relabelled_as_expansion(self):
+        for kind in ("data", "contract"):
+            with self.subTest(kind=kind):
+                self.repo.checkout(self.base)
+                changed = self.changed_plan(lambda d: d["entries"][0].update({"class": kind}))
+                head = self.repo.commit({**self.files, sc.pending_plan.PLAN: changed})
+                result = self.classify(head)
+                self.assertEqual((result.kind, result.dormant), ("none", False))
+                self.assertIn("pending-format-unsupported", result.reasons)
+                self.assertIn("producer-class-unsupported", result.requirements)
+
+    def test_active_byte_edits_cannot_rebind_an_existing_plan_or_first_introduction(self):
+        for path, field in ((sc.CATALOG, "active_catalog_file_sha256"), (sc.GLOBALS, "active_globals_file_sha256"),
+                            (sc.HISTORY, "active_history_file_sha256")):
+            for existing in (False, True):
+                with self.subTest(path=path, existing=existing):
+                    self.repo.checkout(self.base)
+                    base = self.repo.commit(self.files) if existing else self.base
+                    raw = self.repo.git("show", self.base + ":" + path) + " \n"
+                    changed = self.changed_plan(lambda d: d.update({field: hashlib.sha256(raw.encode()).hexdigest()}))
+                    head = self.repo.commit({**self.files, path: raw, sc.pending_plan.PLAN: changed})
+                    self.assertIn("classifier-v2-invalid:pending", self.classify(head, base).reasons)
+
+    def test_pending_never_downgrades_data_active_change_or_contract(self):
+        cases = [({sc.SEEDS: text({"version": 0, "synthetic": ["new_key"]})}, "data", True),
+                 ({sc.SEEDS: text({"version": 0}), sc.HISTORY: text([{"version": 0, "class": "baseline", "min_reader_version": 0, "apply_engine": True}])}, "data", False),
+                 ({"internal/database/tenant.go": TENANT.replace('"t"', '"changed"'), sc.MIGRATION_PATH: text(migration(J))}, "contract", False)]
+        for delta, kind, dormant in cases:
+            with self.subTest(kind=kind, dormant=dormant):
+                self.repo.checkout(self.base)
+                result = self.classify(self.repo.commit({**self.files, **delta}))
+                self.assertEqual((result.kind, result.dormant), (kind, dormant))
+                self.assertIn("producer-class-unsupported", result.requirements)
+                if not dormant:
+                    # The active-engine refusal occurs before final requirement
+                    # collection; its existing refusal remains sufficient.
+                    self.assertTrue(result.reasons or "restore-drills" in result.requirements)
+
+    def test_active_catalog_floor_change_is_not_dormant_pending(self):
+        target = json.loads(self.files[sc.pending_plan.PREFIX + "catalog-v1.json"])
+        result = self.classify(self.repo.commit({**self.files, sc.CATALOG: text(target), sc.HISTORY: text(history(1, "contract", True, 1))}))
+        self.assertEqual((result.kind, result.dormant), ("contract", False))
+        self.assertIn("classifier-v2-invalid:pending", result.reasons)
+        self.assertIn("catalog-format/profile-unsupported", result.requirements)
+
+    def test_migration_guards_and_observations_remain_separate(self):
+        for generated in (False, True):
+            with self.subTest(generated=generated):
+                self.repo.checkout(self.base)
+                delta = {"cmd/whatomate/main.go": MAIN.replace("println(1)", "println(9)")}
+                if generated: delta[sc.MIGRATION_PATH] = text(migration(J))
+                result = self.classify(self.repo.commit({**self.files, **delta}))
+                self.assertEqual((result.kind, result.dormant), ("expand", True))
+                if generated:
+                    self.assertEqual(result.reasons, ())
+                    self.assertIn("generated migration closure changed", result.migration_changes)
+                else:
+                    self.assertIn("migration-contract-stale", result.reasons)
+
+    def test_closed_listing_rejects_bad_nul_duplicate_paths_and_directory_blob(self):
+        head = self.repo.commit(self.files)
+        real_git = sc._git
+        normal = b"\0".join(name.encode() for name in sorted(self.files)) + b"\0"
+        for raw in (normal[:-1], normal + b"\0", normal + normal.split(b"\0")[0] + b"\0",
+                    normal.replace(b"catalog-v1.json", b"../catalog-v1.json"), b"\xff\0",
+                    sc.pending_plan.PREFIX.rstrip("/").encode() + b"\0"):
+            def capture(root, args):
+                if args[:4] == ["ls-tree", "-r", "--name-only", "-z"] and args[4] == head and args[-1] == sc._V2_PENDING.rstrip("/"):
+                    return raw
+                return real_git(root, args)
+            with self.subTest(length=len(raw)), mock.patch.object(sc, "_git", side_effect=capture):
+                self.assertIn("classifier-v2-invalid:pending", self.classify(head).reasons)
+
+    def test_pending_regular_blob_and_existing_per_blob_cap_are_enforced(self):
+        head = self.repo.commit(self.files)
+        real_git = sc._git
+        for failure in ("mode", "size"):
+            pending_blob = False
+            def capture(root, args):
+                nonlocal pending_blob
+                if args[:2] == ["ls-tree", "-z"] and args[-1].startswith(sc._V2_PENDING):
+                    pending_blob = True
+                    raw = real_git(root, args)
+                    return raw.replace(b"100644 blob", b"120000 blob") if failure == "mode" else raw
+                if pending_blob and args[:2] == ["cat-file", "-s"]:
+                    return str(sc.MAX_ARTIFACT_BYTES + 1).encode()
+                return real_git(root, args)
+            with self.subTest(failure=failure), mock.patch.object(sc, "_git", side_effect=capture):
+                self.assertIn("classifier-v2-invalid:pending", self.classify(head).reasons)
+
+    def test_actual_blob_at_pending_directory_name_is_not_an_empty_inventory(self):
+        head = self.repo.commit({sc.pending_plan.PREFIX.rstrip("/"): "not a pending directory\n"})
+        result = self.classify(head)
+        self.assertIn("classifier-v2-invalid:pending", result.reasons)
+        self.assertIn("pending-format-unsupported", result.reasons)
+
+    def test_empty_history_prefix_is_checked_once_per_commit_and_has_no_blob_cost(self):
+        middle = self.repo.commit({"README.md": "middle\n"})
+        head = self.repo.commit({"README.md": "head\n"})
+        real_git = sc._git
+        commands = []
+        def capture(root, args):
+            result = real_git(root, args)
+            commands.append((tuple(args), len(result)))
+            return result
+        repo = sc._Repository(self.repo.root)
+        with mock.patch.object(sc, "_git", side_effect=capture):
+            self.assertFalse(sc._v2_pending(repo, self.base, head, set(), [], set()))
+        self.assertEqual(len(commands), 4)  # One bounded range plus base and both first parents.
+        self.assertEqual(sum(size for _, size in commands), 82)
+        self.assertEqual([args[4] for args, _ in commands[1:]], [self.base, middle, head])
+        self.assertEqual((repo.total, repo.cache), (0, {}))
+
+    def test_real_immutable_git_scope_and_exhaustion_keep_fixed_grammar_and_no_fallback(self):
+        head = self.repo.commit(self.files)
+        reader = source_git.ImmutableGit(self.repo.root, Path(shutil.which("git")))
+        with reader.operation():
+            result = self.classify(head)
+        self.assertEqual((result.kind, result.dormant, result.reasons), ("expand", True, ()))
+        self.assertTrue(reader.closed)
+        for reason in ("calls", "bytes", "deadline"):
+            real_git = sc._git
+            requests = []
+            def refuse(root, args):
+                if args[:4] == ["ls-tree", "-r", "--name-only", "-z"] and args[-1] == sc._V2_PENDING.rstrip("/"):
+                    requests.append(tuple(args))
+                    raise source_git.SourceGitRefusal("git-failed:source-" + reason)
+                return real_git(root, args)
+            with self.subTest(reason=reason), mock.patch.object(sc, "_git", side_effect=refuse):
+                with self.assertRaises(source_git.SourceGitRefusal) as caught:
+                    self.classify(head)
+                self.assertEqual(caught.exception.code, "git-failed:source-" + reason)
+                self.assertEqual(len(requests), 1)
+
+    def test_pending_range_cap_and_malformed_revision_refuse_before_listing(self):
+        # Isolate the new history traversal; legacy traversal has its own cap.
+        head = self.repo.commit({"README.md": "head\n"})
+        for raw in ((head.encode() + b"\n") * (sc.MAX_HISTORY_COMMITS + 1), b"private-invalid-revision\n",
+                    (head + "\n" + head + "\n").encode(), b""):
+            commands = []
+            def capture(root, args):
+                commands.append(tuple(args))
+                return raw
+            with self.subTest(length=len(raw)), mock.patch.object(sc, "_git", side_effect=capture):
+                with self.assertRaises(sc._Invalid):
+                    sc._v2_pending(sc._Repository(self.repo.root), self.base, head, set(), [], set())
+                self.assertEqual(len(commands), 1)
 
 
 class InvocationArtifactBudgetTests(unittest.TestCase):
