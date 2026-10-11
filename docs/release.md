@@ -27,6 +27,13 @@ the reviewed v0 catalog. Both old-server compatibility and migration reversibili
 must pass; `candidate-invalid:irreversible-needs-fix-forward-mode` refuses an
 irreversible result until the separately reviewed recovery implementation.
 
+The classifier also recognizes a complete format-1 dormant pending expansion
+and checks its full first-parent history for replacement, removal or malformed
+intermediate bundles. These source plans still carry `producer-class-unsupported`:
+classification alone cannot authorize a release. Summaries list every changed
+path from the database origin, latest record and selected web source, together
+with planned step and gate names; they do not claim that those steps ran.
+
 A successful promote writes a schema-v2 manifest. It records the measured
 database catalog independently of the images currently running, including the
 catalog version, minimum reader version, compatibility run and staging result.
@@ -42,13 +49,22 @@ snapshot even if `main` has advanced. An exact already-published signed record
 is reused on a record-only retry; missing unpublished handoff evidence refuses.
 Oversized evidence refuses before deployment rather than omitting history.
 
-The remaining PR16 work includes the positive pending/additive/active classifier
-rules and producer formats, contract-label and restore-drill gates, exact-span
-rollback compatibility, authenticated compatibility-outage bypass, and their
-operational validation. None is enabled by this bounded implementation. The
-null restore-drill timestamps are not successful drill evidence. The existing
-staging failure-injection drills do not substitute for database restore/fork
-drills.
+Current handoff format 4 uses bounded, lossless XZ framing and retains the drill
+observation made after the final source and compatibility checks. Record retries
+replay that original observation instead of evaluating drill age at retry time.
+Historical formats 1–3 retain their exact older fields and cannot be re-encoded
+as a current handoff without a real observation. The currently supported changes
+are exempt from the restore-drill requirement; their observation says so.
+
+The remaining PR16 work includes pending producer/custody integration, positive
+active and additive classifier rules, operational contract-label admission,
+exact-span rollback compatibility, authenticated compatibility-outage bypass,
+and their validation. A bounded owner-label collector and pure authorization
+policy are preparatory only; workflow permissions and the release caller do not
+select them yet. Active forward database changes require both restore-drill dates
+within 90 days, but active producers remain disabled. The null timestamps are
+not successful drill evidence. Existing staging failure-injection drills do not
+substitute for database restore/fork drills.
 
 ## Release jobs
 

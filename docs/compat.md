@@ -518,8 +518,13 @@ incomplete attempts or authenticated negative results; a fresh later
 positive may supersede older infrastructure gaps. The original collection
 window and full visible attempt history cross to the record job unchanged.
 
-Semantic expansion, contract/drill gates, dedicated multi-span rollback proof
-and compatibility-outage bypass remain unfinished PR16 work. Visible API
+The source classifier recognizes valid dormant pending plans, while their
+operational producers remain blocked. Release now preserves its original drill
+observation through handoff format 4; the supported none/dormant changes remain
+exempt. Owner-label collection and policy are preparatory and are not selected
+by the release caller. Pending producer integration, active semantic expansion,
+contract admission, dedicated multi-span rollback proof and compatibility-outage
+bypass remain unfinished PR16 work. Visible API
 pagination cannot establish absence of entirely deleted runs, so it does not
 authorize an outage bypass. This partial implementation does not complete the
 canonical plan or enable active DDL/data. The PR8 qualification prerequisite and
