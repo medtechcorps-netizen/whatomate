@@ -4,6 +4,7 @@ Concrete source/Actions captures are covered in test_ship_compat/ship_records.
 These cases exercise the same-run handoff, writer, retries and drift semantics.
 """
 from dataclasses import replace
+import io
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -184,7 +185,8 @@ class FlowTests(unittest.TestCase):
         self.assertIn(f'- Compatibility: ok; run: {value.qualified.run_id}', lines)
         self.assertIn('- Catalog: version 0, minimum reader 0', lines)
         self.assertIn('- Changed database artifact paths: ' + p.SEEDS, lines)
-        self.assertIn('- Other changed source paths: unavailable in the retained preflight projection', lines)
+        self.assertTrue(any(line.startswith('- Changed source range (') for line in lines))
+        self.assertIn('  - M ' + p.SEEDS, lines)
 
     def test_rollback_summaries_do_not_invent_legacy_catalog_or_new_compat(self):
         legacy = fixture.WriterTests.legacy.resolved
@@ -312,6 +314,113 @@ class FlowTests(unittest.TestCase):
     def test_helpers_do_not_accept_supplied_resolutions(self):
         with self.assertRaises(TypeError):
             flow.record_bytes(self.ctx, self.control, self.fields, deadline=self.deadline, current=self.current)
+
+
+class ForwardSummaryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixture.composition.source.ForwardAuditTests.setUpClass()
+
+    def setUp(self):
+        self.case = fixture.composition.source.ForwardAuditTests()
+        self.case.setUp(); self.addCleanup(self.case.doCleanups)
+
+    def lines(self, resolution):
+        # Real resolver-derived source audit; qualification is already covered
+        # by the normal gate composition. No fabricated authority is exercised.
+        normal = SimpleNamespace(resolution=resolution,
+            qualified=SimpleNamespace(reversible=True, old_server=True, run_id=38100000001))
+        return flow.details(flow.Gate(resolution.resolved, normal, None))
+
+    def ranges(self, lines):
+        return [line for line in lines if line.startswith('- Changed source range (')]
+
+    def test_three_distinct_sources_keep_all_roles_headers_and_full_rows(self):
+        case = self.case
+        old = case.add(version=1, images=case.boot['images'])
+        origin = case.add(); case.profile(origin['sha']); case.add(kind='rollback', target=old)
+        case.world.files[case.boot['sha'], case.RECIPE] = b'FROM scratch\n'
+        sha = case.candidate()
+        case.world.files[sha, '.github/workflows/audit.yml'] = b'candidate'
+        resolution = case.forward(sha); lines = self.lines(resolution)
+        self.assertEqual(len(self.ranges(lines)), 3)
+        self.assertEqual({item.roles for item in resolution.audit.changes},
+            {('database-origin',), ('latest-record',), ('selected-web',)})
+        for item in resolution.audit.changes:
+            header = f'- Changed source range ({", ".join(item.roles)}): {item.base_sha} -> {sha}; paths: {len(item.rows)}'
+            at = lines.index(header)
+            self.assertEqual(lines[at+1:at+1+len(item.rows)],
+                [f'  - {row.status} {row.path}' for row in item.rows])
+        self.assertEqual(sum(line == '  - A .github/workflows/audit.yml' for line in lines), 3)
+        self.assertFalse(any('unavailable' in line for line in self.ranges(lines)))
+
+    def test_equal_bases_deduplicate_headers_without_losing_add_modify_delete_or_hidden_path(self):
+        base, sha = self.case.ordinary()
+        self.case.world.files[base, 'docs/removed.md'] = b'before'
+        self.case.world.files[base, 'docs/changed.md'] = b'before'
+        self.case.world.files[sha, 'docs/changed.md'] = b'after'
+        self.case.world.files[sha, '.github/workflows/added.yml'] = b'after'
+        lines = self.lines(self.case.forward(sha))
+        self.assertEqual(self.ranges(lines), [f'- Changed source range (database-origin, latest-record, selected-web): '
+            f'{base} -> {sha}; paths: 3'])
+        self.assertEqual([line for line in lines if line.startswith('  - ')],
+            ['  - A .github/workflows/added.yml', '  - M docs/changed.md', '  - D docs/removed.md'])
+
+    def test_empty_ranges_are_explicit_and_historical_absence_is_not_empty(self):
+        old = self.case.add(version=1); self.case.profile(old['sha'])
+        origin = self.case.add(); self.case.profile(origin['sha'])
+        self.case.add(kind='rollback', target=old)
+        resolution = self.case.forward(origin['sha']); lines = self.lines(resolution)
+        self.assertEqual(len(self.ranges(lines)), 2)
+        self.assertTrue(all(line.endswith('; paths: 0') for line in self.ranges(lines)))
+        self.assertFalse(any(line.startswith('  - ') for line in lines))
+        historical = self.lines(replace(resolution, audit=None))
+        self.assertFalse(self.ranges(historical))
+        self.assertIn('- Other changed source paths: unavailable (historical source audit absent)', historical)
+
+    def test_projection_type_partition_source_status_order_and_bounds_refuse(self):
+        _, sha = self.case.ordinary(); resolution = self.case.forward(sha)
+        audit = resolution.audit; change = audit.changes[0]; rr = flow.record_resolver
+        invalid = [object(), replace(audit, candidate_sha='f'*40), replace(audit, changes=()),
+            replace(audit, changes=(replace(change, roles=('database-origin',)),)),
+            replace(audit, changes=(replace(change, head_sha='f'*40),)),
+            replace(audit, changes=(replace(change, rows=(rr.ChangedPath('R','docs/a'),)),)),
+            replace(audit, changes=(replace(change, rows=(rr.ChangedPath('A','../escape'),)),)),
+            replace(audit, changes=(replace(change, rows=(rr.ChangedPath('A','docs/a'),)*2),)),
+            replace(audit, changes=(replace(change, rows=(rr.ChangedPath('A','docs/z'),rr.ChangedPath('A','docs/a'))),)),
+            replace(audit, changes=(replace(change, rows=(rr.ChangedPath('A','docs/a'),)*10001),))]
+        for value in invalid:
+            with self.subTest(value=type(value).__name__), self.assertRaisesRegex(c.ReleaseError,'^record-chain-invalid:policy$'):
+                self.lines(replace(resolution, audit=value))
+        with self.assertRaisesRegex(c.ReleaseError,'^record-chain-invalid:policy$'):
+            flow._forward_paths(SimpleNamespace(audit=None))
+
+    def test_public_text_rules_refuse_credential_path_and_output_private_match(self):
+        _, sha = self.case.ordinary()
+        self.case.world.files[sha, 'docs/ghp_synthetic_marker.txt'] = b'public fixture'
+        resolution = self.case.forward(sha)
+        with self.assertRaisesRegex(c.ReleaseError, '^output-unsafe:text$'):
+            self.lines(resolution)
+        change = resolution.audit.changes[0]; rr = flow.record_resolver
+        safe = replace(resolution, audit=replace(resolution.audit,
+            changes=(replace(change, rows=(rr.ChangedPath('A','docs/synthetic_private.txt'),)),)))
+        lines = self.lines(safe)
+        out = c.Output(stdout=io.StringIO()); out.add_private('synthetic_private')
+        with self.assertRaisesRegex(c.ReleaseError, '^output-unsafe:text$'):
+            out.summary(lines)
+
+    def test_near_cap_projection_emits_every_path_within_summary_bound(self):
+        _, sha = self.case.ordinary()
+        # Controlled Git responses still pass the real resolver's projection
+        # validation. The canonical audit is close to its512KiB bound.
+        rows = [('A', f'docs/p{i:04d}-' + 'x'*485) for i in range(1000)]
+        raw = b''.join((status+'\0'+path+'\0').encode() for status,path in rows)
+        self.case.audit_output(raw)
+        resolution = self.case.forward(sha); lines = self.lines(resolution)
+        rendered = [line for line in lines if line.startswith('  - ')]
+        self.assertEqual(rendered, [f'  - {status} {path}' for status,path in rows])
+        self.assertGreater(len('\n'.join(rendered)), 480*1024)
+        self.assertLess(len('\n'.join(lines))+1, flow.record_resolver.MAX_AUDIT_BYTES+2048)
 
 
 if __name__ == '__main__':

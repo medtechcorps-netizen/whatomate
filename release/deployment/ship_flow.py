@@ -113,6 +113,29 @@ def gate(ctx, control, mode, target, *, deadline):
     return Gate(result.resolution.resolved, result, None)
 
 
+@_fixed
+def _forward_paths(resolution):
+    """Render the complete checked projection; never discover source here."""
+    if type(resolution) is not record_resolver.ForwardResolution:
+        raise policy.PolicyRefusal('record-source-invalid')
+    if resolution.audit is None:
+        return ['- Other changed source paths: unavailable (historical source audit absent)']
+    audit = record_resolver.validate_forward_audit(resolution.audit,
+        candidate_sha=resolution.candidate.sha, database_base_source=resolution.database_base_source,
+        latest_record_sha=resolution.resolved.latest.record_sha,
+        selected_web_source_sha=resolution.resolved.selected.actual_web_source_sha)
+    lines = []
+    for change in audit.changes:
+        lines.append(f'- Changed source range ({", ".join(change.roles)}): '
+            f'{change.base_sha} -> {change.head_sha}; paths: {len(change.rows)}')
+        lines.extend(f'  - {row.status} {row.path}' for row in change.rows)
+    # Row text is shorter than its canonical representation; reserve a small
+    # fixed margin for the at-most-three headers. Never omit a path to fit.
+    _need(sum(len(line) + 1 for line in lines) <= record_resolver.MAX_AUDIT_BYTES + 2048,
+          'output-unsafe:text')
+    return [common.require_public_text(line) for line in lines]
+
+
 def details(value):
     """Public summary values derived from the already checked gate."""
     latest = value.resolved.latest
@@ -134,7 +157,7 @@ def details(value):
             f'- Measured catalog SHA256: {candidate.catalog.catalog_sha256}',
             f'- Database source: {resolution.database_base_source}',
             f'- Changed database artifact paths: {changed}',
-            '- Other changed source paths: unavailable in the retained preflight projection',
+            *_forward_paths(resolution),
             '- Restore drills: not required for none or dormant changes']
     if latest.live is None:
         return ['- Database history: legacy source checks; measured catalog unavailable',
