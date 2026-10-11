@@ -130,7 +130,7 @@ def _setup(fixture, business_account_id, sweep_factory):
     # including its complete returned shape; missing/foreign/duplicate rows fail.
     _need(type(observed) is dict and set(observed) == {"accounts"}
           and observed["accounts"] == [account])
-    return True
+    return True, client.stub_receipts()
 
 
 def journal_result(value, *, after, discard_baseline):
@@ -152,13 +152,56 @@ def journal_result(value, *, after, discard_baseline):
     return value
 
 
-def _journal(fixture, after, discard_baseline, sweep_factory):
+def _journal(fixture, after, discard_baseline, sweep_factory, *, ring='journal'):
     client = sweep_factory(fixture)
     client._begin()
-    rows, cursor = client._journal(after, discard_baseline=discard_baseline)
-    return journal_result({"after": after, "cursor": cursor, "discard_baseline": discard_baseline,
+    rows, cursor = (client._journal(after, discard_baseline=discard_baseline) if ring == 'journal'
+                    else client._rejected(after))
+    value = journal_result({"after": after, "cursor": cursor, "discard_baseline": discard_baseline,
                            "entries": rows, "requests": client._requests},
                           after=after, discard_baseline=discard_baseline)
+    return value, client.stub_receipts()
+
+
+def validate_receipts(request, response):
+    """Private closed receipts; exact operation grammar, never caller counts."""
+    receipt = response.get('stub_receipts')
+    _need(type(receipt) is dict and set(receipt) == {'calls', 'windows'})
+    calls, windows = receipt['calls'], receipt['windows']
+    _need(type(calls) is list and len(calls) <= 256 and type(windows) is list and len(windows) <= 4)
+    for call in calls:
+        _need(type(call) is dict and set(call) == {'method', 'route', 'status'}
+              and type(call['method']) is str and type(call['route']) is str
+              and type(call['status']) is int and call['status'] == 200)
+    for window in windows:
+        _need(type(window) is dict and set(window) == {'ring','after','cursor','discard_baseline','requests'}
+              and type(window['ring']) is str and window['ring'] in {'journal','rejected'}
+              and type(window['after']) is int and type(window['cursor']) is int
+              and 0 <= window['after'] <= window['cursor'] < 2**64
+              and type(window['discard_baseline']) is bool
+              and (not window['discard_baseline'] or (window['ring'] == 'journal' and window['after'] == 0))
+              and type(window['requests']) is int and 1 <= window['requests'] <= 20)
+    def get_calls(window):
+        return [{'method':'GET','route':window['ring'],'status':200} for _ in range(window['requests'])]
+    operation = request['operation']
+    if operation in {'read', 'readiness'}:
+        _need(not calls and not windows)
+    elif operation == 'setup':
+        _need(not windows and calls == [{'method':'POST','route':'accounts','status':200},
+                                       {'method':'GET','route':'accounts','status':200}])
+    elif operation in {'journal', 'rejected'}:
+        _need(len(windows) == 1)
+        value = response[operation]
+        _need(windows[0] == {'ring':operation, **{k:value[k] for k in ('after','cursor','discard_baseline','requests')}}
+              and calls == get_calls(windows[0]))
+    else:
+        _need(operation == 'write' and len(windows) == 4 and all(w['ring'] == 'journal' for w in windows))
+        _need(all(windows[i]['discard_baseline'] and windows[i]['after'] == 0 for i in (0,2))
+              and all(not windows[i]['discard_baseline'] and windows[i]['after'] == windows[i-1]['cursor'] for i in (1,3)))
+        expected = get_calls(windows[0]) + [{'method':'POST','route':'inbound','status':200}]
+        for window in windows[1:]: expected.extend(get_calls(window))
+        _need(calls == expected)
+    return receipt
 
 
 def parse_request(raw: bytes) -> dict:
@@ -171,9 +214,9 @@ def parse_request(raw: bytes) -> dict:
     request = _parse(raw)
     _need(type(request.get("version")) is int and request["version"] == 1)
     operation = request.get("operation")
-    _need(type(operation) is str and operation in {"setup", "readiness", "write", "read", "journal"})
+    _need(type(operation) is str and operation in {"setup", "readiness", "write", "read", "journal", "rejected"})
     keys = {"version", "operation", "fixture"}
-    if operation == "journal":
+    if operation in {"journal", "rejected"}:
         keys.update({"after", "discard_baseline"})
     elif operation == "setup":
         keys.add("business_account_id")
@@ -183,10 +226,11 @@ def parse_request(raw: bytes) -> dict:
         keys.add("record")
     _need(set(request) == keys)
     fixture = _fixture(request["fixture"])
-    if operation == "journal":
+    if operation in {"journal", "rejected"}:
         _need(type(request["after"]) is int and 0 <= request["after"] < 2**64
               and type(request["discard_baseline"]) is bool
               and (not request["discard_baseline"] or request["after"] == 0))
+        _need(operation != 'rejected' or request['discard_baseline'] is False)
     elif operation == "setup":
         _need(type(request["business_account_id"]) is str
               and sweep._DIGITS.fullmatch(request["business_account_id"]) is not None
@@ -203,7 +247,7 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
     """One bounded private frame; fixed failures never retain exception text.
 
     The owning process adapter must enforce a wall deadline: setup 100s,
-    readiness 30s, journal 190s, write 600s and read 400s. Setup uses two <=45s requests;
+    readiness 30s, either ring 190s, write 600s and read 400s. Setup uses two <=45s requests;
     Sweep retains its existing per-operation budgets.
     A success response is protocol completion, not compatibility qualification.
     """
@@ -217,12 +261,13 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
         elif operation == "read":
             record = sweep.RecordSet(**request["record"])
         response = {"version": 1, "status": "ok", "operation": operation}
-        if operation == "journal":
-            response["journal"] = _journal(fixture, request["after"], request["discard_baseline"], sweep_factory)
+        if operation in {"journal", "rejected"}:
+            response[operation], response['stub_receipts'] = _journal(fixture, request["after"], request["discard_baseline"], sweep_factory, ring=operation)
         elif operation == "setup":
-            response["registered"] = _setup(fixture, request["business_account_id"], sweep_factory)
+            response["registered"], response['stub_receipts'] = _setup(fixture, request["business_account_id"], sweep_factory)
         elif operation == "readiness":
             response["ready"] = _readiness(fixture, http_factory, clock)
+            response['stub_receipts'] = {'calls': [], 'windows': []}
         else:
             client = sweep_factory(fixture)
             client.login()
@@ -236,6 +281,8 @@ def handle(raw: bytes, *, sweep_factory=sweep.Sweep, http_factory=sweep.HTTP,
             # only a RecordSet. Obtain the flags from actual Sweep.read instead
             # of manufacturing six true values from a successful return.
             response["cases"] = _flags(client.read(record))
+            response['stub_receipts'] = client.stub_receipts()
+        validate_receipts(request, response)
         return _encode(response)
     except sweep.SemanticFailure:
         return _failure("semantic")

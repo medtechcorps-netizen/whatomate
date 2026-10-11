@@ -137,6 +137,7 @@ class OwnedProcesses:
         self._ids, self._specs, self._handles, self._events = {}, {}, {}, []
         self._images, self._ambiguous, self._closed = {}, False, False
         self._protocol_failed = False
+        self._controller_receipts = []  # Immutable private frames, never evidence().
         self._assert_all()
         for role, binding in self.bindings.items():
             image = stack._json(self._read(["image", "inspect", binding.reference]))
@@ -358,8 +359,14 @@ class OwnedProcesses:
         parsed = controller.parse_request(request)
         fixture = parsed["fixture"]
         need(fixture["namespace"] == self.owner.namespace, "process-controller-input-invalid")
+        need(fixture['product_origin'] == self.owner.planned_web_origin
+             and fixture['stub_origin'] == self.owner.graph_origin, 'process-controller-input-invalid')
         self._assert_all()
-        need("web" in self._ids and self._check("web", running=True), "process-web-unavailable")
+        if parsed['operation'] not in {'journal', 'rejected'}:
+            need("web" in self._ids and self._check("web", running=True), "process-web-unavailable")
+        else:
+            need(not ({'migration','catalog'} & set(self._ids)), 'process-slot-in-use')
+        need(len(self._controller_receipts) < 256, 'process-receipt-budget')
         identifier = self._create("controller", "controller", "compat-control")
         event = self._begin("controller", "controller", identifier)
         # A known container exit does not establish a valid sweep outcome.
@@ -367,7 +374,7 @@ class OwnedProcesses:
         # This blocks new work but leaves exact owned cleanup available when
         # Docker outcomes are known; transport ambiguity remains stricter.
         self._protocol_failed = True
-        timeout = {"setup": 100, "readiness": 30, "journal": 190, "write": 600, "read": 400}[parsed["operation"]]
+        timeout = {"setup": 100, "readiness": 30, "journal": 190, "rejected": 190, "write": 600, "read": 400}[parsed["operation"]]
         value = self._call(["container", "start", "--attach", "--interactive", identifier],
                            input_bytes=request, timeout=timeout)
         need(value.returncode in (0, 1) and not value.stderr, "process-controller-incomplete")
@@ -395,14 +402,14 @@ class OwnedProcesses:
                 raise controller.sweep.SemanticFailure("process-controller-semantic-failure")
             raise proof.EvidenceError("process-controller-evidence-failure")
         operation = parsed["operation"]
-        payload = {"setup": "registered", "readiness": "ready", "journal": "journal"}.get(operation, "cases")
-        keys = {"version", "status", "operation", payload}
+        payload = {"setup": "registered", "readiness": "ready", "journal": "journal", "rejected": "rejected"}.get(operation, "cases")
+        keys = {"version", "status", "operation", payload, 'stub_receipts'}
         if operation == "write":
             keys.add("record")
         need(set(response) == keys and response.get("status") == "ok" and response.get("operation") == operation
              and value.returncode == 0, "process-controller-response-invalid")
-        if operation == "journal":
-            controller.journal_result(response["journal"], after=parsed["after"],
+        if operation in {"journal", "rejected"}:
+            controller.journal_result(response[operation], after=parsed["after"],
                                       discard_baseline=parsed["discard_baseline"])
         elif operation == "setup":
             need(response["registered"] is True, "process-controller-response-invalid")
@@ -414,8 +421,20 @@ class OwnedProcesses:
         if operation == "write":
             record = controller._record(response["record"], controller._fixture(fixture))
             need(record.nonce == parsed["nonce"], "process-controller-response-invalid")
+        receipt = controller.validate_receipts(parsed, response)
+        audit = {'operation':operation, 'fixture_binding':controller.sweep.Sweep(controller._fixture(fixture))._binding(),
+                 'receipt':receipt}
+        if operation == 'write': audit['nonce'] = parsed['nonce']
+        if operation == 'setup': audit['business_account_id'] = parsed['business_account_id']
+        private = controller._encode(audit)
+        need(sum(map(len,self._controller_receipts)) + len(private) <= 4*runtime.MIB, 'process-receipt-budget')
+        self._controller_receipts.append(private)
         self._protocol_failed = False
         return value.stdout
+
+    def controller_receipts(self):
+        """Private immutable snapshots for the continuous outer ledger only."""
+        return tuple(self._controller_receipts)
 
     def remove(self, handle):
         need(type(handle) is ProcessHandle and self._handles.get(handle.slot) is handle)

@@ -227,6 +227,8 @@ class Sweep:
         self._nonces = set()
         self._deadline = 0.0
         self._requests = 0
+        self._stub_calls = []
+        self._stub_windows = []
 
     def _begin(self):
         _need(not self._failed, "sweep-instance-failed")
@@ -282,6 +284,12 @@ class Sweep:
                         raise proof.EvidenceError("sweep-cookie-invalid") from None
         value = _parse(reply.body)
         if stub:
+            # Private completion receipts, not inferred from later journal
+            # contents. Never retain headers, MACs, tokens or request bodies.
+            route = path.split('?', 1)[0].removeprefix('/_control/')
+            _need(route in {'accounts', 'inbound', 'journal', 'rejected'}
+                  and len(self._stub_calls) < 256, 'sweep-receipt-invalid')
+            self._stub_calls.append({'method': method, 'route': route, 'status': reply.status})
             return value
         _need("data" in value, "sweep-response-invalid")
         return _obj(value["data"])
@@ -317,16 +325,29 @@ class Sweep:
         return {"version": 2, "entry_node": "start", "nodes": [{"id": "start", "type": "start"},
                 {"id": "end", "type": "end"}], "edges": [{"from": "start", "to": "end", "condition": "default"}]}
 
+    def stub_receipts(self):
+        """Detached private receipts across login/write/read budget resets."""
+        _need(not self._failed, 'sweep-instance-failed')
+        return {'calls': [dict(v) for v in self._stub_calls],
+                'windows': [dict(v) for v in self._stub_windows]}
+
     def _journal(self, after, *, discard_baseline=False):
+        return self._ring('journal', after, discard_baseline=discard_baseline)
+
+    def _rejected(self, after):
+        return self._ring('rejected', after, discard_baseline=False)
+
+    def _ring(self, ring, after, *, discard_baseline):
         # A cursor-discard baseline may start at the ring's first retained row.
         # Measured windows require every sequence, including when after is zero.
-        _need(type(after) is int and after >= 0 and type(discard_baseline) is bool
-              and (not discard_baseline or after == 0))
+        _need(ring in {'journal', 'rejected'} and type(after) is int and 0 <= after < 2**64
+              and type(discard_baseline) is bool and (not discard_baseline or (after == 0 and ring == 'journal')))
         rows, cursor = [], after
-        for _ in range(20):
-            page = self._call("GET", f"/_control/journal?after={cursor}&limit=1000", stub=True)
+        for page_number in range(1, 21):
+            page = self._call("GET", f"/_control/{ring}?after={cursor}&limit=1000", stub=True)
             entries, latest = page.get("entries"), page.get("latest")
-            _need(type(entries) is list and len(entries) <= 1000 and type(latest) is int and latest >= cursor,
+            _need(set(page) == {'entries', 'latest'} and type(entries) is list and len(entries) <= 1000
+                  and type(latest) is int and cursor <= latest < 2**64,
                   "sweep-journal-invalid")
             _need(bool(entries) or latest == cursor, "sweep-journal-gap")
             for entry in entries:
@@ -338,6 +359,9 @@ class Sweep:
                 rows.append(entry)
                 cursor = seq
             if cursor == latest:
+                _need(len(self._stub_windows) < 8, 'sweep-receipt-invalid')
+                self._stub_windows.append({'ring': ring, 'after': after, 'cursor': cursor,
+                    'discard_baseline': discard_baseline, 'requests': page_number})
                 return rows, cursor
         raise proof.InfrastructureFailure("sweep-journal-unsettled")
 

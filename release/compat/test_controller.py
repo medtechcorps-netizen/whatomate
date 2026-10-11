@@ -28,6 +28,21 @@ def raw(value):
     return json.dumps(value).encode()
 
 
+def receipts(operation, window=None):
+    """Synthetic completion receipts for fake-controller protocol tests only."""
+    windows, calls = [], []
+    if operation == 'setup':
+        calls = [{'method':m,'route':'accounts','status':200} for m in ('POST','GET')]
+    elif operation in {'journal','rejected'}:
+        windows = [{'ring':operation, **{k:window[k] for k in ('after','cursor','discard_baseline','requests')}}]
+        calls = [{'method':'GET','route':operation,'status':200} for _ in range(window['requests'])]
+    elif operation == 'write':
+        windows = [{'ring':'journal','after':0,'cursor':0,'discard_baseline':i in (0,2),'requests':1} for i in range(4)]
+        calls = [{'method':'GET','route':'journal','status':200}, {'method':'POST','route':'inbound','status':200}]
+        calls.extend({'method':'GET','route':'journal','status':200} for _ in range(3))
+    return {'calls':calls,'windows':windows}
+
+
 def record():
     return c.sweep.RecordSet(c.sweep.Sweep(fixture())._binding(), test_sweep.NONCE,
                             *(f"20000000-0000-4000-8000-{n:012d}" for n in range(1, 7)))
@@ -52,6 +67,9 @@ class FakeSweep:
     def write(self, nonce):
         self.calls.append(("write", nonce))
         return self.retained
+
+    def stub_receipts(self):
+        return receipts('write' if any(v[0] == 'write' for v in self.calls) else 'read')
 
     def read(self, retained):
         self.calls.append(("read", retained))
@@ -108,7 +126,8 @@ class ControllerTests(unittest.TestCase):
         self.fake.flags["flow"] = False
         value = self.handle(request("write", nonce=test_sweep.NONCE))
         self.assertEqual(value, {"version": 1, "status": "ok", "operation": "write",
-                                "record": asdict(record()), "cases": self.fake.flags})
+                                "record": asdict(record()), "cases": self.fake.flags,
+                                'stub_receipts':receipts('write')})
         self.assertEqual([x[0] for x in self.fake.calls], ["fixture", "login", "write", "read"])
         self.assertNotIn("password", json.dumps(value))
 
@@ -116,8 +135,9 @@ class ControllerTests(unittest.TestCase):
         world = SetupWorld()
         world.stub = lambda method, path, value: {"entries": [{"seq": 8}], "latest": 8}
         value = json.loads(c.handle(raw(request("journal", after=7, discard_baseline=False)), sweep_factory=world.factory))
-        self.assertEqual(value, {"version": 1, "status": "ok", "operation": "journal", "journal":
-            {"after": 7, "cursor": 8, "discard_baseline": False, "entries": [{"seq": 8}], "requests": 1}})
+        window = {"after": 7, "cursor": 8, "discard_baseline": False, "entries": [{"seq": 8}], "requests": 1}
+        self.assertEqual(value, {"version": 1, "status": "ok", "operation": "journal", "journal":window,
+                                'stub_receipts':receipts('journal',window)})
         self.assertEqual([(r[0], r[1]) for r in world.calls], [("GET", "/_control/journal?after=7&limit=1000")])
         self.assertNotIn("cases", value)
         self.assertNotIn(fixture().control_key, json.dumps(value))
@@ -150,6 +170,29 @@ class ControllerTests(unittest.TestCase):
         for value in variants:
             with self.assertRaises(c.sweep.proof.EvidenceError): c.parse_request(raw(value))
         self.assertFalse(self.fake.calls)
+
+    def test_rejected_is_fixed_signed_ring_with_no_discard_or_arbitrary_endpoint(self):
+        world=SetupWorld()
+        world.stub=lambda method,path,value: {'entries':[],'latest':0}
+        result=json.loads(c.handle(raw(request('rejected',after=0,discard_baseline=False)),sweep_factory=world.factory))
+        self.assertEqual(result['status'],'ok')
+        self.assertEqual(result['rejected'],{'after':0,'cursor':0,'discard_baseline':False,'entries':[],'requests':1})
+        self.assertEqual(world.calls[0][1],'/_control/rejected?after=0&limit=1000')
+        self.assertEqual(result['stub_receipts'],receipts('rejected',result['rejected']))
+        for change in ({'discard_baseline':True},{'after':True},{'path':'/_control/reset'}):
+            with self.assertRaises(c.sweep.proof.EvidenceError):
+                c.parse_request(raw({**request('rejected',after=0,discard_baseline=False),**change}))
+
+    def test_receipt_shape_counts_windows_and_success_status_cannot_be_forged(self):
+        import copy
+        base={'stub_receipts':receipts('write')}
+        changes=[lambda x:x.pop('windows'), lambda x:x['calls'].pop(),
+                 lambda x:x['calls'][0].update(status=True),lambda x:x['calls'][0].update(route='reset'),
+                 lambda x:x['windows'][0].update(requests=2),lambda x:x['windows'][1].update(after=4),
+                 lambda x:x['windows'][0].update(extra='secret')]
+        for change in changes:
+            value=copy.deepcopy(base);change(value['stub_receipts'])
+            with self.assertRaises(c.sweep.proof.EvidenceError):c.validate_receipts(request('write',nonce=test_sweep.NONCE),value)
 
     def test_read_uses_retained_record_without_write(self):
         value = self.handle(request("read", record=asdict(record())))
@@ -217,7 +260,8 @@ class ControllerTests(unittest.TestCase):
     def test_setup_real_signed_transport_post_then_bound_get_only(self):
         world = SetupWorld()
         value = json.loads(c.handle(raw(request("setup", business_account_id=BUSINESS)), sweep_factory=world.factory))
-        self.assertEqual(value, {"version": 1, "status": "ok", "operation": "setup", "registered": True})
+        self.assertEqual(value, {"version": 1, "status": "ok", "operation": "setup", "registered": True,
+                                'stub_receipts':receipts('setup')})
         self.assertEqual([(x[0], x[1]) for x in world.calls],
                          [("POST", "/_control/accounts"), ("GET", "/_control/accounts")])
         self.assertTrue(all(0 < x[4] <= 45 for x in world.calls))

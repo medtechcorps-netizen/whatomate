@@ -70,7 +70,8 @@ class World(tp.World):
                          "discard_baseline": baseline, "entries": rows, "requests": 1}
                 if not baseline and self.window_mutation:
                     self.window_mutation(value)
-                self.response = json.dumps({"version": 1, "status": "ok", "operation": "journal", "journal": value}).encode()
+                self.response = json.dumps({"version": 1, "status": "ok", "operation": "journal", "journal": value,
+                                            "stub_receipts": test_controller.receipts("journal", value)}).encode()
         result = super().capture(argv, **options)
         if args[:2] == ["container", "create"] and result.returncode == 0:
             row = self.containers[result.stdout.decode()]

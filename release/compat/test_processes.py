@@ -77,7 +77,8 @@ class World(test_stack.DockerWorld):
             self.calls.append((list(args), options)); self.mutations.append(list(args))
             self.containers[args[4]]["State"].update(Running=False, StartedAt="2026-10-11T00:00:01Z", ExitCode=self.response_exit)
             raw = self.response if self.response is not None else json.dumps({"version": 1, "status": "ok",
-                 "operation": "readiness", "ready": {"web": True, "graph": True}}).encode()
+                 "operation": "readiness", "ready": {"web": True, "graph": True},
+                 'stub_receipts':test_controller.receipts('readiness')}).encode()
             return p.runtime.Capture(self.response_exit, raw, b"")
         if args[:1] == ["logs"]:
             self.calls.append((list(args),options))
@@ -219,9 +220,36 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(private[0]["timeout"], 30)
         m.close();self.owner.cleanup()
 
+    def test_only_two_fixed_ring_reads_allowed_without_web_and_audits_private(self):
+        m=self.manager()
+        for operation in ('journal','rejected'):
+            window={'after':0,'cursor':0,'discard_baseline':False,'entries':[],'requests':1}
+            response={'version':1,'status':'ok','operation':operation,operation:window,
+                      'stub_receipts':test_controller.receipts(operation,window)}
+            self.world.response=json.dumps(response).encode()
+            self.assertEqual(json.loads(m.controller(self.frame(operation,after=0,discard_baseline=False))),response)
+        private=m.controller_receipts()
+        self.assertIsInstance(private,tuple);self.assertTrue(all(type(v) is bytes for v in private))
+        self.assertEqual(len(private),2)
+        self.assertNotIn('receipt',json.dumps(m.evidence()))
+        count=len(self.world.mutations)
+        for frame in (self.frame(),self.frame('setup',business_account_id=test_controller.BUSINESS),
+                      self.frame('write',nonce=test_controller.test_sweep.NONCE)):
+            with self.assertRaises(p.proof.EvidenceError):m.controller(frame)
+        self.assertEqual(len(self.world.mutations),count)
+        m.close();self.owner.cleanup()
+
+    def test_same_namespace_foreign_loopback_origin_refuses_before_docker(self):
+        m=self.manager();value=json.loads(self.frame('journal',after=0,discard_baseline=False))
+        value['fixture']['stub_origin']='http://127.0.0.1:8090'
+        count=len(self.world.mutations)
+        with self.assertRaises(p.proof.EvidenceError):m.controller(json.dumps(value).encode())
+        self.assertEqual(len(self.world.mutations),count)
+
     def test_controller_setup_private_protocol_has_own_deadline_not_sweep_flags(self):
         m = self.manager();m.start_web("previous", INPUTS)
-        response = {"version": 1, "status": "ok", "operation": "setup", "registered": True}
+        response = {"version": 1, "status": "ok", "operation": "setup", "registered": True,
+                    'stub_receipts':test_controller.receipts('setup')}
         self.world.response = json.dumps(response).encode()
         request = self.frame("setup", business_account_id=test_controller.BUSINESS)
         self.assertEqual(json.loads(m.controller(request)), response)
@@ -244,7 +272,8 @@ class ProcessTests(unittest.TestCase):
     def test_controller_journal_exact_cursor_contract_and_deadline(self):
         m = self.manager(); m.start_web("previous", INPUTS)
         journal = {"after": 8, "cursor": 9, "discard_baseline": False, "entries": [{"seq": 9}], "requests": 1}
-        response = {"version": 1, "status": "ok", "operation": "journal", "journal": journal}
+        response = {"version": 1, "status": "ok", "operation": "journal", "journal": journal,
+                    'stub_receipts':test_controller.receipts('journal',journal)}
         self.world.response = json.dumps(response).encode()
         request = self.frame("journal", after=8, discard_baseline=False)
         self.assertEqual(json.loads(m.controller(request)), response)
@@ -286,7 +315,8 @@ class ProcessTests(unittest.TestCase):
         retained = replace(test_controller.record(), fixture_binding=controller.sweep.Sweep(fixture)._binding())
         flags = {key: key != "flow" for key in controller.sweep.proof.SWEEP_CASES}
         for operation in ("write", "read"):
-            response = {"version": 1, "status": "ok", "operation": operation, "cases": flags}
+            response = {"version": 1, "status": "ok", "operation": operation, "cases": flags,
+                        'stub_receipts':test_controller.receipts(operation)}
             if operation == "write":response["record"] = asdict(retained)
             self.world.response = json.dumps(response).encode()
             raw = self.frame(operation, **({"nonce": retained.nonce} if operation == "write"

@@ -167,6 +167,28 @@ class World:
 
 
 class SweepTests(unittest.TestCase):
+    def test_successful_stub_receipts_survive_read_budget_reset_without_credentials(self):
+        world=World();client=world.client();record=client.write(NONCE)
+        before=client.stub_receipts();client.read(record)
+        self.assertEqual(client.stub_receipts(),before)
+        self.assertEqual(len(before['windows']),4)
+        self.assertEqual([v['method']+' '+v['route'] for v in before['calls']],
+                         ['GET journal','POST inbound','GET journal','GET journal','GET journal'])
+        before['calls'].clear()
+        self.assertEqual(len(client.stub_receipts()['calls']),5)
+        for private in (world.f.password,world.f.control_key,NONCE):
+            self.assertNotIn(private,json.dumps(client.stub_receipts()))
+
+    def test_rejected_fixed_endpoint_and_uncompleted_calls_do_not_get_receipts(self):
+        world=World();client=world.client();client._begin()
+        world.stub=lambda method,path,value: {'entries':[],'latest':0}
+        self.assertEqual(client._rejected(0),([],0))
+        self.assertEqual(world.calls[-1][1],'/_control/rejected?after=0&limit=1000')
+        receipt=client.stub_receipts()
+        world.intercept=lambda *args: s.Reply(403,(),b'{}')
+        with self.assertRaises(s.SemanticFailure):client._rejected(0)
+        self.assertEqual(client.stub_receipts(),receipt)
+
     def test_two_versions_write_read_reverse_and_exact_settings_patch(self):
         world = World()
         candidate = world.client()
