@@ -36,6 +36,7 @@ _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 _IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _ROLES = ("pg", "redis", "graph")
+_GRAPH_DEFAULT_PATH = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _PG_COMMAND = ["postgres", "-c", "unix_socket_directories=/var/run/postgresql",
                "-c", "autovacuum=off", "-c", "log_statement=mod",
                "-c", "log_min_error_statement=error", "-c", "log_error_verbosity=verbose",
@@ -196,7 +197,8 @@ class OwnedStack:
         need(type(labels) is dict and labels.get(SOURCE_LABEL) == self.source_sha and labels.get(ROLE_LABEL) == "graph"
              and labels.get(RECIPE_LABEL) == GRAPH_RECIPE_SHA256, "stack-source-binding-invalid")
         need(cfg.get("Entrypoint") == ["/graph-stub"] and not cfg.get("Cmd")
-             and cfg.get("User") == "65532:65532" and not cfg.get("Env")
+             and cfg.get("User") == "65532:65532"
+             and cfg.get("Env") in (None, [], [_GRAPH_DEFAULT_PATH])
              and not cfg.get("Volumes") and not cfg.get("OnBuild")
              and not cfg.get("Healthcheck"), "stack-image-invalid")
         self._images["graph"] = row

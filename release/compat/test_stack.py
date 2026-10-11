@@ -182,6 +182,52 @@ class StackTests(unittest.TestCase):
         self.assertEqual(env["STUB_ENVIRONMENT"], "local")
         self.assertEqual(graph["Config"]["Entrypoint"], ["/graph-stub"])
 
+    def test_graph_empty_or_exact_default_path_survives_exact_container_check(self):
+        for image_env in (None, [], [s._GRAPH_DEFAULT_PATH]):
+            with self.subTest(image_env=image_env):
+                world = DockerWorld()
+                world.images[GRAPH]["Config"]["Env"] = copy.deepcopy(image_env)
+                owned = s.OwnedStack("docker", Path(self.tmp.name), SOURCE, s.GraphImage(GRAPH, SOURCE),
+                                     token=TOKEN, capture=world.capture)
+                owned.start()
+                env = world.mapping(world.containers[owned._ids["graph"]]["Config"]["Env"])
+                self.assertEqual(env.get("PATH"), s._GRAPH_DEFAULT_PATH.split("=", 1)[1] if image_env else None)
+                self.assertEqual(env, owned._specs["graph"]["env"])
+                owned.cleanup()
+                self.assertTrue(owned.evidence()["closed"])
+
+    def test_graph_path_duplicates_additions_and_alterations_refuse_before_mutation(self):
+        for image_env in ([s._GRAPH_DEFAULT_PATH, s._GRAPH_DEFAULT_PATH],
+                          [s._GRAPH_DEFAULT_PATH, "EXTRA=value"],
+                          [s._GRAPH_DEFAULT_PATH, "STUB_ENVIRONMENT=external"],
+                          ["PATH=/usr/bin"], ["PATH="], ["path=/usr/bin"],
+                          ["LD_PRELOAD=/other"]):
+            with self.subTest(image_env=image_env):
+                world = DockerWorld()
+                world.images[GRAPH]["Config"]["Env"] = image_env
+                owned = s.OwnedStack("docker", Path(self.tmp.name), SOURCE, s.GraphImage(GRAPH, SOURCE),
+                                     token=TOKEN, capture=world.capture)
+                with self.assertRaises(s.proof.EvidenceError):
+                    owned.start()
+                self.assertEqual(world.mutations, [])
+
+    def test_graph_default_path_post_create_drift_still_refuses_cleanup(self):
+        self.world.images[GRAPH]["Config"]["Env"] = [s._GRAPH_DEFAULT_PATH]
+        self.stack.start()
+        row = self.world.containers[self.stack._ids["graph"]]
+        original = copy.deepcopy(row["Config"]["Env"])
+        for changed in ([v for v in original if not v.startswith("PATH=")],
+                        ["PATH=/other" if v.startswith("PATH=") else v for v in original],
+                        original + [s._GRAPH_DEFAULT_PATH], original + ["EXTRA=value"]):
+            with self.subTest(changed=changed):
+                row["Config"]["Env"] = changed
+                with self.assertRaises(s.proof.EvidenceError):
+                    self.stack._container_check("graph")
+        count = len(self.world.mutations)
+        with self.assertRaises(s.proof.EvidenceError):
+            self.stack.cleanup()
+        self.assertEqual(len(self.world.mutations), count)
+
     def test_graph_recipe_is_existing_source_not_duplicate_server(self):
         path = Path(__file__).resolve().parents[2] / "docker/staging/graph-stub.Dockerfile"
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), s.GRAPH_RECIPE_SHA256)
