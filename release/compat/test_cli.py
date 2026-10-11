@@ -172,6 +172,20 @@ class RunTests(unittest.TestCase):
 
 
 class FileAndEntryTests(unittest.TestCase):
+    def test_client_version_setup_is_five_seconds_and_restores_transport(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            for name in ("gh-config", "gh-work"):
+                (root / name).mkdir()
+            binary = root / "gh"; binary.touch()
+            env = {"COMPAT_GH_BIN": str(binary), "GH_TOKEN": "synthetic-not-a-credential"}
+            with mock.patch.object(cli.runtime, "bounded_command",
+                 return_value=cli.runtime.Capture(0, b"gh version 2.98.0 (2026-10-08)\n", b"")) as capture:
+                client = cli._client(root, env)
+                self.assertIs(client.capture, capture)
+                self.assertEqual(capture.call_args.args[0], [str(binary), "--version"])
+                self.assertEqual(capture.call_args.kwargs["timeout"], 5)
+
     def test_fresh_private_directories_and_create_only_bounded_public_file(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve(); repo = root / "repo"; scratch = root / "scratch"
@@ -222,6 +236,8 @@ class FileAndEntryTests(unittest.TestCase):
         raw = cli.proof.result_bytes(value)
         with tempfile.TemporaryDirectory() as temp:
             env["RUNNER_TEMP"] = str(Path(temp).resolve())
+            output = Path(temp).resolve() / "step-output"; output.touch()
+            env["GITHUB_OUTPUT"] = str(output)
             with mock.patch.dict(cli.os.environ, env, clear=True), \
                  mock.patch.object(cli.images, "_READY_FOR_EXECUTION", True), \
                  mock.patch.object(cli, "_read_public", side_effect=[cli.canonical(snapshot(ctx)), raw]), \
@@ -230,6 +246,7 @@ class FileAndEntryTests(unittest.TestCase):
                 self.assertEqual(cli.main(["check"]), 1)
             self.assertEqual(scratch.call_args.args[2], "check")
             self.assertEqual(write.call_args.args[1], raw)
+            self.assertEqual(output.read_text(), "complete=true\n")
 
     def test_runner_does_not_write_result_on_infrastructure_exception(self):
         env = environment(); ctx = cli.context(env)
@@ -246,6 +263,20 @@ class FileAndEntryTests(unittest.TestCase):
                 self.assertEqual(cli.main(["run"]), 1)
             write.assert_not_called()
             self.assertEqual(stderr.getvalue(), "compatibility-entrypoint-refused\n")
+
+    def test_partial_public_write_never_marks_complete(self):
+        env = environment(); env.update(COMPAT_PREVIEW_OUTCOME="success", COMPAT_RUN_OUTCOME="success")
+        ctx = cli.context(env); raw = cli.proof.result_bytes(result(ctx))
+        with tempfile.TemporaryDirectory() as temp:
+            env["RUNNER_TEMP"] = str(Path(temp).resolve())
+            with mock.patch.dict(cli.os.environ, env, clear=True), \
+                 mock.patch.object(cli.images, "_READY_FOR_EXECUTION", True), \
+                 mock.patch.object(cli, "_read_public", side_effect=[cli.canonical(snapshot(ctx)), raw]), \
+                 mock.patch.object(cli, "_scratch", return_value=Path(temp).resolve()), \
+                 mock.patch.object(cli, "_write_public", side_effect=OSError("private")), \
+                 mock.patch.object(cli, "_mark_complete") as mark, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(["check"]), 1)
+            mark.assert_not_called()
 
 
 if __name__ == "__main__":

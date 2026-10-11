@@ -189,6 +189,21 @@ def _write_public(path, raw):
         stream.write(raw)
 
 
+def _mark_complete(env):
+    """A fixed step output permits uploading a measured negative verdict.
+
+    The workflow may upload only after this marker, even if check returns one
+    for actual false flags. Infrastructure and partial writes never mark it.
+    """
+    value = env.get("GITHUB_OUTPUT")
+    if value is None:
+        return
+    path = regular_path(Path(value))
+    root = regular_path(Path(env.get("RUNNER_TEMP", "")), directory=True)
+    need(path.is_relative_to(root), "cli-output-path-invalid")
+    common.Output(stdout=sys.stdout, output_path=str(path)).set_outputs({"complete": "true"})
+
+
 def _scratch(repo, ctx, phase, env):
     root = regular_path(Path(env.get("RUNNER_TEMP", "")), directory=True)
     need(not root.is_relative_to(repo) and not repo.is_relative_to(root), "cli-scratch-overlap")
@@ -205,8 +220,17 @@ def _client(work, env):
     need(type(token) is str and 0 < len(token) <= 8192 and not any(c in token for c in "\r\n\0"),
          "cli-token-unavailable")
     binary = regular_path(Path(env.get("COMPAT_GH_BIN", "")))
-    return runtime.ReadOnlyGh(str(binary), token, expected_version="2.98.0",
-        config_dir=work / "gh-config", work_dir=work / "gh-work", base_env=common.scrubbed_env(base=env))
+    def version_capture(argv, **options):
+        need(argv == [str(binary), "--version"], "cli-constructor-command-invalid")
+        options["timeout"] = min(options["timeout"], 5)
+        return runtime.bounded_command(argv, **options)
+    client = runtime.ReadOnlyGh(str(binary), token, expected_version="2.98.0",
+        config_dir=work / "gh-config", work_dir=work / "gh-work",
+        base_env=common.scrubbed_env(base=env), capture=version_capture)
+    # Construction is bounded setup, before the experiment's shared clock.
+    # Its verification scope requires the normal untouched transport identity.
+    client.capture = runtime.bounded_command
+    return client
 
 
 def main(argv=None):
@@ -234,6 +258,7 @@ def main(argv=None):
             value = validate_result(result, snapshot, ctx)
             work = _scratch(repo, ctx, "check", os.environ)
             _write_public(work / "public" / "compat-result.json", result)
+            _mark_complete(os.environ)
             return 0 if accepted(value) else 1
         work = _scratch(repo, ctx, "run", os.environ)
         docker = regular_path(Path(os.environ.get("COMPAT_DOCKER_BIN", "")))

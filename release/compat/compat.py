@@ -58,9 +58,10 @@ class _Images:
     fixture: fixture.ExportImage
 
 
-def _admit_images(repo, previous, candidate_sha, docker_binary, config_dir, receipts_dir, deadline):
+def _admit_images(repo, previous, candidate_sha, docker_binary, config_dir, image_work_dir, deadline, *, buildx_binary=None):
     need(image_admission._READY_FOR_EXECUTION, "experiment-source-build-admission-unreviewed")
-    value = image_admission._admit(repo, previous, candidate_sha, docker_binary, config_dir, receipts_dir, deadline)
+    value = image_admission._admit(repo, previous, candidate_sha, docker_binary, config_dir, image_work_dir, deadline,
+                                   buildx_binary=buildx_binary)
     need(type(value) is image_admission._Admitted and value.seal is image_admission._SEAL,
          "experiment-source-build-unproven")
     return _Images(_IMAGE_SEAL, value.previous, value.candidate, value.controller, value.graph, value.fixture)
@@ -396,8 +397,9 @@ class _Engine:
 
 def run_experiment(repo: Path, candidate_sha: str, run_id: int, run_attempt: int,
                    release_client, *, docker_binary: str, config_dir: Path,
-                   image_receipts_dir: Path | None = None, rollback_target=None):
-    """Validate immutable inputs; disabled pending first-local admission review.
+                   image_work_dir: Path | None = None, buildx_binary: Path | None = None,
+                   rollback_target=None, expected_previous_sha: str | None = None):
+    """Validate immutable inputs; disabled pending source-build admission review.
 
     No arbitrary images, observations, successful flags, phase dictionaries,
     command callbacks, SQL or private fixture inputs are accepted here.
@@ -409,16 +411,23 @@ def run_experiment(repo: Path, candidate_sha: str, run_id: int, run_attempt: int
     need(type(run_id) is int and 1 <= run_id < 10**16)
     if rollback_target is not None:
         proof.validate_rollback_target(rollback_target)
+    if expected_previous_sha is not None:
+        need(type(expected_previous_sha) is str and _SHA.fullmatch(expected_previous_sha) is not None,
+             "experiment-previous-expectation-invalid")
     # Review must enable the complete adapter deliberately; accidental public
     # calls cannot launch a build while this slice is still under review.
     need(image_admission._READY_FOR_EXECUTION, "experiment-source-build-admission-unreviewed")
-    need(isinstance(image_receipts_dir, Path), "experiment-receipts-required")
+    need(isinstance(image_work_dir, Path), "experiment-image-work-required")
+    need(buildx_binary is None or isinstance(buildx_binary, Path), "experiment-builder-location-invalid")
     with image_admission._verification_transport(release_client, deadline):
         previous = runtime.verified_previous(release_client, repo, rollback_target=rollback_target)
+        need(expected_previous_sha is None or previous.sha == expected_previous_sha,
+             "experiment-previous-expectation-mismatch")
         classification = schema_change.classify(repo, previous.sha, candidate_sha, mode="forward")
         need(not classification.reasons and ((classification.kind == "none" and not classification.dormant)
              or (classification.kind == "data" and classification.dormant)), "experiment-classification-unsupported")
         contract = catalog.CatalogContract(repo, previous, candidate_sha, capture=deadline.capture)
-    admitted = _admit_images(repo, previous, candidate_sha, docker_binary, config_dir, image_receipts_dir, deadline)
+    admitted = _admit_images(repo, previous, candidate_sha, docker_binary, config_dir, image_work_dir, deadline,
+                             buildx_binary=buildx_binary)
     return _Engine(repo, previous, candidate_sha, run_id, run_attempt, classification, contract,
                    admitted, docker_binary, config_dir, clock=deadline.clock, overall=deadline).run()

@@ -405,7 +405,7 @@ class AdmissionTests(unittest.TestCase):
                  patch.object(c.image_admission,'_verification_transport',return_value=nullcontext()), \
                  patch.object(c,'_admit_images') as admission:
                 with self.assertRaisesRegex(c.proof.EvidenceError,'classification-unsupported'):
-                    c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,image_receipts_dir=self.p)
+                    c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,image_work_dir=self.p)
                 admission.assert_not_called()
 
     def test_source_run_attempt_and_rollback_inputs_validate_before_verification(self):
@@ -415,10 +415,26 @@ class AdmissionTests(unittest.TestCase):
                     c.run_experiment(self.p,sha,run,attempt,object(),docker_binary='docker',config_dir=self.p,rollback_target=target)
             verify.assert_not_called()
 
+    def test_previous_sha_expectation_is_restrictive_and_checked_before_admission(self):
+        with patch.object(c.runtime,'verified_previous') as verify:
+            for value in ('short','A'*40,False,1,'a'*40+'\n'):
+                with self.subTest(value=value),self.assertRaisesRegex(c.proof.EvidenceError,'previous-expectation-invalid'):
+                    c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,
+                                     expected_previous_sha=value)
+            verify.assert_not_called()
+        with patch.object(c.image_admission,'_READY_FOR_EXECUTION',True), \
+             patch.object(c.image_admission,'_verification_transport',return_value=nullcontext()), \
+             patch.object(c.runtime,'verified_previous',return_value=PREVIOUS) as verify, \
+             patch.object(c.schema_change,'classify') as classify,patch.object(c,'_admit_images') as admission:
+            with self.assertRaisesRegex(c.proof.EvidenceError,'previous-expectation-mismatch'):
+                c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,
+                                 image_work_dir=self.p,expected_previous_sha='f'*40)
+            verify.assert_called_once();classify.assert_not_called();admission.assert_not_called()
+
     def test_same_deadline_spans_verification_catalog_admission_engine(self):
         clock=to.Clock();deadline=c.image_admission._Deadline(clock=clock);seen={}
         def verify(*args,**kwargs):clock.now+=100;return PREVIOUS
-        def admission(*args):
+        def admission(*args,**kwargs):
             self.assertIs(args[-1],deadline);clock.now+=1400;return images()
         def contract(*args,**kwargs):
             seen['capture']=kwargs['capture'];return FakeContract()
@@ -435,7 +451,7 @@ class AdmissionTests(unittest.TestCase):
              patch.object(c.catalog,'CatalogContract',side_effect=contract), \
              patch.object(c,'_admit_images',side_effect=admission),patch.object(c,'_Engine',Engine):
             self.assertEqual(c.run_experiment(self.p,SHA,1,1,object(),docker_binary='docker',config_dir=self.p,
-                                             image_receipts_dir=self.p),b'mock-result')
+                                             image_work_dir=self.p,expected_previous_sha=PREVIOUS.sha),b'mock-result')
         self.assertIs(seen['capture'].__self__,deadline)
 
 
