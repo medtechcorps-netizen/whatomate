@@ -1,0 +1,23 @@
+{
+  "AutoMigrate": 48,
+  "BackfillChatbotFlowGraph": 210,
+  "BackfillLastInboundAt": 47,
+  "BackfillLegacyWhatsAppInbox": 61,
+  "BackfillProviderIntegrationBindings": 47,
+  "CreateDefaultAdmin": 47,
+  "EnsurePlatformReseller": 47,
+  "EnsureReReplyProductCatalog": 47,
+  "InstallMessageIngestionOrderTrigger": 48,
+  "MigrateUserOrganizations": 47,
+  "PrepareMessageIngestionOrder": 48,
+  "PrepareMetaInstagramDeletionJournalTenant": 47,
+  "PrepareProviderIntegrationManagementMode": 47,
+  "SeedDefaultWidgets": 47,
+  "SeedPermissionsAndRoles": 47,
+  "SeedSystemRolesForAllOrgs": 47,
+  "SeedSystemRolesForAllOrgs/ApplyManagerSettingsPolicyMigration": 47,
+  "SeedSystemRolesForAllOrgs/FixSystemRolePermissions": 47,
+  "SeedSystemRolesForAllOrgs/MigrateExistingUserRoles": 47,
+  "SeedSystemRolesForAllOrgs/legacy-super-admin-update": 47,
+  "SeedSystemRolesForAllOrgs/seedSystemRolesForOrg": 47
+}
