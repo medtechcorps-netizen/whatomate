@@ -33,6 +33,8 @@ class World:
         self.trace=[]; self.clock=to.Clock(); self.fail=None; self.cleanup_fail=False
         self.codes={}; self.logs={}; self.markers={}; self.catalogs={}; self.digests={}
         self.false_case=None; self.worker_panic=0; self.bad_control=False
+        self.terminal_old_boot=False
+        self.terminal_previous_source=BASE
         self.pending=1; self.rows=0; self.readiness=[b'[17,"*","postgres"]\n']
         self.record_nonces=[]; self.ledger_reads=0; self.operations=[]
 
@@ -160,6 +162,17 @@ class FakeCatalog:
 
 class FakeObservation:
     def __init__(self,manager,handle,fixture,**kwargs):self.manager=manager;self.handle=handle;self.w=manager.w
+    @classmethod
+    def for_old_boot(cls,manager,handle,fixture,*,run_id,run_attempt,**kwargs):
+        value=cls(manager,handle,fixture,**kwargs)
+        value.identity={'sha':SHA,'previous_web_digest':DIGEST,'run_id':run_id,'run_attempt':run_attempt}
+        return value
+    def wait_old_boot(self,timeout=90):
+        self.w.event('startup.'+self.handle.version)
+        if self.w.terminal_old_boot:
+            self.w.event('terminal.old.boot')
+            return tp.terminal_boot(self.identity,previous_source=self.w.terminal_previous_source)
+        return None
     def wait_startup(self,timeout=90):self.w.event('startup.'+self.handle.version)
     def boot(self):self.w.event('boot.'+self.handle.version);return tp.boot()
     def finish_period(self,timeout=30):self.w.event('finish.'+self.handle.version);return {}
@@ -236,6 +249,77 @@ class EngineTests(unittest.TestCase):
                 result=json.loads(self.engine().run())
                 self.assertFalse(result['old_migrate_ok']['rw']);self.assertFalse(result['reversible'])
                 getattr(self.w,field).clear()
+
+    def test_actual_terminal_branch_keeps_all_independent_phases_and_causal_rows(self):
+        self.w.terminal_old_boot=True
+        original=c.proof.evaluate_proof; observed=[]
+        def evaluate(value):observed.append(value);return original(value)
+        with patch.object(c.proof,'evaluate_proof',side_effect=evaluate):raw=self.engine().run()
+        result=json.loads(raw); private=observed[0];trace=self.w.trace
+        self.assertTrue(result['forward']);self.assertTrue(result['reversible'])
+        self.assertFalse(any(result['old_server_ok'].values()))
+        self.assertEqual([x for x in trace if x.startswith('controller.')],
+                         ['controller.setup','controller.write','controller.write'])
+        self.assertEqual(trace.count('web.previous'),2);self.assertEqual(trace.count('web.candidate'),1)
+        self.assertEqual(trace.count('migration.compat-fwd'),2)
+        self.assertEqual(trace.count('migration.compat-n1-rw'),1);self.assertEqual(trace.count('migration.compat-n1-ro'),1)
+        self.assertIn('catalog.d0',trace);self.assertIn('pg.control',trace)
+        self.assertNotIn('workers.begin',trace);self.assertNotIn('controller.read',trace)
+        self.assertLess(trace.index('pg.control'),trace.index('terminal.old.boot'))
+        self.assertLess(trace.index('terminal.old.boot'),trace.index('ledger.seal'))
+        self.assertLess(trace.index('ledger.seal'),trace.index('catalog.final'))
+        self.assertEqual(trace.count('remove.web'),3);self.assertEqual(trace[-1],'stack.cleanup')
+        for key in ('read_sweep','write_sweep','workers','candidate_ready','reverse_sweep'):
+            node=private['old_server'][key]
+            self.assertEqual(node['state'],'blocked-by-semantic')
+            self.assertEqual(node['cause_phase'],'old.boot')
+            self.assertEqual(set(node),{'state','phase','cause_phase','reason','binding'})
+        self.assertTrue(private['old_server']['stopped']['passed'])
+        self.assertNotIn('binding',raw.decode());self.assertNotIn('blocked-by-semantic',raw.decode())
+
+    def test_terminal_does_not_bypass_control_seal_final_catalog_or_cleanup(self):
+        for failure in ('control','ledger.seal','catalog.final','cleanup'):
+            with self.subTest(failure=failure):
+                self.w.trace.clear();self.w.terminal_old_boot=True
+                self.w.bad_control=failure=='control';self.w.cleanup_fail=failure=='cleanup'
+                self.w.fail=failure if failure in {'ledger.seal','catalog.final'} else None
+                with patch.object(c.proof,'result_bytes') as output:
+                    with self.assertRaises(c.proof.EvidenceError):self.engine().run()
+                    output.assert_not_called()
+                self.assertEqual(self.w.trace[-1],'stack.cleanup')
+        self.w.fail=None;self.w.bad_control=False;self.w.cleanup_fail=False
+
+    def test_terminal_removal_failure_and_start_without_handle_never_fabricate(self):
+        original_start=FakeManager.start_web;original_remove=FakeManager.remove
+        for failure in ('start','remove'):
+            with self.subTest(failure=failure):
+                self.w.trace.clear();self.w.terminal_old_boot=True;counts={'previous':0,'remove':0}
+                def start(manager,version,inputs):
+                    if version=='previous':counts['previous']+=1
+                    if failure=='start' and version=='previous' and counts['previous']==2:
+                        manager.w.event('start-refused-no-handle')
+                        raise c.proof.EvidenceError('process-refused')
+                    return original_start(manager,version,inputs)
+                def remove(manager,handle):
+                    counts['remove']+=1
+                    if failure=='remove' and counts['remove']==3:
+                        raise c.proof.EvidenceError('process-removal-unproven')
+                    return original_remove(manager,handle)
+                with patch.object(FakeManager,'start_web',start),patch.object(FakeManager,'remove',remove), \
+                     patch.object(c.proof,'result_bytes') as output:
+                    with self.assertRaises(c.proof.EvidenceError):self.engine().run()
+                    output.assert_not_called()
+                self.assertNotIn('ledger.seal',self.w.trace)
+                if failure=='start':self.assertNotIn('terminal.old.boot',self.w.trace)
+                self.assertEqual(self.w.trace[-1],'stack.cleanup')
+
+    def test_foreign_terminal_source_is_not_a_blocked_result(self):
+        self.w.terminal_old_boot=True
+        self.w.terminal_previous_source='f'*40
+        with patch.object(c.proof,'result_bytes') as output:
+            with self.assertRaisesRegex(c.proof.EvidenceError,'terminal-source'):self.engine().run()
+            output.assert_not_called()
+        self.assertNotIn('ledger.seal',self.w.trace)
 
     def test_completed_row_worker_and_forward_negative_flags_not_defaulted(self):
         self.w.false_case='read';self.w.worker_panic=1
@@ -471,6 +555,18 @@ class BudgetTests(unittest.TestCase):
         timeouts=[options['timeout'] for _,options in h.world.calls]
         self.assertIn(7,timeouts)
         h.manager.close();h.owner.cleanup()
+
+    def test_native_terminal_observer_bridge_restores_and_preserves_failure_latches(self):
+        h=self.harness();h.terminal();observer=h.old_observer();original=h.owner.capture
+        with c._Budget(h.owner,clock=h.clock,seconds=200) as budget:
+            with budget.window(7):value=budget.observer_call(observer.wait_old_boot)
+            self.assertEqual(value['state'],'observed-semantic-failure')
+            self.assertIs(h.owner.capture,budget.transport)
+        self.assertIs(h.owner.capture,original)
+        self.assertFalse(h.manager._protocol_failed)
+        self.assertTrue(all(options.get('timeout',0)<=7 for args,options in h.world.calls
+                            if args[:2]==['logs','--timestamps']))
+        h.manager.remove(h.handle);h.manager.close();h.owner.cleanup()
 
     def test_native_observer_exception_restores_both_layers(self):
         h=self.harness();observer=h.observer();h.world.raw=to.startup().replace(b'runtime_role=compat_runtime',b'runtime_role=postgres')

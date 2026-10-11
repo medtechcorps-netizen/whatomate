@@ -138,14 +138,14 @@ class _Budget:
             self.deadline = previous
 
     def observer_call(self, method):
-        """Compose only the two existing native read-only observer budgets."""
+        """Compose only the fixed native read-only observer budgets."""
         target = getattr(method, "__self__", None)
         name = getattr(method, "__name__", None)
         need(type(target) is observation.OwnedObservation
-             and name in {"wait_startup", "finish_period"}
+             and name in {"wait_startup", "wait_old_boot", "finish_period"}
              and getattr(method, "__func__", None) is getattr(observation.OwnedObservation, name)
              and target.manager.owner is self.owner, "experiment-observer-bridge-invalid")
-        timeout = min(90 if name == "wait_startup" else 30, self.remaining())
+        timeout = min(30 if name == "finish_period" else 90, self.remaining())
         self.owner.capture = self.original
         try:
             return method(timeout=timeout)
@@ -250,6 +250,20 @@ class _Engine:
         need(not self.manager._ids, "experiment-process-still-present")
         return {"execution": _completed(), "passed": True}  # Actual exact removal+absence above.
 
+    def _old_server(self):
+        # A failure before start_web returns a real bound handle stays an
+        # infrastructure/evidence refusal. Never fabricate or recover a handle.
+        handle = self.manager.start_web("previous", self.inputs)
+        observer = observation.OwnedObservation.for_old_boot(self.manager, handle, self.provisioned.fixture,
+            run_id=self.run_id, run_attempt=self.attempt, clock=self.clock, sleep=self.sleep)
+        terminal = self.budget.observer_call(observer.wait_old_boot)
+        if terminal is None:
+            return handle, observer, observer.boot(), False
+        proof._terminal_old_boot(terminal, {"sha": self.sha, "previous_web_digest": self.previous.images["web"],
+                                           "run_id": self.run_id, "run_attempt": self.attempt})
+        need(terminal["binding"]["previous_source_sha"] == self.previous.sha, "experiment-terminal-source")
+        return handle, observer, terminal, True
+
     def _migration(self, application, *, original_columns):
         phase = self.pg.begin_phase(application)
         handle = self.manager.start_migration(application, self.inputs)
@@ -305,21 +319,35 @@ class _Engine:
         ro = self._migration("compat-n1-ro", original_columns=False)
         control = self.pg.read_only_control()
 
-        handle, observed, old_boot = self._server("previous")
-        old_read, _ = self._sweep("read", record=candidate_record)  # Before old writes.
-        old_write, old_record = self._sweep("write", nonce=secrets.token_hex(16))
-        self._settle()
-        # workers() obtains its own actual baseline and updates its event
-        # latch. No manual reset; no external call within its exclusive wait.
-        workers = observed.workers()
-        self.ledger.capture()
-        stopped = self._stop(handle, observed)
+        handle, observed, old_boot, terminal = self._old_server()
+        if terminal:
+            def blocked(phase):
+                return {"state": "blocked-by-semantic", "phase": phase, "cause_phase": "old.boot",
+                        "reason": "retained-record-unavailable" if phase.startswith("reverse.") else "server-unavailable",
+                        "binding": dict(old_boot["binding"])}
+            old_read, old_write, workers = (blocked(phase) for phase in ("old.read", "old.write", "old.workers"))
+            # The terminal path already captured the complete final log and
+            # stopped state; do not pretend finish_period or sweeps ran.
+            self.manager.remove(handle)
+            need(not self.manager._ids, "experiment-process-still-present")
+            stopped = {"execution": _completed(), "passed": True}
+            reverse_ready, reverse = blocked("reverse.boot"), blocked("reverse.read")
+        else:
+            old_read, _ = self._sweep("read", record=candidate_record)  # Before old writes.
+            old_write, old_record = self._sweep("write", nonce=secrets.token_hex(16))
+            self._settle()
+            # workers() owns its interval; no manual latch reset.
+            workers = observed.workers()
+            self.ledger.capture()
+            stopped = self._stop(handle, observed)
         self.old_stop = self.ledger.capture()
         need(self.old_stop.pending == 1, "experiment-old-period-incomplete")
 
-        handle, observed, reverse_boot = self._server("candidate")
-        reverse, _ = self._sweep("read", record=old_record)
-        self._stop(handle, observed)
+        if not terminal:
+            handle, observed, reverse_boot = self._server("candidate")
+            reverse, _ = self._sweep("read", record=old_record)
+            self._stop(handle, observed)
+            reverse_ready = {"execution": reverse_boot["execution"], "passed": proof._boot(reverse_boot)}
         sealed = self.ledger.seal()
         need(sealed.sealed and sealed.pending == 1, "experiment-journal-unsealed")
         final = self.catalog.observe(self.inputs)
@@ -334,7 +362,7 @@ class _Engine:
             "old_migrate": {"rw": rw, "ro": ro, "negative_control": control},
             "old_server": {"boot": old_boot, "read_sweep": old_read, "write_sweep": old_write,
                 "workers": workers, "stopped": stopped,
-                "candidate_ready": {"execution": reverse_boot["execution"], "passed": proof._boot(reverse_boot)},
+                "candidate_ready": reverse_ready,
                 "reverse_sweep": reverse}, "final_catalog_sha256": final.sha256}
         return proof.evaluate_proof(private)
 

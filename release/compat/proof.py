@@ -256,6 +256,58 @@ def _boot(value: Any) -> bool:
     return code == 0 and ready and proven
 
 
+def _terminal_old_boot(value: Any, identity: dict[str, Any]) -> dict[str, Any]:
+    """Only the post-migration old boot may have this private terminal form.
+
+    These are collector facts, not authentication of an arbitrary dictionary.
+    The public runner accepts no observations; the owned observer establishes
+    the source/handle, complete log window and stopped state before returning.
+    Migration/control execution shapes deliberately remain unchanged.
+    """
+    row = _fields(value, {"state", "phase", "binding", "terminal", "logs"})
+    _need(row["state"] == "observed-semantic-failure" and row["phase"] == "old.boot", "terminal-phase-invalid")
+    binding = _fields(row["binding"], {"sha", "previous_source_sha", "previous_web_digest", "run_id", "run_attempt",
+                                      "owner_token", "container_id", "started_at"})
+    for key in ("sha", "previous_web_digest", "run_id", "run_attempt"):
+        _need(type(binding[key]) is type(identity[key]) and binding[key] == identity[key], "terminal-identity-invalid")
+    _need(type(binding["previous_source_sha"]) is str and _SHA.fullmatch(binding["previous_source_sha"]), "terminal-source-invalid")
+    _need(type(binding["owner_token"]) is str and re.fullmatch(r"[0-9a-f]{32}", binding["owner_token"]), "terminal-owner-invalid")
+    _digest(binding["container_id"])
+    terminal = _fields(row["terminal"], {"running", "exit_code", "finished_at", "oom_killed", "daemon_error", "restart_count"})
+    _need(terminal["running"] is False and terminal["oom_killed"] is False and terminal["daemon_error"] is False
+          and type(terminal["restart_count"]) is int and terminal["restart_count"] == 0, "terminal-state-invalid")
+    code = _number(terminal["exit_code"], 255)
+    _need(code == 2, "terminal-exit-unsupported")  # Only an observed Go panic in this first slice.
+    def instant(raw):
+        _need(type(raw) is str and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z", raw), "terminal-time-invalid")
+        try:
+            return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            raise EvidenceError("terminal-time-invalid") from None
+    _need(instant(terminal["finished_at"]) >= instant(binding["started_at"]), "terminal-time-invalid")
+    logs = _fields(row["logs"], {"complete", "stdout_sha256", "stderr_sha256", "stdout_bytes", "stderr_bytes",
+                                "lines", "start_markers", "rls_markers", "fatal_markers", "panic_markers"})
+    _need(logs["complete"] is True, "terminal-log-incomplete")
+    for stream in ("stdout", "stderr"):
+        _digest(logs[stream + "_sha256"])
+        _number(logs[stream + "_bytes"], 1024 * 1024)
+    _need(logs["stdout_bytes"] + logs["stderr_bytes"] > 0 and _number(logs["lines"], 20_000) > 0,
+          "terminal-log-incomplete")
+    _need(_number(logs["start_markers"]) == _number(logs["rls_markers"]) == 1, "terminal-contract-unproven")
+    fatal, panic = _number(logs["fatal_markers"], 20_000), _number(logs["panic_markers"], 20_000)
+    _need(fatal == 0 and panic > 0, "terminal-defect-unproven")
+    return binding
+
+
+def _blocked_old_server(value: Any, phase: str, binding: dict[str, Any]) -> None:
+    row = _fields(value, {"state", "phase", "cause_phase", "reason", "binding"})
+    reason = "retained-record-unavailable" if phase in {"reverse.boot", "reverse.read"} else "server-unavailable"
+    copied = _fields(row["binding"], set(binding))
+    _need(row["state"] == "blocked-by-semantic" and row["phase"] == phase and row["cause_phase"] == "old.boot"
+          and row["reason"] == reason and all(type(copied[k]) is type(v) and copied[k] == v for k, v in binding.items()),
+          "blocked-cause-invalid")
+
+
 def _classification(value: Any) -> dict[str, Any]:
     row = _fields(value, {"kind", "dormant"})
     _need(type(row["kind"]) is str and row["kind"] in {"none", "data", "expand", "contract"}, "classification-invalid")
@@ -329,16 +381,27 @@ def evaluate_proof(value: Any) -> dict[str, Any]:
         migration_flags.append(code == 0 and not log.error_states and "25006" not in log.sqlstates and not log.statement_hashes and not markers
                                and catalog == s0 and tables == d0)
     server = _fields(row["old_server"], {"boot", "read_sweep", "write_sweep", "workers", "stopped", "candidate_ready", "reverse_sweep"})
-    boot, read, write = _boot(server["boot"]), _sweep(server["read_sweep"]), _sweep(server["write_sweep"])
-    workers = _fields(server["workers"], {"execution", "observed_seconds", "panic_count", "unknown_type_count", "unexpected_stub_entries"})
-    worker_code = _execution(workers["execution"])
-    seconds = _number(workers["observed_seconds"], 2700)
-    panics = _number(workers["panic_count"])
-    unknown = _number(workers["unknown_type_count"])
-    unexpected = _number(workers["unexpected_stub_entries"])
-    _need(seconds >= 60 or worker_code != 0 or panics > 0 or unknown > 0 or unexpected > 0, "workers-window-incomplete")
-    worker_ok = worker_code == 0 and seconds >= 60 and panics == unknown == unexpected == 0
-    stopped, rebooted, reverse = _check(server["stopped"]), _check(server["candidate_ready"]), _sweep(server["reverse_sweep"])
+    terminal = type(server["boot"]) is dict and server["boot"].get("state") == "observed-semantic-failure"
+    if terminal:
+        binding = _terminal_old_boot(server["boot"], identity)
+        for key, phase in (("read_sweep", "old.read"), ("write_sweep", "old.write"), ("workers", "old.workers"),
+                           ("candidate_ready", "reverse.boot"), ("reverse_sweep", "reverse.read")):
+            _blocked_old_server(server[key], phase, binding)
+        # Actual removal is mandatory, not another blocked observation.
+        stopped = _check(server["stopped"])
+        _need(stopped, "terminal-removal-unproven")
+        boot = read = write = worker_ok = rebooted = reverse = False
+    else:
+        boot, read, write = _boot(server["boot"]), _sweep(server["read_sweep"]), _sweep(server["write_sweep"])
+        workers = _fields(server["workers"], {"execution", "observed_seconds", "panic_count", "unknown_type_count", "unexpected_stub_entries"})
+        worker_code = _execution(workers["execution"])
+        seconds = _number(workers["observed_seconds"], 2700)
+        panics = _number(workers["panic_count"])
+        unknown = _number(workers["unknown_type_count"])
+        unexpected = _number(workers["unexpected_stub_entries"])
+        _need(seconds >= 60 or worker_code != 0 or panics > 0 or unknown > 0 or unexpected > 0, "workers-window-incomplete")
+        worker_ok = worker_code == 0 and seconds >= 60 and panics == unknown == unexpected == 0
+        stopped, rebooted, reverse = _check(server["stopped"]), _check(server["candidate_ready"]), _sweep(server["reverse_sweep"])
     final_catalog = _digest(row["final_catalog_sha256"])
     forward = previous_boot and all(pass_flags) and candidate_ready and candidate_write and s0 == expected
     old_migrate = {"rw": migration_flags[0], "ro": migration_flags[1], "negative_control": True}

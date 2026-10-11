@@ -79,6 +79,29 @@ def observations():
     }
 
 
+def terminal_boot(identity=None, previous_source="e" * 40):
+    identity = identity or observations()["identity"]
+    return {"state": "observed-semantic-failure", "phase": "old.boot",
+        "binding": {**{key: identity[key] for key in ("sha", "previous_web_digest", "run_id", "run_attempt")},
+                    "previous_source_sha": previous_source, "owner_token": "1" * 32, "container_id": "2" * 64,
+                    "started_at": "2026-10-11T00:00:01Z"},
+        "terminal": {"running": False, "exit_code": 2, "finished_at": "2026-10-11T00:00:03Z",
+                     "oom_killed": False, "daemon_error": False, "restart_count": 0},
+        "logs": {"complete": True, "stdout_sha256": hashlib.sha256(b"").hexdigest(), "stderr_sha256": "3" * 64,
+                 "stdout_bytes": 0, "stderr_bytes": 600, "lines": 4, "start_markers": 1, "rls_markers": 1,
+                 "fatal_markers": 0, "panic_markers": 1}}
+
+
+def terminal_observations():
+    value = observations(); old = value["old_server"]; old["boot"] = terminal_boot(value["identity"])
+    for key, phase in (("read_sweep", "old.read"), ("write_sweep", "old.write"), ("workers", "old.workers"),
+                       ("candidate_ready", "reverse.boot"), ("reverse_sweep", "reverse.read")):
+        old[key] = {"state": "blocked-by-semantic", "phase": phase, "cause_phase": "old.boot",
+                    "reason": "retained-record-unavailable" if phase.startswith("reverse.") else "server-unavailable",
+                    "binding": dict(old["boot"]["binding"])}
+    return value
+
+
 class PgParserTests(unittest.TestCase):
     def test_verbose_error_statement_location_bound_without_double_count(self):
         parsed = proof.parse_pg_log(control_log(), application="compat-control", complete=True)
@@ -145,6 +168,66 @@ class PgParserTests(unittest.TestCase):
 
 
 class ProofTests(unittest.TestCase):
+    def test_terminal_old_boot_blocks_only_server_subtree_and_retains_actual_migrations(self):
+        value = terminal_observations(); result = proof.evaluate_proof(value)
+        self.assertTrue(result["forward"]); self.assertTrue(result["reversible"])
+        self.assertEqual(set(result["old_server_ok"].values()), {False})
+        value["old_migrate"]["rw"]["execution"]["exit_code"] = 1
+        result = proof.evaluate_proof(value)
+        self.assertFalse(result["reversible"]); self.assertFalse(result["old_migrate_ok"]["rw"])
+        raw = proof.result_bytes(result)
+        for private in (b"blocked-by-semantic", b"owner_token", b"container_id", b"finished_at"):
+            self.assertNotIn(private, raw)
+
+    def test_terminal_facts_and_same_experiment_binding_are_mandatory(self):
+        mutations = [
+            lambda r: r.update(phase="previous.boot"),
+            lambda r: r.update(execution=execution(1)),
+            lambda r: r["binding"].update(sha="c" * 40),
+            lambda r: r["binding"].update(run_id=True),
+            lambda r: r["binding"].update(previous_web_digest="sha256:" + "c" * 64),
+            lambda r: r["binding"].update(container_id="foreign"),
+            lambda r: r["terminal"].update(running=True),
+            lambda r: r["terminal"].update(oom_killed=True),
+            lambda r: r["terminal"].update(daemon_error=True),
+            lambda r: r["terminal"].update(restart_count=1),
+            lambda r: r["terminal"].update(exit_code=137),
+            lambda r: r["terminal"].update(exit_code=0),
+            lambda r: r["terminal"].update(exit_code=1),
+            lambda r: r["terminal"].update(finished_at="2026-10-10T00:00:00Z"),
+            lambda r: r["logs"].update(complete=False),
+            lambda r: r["logs"].update(lines=0),
+            lambda r: r["logs"].update(start_markers=0),
+            lambda r: r["logs"].update(rls_markers=2),
+            lambda r: r["logs"].update(panic_markers=0),
+            lambda r: r["logs"].update(fatal_markers=1),
+        ]
+        for index, mutate in enumerate(mutations):
+            value = terminal_observations(); mutate(value["old_server"]["boot"])
+            with self.subTest(index=index), self.assertRaises(proof.EvidenceError): proof.evaluate_proof(value)
+
+    def test_blocked_nodes_cannot_invent_completion_or_arbitrary_dependency(self):
+        mutations = [lambda r:r.update(execution=execution()), lambda r:r.update(cases={}),
+            lambda r:r.update(observed_seconds=60), lambda r:r.update(cause_phase="old.read"),
+            lambda r:r.update(cause_phase="reverse.read"), lambda r:r.update(cause_phase="missing"),
+            lambda r:r.update(phase="old.write"), lambda r:r.update(reason="unavailable"),
+            lambda r:r["binding"].update(container_id="3" * 64)]
+        for index, mutate in enumerate(mutations):
+            value = terminal_observations(); mutate(value["old_server"]["read_sweep"])
+            with self.subTest(index=index), self.assertRaises(proof.EvidenceError): proof.evaluate_proof(value)
+        value = terminal_observations(); value["old_server"]["boot"] = boot()
+        with self.assertRaises(proof.EvidenceError): proof.evaluate_proof(value)
+
+    def test_terminal_never_waives_migration_control_final_catalog_or_real_removal(self):
+        for path in (("old_migrate", "rw"), ("old_migrate", "ro"), ("old_migrate", "negative_control"),
+                     ("old_server", "stopped"), ("quiescence",), ("final_catalog_sha256",)):
+            value = terminal_observations(); target = value
+            for key in path[:-1]: target = target[key]
+            target[path[-1]] = copy.deepcopy(value["old_server"]["read_sweep"])
+            with self.subTest(path=path), self.assertRaises(proof.EvidenceError): proof.evaluate_proof(value)
+        value = terminal_observations(); value["old_server"]["stopped"] = check(False)
+        with self.assertRaises(proof.EvidenceError): proof.evaluate_proof(value)
+
     def test_complete_exact_result_and_attempt_artifact(self):
         result = proof.evaluate_proof(observations())
         self.assertTrue(result["forward"])

@@ -109,6 +109,153 @@ class ObservationTests(unittest.TestCase):
         return o.OwnedObservation(self.manager, self.handle, self.fixture,
                                   clock=self.clock, sleep=kwargs.pop("sleep", self.clock.sleep), **kwargs)
 
+    def old_observer(self):
+        return o.OwnedObservation.for_old_boot(self.manager, self.handle, self.fixture,
+            run_id=12345, run_attempt=2, clock=self.clock, sleep=self.clock.sleep)
+
+    def terminal(self):
+        self.world.raw = startup() + (TIME + " panic: synthetic terminal defect\n").encode()
+        self.world.containers[self.handle.container_id]["State"].update(
+            Running=False, Status="exited", ExitCode=2,
+            FinishedAt="2026-10-11T00:00:03Z", OOMKilled=False, Error="")
+
+    def test_old_terminal_collects_actual_bound_state_and_whole_logs_without_http(self):
+        self.terminal()
+        observed = self.old_observer(); original = self.owner.capture
+        value = observed.wait_old_boot()
+        self.assertIs(self.owner.capture, original)
+        self.assertEqual(value["binding"]["container_id"], self.handle.container_id)
+        self.assertEqual(value["binding"]["previous_source_sha"], self.manager.bindings["previous"].source_sha)
+        self.assertEqual(value["binding"]["sha"], self.manager.bindings["candidate"].source_sha)
+        self.assertEqual(value["binding"]["owner_token"], self.owner.token)
+        self.assertEqual(value["logs"]["stderr_bytes"], len(self.world.raw))
+        self.assertEqual(value["logs"]["stderr_sha256"], o.hashlib.sha256(self.world.raw).hexdigest())
+        self.assertEqual(value["logs"]["panic_markers"], 1)
+        self.assertEqual(self.world.log_calls, 2)
+        self.assertFalse(observed._failed); self.assertFalse(self.manager._protocol_failed)
+        self.assertNotIn("controller", self.manager._ids)
+        self.assertFalse(any(args[:4] == ["container", "start", "--attach", "--interactive"]
+                             for args, _ in self.world.calls))
+        self.assertNotIn("synthetic terminal defect", json.dumps(value))
+        self.manager.remove(self.handle)
+        self.assertEqual(self.manager._ids, {})
+        self.manager.close(); self.owner.cleanup()
+
+    def test_old_terminal_partial_startup_and_running_success_use_distinct_real_paths(self):
+        self.terminal()
+        self.world.raw = (log("Starting ReReply server...")
+                          + log("PostgreSQL tenant RLS verified", fields="runtime_role=compat_runtime")
+                          + (TIME + " panic: synthetic terminal defect\n").encode())
+        value = self.old_observer().wait_old_boot()
+        self.assertEqual(value["terminal"]["exit_code"], 2)
+        self.assertEqual(value["logs"]["fatal_markers"], 0)
+        self.manager.remove(self.handle)
+        self.handle = self.manager.start_web("previous", tp.INPUTS)
+        self.world.raw = startup()
+        observed = self.old_observer()
+        self.assertIsNone(observed.wait_old_boot())
+        self.assertTrue(observed._startup_ready)
+        self.assertTrue(observed.boot()["ready"])
+        self.assertTrue(observed.finish_period()["alive"])
+        self.manager.close(); self.owner.cleanup()
+
+    def test_infrastructure_and_unknown_fatal_windows_never_qualify_as_panic(self):
+        # Exact infrastructure messages from the pinned main.go. Do not give
+        # an arbitrary fatal message semantic authority just because RLS ran.
+        fatal_lines = [log(message, level="fatal") for message in (
+            "Failed to connect to Redis", "Failed to start required realtime subscriber",
+            "Failed to initialize configured object storage", "unclassified fatal",
+            "Route parameter conflicts with request context")]
+        # Even the source-backed route-conflict fatal is outside this first,
+        # panic-only slice. Runtime fatal errors may exit2 with OOMKilled=false.
+        fatal_lines += [(TIME + " fatal error: " + message + "\n").encode()
+                        for message in ("out of memory", "unclassified runtime error")]
+        for raw in fatal_lines:
+            for mixed in (False, True):
+                with self.subTest(raw=raw, mixed=mixed):
+                    h = ObservationTests("test_positive_owned_boot_and_actual_sixty_second_window")
+                    h.setUp(); self.addCleanup(h.doCleanups); h.terminal()
+                    h.world.raw = startup() + raw
+                    if b"level=fatal" in raw and not mixed:
+                        h.world.containers[h.handle.container_id]["State"]["ExitCode"] = 1
+                    if mixed: h.world.raw += (TIME + " panic: synthetic terminal defect\n").encode()
+                    observed = h.old_observer()
+                    with self.assertRaisesRegex(o.proof.EvidenceError, "terminal-fatal-unclassified"):
+                        observed.wait_old_boot()
+                    self.assertTrue(h.manager._protocol_failed)
+                    self.assertFalse(observed._booted)
+                    h.manager.close(); h.owner.cleanup()
+
+    def test_terminal_without_exact_contract_or_recognized_defect_refuses(self):
+        good = startup()
+        panic = (TIME + " panic: synthetic terminal defect\n").encode()
+        cases = {
+            "no-log": b"", "before-start": panic + good,
+            "before-rls": log("Starting ReReply server...") + panic,
+            "wrong-role": good.replace(b"runtime_role=compat_runtime", b"runtime_role=postgres") + panic,
+            "wrong-caller": good.replace(b"cmd/whatomate/main.go", b"unrelated/main.go") + panic,
+            "duplicate": good + log("PostgreSQL tenant RLS verified", fields="runtime_role=compat_runtime") + panic,
+            "ordinary-error": good + log("an ordinary error", level="error"),
+            "quoted-panic": good + log("panic: customer text", level="error"),
+            "partial-log": (good + panic)[:-1],
+            "future-log": good + panic.replace(b"00:00:02", b"00:00:04"),
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                # Fresh synthetic ownership per case; no latch reset.
+                h = ObservationTests("test_positive_owned_boot_and_actual_sixty_second_window")
+                h.setUp(); self.addCleanup(h.doCleanups); h.terminal(); h.world.raw = raw
+                observed = h.old_observer()
+                with self.assertRaises((o.proof.EvidenceError, o.proof.InfrastructureFailure)):
+                    observed.wait_old_boot(timeout=1)
+                self.assertTrue(observed._failed); self.assertTrue(h.manager._protocol_failed)
+                h.manager.close(); h.owner.cleanup()
+
+    def test_terminal_state_and_ownership_drift_never_becomes_semantic_evidence(self):
+        for field, value in [("ExitCode", 0), ("ExitCode", 137), ("ExitCode", True),
+                             ("OOMKilled", True), ("Error", "daemon failure"),
+                             ("FinishedAt", "bad"), ("FinishedAt", "2026-10-11T00:00:00Z"),
+                             ("Status", "dead"), ("StartedAt", "2026-10-11T00:00:00Z"),
+                             ("RestartCount", 1), ("Id", "f" * 64)]:
+            with self.subTest(field=field, value=value):
+                h = ObservationTests("test_positive_owned_boot_and_actual_sixty_second_window")
+                h.setUp(); self.addCleanup(h.doCleanups); h.terminal()
+                row = h.world.containers[h.handle.container_id]
+                (row if field in {"RestartCount", "Id"} else row["State"])[field] = value
+                with self.assertRaises(o.proof.EvidenceError): h.old_observer().wait_old_boot()
+
+    def test_terminal_second_read_truncation_change_or_late_completion_refuses(self):
+        for change in ("truncate", "state", "late", "replace"):
+            with self.subTest(change=change):
+                h = ObservationTests("test_positive_owned_boot_and_actual_sixty_second_window")
+                h.setUp(); self.addCleanup(h.doCleanups); h.terminal()
+                observed = h.old_observer(); original = h.owner.capture
+                foreign = lambda *args, **kwargs: self.fail("foreign transport invoked")
+                def mutate(world):
+                    if world.log_calls == 2:
+                        if change == "truncate": world.raw = log("Starting ReReply server...")
+                        elif change == "state": world.containers[h.handle.container_id]["State"]["ExitCode"] = 1
+                        elif change == "late": h.clock.now += 11
+                        else: h.owner.capture = foreign
+                h.world.mutate_log = mutate
+                with self.assertRaises((o.proof.EvidenceError, o.proof.InfrastructureFailure)):
+                    observed.wait_old_boot(timeout=10)
+                self.assertIs(h.owner.capture, foreign if change == "replace" else original)
+
+    def test_old_terminal_api_preserves_earlier_refusals_and_once_only_state(self):
+        self.terminal()
+        with self.assertRaises(o.proof.EvidenceError): self.observer()
+        self.manager._protocol_failed = True
+        with self.assertRaises(o.proof.EvidenceError): self.old_observer()
+        self.assertTrue(self.manager._protocol_failed)
+        h = ObservationTests("test_positive_owned_boot_and_actual_sixty_second_window")
+        h.setUp(); self.addCleanup(h.doCleanups); h.terminal(); observed = h.old_observer()
+        observed.wait_old_boot()
+        count = h.world.log_calls
+        with self.assertRaises(o.proof.EvidenceError): observed.wait_old_boot()
+        self.assertEqual(h.world.log_calls, count)
+        self.assertTrue(h.manager._protocol_failed)
+
     def test_actual_pinned_logf_empty_values_preserve_record_boundaries(self):
         expected = {"empty_last": ("Serving embedded frontend", "base_path", ""),
                     "empty_middle": ("Synthetic empty field", "first", ""),
