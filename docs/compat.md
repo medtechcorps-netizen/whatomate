@@ -292,7 +292,14 @@ ownership, configuration, network membership and start identity before acting.
 An unknown command outcome or foreign network attachment refuses further
 actions. Cleanup confirms each resource's absence and does not prune or adopt
 resources by name. The mocked tests cover these boundaries and composition
-with the socket collector; live integration is still pending.
+with the socket collector. A disposable local probe also passed three-service
+readiness, host SCRAM refusal with working local socket, complete table capture
+with FORCE RLS, and an empty phase window with unchanged public digests. Its
+in-module cleanup refused after Graph stopped; a separate exact-ID cleanup
+removed the owned resources and preserved the original container set. Cleanup
+now uses the supported `--timeout` flag, retaining strict ID acknowledgement.
+A fresh probe must still validate the corrected full roundtrip; these checks
+do not constitute a release compatibility proof.
 
 There is no web service or in-network controller in this module. Those need
 separate reviewed ownership and transport integration. The existing internal

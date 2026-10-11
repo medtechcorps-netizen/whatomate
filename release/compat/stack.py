@@ -365,7 +365,7 @@ class OwnedStack:
             row = self._container_check(role, started_at=handle.started_at if handle else None)
             identifier = self._ids[role]
             if row["State"]["Running"]:
-                self._mutation(["container", "stop", "--time", "5", identifier], "stop", role, identifier)
+                self._mutation(["container", "stop", "--timeout", "5", identifier], "stop", role, identifier)
             self._container_check(role, running=False, started_at=handle.started_at if handle else None)
             self._mutation(["container", "rm", identifier], "remove", role, identifier)
             absent = self._read(["container", "ls", "--all", "--no-trunc", "--filter", "id=" + identifier,

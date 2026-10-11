@@ -416,6 +416,35 @@ class StackTests(unittest.TestCase):
         self.assertEqual(len(self.stack.evidence()["container_ids"]), 3)
         self.assertTrue(self.stack.evidence()["ambiguous"])
 
+    def test_cleanup_uses_timeout_without_deprecated_stdout_pollution(self):
+        def deprecated_warning(args, value):
+            if args[:2] == ["container", "stop"] and "--time" in args:
+                return "Flag --time has been deprecated, use --timeout instead\n" + value
+            return value
+        self.world.transform = deprecated_warning
+        handles = self.stack.start()
+        self.stack.cleanup()
+        stops = [args for args in self.world.mutations if args[:2] == ["container", "stop"]]
+        self.assertEqual(stops, [["container", "stop", "--timeout", "5", handle.container_id]
+                                 for handle in reversed(handles)])
+        self.assertTrue(self.stack.evidence()["closed"])
+        self.assertFalse(self.world.containers)
+        self.assertIsNone(self.world.network)
+
+    def test_stop_stdout_noise_still_refuses_without_retry_or_removal(self):
+        self.stack.start()
+        self.world.transform = lambda args, value: ("unexpected stdout\n" + value
+            if args[:2] == ["container", "stop"] else value)
+        with self.assertRaisesRegex(s.proof.EvidenceError, "stack-id-invalid"):
+            self.stack.cleanup()
+        count = len(self.world.mutations)
+        self.assertTrue(self.stack.evidence()["ambiguous"])
+        self.assertEqual(len(self.stack.evidence()["container_ids"]), 3)
+        self.assertFalse(any(args[:2] == ["container", "rm"] for args in self.world.mutations))
+        with self.assertRaises(s.proof.EvidenceError):
+            self.stack.cleanup()
+        self.assertEqual(len(self.world.mutations), count)
+
     def test_removal_needs_observed_absence_and_does_not_retry(self):
         self.stack.start()
         self.world.transform = lambda args, value: "f" * 64 if args[:2] == ["container", "ls"] else value
