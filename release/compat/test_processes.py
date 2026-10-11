@@ -8,6 +8,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import processes as p
@@ -137,13 +138,39 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(set(cfg["database"]),{"url","runtime_role","rls_enabled"})
         self.assertIn("compat_runtime:"+INPUTS.runtime_password,cfg["database"]["url"])
         self.assertIn("application_name=compat-control",cfg["database"]["url"])
-        self.assertIn("default_transaction_read_only%3Don",cfg["database"]["url"])
+        self.assertNotIn("options",parse_qs(urlsplit(cfg["database"]["url"]).query))
         self.assertNotIn(INPUTS.owner_password,json.dumps(cfg))
         command=self.world.containers[h.container_id]["Config"]["Cmd"]
         self.assertEqual(command,["-ec",p._WAIT_CONFIG+"catalog-snapshot -config /compat/private/config.toml -mode compare"])
         got=m.wait_catalog(h)
         self.assertEqual(got,p.runtime.Capture(0,b"{}\n",b""))
         m.remove(h);m.close();self.owner.cleanup()
+
+    def test_catalog_and_n1_ro_have_distinct_startup_parameter_contracts(self):
+        m = self.manager()
+        catalog = m.start_catalog(INPUTS)
+        db = self.world.configs[catalog.container_id]["database"]
+        # The catalog collector rejects DSN options and installs its own
+        # read-only startup parameters before connecting.
+        self.assertEqual(parse_qs(urlsplit(db["url"]).query), {
+            "sslmode": ["disable"], "application_name": ["compat-control"],
+        })
+        self.assertNotIn("migration_url", db)
+        self.assertEqual(m.wait_catalog(catalog).returncode, 0)
+        m.remove(catalog)
+
+        migration = m.start_migration("compat-n1-ro", INPUTS)
+        db = self.world.configs[migration.container_id]["database"]
+        for key, role in (("url", "compat_runtime"), ("migration_url", "compat_owner")):
+            with self.subTest(connection=key):
+                parsed = urlsplit(db[key])
+                self.assertEqual(parsed.username, role)
+                self.assertEqual(parse_qs(parsed.query), {
+                    "sslmode": ["disable"], "application_name": ["compat-n1-ro"],
+                    "options": ["-c default_transaction_read_only=on"],
+                })
+        self.assertEqual(m.wait_migration(migration), 0)
+        m.remove(migration);m.close();self.owner.cleanup()
 
     def test_catalog_slot_excludes_web_migration_and_controller(self):
         m=self.manager(); h=m.start_web("previous",INPUTS); before=len(self.world.mutations)

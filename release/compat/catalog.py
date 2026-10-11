@@ -40,6 +40,14 @@ _COUNT_KEYS = {"non_public_schemas", "non_public_objects", "other_roles", "defau
                "statistics", "tablespaces", "other_acl_entries", "other_policy_roles"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+# Only the CLI's fixed public diagnostics may refine a refusal. Never echo
+# arbitrary process output: it may contain configuration or driver details.
+_CLI_FAILURES = {
+    (2, b"catalog-snapshot:invalid-arguments; use -help\n"): "catalog-cli-invalid-arguments",
+    (1, b"catalog-snapshot:configuration-unavailable\n"): "catalog-cli-configuration-unavailable",
+    (1, b"catalog-snapshot:capture-failed\n"): "catalog-cli-capture-failed",
+    (1, b"catalog-snapshot:output-failed\n"): "catalog-cli-output-failed",
+}
 
 
 def need(value, code="catalog-contract-invalid"):
@@ -179,7 +187,11 @@ class OwnedCatalog:
             completed=self.manager.wait_catalog(handle)
             # Known cleanup never turns a failed/ambiguous report into success.
             self.manager.remove(handle)
-            need(type(completed.returncode) is int and completed.returncode==0 and not completed.stderr, "catalog-cli-failed")
+            if type(completed.returncode) is not int or completed.returncode != 0 or completed.stderr:
+                code = "catalog-cli-failed"
+                if type(completed.returncode) is int and type(completed.stderr) is bytes:
+                    code = _CLI_FAILURES.get((completed.returncode, completed.stderr), code)
+                raise proof.EvidenceError(code)
             observed=self.contract.parse_compare(completed.stdout)
             self._quiescent()
             return CatalogObservation(observed,hashlib.sha256(completed.stdout).hexdigest(),len(completed.stdout))

@@ -82,9 +82,10 @@ def _configuration(owner, inputs, phase):
     host = owner.namespace + "-pg"
     def url(user, password):
         value = f"postgres://{user}:{password}@{host}:5432/compat?sslmode=disable&application_name={phase}"
-        return value + ("&options=-c%20default_transaction_read_only%3Don" if phase in {"compat-n1-ro", "compat-control"} else "")
+        return value + ("&options=-c%20default_transaction_read_only%3Don" if phase == "compat-n1-ro" else "")
     if phase == "compat-control":
         # Catalog CLI reads only the runtime connection; no owner credential.
+        # Its collector rejects DSN options and enforces read-only at startup.
         return ('[app]\nenvironment = "test"\n[database]\nurl = ' + json.dumps(url("compat_runtime", inputs.runtime_password))
                 + '\nruntime_role = "compat_runtime"\nrls_enabled = true\n').encode()
     sections = {
@@ -328,7 +329,7 @@ class OwnedProcesses:
         return code  # Not a migration or compatibility verdict.
 
     def start_catalog(self, inputs):
-        """Fixed candidate CLI, runtime startup read-only; no active peers."""
+        """Fixed candidate CLI enforces runtime read-only; no active peers."""
         return self._start("catalog", "candidate", "compat-control", inputs)
 
     def wait_catalog(self, handle):

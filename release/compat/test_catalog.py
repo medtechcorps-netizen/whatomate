@@ -232,5 +232,30 @@ class CatalogTests(unittest.TestCase):
         observer=self.setup_owned();self.manager.bindings['candidate']=replace(self.manager.bindings['candidate'],source_sha='a'*40)
         with self.assertRaises(c.proof.EvidenceError):c.OwnedCatalog(self.manager,self.pg,self.contract)
 
+    def test_only_exact_fixed_cli_diagnostics_refine_refusal(self):
+        cases = [
+            (2, b'catalog-snapshot:invalid-arguments; use -help\n', 'catalog-cli-invalid-arguments'),
+            (1, b'catalog-snapshot:configuration-unavailable\n', 'catalog-cli-configuration-unavailable'),
+            (1, b'catalog-snapshot:capture-failed\n', 'catalog-cli-capture-failed'),
+            (1, b'catalog-snapshot:output-failed\n', 'catalog-cli-output-failed'),
+            (0, b'catalog-snapshot:capture-failed\n', 'catalog-cli-failed'),
+            (2, b'catalog-snapshot:capture-failed\n', 'catalog-cli-failed'),
+            (1, b'catalog-snapshot:capture-failed\nprivate DSN', 'catalog-cli-failed'),
+            (1, b'private DSN\ncatalog-snapshot:capture-failed\n', 'catalog-cli-failed'),
+            (1, b'', 'catalog-cli-failed'),
+        ]
+        for exit_code, diagnostic, expected in cases:
+            with self.subTest(exit_code=exit_code, expected=expected):
+                observer = self.setup_owned()
+                self.world.catalog_exit = exit_code
+                self.world.catalog_stderr = diagnostic
+                with self.assertRaises(c.proof.EvidenceError) as got:
+                    observer.initial(test_processes.INPUTS)
+                self.assertEqual(str(got.exception), expected)
+                self.assertTrue(observer._failed)
+                self.assertTrue(self.manager._protocol_failed)
+                self.assertFalse(self.manager._ids)
+                self.assertFalse(self.world.data_calls)
+
 
 if __name__=='__main__':unittest.main(verbosity=2)
