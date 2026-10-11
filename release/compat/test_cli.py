@@ -2,6 +2,7 @@ import contextlib
 import copy
 import io
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -29,9 +30,9 @@ def environment(event="push", ref="refs/heads/main", attempt="1"):
 
 
 def snapshot(ctx):
-    old = {"release": TAG, "sha": OLD, "web_digest": DIGEST}
-    latest = dict(old) if ctx.target is None else {"release": LATEST_TAG, "sha": LATEST, "web_digest": "sha256:" + "e" * 64}
-    return {"version": 1, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
+    old = {"release": TAG, "manifest_sha256": "1" * 64, "sha": OLD, "web_digest": DIGEST}
+    latest = dict(old) if ctx.target is None else {"release": LATEST_TAG, "manifest_sha256": "2" * 64, "sha": LATEST, "web_digest": "sha256:" + "e" * 64}
+    return {"version": 2, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
             "requested_rollback_target": ctx.target, "latest": latest, "selected": old,
             "preview": {"kind": "none", "dormant": False, "blocked": False}}
 
@@ -97,8 +98,8 @@ class SnapshotTests(unittest.TestCase):
     def test_single_chain_freezes_latest_and_explicit_selection(self):
         env = environment("workflow_dispatch"); env["COMPAT_ROLLBACK_TARGET"] = TAG
         ctx = cli.context(env)
-        old = SimpleNamespace(release=TAG, sha=OLD, images={"web": DIGEST})
-        latest = SimpleNamespace(release=LATEST_TAG, sha=LATEST, images={"web": "sha256:" + "e" * 64})
+        old = SimpleNamespace(release=TAG, sha=OLD, images={"web": DIGEST}, manifest_sha256="1" * 64)
+        latest = SimpleNamespace(release=LATEST_TAG, sha=LATEST, images={"web": "sha256:" + "e" * 64}, manifest_sha256="2" * 64)
         chain = cli.records.Chain((old, latest)); client = SimpleNamespace(work_dir=Path("/private"))
         source = mock.Mock()
         with mock.patch.object(cli.images, "_verification_transport", return_value=contextlib.nullcontext()), \
@@ -114,6 +115,9 @@ class SnapshotTests(unittest.TestCase):
         classify.assert_called_once_with(Path("/repo"), LATEST, SHA, mode="forward")
         self.assertEqual(value["latest"]["sha"], LATEST)
         self.assertEqual(value["selected"]["sha"], OLD)
+        self.assertEqual(value["version"], 2)
+        self.assertEqual(value["selected"]["manifest_sha256"], "1" * 64)
+        self.assertEqual(value["latest"]["manifest_sha256"], "2" * 64)
 
     def test_unknown_target_or_signature_failure_has_no_snapshot(self):
         env = environment("workflow_dispatch"); env["COMPAT_ROLLBACK_TARGET"] = TAG
@@ -180,7 +184,7 @@ class FileAndEntryTests(unittest.TestCase):
                 env = environment("pull_request", "refs/pull/267/merge", "2")
                 env["RUNNER_TEMP"] = str(runner)
                 ctx = cli.context(env)
-                entry = SimpleNamespace(release=TAG, sha=OLD, images={"web": DIGEST})
+                entry = SimpleNamespace(release=TAG, sha=OLD, images={"web": DIGEST}, manifest_sha256="1" * 64)
                 client = SimpleNamespace(work_dir=runner / "private-chain")
                 source = mock.Mock()
                 client_environments = []
@@ -271,24 +275,6 @@ class FileAndEntryTests(unittest.TestCase):
             self.assertEqual(read.call_count, 1)
             write.assert_not_called()
 
-    def test_aggregator_preserves_semantic_false_before_failing_gate(self):
-        env = environment(); env.update(COMPAT_PREVIEW_OUTCOME="success", COMPAT_RUN_OUTCOME="success")
-        ctx = cli.context(env); value = result(ctx); value["old_server_ok"]["reverse"] = False
-        raw = cli.proof.result_bytes(value)
-        with tempfile.TemporaryDirectory() as temp:
-            env["RUNNER_TEMP"] = str(Path(temp).resolve())
-            output = Path(temp).resolve() / "step-output"; output.touch()
-            env["GITHUB_OUTPUT"] = str(output)
-            with mock.patch.dict(cli.os.environ, env, clear=True), \
-                 mock.patch.object(cli.images, "_READY_FOR_EXECUTION", True), \
-                 mock.patch.object(cli, "_read_public", side_effect=[cli.canonical(snapshot(ctx)), raw]), \
-                 mock.patch.object(cli, "_scratch", return_value=Path(temp).resolve()) as scratch, \
-                 mock.patch.object(cli, "_write_public") as write:
-                self.assertEqual(cli.main(["check"]), 1)
-            self.assertEqual(scratch.call_args.args[2], "check")
-            self.assertEqual(write.call_args.args[1], raw)
-            self.assertEqual(output.read_text(), "complete=true\n")
-
     def test_runner_does_not_write_result_on_infrastructure_exception(self):
         env = environment(); ctx = cli.context(env)
         with tempfile.TemporaryDirectory() as temp:
@@ -318,6 +304,196 @@ class FileAndEntryTests(unittest.TestCase):
                  mock.patch.object(cli, "_mark_complete") as mark, contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(cli.main(["check"]), 1)
             mark.assert_not_called()
+
+
+class EvidenceContextTests(unittest.TestCase):
+    def setUp(self):
+        self.ctx = cli.context(environment(attempt="2"))
+        self.snap = snapshot(self.ctx)
+        self.raw = cli.proof.result_bytes(result(self.ctx))
+
+    def test_positive_and_false_context_bind_exact_unchanged_result_bytes(self):
+        for negative in (False, True):
+            value = result(self.ctx)
+            if negative:
+                value["old_migrate_ok"]["ro"] = False
+                value["reversible"] = False
+            raw = cli.proof.result_bytes(value)
+            bound = cli.evidence_context(raw, self.snap, self.ctx)
+            self.assertEqual(bound, {"version": 1, "repository": cli.common.REPOSITORY,
+                "workflow_path": ".github/workflows/compat.yml", "workflow_sha": SHA,
+                "event": "push", "ref": "refs/heads/main", "sha": SHA,
+                "run_id": self.ctx.run_id, "run_attempt": 2, "requested_rollback_target": None,
+                "latest": self.snap["latest"], "selected": self.snap["selected"],
+                "preview": self.snap["preview"], "result_sha256": hashlib.sha256(raw).hexdigest()})
+            encoded = cli.canonical(bound)
+            self.assertLess(len(encoded), 4096)
+            self.assertEqual(cli.validate_evidence(encoded, raw, self.snap, self.ctx), bound)
+            self.assertEqual(raw, cli.proof.result_bytes(value))
+            self.assertNotIn("result_sha256", value)
+            self.assertEqual(cli.accepted(value), not negative)
+
+    def test_every_context_field_and_nested_identity_is_rebound(self):
+        original = cli.evidence_context(self.raw, self.snap, self.ctx)
+        changes = [(key, "foreign") for key in original]
+        changes += [("version", True), ("run_id", True), ("run_attempt", True),
+                    ("event", "workflow_dispatch"), ("ref", "refs/heads/other"),
+                    ("sha", OLD), ("workflow_sha", OLD), ("requested_rollback_target", TAG)]
+        for key, value in changes:
+            altered = copy.deepcopy(original); altered[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(cli.proof.EvidenceError):
+                cli.validate_evidence(cli.canonical(altered), self.raw, self.snap, self.ctx)
+        for key in original:
+            altered = copy.deepcopy(original); del altered[key]
+            with self.subTest(missing=key), self.assertRaises(cli.proof.EvidenceError):
+                cli.validate_evidence(cli.canonical(altered), self.raw, self.snap, self.ctx)
+        for which in ("latest", "selected"):
+            for key in original[which]:
+                altered = copy.deepcopy(original); altered[which][key] = "f" * 64
+                with self.subTest(which=which, key=key), self.assertRaises(cli.proof.EvidenceError):
+                    cli.validate_evidence(cli.canonical(altered), self.raw, self.snap, self.ctx)
+        altered = copy.deepcopy(original); altered["extra"] = False
+        with self.assertRaises(cli.proof.EvidenceError):
+            cli.validate_evidence(cli.canonical(altered), self.raw, self.snap, self.ctx)
+        for key in ("kind", "dormant", "blocked"):
+            altered = copy.deepcopy(original); altered["preview"][key] = "bad"
+            with self.assertRaises(cli.proof.EvidenceError):
+                cli.validate_evidence(cli.canonical(altered), self.raw, self.snap, self.ctx)
+
+    def test_strict_context_bytes_and_digest_do_not_accept_equivalent_or_foreign_input(self):
+        raw = cli.canonical(cli.evidence_context(self.raw, self.snap, self.ctx))
+        cases = [b" " + raw, raw[:-1], raw + b" " * 4096, b"\xff", b'{"version":1,"version":1}',
+                 b'{"value":NaN}', b'{"value":Infinity}', b'[]\n', raw.replace(b'"version":1', b'"version":1.0')]
+        for case in cases:
+            with self.subTest(raw=case[:32]), self.assertRaises((cli.proof.EvidenceError, cli.common.ReleaseError)):
+                cli.validate_evidence(case, self.raw, self.snap, self.ctx)
+        changed = result(self.ctx); changed["old_server_ok"]["read"] = False
+        with self.assertRaises(cli.proof.EvidenceError):
+            cli.validate_evidence(raw, cli.proof.result_bytes(changed), self.snap, self.ctx)
+
+    def test_resolution_v1_or_missing_manifest_hash_cannot_be_upgraded_implicitly(self):
+        for mutate in (lambda s: s.update(version=1),
+                       lambda s: s["latest"].pop("manifest_sha256"),
+                       lambda s: s["selected"].update(manifest_sha256=True),
+                       lambda s: s["selected"].update(manifest_sha256="A" * 64)):
+            snap = copy.deepcopy(self.snap); mutate(snap)
+            with self.assertRaises(cli.proof.EvidenceError): cli.validate_snapshot(snap, self.ctx)
+
+    def test_normal_classification_mismatch_refuses_but_explicit_target_has_distinct_base(self):
+        value = result(self.ctx); value["classification"] = {"kind": "data", "dormant": True}
+        with self.assertRaises(cli.proof.EvidenceError):
+            cli.evidence_context(cli.proof.result_bytes(value), self.snap, self.ctx)
+        for target in (TAG, "prod-0000"):
+            env = environment("workflow_dispatch"); env["COMPAT_ROLLBACK_TARGET"] = target
+            ctx = cli.context(env); snap = snapshot(ctx); snap["selected"]["release"] = target
+            value = result(ctx); value["previous_release"] = target
+            value["classification"] = {"kind": "data", "dormant": True}
+            raw = cli.proof.result_bytes(value)
+            bound = cli.evidence_context(raw, snap, ctx)
+            self.assertEqual(bound["requested_rollback_target"], target)
+            self.assertEqual(bound["preview"], {"kind": "none", "dormant": False, "blocked": False})
+            self.assertNotEqual(bound["latest"], bound["selected"])
+            self.assertEqual(cli.validate_evidence(cli.canonical(bound), raw, snap, ctx), bound)
+
+    def test_events_and_attempts_are_independently_rebound_without_new_capabilities(self):
+        for event, ref in (("push", "refs/heads/main"), ("pull_request", "refs/pull/268/merge"),
+                           ("workflow_dispatch", "refs/heads/codex/fixture")):
+            env = environment(event, ref, "3"); ctx = cli.context(env); snap = snapshot(ctx)
+            raw = cli.proof.result_bytes(result(ctx)); bound = cli.evidence_context(raw, snap, ctx)
+            self.assertEqual((bound["event"], bound["ref"], bound["run_attempt"]), (event, ref, 3))
+            with self.assertRaises(cli.proof.EvidenceError):
+                cli.validate_evidence(cli.canonical(bound), self.raw, self.snap, self.ctx)
+
+
+class EvidenceEntryTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def workspace(self, negative=False):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve(); repo = root / "repo"; repo.mkdir()
+            runner = root / "runner"; runner.mkdir(); inputs = runner / "compat-input"; inputs.mkdir()
+            output = runner / "step-output"; output.touch()
+            env = environment(attempt="2")
+            env.update(RUNNER_TEMP=str(runner), GITHUB_OUTPUT=str(output),
+                       COMPAT_PREVIEW_OUTCOME="success", COMPAT_RUN_OUTCOME="success")
+            ctx = cli.context(env); snap = snapshot(ctx); value = result(ctx)
+            if negative: value["old_server_ok"]["reverse"] = False
+            raw = cli.proof.result_bytes(value)
+            (inputs / "resolution.json").write_bytes(cli.canonical(snap))
+            (inputs / "compat-result.json").write_bytes(raw)
+            with mock.patch.dict(cli.os.environ, env, clear=True), mock.patch.object(Path, "cwd", return_value=repo), \
+                 mock.patch.object(cli, "_client", side_effect=AssertionError("no client")), \
+                 mock.patch.object(cli.compat, "run_experiment", side_effect=AssertionError("no experiment")), \
+                 mock.patch.object(cli.records, "resolve_chain", side_effect=AssertionError("no moving latest")), \
+                 contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                yield runner, inputs, output, ctx, snap, raw, stdout, stderr
+
+    def test_real_pair_publication_and_independent_revalidation_preserve_negative_verdict(self):
+        for negative in (False, True):
+            with self.subTest(negative=negative), self.workspace(negative) as state:
+                runner, inputs, output, ctx, snap, raw, stdout, stderr = state
+                self.assertEqual(cli.main(["check"]), int(negative))
+                self.assertEqual(output.read_text(), "complete=true\n")
+                public = runner / ("compat-check-" + ctx.suffix) / "public"
+                self.assertEqual({p.name for p in public.iterdir()}, {"compat-result.json", "compat-context.json"})
+                self.assertEqual((public / "compat-result.json").read_bytes(), raw)
+                context_raw = (public / "compat-context.json").read_bytes()
+                cli.validate_evidence(context_raw, raw, snap, ctx)
+                (inputs / "compat-context.json").write_bytes(context_raw); output.write_bytes(b"")
+                self.assertEqual(cli.main(["validate-evidence"]), 0)
+                checked = runner / ("compat-validate-evidence-" + ctx.suffix) / "public"
+                self.assertEqual({p.name: p.read_bytes() for p in checked.iterdir()},
+                                 {p.name: p.read_bytes() for p in public.iterdir()})
+                self.assertEqual(output.read_text(), "complete=true\n")
+                self.assertEqual(cli.accepted(json.loads(raw)), not negative)
+                self.assertEqual(stdout.getvalue(), ""); self.assertEqual(stderr.getvalue(), "")
+
+    def test_signer_refuses_missing_extra_tampered_and_wrong_attempt_evidence(self):
+        for case in ("missing", "extra", "wrong-hash", "changed-result", "wrong-attempt", "oversize"):
+            with self.subTest(case=case), self.workspace() as state:
+                runner, inputs, output, ctx, snap, raw, _, _ = state
+                bound = cli.evidence_context(raw, snap, ctx)
+                if case == "wrong-hash": bound["result_sha256"] = "0" * 64
+                if case == "wrong-attempt": bound["run_attempt"] = 1
+                if case != "missing": (inputs / "compat-context.json").write_bytes(cli.canonical(bound))
+                if case == "extra": (inputs / "unexpected.json").write_bytes(b"{}")
+                if case == "oversize": (inputs / "compat-context.json").write_bytes(b" " * 4097)
+                if case == "changed-result":
+                    value = result(ctx); value["old_server_ok"]["workers"] = False
+                    (inputs / "compat-result.json").write_bytes(cli.proof.result_bytes(value))
+                self.assertEqual(cli.main(["validate-evidence"]), 1)
+                self.assertEqual(output.read_bytes(), b"")
+                self.assertFalse((runner / ("compat-validate-evidence-" + ctx.suffix)).exists())
+
+    def test_context_write_or_readback_failure_never_marks_complete(self):
+        for case in ("partial-context", "tampered-context", "tampered-result"):
+            with self.subTest(case=case), self.workspace() as state:
+                runner, _, output, ctx, _, _, _, _ = state
+                real_write = cli._write_public
+                def write(path, raw):
+                    if path.name == "compat-context.json":
+                        if case == "partial-context":
+                            path.write_bytes(raw[:1]); raise OSError("private detail")
+                        real_write(path, raw)
+                        if case == "tampered-context": path.write_bytes(raw[:-1])
+                        if case == "tampered-result": (path.parent / "compat-result.json").write_bytes(b"{}\n")
+                    else: real_write(path, raw)
+                with mock.patch.object(cli, "_write_public", side_effect=write):
+                    self.assertEqual(cli.main(["check"]), 1)
+                self.assertEqual(output.read_bytes(), b"")
+                self.assertTrue((runner / ("compat-check-" + ctx.suffix) / "public/compat-result.json").exists())
+
+    def test_evidence_path_guards_refuse_link_or_junction_before_read(self):
+        with self.workspace() as state:
+            _, inputs, output, ctx, snap, raw, _, _ = state
+            target = inputs / "compat-context.json"
+            target.write_bytes(cli.canonical(cli.evidence_context(raw, snap, ctx)))
+            original = Path.is_symlink
+            with mock.patch.object(Path, "is_symlink", lambda p: p == target or original(p)):
+                self.assertEqual(cli.main(["validate-evidence"]), 1)
+            self.assertEqual(output.read_bytes(), b"")
+            with mock.patch.object(Path, "is_junction", lambda p: p == inputs, create=True):
+                self.assertEqual(cli.main(["validate-evidence"]), 1)
+            self.assertEqual(output.read_bytes(), b"")
 
 
 if __name__ == "__main__":

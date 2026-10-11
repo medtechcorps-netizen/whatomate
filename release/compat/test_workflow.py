@@ -6,6 +6,7 @@ mutations must fail the policy rather than merely match a source-file hash.
 from __future__ import annotations
 
 import copy
+import ast
 import io
 import json
 import os
@@ -38,6 +39,11 @@ MEASURED = 'compat-measured-' + SUFFIX
 CANONICAL = 'compat-result-${{ github.sha }}-${{ github.run_attempt }}'
 CHECK_COMMAND = '/usr/bin/python3 -I -S -B release/compat/cli.py check'
 PUBLIC_CHECK = '${{ runner.temp }}/compat-check-' + SUFFIX + '/public/compat-result.json'
+PUBLIC_CONTEXT = PUBLIC_CHECK.replace('compat-result.json','compat-context.json')
+PUBLIC_SIGN = PUBLIC_CHECK.replace('/compat-check-','/compat-validate-evidence-')
+PUBLIC_SIGN_CONTEXT = PUBLIC_SIGN.replace('compat-result.json','compat-context.json')
+READY_IF = "${{ always() && !cancelled() && steps.check.outputs.complete == 'true' && steps.canonical.outcome == 'success' }}"
+ATTEST_IF = "${{ always() && !cancelled() && needs.compat.outputs.evidence_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}"
 READ_PERMISSIONS = {'contents':'read', 'actions':'read', 'attestations':'read'}
 
 
@@ -58,6 +64,24 @@ def heredoc(script):
     body, end, _ = script.split("<<'PY'\n", 1)[1].partition('\nPY\n')
     require(bool(end), 'closed Python heredoc')
     return body
+
+
+def condition(expression, values, *, cancelled=False):
+    """Evaluate the narrow actual job conditions, never external expressions."""
+    require(expression.startswith('${{ ') and expression.endswith(' }}'), 'closed condition')
+    source = expression[4:-3].replace('always()', 'True').replace('cancelled()', str(cancelled))
+    names = {}
+    for index, key in enumerate(sorted(values, key=len, reverse=True)):
+        name = 'value_' + str(index)
+        source = source.replace(key, name)
+        names[name] = values[key]
+    source = source.replace('&&', 'and').replace('||', 'or').replace('!', 'not ')
+    parsed = ast.parse(source, mode='eval')
+    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not,
+               ast.Compare, ast.Eq, ast.Name, ast.Load, ast.Constant)
+    require(all(isinstance(node, allowed) for node in ast.walk(parsed)), 'closed expression grammar')
+    require(all(node.id in names for node in ast.walk(parsed) if isinstance(node, ast.Name)), 'bound names')
+    return bool(eval(compile(parsed, '<workflow-condition>', 'eval'), {'__builtins__': {}}, names))
 
 
 def validate(doc):
@@ -113,7 +137,7 @@ def validate(doc):
     for job, expected_name, expected_path in [
         (preview, RESOLUTION, '${{ runner.temp }}/compat-preview-'+SUFFIX+'/public/resolution.json'),
         (run, MEASURED, '${{ runner.temp }}/compat-run-'+SUFFIX+'/public/compat-result.json'),
-        (aggregate, CANONICAL, PUBLIC_CHECK)]:
+        (aggregate, CANONICAL, PUBLIC_CHECK + "\n" + PUBLIC_CONTEXT + "\n")]:
         uploads = [item for item in job['steps'] if item.get('uses') == UPLOAD]
         require(len(uploads) == 1, 'one public file upload')
         upload = uploads[0]
@@ -121,6 +145,15 @@ def validate(doc):
             'retention-days':7} and upload['timeout-minutes'] == 1, 'bounded exact-file publication')
         if job is not aggregate:
             require('if' not in upload, 'partial/failed producer never uploads')
+    require(aggregate.get('outputs') == {'evidence_ready':'${{ steps.ready.outputs.evidence_ready }}'},
+            'readiness is from the post-upload guarded marker only')
+    ready = step(aggregate,identifier='ready')
+    require(ready['if'] == READY_IF and ready['run'].strip().splitlines() ==
+            ['set -euo pipefail', r'''printf '%s\n' 'evidence_ready=true' >> "$GITHUB_OUTPUT"'''],
+            'cancelled, incomplete or unpublished evidence never marks ready')
+    require(aggregate['steps'].index(step(aggregate,identifier='canonical')) < aggregate['steps'].index(ready)
+            < aggregate['steps'].index(step(aggregate,name='Require proof and publication success')),
+            'publication precedes readiness, negative verdict enforcement follows')
     require(aggregate['needs'] == ['release-preview','compat-run'] and aggregate['if'] == '${{ always() }}',
             'aggregate observes both failures and successes')
     check = step(aggregate, identifier='check')
@@ -135,20 +168,27 @@ def validate(doc):
         'PREVIEW_RESULT':'${{ needs.release-preview.result }}', 'RUN_RESULT':'${{ needs.compat-run.result }}',
         'CHECK_RESULT':'${{ steps.check.outcome }}', 'UPLOAD_RESULT':'${{ steps.canonical.outcome }}'}, 'real outcomes gate success')
     require(attest['needs'] == ['release-preview','compat-run','compat'] and attest['if'] ==
-        "${{ needs.compat.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}",
-        'no PR or failed-result signing')
+        ATTEST_IF, 'only complete published evidence can sign, including measured negatives')
     recheck = step(attest, identifier='check')
-    require(recheck['run'] == CHECK_COMMAND and recheck['env'] == expected_env
+    require(recheck['run'] == CHECK_COMMAND.replace(' check',' validate-evidence') and recheck['env'] == expected_env
             and 'continue-on-error' not in recheck, 'attestation independently checks canonical identity')
     sign = step(attest, identifier='sign')
     require(sign['uses'] == ATTEST and sign['if'] ==
         "${{ steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' }}" and sign['with'] == {
-        'subject-path':PUBLIC_CHECK, 'push-to-registry':False}, 'attest only the revalidated complete file')
+        'subject-path':PUBLIC_SIGN, 'push-to-registry':False}, 'attest only revalidated result bytes')
+    sign_context = step(attest,identifier='sign-context')
+    require(sign_context['uses'] == ATTEST and sign_context['if'] ==
+        "${{ steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.sign.outcome == 'success' }}"
+        and sign_context['with'] == {'subject-path':PUBLIC_SIGN_CONTEXT, 'push-to-registry':False},
+        'context independently signed after validated result, with fixed path')
+    require(attest['timeout-minutes'] == 6 and sign['timeout-minutes'] == sign_context['timeout-minutes'] == 1,
+            'three setup minutes plus two bounded signing minutes leave one minute for revalidation')
     require(not any(item.get('uses') == ATTEST for name,job in jobs.items() if name != 'attest' for item in job['steps']),
             'no other signer')
     final = step(attest, name='Require the attestation to complete')
     require(final['if'] == '${{ always() }}' and final['env'] == {
-        'CHECK_RESULT':'${{ steps.check.outcome }}', 'SIGN_RESULT':'${{ steps.sign.outcome }}'}, 'skipped signing cannot pass')
+        'CHECK_RESULT':'${{ steps.check.outcome }}', 'SIGN_RESULT':'${{ steps.sign.outcome }}',
+        'CONTEXT_SIGN_RESULT':'${{ steps.sign-context.outcome }}'}, 'either missing signature fails')
     require(run['timeout-minutes'] == 45 and step(run,identifier='experiment')['timeout-minutes'] == 41,
             'canonical job and one aggregate experiment budget')
     setup = [step(run,name=name) for name in ('Check out the exact candidate',"Download this run's exact resolution",
@@ -218,6 +258,11 @@ class WorkflowTests(unittest.TestCase):
             lambda d:step(d['jobs']['compat'],name='Require proof and publication success')['env'].update(CHECK_RESULT='${{ steps.check.conclusion }}'),
             lambda d:d['jobs']['attest'].update(**{'if':'${{ success() }}'}),
             lambda d:step(d['jobs']['attest'],identifier='check').update(**{'continue-on-error':True}),
+            lambda d:step(d['jobs']['attest'],identifier='check').update(run=CHECK_COMMAND),
+            lambda d:d['jobs']['attest'].update(**{'if':"${{ needs.compat.result == 'success' }}"}),
+            lambda d:d['jobs']['compat']['outputs'].update(evidence_ready='true'),
+            lambda d:step(d['jobs']['compat'],identifier='ready').update(**{'if':"${{ always() }}"}),
+            lambda d:step(d['jobs']['attest'],identifier='sign-context')['with'].update(**{'subject-path':PUBLIC_SIGN}),
             lambda d:step(d['jobs']['attest'],identifier='sign')['with'].update(**{'subject-path':'${{ runner.temp }}/compat-input/compat-result.json'}),
             lambda d:d['jobs']['compat-run'].update(**{'timeout-minutes':90}),
             lambda d:step(d['jobs']['compat-run'],identifier='experiment').update(run='echo ${{ inputs.rollback_target }}'),
@@ -237,6 +282,55 @@ class WorkflowTests(unittest.TestCase):
             for value in ('failure','cancelled','skipped',''):
                 with self.subTest(name=name,value=value),patch.dict(os.environ,{**values,name:value}),self.assertRaises(SystemExit):
                     exec(compile(script,'<aggregate>','exec'),{})
+
+    def test_actual_attestation_script_requires_both_signatures_and_revalidation(self):
+        script = heredoc(step(DOCUMENT['jobs']['attest'],name='Require the attestation to complete')['run'])
+        names = ('CHECK_RESULT','SIGN_RESULT','CONTEXT_SIGN_RESULT')
+        values = dict.fromkeys(names,'success')
+        for value in ('success','failure','cancelled','skipped',''):
+            for name in names:
+                with self.subTest(name=name,value=value), patch.dict(os.environ,{**values,name:value}), \
+                     self.assertRaises(SystemExit) as raised:
+                    exec(compile(script,'<attestation>','exec'),{})
+                self.assertEqual(raised.exception.code,0 if value == 'success' else 1)
+
+    def test_complete_negative_can_sign_but_keeps_compat_and_workflow_failed(self):
+        aggregate = DOCUMENT['jobs']['compat']; attest = DOCUMENT['jobs']['attest']
+        gate = heredoc(step(aggregate,name='Require proof and publication success')['run'])
+        ready_if = step(aggregate,identifier='ready')['if']
+        for verdict in ('success','failure'):
+            values = {'steps.check.outputs.complete':'true','steps.canonical.outcome':'success'}
+            self.assertTrue(condition(ready_if,values))
+            for event in ('push','workflow_dispatch','pull_request'):
+                self.assertEqual(condition(attest['if'],{
+                    'needs.compat.outputs.evidence_ready':'true','github.event_name':event}),
+                    event != 'pull_request')
+            env = dict(PREVIEW_RESULT='success',RUN_RESULT='success',CHECK_RESULT=verdict,UPLOAD_RESULT='success')
+            if verdict == 'failure':
+                with patch.dict(os.environ,env), self.assertRaises(SystemExit) as raised:
+                    exec(compile(gate,'<aggregate>','exec'),{})
+                self.assertNotEqual(raised.exception.code,0)
+            else:
+                with patch.dict(os.environ,env): exec(compile(gate,'<aggregate>','exec'),{})
+        # The aggregate job failure is not hidden, even though its signing dependent can run.
+        self.assertNotIn('continue-on-error',aggregate)
+        self.assertNotIn('continue-on-error',attest)
+
+    def test_cancellation_incomplete_write_upload_failure_or_missing_marker_never_signs(self):
+        aggregate = DOCUMENT['jobs']['compat']; attest = DOCUMENT['jobs']['attest']
+        ready_if = step(aggregate,identifier='ready')['if']
+        for complete in ('true','false',''):
+            for upload in ('success','failure','cancelled','skipped',''):
+                for cancelled in (False,True):
+                    with self.subTest(complete=complete,upload=upload,cancelled=cancelled):
+                        ready = condition(ready_if,{'steps.check.outputs.complete':complete,
+                            'steps.canonical.outcome':upload},cancelled=cancelled)
+                        self.assertEqual(ready,complete == 'true' and upload == 'success' and not cancelled)
+                        self.assertEqual(condition(attest['if'],{
+                            'needs.compat.outputs.evidence_ready':'true' if ready else '',
+                            'github.event_name':'push'},cancelled=cancelled),ready)
+        self.assertFalse(condition(attest['if'],{'needs.compat.outputs.evidence_ready':'true',
+            'github.event_name':'workflow_dispatch'},cancelled=True))
 
     def test_actual_setup_clock_boundaries(self):
         script = heredoc(step(DOCUMENT['jobs']['compat-run'],name='Enforce the shared setup allocation')['run'])
@@ -278,6 +372,10 @@ class WorkflowTests(unittest.TestCase):
                 if complete:
                     public=runner/('compat-check-'+ctx.suffix)/'public/compat-result.json'
                     self.assertEqual(public.read_bytes(),raw)
+                    context_raw=public.with_name('compat-context.json').read_bytes()
+                    cli.validate_evidence(context_raw,raw,snapshot,ctx)
+                    self.assertEqual({p.name for p in public.parent.iterdir()},
+                                     {'compat-result.json','compat-context.json'})
                 if case=='partial-write':
                     public=runner/('compat-check-'+ctx.suffix)/'public/compat-result.json'
                     self.assertEqual(public.read_bytes(),raw[:1])

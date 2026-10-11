@@ -444,19 +444,50 @@ latest-release preview base. `cli.py run` verifies the selected tag again and
 requires its exact source SHA, then runs the experiment. There is no second
 moving-latest selection.
 
+The resolution format is version 2. Both `latest` and `selected` contain the
+verified release tag, signed manifest SHA-256, source SHA and web digest.
+Version 1 resolutions are rejected, not silently upgraded. The manifest
+digest comes from the verified record bytes, not a GitHub metadata identifier.
+
 `compat.yml` runs on every pull request, main push and explicit
 dispatch. It has no path filter or first-attempt restriction. `release-preview`
 feeds the exact same-run resolution into `compat-run`; the `compat` aggregator
 requires both actual job outcomes and validates source, release, run and
-attempt identity. Only a completely written, validated result receives the
-upload marker. A measured negative result is retained as an artifact while
+attempt identity. Only a completely written, re-read and validated evidence
+pair receives the upload marker. A measured negative result is retained while
 the compatibility check fails. Missing, malformed or incomplete evidence
 cannot become an artifact by continuing after an error.
 
-The final artifact name is `compat-result-<sha>-<run_attempt>`. The `attest`
-job runs only after successful aggregation on push or dispatch, downloads the
-same-run canonical result and revalidates it before signing. Pull requests
-cannot sign results. Read jobs use contents/actions/attestations read access;
+The final artifact name is `compat-result-<sha>-<run_attempt>` and contains
+exactly `compat-result.json` and `compat-context.json`. The result schema and
+verdict are unchanged. The context is version 1 with exactly these fields:
+
+- `version`, `repository`, `workflow_path`, `workflow_sha`, `event`, `ref`,
+  `sha`, `run_id`, `run_attempt` and `requested_rollback_target`;
+- `latest` and `selected`, each with `release`, `manifest_sha256`, `sha` and
+  `web_digest`;
+- `preview`, with `kind`, `dormant` and `blocked`;
+- `result_sha256`, covering the exact canonical result bytes, including LF.
+
+Both files are sorted compact ASCII JSON with a final LF. The result remains
+bounded to 16 KiB and the context to 4 KiB. Normal selection requires the
+result classification to equal the frozen latest-to-candidate preview. With
+an explicit rollback target, that preview remains latest-to-candidate while
+the result describes selected-to-candidate; the two classifications need not
+match. This distinction does not add support for active schema changes.
+
+After successful upload, a separate guarded `evidence_ready` output permits
+the `attest` job on push or dispatch, including a complete measured negative.
+Cancellation, partial writes or failed uploads cannot set that marker.
+`cli.py validate-evidence` revalidates the exact two files against the same-run
+resolution and current job context without running an experiment or resolving
+latest again. It returns success for complete negative evidence while `check`
+still returns failure. The signing job attests the result and context as two
+individually required subjects; the signed context binds the exact result
+digest. A consumer must authenticate both subjects and their matching source,
+workflow, run and attempt. Successful signing does not make a failed `compat`
+job or the overall workflow successful. Pull requests cannot sign either file.
+Read jobs use contents/actions/attestations read access;
 only the signing job has attestations and OIDC write permissions. No deployment
 environment, provider credentials or production action is part of this
 workflow. The existing CI release-tests job also discovers the compatibility
@@ -466,6 +497,20 @@ The experiment job is capped at 45 minutes. Checkout, artifact download and
 tool setup share 180 seconds; the core uses 2,400 seconds, the client version
 probe at most five seconds and result upload at most 60 seconds, leaving
 55 seconds of margin. The step ceiling does not extend the core deadline.
+The separate signing job has a six-minute ceiling: checkout and two downloads
+have one minute each, the two signing steps one minute each, leaving one minute
+for local revalidation and final enforcement. Both signatures are required.
+
+This is the PR16 producer foundation only. Production enforcement, newest-run
+selection, legacy record normalization, v2 rollback database provenance and
+semantic expand classification are not implemented here. A future normal
+promotion consumer must veto later incomplete attempts or authenticated
+negative results after its selected positive; a fresh later positive may
+supersede older infrastructure gaps. Break-glass requires a separate exact-SHA
+negative-history check. Visible API pagination cannot establish the absence of
+entirely deleted runs, so that coverage capability remains unresolved. No
+consumer guard is lifted by these producer files. PR16 publication and merge
+remain behind PR8 qualification and three accepted main compatibility runs.
 
 ## Validation still required
 

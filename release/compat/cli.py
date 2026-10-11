@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
 import json
 import os
 import re
@@ -24,6 +25,8 @@ import schema_change
 common, records = runtime.common, runtime.release_record
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _MAX_PUBLIC = 16384
+_MAX_CONTEXT = 4096
+_WORKFLOW_PATH = ".github/workflows/compat.yml"
 _WORKFLOW = common.REPOSITORY + "/.github/workflows/compat.yml@"
 
 
@@ -42,6 +45,8 @@ class Context:
     run_id: int
     attempt: int
     target: str | None
+    event: str
+    ref: str
 
     @property
     def suffix(self):
@@ -74,7 +79,7 @@ def context(env):
     need(type(target) is str and (not target or event == "workflow_dispatch"), "cli-target-invalid")
     if target:
         proof.validate_rollback_target(target)
-    return Context(sha, int(run), int(attempt), target or None)
+    return Context(sha, int(run), int(attempt), target or None, event, ref)
 
 
 def regular_path(path, *, directory=False):
@@ -87,21 +92,25 @@ def regular_path(path, *, directory=False):
 
 
 def _identity(entry):
-    return {"release": entry.release, "sha": entry.sha, "web_digest": entry.images["web"]}
+    return {"release": entry.release, "manifest_sha256": entry.manifest_sha256,
+            "sha": entry.sha, "web_digest": entry.images["web"]}
 
 
 def validate_snapshot(value, ctx):
     need(type(value) is dict and set(value) == {"version", "sha", "run_id", "run_attempt",
          "requested_rollback_target", "latest", "selected", "preview"}, "cli-snapshot-invalid")
-    need(type(value["version"]) is int and value["version"] == 1
+    need(type(value["version"]) is int and value["version"] == 2
          and value["sha"] == ctx.sha and type(value["run_id"]) is int and value["run_id"] == ctx.run_id
          and type(value["run_attempt"]) is int and value["run_attempt"] == ctx.attempt
          and value["requested_rollback_target"] == ctx.target, "cli-snapshot-context")
     for name in ("latest", "selected"):
         item = value[name]
-        need(type(item) is dict and set(item) == {"release", "sha", "web_digest"}, "cli-snapshot-identity")
+        need(type(item) is dict and set(item) == {"release", "manifest_sha256", "sha", "web_digest"},
+             "cli-snapshot-identity")
         proof.validate_rollback_target(item["release"])
         need(type(item["sha"]) is str and _SHA.fullmatch(item["sha"])
+             and type(item["manifest_sha256"]) is str
+             and re.fullmatch(r"[0-9a-f]{64}", item["manifest_sha256"])
              and type(item["web_digest"]) is str and common.DIGEST_RE.fullmatch(item["web_digest"]),
              "cli-snapshot-identity")
     if ctx.target is None:
@@ -134,7 +143,7 @@ def preview(repo, ctx, client):
             records.verify_images(client, selected.images, selected.sha, bootstrap)
         classification = schema_change.classify(repo, latest.sha, ctx.sha, mode="forward")
         source.clean()
-    value = {"version": 1, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
+    value = {"version": 2, "sha": ctx.sha, "run_id": ctx.run_id, "run_attempt": ctx.attempt,
              "requested_rollback_target": ctx.target, "latest": _identity(latest), "selected": _identity(selected),
              "preview": {"kind": classification.kind, "dormant": classification.dormant,
                          "blocked": bool(classification.reasons)}}
@@ -151,6 +160,34 @@ def validate_result(raw, snapshot, ctx):
          and value["previous_release"] == selected["release"]
          and value["previous_web_digest"] == selected["web_digest"], "cli-result-context")
     need(snapshot["preview"]["blocked"] is False, "cli-preview-blocked")
+    if ctx.target is None:
+        need(value["classification"] == {k: snapshot["preview"][k] for k in ("kind", "dormant")},
+             "cli-result-classification")
+    return value
+
+
+def evidence_context(result, snapshot, ctx):
+    """Bind complete measured bytes to the authenticated frozen selection.
+
+    This is not a success verdict or a claim of current provider state.
+    Its digest covers the unchanged canonical result schema, including LF.
+    """
+    validate_result(result, snapshot, ctx)
+    return {"version": 1, "repository": common.REPOSITORY, "workflow_path": _WORKFLOW_PATH,
+            "workflow_sha": ctx.sha, "event": ctx.event, "ref": ctx.ref, "sha": ctx.sha,
+            "run_id": ctx.run_id, "run_attempt": ctx.attempt,
+            "requested_rollback_target": ctx.target, "latest": snapshot["latest"],
+            "selected": snapshot["selected"], "preview": snapshot["preview"],
+            "result_sha256": hashlib.sha256(result).hexdigest()}
+
+
+def validate_evidence(raw, result, snapshot, ctx):
+    need(type(raw) is bytes and 0 < len(raw) <= _MAX_CONTEXT, "cli-context-bound")
+    value = common.loads_strict(raw)
+    # Byte equality enforces every closed field/type, including bool vs int,
+    # and rebinds the context to this job rather than trusting uploaded fields.
+    need(canonical(value) == raw and raw == canonical(evidence_context(result, snapshot, ctx)),
+         "cli-evidence-context")
     return value
 
 
@@ -171,11 +208,11 @@ def execute(repo, ctx, client, snapshot, *, docker_binary, config_dir, image_wor
     return raw  # An actual false result is valid evidence, not a passing gate.
 
 
-def _read_public(path):
+def _read_public(path, *, limit=_MAX_PUBLIC):
     regular_path(path)
     with path.open("rb") as stream:
-        raw = stream.read(_MAX_PUBLIC + 1)
-    need(0 < len(raw) <= _MAX_PUBLIC, "cli-public-bound")
+        raw = stream.read(limit + 1)
+    need(0 < len(raw) <= limit, "cli-public-bound")
     return raw
 
 
@@ -187,6 +224,18 @@ def _write_public(path, raw):
     # complete bytes and this process must succeed before upload is permitted.
     with path.open("xb") as stream:
         stream.write(raw)
+
+
+def _write_evidence(directory, result, context_raw, snapshot, ctx):
+    validate_evidence(context_raw, result, snapshot, ctx)
+    _write_public(directory / "compat-result.json", result)
+    _write_public(directory / "compat-context.json", context_raw)
+    need({p.name for p in directory.iterdir()} == {"compat-result.json", "compat-context.json"},
+         "cli-evidence-inventory")
+    written_result = _read_public(directory / "compat-result.json")
+    written_context = _read_public(directory / "compat-context.json", limit=_MAX_CONTEXT)
+    need(written_result == result and written_context == context_raw, "cli-evidence-written")
+    validate_evidence(written_context, written_result, snapshot, ctx)
 
 
 def _mark_complete(env):
@@ -237,7 +286,7 @@ def main(argv=None):
     try:
         args = sys.argv[1:] if argv is None else argv
         need(type(args) is list and len(args) == 1 and type(args[0]) is str
-             and args[0] in {"preview", "run", "check"}, "cli-command-invalid")
+             and args[0] in {"preview", "run", "check", "validate-evidence"}, "cli-command-invalid")
         command = args[0]
         need(images._READY_FOR_EXECUTION, "cli-experiment-disabled")
         ctx = context(os.environ)
@@ -251,15 +300,23 @@ def main(argv=None):
         raw = _read_public(root / "compat-input" / "resolution.json")
         snapshot = common.loads_strict(raw)
         need(canonical(validate_snapshot(snapshot, ctx)) == raw, "cli-snapshot-noncanonical")
-        if command == "check":
+        if command in {"check", "validate-evidence"}:
             need(os.environ.get("COMPAT_PREVIEW_OUTCOME") == "success"
                  and os.environ.get("COMPAT_RUN_OUTCOME") == "success", "cli-upstream-failed")
             result = _read_public(root / "compat-input" / "compat-result.json")
             value = validate_result(result, snapshot, ctx)
-            work = _scratch(repo, ctx, "check", os.environ)
-            _write_public(work / "public" / "compat-result.json", result)
+            if command == "validate-evidence":
+                need({p.name for p in (root / "compat-input").iterdir()}
+                     == {"resolution.json", "compat-result.json", "compat-context.json"},
+                     "cli-evidence-inventory")
+                context_raw = _read_public(root / "compat-input" / "compat-context.json", limit=_MAX_CONTEXT)
+                validate_evidence(context_raw, result, snapshot, ctx)
+            else:
+                context_raw = canonical(evidence_context(result, snapshot, ctx))
+            work = _scratch(repo, ctx, command, os.environ)
+            _write_evidence(work / "public", result, context_raw, snapshot, ctx)
             _mark_complete(os.environ)
-            return 0 if accepted(value) else 1
+            return 0 if command == "validate-evidence" or accepted(value) else 1
         work = _scratch(repo, ctx, "run", os.environ)
         docker = regular_path(Path(os.environ.get("COMPAT_DOCKER_BIN", "")))
         plugin = regular_path(Path(os.environ.get("COMPAT_BUILDX_BIN", "")))

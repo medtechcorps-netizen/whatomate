@@ -172,6 +172,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+    outputs:
+      evidence_ready: ${{ steps.ready.outputs.evidence_ready }}
     steps:
       - name: Check out the exact candidate
         timeout-minutes: 1
@@ -208,16 +210,25 @@ jobs:
           COMPAT_RUN_OUTCOME: ${{ needs.compat-run.result }}
         run: /usr/bin/python3 -I -S -B release/compat/cli.py check
 
-      - name: Upload the canonical result including measured negative verdicts
+      - name: Upload the canonical evidence including measured negative verdicts
         id: canonical
         if: ${{ always() && steps.check.outputs.complete == 'true' }}
         timeout-minutes: 1
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: compat-result-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/compat-check-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}/public/compat-result.json
+          path: |
+            ${{ runner.temp }}/compat-check-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}/public/compat-result.json
+            ${{ runner.temp }}/compat-check-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}/public/compat-context.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Mark only a complete published evidence pair
+        id: ready
+        if: ${{ always() && !cancelled() && steps.check.outputs.complete == 'true' && steps.canonical.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'evidence_ready=true' >> "$GITHUB_OUTPUT"
 
       - name: Require proof and publication success
         if: ${{ always() }}
@@ -240,9 +251,9 @@ jobs:
       - release-preview
       - compat-run
       - compat
-    if: ${{ needs.compat.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ always() && !cancelled() && needs.compat.outputs.evidence_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 6
     permissions:
       contents: read
       actions: read
@@ -266,7 +277,7 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/compat-input
 
-      - name: Download this run's exact canonical result
+      - name: Download this run's exact canonical evidence
         timeout-minutes: 1
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -281,15 +292,24 @@ jobs:
         env:
           COMPAT_PREVIEW_OUTCOME: ${{ needs.release-preview.result }}
           COMPAT_RUN_OUTCOME: ${{ needs.compat-run.result }}
-        run: /usr/bin/python3 -I -S -B release/compat/cli.py check
+        run: /usr/bin/python3 -I -S -B release/compat/cli.py validate-evidence
 
-      - name: Attest only the validated successful result
+      - name: Attest the complete result without changing its verdict
         id: sign
         if: ${{ steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' }}
         timeout-minutes: 1
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: ${{ runner.temp }}/compat-check-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}/public/compat-result.json
+          subject-path: ${{ runner.temp }}/compat-validate-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}/public/compat-result.json
+          push-to-registry: false
+
+      - name: Attest the context bound to the exact result digest
+        id: sign-context
+        if: ${{ steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.sign.outcome == 'success' }}
+        timeout-minutes: 1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/compat-validate-evidence-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}/public/compat-context.json
           push-to-registry: false
 
       - name: Require the attestation to complete
@@ -297,6 +317,12 @@ jobs:
         env:
           CHECK_RESULT: ${{ steps.check.outcome }}
           SIGN_RESULT: ${{ steps.sign.outcome }}
+          CONTEXT_SIGN_RESULT: ${{ steps.sign-context.outcome }}
         run: |
           set -euo pipefail
-          [[ "$CHECK_RESULT" == "success" && "$SIGN_RESULT" == "success" ]]
+          /usr/bin/python3 -I -S -B - <<'PY'
+          import os
+          import sys
+          names = ('CHECK_RESULT', 'SIGN_RESULT', 'CONTEXT_SIGN_RESULT')
+          sys.exit(0 if all(os.environ.get(name) == 'success' for name in names) else 1)
+          PY
