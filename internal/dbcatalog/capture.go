@@ -166,6 +166,10 @@ func mergedCatalog(c Catalog, overlay *Catalog) (Catalog, error) {
 }
 
 func capture(ctx context.Context, dsn string, opt Options) (Snapshot, error) {
+	return captureWithNullableGraph(ctx, dsn, opt, nil)
+}
+
+func captureWithNullableGraph(ctx context.Context, dsn string, opt Options, graph *nullableGraphCapture) (Snapshot, error) {
 	known, err := mergedCatalog(opt.Catalog, opt.Overlay)
 	if err != nil {
 		return Snapshot{}, err
@@ -286,6 +290,15 @@ func capture(ctx context.Context, dsn string, opt Options) (Snapshot, error) {
 	}
 	if opt.IncludeSeeds {
 		snapshot.Seeds, err = captureSeeds(ctx, tx, opt.GlobalTables, known)
+		if err != nil {
+			return Snapshot{}, err
+		}
+	}
+	if graph != nil {
+		if major != 17 || opt.IncludeSeeds {
+			return Snapshot{}, refuse("nullable-capture")
+		}
+		graph.observation, err = captureNullableGraphInTx(ctx, tx, roles, snapshot, graph.operation, maxCatalogBytes-totalBytes)
 		if err != nil {
 			return Snapshot{}, err
 		}

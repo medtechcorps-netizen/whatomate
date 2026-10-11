@@ -637,6 +637,14 @@ three distinct signed main runs are accepted; this new source/context contract
 still requires its own signed main qualification and protected release validation.
 See [the Release runbook](release.md) for the current operational boundary.
 
+## Nullable-column observation v1: actual synthetic PG17 qualification
+
+The preparatory v1 observer/explainer has been checked against a complete actual PG17 fixture for adding one nullable, no-default `pg_catalog.int8` column. The source-defined synthetic inventory changes only the new column and its table row type; existing objects, ACL/security observations and old columns remain equal. The actual positive test also verifies runtime DDL rejection, owner DDL success, unchanged old row values and NULL values in both existing rows. These are test assertions; the exported catalog fixture alone does not prove row preservation or statement history.
+
+Saved validation covers 21 actual catalog test groups across the original run and a focused correction, 26 pure Go test roots plus two fuzz seed groups (78 passing test/subtest events), 12 Python cases and 10 registry groups with no-update flags. The generated closure is exactly 229 files. Both actual runs restored the original 12 containers, 12 networks and 540 volume names, and the 18,855-byte fixture remained unchanged. Initial refusals and the original failed negative are retained.
+
+The corrected negative requires a stored non-null default and rejects it. A separate actual test shows that PostgreSQL17 normalizes `SET DEFAULT NULL::bigint` on this ordinary column to no stored default and no change in the complete observation. Endpoint evidence cannot establish whether that catalog no-op SQL was issued. The real application bootstrap remains unsupported by v1 because its default ACLs are nonempty. This qualification does not enable active DDL, classifier/producer admission, constant defaults, concurrent indexes or full old-binary compatibility.
+
 ## Validation still required
 
 The complete local synthetic experiment passed on candidate
