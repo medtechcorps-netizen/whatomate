@@ -1,11 +1,12 @@
-"""Source-bound first-baseline catalog observations, not a catalog normalizer.
+"""Source-bound reviewed-v0 catalog observations, not a catalog normalizer.
 
 The caller first verifies the previous signed release using runtime.verified_previous.
 This module then reads fixed paths from its immutable Git commit and candidate
 commit; working-tree files cannot supply the expected table inventory. The
-initial e001 baseline has no overlay. Only the reviewed head comments-only NOP
-and physical-order profile are supported. Future progression refuses rather
-than applying arbitrary head DDL to an old release.
+initial e001 baseline has no overlay. Later verified releases must contain the
+same pinned v0 artifacts as the candidate, including its physical-order profile
+and comments-only NOP overlay. Other catalog progression refuses rather than
+applying arbitrary head DDL to an old release.
 
 Catalog SHA values come only from the actual owned candidate Go CLI. The equal
 embedded golden contract lets that CLI observe every current phase against the
@@ -67,7 +68,8 @@ class CatalogContract:
     def __init__(self, repo: Path, previous: runtime.release_record.Entry, candidate_sha: str,
                  *, base_env=None, capture=runtime.bounded_command):
         need(isinstance(repo, Path) and repo.is_dir() and type(previous) is runtime.release_record.Entry)
-        need(previous.sha == _BASE and type(candidate_sha) is str and _SHA.fullmatch(candidate_sha),
+        need(type(previous.sha) is str and _SHA.fullmatch(previous.sha)
+             and type(candidate_sha) is str and _SHA.fullmatch(candidate_sha),
              "catalog-progression-unsupported")
         self.previous_sha, self.candidate_sha = previous.sha, candidate_sha
         digest = previous.images.get("web")
@@ -92,12 +94,14 @@ class CatalogContract:
             raw = git(["cat-file", "blob", candidate_sha+":"+name])
             need(hashlib.sha256(raw).hexdigest() == _PINS[name], "catalog-progression-unsupported")
             blobs[name] = raw
-            if name not in {_PROFILE,_OVERLAY}:
+            if previous.sha != _BASE or name not in {_PROFILE,_OVERLAY}:
                 need(git(["cat-file", "blob", self.previous_sha+":"+name]) == raw, "catalog-fallback-not-equal")
             else:
                 # Absence is admitted only for the fixed first baseline; no
                 # generic missing-overlay fallback is inferred for later refs.
                 need(git(["ls-tree", "-z", self.previous_sha, "--", name],1024) == b"", "catalog-base-overlay-unsupported")
+        self._base_overlay = ("explicit-empty-first-baseline" if previous.sha == _BASE
+                              else "equal-reviewed-v0-nop")
         golden, profile = _json(blobs[_GOLDEN]), _json(blobs[_PROFILE])
         need(type(golden) is dict and set(golden) == {"version","objects"} and golden["version"] == 0)
         need(profile["released_source"] == _BASE and profile["golden_sha256"] == _PINS[_GOLDEN]
@@ -132,7 +136,7 @@ class CatalogContract:
             need(key in self._known and key not in seen and type(row["status"]) is str and row["status"] in {"changed","missing"}, "catalog-output-invalid")
             seen.add(key)
         need(value["match"] is (not seen), "catalog-output-invalid")
-        # First-baseline overlay admits no unpublished identities. A known-only
+        # The reviewed v0 overlay admits no unpublished identities. A known-only
         # SHA cannot hide new unknown functions, relations or other objects.
         need(value["unknown"] == [] and type(value["unknown"]) is list, "catalog-unknown-unsupported")
         counts=value["count_only"]
@@ -144,7 +148,7 @@ class CatalogContract:
 
     def public(self):
         return {"previous_sha":self.previous_sha,"candidate_sha":self.candidate_sha,
-                "source_sha256":dict(self._pins),"base_overlay":"explicit-empty-first-baseline",
+                "source_sha256":dict(self._pins),"base_overlay":self._base_overlay,
                 "target_catalog_sha256":self.target_sha256,
                 "expected_preexisting_tables":list(self.expected_preexisting_tables)}
 

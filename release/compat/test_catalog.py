@@ -17,6 +17,7 @@ import test_stack
 
 REPO=Path(__file__).resolve().parents[2]
 HEAD="e"*40
+LATER="a"*40
 BLOBS={name:(REPO/name).read_bytes() for name in c._PINS}
 ENTRY=c.runtime.release_record.Entry("prod-20261011T000000Z-e0016b35","promote",c._BASE,
     {"web":test_processes.PREV.split('@',1)[1]},"1"*64,"2026-10-11T00:00:00Z",None,None,False,{})
@@ -25,15 +26,22 @@ ENTRY=c.runtime.release_record.Entry("prod-20261011T000000Z-e0016b35","promote",
 class Git:
     def __init__(self):
         self.calls=[];self.changed=None;self.present=False;self.fail=False
+        self.commits={c._BASE,LATER,HEAD};self.missing=set();self.ancestor=True
     def __call__(self,argv,**options):
         self.calls.append((argv,options));args=argv[3:]
         assert argv[:2]==["git","-C"] and options['timeout']==30
         if self.fail:return c.runtime.Capture(1,b'',b'private path')
-        if args[:2]==['cat-file','-t']:raw=b'commit\n'
-        elif args[:2]==['merge-base','--is-ancestor']:raw=b''
+        if args[:2]==['cat-file','-t']:
+            if args[2] not in self.commits:return c.runtime.Capture(1,b'',b'private missing commit')
+            raw=b'commit\n'
+        elif args[:2]==['merge-base','--is-ancestor']:
+            if not self.ancestor:return c.runtime.Capture(1,b'',b'')
+            raw=b''
         elif args[0]=='ls-tree':raw=b'present' if self.present else b''
         elif args[:2]==['cat-file','blob']:
-            sha,path=args[2].split(':',1);raw=BLOBS[path]
+            sha,path=args[2].split(':',1)
+            if (sha,path) in self.missing:return c.runtime.Capture(1,b'',b'private missing artifact')
+            raw=BLOBS[path]
             if self.changed and self.changed(sha,path):raw+=b' '
         else:raise AssertionError('unknown source route')
         return c.runtime.Capture(0,raw,b'')
@@ -123,15 +131,78 @@ class CatalogTests(unittest.TestCase):
         env={k:v for k,v in os.environ.items() if k in {'PATH','SYSTEMROOT','SystemRoot','TEMP','TMP','COMSPEC','ComSpec'}}
         actual=c.CatalogContract(REPO,ENTRY,head,base_env=env)
         self.assertEqual(actual.expected_preexisting_tables,self.contract.expected_preexisting_tables)
+        later=c.CatalogContract(REPO,ENTRY._replace(sha=head),head,base_env=env)
+        self.assertEqual(later.expected_preexisting_tables,actual.expected_preexisting_tables)
+        self.assertEqual(later.previous_sha,head)
+        self.assertEqual(later.public()['base_overlay'],'equal-reviewed-v0-nop')
 
-    def test_future_source_or_head_mutation_or_existing_base_overlay_refuses(self):
-        with self.assertRaises(c.proof.EvidenceError):c.CatalogContract(REPO,ENTRY._replace(sha='a'*40),HEAD,base_env={},capture=self.git)
-        for sha,path in ((HEAD,c._GOLDEN),(c._BASE,c._GOLDEN),(HEAD,c._PROFILE),(HEAD,c._OVERLAY)):
+    def test_later_equal_v0_preserves_actual_previous_identity_and_provenance(self):
+        # The ordinary manifest validator supplies the Entry shape. Signature
+        # verification is still the caller's obligation, not this source test.
+        record=c.runtime.release_record
+        raw=record.build_manifest({'kind':'promote','release':'prod-20261011T000000Z-'+LATER[:8],'sha':LATER,
+            'images':{'web':ENTRY.images['web'],'meta-relay':'sha256:'+'8'*64,'gmail-relay':'sha256:'+'9'*64},
+            'previous':ENTRY.release,'rolled_back_from':None,'reconciled':False,
+            'built_at':ENTRY.deployed_at,'deployed_at':ENTRY.deployed_at,'workflow_sha':LATER,
+            'environment_values_sha256':'2'*64,'non_source_projection_sha256':'3'*64})
+        previous=record.manifest_entry(record.validate_manifest(c.runtime.common.loads_strict(raw)),raw)
+        fake=Git()
+        actual=c.CatalogContract(REPO,previous,HEAD,base_env={},capture=fake)
+        value=actual.public()
+        self.assertEqual((value['previous_sha'],value['candidate_sha']),(LATER,HEAD))
+        self.assertEqual(actual.previous_web,self.contract.previous_web)
+        self.assertEqual(value['base_overlay'],'equal-reviewed-v0-nop')
+        self.assertEqual(value['source_sha256'],dict(c._PINS))
+        self.assertEqual(actual.target_sha256,self.contract.target_sha256)
+        self.assertEqual(actual.expected_preexisting_tables,self.contract.expected_preexisting_tables)
+        self.assertEqual(json.loads(BLOBS[c._PROFILE])['released_source'],c._BASE)
+        args=[argv[3:] for argv,_ in fake.calls]
+        self.assertIn(['merge-base','--is-ancestor',LATER,HEAD],args)
+        self.assertEqual([a[2] for a in args if a[:2]==['cat-file','blob'] and a[2].startswith(LATER+':')],
+                         [LATER+':'+path for path in c._PINS])
+        self.assertFalse(any(a[0]=='ls-tree' for a in args))
+
+    def test_head_mutation_or_existing_historical_base_overlay_refuses(self):
+        mutations=[(HEAD,path) for path in c._PINS]+[(c._BASE,path) for path in c._PINS if path not in {c._PROFILE,c._OVERLAY}]
+        for sha,path in mutations:
             with self.subTest(sha=sha,path=path):
                 fake=Git();fake.changed=lambda a,b:a==sha and b==path
                 with self.assertRaises(c.proof.EvidenceError):c.CatalogContract(REPO,ENTRY,HEAD,base_env={},capture=fake)
         fake=Git();fake.present=True
         with self.assertRaises(c.proof.EvidenceError):c.CatalogContract(REPO,ENTRY,HEAD,base_env={},capture=fake)
+
+    def test_later_missing_or_modified_artifact_never_uses_historical_exception(self):
+        for path in c._PINS:
+            for kind in ('missing','modified'):
+                with self.subTest(path=path,kind=kind):
+                    fake=Git()
+                    if kind=='missing':fake.missing.add((LATER,path))
+                    else:fake.changed=lambda sha,name:sha==LATER and name==path
+                    with self.assertRaises(c.proof.EvidenceError) as got:
+                        c.CatalogContract(REPO,ENTRY._replace(sha=LATER),HEAD,base_env={},capture=fake)
+                    self.assertEqual(str(got.exception),'catalog-source-invalid' if kind=='missing' else 'catalog-fallback-not-equal')
+                    self.assertNotIn('private',str(got.exception))
+                    self.assertFalse(any(argv[3]=='ls-tree' for argv,_ in fake.calls))
+
+    def test_invalid_or_foreign_commit_and_nonancestor_refuse(self):
+        for value in (None,True,'main','a'*39,'A'*40,LATER+'\n',LATER+':private'):
+            for field in ('previous','candidate'):
+                with self.subTest(value=value,field=field):
+                    fake=Git()
+                    with self.assertRaises(c.proof.EvidenceError):
+                        c.CatalogContract(REPO,ENTRY._replace(sha=value if field=='previous' else LATER),
+                            value if field=='candidate' else HEAD,base_env={},capture=fake)
+                    self.assertEqual(fake.calls,[])
+        for field in ('previous','candidate'):
+            fake=Git()
+            with self.assertRaises(c.proof.EvidenceError) as got:
+                c.CatalogContract(REPO,ENTRY._replace(sha='b'*40 if field=='previous' else LATER),
+                    'b'*40 if field=='candidate' else HEAD,base_env={},capture=fake)
+            self.assertEqual(str(got.exception),'catalog-source-invalid')
+        fake=Git();fake.ancestor=False
+        with self.assertRaises(c.proof.EvidenceError):
+            c.CatalogContract(REPO,ENTRY._replace(sha=LATER),HEAD,base_env={},capture=fake)
+        self.assertFalse(any(argv[3:5]==['cat-file','blob'] for argv,_ in fake.calls))
 
     def test_source_read_failure_not_empty_overlay(self):
         fake=Git();fake.fail=True
