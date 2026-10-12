@@ -760,11 +760,18 @@ class PublisherBlob:
 
 
 @dataclass(frozen=True, slots=True)
+class PublisherNamespace:
+    source_sha: str
+    raw: bytes = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class SourceCoverage:
     policy_raw: bytes = field(repr=False)
     policy_blob: BlobObservation = field(repr=False)
     ancestry: tuple[PublisherAncestry, ...]
     blobs: tuple[PublisherBlob, ...] = field(repr=False)
+    namespaces: tuple[PublisherNamespace, ...] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -812,7 +819,7 @@ def _outage_sources(reader, budget, candidate_sha):
     policy_blob = _outage_blob(reader, budget, candidate_sha, loader.DATA_PATH, index.MAX_CONFIG)
     if policy_blob.raw != installed.raw:
         budget.fail("outage-policy-source")
-    ancestors, blobs, total = [], [], 0
+    ancestors, blobs, namespaces, total = [], [], [], 0
     for lineage in installed.lineage:
         producer = lineage.producer_sha
         if reader.output(reader.repo, ["cat-file", "-t", producer], code="unused") != b"commit\n":
@@ -821,14 +828,26 @@ def _outage_sources(reader, budget, candidate_sha):
         if len(raw) != 41 or raw[-1:] != b"\n" or common.SHA1_RE.fullmatch(raw[:-1].decode("ascii")) is None:
             budget.fail("outage-ancestry")
         ancestors.append(PublisherAncestry(producer, candidate_sha, raw[:-1].decode("ascii")))
+        for sha in (producer, candidate_sha):
+            namespace = reader.output(reader.repo, [*source_git._PUBLISHER_TREE_ARGS, sha, "--",
+                *source_git._PUBLISHER_PATHS], code="unused")
+            total += len(namespace)
+            if total > index.MAX_SOURCE_TOTAL:
+                budget.fail("outage-source-bound")
+            namespaces.append(PublisherNamespace(sha, namespace))
         for row in lineage.inventory:
             for sha in (producer, candidate_sha):
                 blob = _outage_blob(reader, budget, sha, row.path, index.MAX_SOURCE_TOTAL - total)
                 total += len(blob.raw) if blob.raw is not None else 0
                 blobs.append(blob)
+    # Parse only after every logical namespace/blob byte has been charged.
+    # Ineligible but well-framed topology is retained for possible normal proof;
+    # malformed or truncated captured metadata still poisons this source read.
+    for namespace in namespaces:
+        source_git.publisher_namespace(namespace.raw)
     budget.check()
     return SourceCoverage(installed.raw, BlobObservation(loader.DATA_PATH, policy_blob.raw),
-                          tuple(ancestors), tuple(blobs))
+                          tuple(ancestors), tuple(blobs), tuple(namespaces))
 
 
 def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False,

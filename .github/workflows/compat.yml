@@ -256,11 +256,11 @@ jobs:
       - release-preview
       - compat-run
       - compat
-    if: ${{ always() && !cancelled() && needs.compat.outputs.evidence_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ always() && !cancelled() && needs.compat.outputs.evidence_ready == 'true' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 6
+    timeout-minutes: 18
     permissions:
-      contents: read
+      contents: write
       actions: read
       attestations: write
       id-token: write
@@ -297,11 +297,38 @@ jobs:
         env:
           COMPAT_PREVIEW_OUTCOME: ${{ needs.release-preview.result }}
           COMPAT_RUN_OUTCOME: ${{ needs.compat-run.result }}
-        run: /usr/bin/python3 -I -S -B release/compat/cli.py validate-evidence
+        run: /usr/bin/python3 -I -S -B release/compat/attest_evidence.py
+
+      # 5 existing setup/sign minutes + 1 install + 11 publisher leave 1 minute.
+      # The publisher retains its original 600s / 10-call / 2MiB internal limits.
+      - name: Install pinned GitHub CLI for negative evidence
+        id: install-gh
+        if: ${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' }}
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/compat-tools"
+          mkdir -m 0700 "$tools"
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --connect-timeout 10 --max-time 20 \
+            "$PINNED_GH_URL" -o "$tools/gh.tar.gz"
+          printf '%s  %s\n' "$PINNED_GH_SHA256" "$tools/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$tools/gh.tar.gz" -C "$tools"
+          install -m 0755 "$tools/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools/gh"
+          printf 'COMPAT_GH_BIN=%s\n' "$tools/gh" >> "$GITHUB_ENV"
+
+      - name: Persist complete negative intent before either signature
+        id: negative-index
+        if: ${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.install-gh.outcome == 'success' }}
+        timeout-minutes: 11
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPAT_PREVIEW_OUTCOME: ${{ needs.release-preview.result }}
+          COMPAT_RUN_OUTCOME: ${{ needs.compat-run.result }}
+        run: /usr/bin/python3 -I -S -B release/compat/negative_index.py
 
       - name: Attest the complete result without changing its verdict
         id: sign
-        if: ${{ steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' }}
+        if: ${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.install-gh.outcome == 'success' && steps.negative-index.outcome == 'success' }}
         timeout-minutes: 1
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
@@ -310,7 +337,7 @@ jobs:
 
       - name: Attest the context bound to the exact result digest
         id: sign-context
-        if: ${{ steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.sign.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.install-gh.outcome == 'success' && steps.negative-index.outcome == 'success' && steps.sign.outcome == 'success' }}
         timeout-minutes: 1
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
@@ -321,6 +348,8 @@ jobs:
         if: ${{ always() }}
         env:
           CHECK_RESULT: ${{ steps.check.outcome }}
+          INSTALL_RESULT: ${{ steps.install-gh.outcome }}
+          INDEX_RESULT: ${{ steps.negative-index.outcome }}
           SIGN_RESULT: ${{ steps.sign.outcome }}
           CONTEXT_SIGN_RESULT: ${{ steps.sign-context.outcome }}
         run: |
@@ -328,6 +357,6 @@ jobs:
           /usr/bin/python3 -I -S -B - <<'PY'
           import os
           import sys
-          names = ('CHECK_RESULT', 'SIGN_RESULT', 'CONTEXT_SIGN_RESULT')
+          names = ('CHECK_RESULT', 'INSTALL_RESULT', 'INDEX_RESULT', 'SIGN_RESULT', 'CONTEXT_SIGN_RESULT')
           sys.exit(0 if all(os.environ.get(name) == 'success' for name in names) else 1)
           PY

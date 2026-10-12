@@ -363,21 +363,37 @@ guard.
 
 The separate outage preflight is connected only to `promote-without-staging`.
 Its fixed `release/deployment/compat-negative-consumer-v1.json` file is absent,
-so it delegates to the existing normal compatibility gate. This preparation
-changes no workflow, token permissions, active database artifacts or provider mode.
-Activation requires a separately reviewed producer revision and complete source
-inventory, actual hosted permissions and signing-order qualification, and then
-consumer policy data that is outside the publisher's inputs.
+so it delegates to the existing normal compatibility gate. Producer setup is
+installed, and the main-only Compatibility signing job publishes any complete
+negative intent before either subject is signed. That source wiring and its
+configuration witness do not establish hosted permissions or outage admission;
+active database artifacts and provider modes remain unchanged.
+
+The sequence is protected merge of complete producer P with consumer data absent,
+then an actual exact-main positive Compatibility run and a distinct main-only
+synthetic ordinary-token qualification. The latter has separate subjects, signer
+and predicate and cannot supply release compatibility. Both results require
+independent acceptance before a separate data-only V activation PR binds P and
+its complete source inventory. Consumer data stays outside publisher inputs and
+cannot include itself in that inventory. Required CI and review precede each
+protected merge. No hosted permission, signing-order or outage qualification is
+claimed complete by the installed source or setup witness.
 
 Once configured, outage admission requires either a complete fixed-endpoint
 502/503/504 response or complete missing/expired compatibility history. It also
-requires matching publisher ancestry and full source bytes, repeated unchanged
-protected-rule and empty negative-marker reads, unchanged authenticated release
+requires matching publisher ancestry and full source bytes, complete unchanged
+Python import namespaces, repeated unchanged protected-rule and empty
+negative-marker reads, unchanged authenticated release
 source, an existing live catalog, and a non-dormant `none` change with identical
 database artifacts. Incomplete, negative, changed, unsafe or oversized evidence
 refuses before provider access. A valid normal proof does not need outage coverage.
 
-Format 8 preserves complete original source, raw service/history evidence,
+The reviewed publisher source includes the signing job's small evidence
+preparer and its local imports. Namespace observations reject relevant Git
+attributes, bytecode caches and native extension candidates; they permit only
+the exact regular consumer JSON leaf to be added outside the publisher inputs.
+
+Format 8 preserves complete original source and namespace listings, raw service/history evidence,
 negative-index observations and fractional timestamps under the existing handoff
 limits. The production caller roundtrips this custody and then checks the original
 monotonic deadline and full UTC freshness before its first provider request.
@@ -386,7 +402,12 @@ recollection or a new admission deadline. Deployment completion may occur later.
 Such a record reports compatibility and staging as `bypassed`, old-server
 compatibility as `unproven`, and retained catalog material; it claims no new
 compatibility measurement. Formats 1-7 keep their own closed historical replay
-paths, separate from current-only creation. The existing one-PUT promotion and
+paths, separate from current-only creation. Exact saved W0 custody can replay
+its original workflow and times after the producer workflow changes; it cannot
+enter fresh collection or new encoding. An all-v1 history still cannot invent a
+measured live baseline. For a future accepted bypass, the existing schema-v2
+append rules re-anchor the origin record while preserving the catalog tuple;
+this does not claim a new measurement. The existing one-PUT promotion and
 automatic recovery behavior remains in place; reconcile remains a rollback mode.
 
 **PR10 requires all four real PR9 proofs to be recorded and reviewed before

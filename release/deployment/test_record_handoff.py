@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import lzma
+import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -682,12 +683,18 @@ class XZTests(unittest.TestCase):
 
 
     def test_v5_historical_pending_drills_preserved_without_owner_field(self):
-        budget = codec._Budget(version=5)
-        node = codec._value(self.handoff, w.PromotionHandoff, budget, 0, encoding=True)
-        self.assertNotIn('contract_observation', node['fields'])
-        outputs = xz_envelope(codec._frame(node, budget.blobs, version=5), version='5')
+        value=replace(self.resolution,workflow=fixture.composition.actions.W0_WORKFLOW,
+                      workflow_sha256=fixture.composition.actions.W0_WORKFLOW_SHA256)
+        with fixture.composition.actions.w0_epoch():
+            history=fixture.composition.collected(value)
+            historical=w.prepare_promotion(value,history,fixture.images(value),fixture.execution(),
+                staging='passed',drills=fixture.drills(value))
+            budget = codec._Budget(version=5)
+            node = codec._value(historical, w.PromotionHandoff, budget, 0, encoding=True)
+            self.assertNotIn('contract_observation', node['fields'])
+            outputs = xz_envelope(codec._frame(node, budget.blobs, version=5), version='5')
         original = self.decode(outputs, record_attempt=19)
-        self.assertEqual(original, self.handoff)
+        self.assertEqual(original, historical)
         self.assertIsNone(original.contract_observation)
         self.assertEqual(original.resolution.pending, self.handoff.resolution.pending)
         self.assertEqual(original.drills, self.handoff.drills)
@@ -1117,10 +1124,12 @@ class OutageHandoffTests(unittest.TestCase):
                 current_resolution=fixture.outage_plain(self.handoff, main='c'*40)))
 
     def test_current_encode_does_not_gain_historical_workflow_from_decoder(self):
-        # Controlled pin change proves route separation, not future P authority.
-        with mock.patch.object(codec.c, 'WORKFLOW_SHA256', 'f'*64):
-            self.assertEqual(self.decode(), self.handoff)
-            with self.assertRaises(codec.HandoffRefusal): codec.encode_outage(self.handoff)
+        with fixture.composition.actions.w0_epoch():
+            case, handoff=fixture.outage_fixture(self)
+            outputs=codec.encode_outage(handoff)
+        self.assertEqual(codec.c.WORKFLOW_SHA256,fixture.composition.actions.P_WORKFLOW_SHA256)
+        self.assertEqual(codec.decode_outage(outputs,**self.args(handoff)),handoff)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode_outage(handoff)
 
     def test_same_second_publication_and_previous_second_refusal(self):
         self.assertTrue(self.build(publication=fixture.outage_publication(self.handoff, seconds=0)))
@@ -1140,7 +1149,24 @@ class OutageHandoffTests(unittest.TestCase):
                 self.measurements[key].update(command_count=handoff.preflight.command_count,
                     captured_bytes=handoff.preflight.captured_bytes,
                     closure_rows=len(handoff.preflight.source.coverage.blobs),
-                    closure_raw_bytes=sum(len(row.raw or b'') for row in handoff.preflight.source.coverage.blobs))
+                    closure_raw_bytes=sum(len(row.raw or b'') for row in handoff.preflight.source.coverage.blobs),
+                    namespace_roles=len(handoff.preflight.source.coverage.namespaces),
+                    namespace_raw_bytes=sum(len(row.raw) for row in handoff.preflight.source.coverage.namespaces))
+
+    def test_namespace_raw_roles_roundtrip_and_missing_schema_refuses(self):
+        restored = self.decode()
+        coverage = restored.preflight.source.coverage
+        self.assertEqual(coverage.namespaces, self.handoff.preflight.source.coverage.namespaces)
+        self.assertEqual(len(coverage.namespaces), 2)
+        for rows in ((), coverage.namespaces[::-1], coverage.namespaces + (coverage.namespaces[0],)):
+            changed = replace(self.handoff, preflight=replace(self.handoff.preflight,
+                source=replace(self.handoff.preflight.source, coverage=replace(coverage, namespaces=rows))))
+            with self.assertRaises(codec.HandoffRefusal): codec.encode_outage(changed)
+        header, blobs = self.frame()
+        node = header['handoff']['fields']['preflight']['fields']['source']['fields']['coverage']['fields']
+        self.assertIn('namespaces', node)
+        del node['namespaces']
+        self.refuse(self.repack(header, blobs))
 
     def test_complete_high_entropy_source_refuses_at_codec_capacity_without_pruning(self):
         import test_ship_outage_compat as outage
@@ -1163,25 +1189,88 @@ class OutageHandoffTests(unittest.TestCase):
 
 class HistoricalEncodingBoundaryTests(unittest.TestCase):
     def test_normal_current_write_refuses_old_pin_but_saved6_replays(self):
-        fixture.HistoricalContext3WriterTests.setUpClass()
-        handoff = fixture.HistoricalContext3WriterTests.handoff
-        outputs = codec.encode(handoff)
-        with mock.patch.object(codec.c, 'WORKFLOW_SHA256', 'f'*64):
-            restored = codec.decode(outputs, candidate_sha=handoff.candidate_images.sha,
-                workflow_sha=handoff.execution.workflow_sha, run_id=handoff.execution.run_id, record_attempt=9)
-            self.assertEqual(restored, handoff)
-            with self.assertRaises(codec.HandoffRefusal): codec.encode(handoff)
+        with fixture.composition.actions.w0_epoch():
+            fixture.HistoricalContext3WriterTests.setUpClass()
+            handoff=fixture.HistoricalContext3WriterTests.handoff
+            outputs=codec.encode(handoff)
+        restored=codec.decode(outputs,candidate_sha=handoff.candidate_images.sha,
+            workflow_sha=handoff.execution.workflow_sha,run_id=handoff.execution.run_id,record_attempt=9)
+        self.assertEqual(restored,handoff)
+        self.assertEqual(codec.c.WORKFLOW_SHA256,fixture.composition.actions.P_WORKFLOW_SHA256)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(handoff)
 
     def test_rollback_current_write_refuses_old_pin_but_saved7_replays(self):
-        case, handoff = fixture.rollback_fixture(self)
-        outputs = codec.encode_rollback(handoff)
-        args = dict(producer_sha=handoff.preflight.resolution.producer.sha,
+        with fixture.composition.actions.w0_epoch():
+            case,handoff=fixture.rollback_fixture(self)
+            outputs=codec.encode_rollback(handoff)
+        args=dict(producer_sha=handoff.preflight.resolution.producer.sha,
             target_release=handoff.preflight.resolution.resolved.selected.release,
             workflow_sha=handoff.execution.workflow_sha,run_id=handoff.execution.run_id,record_attempt=9)
-        with mock.patch.object(codec.c, 'WORKFLOW_SHA256', 'f'*64):
-            self.assertEqual(codec.decode_rollback(outputs, **args), handoff)
-            with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(handoff)
+        self.assertEqual(codec.c.WORKFLOW_SHA256,fixture.composition.actions.P_WORKFLOW_SHA256)
+        self.assertEqual(codec.decode_rollback(outputs,**args),handoff)
+        current=fixture.rollback_plain(case)
+        self.assertTrue(codec.build_rollback_record(outputs,publication=fixture.rollback_publication(handoff),
+            current_resolution=current,**args))
+        with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(handoff)
 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SavedW0WireTransitionTests(unittest.TestCase):
+    def test_original_wires_one_through_seven_are_saved_before_p_replay(self):
+        # Exact old format framing; no current encoder option or policy override
+        # exists after the original-epoch scope ends.
+        with tempfile.TemporaryDirectory() as directory:
+            saved=Path(directory)/'original-w0-custody.json'
+            with fixture.composition.actions.w0_epoch():
+                fixture.composition.source.ForwardResolverTests.setUpClass()
+                value=fixture.composition.resolution()
+                history=fixture.composition.collected(value)
+                normal=w.prepare_promotion(value,history,fixture.images(value),fixture.execution(),
+                    staging='passed',drills=fixture.drills(value))
+                originals={}
+                for version in range(1,6):
+                    handoff=(fixture.historical_handoff(value,
+                        observation=fixture.drills(value) if version==4 else None) if version<5 else normal)
+                    budget=codec._Budget(version=version)
+                    node=codec._value(handoff,w.PromotionHandoff,budget,0,encoding=True)
+                    if version<3:
+                        raw=raw_json({'version':version,'handoff':node,'blobs':[
+                            {'sha256':digest,'length':len(blob),'value':base64.b64encode(zlib.compress(blob,9)).decode()}
+                            for digest,blob in sorted(budget.blobs.items())]})
+                        originals[str(version)]=envelope(raw,version=str(version))
+                    else:
+                        originals[str(version)]=xz_envelope(codec._frame(node,budget.blobs,version=version),version=str(version))
+                originals['6']=codec.encode(normal)
+                case,rollback=fixture.rollback_fixture(self)
+                originals['7']=codec.encode_rollback(rollback)
+                saved.write_bytes(raw_json(originals))
+                original_digest=hashlib.sha256(saved.read_bytes()).hexdigest()
+            self.assertEqual(codec.c.WORKFLOW_SHA256,fixture.composition.actions.P_WORKFLOW_SHA256)
+            originals=json.loads(saved.read_bytes())
+            args=dict(candidate_sha=normal.candidate_images.sha,workflow_sha=normal.execution.workflow_sha,
+                      run_id=normal.execution.run_id,record_attempt=17)
+            expected=None
+            for version in range(1,7):
+                with self.subTest(version=version):
+                    decoded=codec.decode(originals[str(version)],**args)
+                    self.assertEqual(decoded.resolution.workflow,fixture.composition.actions.W0_WORKFLOW)
+                    self.assertEqual(decoded.execution,normal.execution)
+                    self.assertEqual(decoded.collected.history.observed_at,normal.collected.history.observed_at)
+                    raw=codec.build_record(originals[str(version)],publication=fixture.publication(),
+                        current_resolution=value.resolved,**args)
+                    if expected is None: expected=raw
+                    self.assertEqual(raw,expected)
+                    with self.assertRaises(codec.HandoffRefusal): codec.encode(decoded)
+            rargs=dict(producer_sha=rollback.preflight.resolution.producer.sha,
+                target_release=rollback.preflight.resolution.resolved.selected.release,
+                workflow_sha=rollback.execution.workflow_sha,run_id=rollback.execution.run_id,record_attempt=17)
+            decoded=codec.decode_rollback(originals['7'],**rargs)
+            self.assertEqual(decoded,rollback)
+            self.assertEqual(decoded.preflight.resolution.workflow,fixture.composition.actions.W0_WORKFLOW)
+            self.assertTrue(codec.build_rollback_record(originals['7'],**rargs,
+                publication=fixture.rollback_publication(rollback),current_resolution=fixture.rollback_plain(case)))
+            with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(decoded)
+            self.assertEqual(hashlib.sha256(saved.read_bytes()).hexdigest(),original_digest)

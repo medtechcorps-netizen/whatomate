@@ -7,8 +7,9 @@ The ordered experiment, source-built image admission and hosted entry points
 are implemented and enabled in this source for hosted qualification. The
 local positive experiment and swallowed-UPDATE fixture-branch advisory have
 separate source-bound evidence described below. Hosted CI qualifies each
-candidate; three accepted consecutive main compatibility runs remain required
-before PR16. Component tests do not establish release compatibility.
+candidate. The three accepted consecutive main compatibility runs remain an
+accepted prerequisite; this producer still requires its own exact-main
+qualification. Component tests do not establish release compatibility.
 
 ## Result and failure contract
 
@@ -494,9 +495,10 @@ successful. File limits remain 16 KiB for results and 4 KiB for context.
 For this lane, `check` and `validate-evidence` use a separate closed validator and
 create-only writer for the same two canonical artifact names. Both files must
 round-trip exactly before the complete marker. A complete negative fails `check`
-but remains eligible for the unchanged workflow's upload and independent signing;
-infrastructure, partial-write, failed-upload and cancellation paths do not become
-ready evidence. The workflow bytes, permissions and limits are unchanged.
+but remains eligible for upload and independent signing after the protected
+negative-intent publisher succeeds. Infrastructure, partial-write, failed-upload,
+publisher failure and cancellation paths do not become ready evidence. The
+normal and rollback evidence schemas and file limits are unchanged.
 
 Operational rollback across two or more non-none changes uses the dedicated
 fresh source/collection/source gate in both plan and production. Before any
@@ -560,29 +562,37 @@ Active schema changes remain unsupported. The qualified rollback route is
 separate from normal evidence and never accepts a normal forward receipt.
 
 After successful upload, a separate guarded `evidence_ready` output permits
-the `attest` job on push or dispatch, including a complete measured negative.
+the `attest` job on main push or main dispatch, including a complete measured
+negative.
 Cancellation, partial writes or failed uploads cannot set that marker.
-`cli.py validate-evidence` revalidates the exact two files against the same-run
-resolution and current job context without running an experiment or resolving
-latest again. It returns success for complete negative evidence while `check`
-still returns failure. The signing job attests the result and context as two
-individually required subjects; the signed context binds the exact result
-digest. A consumer must authenticate both subjects and their matching source,
-workflow, run and attempt. Successful signing does not make a failed `compat`
-job or the overall workflow successful. Pull requests cannot sign either file.
-Read jobs use contents/actions/attestations read access;
-only the signing job has attestations and OIDC write permissions. No deployment
-environment, provider credentials or production action is part of this
-workflow. The existing CI release-tests job also discovers the compatibility
+`attest_evidence.py` revalidates the exact two files against the same-run
+resolution and current job context without importing the experiment CLI or
+resolving latest again. It returns success for complete negative evidence while
+the earlier CLI `check` still returns failure. After that validation, the signing job installs the
+pinned GitHub CLI and runs the negative-intent publisher against the exact two
+public subject files. A validated positive performs no index write; a complete
+negative must have its exact protected marker read back before either signature.
+Both signing steps and the final assertion require publisher success. The job
+attests the result and context as two individually required subjects; the signed
+context binds the exact result digest. A consumer must authenticate both subjects
+and their matching source, workflow, run and attempt. Successful signing does
+not make a failed `compat` job or the overall workflow successful. Pull requests
+cannot sign either file. Read jobs retain contents/actions/attestations read
+access; only this main-only signing job has contents, attestations and OIDC write
+permissions. No deployment environment, provider credentials or production action
+is part of this workflow. The existing CI release-tests job also discovers the compatibility
 unit and workflow tests.
 
 The experiment job is capped at 45 minutes. Checkout, artifact download and
 tool setup share 180 seconds; the core uses 2,400 seconds, the client version
 probe at most five seconds and result upload at most 60 seconds, leaving
 55 seconds of margin. The step ceiling does not extend the core deadline.
-The separate signing job has a six-minute ceiling: checkout and two downloads
-have one minute each, the two signing steps one minute each, leaving one minute
-for local revalidation and final enforcement. Both signatures are required.
+The separate signing job has an 18-minute ceiling: checkout and two downloads
+have one minute each, pinned GitHub CLI installation one minute, publisher
+execution 11 minutes, and the two signing steps one minute each, leaving one
+minute for local revalidation and final enforcement. The publisher retains its
+600-second internal allowance and unchanged 10-command/2-MiB transport bounds;
+the step ceiling does not extend them. Both signatures are required.
 
 The required Test workflow uses a CI-only source predicate for the sole legacy
 migration-closure endpoint refusal. Its narrow exception requires full valid
@@ -598,8 +608,9 @@ makes `compat` required, the controlled merge gate must bind both successes to
 the current PR head/base/test-merge and exact run/attempt. Actions metadata can
 identify the PR head while result/context identify its synthetic merge; neither
 may be substituted for the actual main commit after merging. Main requires its
-own signed qualification. This change does not configure repository-wide
-enforcement or alter compatibility workflow permissions or source identity.
+own signed qualification. This CI source predicate does not configure
+repository-wide enforcement. The separate main-only publisher permission and
+signing-order changes are described above.
 
 The bounded PR16 implementation now connects this normal producer to Release
 plan, staging and production admission and schema-v2 records. It authenticates
@@ -632,8 +643,9 @@ owner event and compares every before/after observation field except ordered
 UTC capture time. Generic PR preview and rollback do not perform this collection.
 Current active semantic proof remains unsupported: valid label facts and a
 closed custody schema do not make an active contract pass compatibility.
-No workflow permissions changed, hosted token read access is not qualified by
-synthetic tests, and these observations do not authorize production DDL/data.
+Owner-label collection adds no workflow permissions. Synthetic tests do not
+qualify hosted token access, and these observations do not authorize production
+DDL/data.
 The complete pending fixture passed unsigned PR270 Compatibility
 [run 38145640684, attempt 1](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38145640684)
 at merge source `345571b51fdc7b6e6b45cb0a7fffe7ecd7b55865`. The verified artifacts
@@ -992,16 +1004,23 @@ repaired fixture cases, 163 normal-collection cases and 154 custody/workflow cas
 The initial three fixture failures are retained; there was no fresh all-green
 79-case rerun. These tests do not establish hosted rollback qualification.
 
-### Disabled negative-intent index preparation
+### Negative-intent publisher and disabled outage consumer
 
-The preparatory negative-index publisher has no installed producer configuration
-and is not called by a workflow. Its unconfigured entry point refuses before
-reading operational paths, credentials or network state. The release gate's
-separate outage consumer is connected but disabled: its fixed policy data file
+The producer setup is installed and the main-only Compatibility signing job
+runs the publisher before both signatures. Its embedded witness binds the
+reviewed protected tag rule and records configuration observation only. It does
+not prove hosted token permissions, durable publication or signing order. The
+explicit absent-configuration path still refuses before reading operational
+paths, credentials or network state. The release gate's separate outage consumer
+is connected but disabled: `release/deployment/compat-negative-consumer-v1.json`
 is absent, so `promote-without-staging` still requires normal compatibility.
 
-The publisher validates the actual two public signature subjects against the
-fixed resolution snapshot. A complete measured negative derives an exact
+The signing job first runs a small evidence preparer whose source and local
+imports belong to the reviewed publisher inventory. It uses the shared public
+validators for normal and rollback evidence without importing the experiment
+CLI. It retains complete negative results and marks completion only after both
+public subjects are written and read back. The publisher validates those actual
+two public signature subjects against the fixed resolution snapshot. A complete measured negative derives an exact
 commit/run/attempt/result/context marker, reads the protected rule, creates at
 most one exact ref and reads it back before returning. An existing exact marker
 is idempotent. Ambiguous creation, changed subject or snapshot files or rules, budget expiry,
@@ -1011,9 +1030,33 @@ ordinary data, not signatures or coverage proof.
 
 The fixed transport shares its caller's original allowance, pins its executable,
 uses a private configuration and permits only its closed API operations. Pure
-replay keeps complete raw rule/ref/HTTP observations with strict bounds. Future
-activation still requires reviewed producer/workflow source, hosted permissions
-and signatures, and a separate consumer policy tied to the real producer revision.
+replay keeps complete raw rule/ref/HTTP observations with strict bounds. Setup
+installation and local tests do not establish hosted permissions or source
+coverage. The consumer data remains outside publisher imports, reads and its
+future immutable source inventory.
+
+The qualification sequence is complete source review and required CI, protected
+merge of producer P with consumer data absent, then two distinct hosted checks.
+An ordinary successful Compatibility run at exact main must validate the actual
+pair, perform no intent write and verify both signatures after publisher success.
+A separate manual main-only `compat-negative-index-qualification.yml` workflow
+uses the ordinary job token and explicitly synthetic subjects under its own
+signer and predicate. It checks protected-ref create/readback, rule-denied update
+and deletion with unchanged-ref readback, positive no-write and negative intent
+publication before qualification signing. Its fixed pre-P source Q differs from
+the job's actual H and is permanently excluded from eligible producer lineages.
+It never attests a synthetic pair as ordinary compatibility evidence or creates
+a fabricated negative for a covered real candidate. These hosted results have
+not yet been established by this source change.
+
+Only independent acceptance of both the exact-main result and the distinct
+synthetic qualification permits a separately reviewed data-only V activation PR.
+V binds the actual P revision, setup digest and complete final source inventory;
+it cannot include itself or alter imported producer code. Changed producer code
+requires a new reviewed lineage and qualification. Ordinary review and required
+CI still precede the protected V merge. No runtime qualification receipt replaces
+these gates, and synthetic qualification does not claim an actual negative
+database measurement or lifetime administrator continuity.
 
 The disabled consumer retains the same actual normal collection pass plus both
 closed raw inventory snapshots. Replay derives terminal execution windows from
@@ -1024,12 +1067,26 @@ evidence. Empty complete visible history is only a possible outage condition;
 it is not proof against whole-run deletion. The protected negative index and
 reviewed producer source coverage are separately required.
 
-Format-8 custody retains every source and raw history role with the existing
-logical, encoded and expanded limits. Equal bytes may be losslessly shared in
+Source coverage also retains complete immutable directory listings for both
+Python import roots at P and H. The listings bind names, modes and directory
+structure as well as the inventory's exact imported file bytes. Relevant Git
+attributes, tracked bytecode caches and native extension candidates make an
+outage lineage ineligible. The only namespace exception is the exact regular
+consumer JSON leaf; its bytes are independently bound. Existing unimported
+helper or test contents may change, but adding an import candidate requires a
+new reviewed lineage. Valid normal compatibility proof remains independent of
+this outage-only coverage.
+
+Format-8 custody retains every source, raw directory listing and raw history
+role with the existing logical, encoded and expanded limits. Equal bytes may be losslessly shared in
 the frame; no history or source is omitted to fit. Full publisher-dependency
 capacity must pass before activation. Original timestamps and raw policy are
 replayed without reading current policy or sampling a new clock. Counter replay
 checks bounds and arithmetic, not the authenticity of a missing process
 transcript. Exact old-workflow custody has a named historical route; new encoding
-still requires the current workflow. Trusted setup continuity and the last
-observation horizon remain explicit limits.
+still requires the current workflow. The immutable W0 workflow remains available
+only through exact historical replay: saved promotion formats 1-6 and rollback
+format 7 retain their original workflow, field sets and times. Fresh collection
+and new encoding require the current workflow; an old head's envelope uses its
+own reviewed steps. Trusted setup continuity and the last observation horizon
+remain explicit limits.

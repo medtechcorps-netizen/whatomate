@@ -1,8 +1,10 @@
 """Closed negative-intent data replay; no source, transport or outage authority.
 
-Both installed configurations are deliberately absent. Future consumer policy
-bytes belong outside the publisher's import/read/build closure, not in this
-module's own source inventory. Parsed holders and receipts are ordinary data.
+Producer setup records a reviewed configuration observation only; it does not
+prove hosted permissions or outage authority. Consumer policy and data remain
+absent. Future consumer policy bytes belong outside the publisher's import/read/
+build closure, not in this module's own source inventory. Parsed holders and
+receipts are ordinary data.
 """
 from dataclasses import dataclass, fields, is_dataclass
 import datetime as dt
@@ -29,7 +31,46 @@ _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _EPOCH = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})\Z")
-_INSTALLED_PRODUCER_SETUP: bytes | None = None
+_INSTALLED_PRODUCER_SETUP: bytes | None = (
+    b'{"epoch":"rereply-compat-negative-v1","format_version":1,"prefix":"rereply-compat-negative-v1-",'
+    b'"repository":"medtechcorps-netizen/whatomate","repository_id":1297344686,"setup_review_sha256":"'
+    b'7c656bc617731209f4ee32e8d0f6fff919fcb3f898d2812e19dd07ea529def3e","setup_witness":"{\\"complete_o'
+    b'riginal_post_response\\":{\\"_links\\":{\\"html\\":{\\"href\\":\\"https://github.com/medtechcorps-netize'
+    b'n/whatomate/rules/24896373\\"},\\"self\\":{\\"href\\":\\"https://api.github.com/repos/medtechcorps-net'
+    b'izen/whatomate/rulesets/24896373\\"}},\\"bypass_actors\\":[],\\"conditions\\":{\\"ref_name\\":{\\"exclud'
+    b'e\\":[],\\"include\\":[\\"refs/tags/rereply-compat-negative-v1-*\\"]}},\\"created_at\\":\\"2026-10-12T06'
+    b':08:39.569+08:00\\",\\"current_user_can_bypass\\":\\"never\\",\\"enforcement\\":\\"active\\",\\"id\\":24896'
+    b'373,\\"name\\":\\"rereply-compat-negative-v1\\",\\"node_id\\":\\"RRS_lACqUmVwb3NpdG9yec5NU-iuzgF743U\\",'
+    b'\\"rules\\":[{\\"parameters\\":{\\"update_allows_fetch_and_merge\\":false},\\"type\\":\\"update\\"},{\\"typ'
+    b'e\\":\\"deletion\\"}],\\"source\\":\\"medtechcorps-netizen/whatomate\\",\\"source_type\\":\\"Repository\\",'
+    b'\\"target\\":\\"tag\\",\\"updated_at\\":\\"2026-10-12T06:08:39.591+08:00\\"},\\"complete_privileged_respo'
+    b'nse\\":{\\"_links\\":{\\"html\\":{\\"href\\":\\"https://github.com/medtechcorps-netizen/whatomate/rules/'
+    b'24896373\\"},\\"self\\":{\\"href\\":\\"https://api.github.com/repos/medtechcorps-netizen/whatomate/rul'
+    b'esets/24896373\\"}},\\"bypass_actors\\":[],\\"conditions\\":{\\"ref_name\\":{\\"exclude\\":[],\\"include\\"'
+    b':[\\"refs/tags/rereply-compat-negative-v1-*\\"]}},\\"created_at\\":\\"2026-10-12T06:08:39.569+08:00\\"'
+    b',\\"current_user_can_bypass\\":\\"never\\",\\"enforcement\\":\\"active\\",\\"id\\":24896373,\\"name\\":\\"rer'
+    b'eply-compat-negative-v1\\",\\"node_id\\":\\"RRS_lACqUmVwb3NpdG9yec5NU-iuzgF743U\\",\\"rules\\":[{\\"para'
+    b'meters\\":{\\"update_allows_fetch_and_merge\\":false},\\"type\\":\\"update\\"},{\\"type\\":\\"deletion\\"}]'
+    b',\\"source\\":\\"medtechcorps-netizen/whatomate\\",\\"source_type\\":\\"Repository\\",\\"target\\":\\"tag\\"'
+    b',\\"updated_at\\":\\"2026-10-12T06:08:39.591+08:00\\"},\\"epoch\\":\\"rereply-compat-negative-v1\\",\\"fo'
+    b'rmat_version\\":1,\\"observed_at\\":\\"2026-10-11T22:15:58.435908+00:00\\",\\"old_rule_unchanged\\":tru'
+    b'e,\\"original_old_rule_response_sha256\\":\\"d5a27954a5a2ab001736f3ce94222f114e71ed5aed2462b6747b58'
+    b'48bc97c761\\",\\"original_post_response_sha256\\":\\"15532a156ac0760104d3e00274c311bcbe0bd8759fbc305'
+    b'9929cbb2a4980dbe4\\",\\"original_refused_result_sha256\\":\\"0d68c378622848706c32dc93ed00ad65b4a619c'
+    b'de11f23265514597be42d5631\\",\\"prefix\\":\\"rereply-compat-negative-v1-\\",\\"privileged_read\\":true,'
+    b'\\"qualification\\":\\"One actual POST, then read-only recovery of its exact captured rule ID. Conf'
+    b'iguration only; publisher permissions, signed intent and outage admission remain unqualified.\\",'
+    b'\\"repository\\":\\"medtechcorps-netizen/whatomate\\",\\"repository_id\\":1297344686,\\"request_sha256\\'
+    b'":\\"82ab9132f26cea08c7398c32c3c37f3e218d1aad773e2248e04a0047a9304d6b\\",\\"rule\\":{\\"bypass_actors'
+    b'\\":[],\\"conditions\\":{\\"ref_name\\":{\\"exclude\\":[],\\"include\\":[\\"refs/tags/rereply-compat-negat'
+    b'ive-v1-*\\"]}},\\"created_at\\":\\"2026-10-11T22:08:39.569000Z\\",\\"enforcement\\":\\"active\\",\\"id\\":2'
+    b'4896373,\\"name\\":\\"rereply-compat-negative-v1\\",\\"rules\\":[{\\"type\\":\\"deletion\\"},{\\"parameters'
+    b'\\":{\\"update_allows_fetch_and_merge\\":false},\\"type\\":\\"update\\"}],\\"source\\":\\"medtechcorps-net'
+    b'izen/whatomate\\",\\"source_type\\":\\"Repository\\",\\"target\\":\\"tag\\",\\"updated_at\\":\\"2026-10-11T2'
+    b'2:08:39.591000Z\\"},\\"time_check\\":\\"Created and updated instants fall within the approximate ori'
+    b'ginal execution window reconstructed from rounded elapsed seconds, with five-second clock tolera'
+    b'nce; exact original strings and normalized instants retained.\\"}\\n"}\n'
+)
 _INSTALLED_CONSUMER_POLICY: bytes | None = None
 
 

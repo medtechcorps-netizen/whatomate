@@ -113,14 +113,24 @@ image digests only and will not notice.
 
 ## Compatibility outage preparation
 
-The separate compatibility-outage consumer is disabled until its fixed policy
-data is installed after producer and hosted qualification. It belongs only to
-the owner-dispatched `promote-without-staging` path. It does not change rollback
-eligibility, provide missing rollback proof, or authorize console overrides.
+The separate compatibility-outage consumer remains disabled because its fixed
+`release/deployment/compat-negative-consumer-v1.json` data is absent. Producer
+setup is installed and the main-only Compatibility workflow publishes complete
+negative intent before both signatures; that configuration is not hosted
+permission or outage qualification. After protected merge, an exact-main normal
+positive and a distinct synthetic ordinary-token qualification must each receive
+independent acceptance before a separate data-only V activation PR. Synthetic
+qualification uses separate subjects and signer identity, never release proof.
+The consumer belongs only to the owner-dispatched `promote-without-staging` path.
+It does not change rollback eligibility, provide missing rollback proof, or
+authorize console overrides.
 
 An eligible future outage promotion must retain the live catalog and all database
 artifacts, have no migration or dormant change, and preserve complete bounded
-source and negative-index evidence before provider access. Its record states
+source, complete Python import namespaces and negative-index evidence before
+provider access. The reviewed source includes the signing evidence preparer;
+relevant checkout attributes and tracked bytecode or native extensions refuse
+outage coverage. Its record states
 compatibility and staging were bypassed and old-server compatibility is unproven.
 Record-only retries reuse the original evidence and exact parent; they do not
 renew admission. Existing rollback reconcile and promotion recovery behavior

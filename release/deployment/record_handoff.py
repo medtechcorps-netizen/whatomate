@@ -263,9 +263,12 @@ _SCHEMAS.update({
         ("producer_sha", str), ("head_sha", str), ("merge_base_sha", str))),
     r.PublisherBlob: ("record_resolver.PublisherBlob", (
         ("source_sha", str), ("path", str), ("mode", _optional(str)), ("raw", _optional(bytes)))),
+    r.PublisherNamespace: ("record_resolver.PublisherNamespace", (
+        ("source_sha", str), ("raw", bytes))),
     r.SourceCoverage: ("record_resolver.SourceCoverage", (
         ("policy_raw", bytes), ("policy_blob", r.BlobObservation),
-        ("ancestry", _many(r.PublisherAncestry)), ("blobs", _many(r.PublisherBlob)))),
+        ("ancestry", _many(r.PublisherAncestry)), ("blobs", _many(r.PublisherBlob)),
+        ("namespaces", _many(r.PublisherNamespace)))),
     r.OutageForwardResolution: ("record_resolver.OutageForwardResolution", (
         ("admission", r.ForwardAdmission), ("coverage", r.SourceCoverage))),
     c.OutageHistorySnapshot: ("compat_collect.OutageHistorySnapshot", (

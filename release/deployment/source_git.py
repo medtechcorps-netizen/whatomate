@@ -32,6 +32,13 @@ CLEANUP_RESERVE = 2.25
 _OID = re.compile(r"[0-9a-f]{40}\Z")
 _PATH = re.compile(r"[A-Za-z_.][A-Za-z0-9_./-]{0,511}\Z")
 _PARTIAL = r"^(extensions\.partialclone|remote\..*\.promisor)$"
+PUBLISHER_NAMESPACE_LIMIT = 65536
+PUBLISHER_NAMESPACE_RECORDS = 1024
+_PUBLISHER_ROOTS = ("release/compat", "release/deployment")
+_PUBLISHER_ATTRIBUTES = (".gitattributes", "release/.gitattributes")
+_PUBLISHER_PATHS = (*_PUBLISHER_ATTRIBUTES, *_PUBLISHER_ROOTS)
+_PUBLISHER_CONSUMER = "release/deployment/compat-negative-consumer-v1.json"
+_PUBLISHER_TREE_ARGS = ("ls-tree", "-r", "-t", "-z", "--full-tree")
 
 
 class SourceGitRefusal(common.ReleaseError):
@@ -52,6 +59,64 @@ def _path(value, *, directory=False):
         return False
     parts = value.removesuffix("/").split("/") if directory else value.split("/")
     return all(part.casefold() not in {"", ".", "..", ".git"} for part in parts)
+
+
+def publisher_namespace(raw):
+    """Replay a complete fixed Git listing; None means ineligible topology.
+
+    Raw capture is provenance, not authentication by a parser. Blob OIDs are
+    retained for consistency with the separately pinned executable bytes.
+    Well-framed unsupported topology never becomes a normal-proof veto.
+    """
+    _need(type(raw) is bytes and len(raw) <= PUBLISHER_NAMESPACE_LIMIT, "namespace-bound")
+    if not raw:
+        return None
+    _need(raw.endswith(b"\0"), "namespace-frame")
+    records = raw[:-1].split(b"\0")
+    _need(len(records) <= PUBLISHER_NAMESPACE_RECORDS and all(records), "namespace-bound")
+    rows, seen, folded = [], {}, set()
+    eligible = True
+    for record in records:
+        meta, sep, name = record.partition(b"\t")
+        _need(sep and 0 < len(name) <= 512, "namespace-frame")
+        try:
+            mode, kind, oid = meta.decode("ascii").split(" ")
+            path = name.decode("ascii")
+        except (UnicodeError, ValueError):
+            raise SourceGitRefusal("git-failed:source-namespace-frame") from None
+        _need((mode, kind) in (("040000", "tree"), ("100644", "blob"),
+              ("100755", "blob"), ("120000", "blob"), ("160000", "commit"))
+              and _oid(oid), "namespace-frame")
+        parts = path.split("/")
+        _need(len(parts) <= 16 and all(parts)
+              and all(32 <= ord(char) <= 126 and char != "\\" for char in path)
+              and all(part.casefold() not in (".", "..", ".git") for part in parts)
+              and not path.startswith("/") and path not in seen
+              and path.casefold() not in folded, "namespace-path")
+        _need(path == "release" or any(path == root or path.startswith(root + "/")
+              for root in _PUBLISHER_PATHS), "namespace-scope")
+        parent = path.rpartition("/")[0]
+        _need(not parent or parent in seen and seen[parent][1:3] == ("040000", "tree"),
+              "namespace-parent")
+        row = (path, mode, kind, oid)
+        rows.append(row); seen[path] = row; folded.add(path.casefold())
+        lower = tuple(part.casefold() for part in parts)
+        if (mode in ("120000", "160000") or ".gitattributes" in lower
+                or "__pycache__" in lower
+                or any(part.endswith((".pyc", ".pyo", ".so", ".pyd")) for part in lower)):
+            eligible = False
+        if path == _PUBLISHER_CONSUMER and (kind != "blob" or mode not in ("100644", "100755")):
+            eligible = False
+    # Git compares tree names as if suffixed with '/', and emits each tree
+    # before its descendants. Plain lexical sorting of paths is not this order.
+    ordered = sorted(rows, key=lambda row: row[0] + ("/" if row[2] == "tree" else ""))
+    _need(rows == ordered, "namespace-order")
+    if any(root not in seen or seen[root][1:3] != ("040000", "tree")
+           for root in ("release", *_PUBLISHER_ROOTS)):
+        eligible = False
+    if not eligible:
+        return None
+    return tuple(row for row in rows if row[0] != _PUBLISHER_CONSUMER)
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +284,10 @@ class ImmutableGit:
         if (7 <= len(values) <= 14 and values[:4] == ["ls-tree", "-r", "--name-only", "-z"]
                 and _oid(values[4]) and values[5] == "--" and all(_path(p, directory=True) for p in values[6:])):
             return self._call(values).stdout
+        if (len(values) == 11 and tuple(values[:5]) == _PUBLISHER_TREE_ARGS
+                and _oid(values[5]) and values[6] == "--"
+                and tuple(values[7:]) == _PUBLISHER_PATHS):
+            return self._call(values, limit=PUBLISHER_NAMESPACE_LIMIT).stdout
         if len(values) == 3 and values[0] == "merge-base" and all(_oid(v) for v in values[1:]):
             return self._call(values, limit=128).stdout
         if (len(values) == 4 and values[:3] == ["rev-list", "--first-parent", "--reverse"]

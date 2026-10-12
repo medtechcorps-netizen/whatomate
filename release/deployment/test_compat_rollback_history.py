@@ -361,13 +361,14 @@ if __name__ == '__main__':
 
 class OwnWorkflowReplayTests(unittest.TestCase):
     def test_real_w0_raw_workflow_stays_known_after_current_pin_changes(self):
-        facts = row().envelope
-        source = envelope.WorkflowObservation(rollback_fixtures.binding().producer_sha, WORKFLOW)
-        before = envelope.replay(source, facts, observed_at=NOW)
-        with mock.patch.object(envelope, 'WORKFLOW_SHA256', 'f'*64):
-            after = envelope.replay(source, facts, observed_at=NOW)
-        self.assertEqual(after, before)
+        with collected_fixtures.w0_epoch():
+            facts = row().envelope
+        source = envelope.WorkflowObservation(rollback_fixtures.binding().producer_sha,
+                                               collected_fixtures.W0_WORKFLOW)
+        self.assertEqual(envelope.WORKFLOW_SHA256, collected_fixtures.P_WORKFLOW_SHA256)
+        after = envelope.replay(source, facts, observed_at=NOW)
         self.assertIsNotNone(after.attempt.execution_window)
+        self.assertEqual(len(after.attempt.jobs), 4)
 
     def test_unknown_workflow_never_borrows_historical_steps(self):
         facts = row().envelope
@@ -377,3 +378,39 @@ class OwnWorkflowReplayTests(unittest.TestCase):
                 result = envelope.replay(envelope.WorkflowObservation(sha, raw), facts, observed_at=NOW)
                 self.assertIsNone(result.attempt.execution_window)
                 self.assertEqual(result.attempt.jobs, ())
+
+
+class MixedWorkflowTransitionTests(unittest.TestCase):
+    def original(self, **options):
+        with collected_fixtures.w0_epoch():
+            return row(run=90, number=9, minute=1, sha='b'*40, **options)
+
+    def test_old_and_new_heads_replay_only_their_own_actual_steps(self):
+        old, current = self.original(), row()
+        old_source = envelope.WorkflowObservation('b'*40, collected_fixtures.W0_WORKFLOW)
+        new_source = envelope.WorkflowObservation(rollback_fixtures.binding().producer_sha, WORKFLOW)
+        self.assertNotEqual(collected_fixtures.W0_WORKFLOW, WORKFLOW)
+        self.assertIsNotNone(envelope.replay(old_source, old.envelope, observed_at=NOW).attempt.execution_window)
+        self.assertIsNotNone(envelope.replay(new_source, current.envelope, observed_at=NOW).attempt.execution_window)
+        value = history(None, old, current, workflows=tuple(sorted((old_source,new_source),key=lambda v:v.sha)))
+        self.assertEqual(history_policy.require_rollback_compat(request(), value).run_id, 100)
+        # W0's seven declared attest steps omit two required by P. The
+        # structurally valid shorter list is incomplete and supplies no window.
+        replayed=envelope.replay(replace(old_source,raw=WORKFLOW),old.envelope,observed_at=NOW)
+        self.assertIsNone(replayed.attempt.execution_window)
+        # P's nine declared steps plus three wrappers exceed W0's seven+three
+        # bound. This direction must retain the exact strict parser refusal.
+        with self.assertRaises(evidence.CompatRefusal) as caught:
+            envelope.replay(replace(new_source,raw=collected_fixtures.W0_WORKFLOW),
+                            current.envelope,observed_at=NOW)
+        self.assertEqual((caught.exception.code,caught.exception.detail),
+                         ('compat-stale','collect-steps'))
+
+    def test_later_old_workflow_negative_is_not_hidden_by_new_current(self):
+        with collected_fixtures.w0_epoch():
+            old=row(run=200,number=20,minute=60,sha='b'*40,server_false='workers')
+        sources=(envelope.WorkflowObservation('b'*40,collected_fixtures.W0_WORKFLOW),
+                 envelope.WorkflowObservation(rollback_fixtures.binding().producer_sha,WORKFLOW))
+        value=history(None,row(),old,workflows=tuple(sorted(sources,key=lambda v:v.sha)))
+        with self.assertRaises(evidence.CompatRefusal):
+            history_policy.require_rollback_compat(request(),value)

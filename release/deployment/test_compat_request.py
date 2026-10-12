@@ -270,6 +270,9 @@ class SourceOnlyAndHistoricalTests(unittest.TestCase):
         source.ForwardResolverTests.setUpClass()
         cls.value = resolution()
         cls.history = collected(cls.value)
+        with actions.w0_epoch():
+            cls.old_value = resolution()
+            cls.old_history = collected(cls.old_value)
 
     def test_actual_source_only_validation_needs_no_collected_history_or_io(self):
         with mock.patch.object(bridge.collect, 'collect_history', side_effect=AssertionError('collection')), \
@@ -303,20 +306,21 @@ class SourceOnlyAndHistoricalTests(unittest.TestCase):
                 bridge.validate_current_source(replace(self.value, classification=change))
 
     def test_historical_context3_replays_real_old_pair_after_current_pin_changes(self):
-        # A controlled future current-pin policy input, not real P qualification.
-        with mock.patch.object(bridge.collect, 'WORKFLOW_SHA256', 'f'*64):
-            self.assertIs(bridge._validate_source_custody(self.value), self.value)
-            self.assertTrue(bridge._qualify_context3_custody(self.value, self.history).forward)
-            with self.assertRaises(evidence.CompatRefusal): bridge.validate_current_source(self.value)
-            with self.assertRaises(evidence.CompatRefusal): bridge.qualify(self.value, self.history)
+        self.assertEqual(bridge.collect.WORKFLOW_SHA256, actions.P_WORKFLOW_SHA256)
+        self.assertEqual(self.old_value.workflow, actions.W0_WORKFLOW)
+        self.assertIs(bridge._validate_source_custody(self.old_value), self.old_value)
+        self.assertTrue(bridge._qualify_context3_custody(self.old_value, self.old_history).forward)
+        with self.assertRaises(evidence.CompatRefusal): bridge.validate_current_source(self.old_value)
+        with self.assertRaises(evidence.CompatRefusal): bridge.qualify(self.old_value, self.old_history)
 
     def test_historical_context2_keeps_exact_old_none_pending_semantics(self):
-        old = replace(self.value, pending=None)
-        history = collected(self.value, version=2)
-        with mock.patch.object(bridge.collect, 'WORKFLOW_SHA256', 'f'*64):
-            self.assertTrue(bridge._qualify_context2_custody(old, history).forward)
-            with self.assertRaises(evidence.CompatRefusal): bridge._qualify_context2_custody(self.value, history)
-            with self.assertRaises(evidence.CompatRefusal): bridge._qualify_context3_custody(old, history)
+        old = replace(self.old_value, pending=None)
+        with actions.w0_epoch():
+            history = collected(self.old_value, version=2)
+        self.assertEqual(bridge.collect.WORKFLOW_SHA256, actions.P_WORKFLOW_SHA256)
+        self.assertTrue(bridge._qualify_context2_custody(old, history).forward)
+        with self.assertRaises(evidence.CompatRefusal): bridge._qualify_context2_custody(self.old_value, history)
+        with self.assertRaises(evidence.CompatRefusal): bridge._qualify_context3_custody(old, history)
 
     def test_historical_route_does_not_resurrect_context2_as_current3(self):
         history = collected(self.value, version=2)

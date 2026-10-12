@@ -1,5 +1,6 @@
 """Real composed outage source/transport boundaries with synthetic commands."""
 import ast
+import hashlib
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
@@ -14,6 +15,35 @@ import test_compat_request as bridge_fixture
 import test_compat_negative_index as index_fixture
 import test_compat_negative_transport as index_world
 import test_record_resolver as source
+
+
+def namespace_bytes(files, sha):
+    """Complete synthetic Git tree projection, including real blob/tree OIDs.
+
+    This models only the fixed read command; it never imports these sources.
+    Actual Git traversal has separate disposable-repository coverage.
+    """
+    paths = ship.resolver.source_git._PUBLISHER_PATHS
+    entries = {}
+    for (revision, path), raw in files.items():
+        if revision == sha and any(path == root or path.startswith(root + "/") for root in paths):
+            oid = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+            entries[path] = ("100644", "blob", oid)
+    for path in tuple(entries):
+        parent = path.rpartition("/")[0]
+        while parent:
+            if parent not in entries: entries[parent] = ("040000", "tree", None)
+            parent = parent.rpartition("/")[0]
+    for path in sorted(entries, key=lambda item: item.count("/"), reverse=True):
+        if entries[path][1] != "tree": continue
+        children = [(name.rpartition("/")[2], value) for name, value in entries.items()
+                    if name.rpartition("/")[0] == path]
+        children.sort(key=lambda row: row[0] + ("/" if row[1][1] == "tree" else ""))
+        raw = b"".join((mode.lstrip("0") + " " + name).encode("ascii") + b"\0" + bytes.fromhex(oid)
+                       for name, (mode, kind, oid) in children)
+        entries[path] = ("040000", "tree", hashlib.sha1(b"tree " + str(len(raw)).encode() + b"\0" + raw).hexdigest())
+    ordered = sorted(entries, key=lambda path: path + ("/" if entries[path][1] == "tree" else ""))
+    return b"".join((" ".join(entries[path]) + "\t" + path + "\0").encode("ascii") for path in ordered)
 
 
 class OutageCase:
@@ -36,8 +66,36 @@ class OutageCase:
         self.inventory = {}
         files = self._closure() if full_closure else {
             ".github/workflows/compat.yml": (source.ROOT / ".github/workflows/compat.yml").read_bytes(),
-            "release/compat/negative_index.py": b"# complete synthetic publisher module\n"}
+            "release/compat/negative_index.py": b"# complete synthetic publisher module\n",
+            "release/compat/attest_evidence.py": b"# complete synthetic preparer module\n"}
+        # The fixture's complete source namespace is distinct from its executed
+        # inventory. Ordinary source facts already include drills.json at H.
+        for (revision, path), raw in tuple(self.world.files.items()):
+            if revision == self.sha and path.startswith(("release/compat/", "release/deployment/")):
+                self.world.files[self.producer, path] = raw
+        if full_closure:
+            for directory in (source.ROOT / "release/compat", source.ROOT / "release/deployment"):
+                for path in directory.rglob("*"):
+                    # Interpreter-generated checkout caches are not part of
+                    # this controlled committed-source fixture. Adversarial
+                    # tracked caches are installed explicitly by tests below.
+                    if path.is_file() and "__pycache__" not in path.parts and path.suffix not in (".pyc", ".pyo"):
+                        relative = path.relative_to(source.ROOT).as_posix()
+                        for sha in (self.producer, self.sha): self.world.files[sha, relative] = path.read_bytes()
         for path, raw in files.items(): self._install_blob(path, raw)
+        self.namespace_response = lambda sha, raw: raw
+        # One shared Git seam serves both direct resolver captures and the
+        # composed preflight. ControlledWorld.__call__ still owns its trace and
+        # before/after hooks; later test wrappers can delegate to this function.
+        original_git = self.world.git
+        def git(args):
+            sg = ship.resolver.source_git
+            if (len(args) == 11 and tuple(args[:5]) == sg._PUBLISHER_TREE_ARGS
+                    and args[6] == "--" and tuple(args[7:]) == sg._PUBLISHER_PATHS):
+                raw = namespace_bytes(self.world.files, args[5])
+                return ship.runtime.Capture(0, self.namespace_response(args[5], raw), b"")
+            return original_git(args)
+        self.world.git = git
         self._policy()
         self.serial = 0
         self.expected = self._resolve_expected()
@@ -59,7 +117,8 @@ class OutageCase:
         # Fixed source inputs read by validators are also retained independently.
         modules = {p.stem: p for directory in (source.ROOT / "release/deployment", source.ROOT / "release/compat")
                    for p in directory.glob("*.py") if not p.name.startswith("test_")}
-        todo, seen = [source.ROOT / "release/compat/negative_index.py"], {}
+        todo, seen = [source.ROOT / "release/compat/negative_index.py",
+                      source.ROOT / "release/compat/attest_evidence.py"], {}
         while todo:
             path = todo.pop()
             relative = path.relative_to(source.ROOT).as_posix()
@@ -318,6 +377,126 @@ class OutagePreflightTests(unittest.TestCase):
                     replace(value, index=replace(value.index, setup_sha256="f"*64)))
         for changed in variants:
             with self.assertRaises(ship.evidence.CompatRefusal): ship.validate_preserved(changed)
+
+
+class PublisherNamespacePreflightTests(unittest.TestCase):
+    make = OutagePreflightTests.make
+    refusal = OutagePreflightTests.refusal
+
+    def test_exact_logical_roles_and_commands_survive_raw_custody(self):
+        case = self.make()
+        with case.installed(): value = case.run()
+        rows = value.source.coverage.namespaces
+        self.assertEqual(tuple(row.source_sha for row in rows), (case.producer, case.sha))
+        self.assertEqual(rows[0].raw, namespace_bytes(case.world.files, case.producer))
+        self.assertEqual(rows[1].raw, namespace_bytes(case.world.files, case.sha))
+        calls = [(phase, args, opts) for phase, args, opts in case.calls if "--full-tree" in args]
+        self.assertEqual([phase for phase, _, _ in calls], ["source-before"] * 2 + ["source-after"] * 2)
+        self.assertTrue(all(opts["stdout_limit"] == 65536 for _, _, opts in calls))
+        self.assertEqual(value, ship.validate_preserved(value))
+
+    def test_added_packages_stdlib_shadows_and_candidate_binaries_are_uncovered(self):
+        for path in ("release/compat/public_evidence/__init__.py", "release/deployment/json.py",
+                     "release/compat/__pycache__/public_evidence.cpython-312.pyc",
+                     "release/compat/public_evidence.pyo", "release/compat/public_evidence.abi3.so",
+                     "release/compat/public_evidence.PYD"):
+            with self.subTest(path=path):
+                case = self.make(); original = case.policy_raw
+                case.world.files[case.sha, path] = b"synthetic shadow"
+                self.assertNotIn(path, case.inventory)
+                self.assertEqual(case.policy_raw, original)
+                self.assertIn("uncovered", str(self.refusal(case)))
+
+    def test_preexisting_dormant_cache_or_native_content_never_grants_coverage(self):
+        for path in ("release/compat/__pycache__/public_evidence.cpython-312.pyc",
+                     "release/compat/unused.PYC", "release/compat/unused.so", "release/compat/unused.pyd"):
+            with self.subTest(path=path):
+                case = self.make()
+                case.world.files[case.producer, path] = b"ignored old cache"
+                case.world.files[case.sha, path] = b"different candidate executable"
+                self.assertIn("uncovered", str(self.refusal(case)))
+
+    def test_ancestor_and_nested_attributes_are_uncovered_even_if_unchanged(self):
+        for path in (".gitattributes", "release/.gitattributes", "release/compat/.gitattributes",
+                     "release/deployment/fixtures/.gitattributes"):
+            with self.subTest(path=path):
+                case = self.make()
+                for sha in (case.producer, case.sha): case.world.files[sha, path] = b"*.py filter=unexpected\n"
+                self.assertIn("uncovered", str(self.refusal(case)))
+
+    def test_topology_and_native_changes_do_not_poison_a_qualifying_normal_proof(self):
+        for path in ("release/compat/public_evidence/__init__.py", "release/compat/unused.so", ".gitattributes"):
+            with self.subTest(path=path):
+                case = self.make()
+                case.world.files[case.sha, path] = b"foreign"
+                case.negative_world.service = ship.runtime.Capture(0, index_fixture.http(200), b"")
+                with case.installed(): value = case.run()
+                self.assertIs(type(value), ship.normal.NormalPreflight)
+                self.assertEqual(len(case.negative_world.calls), 3)
+
+    def test_existing_unimported_content_can_change_without_freezing_tree_oids(self):
+        case = self.make()
+        path = "release/compat/qualify_negative_index.py"
+        case.world.files[case.producer, path] = b"old nonimported helper"
+        case.world.files[case.sha, path] = b"changed nonimported helper"
+        with case.installed(): value = case.run()
+        rows = value.source.coverage.namespaces
+        self.assertNotEqual(rows[0].raw, rows[1].raw)
+        self.assertEqual(value, ship.validate_preserved(value))
+
+    def test_preparer_bytes_are_pinned_separately_from_topology(self):
+        case = self.make(); path = "release/compat/attest_evidence.py"
+        self.assertIn(path, case.inventory)
+        case.world.files[case.sha, path] += b"# changed behavior\n"
+        self.assertIn("uncovered", str(self.refusal(case)))
+
+    def test_before_after_namespace_change_is_not_hidden_by_equal_listed_blobs(self):
+        case = self.make()
+        def after(phase, argv):
+            if phase == "negative-index" and ship.negative.ACTIONS_ENDPOINT in argv:
+                case.world.files[case.sha, "release/compat/new_package/__init__.py"] = b"new"
+        case.after = after
+        self.assertIn("source-changed", str(self.refusal(case)))
+
+    def test_raw_capture_truncation_bound_and_deadline_refuse_without_actions(self):
+        for change in ("truncated", "overbound", "deadline"):
+            with self.subTest(change=change):
+                case = self.make()
+                def response(sha, raw):
+                    if change == "deadline": case.clock.now = case.deadline
+                    return raw[:-1] if change == "truncated" else b"x" * 65537 if change == "overbound" else raw
+                case.namespace_response = response
+                self.refusal(case)
+                self.assertFalse(any(phase == "actions" for phase, _, _ in case.calls))
+
+    def test_raw_holder_role_inventory_and_leaf_oid_are_replayed(self):
+        case = self.make()
+        with case.installed(): value = case.run()
+        coverage = value.source.coverage; rows = coverage.namespaces
+        variants = (rows[:-1], rows + (rows[0],), rows[::-1],
+                    (replace(rows[0], source_sha='f' * 40), rows[1]),
+                    (replace(rows[0], raw=True), rows[1]))
+        # Same topology, wrong metadata for a separately pinned executable.
+        raw = rows[0].raw
+        for line in raw.split(b"\0"):
+            if line.endswith(b"\trelease/compat/negative_index.py"):
+                wrong = line.split(b"\t")[0].rsplit(b" ", 1)[0] + b" " + b"f" * 40 + b"\trelease/compat/negative_index.py"
+                variants += ((replace(rows[0], raw=raw.replace(line, wrong)), rows[1]),)
+        for changed in variants:
+            with self.subTest(changed=changed), self.assertRaises(ship.evidence.CompatRefusal):
+                ship.validate_preserved(replace(value, source=replace(value.source,
+                    coverage=replace(coverage, namespaces=changed))))
+
+    def test_namespace_bytes_share_original_source_cap_before_parsing(self):
+        case = self.make()
+        with case.installed(): value = case.run()
+        coverage = value.source.coverage
+        payload = b'x' * ship.negative.MAX_SOURCE
+        blobs = tuple(replace(row, raw=payload) for row in coverage.blobs)
+        with mock.patch.object(ship.resolver.source_git, 'publisher_namespace', side_effect=AssertionError('parsed early')):
+            with self.assertRaisesRegex(ship.evidence.CompatRefusal, 'source-bound'):
+                ship.validate_preserved(replace(value, source=replace(value.source,
+                    coverage=replace(coverage, blobs=blobs))))
 
 
 if __name__ == "__main__":

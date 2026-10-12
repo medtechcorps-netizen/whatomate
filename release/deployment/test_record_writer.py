@@ -65,11 +65,14 @@ def contract_observation(value, *, at=composition.actions.NOW, events=1):
 
 
 def historical_handoff(value, *, observation=None, workflow_execution=None):
-    """Synthetic historical context2 custody, never a current admission."""
-    history = composition.collected(value, version=2)
-    return writer._prepare_promotion_context2_custody(replace(value, pending=None), history,
-        images(value), execution() if workflow_execution is None else workflow_execution,
-        staging='passed', drills=observation)
+    """Synthetic original W0/context2 custody, never current admission."""
+    value = replace(value, workflow=composition.actions.W0_WORKFLOW,
+        workflow_sha256=composition.actions.W0_WORKFLOW_SHA256)
+    with composition.actions.w0_epoch():
+        history = composition.collected(value, version=2)
+        return writer._prepare_promotion_context2_custody(replace(value, pending=None), history,
+            images(value), execution() if workflow_execution is None else workflow_execution,
+            staging='passed', drills=observation)
 
 
 def retained_pending_resolution():
@@ -909,20 +912,22 @@ class HistoricalContext3WriterTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         composition.source.ForwardResolverTests.setUpClass()
-        cls.value = composition.resolution()
-        cls.history = composition.collected(cls.value)
-        cls.handoff = writer.prepare_promotion(cls.value, cls.history, images(cls.value), execution(),
-                                              staging='passed', drills=drills(cls.value))
+        with composition.actions.w0_epoch():
+            cls.value = composition.resolution()
+            cls.history = composition.collected(cls.value)
+            cls.handoff = writer.prepare_promotion(cls.value, cls.history, images(cls.value), execution(),
+                                                  staging='passed', drills=drills(cls.value))
 
     def test_closed_context3_replay_preserves_old_workflow_but_current_prepare_refuses(self):
-        with mock.patch.object(writer.collect, 'WORKFLOW_SHA256', 'f'*64):
-            rebuilt = writer._prepare_promotion_context3_custody(self.value, self.history, images(self.value),
-                execution(), staging='passed', drills=drills(self.value))
-            self.assertEqual(rebuilt, self.handoff)
-            self.assertTrue(writer._build_promotion_context3_custody(rebuilt, publication(), self.value.resolved))
-            with self.assertRaises(writer.WriterRefusal):
-                writer.prepare_promotion(self.value, self.history, images(self.value), execution(),
-                                         staging='passed', drills=drills(self.value))
+        self.assertEqual(writer.collect.WORKFLOW_SHA256, composition.actions.P_WORKFLOW_SHA256)
+        self.assertEqual(self.value.workflow, composition.actions.W0_WORKFLOW)
+        rebuilt = writer._prepare_promotion_context3_custody(self.value, self.history, images(self.value),
+            execution(), staging='passed', drills=drills(self.value))
+        self.assertEqual(rebuilt, self.handoff)
+        self.assertTrue(writer._build_promotion_context3_custody(rebuilt, publication(), self.value.resolved))
+        with self.assertRaises(writer.WriterRefusal):
+            writer.prepare_promotion(self.value, self.history, images(self.value), execution(),
+                                     staging='passed', drills=drills(self.value))
 
     def test_historical_context3_keeps_original_drill_and_subject_binding(self):
         h = self.handoff

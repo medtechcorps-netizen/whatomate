@@ -133,10 +133,11 @@ class NegativeTransportTests(unittest.TestCase):
     def test_public_unconfigured_factories_precede_every_argument_effect(self):
         class Bomb:
             def __getattribute__(self, name): raise AssertionError("argument inspected")
-        for factory in (transport.open_reader, transport.open_publisher):
-            with self.subTest(factory=factory.__name__), mock.patch.object(transport, "_open", side_effect=AssertionError("client created")):
-                with self.assertRaisesRegex(policy.NegativeIndexRefusal, "^negative-index-unconfigured$"):
-                    factory(Bomb(), Bomb(), Bomb(), budget=Bomb(), base_env=Bomb())
+        with mock.patch.object(policy, "_INSTALLED_PRODUCER_SETUP", None):
+            for factory in (transport.open_reader, transport.open_publisher):
+                with self.subTest(factory=factory.__name__), mock.patch.object(transport, "_open", side_effect=AssertionError("client created")):
+                    with self.assertRaisesRegex(policy.NegativeIndexRefusal, "^negative-index-unconfigured$"):
+                        factory(Bomb(), Bomb(), Bomb(), budget=Bomb(), base_env=Bomb())
         self.assertEqual(self.world.calls, [])
 
     def test_public_classes_do_not_accept_constructor_trust(self):

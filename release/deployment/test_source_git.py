@@ -59,6 +59,55 @@ class SourceGitTests(unittest.TestCase):
                 with self.transport().operation() as reader:
                     reader.read_blob(self.repo.head(), "foreign")
 
+    def test_fixed_publisher_namespace_reads_real_tree_order_and_exact_blob_oids(self):
+        head = self.repo.commit({"release/compat/a.c": "unimported\n",
+            "release/compat/a/file.py": "# nested\n", "release/deployment/policy.py": "# policy\n"})
+        args = [*sg._PUBLISHER_TREE_ARGS, head, "--", *sg._PUBLISHER_PATHS]
+        captures = []
+        def capture(argv, **options):
+            captures.append((argv, options))
+            return sg.runtime.bounded_command(argv, **options)
+        with self.transport(capture=capture).operation() as reader:
+            raw = reader.output(self.repo.root, args, code="unused")
+        rows = sg.publisher_namespace(raw)
+        self.assertEqual([row[0] for row in rows], ["release", "release/compat",
+            "release/compat/a.c", "release/compat/a", "release/compat/a/file.py",
+            "release/deployment", "release/deployment/policy.py"])
+        expected = hashlib.sha1(b"blob 9\0# nested\n").hexdigest()
+        self.assertEqual(dict((row[0], row[3]) for row in rows)["release/compat/a/file.py"], expected)
+        command = next(options for argv, options in captures if "--full-tree" in argv)
+        self.assertEqual(command["stdout_limit"], 65536)
+        self.assertLessEqual(command["timeout"], 15)
+
+    def test_publisher_command_has_only_fixed_paths_flags_and_immutable_sha(self):
+        good = [*sg._PUBLISHER_TREE_ARGS, self.base, "--", *sg._PUBLISHER_PATHS]
+        bad = [good[:5] + ["HEAD"] + good[6:], good[:-1], good + ["other"],
+               good[:7] + list(reversed(good[7:])),
+               [value for value in good if value != "-t"],
+               good[:7] + [".gitattributes", "release/.gitattributes", "release/compat", "release/deployment-other"]]
+        for args in bad:
+            with self.subTest(args=args), self.assertRaisesRegex(sg.SourceGitRefusal, "source-grammar"):
+                with self.transport().operation() as reader:
+                    reader.output(self.repo.root, args, code="private")
+
+    def test_real_git_consumer_leaf_is_the_only_normalized_addition(self):
+        first = self.repo.commit({"release/compat/publisher.py": "# fixed\n",
+                                  "release/deployment/policy.py": "# fixed\n"})
+        second = self.repo.commit({sg._PUBLISHER_CONSUMER: "{}\n"})
+        values = []
+        with self.transport().operation() as reader:
+            for sha in (first, second):
+                raw = reader.output(self.repo.root,
+                    [*sg._PUBLISHER_TREE_ARGS, sha, "--", *sg._PUBLISHER_PATHS], code="unused")
+                values.append(sg.publisher_namespace(raw))
+        self.assertNotEqual(values[0], values[1])  # real changed tree OIDs
+        self.assertEqual(tuple(row[:3] for row in values[0]), tuple(row[:3] for row in values[1]))
+        third = self.repo.commit({"release/.gitattributes": "*.py -text\n"})
+        with self.transport().operation() as reader:
+            raw = reader.output(self.repo.root,
+                [*sg._PUBLISHER_TREE_ARGS, third, "--", *sg._PUBLISHER_PATHS], code="unused")
+        self.assertIsNone(sg.publisher_namespace(raw))
+
     def test_immutable_grammar_rejects_refs_options_paths_and_mutations(self):
         bad = [["cat-file", "-t", "HEAD"], ["show", self.base + ":../private"],
                ["show", self.base + ":.git/config"], ["show", self.base + ":(top)private"],
@@ -245,6 +294,86 @@ class SourceGitTests(unittest.TestCase):
             with self.transport().operation():
                 result = sc.classify(self.repo.root, base, head)
                 self.assertIn("guarded-function:cmd/whatomate/main.go#runRLSMigration", result.reasons)
+
+
+class PublisherNamespaceParserTests(unittest.TestCase):
+    def rows(self, extra=()):
+        rows = [("release", "040000", "tree", "a" * 40),
+                ("release/compat", "040000", "tree", "b" * 40),
+                ("release/compat/publisher.py", "100644", "blob", "c" * 40),
+                ("release/deployment", "040000", "tree", "d" * 40),
+                ("release/deployment/policy.py", "100644", "blob", "e" * 40), *extra]
+        return sorted(rows, key=lambda row: row[0] + ("/" if row[2] == "tree" else ""))
+
+    def wire(self, rows):
+        return b"".join((" ".join(row[1:]) + "\t" + row[0] + "\0").encode("ascii") for row in rows)
+
+    def test_malformed_framing_order_scope_oid_and_parent_are_rejected(self):
+        good = self.rows(); raw = self.wire(good)
+        variants = [raw[:-1], raw + b"\0", raw + raw.split(b"\0")[0] + b"\0",
+                    self.wire(good[::-1]), self.wire(good[1:]),
+                    raw.replace(b"100644 blob", b"100644 tree", 1),
+                    raw.replace(b"c" * 40, b"C" * 40, 1),
+                    self.wire(self.rows((("other", "100644", "blob", "f" * 40),))),
+                    self.wire(self.rows((("release/compat/MISSING/x.py", "100644", "blob", "f" * 40),))),
+                    self.wire(self.rows((("release/compat/PUBLISHER.py", "100644", "blob", "f" * 40),)))]
+        for value in variants:
+            with self.subTest(value=value), self.assertRaises(sg.SourceGitRefusal):
+                sg.publisher_namespace(value)
+
+    def test_raw_exact_type_and_size_are_bounded(self):
+        for value in (True, "", bytearray(self.wire(self.rows())), b"x" * 65537):
+            with self.subTest(value=type(value)), self.assertRaises(sg.SourceGitRefusal):
+                sg.publisher_namespace(value)
+        self.assertIsNone(sg.publisher_namespace(b""))
+
+    def test_path_controls_noncanonical_components_depth_and_length_refuse(self):
+        names = ("/release/compat/x", "release/compat/../x", "release/compat//x",
+                 "release/compat/.git/x", "release/compat/a\\b", "release/compat/a\tb",
+                 "release/compat/a\nb", "release/compat/" + "x" * 513)
+        for name in names:
+            with self.subTest(name=name), self.assertRaises(sg.SourceGitRefusal):
+                sg.publisher_namespace(self.wire(self.rows(((name, "100644", "blob", "f" * 40),))))
+        rows = self.rows()
+        for index in range(15):
+            rows.append(("release/compat/" + "/".join(["x"] * (index + 1)), "040000", "tree", "f" * 40))
+        rows.sort(key=lambda row: row[0] + ("/" if row[2] == "tree" else ""))
+        with self.assertRaises(sg.SourceGitRefusal): sg.publisher_namespace(self.wire(rows))
+        with self.assertRaises(sg.SourceGitRefusal): sg.publisher_namespace(self.wire(self.rows()).replace(b"publisher.py", b"bad\xff.py"))
+
+    def test_missing_replaced_roots_and_valid_nonregular_nodes_are_uncovered(self):
+        for mode, kind in (("120000", "blob"), ("160000", "commit"), ("100644", "blob")):
+            rows = [row for row in self.rows() if not row[0].startswith("release/compat/")]
+            rows = [(path, mode, kind, oid) if path == "release/compat" else (path, old_mode, old_kind, oid)
+                    for path, old_mode, old_kind, oid in rows]
+            rows.sort(key=lambda row: row[0] + ("/" if row[2] == "tree" else ""))
+            self.assertIsNone(sg.publisher_namespace(self.wire(rows)))
+        self.assertIsNone(sg.publisher_namespace(self.wire([row for row in self.rows()
+            if not row[0].startswith("release/compat")])))
+        for mode, kind in (("120000", "blob"), ("160000", "commit")):
+            self.assertIsNone(sg.publisher_namespace(self.wire(self.rows((
+                ("release/compat/foreign", mode, kind, "f" * 40),)))))
+
+    def test_attributes_cache_and_native_candidates_are_ineligible_with_same_topology(self):
+        for path in (".gitattributes", "release/.gitattributes", "release/compat/.GITATTRIBUTES",
+                     "release/compat/unused.PYC", "release/deployment/unused.pyo",
+                     "release/compat/unused.abi3.so", "release/deployment/unused.PYD"):
+            with self.subTest(path=path):
+                self.assertIsNone(sg.publisher_namespace(self.wire(self.rows(((path, "100644", "blob", "f" * 40),)))))
+        rows = self.rows((("release/compat/__PYCACHE__", "040000", "tree", "f" * 40),))
+        self.assertIsNone(sg.publisher_namespace(self.wire(rows)))
+
+    def test_only_exact_regular_consumer_json_is_removed(self):
+        expected = tuple(self.rows())
+        for mode in ("100644", "100755"):
+            self.assertEqual(sg.publisher_namespace(self.wire(self.rows((
+                (sg._PUBLISHER_CONSUMER, mode, "blob", "f" * 40),)))), expected)
+        for mode, kind in (("040000", "tree"), ("120000", "blob"), ("160000", "commit")):
+            self.assertIsNone(sg.publisher_namespace(self.wire(self.rows((
+                (sg._PUBLISHER_CONSUMER, mode, kind, "f" * 40),)))))
+        for path in (sg._PUBLISHER_CONSUMER + ".py", sg._PUBLISHER_CONSUMER.upper().replace("RELEASE/DEPLOYMENT", "release/deployment")):
+            parsed = sg.publisher_namespace(self.wire(self.rows(((path, "100644", "blob", "f" * 40),))))
+            self.assertIn(path, [row[0] for row in parsed])
 
 
 if __name__ == "__main__":

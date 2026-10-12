@@ -5,6 +5,7 @@ The caller must roundtrip custody and check its original deadline before I/O.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
 import time
@@ -72,16 +73,42 @@ def _coverage(source):
     sha = resolution.candidate.sha
     _need(type(coverage.ancestry) is tuple and len(coverage.ancestry) == len(parsed.lineage)
           and type(coverage.blobs) is tuple
-          and len(coverage.blobs) == 2 * sum(len(row.inventory) for row in parsed.lineage), "inventory")
-    total, position, covered = 0, 0, False
+          and len(coverage.blobs) == 2 * sum(len(row.inventory) for row in parsed.lineage)
+          and type(coverage.namespaces) is tuple
+          and len(coverage.namespaces) == 2 * len(parsed.lineage), "inventory")
+    _need(all(type(row) is resolver.PublisherNamespace and type(row.raw) is bytes
+              and len(row.raw) <= resolver.source_git.PUBLISHER_NAMESPACE_LIMIT
+              for row in coverage.namespaces)
+          and all(type(row) is resolver.PublisherBlob and (row.raw is None or
+              type(row.raw) is bytes and len(row.raw) <= negative.MAX_SOURCE) for row in coverage.blobs),
+          "source-bound")
+    _need(sum(len(row.raw) for row in coverage.namespaces)
+          + sum(len(row.raw) if row.raw is not None else 0 for row in coverage.blobs)
+          <= negative.MAX_SOURCE_TOTAL, "source-bound")
+    total, position, namespace_position, covered = 0, 0, 0, False
     for lineage, ancestry in zip(parsed.lineage, coverage.ancestry, strict=True):
         _need(type(ancestry) is resolver.PublisherAncestry
               and ancestry.producer_sha == lineage.producer_sha and ancestry.head_sha == sha
               and type(ancestry.merge_base_sha) is str
               and common.SHA1_RE.fullmatch(ancestry.merge_base_sha), "ancestry")
         matches = ancestry.merge_base_sha == lineage.producer_sha
+        namespaces = []
+        for source_sha in (lineage.producer_sha, sha):
+            namespace = coverage.namespaces[namespace_position]; namespace_position += 1
+            _need(type(namespace) is resolver.PublisherNamespace and namespace.source_sha == source_sha
+                  and type(namespace.raw) is bytes
+                  and len(namespace.raw) <= resolver.source_git.PUBLISHER_NAMESPACE_LIMIT, "namespace-role")
+            total += len(namespace.raw)
+            _need(total <= negative.MAX_SOURCE_TOTAL, "source-bound")
+            namespaces.append(resolver.source_git.publisher_namespace(namespace.raw))
+        if any(row is None for row in namespaces):
+            matches = False
+        else:
+            matches &= (tuple(row[:3] for row in namespaces[0]) == tuple(row[:3] for row in namespaces[1]))
+        namespace_maps = tuple({row[0]: row for row in rows} if rows is not None else {}
+                               for rows in namespaces)
         for row in lineage.inventory:
-            for source_sha in (lineage.producer_sha, sha):
+            for role, source_sha in enumerate((lineage.producer_sha, sha)):
                 blob = coverage.blobs[position]; position += 1
                 _need(type(blob) is resolver.PublisherBlob and blob.source_sha == source_sha
                       and blob.path == row.path, "blob-role")
@@ -95,6 +122,9 @@ def _coverage(source):
                     _need(total <= negative.MAX_SOURCE_TOTAL, "source-bound")
                     matches &= (blob.mode == row.mode and len(blob.raw) == row.byte_count
                                 and common.sha256_bytes(blob.raw) == row.sha256)
+                    if any(row.path.startswith(root + "/") for root in resolver.source_git._PUBLISHER_ROOTS):
+                        oid = hashlib.sha1(b"blob " + str(len(blob.raw)).encode("ascii") + b"\0" + blob.raw).hexdigest()
+                        matches &= namespace_maps[role].get(row.path) == (row.path, blob.mode, "blob", oid)
         # Deterministic sorted policy order; no caller-selected producer.
         if matches and not covered:
             covered = True

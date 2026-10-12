@@ -39,7 +39,8 @@ class World(actions.World):
         self.before = lambda argv: None
         self.git_hook = lambda args, result: result
 
-    def add_row(self, row):
+    def add_row(self, row, *, workflow=None):
+        workflow = WORKFLOW if workflow is None else workflow
         value = json.loads(row.envelope.raw)
         run = dict(value['run'])
         run.pop('latest_run_attempt')
@@ -51,7 +52,7 @@ class World(actions.World):
         if current is None or current['run_attempt'] < run['run_attempt']:
             self.runs[run['id']] = run
         self.artifacts.setdefault(run['id'], [])
-        self.workflow_bytes.setdefault(run['head_sha'], WORKFLOW)
+        self.workflow_bytes.setdefault(run['head_sha'], workflow)
         if type(row.measurement) is evidence.AuthenticatedPair:
             meta = next(item for item in value['artifacts']
                         if item['name'] == f"compat-result-{run['head_sha']}-{run['run_attempt']}")
@@ -60,7 +61,7 @@ class World(actions.World):
             self.artifacts[run['id']].append(meta)
             self.archives[meta['id']] = raw, key
             self.pairs[key] = row.measurement
-            attempt = envelope.replay(envelope.WorkflowObservation(run['head_sha'], WORKFLOW),
+            attempt = envelope.replay(envelope.WorkflowObservation(run['head_sha'], workflow),
                 row.envelope, observed_at=NOW).attempt
             self.signers[key] = signature.SyntheticGh(attempt)
         return row
@@ -453,7 +454,21 @@ class SharedProjectionTests(unittest.TestCase):
         with self.assertRaises(evidence.CompatRefusal): collect._canonical({'a':1}, 7)
 
     def test_rollback_own_w0_source_window_survives_current_pin_transition(self):
-        with mock.patch.object(envelope, 'WORKFLOW_SHA256', 'f'*64), harness() as (world, repo, options):
+        with actions.w0_epoch():
+            old = histories.row(run=90,number=9,minute=1,sha='b'*40)
+        world=World();world.add();world.add_row(old,workflow=actions.W0_WORKFLOW)
+        with harness(world) as (world, repo, options):
             result = execute(world, repo, options)
             self.assertEqual(qualify(world, result).run_id, 100)
-            self.assertEqual(len([a for a, _ in world.trace if a[1:3] == ['attestation', 'verify']]), 2)
+            self.assertEqual(len([a for a, _ in world.trace if a[1:3] == ['attestation', 'verify']]), 4)
+            self.assertEqual(next(w.raw for w in result.history.workflows if w.sha=='b'*40), actions.W0_WORKFLOW)
+            self.assertEqual(next(w.raw for w in result.history.workflows if w.sha==world.binding.producer_sha), WORKFLOW)
+
+
+class CurrentWorkflowTransitionTests(unittest.TestCase):
+    def test_current_producer_cannot_collect_under_w0(self):
+        with actions.w0_epoch():
+            world=World();world.add()
+        with harness(world) as (world, repo, options):
+            with self.assertRaises(evidence.CompatRefusal): execute(world,repo,options)
+        self.assertFalse(any(a[1:3]==['attestation','verify'] for a,_ in world.trace))

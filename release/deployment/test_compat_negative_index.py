@@ -104,11 +104,48 @@ class NegativeIndexTests(unittest.TestCase):
         self.refused_setup(value)
 
     def test_unconfigured_loaders_have_no_effects_or_fallback(self):
-        self.assertIsNone(policy._INSTALLED_PRODUCER_SETUP)
         self.assertIsNone(policy._INSTALLED_CONSUMER_POLICY)
-        with mock.patch.object(policy, "_load", side_effect=AssertionError("parse before configured")):
+        with mock.patch.object(policy, "_INSTALLED_PRODUCER_SETUP", None), \
+             mock.patch.object(policy, "_load", side_effect=AssertionError("parse before configured")):
+            self.assertIsNone(policy._INSTALLED_PRODUCER_SETUP)
             for loader in (policy.load_producer_setup, policy.load_consumer_policy):
                 with self.assertRaisesRegex(policy.NegativeIndexRefusal, "^negative-index-unconfigured$"): loader()
+
+    def test_installed_producer_setup_preserves_reviewed_configuration_witness_only(self):
+        # Configuration observation is not hosted permission, signature, source
+        # coverage or outage qualification. Consumer installation stays absent.
+        value = policy.load_producer_setup()
+        self.assertIs(type(value), policy.ProducerSetup)
+        self.assertEqual(value.raw, policy._INSTALLED_PRODUCER_SETUP)
+        self.assertEqual(len(value.raw), 3621)
+        self.assertEqual(digest(value.raw), "35b46518a4503470dbf47b4f19111298baf0d9049eb6819d27028b9924322987")
+        self.assertEqual(value.sha256, digest(value.raw))
+        self.assertEqual(value.rule_id, 24896373)
+        self.assertEqual(value.setup_review_sha256,
+                         "7c656bc617731209f4ee32e8d0f6fff919fcb3f898d2812e19dd07ea529def3e")
+        self.assertEqual(len(value.setup_witness), 3076)
+        self.assertEqual(digest(value.setup_witness),
+                         "1fdc80de2ba32996889d768dd0ab0bc35dc88ef0cdd016084d2a7f3e0e62df03")
+        self.assertEqual(policy.parse_producer_setup(value.raw), value)
+        setup_doc, witness = json.loads(value.raw), json.loads(value.setup_witness)
+        self.assertEqual(wire(setup_doc), value.raw)
+        self.assertEqual(wire(witness), value.setup_witness)
+        self.assertEqual(setup_doc["setup_witness"].encode("utf-8"), value.setup_witness)
+        self.assertEqual((setup_doc["repository"], setup_doc["repository_id"], setup_doc["prefix"]),
+                         (policy.REPOSITORY, policy.REPOSITORY_ID, policy.PREFIX))
+        for name in ("complete_original_post_response", "complete_privileged_response"):
+            self.assertEqual(witness[name]["id"], 24896373)
+            self.assertEqual(witness[name]["created_at"], "2026-10-12T06:08:39.569+08:00")
+            self.assertEqual(witness[name]["updated_at"], "2026-10-12T06:08:39.591+08:00")
+            self.assertEqual(witness[name]["bypass_actors"], [])
+        self.assertEqual(value.created_at, dt.datetime(2026,10,11,22,8,39,569000,tzinfo=dt.timezone.utc))
+        self.assertEqual(value.updated_at-value.created_at, dt.timedelta(milliseconds=22))
+        self.assertEqual(value.witness_observed_at, NOW)
+        self.assertIn("Configuration only", witness["qualification"])
+        self.assertIn("remain unqualified", witness["qualification"])
+        self.assertIsNone(policy._INSTALLED_CONSUMER_POLICY)
+        with self.assertRaisesRegex(policy.NegativeIndexRefusal, "^negative-index-unconfigured$"):
+            policy.load_consumer_policy()
 
     def test_original_offset_bytes_and_distinct_fractional_instants_preserved(self):
         value = setup()

@@ -22,7 +22,7 @@ import ship_common as common
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "compat"))
 import runtime
 
-WORKFLOW_SHA256 = "0f8ae9f3079d4a3c0749721e5100d6df60842b4811059aee02a2ee4d8ced4f6b"
+WORKFLOW_SHA256 = "56005fe2015e8385e6ecfc621a403c06a534ed9a5712e5ec4ec4f9c70407b941"
 REPOSITORY_ID = 1297344686
 API = "/repos/" + evidence.REPOSITORY
 WEB = "https://github.com/" + evidence.REPOSITORY

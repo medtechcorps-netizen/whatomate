@@ -1,8 +1,10 @@
-"""Disabled publisher for complete negative compatibility measurements.
+"""Publisher for complete negative compatibility measurements.
 
-The installed setup stays absent in the preparatory leaf. A later reviewed
-caller must run this before signing the exact public subjects. Local parsing
-and an intent receipt are not signatures, source eligibility or outage cover.
+Reviewed producer setup is installed. The main-only Compatibility workflow runs
+this before signing the exact public subjects. Setup records configuration only;
+local parsing and intent receipts do not establish hosted permissions, signatures
+or source coverage. Consumer data remains absent and outage admission disabled
+pending independent main/synthetic qualification and a later data-only V PR.
 """
 from dataclasses import dataclass
 import hashlib
