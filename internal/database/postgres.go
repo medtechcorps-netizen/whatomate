@@ -5767,11 +5767,6 @@ func SeedSystemRolesForAllOrgs(db *gorm.DB) error {
 		return fmt.Errorf("failed to migrate user roles: %w", err)
 	}
 
-	// Make admin@admin.com a super admin if exists
-	if err := db.Exec("UPDATE users SET is_super_admin = true WHERE email = 'admin@admin.com'").Error; err != nil {
-		return fmt.Errorf("failed to set super admin: %w", err)
-	}
-
 	return nil
 }
 

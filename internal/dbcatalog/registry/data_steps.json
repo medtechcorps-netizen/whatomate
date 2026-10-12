@@ -424,7 +424,7 @@
   },
   {
     "id": "SeedSystemRolesForAllOrgs",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.SeedSystemRolesForAllOrgs",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -480,7 +480,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "8d0b423d4384c1f4427fbe3f0118e98a3ccdcb2ad24b9f29520111ad346f95e1"
+    "closure_sha256": "0ec934f0e04b190afa35395b1db0f242b673073bcb349156eaa5c99949f8d319"
   },
   {
     "id": "SeedSystemRolesForAllOrgs/seedSystemRolesForOrg",
@@ -728,7 +728,7 @@
   },
   {
     "id": "SeedSystemRolesForAllOrgs/legacy-super-admin-update",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.SeedSystemRolesForAllOrgs",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -784,7 +784,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "8d0b423d4384c1f4427fbe3f0118e98a3ccdcb2ad24b9f29520111ad346f95e1",
+    "closure_sha256": "0ec934f0e04b190afa35395b1db0f242b673073bcb349156eaa5c99949f8d319",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
