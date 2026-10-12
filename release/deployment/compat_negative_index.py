@@ -497,6 +497,10 @@ def _frame(raw):
     _need(separator and 0 < len(head) <= MAX_HEADERS and len(body) <= MAX_BODY)
     newline = b"\r\n" if delimiter == b"\r\n\r\n" else b"\n"
     lines = head.split(newline)
+    # gh --include writes the status with LF and serializes headers with CRLF.
+    # Split only that status boundary; every header and the body stay exact.
+    if newline == b"\r\n" and b"\n" in lines[0]:
+        lines = lines[0].split(b"\n", 1) + lines[1:]
     match = re.fullmatch(rb"HTTP/(?:1\.1|2(?:\.0)?) ([0-9]{3})(?: [ -~]{0,64})?", lines[0])
     _need(match is not None and len(lines) <= 129)
     status, headers = int(match[1]), {}
