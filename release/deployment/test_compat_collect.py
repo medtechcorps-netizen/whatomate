@@ -704,3 +704,300 @@ class NormalGetPolicyTests(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
+
+class OutageCollectorTests(unittest.TestCase):
+    """The ordinary synthetic command world still performs real pair verification."""
+    def retained(self, world=None, *, empty=False, moments=None):
+        with harness(world) as (world, client, scratch):
+            if empty:
+                world.runs.clear()
+            clock = (lambda: next(moments)) if moments is not None else lambda:NOW
+            result = collect.collect_outage_history(REQUEST, client, scratch, wall_clock=clock)
+            self.assertEqual(world.workflow_reads, 2)
+            self.assertEqual(result.normal.command_count, len(world.calls))
+            return result
+
+    def request(self, value):
+        return replace(fixture.request(), observation_id=value.normal.history.observation_id)
+
+    def missing(self, value):
+        return collect.require_missing_expired(self.request(value), value, workflow=WORKFLOW)
+
+    def invalid(self, value, detail=None):
+        with self.assertRaises(evidence.CompatRefusal) as caught:
+            collect.validate_outage_history(value, workflow=WORKFLOW, producer_sha=fixture.SHA)
+        if detail is not None:
+            self.assertEqual(caught.exception.detail, detail)
+
+    def altered(self, value, change):
+        raw = json.loads(value.before.attempts[0].raw)
+        change(raw)
+        fact = collect.envelope.EnvelopeFacts(fixture.canonical(raw))
+        return replace(value, before=replace(value.before, attempts=(fact, *value.before.attempts[1:])),
+                       after=replace(value.after, attempts=(fact, *value.after.attempts[1:])))
+
+    def test_positive_normal_result_and_exact_existing_capture_parity(self):
+        world = World(); world.add()
+        with harness(world) as (w, c, scratch):
+            normal = execute(c, scratch)
+            trace = [(a, o['stdout_limit'], o['stderr_limit']) for a, o in w.calls
+                     if a[1:3] != ['attestation', 'verify']]
+        world = World(); world.add()
+        with harness(world) as (w, c, scratch):
+            retained = collect.collect_outage_history(REQUEST, c, scratch, wall_clock=lambda:NOW)
+            self.assertEqual(retained.normal, normal)
+            self.assertEqual(trace, [(a, o['stdout_limit'], o['stderr_limit']) for a, o in w.calls
+                                   if a[1:3] != ['attestation', 'verify']])
+            self.assertEqual(qualify(retained.normal).run_id, 100)
+            self.assertEqual(len([a for a, _ in w.calls if a[1:3] == ['attestation', 'verify']]), 2)
+        with self.assertRaisesRegex(evidence.CompatRefusal, 'outage-history-no-missing-evidence'):
+            self.missing(retained)
+
+    def test_complete_empty_inventory_is_missing_not_deletion_proof(self):
+        result = self.retained(empty=True)
+        self.assertIs(self.missing(result), result)
+        self.assertEqual(result.before.runs, b'[]\n')
+        self.assertEqual(result.before.attempts, ())
+        self.assertEqual(result.normal.history.whole_run_deletion_coverage, 'unavailable')
+
+    def test_genuine_missing_and_expired_are_derived_from_raw_inventory(self):
+        for expired in (False, True):
+            world = World(); world.add()
+            if expired:
+                world.artifacts[100][0]['expired'] = True
+            else:
+                world.artifacts[100].clear()
+            with self.subTest(expired=expired):
+                result = self.retained(world)
+                self.assertIs(self.missing(result), result)
+                expected = evidence.MissingEvidence.EXPIRED if expired else evidence.MissingEvidence.MISSING
+                self.assertIs(result.normal.history.attempts[0].measurement, expected)
+
+    def test_earlier_positive_and_later_missing_preserve_normal_veto(self):
+        world = World(); world.add(); world.add(200, 20, minute=60)
+        world.artifacts[200].clear()
+        result = self.retained(world)
+        with self.assertRaises(evidence.CompatRefusal):
+            qualify(result.normal)
+        self.assertIs(self.missing(result), result)
+
+    def test_unsuperseded_actual_negative_vetoes_missing_branch(self):
+        world = World(); world.add(negative=True); world.add(200, 20, minute=60)
+        world.add(300, 30, minute=90); world.artifacts[300].clear()
+        result = self.retained(world)
+        with self.assertRaisesRegex(evidence.CompatRefusal, 'compat-old-server-incompatible'):
+            self.missing(result)
+        world = World(); world.add(negative=True); world.add(200, 20, minute=60)
+        result = self.retained(world)
+        self.assertEqual(qualify(result.normal).run_id, 200)
+        with self.assertRaisesRegex(evidence.CompatRefusal, 'compat-old-server-incompatible'):
+            self.missing(result)
+
+    def test_failed_positive_is_not_missing_even_alongside_missing_row(self):
+        world = World(); world.add(); world.add(200, 20, minute=60)
+        world.artifacts[200].clear()
+        world.attempts[100, 1]['conclusion'] = 'cancelled'
+        result = self.retained(world)
+        self.assertIsNotNone(result.normal.history.attempts[0].execution_window)
+        with self.assertRaisesRegex(evidence.CompatRefusal, 'outage-history-positive-unqualified'):
+            self.missing(result)
+
+    def test_wrong_bound_positive_is_not_missing(self):
+        world = World(); world.add(); world.add(200, 20, minute=60); world.artifacts[200].clear()
+        result = self.retained(world)
+        request = self.request(result)
+        changed = replace(request, source=replace(request.source, expected_after_catalog_sha256='f'*64))
+        evidence._request(changed)
+        with self.assertRaisesRegex(evidence.CompatRefusal, 'outage-history-positive-unqualified'):
+            collect.require_missing_expired(changed, result, workflow=WORKFLOW)
+
+    def test_signature_failure_is_unknown_and_cannot_be_missing(self):
+        world = World(); world.add()
+        world.sign_mutate = lambda value, path: value[0]['verificationResult'].update({'statement':{}})
+        result = self.retained(world)
+        self.assertIs(result.normal.history.attempts[0].measurement, evidence.MissingEvidence.UNKNOWN)
+        self.assertEqual(result.normal.issues, ('artifact-unverified',))
+        with self.assertRaises(evidence.CompatRefusal):
+            self.missing(result)
+
+    def test_reused_and_partial_steps_cannot_supply_outage_window(self):
+        for change in ('reused', 'partial'):
+            world = World(); world.add(attempts=2); world.artifacts[100].clear()
+            job = world.jobs[100, 2][0]
+            if change == 'reused':
+                job['created_at'] = world.attempts[100, 1]['run_started_at']
+            else:
+                job['steps'] = [step for step in job['steps'] if step['name'] != world.steps[job['name']][0]]
+            with self.subTest(change=change):
+                result = self.retained(world)
+                with self.assertRaises(evidence.CompatRefusal): self.missing(result)
+
+    def test_active_and_no_work_are_not_missing(self):
+        for mode in ('active', 'no-work'):
+            world = World(); world.add(); world.artifacts[100].clear()
+            if mode == 'active':
+                world.attempts[100, 1].update(status='in_progress', conclusion=None)
+            else:
+                world.attempts[100, 1]['conclusion'] = 'cancelled'
+                for name in evidence.JOBS:
+                    world.set_job(100, 1, name, conclusion='skipped', steps=[])
+            with self.subTest(mode=mode):
+                result = self.retained(world)
+                with self.assertRaises(evidence.CompatRefusal): self.missing(result)
+
+    def test_original_snapshot_times_and_fractional_clock_replay(self):
+        start = NOW + timedelta(microseconds=123)
+        moments = iter(start + timedelta(microseconds=n) for n in range(4))
+        result = self.retained(moments=moments)
+        self.assertEqual(result.started_at, start)
+        self.assertEqual(result.before.observed_at, start + timedelta(microseconds=1))
+        self.assertEqual(result.after.observed_at, start + timedelta(microseconds=2))
+        self.assertEqual(result.normal.history.observed_at, start + timedelta(microseconds=3))
+        for value in (replace(result, started_at=start + timedelta(seconds=1)),
+                      replace(result, before=replace(result.before, observed_at=start.replace(tzinfo=None))),
+                      replace(result, after=replace(result.after, observed_at=start.replace(fold=1)))):
+            self.invalid(value, 'outage-history-clock')
+
+    def test_envelope_uses_its_original_snapshot_time(self):
+        result = self.retained()
+        too_early = fixture.T0 + timedelta(minutes=10)
+        value = replace(result, started_at=too_early, before=replace(result.before, observed_at=too_early))
+        self.invalid(value, 'collect-time')
+
+    def test_each_raw_role_and_normal_commitment_are_bound(self):
+        result = self.retained()
+        for value in (replace(result, before=replace(result.before, workflow_id=901)),
+                      replace(result, after=replace(result.after, runs=b'[]\n')),
+                      replace(result, normal=replace(result.normal, transcript_sha256='a'*64)),
+                      replace(result, normal=replace(result.normal, history=replace(result.normal.history,
+                          observation_id='b'*64)))):
+            self.invalid(value)
+
+    def test_complete_run_listing_cannot_omit_or_change_attempts(self):
+        world = World(); world.add(attempts=2)
+        result = self.retained(world)
+        for facts in (result.before.attempts[:1], tuple(reversed(result.before.attempts)),
+                      (result.before.attempts[0], result.before.attempts[0])):
+            value = replace(result, before=replace(result.before, attempts=facts),
+                            after=replace(result.after, attempts=facts))
+            self.invalid(value)
+
+    def test_closed_raw_keys_canonical_bytes_and_types_are_required(self):
+        result = self.retained()
+        for change in (lambda v:v.update(extra=1), lambda v:v.update(version=True),
+                       lambda v:v['run'].update(latest_run_attempt=True),
+                       lambda v:v['run']['repository'].update(extra=1),
+                       lambda v:v['jobs'][0]['steps'][0].update(extra=1)):
+            self.invalid(self.altered(result, change))
+        fact = collect.envelope.EnvelopeFacts(b' ' + result.before.attempts[0].raw)
+        self.invalid(replace(result, before=replace(result.before, attempts=(fact,)),
+                             after=replace(result.after, attempts=(fact,))))
+
+    def test_complete_check_inventory_and_identity_mutants_refuse(self):
+        result = self.retained()
+        for change in (lambda v:v['checks'].pop(),
+                       lambda v:v['checks'][0]['app'].update(id=1),
+                       lambda v:v['checks'][0].update(head_sha='b'*40),
+                       lambda v:v['jobs'][0].update(run_attempt=2),
+                       lambda v:v['artifacts'][0]['workflow_run'].update(head_sha='b'*40)):
+            self.invalid(self.altered(result, change))
+
+    def test_pair_measurement_cannot_be_relabelled_missing_or_expired(self):
+        result = self.retained(); original = result.normal.history.attempts[0]
+        for measurement in (evidence.MissingEvidence.MISSING, evidence.MissingEvidence.EXPIRED,
+                            evidence.MissingEvidence.UNKNOWN):
+            history = replace(result.normal.history, attempts=(replace(original, measurement=measurement),))
+            self.invalid(replace(result, normal=replace(result.normal, history=history)))
+
+    def test_authenticated_pair_must_bind_exact_raw_artifact(self):
+        result = self.retained(); original = result.normal.history.attempts[0]
+        pair = replace(original.measurement, artifact=replace(original.measurement.artifact, artifact_id=99))
+        history = replace(result.normal.history, attempts=(replace(original, measurement=pair),))
+        self.invalid(replace(result, normal=replace(result.normal, history=history)), 'outage-history-pair')
+
+    def test_supplied_window_is_not_an_authority(self):
+        result = self.retained(); original = result.normal.history.attempts[0]
+        shifted = replace(original.execution_window, started_at=original.execution_window.started_at+timedelta(microseconds=1))
+        history = replace(result.normal.history, attempts=(replace(original, execution_window=shifted),))
+        self.invalid(replace(result, normal=replace(result.normal, history=history)), 'outage-history-derived')
+
+    def test_metadata_bounds_fatal_issues_and_noncanonical_order_refuse(self):
+        result = self.retained()
+        for fields in ({'command_count':True}, {'command_count':0}, {'command_count':6001},
+                       {'captured_bytes':-1}, {'captured_bytes':collect.MAX_BYTES+1},
+                       {'issues':('inventory-changed',)}, {'issues':('collection-deadline',)},
+                       {'issues':('inventory-unavailable',)}, {'issues':('artifact-unverified', 'artifact-unverified')}):
+            self.invalid(replace(result, normal=replace(result.normal, **fields)))
+
+    def test_raw_aggregate_is_checked_before_json_decode_and_counts_both_roles(self):
+        result = self.retained()
+        fact = collect.envelope.EnvelopeFacts(b'x' * collect.envelope.MAX_RAW_BYTES)
+        snap = replace(result.before, attempts=(fact, fact))
+        value = replace(result, before=snap, after=snap)
+        with mock.patch.object(collect.common, 'loads_strict', side_effect=AssertionError('decoded over-bound data')):
+            self.invalid(value, 'outage-history-bound')
+
+    def test_changed_and_failed_second_inventory_refuse_without_new_pass(self):
+        for failed in (False, True):
+            world = World(); world.add()
+            def changed(path, value):
+                if world.workflow_reads == 2 and path.endswith('/actions/workflows/compat.yml'):
+                    if failed: raise evidence.CompatRefusal('compat-stale', 'synthetic-read-failure')
+                    value['id'] = 901
+                return value
+            world.hook = changed
+            with self.subTest(failed=failed), harness(world) as (w, c, scratch):
+                with self.assertRaises(evidence.CompatRefusal):
+                    collect.collect_outage_history(REQUEST, c, scratch, wall_clock=lambda:NOW)
+                self.assertEqual(w.workflow_reads, 2)
+
+    def test_current_write_and_exact_w0_custody_routes_are_separate(self):
+        result = self.retained(empty=True)
+        # No future workflow is invented: only current rejection versus real W0 replay.
+        with mock.patch.object(collect, 'WORKFLOW_SHA256', 'f'*64):
+            self.invalid(result, 'collect-workflow-source')
+            self.assertIs(collect._validate_outage_history_custody(result, workflow=WORKFLOW,
+                producer_sha=fixture.SHA), result)
+            self.assertIs(collect._require_missing_expired_custody(self.request(result), result,
+                workflow=WORKFLOW), result)
+        with self.assertRaises(evidence.CompatRefusal):
+            collect._validate_outage_history_custody(result, workflow=WORKFLOW+b'\n', producer_sha=fixture.SHA)
+
+    def test_request_identity_and_observation_are_required(self):
+        result = self.retained(empty=True)
+        for request in (replace(self.request(result), observation_id='a'*64),
+                        replace(self.request(result), source=replace(self.request(result).source, sha='b'*40))):
+            with self.assertRaises(evidence.CompatRefusal):
+                collect.require_missing_expired(request, result, workflow=WORKFLOW)
+
+    def test_holders_are_immutable_and_container_substitutions_refuse(self):
+        from dataclasses import FrozenInstanceError
+        result = self.retained()
+        with self.assertRaises(FrozenInstanceError): result.started_at = NOW
+        self.invalid(replace(result, before=replace(result.before, attempts=list(result.before.attempts))))
+        self.invalid(replace(result, normal=replace(result.normal, history=replace(result.normal.history,
+            attempts=list(result.normal.history.attempts)))))
+
+
+    def test_capture_limit_counts_both_snapshots_and_signed_pair_bytes(self):
+        baseline = self.retained()
+        raw_bytes = sum(len(snap.runs) + sum(len(row.raw) for row in snap.attempts)
+                        for snap in (baseline.before, baseline.after))
+        pair_bytes = sum(len(row.measurement.result) + len(row.measurement.context)
+                         for row in baseline.normal.history.attempts)
+        self.assertGreater(pair_bytes, 0)
+        with mock.patch.object(collect, 'MAX_OUTAGE_RAW_BYTES', raw_bytes + pair_bytes - 1):
+            with harness() as (world, client, scratch):
+                with self.assertRaises(evidence.CompatRefusal):
+                    collect.collect_outage_history(REQUEST, client, scratch, wall_clock=lambda:NOW)
+                self.assertEqual(world.workflow_reads, 2)
+        self.assertIsNotNone(qualify(baseline.normal))
+
+    def test_normal_then_outage_cannot_reuse_or_refresh_the_same_client(self):
+        with harness() as (world, client, scratch):
+            execute(client, scratch)
+            calls = len(world.calls)
+            with self.assertRaisesRegex(evidence.CompatRefusal, 'collect-client-reuse'):
+                collect.collect_outage_history(REQUEST, client, scratch, wall_clock=lambda:NOW)
+            self.assertEqual(len(world.calls), calls)

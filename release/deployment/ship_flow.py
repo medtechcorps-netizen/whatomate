@@ -5,19 +5,23 @@ external receipt in place of a fresh read. Promotion inputs cross jobs only
 through the successful production job's fixed needs outputs in ship.yml.
 """
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import wraps
+import math
 from pathlib import Path
 import shutil
 import time
 import uuid
 
 import compat_evidence
+import compat_negative_index
 import record_handoff
 import record_resolver
 import record_writer
 import forward_gates
 import contract_authorization
 import ship_compat
+import ship_outage_compat
 import ship_rollback_compat
 import ship_records
 import ship_common as common
@@ -42,6 +46,8 @@ def _fixed(function):
             code = exc.code if exc.code in ('compat-missing', 'compat-old-server-incompatible',
                 'irreversible-needs-fix-forward-mode') else 'compat-stale'
             common.fail('candidate-invalid:' + code)
+        except compat_negative_index.NegativeIndexRefusal:
+            common.fail('candidate-invalid:compat-stale')
         except policy.PolicyRefusal:
             common.fail('record-chain-invalid:policy')
         except forward_gates.DrillRefusal as exc:
@@ -70,11 +76,14 @@ class Gate:
     normal: ship_compat.NormalPreflight | None
     rollback: record_resolver.RollbackResolution | None
     qualified_rollback: ship_rollback_compat.RollbackPreflight | None = None
+    outage: ship_outage_compat.OutagePreflight | None = None
 
     @property
     def classification(self):
         if self.normal is not None:
             return self.normal.resolution.classification
+        if self.outage is not None:
+            return self.outage.source.admission.resolution.classification
         if self.qualified_rollback is not None:
             return None
         return self.rollback.legacy_classification
@@ -120,9 +129,14 @@ def gate(ctx, control, mode, target, *, deadline):
         _need(type(result) is record_resolver.RollbackResolution, 'record-chain-invalid:policy')
         return Gate(result.resolved, None, result)
     _need(mode in ('dry-run', 'promote', 'stage', 'promote-without-staging'), 'input-invalid:mode')
-    result = ship_compat.preflight(ctx.repo_dir, control['sha'], **options)
     if mode == 'promote-without-staging':
+        result = ship_outage_compat.preflight(ctx.repo_dir, control['sha'], **options)
+        if type(result) is ship_outage_compat.OutagePreflight:
+            return Gate(result.source.admission.resolution.resolved, None, None, outage=result)
+        _need(type(result) is ship_compat.NormalPreflight, 'candidate-invalid:compat-stale')
         _staging_bypass(result)
+    else:
+        result = ship_compat.preflight(ctx.repo_dir, control['sha'], **options)
     return Gate(result.resolution.resolved, result, None)
 
 
@@ -175,6 +189,22 @@ def _contract_details(normal):
 def details(value):
     """Public summary values derived from the already checked gate."""
     latest = value.resolved.latest
+    if value.outage is not None:
+        proof = value.outage
+        resolution = proof.source.admission.resolution
+        catalog = resolution.candidate.catalog
+        unavailable = ('service unavailable' if type(proof.availability) is ship_outage_compat.ServiceUnavailable
+                       else 'complete missing/expired evidence')
+        return ['- Database change: none; dormant: false',
+            '- Reversible: true; old_server_ok: unproven',
+            f'- Compatibility: bypassed; {unavailable}; no new compatibility measurement',
+            f'- Retained catalog: version {catalog.catalog_version}, minimum reader {catalog.min_reader_version}',
+            f'- Retained catalog SHA256: {catalog.catalog_sha256}',
+            f'- Database source before promotion: {resolution.database_base_source}',
+            '- Changed database artifact paths: none (retained live contract)',
+            '- Staging: bypassed; original bounded outage evidence retained',
+            '- Restore drills: not required for a non-dormant none change',
+            *_forward_paths(resolution)]
     if value.normal is not None:
         qualified = value.normal.qualified
         resolution = value.normal.resolution
@@ -264,16 +294,28 @@ def promotion_outputs(value, control, verified_images, *, staging, private=()):
     Complete encode/decode/size validation happens here. Only emit the returned
     mapping after a successful deployment; failed deployments write no record.
     """
-    _need(value.normal is not None and control['run_attempt'] == 1, 'record-invalid:production-handoff')
-    _need(type(value.normal.drills) is forward_gates.DrillGate, 'record-invalid:production-handoff')
+    _need(type(value) is Gate and value.rollback is None and value.qualified_rollback is None
+          and control['run_attempt'] == 1, 'record-invalid:production-handoff')
     sha = control['sha']
     images = record_writer.CandidateImages(sha,
         tuple((part, verified_images[part]) for part in common.COMPONENTS),
         tuple((part, sha) for part in common.COMPONENTS))
-    handoff = record_writer.prepare_promotion(value.normal.resolution, value.normal.collected,
-        images, _execution(control), staging=staging, drills=value.normal.drills,
-        contract_observation=value.normal.contract_observation)
-    outputs = record_handoff.encode(handoff)
+    if value.outage is not None:
+        _need(value.normal is None and staging == 'bypassed'
+              and type(value.outage) is ship_outage_compat.OutagePreflight
+              and value.resolved == value.outage.source.admission.resolution.resolved
+              and sha == value.outage.source.admission.resolution.candidate.sha,
+              'record-invalid:production-handoff')
+        handoff = record_writer.prepare_outage_promotion(value.outage, images, _execution(control))
+        outputs = record_handoff.encode_outage(handoff)
+    else:
+        _need(type(value.normal) is ship_compat.NormalPreflight
+              and type(value.normal.drills) is forward_gates.DrillGate,
+              'record-invalid:production-handoff')
+        handoff = record_writer.prepare_promotion(value.normal.resolution, value.normal.collected,
+            images, _execution(control), staging=staging, drills=value.normal.drills,
+            contract_observation=value.normal.contract_observation)
+        outputs = record_handoff.encode(handoff)
     for key, text in outputs.items():
         _need(common.OUTPUT_KEY_RE.fullmatch(key) and common.OUTPUT_VALUE_RE.fullmatch(text),
               'record-invalid:production-handoff')
@@ -283,8 +325,23 @@ def promotion_outputs(value, control, verified_images, *, staging, private=()):
 
 
 @_fixed
+def require_outage_freshness(value, *, deadline, observed_at):
+    """Original production allowance, checked after codec before provider I/O."""
+    _need(type(value) is Gate and type(value.outage) is ship_outage_compat.OutagePreflight
+          and value.normal is None and value.rollback is None and value.qualified_rollback is None,
+          'candidate-invalid:compat-stale')
+    _need(type(deadline) in (int, float) and math.isfinite(deadline)
+          and time.monotonic() < deadline, 'candidate-invalid:compat-stale')
+    _need(type(observed_at) is datetime and observed_at.tzinfo is timezone.utc
+          and observed_at.fold == 0
+          and value.outage.checked_at <= observed_at < value.outage.valid_until,
+          'candidate-invalid:compat-stale')
+
+
+@_fixed
 def rollback_outputs(value, control, *, private=()):
     """Prepare complete qualified rollback custody before the first provider read."""
+    _need(value.outage is None, 'record-invalid:production-handoff')
     if value.qualified_rollback is None:
         _need(value.normal is None and type(value.rollback) is record_resolver.RollbackResolution,
               'record-invalid:production-handoff')
@@ -341,7 +398,9 @@ def record_bytes(ctx, control, fields, *, deadline):
     publication = _publication(control, fields)
     if fields['kind'] == 'promote':
         outputs = {key: ctx.env.get('REC_' + key.upper(), '') for key in record_handoff.OUTPUT_KEYS}
-        raw = record_handoff.build_record(outputs, workflow_sha=control['workflow_sha'],
+        build = (record_handoff.build_outage_record if outputs.get('handoff_version') == '8'
+                 else record_handoff.build_record)
+        raw = build(outputs, workflow_sha=control['workflow_sha'],
             candidate_sha=fields['sha'], run_id=int(control['run_id']), record_attempt=control['run_attempt'],
             publication=publication, current_resolution=resolved)
     else:

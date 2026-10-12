@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -21,6 +23,51 @@ import test_cli_resolution as source_tests
 import test_cli_rollback as rollback_source_tests
 import test_compat_rollback as rollback_tests
 
+
+_COLD_PUBLISHER_RUNNER = r'''import contextlib,hashlib,importlib.util,io,json,os,pathlib,sys
+publisher_path=pathlib.Path(sys.argv[1]); setup_path=pathlib.Path(sys.argv[2])
+expected=int(sys.argv[3]); root=pathlib.Path(os.environ['RUNNER_TEMP'])
+repository=publisher_path.parents[2]
+assert sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode
+assert 'GH_TOKEN' not in os.environ and 'COMPAT_GH_BIN' not in os.environ
+def local_modules():
+    result=[]
+    for name,module in tuple(sys.modules.items()):
+        value=getattr(module,'__file__',None)
+        if value and pathlib.Path(value).absolute().is_relative_to(repository): result.append(name)
+    return sorted(result)
+assert local_modules()==[]
+denied=[]
+def audit(event,args):
+    if event in ('subprocess.Popen','os.system') or event.startswith('socket.'):
+        denied.append(event)
+        raise RuntimeError('cold-publisher-native-network-forbidden')
+sys.addaudithook(audit)
+def files():
+    return {str(path.relative_to(root)):hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob('*') if path.is_file()}
+before=files()
+spec=importlib.util.spec_from_file_location('negative_index_cold',publisher_path)
+assert spec is not None and spec.loader is not None
+publisher=importlib.util.module_from_spec(spec)
+sys.modules[spec.name]=publisher
+spec.loader.exec_module(publisher)
+assert set(local_modules())=={'negative_index_cold','compat_negative_index'}
+publisher.policy._INSTALLED_PRODUCER_SETUP=setup_path.read_bytes()
+stdout,stderr=io.StringIO(),io.StringIO()
+with contextlib.redirect_stdout(stdout),contextlib.redirect_stderr(stderr):
+    code=publisher.main([])
+assert code==expected
+assert stdout.getvalue()==''
+assert stderr.getvalue()==('' if expected==0 else 'negative-index-publisher-refused\n')
+assert files()==before and denied==[]
+assert not any(path.name.startswith('compat-negative-index-') for path in root.iterdir())
+loaded=local_modules()
+assert 'public_evidence' in loaded and 'record_transport' in loaded
+assert not set(loaded)&{'cli','record_resolver','schema_change','ship_outage_compat','record_handoff'}
+print(json.dumps({'main_return':code,'stdout':stdout.getvalue(),'stderr':stderr.getvalue(),
+                  'native_network_calls':len(denied),'files_unchanged':True,'loaded':loaded},sort_keys=True))
+'''
 
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
@@ -592,6 +639,56 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(result.request.producer_sha, case.ctx.sha)
         self.assertEqual(result.request.protocol, "rollback4")
         self.assertEqual(result.request.context_sha256, digest(pair.context))
+
+
+    def cold_main(self, expected):
+        # The parent may use normal fixture builders. The fresh isolated child
+        # receives bytes only, with no imported project modules or path setup.
+        environment = {key: value for key, value in os.environ.items() if key.upper() in {
+            'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA',
+            'APPDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'COMSPEC', 'PATHEXT'}}
+        environment.update({key: value for key, value in self.env.items()
+            if key.startswith('GITHUB_') or key in {'RUNNER_TEMP', 'RUNNER_ENVIRONMENT',
+                'COMPAT_PREVIEW_OUTCOME', 'COMPAT_RUN_OUTCOME', 'COMPAT_ROLLBACK_TARGET'}})
+        output = self.root / 'cold-output-sentinel'; output.write_bytes(b'unchanged\n')
+        environment['GITHUB_OUTPUT'] = str(output)
+        before = {str(path.relative_to(self.root)): path.read_bytes()
+                  for path in self.root.rglob('*') if path.is_file()}
+        with tempfile.TemporaryDirectory(prefix='publisher-isolated-') as temporary:
+            work = Path(temporary).resolve()
+            setup = work / 'synthetic-setup.json'; setup.write_bytes(self.setup)
+            stdout, stderr = work / 'stdout.log', work / 'stderr.log'
+            with stdout.open('xb') as out, stderr.open('xb') as err:
+                process = subprocess.run([sys.executable, '-I', '-S', '-B', '-c',
+                    _COLD_PUBLISHER_RUNNER, str(Path(publisher.__file__).resolve()),
+                    str(setup), str(expected)], cwd=work, env=environment,
+                    stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=30,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            self.assertLessEqual(stdout.stat().st_size + stderr.stat().st_size, 65536)
+            self.assertEqual(process.returncode, 0, stderr.read_text(encoding='utf-8'))
+            self.assertEqual(stderr.read_bytes(), b'')
+            report = json.loads(stdout.read_bytes())
+        self.assertEqual(report['main_return'], expected)
+        self.assertEqual(report['stdout'], '')
+        self.assertEqual(report['stderr'], '' if expected == 0 else 'negative-index-publisher-refused\n')
+        self.assertEqual(report['native_network_calls'], 0)
+        self.assertTrue(report['files_unchanged'])
+        self.assertEqual({str(path.relative_to(self.root)): path.read_bytes()
+                          for path in self.root.rglob('*') if path.is_file()}, before)
+        self.assertEqual(self.capture.calls, [])
+
+    def test_cold_isolated_main_normal_positive_without_preloaded_modules(self):
+        self.cold_main(0)
+
+    def test_cold_isolated_main_rollback_positive_without_preloaded_modules(self):
+        self.rollback()
+        self.cold_main(0)
+
+    def test_cold_isolated_main_rejects_wrong_context_digest_without_effects(self):
+        value = json.loads(self.context_raw)
+        value['result_sha256'] = '0' * 64
+        (self.public / 'compat-context.json').write_bytes(cli.canonical(value))
+        self.cold_main(1)
 
 
 if __name__ == "__main__":

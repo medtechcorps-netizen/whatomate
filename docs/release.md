@@ -350,15 +350,44 @@ banner appears in plan/candidate/production summaries, and release notes state
 `staging: bypassed`. It immediately follows the normal promote code path and
 records kind `promote`; the attested manifest schema and record-chain rules do
 not gain a bypass kind. Schema-v2 records explicitly retain `staging: bypassed`.
-This mode still requires green compatibility evidence. It admits only `none`
+The installed configuration still requires green compatibility evidence. It admits only `none`
 with the required catalog, history, global-table, seed and data-registry artifacts
 unchanged and no migration-path change; unavailable source facts refuse it.
-It cannot bypass an unavailable compatibility run or a signed semantic failure.
+The preparatory outage consumer described below is disabled; a signed semantic
+failure can never be bypassed.
 A retained database origin that differs from the latest record's source also
 refuses this bounded staging bypass: artifact equality alone does not prove
 migration-path equality. Use the normal staging path for those releases.
 A staging bypass is not permission to skip a failing product test or a production
 guard.
+
+The separate outage preflight is connected only to `promote-without-staging`.
+Its fixed `release/deployment/compat-negative-consumer-v1.json` file is absent,
+so it delegates to the existing normal compatibility gate. This preparation
+changes no workflow, token permissions, active database artifacts or provider mode.
+Activation requires a separately reviewed producer revision and complete source
+inventory, actual hosted permissions and signing-order qualification, and then
+consumer policy data that is outside the publisher's inputs.
+
+Once configured, outage admission requires either a complete fixed-endpoint
+502/503/504 response or complete missing/expired compatibility history. It also
+requires matching publisher ancestry and full source bytes, repeated unchanged
+protected-rule and empty negative-marker reads, unchanged authenticated release
+source, an existing live catalog, and a non-dormant `none` change with identical
+database artifacts. Incomplete, negative, changed, unsafe or oversized evidence
+refuses before provider access. A valid normal proof does not need outage coverage.
+
+Format 8 preserves complete original source, raw service/history evidence,
+negative-index observations and fractional timestamps under the existing handoff
+limits. The production caller roundtrips this custody and then checks the original
+monotonic deadline and full UTC freshness before its first provider request.
+Record retries replay original evidence against the exact parent without
+recollection or a new admission deadline. Deployment completion may occur later.
+Such a record reports compatibility and staging as `bypassed`, old-server
+compatibility as `unproven`, and retained catalog material; it claims no new
+compatibility measurement. Formats 1-7 keep their own closed historical replay
+paths, separate from current-only creation. The existing one-PUT promotion and
+automatic recovery behavior remains in place; reconcile remains a rollback mode.
 
 **PR10 requires all four real PR9 proofs to be recorded and reviewed before
 owner-authorized merge.** The following operational proofs were independently

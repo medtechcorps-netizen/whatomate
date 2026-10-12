@@ -994,10 +994,11 @@ The initial three fixture failures are retained; there was no fresh all-green
 
 ### Disabled negative-intent index preparation
 
-The preparatory negative-index modules have no installed producer or consumer
-configuration and are not called by a workflow or release gate. Unconfigured
-entry points refuse before reading operational paths, credentials or network
-state. They do not grant compatibility-outage admission.
+The preparatory negative-index publisher has no installed producer configuration
+and is not called by a workflow. Its unconfigured entry point refuses before
+reading operational paths, credentials or network state. The release gate's
+separate outage consumer is connected but disabled: its fixed policy data file
+is absent, so `promote-without-staging` still requires normal compatibility.
 
 The publisher validates the actual two public signature subjects against the
 fixed resolution snapshot. A complete measured negative derives an exact
@@ -1011,6 +1012,24 @@ ordinary data, not signatures or coverage proof.
 The fixed transport shares its caller's original allowance, pins its executable,
 uses a private configuration and permits only its closed API operations. Pure
 replay keeps complete raw rule/ref/HTTP observations with strict bounds. Future
-activation still requires reviewed producer/workflow source, preserved historical
-custody, hosted permissions and signatures, a separate consumer policy tied to
-the real producer revision, and the complete release preflight/custody path.
+activation still requires reviewed producer/workflow source, hosted permissions
+and signatures, and a separate consumer policy tied to the real producer revision.
+
+The disabled consumer retains the same actual normal collection pass plus both
+closed raw inventory snapshots. Replay derives terminal execution windows from
+the attempt's own known workflow and checks complete run/job/check/artifact
+coverage. A failed collector, unknown workflow, active or no-work attempt,
+incorrectly bound positive, or authenticated negative cannot become missing
+evidence. Empty complete visible history is only a possible outage condition;
+it is not proof against whole-run deletion. The protected negative index and
+reviewed producer source coverage are separately required.
+
+Format-8 custody retains every source and raw history role with the existing
+logical, encoded and expanded limits. Equal bytes may be losslessly shared in
+the frame; no history or source is omitted to fit. Full publisher-dependency
+capacity must pass before activation. Original timestamps and raw policy are
+replayed without reading current policy or sampling a new clock. Counter replay
+checks bounds and arithmetic, not the authenticity of a missing process
+transcript. Exact old-workflow custody has a named historical route; new encoding
+still requires the current workflow. Trusted setup continuity and the last
+observation horizon remain explicit limits.

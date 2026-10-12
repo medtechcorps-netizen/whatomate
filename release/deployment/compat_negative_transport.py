@@ -29,7 +29,8 @@ def _need(value):
 
 
 def open_reader(binary, token, config_dir, *, budget, base_env=None):
-    installed = policy.load_consumer_policy()  # First: None has zero effects.
+    import compat_outage_policy
+    installed = compat_outage_policy.require_consumer_policy()  # Before client effects.
     _need(type(installed) is policy.ConsumerPolicy)
     replayed = policy.parse_consumer_policy(installed.raw)
     _need(policy._same(replayed, installed))

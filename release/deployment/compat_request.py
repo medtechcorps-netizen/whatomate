@@ -16,6 +16,7 @@ import compat_rollback_history as rollback_history
 import catalog as compat_catalog
 
 policy, common = resolver.policy, resolver.common
+W0_WORKFLOW_SHA256 = "0f8ae9f3079d4a3c0749721e5100d6df60842b4811059aee02a2ee4d8ced4f6b"
 
 
 def _need(value):
@@ -111,8 +112,8 @@ def _material(resolution, latest):
     return base, tuple(evidence.CatalogBlob(path, artifacts[path]) for path in paths)
 
 
-def _build_request_base(resolution, collected):
-    _need(type(resolution) is resolver.ForwardResolution and type(collected) is collect.CollectedHistory)
+def _source_base(resolution):
+    _need(type(resolution) is resolver.ForwardResolution)
     latest = _chain(resolution.resolved)
     candidate = resolution.candidate
     _need(type(candidate) is policy.SourceFacts and candidate.sha == resolution.resolved.inventory.main_sha)
@@ -131,7 +132,29 @@ def _build_request_base(resolution, collected):
           and classification.requirements == ("compat-required", "generated-migration-closure-ci"))
     _need(type(resolution.workflow) is bytes
           and 0 < len(resolution.workflow) <= policy.MAX_SOURCE_FILE_BYTES
+          and common.sha256_bytes(resolution.workflow) == resolution.workflow_sha256)
+    return latest, base, authority
+
+
+def _current_workflow(resolution):
+    _need(type(resolution.workflow) is bytes
+          and 0 < len(resolution.workflow) <= policy.MAX_SOURCE_FILE_BYTES
           and common.sha256_bytes(resolution.workflow) == resolution.workflow_sha256 == collect.WORKFLOW_SHA256)
+
+
+def _custody_workflow(resolution):
+    # Exact source-owned cases; this does not confer publisher coverage.
+    _need(type(resolution.workflow) is bytes
+          and 0 < len(resolution.workflow) <= policy.MAX_SOURCE_FILE_BYTES
+          and common.sha256_bytes(resolution.workflow) == resolution.workflow_sha256
+          and (resolution.workflow_sha256 == W0_WORKFLOW_SHA256
+               or resolution.workflow_sha256 == collect.WORKFLOW_SHA256))
+
+
+def _build_request_base(resolution, collected):
+    _need(type(resolution) is resolver.ForwardResolution and type(collected) is collect.CollectedHistory)
+    latest, base, authority = _source_base(resolution)
+    candidate, classification = resolution.candidate, resolution.classification
     _need(type(collected.history) is evidence.VisibleHistory
           and collected.history.sha == candidate.sha
           and type(collected.issues) is tuple
@@ -150,22 +173,39 @@ def _build_request_base(resolution, collected):
     return request
 
 
-def _build_request(resolution, collected):
-    request = _build_request_base(resolution, collected)
+def _pending_projection(resolution):
     active = {row.path: row.raw for row in resolution.catalog_material.candidate_blobs}
     projection = pending_source.replay(resolution.pending,
         candidate_sha=resolution.candidate.sha, previous_sha=resolution.resolved.latest.record_sha,
         active_catalog=active[policy.GOLDEN], active_globals=active[policy.GLOBALS],
         active_history=active[policy.HISTORY])
     _need(projection.plan is None or all(entry.kind == "expand" for entry in projection.plan.entries))
+    return projection
+
+
+def _bind_pending_request(resolution, request):
+    projection = _pending_projection(resolution)
     request = replace(request, source=replace(request.source, pending_binding=projection.binding))
     evidence._request(request)
     return request
 
 
+def _build_request(resolution, collected):
+    request = _build_request_base(resolution, collected)
+    _current_workflow(resolution)
+    return _bind_pending_request(resolution, request)
+
+
+def _build_context3_custody_request(resolution, collected):
+    request = _build_request_base(resolution, collected)
+    _custody_workflow(resolution)
+    return _bind_pending_request(resolution, request)
+
+
 def _build_context2_custody_request(resolution, collected):
     _need(type(resolution) is resolver.ForwardResolution and resolution.pending is None)
     request = _build_request_base(resolution, collected)
+    _need(resolution.workflow_sha256 == W0_WORKFLOW_SHA256)
     evidence._request_context2_custody(request)
     return request
 
@@ -204,6 +244,58 @@ def _qualify_context2_custody(resolution, collected) -> evidence.QualifiedCompat
     """
     request = _fixed_build(_build_context2_custody_request, resolution, collected)
     return evidence._require_context2_custody(request, collected.history)
+
+
+def _qualify_context3_custody(resolution, collected) -> evidence.QualifiedCompat:
+    """Closed original context3 replay, never current workflow admission."""
+    request = _fixed_build(_build_context3_custody_request, resolution, collected)
+    return evidence.require_compat(request, collected.history)
+
+
+def _validate_source_material(resolution):
+    projection = _pending_projection(resolution)
+    contract = compat_catalog.CatalogContract.from_resolution(resolution)
+    _need(contract.pending_binding == projection.binding)
+    change = resolution.classification
+    _need((change.kind == "none" and not change.dormant)
+          or (change.kind == "data" and change.dormant)
+          or (change.kind == "expand" and change.dormant and projection.binding.target_version is not None))
+    resolver.validate_forward_audit(resolution.audit, candidate_sha=resolution.candidate.sha,
+        database_base_source=resolution.database_base_source,
+        latest_record_sha=resolution.resolved.latest.record_sha,
+        selected_web_source_sha=resolution.resolved.selected.actual_web_source_sha)
+    recipe = resolution.previous_recipe
+    _need(type(recipe) is resolver.WebRecipe and recipe.path == resolver._WEB_RECIPE
+          and recipe.source_sha == resolution.previous_web_source_sha
+          and type(recipe.raw) is bytes and 0 < len(recipe.raw) <= policy.MAX_SOURCE_FILE_BYTES
+          and common.sha256_bytes(recipe.raw) == recipe.sha256)
+    return resolution
+
+
+def validate_current_source(resolution):
+    """Pure source validation; no fabricated collection or availability fact."""
+    try:
+        _source_base(resolution)
+        _current_workflow(resolution)
+        return _validate_source_material(resolution)
+    except evidence.CompatRefusal:
+        raise
+    except (compat_catalog.proof.EvidenceError, policy.PolicyRefusal, common.ReleaseError,
+            ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError, OverflowError):
+        raise evidence.CompatRefusal("compat-stale", "request-resolution-invalid") from None
+
+
+def _validate_source_custody(resolution):
+    """Exact preserved source replay only; old workflow is not index coverage."""
+    try:
+        _source_base(resolution)
+        _custody_workflow(resolution)
+        return _validate_source_material(resolution)
+    except evidence.CompatRefusal:
+        raise
+    except (compat_catalog.proof.EvidenceError, policy.PolicyRefusal, common.ReleaseError,
+            ValueError, TypeError, AttributeError, KeyError, IndexError, RecursionError, OverflowError):
+        raise evidence.CompatRefusal("compat-stale", "request-resolution-invalid") from None
 
 
 def _build_rollback_request(resolution, collected):

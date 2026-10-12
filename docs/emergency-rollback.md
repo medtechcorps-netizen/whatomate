@@ -110,3 +110,18 @@ image digests only and will not notice.
    (`drift:live-matches-record`); reconcile with that record instead.
 4. Open an issue describing what happened (no identifiers or hostnames).
 5. If health still fails, contact DigitalOcean support.
+
+## Compatibility outage preparation
+
+The separate compatibility-outage consumer is disabled until its fixed policy
+data is installed after producer and hosted qualification. It belongs only to
+the owner-dispatched `promote-without-staging` path. It does not change rollback
+eligibility, provide missing rollback proof, or authorize console overrides.
+
+An eligible future outage promotion must retain the live catalog and all database
+artifacts, have no migration or dormant change, and preserve complete bounded
+source and negative-index evidence before provider access. Its record states
+compatibility and staging were bypassed and old-server compatibility is unproven.
+Record-only retries reuse the original evidence and exact parent; they do not
+renew admission. Existing rollback reconcile and promotion recovery behavior
+remain unchanged. See [Release admission](release.md) for the complete boundary.

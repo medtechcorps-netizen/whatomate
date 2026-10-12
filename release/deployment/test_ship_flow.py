@@ -82,7 +82,8 @@ class FlowTests(unittest.TestCase):
 
     def test_irreversible_refusal_keeps_specific_reason_without_private_detail(self):
         for mode in ('promote', 'promote-without-staging'):
-            with self.subTest(mode=mode), mock.patch.object(flow.ship_compat, 'preflight',
+            adapter = flow.ship_outage_compat if mode == 'promote-without-staging' else flow.ship_compat
+            with self.subTest(mode=mode), mock.patch.object(adapter, 'preflight',
                     side_effect=flow.compat_evidence.CompatRefusal(
                         'irreversible-needs-fix-forward-mode', 'PRIVATE token/path')):
                 with self.assertRaises(c.ReleaseError) as caught:
@@ -121,7 +122,7 @@ class FlowTests(unittest.TestCase):
             fixture.composition.bridge.qualify(resolution, history), history, 1, 1, fixture.drills(resolution))
 
     def bypass_gate(self, preflight):
-        with mock.patch.object(flow.ship_compat, 'preflight', return_value=preflight) as call:
+        with mock.patch.object(flow.ship_outage_compat, 'preflight', return_value=preflight) as call:
             value = flow.gate(self.ctx, self.control, 'promote-without-staging', '', deadline=self.deadline)
         call.assert_called_once()
         self.assertEqual(call.call_args.kwargs['deadline'], self.deadline)
@@ -130,7 +131,7 @@ class FlowTests(unittest.TestCase):
     def test_staging_bypass_still_requires_successful_normal_compat(self):
         value = self.bypass_preflight()
         self.assertEqual(self.bypass_gate(value).normal, value)
-        with mock.patch.object(flow.ship_compat, 'preflight',
+        with mock.patch.object(flow.ship_outage_compat, 'preflight',
                 side_effect=flow.compat_evidence.CompatRefusal('compat-missing', 'not an outage waiver')):
             with self.assertRaisesRegex(c.ReleaseError, '^candidate-invalid:compat-missing$'):
                 flow.gate(self.ctx, self.control, 'promote-without-staging', '', deadline=self.deadline)
@@ -570,6 +571,64 @@ class ForwardSummaryTests(unittest.TestCase):
         self.assertEqual(rendered, [f'  - {status} {path}' for status,path in rows])
         self.assertGreater(len('\n'.join(rendered)), 480*1024)
         self.assertLess(len('\n'.join(lines))+1, flow.record_resolver.MAX_AUDIT_BYTES+2048)
+
+
+class OutageFlowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        case = unittest.TestCase(); cls.addClassCleanup(case.doCleanups)
+        cls.case, cls.handoff = fixture.outage_fixture(case)
+        cls.proof = cls.handoff.preflight
+        cls.forward = cls.proof.source.admission.resolution
+        cls.gate = flow.Gate(cls.forward.resolved, None, None, outage=cls.proof)
+        cls.control = dict(sha=cls.forward.candidate.sha, workflow_sha=cls.forward.candidate.sha,
+                           run_id=str(cls.handoff.execution.run_id), run_attempt=1)
+
+    def test_summary_retains_catalog_and_does_not_claim_new_compat_measurement(self):
+        lines = flow.details(self.gate)
+        self.assertEqual(self.gate.classification, self.forward.classification)
+        self.assertIn('- Reversible: true; old_server_ok: unproven', lines)
+        self.assertIn('- Compatibility: bypassed; service unavailable; no new compatibility measurement', lines)
+        self.assertIn('- Retained catalog SHA256: '+self.forward.candidate.catalog.catalog_sha256, lines)
+        self.assertTrue(any(line.startswith('- Changed source range (') for line in lines))
+
+    def test_outage_cannot_mix_normal_rollback_staging_or_execution_families(self):
+        for gate, control, staging in (
+                (replace(self.gate, normal=object()), self.control, 'bypassed'),
+                (replace(self.gate, rollback=object()), self.control, 'bypassed'),
+                (replace(self.gate, qualified_rollback=object()), self.control, 'bypassed'),
+                (self.gate, self.control, 'passed'),
+                (self.gate, {**self.control, 'run_attempt': 2}, 'bypassed')):
+            with self.subTest(staging=staging), self.assertRaisesRegex(c.ReleaseError, '^record-invalid:production-handoff$'):
+                flow.promotion_outputs(gate, control, dict(self.handoff.candidate_images.images), staging=staging)
+        with self.assertRaisesRegex(c.ReleaseError, '^record-invalid:production-handoff$'):
+            flow.rollback_outputs(self.gate, self.control)
+
+    def test_final_freshness_checks_both_original_clocks_and_exact_utc(self):
+        with mock.patch.object(flow, 'time', SimpleNamespace(monotonic=lambda: 100.0)):
+            flow.require_outage_freshness(self.gate, deadline=101.0, observed_at=self.proof.checked_at)
+            for deadline, observed in ((100.0, self.proof.checked_at), (True, self.proof.checked_at),
+                    (float('inf'), self.proof.checked_at), (float('nan'), self.proof.checked_at),
+                    (101, self.proof.checked_at-timedelta(microseconds=1)), (101, self.proof.valid_until),
+                    (101, self.proof.checked_at.replace(tzinfo=None)),
+                    (101, self.proof.checked_at.replace(fold=1))):
+                with self.subTest(deadline=deadline), self.assertRaisesRegex(c.ReleaseError, '^candidate-invalid:compat-stale$'):
+                    flow.require_outage_freshness(self.gate, deadline=deadline, observed_at=observed)
+
+    def test_only_owner_bypass_route_can_select_outage_preflight(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ctx = SimpleNamespace(repo_dir=root, work_dir=lambda name: root/name,
+                env={'SHIP_GH_BIN': str(root/'gh.exe'), 'GH_TOKEN': 'synthetic'})
+            deadline = time.monotonic()+900
+            with mock.patch.object(flow.ship_outage_compat, 'preflight', return_value=self.proof) as call:
+                self.assertEqual(flow.gate(ctx, self.control, 'promote-without-staging', '', deadline=deadline), self.gate)
+            self.assertEqual(call.call_args.kwargs['deadline'], deadline)
+            for mode in ('promote', 'stage', 'dry-run'):
+                with mock.patch.object(flow.ship_outage_compat, 'preflight', side_effect=AssertionError('outage route')) as call, \
+                        mock.patch.object(flow.ship_compat, 'preflight', side_effect=flow.compat_evidence.CompatRefusal('compat-missing', 'synthetic')):
+                    with self.assertRaises(c.ReleaseError): flow.gate(ctx, self.control, mode, '', deadline=deadline)
+                call.assert_not_called()
 
 
 if __name__ == '__main__':

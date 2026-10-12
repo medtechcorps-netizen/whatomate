@@ -26,6 +26,7 @@ import postgres
 import processes
 import record_resolver
 import pending_source
+import public_evidence
 
 runtime, proof = processes.runtime, processes.proof
 _BASE = "e0016b3595114728e7864da2adb44c29065f25ef"
@@ -39,11 +40,7 @@ _PINS = {
     _PROFILE: "808e11a5fdab638adc6f0004e9595371d1eee9a51763e12e779b355f7cdd391d",
     _OVERLAY: "48b2558aaa0c54f0de886093c875ff70fbc65231ee80d8b560df91afc97c131d",
 }
-PENDING_ACTIVE_ARTIFACTS = (
-    ("active_catalog", _PINS[_GOLDEN]),
-    ("active_globals", _PINS["internal/dbcatalog/golden/global_tables.json"]),
-    ("active_history", _PINS["internal/dbcatalog/golden/history.json"]),
-)
+PENDING_ACTIVE_ARTIFACTS = public_evidence.PENDING_ACTIVE_ARTIFACTS
 _COUNT_KEYS = {"non_public_schemas", "non_public_objects", "other_roles", "default_acls", "oids", "reloptions",
                "statistics", "tablespaces", "other_acl_entries", "other_policy_roles"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")

@@ -744,12 +744,102 @@ def _resolve_nullable_profile(client: transport.ReleaseGh, repo_dir: Path,
                     forward=True, nullable_profile=True)
 
 
+@dataclass(frozen=True, slots=True)
+class PublisherAncestry:
+    producer_sha: str
+    head_sha: str
+    merge_base_sha: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublisherBlob:
+    source_sha: str
+    path: str
+    mode: str | None
+    raw: bytes | None = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCoverage:
+    policy_raw: bytes = field(repr=False)
+    policy_blob: BlobObservation = field(repr=False)
+    ancestry: tuple[PublisherAncestry, ...]
+    blobs: tuple[PublisherBlob, ...] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class OutageForwardResolution:
+    admission: ForwardAdmission = field(repr=False)
+    coverage: SourceCoverage = field(repr=False)
+
+
+def resolve_outage_forward(client: transport.ReleaseGh, repo_dir: Path,
+                           git_binary: Path, candidate_sha: str) -> OutageForwardResolution:
+    """Capture configured lineage data within the original source operation.
+
+    Noncoverage is data until outage is selected. No source fact or Python
+    holder supplies signature authority, and no new allowance is created.
+    """
+    return _resolve(client, repo_dir, git_binary, None, candidate_sha,
+                    forward=True, admission=True, outage=True)
+
+
+def _outage_blob(reader, budget, sha, path, remaining):
+    import compat_negative_index as index
+    raw = reader.output(reader.repo, ["ls-tree", "-z", sha, "--", path], code="unused")
+    if not raw:
+        return PublisherBlob(sha, path, None, None)
+    rows = raw.split(b"\0")
+    meta, sep, name = rows[0].partition(b"\t")
+    mode, kind, oid = meta.split(b" ")
+    if (len(rows) != 2 or rows[1] or not sep or name != path.encode("ascii")
+            or mode not in (b"100644", b"100755") or kind != b"blob"
+            or common.SHA1_RE.fullmatch(oid.decode("ascii")) is None):
+        budget.fail("outage-source")
+    size = reader.output(reader.repo, ["cat-file", "-s", oid.decode("ascii")], code="unused").strip()
+    if not size.isdigit() or not 0 <= int(size) <= min(index.MAX_SOURCE, remaining):
+        budget.fail("outage-source-bound")
+    value = reader.output(reader.repo, ["cat-file", "blob", oid.decode("ascii")], code="unused")
+    if len(value) != int(size):
+        budget.fail("outage-source")
+    return PublisherBlob(sha, path, mode.decode("ascii"), value)
+
+
+def _outage_sources(reader, budget, candidate_sha):
+    import compat_outage_policy as loader
+    import compat_negative_index as index
+    installed = loader.require_consumer_policy()
+    policy_blob = _outage_blob(reader, budget, candidate_sha, loader.DATA_PATH, index.MAX_CONFIG)
+    if policy_blob.raw != installed.raw:
+        budget.fail("outage-policy-source")
+    ancestors, blobs, total = [], [], 0
+    for lineage in installed.lineage:
+        producer = lineage.producer_sha
+        if reader.output(reader.repo, ["cat-file", "-t", producer], code="unused") != b"commit\n":
+            budget.fail("outage-producer")
+        raw = reader.output(reader.repo, ["merge-base", producer, candidate_sha], code="unused")
+        if len(raw) != 41 or raw[-1:] != b"\n" or common.SHA1_RE.fullmatch(raw[:-1].decode("ascii")) is None:
+            budget.fail("outage-ancestry")
+        ancestors.append(PublisherAncestry(producer, candidate_sha, raw[:-1].decode("ascii")))
+        for row in lineage.inventory:
+            for sha in (producer, candidate_sha):
+                blob = _outage_blob(reader, budget, sha, row.path, index.MAX_SOURCE_TOTAL - total)
+                total += len(blob.raw) if blob.raw is not None else 0
+                blobs.append(blob)
+    budget.check()
+    return SourceCoverage(installed.raw, BlobObservation(loader.DATA_PATH, policy_blob.raw),
+                          tuple(ancestors), tuple(blobs))
+
+
 def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forward, rollback=False,
-             admission=False, rollback_proof=False, nullable_profile=False, rollback_admission=False):
+             admission=False, rollback_proof=False, nullable_profile=False, rollback_admission=False, outage=False):
     if type(client) is not transport.ReleaseGh or type(client.budget) is not transport.OperationBudget:
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
     try:
+        if outage and (not forward or not admission or rollback or rollback_proof
+                       or nullable_profile or rollback_admission or selected_tag is not None):
+            budget.fail("resolver-selection")
         if rollback_admission and (forward or rollback or admission or rollback_proof
                                    or nullable_profile or selected_tag is None):
             budget.fail("resolver-selection")
@@ -868,6 +958,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                 producer = next(fact for fact in facts if fact.sha == candidate_sha)
                 requirements, workflow, materials, target_recipe, live_recipe = _rollback_proof_source(
                     reader, repo_dir, chain, latest, selected, producer)
+            if outage:
+                outage_sources = _outage_sources(reader, budget, candidate_sha)
             if nullable_profile:
                 nullable_sources = _nullable_sources(reader, budget, latest, candidate)
             budget.check()
@@ -882,6 +974,8 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
                 material, recipe, audit, pending)
             if nullable_profile:
                 return NullableProfilePreparation(result, *nullable_sources)
+            if outage:
+                return OutageForwardResolution(ForwardAdmission(result, observation), outage_sources)
             return ForwardAdmission(result, observation) if admission else result
         if rollback or (rollback_admission and not proof_lane):
             return RollbackResolution(resolved, legacy_chain, legacy_classification, decision)

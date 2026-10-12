@@ -9,6 +9,7 @@ observations; historical1-5 retain their exact field sets and absence semantics.
 No record-time label collection, new clock or active-contract proof is supplied.
 Separate version7 carries full original rollback qualification under the same
 bounds; promotion1-6 roots and their historical replay remain unchanged.
+Separate version8 retains full original outage evidence, never a measured H proof.
 Some otherwise valid upstream-max histories exceed these transport limits;
 they refuse before effects. No attempt or source bytes are dropped to make room.
 """
@@ -29,6 +30,8 @@ pending = r.pending_source
 contract = writer.contract_authorization
 rp = writer.rollback_preflight
 rh, envelope = rp.history, rp.envelope
+op = writer.outage_preflight
+negative = op.negative
 
 VERSION = "6"
 CHUNK_SIZE = 8192
@@ -253,6 +256,48 @@ _SCHEMAS.update({
         ("preflight", rp.RollbackPreflight), ("execution", writer.WorkflowExecution), ("facts", d.ManifestFacts))),
 })
 
+_SCHEMAS.update({
+    r.ForwardAdmission: ("record_resolver.ForwardAdmission", (
+        ("resolution", r.ForwardResolution), ("contract_observation", _optional(contract.ContractObservation)))),
+    r.PublisherAncestry: ("record_resolver.PublisherAncestry", (
+        ("producer_sha", str), ("head_sha", str), ("merge_base_sha", str))),
+    r.PublisherBlob: ("record_resolver.PublisherBlob", (
+        ("source_sha", str), ("path", str), ("mode", _optional(str)), ("raw", _optional(bytes)))),
+    r.SourceCoverage: ("record_resolver.SourceCoverage", (
+        ("policy_raw", bytes), ("policy_blob", r.BlobObservation),
+        ("ancestry", _many(r.PublisherAncestry)), ("blobs", _many(r.PublisherBlob)))),
+    r.OutageForwardResolution: ("record_resolver.OutageForwardResolution", (
+        ("admission", r.ForwardAdmission), ("coverage", r.SourceCoverage))),
+    c.OutageHistorySnapshot: ("compat_collect.OutageHistorySnapshot", (
+        ("workflow_id", int), ("runs", bytes), ("attempts", _many(envelope.EnvelopeFacts)), ("observed_at", datetime))),
+    c.CollectedOutageHistory: ("compat_collect.CollectedOutageHistory", (
+        ("normal", c.CollectedHistory), ("started_at", datetime),
+        ("before", c.OutageHistorySnapshot), ("after", c.OutageHistorySnapshot))),
+    negative.RuleView: ("compat_negative_index.RuleView", (
+        ("raw", bytes), ("rule_id", int), ("created_at", datetime), ("updated_at", datetime),
+        ("bypass_visibility", str))),
+    negative.RefInventory: ("compat_negative_index.RefInventory", (
+        ("raw", bytes), ("producer_sha", str), ("rows", _many(bytes)))),
+    negative.HttpObservation: ("compat_negative_index.HttpObservation", (
+        ("raw", bytes), ("status", int), ("state", str))),
+    negative.IndexSnapshot: ("compat_negative_index.IndexSnapshot", (
+        ("setup_sha256", str), ("producer_sha", str), ("before_rule", negative.RuleView),
+        ("before_refs", negative.RefInventory), ("after_rule", negative.RuleView),
+        ("after_refs", negative.RefInventory), ("started_at", datetime), ("observed_at", datetime))),
+    op.ServiceUnavailable: ("ship_outage_compat.ServiceUnavailable", (
+        ("observation", negative.HttpObservation), ("observed_at", datetime))),
+    op.MissingExpiredEvidence: ("ship_outage_compat.MissingExpiredEvidence", (
+        ("observation", negative.HttpObservation), ("observed_at", datetime), ("collected", c.CollectedOutageHistory))),
+    op.OutagePreflight: ("ship_outage_compat.OutagePreflight", (
+        ("source", r.OutageForwardResolution), ("availability", ("union", op.ServiceUnavailable, op.MissingExpiredEvidence)),
+        ("index", negative.IndexSnapshot), ("entry_at", datetime), ("checked_at", datetime),
+        ("remaining_us", int), ("valid_until", datetime), ("command_count", int), ("captured_bytes", int))),
+    writer.OutageHandoff: ("record_writer.OutageHandoff", (
+        ("preflight", op.OutagePreflight), ("candidate_images", writer.CandidateImages),
+        ("execution", writer.WorkflowExecution), ("facts", d.ManifestFacts))),
+})
+
+
 _MISSING = {
     "active": e.MissingEvidence.ACTIVE, "never-started-proven": e.MissingEvidence.NEVER_STARTED,
     "started-incomplete": e.MissingEvidence.STARTED_INCOMPLETE, "artifact-expired": e.MissingEvidence.EXPIRED,
@@ -466,7 +511,7 @@ def _replay(handoff, candidate_sha, workflow_sha, run_id, record_attempt, *, ver
         _need(handoff.contract_observation is None)
     if version in (5, 6):
         _need(type(resolution.pending) is pending.PendingMaterial)
-        rebuilt = writer.prepare_promotion(handoff.resolution, handoff.collected,
+        rebuilt = writer._prepare_promotion_context3_custody(handoff.resolution, handoff.collected,
             handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills,
             contract_observation=handoff.contract_observation)
     else:
@@ -526,7 +571,7 @@ def _frame(encoded, blobs, *, version=6):
     # the canonical header; raw blobs follow in exact digest order. The outer
     # metadata binds the complete frame's size and SHA256, including this prefix.
     rows = sorted(blobs.items())
-    _need(type(version) is int and version in (3, 4, 5, 6, 7))
+    _need(type(version) is int and version in (3, 4, 5, 6, 7, 8))
     header = _canonical({"version": version, "handoff": encoded,
         "blobs": [{"sha256": digest, "length": len(raw)} for digest, raw in rows]})
     size = 4 + len(header) + sum(len(raw) for _, raw in rows)
@@ -548,7 +593,7 @@ def _unframe(raw, *, version=6):
     size = int.from_bytes(raw[:4], "big")
     _need(0 < size <= MAX_RAW - 4 and 4 + size <= len(raw))
     value = _json(raw[4:4 + size])
-    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4, 5, 6, 7))
+    _need(type(value["version"]) is int and value["version"] == version and version in (3, 4, 5, 6, 7, 8))
     rows = value["blobs"]
     _need(type(rows) is list and 1 <= len(rows) <= MAX_BLOBS)
     offset, total, previous, blobs = 4 + size, 0, "", {}
@@ -655,7 +700,7 @@ def build_record(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt
     version, handoff = _decode_versioned(outputs, candidate_sha=candidate_sha,
         workflow_sha=workflow_sha, run_id=run_id, record_attempt=record_attempt)
     if version in (5, 6):
-        return writer.build_promotion(handoff, publication, current_resolution)
+        return writer._build_promotion_context3_custody(handoff, publication, current_resolution)
     return writer._build_promotion_context2_custody(handoff, publication, current_resolution)
 
 
@@ -666,6 +711,10 @@ def encode(handoff):
     Precompute this before provider effects; emit it only after production
     success. Otherwise-valid histories exceeding capacity refuse, never truncate.
     """
+    _need(type(handoff) is writer.PromotionHandoff)
+    _need(writer.prepare_promotion(handoff.resolution, handoff.collected, handoff.candidate_images,
+        handoff.execution, staging=handoff.facts.staging, drills=handoff.drills,
+        contract_observation=handoff.contract_observation) == handoff)
     budget = _Budget()
     encoded = _value(handoff, writer.PromotionHandoff, budget, 0, encoding=True)
     raw = _frame(encoded, budget.blobs)
@@ -750,6 +799,11 @@ def build_rollback_record(outputs, *, producer_sha, target_release, workflow_sha
 @_public
 def encode_rollback(handoff):
     """Precompute the whole retained history before effects; never truncate."""
+    _need(type(handoff) is writer.RollbackHandoff)
+    resolution = handoff.preflight.resolution
+    _need(type(resolution.workflow) is bytes
+          and writer.common.sha256_bytes(resolution.workflow) == resolution.workflow_sha256 == c.WORKFLOW_SHA256)
+    _need(writer.prepare_rollback(handoff.preflight, handoff.execution) == handoff)
     budget = _Budget(version=7)
     encoded = _value(handoff, writer.RollbackHandoff, budget, 0, encoding=True)
     raw = _frame(encoded, budget.blobs, version=7)
@@ -767,6 +821,90 @@ def encode_rollback(handoff):
             writer.common.require_public_text(item)
     restored = decode_rollback(outputs, producer_sha=handoff.preflight.resolution.producer.sha,
         target_release=handoff.preflight.resolution.resolved.selected.release,
+        workflow_sha=handoff.execution.workflow_sha, run_id=handoff.execution.run_id, record_attempt=1)
+    _need(restored == handoff)
+    return outputs
+
+
+def _unpack_outage(outputs):
+    _exact(outputs, OUTPUT_KEYS)
+    _need(all(type(value) is str and len(value) <= CHUNK_SIZE and value.isascii() for value in outputs.values())
+          and outputs["handoff_version"] == "8"
+          and writer.common.SHA256_RE.fullmatch(outputs["handoff_sha256"]))
+    encoded_size = _length(outputs["handoff_encoded_length"], MAX_ENCODED)
+    compressed_size = _length(outputs["handoff_compressed_length"], MAX_COMPRESSED)
+    raw_size = _length(outputs["handoff_raw_length"], MAX_RAW)
+    count = _length(outputs["handoff_chunk_count"], len(CHUNK_SLOTS))
+    _need(count == (encoded_size + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    for index, key in enumerate(CHUNK_SLOTS):
+        expected = CHUNK_SIZE if index < count - 1 else encoded_size - CHUNK_SIZE * index if index == count - 1 else 0
+        _need(len(outputs[key]) == expected)
+    text = "".join(outputs[key] for key in CHUNK_SLOTS)
+    _need(len(text) == encoded_size)
+    compressed = _unb64(text, MAX_COMPRESSED)
+    _need(len(compressed) == compressed_size)
+    raw = _xz_inflate(compressed, raw_size)
+    _need(len(raw) == raw_size
+          and writer.common.sha256_bytes(raw) == outputs["handoff_sha256"])
+    return raw
+
+
+
+def _replay_outage(handoff, candidate_sha, workflow_sha, run_id, record_attempt):
+    _need(type(candidate_sha) is str and writer.common.SHA1_RE.fullmatch(candidate_sha)
+          and type(workflow_sha) is str and writer.common.SHA1_RE.fullmatch(workflow_sha)
+          and type(run_id) is int and 1 <= run_id <= MAX_INTEGER
+          and type(record_attempt) is int and 1 <= record_attempt <= MAX_INTEGER)
+    _need(type(handoff) is writer.OutageHandoff
+          and handoff.preflight.source.admission.resolution.candidate.sha == candidate_sha
+          and handoff.candidate_images.sha == candidate_sha
+          and handoff.execution == writer.WorkflowExecution(writer.common.REPOSITORY,
+              d.SHIP_SIGNER, workflow_sha, run_id, 1))
+    _need(writer._prepare_outage_custody(handoff.preflight, handoff.candidate_images, handoff.execution) == handoff)
+    return handoff
+
+
+@_public
+def decode_outage(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt):
+    """Only full wire8 original custody; no current clock/config or fallback."""
+    raw = _unpack_outage(outputs)
+    value, blobs = _unframe(raw, version=8)
+    budget = _Budget(blobs, version=8)
+    handoff = _value(value["handoff"], writer.OutageHandoff, budget, 0, encoding=False)
+    _need(budget.used == budget.blobs.keys())
+    return _replay_outage(handoff, candidate_sha, workflow_sha, run_id, record_attempt)
+
+
+@_public
+def build_outage_record(outputs, *, candidate_sha, workflow_sha, run_id, record_attempt,
+                        publication, current_resolution):
+    """Caller establishes original custody and checks published idempotency first."""
+    handoff = decode_outage(outputs, candidate_sha=candidate_sha, workflow_sha=workflow_sha,
+        run_id=run_id, record_attempt=record_attempt)
+    return writer._build_outage_custody(handoff, publication, current_resolution)
+
+
+@_public
+def encode_outage(handoff):
+    """Full bounded current proof before provider effects; no history pruning."""
+    _need(type(handoff) is writer.OutageHandoff)
+    _need(writer.prepare_outage_promotion(handoff.preflight, handoff.candidate_images, handoff.execution) == handoff)
+    budget = _Budget(version=8)
+    encoded = _value(handoff, writer.OutageHandoff, budget, 0, encoding=True)
+    raw = _frame(encoded, budget.blobs, version=8)
+    compressed = _xz_compress(raw)
+    _need(0 < len(compressed) <= MAX_COMPRESSED)
+    text = _b64(compressed); _need(len(text) <= MAX_ENCODED)
+    count = (len(text) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    outputs = {"handoff_version": "8", "handoff_sha256": writer.common.sha256_bytes(raw),
+        "handoff_raw_length": str(len(raw)), "handoff_compressed_length": str(len(compressed)),
+        "handoff_encoded_length": str(len(text)), "handoff_chunk_count": str(count)}
+    outputs.update((key, text[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]) for i, key in enumerate(CHUNK_SLOTS))
+    for key, item in outputs.items():
+        _need(writer.common.OUTPUT_KEY_RE.fullmatch(key) and writer.common.OUTPUT_VALUE_RE.fullmatch(item))
+        if item:
+            writer.common.require_public_text(item)
+    restored = decode_outage(outputs, candidate_sha=handoff.candidate_images.sha,
         workflow_sha=handoff.execution.workflow_sha, run_id=handoff.execution.run_id, record_attempt=1)
     _need(restored == handoff)
     return outputs

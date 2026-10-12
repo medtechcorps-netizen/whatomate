@@ -265,18 +265,27 @@ _job = envelope._job
 _artifact = envelope._artifact
 
 
-def _snapshot(client, request, steps, observed):
+def _snapshot(client, request, steps, observed, *, retain=False, retention_limit=None):
+    if retain:
+        if retention_limit is None:
+            retention_limit = MAX_OUTAGE_RAW_BYTES
+        _need(type(retention_limit) is int and 0 < retention_limit <= MAX_OUTAGE_RAW_BYTES,
+              'outage-history-bound')
     workflow = client.get(API + "/actions/workflows/compat.yml")
     _need(type(workflow) is dict and workflow.get("path") == evidence.WORKFLOW
           and workflow.get("name") == "Compatibility" and workflow.get("state") == "active", "collect-workflow")
     wid = _integer(workflow.get("id"))
     runs, total, numbers = {}, 0, set()
+    if retain:
+        raw_runs, raw_attempts, retained_bytes = {}, [], 0
     for event in ("push", "workflow_dispatch"):
         raw = _pages(client, API + f"/actions/workflows/{wid}/runs?head_sha={request.sha}&branch=main&event={event}", "workflow_runs", evidence.MAX_ATTEMPTS)
         for row in raw:
             run = _run_meta(row, request, wid, observed)
             _need(run["event"] == event and run["id"] not in runs and run["number"] not in numbers, "collect-run-duplicate")
             runs[run["id"]] = run; numbers.add(run["number"]); total += run["attempt"]
+            if retain:
+                raw_runs[run["id"]] = envelope._project_run(row, run["attempt"])
             _need(total <= evidence.MAX_ATTEMPTS, "collect-attempt-bound")
     attempts, projections, artifacts, all_jobs, all_checks, listed_checks = [], [], {}, set(), set(), set()
     for rid, latest in sorted(runs.items()):
@@ -287,6 +296,8 @@ def _snapshot(client, request, steps, observed):
         for number in range(1, latest["attempt"]+1):
             row = client.get(API + f"/actions/runs/{rid}/attempts/{number}")
             run = _run_meta(row, request, wid, observed)
+            if retain:
+                raw_run = envelope._project_run(row, latest["attempt"])
             _need(run["id"] == rid and run["attempt"] == number and run["number"] == latest["number"]
                   and run["event"] == latest["event"] and run["created"] == latest["created"], "collect-attempt")
             if number == latest["attempt"]:
@@ -314,7 +325,22 @@ def _snapshot(client, request, steps, observed):
                 execution_window=window)
             attempts.append(attempt)
             projections.append((run, tuple(sorted(details,key=lambda d:d[0].name)), window))
+            if retain:
+                raw = envelope._canonical_projection({'version': 1, 'run': raw_run,
+                    'jobs': sorted((envelope._project_job(j) for j in raw_jobs), key=lambda j:j['id']),
+                    'checks': sorted((envelope._project_check(j) for j in raw_checks), key=lambda j:j['id']),
+                    'artifacts': sorted((envelope._project_artifact(j) for j in raw_artifacts), key=lambda j:j['id'])},
+                    min(envelope.MAX_RAW_BYTES, retention_limit - retained_bytes))
+                retained_bytes += len(raw)
+                _need(retained_bytes <= retention_limit, 'outage-history-bound')
+                raw_attempts.append(envelope.EnvelopeFacts(raw))
     _need(all_checks == listed_checks, "collect-check-inventory")
+    if retain:
+        raw = envelope._canonical_projection([raw_runs[rid] for rid in sorted(raw_runs)],
+            min(envelope.MAX_RAW_BYTES, retention_limit - retained_bytes))
+        _need(retained_bytes + len(raw) <= retention_limit, 'outage-history-bound')
+        return attempts, (wid, runs, projections, artifacts), artifacts, OutageHistorySnapshot(
+            wid, raw, tuple(raw_attempts), observed)
     return attempts, (wid, runs, projections, artifacts), artifacts
 
 
@@ -327,7 +353,7 @@ def _safe_projection(value):
     return value
 
 
-def collect_history(request, client, scratch, *, wall_clock=lambda:datetime.now(timezone.utc)):
+def _collect_history(request, client, scratch, *, wall_clock, retain=False):
     """Collect once; no policy grant and no claim against deleted whole runs."""
     steps = _workflow(request)
     _need(type(client) is ActionsGh and not client._used, "collect-client-reuse")
@@ -336,7 +362,10 @@ def collect_history(request, client, scratch, *, wall_clock=lambda:datetime.now(
         _directory(scratch)
         start = wall_clock()
         _need(type(start) is datetime and start.tzinfo == timezone.utc, "collect-clock")
-        attempts, first, artifacts = _snapshot(client, request, steps, wall_clock())
+        if retain:
+            attempts, first, artifacts, before = _snapshot(client, request, steps, wall_clock(), retain=True)
+        else:
+            attempts, first, artifacts = _snapshot(client, request, steps, wall_clock())
         issues = []
         for i, attempt in enumerate(attempts):
             name = f"compat-result-{request.sha}-{attempt.run_attempt}"
@@ -355,8 +384,17 @@ def collect_history(request, client, scratch, *, wall_clock=lambda:datetime.now(
                         issues.append("artifact-unverified")
             attempts[i] = replace(attempt, measurement=measurement)
         enumeration, second = "complete-visible", None
+        if retain:
+            after = None
         try:
-            _, second, _ = _snapshot(client, request, steps, wall_clock())
+            if retain:
+                used = len(before.runs) + sum(len(row.raw) for row in before.attempts)
+                used += sum(len(row.measurement.result) + len(row.measurement.context) for row in attempts
+                            if type(row.measurement) is evidence.AuthenticatedPair)
+                _, second, _, after = _snapshot(client, request, steps, wall_clock(), retain=True,
+                    retention_limit=MAX_OUTAGE_RAW_BYTES - used)
+            else:
+                _, second, _ = _snapshot(client, request, steps, wall_clock())
             if second != first:
                 enumeration = "incomplete"; issues.append("inventory-changed")
         except evidence.CompatRefusal:
@@ -373,8 +411,261 @@ def collect_history(request, client, scratch, *, wall_clock=lambda:datetime.now(
         history = evidence.VisibleHistory(request.sha, evidence.REPOSITORY, evidence.WORKFLOW,
             observation, end, tuple(attempts), enumeration)
         evidence._history(history, request.sha)
-        return CollectedHistory(history, tuple(sorted(set(issues))), client._commands, client._bytes, transcript)
+        normal = CollectedHistory(history, tuple(sorted(set(issues))), client._commands, client._bytes, transcript)
+        if retain:
+            _need(after is not None, 'outage-history-incomplete')
+            return validate_outage_history(CollectedOutageHistory(normal, start, before, after),
+                                           workflow=request.workflow_bytes, producer_sha=request.sha)
+        return normal
     except evidence.CompatRefusal:
         raise
     except (common.ReleaseError, OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError, OverflowError):
         raise evidence.CompatRefusal("compat-stale", "collect-invalid") from None
+
+
+# Raw retention is a sibling of normal collection, not a new coverage verdict.
+MAX_OUTAGE_RAW_BYTES = 12 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class OutageHistorySnapshot:
+    workflow_id: int
+    runs: bytes = field(repr=False)
+    attempts: tuple[envelope.EnvelopeFacts, ...]
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CollectedOutageHistory:
+    normal: CollectedHistory
+    started_at: datetime
+    before: OutageHistorySnapshot
+    after: OutageHistorySnapshot
+
+
+def collect_history(request, client, scratch, *, wall_clock=lambda:datetime.now(timezone.utc)):
+    """Original normal collector; raw outage custody is never fabricated here."""
+    return _collect_history(request, client, scratch, wall_clock=wall_clock)
+
+
+def collect_outage_history(request, client, scratch, *, wall_clock=lambda:datetime.now(timezone.utc)):
+    """Retain the same two API snapshots, without another client or query pass."""
+    return _collect_history(request, client, scratch, wall_clock=wall_clock, retain=True)
+
+
+def _outage_utc(value):
+    _need(type(value) is datetime and value.tzinfo is timezone.utc and value.fold == 0,
+          'outage-history-clock')
+
+
+def _outage_bound(value):
+    _need(type(value) is CollectedOutageHistory and type(value.normal) is CollectedHistory
+          and type(value.normal.history) is evidence.VisibleHistory, 'outage-history-shape')
+    total = 0
+    for snapshot in (value.before, value.after):
+        _need(type(snapshot) is OutageHistorySnapshot and type(snapshot.runs) is bytes
+              and 0 < len(snapshot.runs) <= envelope.MAX_RAW_BYTES
+              and type(snapshot.attempts) is tuple and len(snapshot.attempts) <= evidence.MAX_ATTEMPTS,
+              'outage-history-bound')
+        total += len(snapshot.runs)
+        for item in snapshot.attempts:
+            _need(type(item) is envelope.EnvelopeFacts and type(item.raw) is bytes
+                  and 0 < len(item.raw) <= envelope.MAX_RAW_BYTES, 'outage-history-bound')
+            total += len(item.raw)
+    _need(type(value.normal.history.attempts) is tuple
+          and len(value.normal.history.attempts) <= evidence.MAX_ATTEMPTS, 'outage-history-bound')
+    for attempt in value.normal.history.attempts:
+        _need(type(attempt) is evidence.Attempt, 'outage-history-shape')
+        if type(attempt.measurement) is evidence.AuthenticatedPair:
+            pair = attempt.measurement
+            _need(type(pair.result) is bytes and 0 < len(pair.result) <= 16384
+                  and type(pair.context) is bytes and 0 < len(pair.context) <= 4096,
+                  'outage-history-bound')
+            total += len(pair.result) + len(pair.context)
+    _need(total <= MAX_OUTAGE_RAW_BYTES, 'outage-history-bound')
+
+
+def _outage_snapshot(snapshot, workflow):
+    """Reconstruct the exact old normal projection from complete raw facts."""
+    _outage_utc(snapshot.observed_at)
+    wid = _integer(snapshot.workflow_id)
+    raw_runs = common.loads_strict(snapshot.runs)
+    envelope._tree(raw_runs)
+    _need(common.canonical_file_bytes(raw_runs) == snapshot.runs, 'outage-history-canonical')
+    envelope._ordered(raw_runs, evidence.MAX_ATTEMPTS)
+    runs, numbers, total, listings = {}, set(), 0, {}
+    for raw in raw_runs:
+        envelope._keys(raw, envelope._RUN_KEYS)
+        for name in ('repository', 'head_repository'):
+            envelope._keys(raw[name], {'id', 'full_name'})
+        run = _run_meta(raw, workflow, wid, snapshot.observed_at)
+        _need(type(raw['latest_run_attempt']) is int and raw['latest_run_attempt'] == run['attempt']
+              and run['number'] not in numbers, 'outage-history-runs')
+        numbers.add(run['number']); total += run['attempt']
+        runs[run['id']], listings[run['id']] = run, raw
+    _need(total <= evidence.MAX_ATTEMPTS and total == len(snapshot.attempts), 'outage-history-attempts')
+    expected_keys = [(rid, number) for rid, row in runs.items() for number in range(1, row['attempt'] + 1)]
+    steps = envelope._reviewed_steps(workflow)
+    _need(steps is not None, 'outage-history-workflow')
+    projections, replayed, artifacts = [], [], {}
+    jobs, referenced, listed, suites, artifact_ids = set(), set(), {}, {}, {}
+    artifact_raw = {}
+    for facts, key in zip(snapshot.attempts, expected_keys, strict=True):
+        result = envelope.replay(workflow, facts, observed_at=snapshot.observed_at)
+        attempt = result.attempt
+        _need((attempt.run_id, attempt.run_attempt) == key and result.workflow_id == wid,
+              'outage-history-attempts')
+        value = common.loads_strict(facts.raw)
+        run = _run_meta(value['run'], workflow, wid, snapshot.observed_at)
+        latest = runs[attempt.run_id]
+        _need(attempt.latest_run_attempt == latest['attempt']
+              and run['number'] == latest['number'] and run['event'] == latest['event']
+              and run['created'] == latest['created'], 'outage-history-run')
+        if attempt.run_attempt == latest['attempt']:
+            _need(value['run'] == listings[attempt.run_id], 'outage-history-latest')
+        for jid in result.job_ids:
+            _need(jid not in jobs, 'outage-history-job-duplicate'); jobs.add(jid)
+        for cid in result.check_ids:
+            _need(cid not in referenced, 'outage-history-check-duplicate'); referenced.add(cid)
+        suite = attempt.run_id, result.listed_checks
+        _need(result.suite not in suites or suites[result.suite] == suite, 'outage-history-suite')
+        suites[result.suite] = suite
+        for cid, raw in result.listed_checks:
+            check = attempt.run_id, result.suite, raw
+            _need(cid not in listed or listed[cid] == check, 'outage-history-checks')
+            listed[cid] = check
+        _need(attempt.run_id not in artifact_raw or artifact_raw[attempt.run_id] == result.artifacts_raw,
+              'outage-history-artifacts')
+        artifact_raw[attempt.run_id] = result.artifacts_raw
+        for meta in result.artifacts:
+            _need(meta.id not in artifact_ids or artifact_ids[meta.id] == (attempt.run_id, meta),
+                  'outage-history-artifact-duplicate')
+            artifact_ids[meta.id] = attempt.run_id, meta
+        artifacts[attempt.run_id] = [dict(id=a.id, name=a.name, size=a.size, expired=a.expired,
+            created=a.created, updated=a.updated, expires=a.expires) for a in result.artifacts]
+        checks = {row['id']:row for row in value['checks']}
+        details = []
+        for row in value['jobs']:
+            typed, eligible, terminal, _, detail = _job(row, checks, run, workflow.sha, steps, snapshot.observed_at)
+            details.append((typed, eligible, terminal, detail))
+        projections.append((run, tuple(sorted(details, key=lambda d:d[0].name)), attempt.execution_window))
+        replayed.append(result)
+    _need(referenced == set(listed), 'outage-history-check-inventory')
+    return tuple(replayed), (wid, runs, projections, artifacts)
+
+
+def _outage_pair(attempt, replayed):
+    pair = attempt.measurement
+    meta = next((row for row in replayed.artifacts
+                 if row.name == f'compat-result-{attempt.sha}-{attempt.run_attempt}'), None)
+    if type(pair) is evidence.AuthenticatedPair:
+        _need(meta is not None and not meta.expired and type(pair.artifact) is evidence.Artifact
+              and type(pair.artifact.artifact_id) is int and pair.artifact.artifact_id == meta.id
+              and attempt.started_at is not None and attempt.started_at <= meta.created
+              and (attempt.completed_at is None or meta.updated <= attempt.completed_at), 'outage-history-pair')
+        evidence.parse_authenticated_pair(pair, attempt)
+    elif meta is None:
+        _need(pair is replayed.attempt.measurement, 'outage-history-missing')
+    elif meta.expired:
+        _need(pair is evidence.MissingEvidence.EXPIRED, 'outage-history-expired')
+    else:
+        _need(pair is evidence.MissingEvidence.UNKNOWN, 'outage-history-unverified')
+
+
+def _outage_history(value, workflow, producer_sha):
+    _outage_bound(value)
+    observation = envelope.WorkflowObservation(producer_sha, workflow)
+    envelope.validate_workflow(observation)
+    _need(envelope._reviewed_steps(observation) is not None, 'outage-history-workflow')
+    normal, history = value.normal, value.normal.history
+    for moment in (value.started_at, value.before.observed_at, value.after.observed_at, history.observed_at):
+        _outage_utc(moment)
+    _need(value.started_at <= value.before.observed_at <= value.after.observed_at <= history.observed_at,
+          'outage-history-clock')
+    _need(type(normal.issues) is tuple and normal.issues in ((), ('artifact-unverified',))
+          and type(normal.command_count) is int and 0 < normal.command_count <= MAX_COMMANDS
+          and type(normal.captured_bytes) is int and 0 <= normal.captured_bytes <= MAX_BYTES
+          and type(normal.transcript_sha256) is str and re.fullmatch(r'[0-9a-f]{64}', normal.transcript_sha256),
+          'outage-history-metadata')
+    evidence._history(history, producer_sha)
+    _need(history.enumeration == 'complete-visible'
+          and value.before.workflow_id == value.after.workflow_id
+          and value.before.runs == value.after.runs
+          and value.before.attempts == value.after.attempts, 'outage-history-incomplete')
+    before, first = _outage_snapshot(value.before, observation)
+    after, second = _outage_snapshot(value.after, observation)
+    _need(first == second and len(history.attempts) == len(before), 'outage-history-incomplete')
+    unknown = False
+    for actual, derived, final in zip(history.attempts, before, after, strict=True):
+        for moment in (actual.requested_at, actual.started_at, actual.completed_at):
+            if moment is not None:
+                _outage_utc(moment)
+        if actual.execution_window is not None:
+            _outage_utc(actual.execution_window.started_at); _outage_utc(actual.execution_window.completed_at)
+        _need(replace(actual, measurement=derived.attempt.measurement) == derived.attempt
+              and derived.attempt == final.attempt, 'outage-history-derived')
+        _outage_pair(actual, derived)
+        unknown |= actual.measurement is evidence.MissingEvidence.UNKNOWN
+    _need(unknown == ('artifact-unverified' in normal.issues), 'outage-history-metadata')
+    observation_id = _hash(common.canonical_file_bytes(_safe_projection({'begin':first, 'end':second,
+        'transcript':normal.transcript_sha256, 'started':value.started_at, 'observed':history.observed_at})))
+    _need(history.observation_id == observation_id, 'outage-history-observation')
+    return value
+
+
+def _outage_safe(value, workflow, producer_sha):
+    try:
+        return _outage_history(value, workflow, producer_sha)
+    except evidence.CompatRefusal:
+        raise
+    except (common.ReleaseError, ValueError, TypeError, KeyError, AttributeError,
+            RecursionError, OverflowError, UnicodeError):
+        raise evidence.CompatRefusal('compat-stale', 'outage-history-invalid') from None
+
+
+def validate_outage_history(collected, *, workflow, producer_sha):
+    _workflow(CollectionRequest(producer_sha, workflow))
+    return _outage_safe(collected, workflow, producer_sha)
+
+
+def _validate_outage_history_custody(collected, *, workflow, producer_sha):
+    """Only fixed W0/current original-custody replay, not source coverage."""
+    return _outage_safe(collected, workflow, producer_sha)
+
+
+def _missing_expired(request, collected):
+    evidence._request(request)
+    history = collected.normal.history
+    _need(request.observation_id == history.observation_id and request.source.sha == history.sha
+          and not collected.normal.issues, 'outage-history-request')
+    missing = not history.attempts
+    for attempt in history.attempts:
+        window = attempt.execution_window
+        _need(attempt.status == 'completed' and window is not None and window.fresh,
+              'outage-history-unqualified')
+        if type(attempt.measurement) is evidence.AuthenticatedPair:
+            measured = evidence.parse_authenticated_pair(attempt.measurement, attempt)
+            if not measured.positive:
+                if evidence._negative_current(measured, request):
+                    evidence._negative(measured)
+                raise evidence.CompatRefusal('compat-stale', 'outage-authenticated-negative')
+            _need(evidence._current(measured, request) and evidence._successful(attempt),
+                  'outage-history-positive-unqualified')
+        else:
+            _need(attempt.measurement in (evidence.MissingEvidence.MISSING, evidence.MissingEvidence.EXPIRED),
+                  'outage-history-unavailable')
+            missing = True
+    _need(missing, 'outage-history-no-missing-evidence')
+    return collected
+
+
+def require_missing_expired(request, collected, *, workflow):
+    evidence._request(request)
+    validate_outage_history(collected, workflow=workflow, producer_sha=request.source.sha)
+    return _missing_expired(request, collected)
+
+
+def _require_missing_expired_custody(request, collected, *, workflow):
+    evidence._request(request)
+    _validate_outage_history_custody(collected, workflow=workflow, producer_sha=request.source.sha)
+    return _missing_expired(request, collected)

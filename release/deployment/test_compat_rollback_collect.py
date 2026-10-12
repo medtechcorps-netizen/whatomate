@@ -425,3 +425,35 @@ class RollbackCollectorTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SharedProjectionTests(unittest.TestCase):
+    def test_all_six_original_rollback_helpers_are_exact_shared_aliases(self):
+        for local, shared in (('_project', '_project_fields'), ('_canonical', '_canonical_projection'),
+                ('_run', '_project_run'), ('_job', '_project_job'), ('_check', '_project_check'),
+                ('_artifact', '_project_artifact')):
+            self.assertIs(getattr(collect, local), getattr(envelope, shared))
+
+    def test_fixed_projection_reproduces_complete_original_envelope(self):
+        raw = json.loads(histories.row().envelope.raw)
+        rebuilt = {'version':1, 'run':collect._run(raw['run'], raw['run']['latest_run_attempt']),
+            'jobs':[collect._job(row) for row in raw['jobs']],
+            'checks':[collect._check(row) for row in raw['checks']],
+            'artifacts':[collect._artifact(row) for row in raw['artifacts']]}
+        self.assertEqual(collect._canonical(rebuilt, envelope.MAX_RAW_BYTES), histories.row().envelope.raw)
+        for name in ('jobs', 'checks', 'artifacts'):
+            changed = copy.deepcopy(raw); changed[name][0].pop('id')
+            projector = {'jobs':collect._job, 'checks':collect._check, 'artifacts':collect._artifact}[name]
+            with self.subTest(name=name), self.assertRaises(evidence.CompatRefusal):
+                projector(changed[name][0])
+
+    def test_canonical_shared_buffer_limit_includes_terminal_lf(self):
+        raw = collect._canonical({'a':1}, 8)
+        self.assertEqual(raw, b'{"a":1}\n')
+        with self.assertRaises(evidence.CompatRefusal): collect._canonical({'a':1}, 7)
+
+    def test_rollback_own_w0_source_window_survives_current_pin_transition(self):
+        with mock.patch.object(envelope, 'WORKFLOW_SHA256', 'f'*64), harness() as (world, repo, options):
+            result = execute(world, repo, options)
+            self.assertEqual(qualify(world, result).run_id, 100)
+            self.assertEqual(len([a for a, _ in world.trace if a[1:3] == ['attestation', 'verify']]), 2)

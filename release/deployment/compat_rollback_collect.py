@@ -87,51 +87,22 @@ class _RollbackActionsGh(normal.ActionsGh):
             self._scope = None
 
 
-def _project(value, keys):
-    _need(type(value) is dict and keys <= value.keys(), 'rollback-collect-field')
-    return {key: value[key] for key in sorted(keys)}
+_project = envelope._project_fields
 
 
-def _canonical(value, maximum):
-    """Bound the canonical retained buffer as it is encoded, including LF."""
-    output = bytearray()
-    for part in json.JSONEncoder(sort_keys=True, separators=(',', ':'),
-                                 ensure_ascii=True, allow_nan=False).iterencode(value):
-        raw = part.encode('ascii')
-        _need(len(output) + len(raw) + 1 <= maximum, 'rollback-history-bound')
-        output.extend(raw)
-    output.extend(b'\n')
-    return bytes(output)
+_canonical = envelope._canonical_projection
 
 
-def _run(value, latest):
-    row = _project(value, envelope._RUN_KEYS - {'latest_run_attempt'})
-    row['latest_run_attempt'] = latest
-    for key in ('repository', 'head_repository'):
-        row[key] = _project(row[key], {'id', 'full_name'})
-    return row
+_run = envelope._project_run
 
 
-def _job(value):
-    row = _project(value, envelope._JOB_KEYS)
-    _need(type(row['steps']) is list and len(row['steps']) <= 100,
-          'rollback-collect-steps')
-    row['steps'] = [_project(step, envelope._STEP_KEYS) for step in row['steps']]
-    return row
+_job = envelope._project_job
 
 
-def _check(value):
-    row = _project(value, envelope._CHECK_KEYS)
-    row['app'] = _project(row['app'], {'id'})
-    row['check_suite'] = _project(row['check_suite'], {'id'})
-    return row
+_check = envelope._project_check
 
 
-def _artifact(value):
-    row = _project(value, envelope._ARTIFACT_KEYS)
-    row['workflow_run'] = _project(row['workflow_run'],
-        {'id', 'repository_id', 'head_repository_id', 'head_sha', 'head_branch'})
-    return row
+_artifact = envelope._project_artifact
 
 
 def _inventory(client, wall_clock):

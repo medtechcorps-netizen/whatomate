@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import compat_negative_index as policy
+import compat_outage_policy as outage_loader
 import compat_negative_transport as transport
 import record_transport as rt
 import test_compat_negative_index as fixtures
@@ -147,9 +148,10 @@ class NegativeTransportTests(unittest.TestCase):
             with self.subTest(publisher=publisher):
                 config = self.root / ("factory-" + str(publisher)); config.mkdir()
                 budget = rt.OperationBudget(700, capture=self.world, clock=self.clock)
-                key = "_INSTALLED_PRODUCER_SETUP" if publisher else "_INSTALLED_CONSUMER_POLICY"
-                value = fixtures.setup_bytes() if publisher else fixtures.wire(fixtures.consumer_dict())
-                with mock.patch.object(policy, key, value):
+                consumer = self.root / "consumer.json"
+                consumer.write_bytes(fixtures.wire(fixtures.consumer_dict()))
+                with mock.patch.object(policy, "_INSTALLED_PRODUCER_SETUP", fixtures.setup_bytes()), \
+                     mock.patch.object(outage_loader, "_POLICY_PATH", consumer):
                     factory = transport.open_publisher if publisher else transport.open_reader
                     client = factory(self.binary, "synthetic", config, budget=budget, base_env={})
                 self.assertIs(client.budget, budget)

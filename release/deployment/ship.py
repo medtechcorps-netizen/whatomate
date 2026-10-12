@@ -1141,6 +1141,10 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
             common.fail("candidate-invalid:compat-stale")
         if not proof.checked_at <= observed < proof.artifact_expires_at:
             common.fail("candidate-invalid:compat-stale")
+    if gate.outage is not None:
+        # Use the original deadline and the full-precision clock after custody
+        # encoding. Completion/record retries do not get a new admission clock.
+        ship_flow.require_outage_freshness(gate, deadline=deadline, observed_at=ctx.deps.clock())
     # P5 two identical double reads, digest sources, topology and VPC.
     client = do_app.DOAppClient(
         secret["app_id"],

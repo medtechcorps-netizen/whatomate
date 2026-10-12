@@ -778,5 +778,160 @@ def evidence_workflow():
     return writer.evidence.WORKFLOW
 
 
+
+def outage_fixture(testcase, *, unavailable=True, full_closure=False):
+    """Actual composed preflight on controlled Git/GH edges; no live authority."""
+    import test_ship_outage_compat as outage
+    case = outage.outage_case(testcase, unavailable=unavailable, full_closure=full_closure)
+    with case.installed():
+        preflight = case.run()
+    testcase.assertIs(type(preflight), writer.outage_preflight.OutagePreflight)
+    value = preflight.source.admission.resolution
+    return case, writer.prepare_outage_promotion(preflight, images(value), execution())
+
+
+def outage_publication(handoff, *, seconds=1, **changes):
+    at = handoff.preflight.checked_at.replace(microsecond=0) + timedelta(seconds=seconds)
+    fields = dict(deployed_at=common.format_timestamp(at), execution=handoff.execution)
+    fields.update(changes)
+    return publication(**fields)
+
+
+def outage_plain(handoff, *, main='b'*40):
+    return projected(handoff.preflight.source.admission.resolution.resolved.chain, main=main)
+
+
+class OutageWriterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        case = unittest.TestCase(); cls.addClassCleanup(case.doCleanups)
+        cls.case, cls.handoff = outage_fixture(case)
+        cls.missing_case, cls.missing = outage_fixture(case, unavailable=False)
+
+    def build(self, handoff=None, **options):
+        handoff = self.handoff if handoff is None else handoff
+        return writer.build_outage_promotion(handoff, options.pop('publication', outage_publication(handoff)),
+            options.pop('current_resolution', outage_plain(handoff)), **options)
+
+    def refuse(self, call, *args, **kwargs):
+        with self.assertRaises(writer.WriterRefusal) as caught: call(*args, **kwargs)
+        self.assertNotIn('PRIVATE', str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+
+    def test_real_preflight_both_unavailable_branches_build_exact_unproven_facts(self):
+        for handoff in (self.handoff, self.missing):
+            with self.subTest(kind=type(handoff.preflight.availability).__name__):
+                value = common.loads_strict(self.build(handoff))
+                self.assertEqual((value['db_change'], value['dormant'], value['reversible']), ('none', False, True))
+                self.assertEqual((value['compat'], value['compat_run_id'], value['old_server_ok'], value['staging']),
+                                 ('bypassed', None, 'unproven', 'bypassed'))
+                self.assertEqual(value['catalog_sha256'], handoff.facts.catalog.catalog_sha256)
+
+    def test_append_reanchors_origin_without_claiming_new_measurement(self):
+        handoff = self.handoff; resolution = handoff.preflight.source.admission.resolution
+        raw = self.build(); current = outage_plain(handoff)
+        after = appended(current, raw, resolution.candidate)
+        live = after.latest.live
+        self.assertEqual(live.catalog, resolution.resolved.latest.live.catalog)
+        self.assertEqual(live.origin_release, after.latest.release)
+        self.assertEqual(live.origin_manifest_sha256, common.sha256_bytes(raw))
+        self.assertEqual(live.origin_source.sha, resolution.candidate.sha)
+        self.assertNotEqual(live.origin_release, resolution.resolved.latest.live.origin_release)
+        entry = after.chain.entries[-1]
+        self.assertEqual(after.latest, resolver._selection(after.chain, len(after.chain.entries) - 1))
+        self.assertEqual(after.selected, after.latest)
+        self.assertEqual(entry.record.raw, raw)
+        self.assertIsNone(entry.facts.old_server_ok)
+
+    def test_frozen_models_and_forged_facts_do_not_supply_authority(self):
+        with self.assertRaises(FrozenInstanceError): self.handoff.facts = None
+        for facts in (self.handoff.facts._replace(compat='ok', compat_run_id=100),
+                      self.handoff.facts._replace(old_server_ok=True),
+                      self.handoff.facts._replace(staging='passed'),
+                      self.handoff.facts._replace(db_change='data', dormant=True)):
+            self.refuse(self.build, replace(self.handoff, facts=facts))
+
+    def test_original_execution_attempt_and_verified_candidate_image_projection(self):
+        h = self.handoff
+        for bad in (replace(h.execution, run_attempt=2), replace(h.execution, run_attempt=True),
+                    replace(h.execution, workflow='PRIVATE')):
+            self.refuse(writer.prepare_outage_promotion, h.preflight, h.candidate_images, bad)
+        for bad in (replace(h.candidate_images, sha='f'*40),
+                    replace(h.candidate_images, source_shas=((common.COMPONENTS[0], 'f'*40),))):
+            self.refuse(writer.prepare_outage_promotion, h.preflight, bad, h.execution)
+
+    def test_publication_execution_change_and_parent_image_changes_refuse(self):
+        h = self.handoff
+        self.refuse(self.build, publication=outage_publication(h, execution=execution(run_id=999)))
+        current = outage_plain(h)
+        self.refuse(self.build, current_resolution=replace(current, image_bindings=current.image_bindings[:-1]))
+        self.refuse(self.build, current_resolution=replace(current, selected=resolver._selection(current.chain, 0)))
+
+    def test_same_second_publication_and_later_completion_are_allowed(self):
+        h = self.handoff
+        self.assertTrue(self.build(publication=outage_publication(h, seconds=0)))
+        end = h.preflight.valid_until + timedelta(days=2)
+        self.assertTrue(self.build(publication=outage_publication(h, deployed_at=common.format_timestamp(end))))
+        self.refuse(self.build, publication=outage_publication(h, seconds=-1))
+
+    def test_later_main_does_not_requalify_original_admission(self):
+        self.assertEqual(self.build(current_resolution=outage_plain(self.handoff, main='c'*40)), self.build())
+
+    def test_preserved_validation_rejects_changed_raw_policy_and_index(self):
+        h = self.handoff; p = h.preflight
+        bad_source = replace(p.source, coverage=replace(p.source.coverage, policy_raw=b'PRIVATE'))
+        for bad in (replace(p, source=bad_source), replace(p, command_count=True),
+                    replace(p, valid_until=p.valid_until+timedelta(microseconds=1)),
+                    replace(p, index=replace(p.index, producer_sha='f'*40)),
+                    replace(p, availability=replace(p.availability, observation=replace(
+                        p.availability.observation, raw=b'PRIVATE')))):
+            self.refuse(writer.prepare_outage_promotion, bad, h.candidate_images, h.execution)
+
+    def test_outage_is_not_accepted_by_normal_or_rollback_writer(self):
+        self.refuse(writer.build_promotion, self.handoff, outage_publication(self.handoff), outage_plain(self.handoff))
+        self.refuse(writer.build_qualified_rollback, self.handoff, outage_publication(self.handoff), outage_plain(self.handoff))
+
+    def test_record_replay_has_no_clock_collection_or_installed_policy_read(self):
+        with mock.patch.object(writer.outage_preflight, 'preflight', side_effect=AssertionError('new preflight')), \
+             mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('policy read')):
+            self.assertEqual(writer._build_outage_custody(self.handoff, outage_publication(self.handoff),
+                                                        outage_plain(self.handoff)), self.build())
+
+    def test_missing_history_cannot_be_discarded_or_replaced_by_service_status(self):
+        h = self.missing; available = h.preflight.availability
+        changed = replace(available, collected=replace(available.collected,
+            before=replace(available.collected.before, runs=b'PRIVATE')))
+        self.refuse(writer.prepare_outage_promotion, replace(h.preflight, availability=changed),
+                    h.candidate_images, h.execution)
+
+
+class HistoricalContext3WriterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        composition.source.ForwardResolverTests.setUpClass()
+        cls.value = composition.resolution()
+        cls.history = composition.collected(cls.value)
+        cls.handoff = writer.prepare_promotion(cls.value, cls.history, images(cls.value), execution(),
+                                              staging='passed', drills=drills(cls.value))
+
+    def test_closed_context3_replay_preserves_old_workflow_but_current_prepare_refuses(self):
+        with mock.patch.object(writer.collect, 'WORKFLOW_SHA256', 'f'*64):
+            rebuilt = writer._prepare_promotion_context3_custody(self.value, self.history, images(self.value),
+                execution(), staging='passed', drills=drills(self.value))
+            self.assertEqual(rebuilt, self.handoff)
+            self.assertTrue(writer._build_promotion_context3_custody(rebuilt, publication(), self.value.resolved))
+            with self.assertRaises(writer.WriterRefusal):
+                writer.prepare_promotion(self.value, self.history, images(self.value), execution(),
+                                         staging='passed', drills=drills(self.value))
+
+    def test_historical_context3_keeps_original_drill_and_subject_binding(self):
+        h = self.handoff
+        with self.assertRaises(writer.WriterRefusal):
+            writer._build_promotion_context3_custody(replace(h, drills=None), publication(), self.value.resolved)
+        with self.assertRaises(writer.WriterRefusal):
+            writer._build_promotion_context3_custody(replace(h, facts=h.facts._replace(compat_run_id=999)),
+                                                   publication(), self.value.resolved)
+
+
 if __name__ == '__main__':
     unittest.main()

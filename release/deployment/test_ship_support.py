@@ -1125,7 +1125,7 @@ class PostGateHarness(Harness):
         # Deliberately simple test data, not a forged authenticated dataclass.
         resolved = SimpleNamespace(chain=chain, latest=projection(chain.latest), selected=projection(selected))
         return SimpleNamespace(resolved=resolved, classification=classification, normal=None, rollback=None,
-                               qualified_rollback=None)
+                               qualified_rollback=None, outage=None)
 
     def _promotion_outputs(self, value: Any, control: Mapping[str, Any], images: Mapping[str, str],
                            *, staging: str, private: Iterable[str] = ()) -> dict[str, str]:

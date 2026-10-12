@@ -33,9 +33,11 @@ def _need(value):
 def _operational_modules():
     # Existing modules perform their own import-path setup. They are deliberately
     # unreachable from an unconfigured operational entry, including bad argv.
-    import cli
+    sys.path.insert(0, str(Path(__file__).parent))
+    import public_evidence
     import compat_negative_transport as transport
-    return cli, transport, cli.record_transport
+    import record_transport
+    return public_evidence, transport, record_transport
 
 
 def _file_identity(value):

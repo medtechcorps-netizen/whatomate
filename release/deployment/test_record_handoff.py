@@ -963,5 +963,225 @@ class RollbackHandoffTests(unittest.TestCase):
                 execution=replace(self.handoff.execution, run_attempt=2)))
 
 
+
+class OutageHandoffTests(unittest.TestCase):
+    measurements = {}
+
+    @classmethod
+    def setUpClass(cls):
+        case = unittest.TestCase(); cls.addClassCleanup(case.doCleanups)
+        cls.case, cls.handoff = fixture.outage_fixture(case)
+        cls.missing_case, cls.missing = fixture.outage_fixture(case, unavailable=False)
+        cls.outputs = codec.encode_outage(cls.handoff)
+        cls.missing_outputs = codec.encode_outage(cls.missing)
+
+    def args(self, handoff=None, **changes):
+        h = self.handoff if handoff is None else handoff
+        values = dict(candidate_sha=h.candidate_images.sha, workflow_sha=h.execution.workflow_sha,
+                      run_id=h.execution.run_id, record_attempt=1)
+        values.update(changes); return values
+
+    def decode(self, outputs=None, **changes):
+        return codec.decode_outage(self.outputs if outputs is None else outputs, **self.args(**changes))
+
+    def build(self, outputs=None, handoff=None, **changes):
+        h = self.handoff if handoff is None else handoff
+        args = self.args(h, record_attempt=9)
+        args.update(publication=fixture.outage_publication(h), current_resolution=fixture.outage_plain(h))
+        args.update(changes)
+        return codec.build_outage_record(self.outputs if outputs is None else outputs, **args)
+
+    def refuse(self, outputs=None, **changes):
+        with self.assertRaises(codec.HandoffRefusal) as caught: self.decode(outputs, **changes)
+        self.assertEqual(str(caught.exception), 'record-handoff-invalid')
+        self.assertIsNone(caught.exception.__cause__)
+
+    def frame(self, outputs=None):
+        raw = codec._unpack_outage(self.outputs if outputs is None else outputs)
+        header, blobs = codec._unframe(raw, version=8)
+        return copy.deepcopy(header), dict(blobs)
+
+    def repack(self, header, blobs):
+        raw = codec._frame(header['handoff'], blobs, version=header['version'])
+        return envelope(raw, compressed=lzma.compress(raw, format=lzma.FORMAT_XZ,
+            check=lzma.CHECK_CRC64, preset=6), version='8')
+
+    def test_both_complete_unavailable_branches_public_roundtrip_and_build(self):
+        for h, outputs in ((self.handoff, self.outputs), (self.missing, self.missing_outputs)):
+            with self.subTest(branch=type(h.preflight.availability).__name__):
+                decoded = codec.decode_outage(outputs, **self.args(h))
+                self.assertEqual(decoded, h)
+                self.assertEqual(decoded.preflight.source.coverage.blobs, h.preflight.source.coverage.blobs)
+                value = w.common.loads_strict(self.build(outputs, h))
+                self.assertEqual((value['compat'], value['old_server_ok'], value['compat_run_id']),
+                                 ('bypassed', 'unproven', None))
+                self.assertEqual(value['catalog_sha256'], h.facts.catalog.catalog_sha256)
+                self.assertEqual(outputs['handoff_version'], '8')
+        self.assertFalse(hasattr(self.decode().preflight.availability, 'collected'))
+        restored = codec.decode_outage(self.missing_outputs, **self.args(self.missing))
+        self.assertEqual(restored.preflight.availability.collected, self.missing.preflight.availability.collected)
+
+    def test_fixed38_outputs_original_caps_and_determinism(self):
+        self.assertEqual(codec.encode_outage(self.handoff), self.outputs)
+        self.assertEqual(set(self.outputs), set(codec.OUTPUT_KEYS))
+        self.assertEqual(len(self.outputs), 38)
+        self.assertEqual((codec.VERSION, codec.MAX_ENCODED, codec.MAX_COMPRESSED,
+                          codec.MAX_RAW, codec.MAX_EXPANDED_BYTES, codec.MAX_BLOB),
+                         ('6', 262144, 196608, 16777216, 16777216, 4194304))
+        for key, value in self.outputs.items():
+            self.assertRegex(key, w.common.OUTPUT_KEY_RE)
+            self.assertRegex(value, w.common.OUTPUT_VALUE_RE)
+            if value: w.common.require_public_text(value)
+
+    def test_all_other_wire_versions_and_roots_refuse(self):
+        for version in ('1','2','3','4','5','6','7','9',True):
+            with self.subTest(version=version): self.refuse(dict(self.outputs, handoff_version=version))
+        with self.assertRaises(codec.HandoffRefusal): codec.decode(self.outputs, **self.args())
+        with self.assertRaises(codec.HandoffRefusal):
+            codec.decode_rollback(self.outputs, producer_sha=self.args()['candidate_sha'],
+                target_release=fixture.outage_plain(self.handoff).latest.release,
+                workflow_sha=self.args()['workflow_sha'], run_id=self.args()['run_id'], record_attempt=1)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode(self.handoff)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(self.handoff)
+
+    def test_wrong_candidate_workflow_run_or_boolean_attempt_refuses(self):
+        for key, value in (('candidate_sha','f'*40), ('workflow_sha','f'*40), ('run_id',99),
+                           ('run_id',True), ('record_attempt',True), ('record_attempt',0)):
+            with self.subTest(key=key): self.refuse(**{key:value})
+        self.assertEqual(self.decode(record_attempt=500).execution.run_attempt, 1)
+
+    def test_closed_root_missing_extra_fields_and_false_facts_refuse(self):
+        for change in (lambda f: f.pop('preflight'), lambda f: f.__setitem__('allow',True),
+                       lambda f: f['facts']['fields'].__setitem__('old_server_ok',True),
+                       lambda f: f['facts']['fields'].__setitem__('compat_run_id',100),
+                       lambda f: f['facts']['fields'].__setitem__('staging','passed')):
+            header, blobs = self.frame(); change(header['handoff']['fields']); self.refuse(self.repack(header, blobs))
+        header, blobs = self.frame(); header['handoff']['type'] = 'record_writer.PromotionHandoff'
+        self.refuse(self.repack(header, blobs))
+
+    def test_preflight_types_utc_and_original_arithmetic_refuse(self):
+        for change in (lambda f: f.__setitem__('command_count',True),
+                       lambda f: f.__setitem__('captured_bytes',-1),
+                       lambda f: f.__setitem__('remaining_us',True),
+                       lambda f: f.__setitem__('remaining_us',900000001),
+                       lambda f: f['valid_until'].__setitem__('value','2027-01-01T00:00:00.000000Z'),
+                       lambda f: f['checked_at'].__setitem__('value','2026-10-11T12:00:00+08:00'),
+                       lambda f: f['entry_at'].__setitem__('value','2027-01-01T00:00:00.000000Z')):
+            header, blobs = self.frame(); change(header['handoff']['fields']['preflight']['fields'])
+            self.refuse(self.repack(header, blobs))
+
+    def test_raw_policy_source_and_index_are_replayed_after_coherent_frame_hash(self):
+        mutations = (
+            lambda f: f['source']['fields']['coverage']['fields']['ancestry']['items'][0]['fields'].__setitem__('merge_base_sha','f'*40),
+            lambda f: f['source']['fields']['coverage']['fields']['blobs']['items'][0]['fields'].__setitem__('mode','120000'),
+            lambda f: f['index']['fields'].__setitem__('producer_sha','f'*40),
+            lambda f: f['index']['fields'].__setitem__('setup_sha256','0'*64),
+            lambda f: f['availability']['fields']['observation']['fields'].__setitem__('status',200))
+        for change in mutations:
+            header, blobs = self.frame(); change(header['handoff']['fields']['preflight']['fields'])
+            self.refuse(self.repack(header, blobs))
+
+    def test_missing_raw_snapshot_and_own_observation_time_cannot_be_omitted(self):
+        for change in (lambda f: f.pop('before'),
+                       lambda f: f['before']['fields'].pop('observed_at'),
+                       lambda f: f['before']['fields']['observed_at'].__setitem__('value','2027-01-01T00:00:00.000000Z')):
+            header, blobs = self.frame(self.missing_outputs)
+            collected = header['handoff']['fields']['preflight']['fields']['availability']['fields']['collected']['fields']
+            change(collected); self.refuse(self.repack(header, blobs))
+
+    def test_duplicate_unknown_unreferenced_blob_and_trailing_bytes_refuse(self):
+        header, blobs = self.frame(); blobs[hashlib.sha256(b'PRIVATE').hexdigest()] = b'PRIVATE'
+        self.refuse(self.repack(header, blobs))
+        raw = codec._unpack_outage(self.outputs)
+        for bad in (raw+b'x', raw[:-1], b'\xff\xff\xff\xff'+raw[4:]):
+            self.refuse(envelope(bad, compressed=lzma.compress(bad), version='8'))
+        self.refuse(envelope(raw, compressed=lzma.compress(raw)+lzma.compress(b''), version='8'))
+
+    def test_bad_metadata_fails_before_inflate(self):
+        for key, value in (('handoff_raw_length',str(codec.MAX_RAW+1)),
+                           ('handoff_encoded_length',str(codec.MAX_ENCODED+1)),
+                           ('handoff_compressed_length',str(codec.MAX_COMPRESSED+1)),
+                           ('handoff_chunk_count','33'), ('handoff_raw_length','01')):
+            with mock.patch.object(codec, '_xz_inflate', side_effect=AssertionError('inflate')):
+                self.refuse(dict(self.outputs, **{key:value}))
+        for key in codec.OUTPUT_KEYS:
+            bad = dict(self.outputs); del bad[key]; self.refuse(bad)
+
+    def test_original_time_retry_after_expiry_and_main_advance_without_recollection(self):
+        end = self.handoff.preflight.valid_until + timedelta(days=3)
+        publication = fixture.outage_publication(self.handoff, deployed_at=w.common.format_timestamp(end))
+        with mock.patch.object(codec.op, 'preflight', side_effect=AssertionError('fresh preflight')), \
+             mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('policy read')):
+            self.assertEqual(self.decode(record_attempt=9), self.handoff)
+            self.assertTrue(self.build(publication=publication,
+                current_resolution=fixture.outage_plain(self.handoff, main='c'*40)))
+
+    def test_current_encode_does_not_gain_historical_workflow_from_decoder(self):
+        # Controlled pin change proves route separation, not future P authority.
+        with mock.patch.object(codec.c, 'WORKFLOW_SHA256', 'f'*64):
+            self.assertEqual(self.decode(), self.handoff)
+            with self.assertRaises(codec.HandoffRefusal): codec.encode_outage(self.handoff)
+
+    def test_same_second_publication_and_previous_second_refusal(self):
+        self.assertTrue(self.build(publication=fixture.outage_publication(self.handoff, seconds=0)))
+        with self.assertRaises(codec.HandoffRefusal):
+            self.build(publication=fixture.outage_publication(self.handoff, seconds=-1))
+
+    def test_realistic_full_closure_both_branches_capacity_before_provider(self):
+        for unavailable in (True, False):
+            with self.subTest(unavailable=unavailable):
+                case, handoff = fixture.outage_fixture(self, unavailable=unavailable, full_closure=True)
+                outputs = codec.encode_outage(handoff)
+                self.assertEqual(codec.decode_outage(outputs, **self.args(handoff)), handoff)
+                self.assertTrue(self.build(outputs, handoff))
+                key = 'service' if unavailable else 'missing'
+                self.measurements[key] = {name:int(outputs[name]) for name in
+                    ('handoff_raw_length','handoff_compressed_length','handoff_encoded_length','handoff_chunk_count')}
+                self.measurements[key].update(command_count=handoff.preflight.command_count,
+                    captured_bytes=handoff.preflight.captured_bytes,
+                    closure_rows=len(handoff.preflight.source.coverage.blobs),
+                    closure_raw_bytes=sum(len(row.raw or b'') for row in handoff.preflight.source.coverage.blobs))
+
+    def test_complete_high_entropy_source_refuses_at_codec_capacity_without_pruning(self):
+        import test_ship_outage_compat as outage
+        case = outage.outage_case(self)
+        # Complete coherent P/H observation with one independently controlled
+        # extra source file; not a claim this is the real publisher closure.
+        raw = b'# ' + hashlib.shake_256(b'outage-capacity-source').hexdigest(1500000).encode('ascii') + b'\n'
+        case.add_source('release/compat/outage_capacity_probe.py', raw)
+        with case.installed(): preflight = case.run()
+        resolution = preflight.source.admission.resolution
+        handoff = w.prepare_outage_promotion(preflight, fixture.images(resolution), fixture.execution())
+        self.assertIs(w.outage_preflight.validate_preserved(preflight), preflight)
+        self.assertEqual(sum(row.raw == raw for row in preflight.source.coverage.blobs), 2)
+        with self.assertRaises(codec.HandoffRefusal): codec.encode_outage(handoff)
+        self.assertEqual(sum(row.raw == raw for row in preflight.source.coverage.blobs), 2)
+        self.measurements['overcap'] = dict(command_count=preflight.command_count,
+            captured_bytes=preflight.captured_bytes, extra_source_bytes=len(raw),
+            closure_rows=len(preflight.source.coverage.blobs))
+
+
+class HistoricalEncodingBoundaryTests(unittest.TestCase):
+    def test_normal_current_write_refuses_old_pin_but_saved6_replays(self):
+        fixture.HistoricalContext3WriterTests.setUpClass()
+        handoff = fixture.HistoricalContext3WriterTests.handoff
+        outputs = codec.encode(handoff)
+        with mock.patch.object(codec.c, 'WORKFLOW_SHA256', 'f'*64):
+            restored = codec.decode(outputs, candidate_sha=handoff.candidate_images.sha,
+                workflow_sha=handoff.execution.workflow_sha, run_id=handoff.execution.run_id, record_attempt=9)
+            self.assertEqual(restored, handoff)
+            with self.assertRaises(codec.HandoffRefusal): codec.encode(handoff)
+
+    def test_rollback_current_write_refuses_old_pin_but_saved7_replays(self):
+        case, handoff = fixture.rollback_fixture(self)
+        outputs = codec.encode_rollback(handoff)
+        args = dict(producer_sha=handoff.preflight.resolution.producer.sha,
+            target_release=handoff.preflight.resolution.resolved.selected.release,
+            workflow_sha=handoff.execution.workflow_sha,run_id=handoff.execution.run_id,record_attempt=9)
+        with mock.patch.object(codec.c, 'WORKFLOW_SHA256', 'f'*64):
+            self.assertEqual(codec.decode_rollback(outputs, **args), handoff)
+            with self.assertRaises(codec.HandoffRefusal): codec.encode_rollback(handoff)
+
+
 if __name__ == '__main__':
     unittest.main()

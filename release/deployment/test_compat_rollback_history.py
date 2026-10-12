@@ -357,3 +357,23 @@ class RollbackHistoryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class OwnWorkflowReplayTests(unittest.TestCase):
+    def test_real_w0_raw_workflow_stays_known_after_current_pin_changes(self):
+        facts = row().envelope
+        source = envelope.WorkflowObservation(rollback_fixtures.binding().producer_sha, WORKFLOW)
+        before = envelope.replay(source, facts, observed_at=NOW)
+        with mock.patch.object(envelope, 'WORKFLOW_SHA256', 'f'*64):
+            after = envelope.replay(source, facts, observed_at=NOW)
+        self.assertEqual(after, before)
+        self.assertIsNotNone(after.attempt.execution_window)
+
+    def test_unknown_workflow_never_borrows_historical_steps(self):
+        facts = row().envelope
+        sha = rollback_fixtures.binding().producer_sha
+        for raw in (None, WORKFLOW+b'\n'):
+            with self.subTest(raw_is_none=raw is None):
+                result = envelope.replay(envelope.WorkflowObservation(sha, raw), facts, observed_at=NOW)
+                self.assertIsNone(result.attempt.execution_window)
+                self.assertEqual(result.attempt.jobs, ())

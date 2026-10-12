@@ -6,6 +6,7 @@ network or subprocess read occurs here. Unknown workflow bytes yield no window.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import json
 import re
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ import compat_evidence as evidence
 import ship_common as common
 
 WORKFLOW_SHA256 = "0f8ae9f3079d4a3c0749721e5100d6df60842b4811059aee02a2ee4d8ced4f6b"
+W0_WORKFLOW_SHA256 = "0f8ae9f3079d4a3c0749721e5100d6df60842b4811059aee02a2ee4d8ced4f6b"
 REPOSITORY_ID = 1297344686
 API = "/repos/" + evidence.REPOSITORY
 WEB = "https://github.com/" + evidence.REPOSITORY
@@ -254,7 +256,7 @@ def validate_workflow(value):
 
 def _reviewed_steps(value):
     validate_workflow(value)
-    if value.raw is None or hashlib.sha256(value.raw).hexdigest() != WORKFLOW_SHA256:
+    if value.raw is None or hashlib.sha256(value.raw).hexdigest() not in (W0_WORKFLOW_SHA256, WORKFLOW_SHA256):
         return None
     steps, job = {}, None
     for line in value.raw.decode('ascii').splitlines():
@@ -385,3 +387,51 @@ def replay(workflow, facts, *, observed_at):
     except (common.ReleaseError, ValueError, TypeError, KeyError, AttributeError,
             RecursionError, OverflowError, UnicodeError):
         raise evidence.CompatRefusal('compat-stale', 'envelope-invalid') from None
+
+
+# Fixed lossless API projections shared by both concrete collectors.
+def _project_fields(value, keys):
+    _need(type(value) is dict and keys <= value.keys(), 'rollback-collect-field')
+    return {key: value[key] for key in sorted(keys)}
+
+
+def _canonical_projection(value, maximum):
+    """Bound the canonical retained buffer as it is encoded, including LF."""
+    output = bytearray()
+    for part in json.JSONEncoder(sort_keys=True, separators=(',', ':'),
+                                 ensure_ascii=True, allow_nan=False).iterencode(value):
+        raw = part.encode('ascii')
+        _need(len(output) + len(raw) + 1 <= maximum, 'rollback-history-bound')
+        output.extend(raw)
+    output.extend(b'\n')
+    return bytes(output)
+
+
+def _project_run(value, latest):
+    row = _project_fields(value, _RUN_KEYS - {'latest_run_attempt'})
+    row['latest_run_attempt'] = latest
+    for key in ('repository', 'head_repository'):
+        row[key] = _project_fields(row[key], {'id', 'full_name'})
+    return row
+
+
+def _project_job(value):
+    row = _project_fields(value, _JOB_KEYS)
+    _need(type(row['steps']) is list and len(row['steps']) <= 100,
+          'rollback-collect-steps')
+    row['steps'] = [_project_fields(step, _STEP_KEYS) for step in row['steps']]
+    return row
+
+
+def _project_check(value):
+    row = _project_fields(value, _CHECK_KEYS)
+    row['app'] = _project_fields(row['app'], {'id'})
+    row['check_suite'] = _project_fields(row['check_suite'], {'id'})
+    return row
+
+
+def _project_artifact(value):
+    row = _project_fields(value, _ARTIFACT_KEYS)
+    row['workflow_run'] = _project_fields(row['workflow_run'],
+        {'id', 'repository_id', 'head_repository_id', 'head_sha', 'head_branch'})
+    return row

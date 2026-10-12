@@ -264,5 +264,79 @@ class RequestTests(unittest.TestCase):
         self.refuse(history=history)
 
 
+class SourceOnlyAndHistoricalTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source.ForwardResolverTests.setUpClass()
+        cls.value = resolution()
+        cls.history = collected(cls.value)
+
+    def test_actual_source_only_validation_needs_no_collected_history_or_io(self):
+        with mock.patch.object(bridge.collect, 'collect_history', side_effect=AssertionError('collection')), \
+             mock.patch.object(Path, 'read_bytes', side_effect=AssertionError('source read')):
+            self.assertIs(bridge.validate_current_source(self.value), self.value)
+
+    def test_source_only_requires_full_audit_pending_and_recipe(self):
+        value = self.value
+        for bad in (replace(value, audit=None), replace(value, pending=None),
+                    replace(value, previous_recipe=replace(value.previous_recipe, sha256='0'*64)),
+                    replace(value, previous_recipe=replace(value.previous_recipe, source_sha='f'*40)),
+                    replace(value, previous_recipe=replace(value.previous_recipe, raw=b'PRIVATE'))):
+            with self.subTest(audit=bad.audit is None), self.assertRaises(evidence.CompatRefusal):
+                bridge.validate_current_source(bad)
+
+    def test_current_and_custody_source_require_self_hash_and_known_workflow(self):
+        value = self.value; changed = value.workflow + b'PRIVATE'
+        for bad in (replace(value, workflow_sha256='f'*64), replace(value, workflow=changed),
+                    replace(value, workflow=changed, workflow_sha256=source.common.sha256_bytes(changed))):
+            for check in (bridge.validate_current_source, bridge._validate_source_custody):
+                with self.subTest(check=check.__name__), self.assertRaises(evidence.CompatRefusal): check(bad)
+
+    def test_source_only_does_not_synthesize_v2_live_or_accept_active_source(self):
+        legacy = resolution(legacy=True)
+        self.assertIsNone(bridge.validate_current_source(legacy).resolved.latest.live)
+        for change in (self.value.classification._replace(kind='contract'),
+                       self.value.classification._replace(kind='expand'),
+                       self.value.classification._replace(kind='none', dormant=True),
+                       self.value.classification._replace(reasons=('blocked',))):
+            with self.subTest(change=change.kind), self.assertRaises(evidence.CompatRefusal):
+                bridge.validate_current_source(replace(self.value, classification=change))
+
+    def test_historical_context3_replays_real_old_pair_after_current_pin_changes(self):
+        # A controlled future current-pin policy input, not real P qualification.
+        with mock.patch.object(bridge.collect, 'WORKFLOW_SHA256', 'f'*64):
+            self.assertIs(bridge._validate_source_custody(self.value), self.value)
+            self.assertTrue(bridge._qualify_context3_custody(self.value, self.history).forward)
+            with self.assertRaises(evidence.CompatRefusal): bridge.validate_current_source(self.value)
+            with self.assertRaises(evidence.CompatRefusal): bridge.qualify(self.value, self.history)
+
+    def test_historical_context2_keeps_exact_old_none_pending_semantics(self):
+        old = replace(self.value, pending=None)
+        history = collected(self.value, version=2)
+        with mock.patch.object(bridge.collect, 'WORKFLOW_SHA256', 'f'*64):
+            self.assertTrue(bridge._qualify_context2_custody(old, history).forward)
+            with self.assertRaises(evidence.CompatRefusal): bridge._qualify_context2_custody(self.value, history)
+            with self.assertRaises(evidence.CompatRefusal): bridge._qualify_context3_custody(old, history)
+
+    def test_historical_route_does_not_resurrect_context2_as_current3(self):
+        history = collected(self.value, version=2)
+        with self.assertRaises(evidence.CompatRefusal): bridge._qualify_context3_custody(self.value, history)
+        world = actions.World(); world.add(negative=True)
+        history = collected(self.value, world)
+        with self.assertRaises(evidence.CompatRefusal) as caught:
+            bridge._qualify_context3_custody(self.value, history)
+        self.assertEqual(caught.exception.code, 'compat-old-server-incompatible')
+
+    def test_source_only_rechecks_complete_chain_material_and_main(self):
+        value = self.value
+        variants = (replace(value, resolved=replace(value.resolved,
+                        inventory=replace(value.resolved.inventory, main_sha='f'*40))),
+                    replace(value, catalog_material=replace(value.catalog_material, candidate_blobs=())),
+                    replace(value, resolved=replace(value.resolved, chain=replace(value.resolved.chain,
+                        runtime_source_supported=False))))
+        for bad in variants:
+            with self.assertRaises(evidence.CompatRefusal): bridge.validate_current_source(bad)
+
+
 if __name__ == '__main__':
     unittest.main()

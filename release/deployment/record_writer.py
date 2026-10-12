@@ -11,8 +11,9 @@ Existing schema1 writing and its legacy-only route are intact.
 New promotion qualification uses the preserved predeployment capture. It never
 reinterprets later main as the deployed candidate or fetches expired evidence.
 Already published exact bytes use a separate idempotency path first. Image-only
-v2 records require a retained live contract; absent legacy metadata, outage
-bypass, unqualified multi-span transitions, and PR20 fixed-forward remain unsupported.
+v2 records require a retained live contract; absent legacy metadata,
+unqualified multi-span transitions, and PR20 fixed-forward remain unsupported.
+Separate outage custody replays original raw evidence without a measured H claim.
 The dedicated rollback handoff replays complete current-v0 qualification.
 """
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ import record_resolver as resolver
 import forward_gates
 import contract_authorization
 import ship_rollback_compat as rollback_preflight
+import ship_outage_compat as outage_preflight
 
 policy, records, common, transport = resolver.policy, resolver.records, resolver.common, resolver.transport
 
@@ -199,6 +201,18 @@ def _prepare_promotion_context2_custody(resolution, collected, candidate_images,
                               qualified, staging=staging, drills=drills, contract_observation=None)
 
 
+@_public
+def _prepare_promotion_context3_custody(resolution, collected, candidate_images, execution, *, staging, drills=None,
+                                        contract_observation=None):
+    """Only closed historical context3 custody may select this fixed route."""
+    _need(type(resolution) is resolver.ForwardResolution
+          and type(resolution.pending) is resolver.pending_source.PendingMaterial
+          and type(drills) is forward_gates.DrillGate)
+    qualified = request._qualify_context3_custody(resolution, collected)
+    return _promotion_handoff(resolution, collected, candidate_images, execution,
+        qualified, staging=staging, drills=drills, contract_observation=contract_observation)
+
+
 def _contract_custody(resolution, collected, drills, observation):
     """Pure original-time replay; no current label read or retry-time clock."""
     receipt = forward_gates.validate_preserved_contract(resolution, observation)
@@ -314,6 +328,17 @@ def _build_promotion_context2_custody(handoff, publication, current_resolution):
     _need(type(handoff) is PromotionHandoff)
     expected = _prepare_promotion_context2_custody(handoff.resolution, handoff.collected,
         handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills)
+    _need(handoff == expected, "record-writer-handoff-changed")
+    return _append_promotion(handoff, publication, current_resolution)
+
+
+@_public
+def _build_promotion_context3_custody(handoff, publication, current_resolution):
+    """Preserve original workflow/time; never reload current policy or evidence."""
+    _need(type(handoff) is PromotionHandoff)
+    expected = _prepare_promotion_context3_custody(handoff.resolution, handoff.collected,
+        handoff.candidate_images, handoff.execution, staging=handoff.facts.staging, drills=handoff.drills,
+        contract_observation=handoff.contract_observation)
     _need(handoff == expected, "record-writer-handoff-changed")
     return _append_promotion(handoff, publication, current_resolution)
 
@@ -440,3 +465,76 @@ def build_qualified_rollback(handoff, publication, current_resolution, *, reconc
     raw = _serialize("rollback", target.sha, target.images, before.latest.release,
                      publication, handoff.facts, reconciled=reconciled)
     return _append(chain, raw, target.record.web_source_sha)
+
+
+@dataclass(frozen=True, slots=True)
+class OutageHandoff:
+    """Original raw outage facts; only protected same-run custody authenticates them."""
+    preflight: outage_preflight.OutagePreflight
+    candidate_images: CandidateImages
+    execution: WorkflowExecution
+    facts: records.ManifestFacts
+
+
+def _outage_handoff(preflight, candidate_images, execution):
+    _execution(execution)
+    _need(execution.run_attempt == 1)
+    resolution = preflight.source.admission.resolution
+    candidate, latest = resolution.candidate, resolution.resolved.latest
+    _candidate_images(candidate_images, candidate.sha)
+    _need(latest.live is not None and candidate.catalog == latest.live.catalog
+          and candidate.artifacts == latest.live.origin_source.artifacts)
+    # No QualifiedCompat or old-server success is invented. normalize_chain
+    # later reanchors the new origin, while these exact catalog bytes survive.
+    facts = records.ManifestFacts(2, "none", False, True, None, candidate.catalog,
+                                  "bypassed", None, "bypassed")
+    return OutageHandoff(preflight, candidate_images, execution, facts)
+
+
+@_public
+def prepare_outage_promotion(preflight, candidate_images, execution):
+    """Current source, fixed unavailable outcome and exact prior measured live."""
+    outage_preflight.validate_preserved(preflight)
+    return _outage_handoff(preflight, candidate_images, execution)
+
+
+@_public
+def _prepare_outage_custody(preflight, candidate_images, execution):
+    """Closed wire8 only; no current clock, policy read, or evidence fetch."""
+    outage_preflight._validate_preserved_custody(preflight)
+    return _outage_handoff(preflight, candidate_images, execution)
+
+
+@_public
+def build_outage_promotion(handoff, publication, current_resolution):
+    _need(type(handoff) is OutageHandoff)
+    _need(prepare_outage_promotion(handoff.preflight, handoff.candidate_images, handoff.execution) == handoff,
+          "record-writer-handoff-changed")
+    return _append_outage(handoff, publication, current_resolution)
+
+
+@_public
+def _build_outage_custody(handoff, publication, current_resolution):
+    _need(type(handoff) is OutageHandoff)
+    _need(_prepare_outage_custody(handoff.preflight, handoff.candidate_images, handoff.execution) == handoff,
+          "record-writer-handoff-changed")
+    return _append_outage(handoff, publication, current_resolution)
+
+
+def _append_outage(handoff, publication, current_resolution):
+    _publication(publication)
+    _need(publication.execution == handoff.execution, "record-writer-execution-changed")
+    deployed = common.require_timestamp(publication.deployed_at, "record-writer-invalid")
+    _need(deployed >= handoff.preflight.checked_at.replace(microsecond=0), "record-writer-time")
+    # valid_until guards original provider entry, not deployment completion.
+    # No record-time now or upper completion bound can reconstruct that entry.
+    resolution = handoff.preflight.source.admission.resolution
+    before, candidate = resolution.resolved, resolution.candidate
+    chain = _resolved(current_resolution)
+    _need(current_resolution.selected == current_resolution.latest
+          and current_resolution.image_bindings == before.image_bindings, "record-writer-parent-changed")
+    chain = policy.normalize_chain(chain.inputs, _promotion_sources(chain, candidate), chain.ancestors)
+    _need(chain == before.chain, "record-writer-parent-changed")
+    raw = _serialize("promote", candidate.sha, handoff.candidate_images.images, before.latest.release,
+                     publication, handoff.facts)
+    return _append(chain, raw, candidate.sha, candidate=candidate)

@@ -20,6 +20,7 @@ import test_ship_compat as fixtures
 import test_ship_support as support
 import test_record_writer as writer_fixture
 import test_ship_rollback_compat as rollback_fixture
+import test_ship_outage_compat as outage_fixture
 
 c = ship.common
 
@@ -75,7 +76,8 @@ class CallerTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(flow.shutil, 'which', return_value=str(self.case.git)))
             clock_module = SimpleNamespace(monotonic=self.case.clock)
-            for module in (ship, flow, flow.ship_compat, flow.ship_records, flow.ship_rollback_compat):
+            for module in (ship, flow, flow.ship_compat, flow.ship_records,
+                           flow.ship_rollback_compat, flow.ship_outage_compat):
                 stack.enter_context(mock.patch.object(module, 'time', clock_module))
             # Keep the real datetime type and all concrete policy checks. Only
             # the existing private wall-clock seam receives deterministic UTC.
@@ -84,6 +86,11 @@ class CallerTests(unittest.TestCase):
                 kwargs['wall_clock'] = lambda: self.now
                 return original_preflight(*args, **kwargs)
             stack.enter_context(mock.patch.object(flow.ship_compat, '_preflight', side_effect=preflight))
+            original_outage = flow.ship_outage_compat._preflight
+            def outage(*args, **kwargs):
+                kwargs['wall_clock'] = lambda: self.now
+                return original_outage(*args, **kwargs)
+            stack.enter_context(mock.patch.object(flow.ship_outage_compat, '_preflight', side_effect=outage))
             stack.enter_context(mock.patch.object(flow.ship_compat.runtime, 'bounded_command', self.fixture.capture))
             stack.enter_context(mock.patch.object(ship, 'first_parent_commits', return_value=(0, [])))
             return ship.main(list(args), self.env, self.deps)
@@ -499,6 +506,203 @@ class QualifiedRollbackCallerTests(unittest.TestCase):
         self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_REFUSED, self.output.getvalue())
         self.env['REC_HANDOFF_01'] = outputs['handoff_01']
         self.case.add(kind='restore')
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_REFUSED, self.output.getvalue())
+        self.assertEqual(self.do.put_count(), 1)
+
+
+class OutageCallerTests(unittest.TestCase):
+    """Concrete outage gate, writer and provider ordering with synthetic I/O."""
+    outputs = CallerTests.outputs
+    to_record = CallerTests.to_record
+
+    def setUp(self):
+        self.configure()
+
+    def configure(self, *, unavailable=True):
+        self.case = outage_fixture.outage_case(self, unavailable=unavailable)
+        self.now, self.sha = self.case.now, self.case.sha
+        self.images = dict(writer_fixture.images(self.case.expected).images)
+        self.gh = self.case.world.fake
+        self.gh.ci_green(self.sha); self.gh.attest_ship_images(self.images, self.sha)
+        self.env = support.context_env(self.sha, self.case.root)
+        latest = self.case.expected.resolved.latest
+        self.env.update(SHIP_GH_BIN=str(self.case.gh), SHIP_MODE='promote-without-staging',
+            SHIP_TARGET_RELEASE='', PLAN_LATEST_RELEASE=latest.release,
+            PLAN_LATEST_MANIFEST_SHA256=latest.manifest_sha256,
+            PLAN_TARGET_RELEASE='', PLAN_TARGET_MANIFEST_SHA256='')
+        payload, digest = support.candidate_b64(self.images, self.sha, self.now-timedelta(hours=1))
+        self.env.update(CANDIDATE_B64=payload, CANDIDATE_SHA256=digest)
+        self.target = self.case.root/'target.json'
+        self.target.write_bytes(support.canonical(support.make_target()))
+        self.policy = self.case.root/'ship.trivyignore'; self.policy.write_bytes(b'# no exceptions\n')
+        self.do = support.FakeDO(spec=support.make_spec(dict(latest.images)), backups=[{
+            'created_at': c.format_timestamp(self.now-timedelta(hours=2)), 'size_gigabytes': 0.03}])
+        self.https = support.FakeHttps(); self.output = io.StringIO(); self.sleeps = []
+        self.deps = ship.Deps(clock=lambda: self.now, sleeper=self.sleeps.append, opener=self.do,
+            gh_runner=self.gh, https_request=self.https, stdout=self.output,
+            repo_dir=self.case.repo, target_path=self.target, trivy_policy_path=self.policy,
+            poll_limit=8, smoke_rounds=2, smoke_delay=0)
+
+    def run_command(self, *args):
+        def capture(argv, **options):
+            parts = Path(options['env'].get('GH_CONFIG_DIR', '')).parts
+            if any(phase in parts for phase in ('source-before', 'source-after', 'actions', 'negative-index')):
+                return self.case.capture(argv, **options)
+            self.case.clock.now += 0.001
+            return self.case.world(argv, **options)
+        with ExitStack() as stack:
+            stack.enter_context(self.case.installed())
+            stack.enter_context(mock.patch.object(flow.shutil, 'which', return_value=str(self.case.git)))
+            for module in (ship, flow, flow.ship_compat, flow.ship_records,
+                           flow.ship_rollback_compat, flow.ship_outage_compat):
+                stack.enter_context(mock.patch.object(module, 'time', SimpleNamespace(monotonic=self.case.clock)))
+            for module in (flow.ship_compat, flow.ship_outage_compat):
+                original = module._preflight
+                def preflight(*args, _original=original, **kwargs):
+                    kwargs['wall_clock'] = lambda: self.now
+                    return _original(*args, **kwargs)
+                stack.enter_context(mock.patch.object(module, '_preflight', side_effect=preflight))
+            stack.enter_context(mock.patch.object(flow.ship_compat.runtime, 'bounded_command', capture))
+            stack.enter_context(mock.patch.object(ship, 'first_parent_commits', return_value=(0, [])))
+            return ship.main(list(args), self.env, self.deps)
+
+    def production(self):
+        self.env.update(SHIP_DO_TOKEN=support.DO_TOKEN, SHIP_TARGET_JSON=c.canonical_payload_bytes({
+            'schema_version': 1, 'app_id': support.APP_ID, 'postgres_cluster_id': support.PG_ID}).decode())
+        return self.run_command('production')
+
+    def refused_before_provider(self):
+        before_outputs = self.outputs()
+        with mock.patch.object(ship.do_app, 'DOAppClient', side_effect=AssertionError('provider constructed')) as client:
+            self.assertEqual(self.production(), ship.EXIT_REFUSED, self.output.getvalue())
+        client.assert_not_called(); self.assertEqual(self.do.requests, []); self.assertEqual(self.outputs(), before_outputs)
+
+    def negative_refs(self):
+        negative = flow.ship_outage_compat.negative
+        endpoint = negative.API+'/git/matching-refs/tags/'+negative.PREFIX+self.sha+'-'
+        self.case.negative_world.overrides['GET', endpoint] = flow.ship_outage_compat.runtime.Capture(
+            0, b'[{"ref":"refs/tags/synthetic-negative"}]\n', b'')
+
+    def record_cycle(self):
+        self.assertEqual(self.run_command('plan'), ship.EXIT_OK, self.output.getvalue())
+        plan_calls = len(self.case.calls); self.now += timedelta(seconds=1)
+        self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        self.assertGreater(len(self.case.calls), plan_calls)
+        self.assertEqual(self.do.put_count(), 1); self.assertEqual(len(self.https.calls), 6)
+        outputs = self.to_record()
+        self.assertEqual(outputs['handoff_version'], '8')
+        custody = flow.record_handoff.decode_outage(
+            {key: outputs[key] for key in flow.record_handoff.OUTPUT_KEYS}, candidate_sha=self.sha,
+            workflow_sha=self.sha, run_id=int(self.env['GITHUB_RUN_ID']), record_attempt=1)
+        self.assertEqual(custody.preflight.checked_at, self.now)
+        self.assertNotIn('SHIP_DO_TOKEN', self.env)
+        self.case.world.main = 'f'*40
+        # Original raw custody is sufficient even after installed policy has gone.
+        self.case.policy_path.unlink()
+        self.now += timedelta(days=2)
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_OK, self.output.getvalue())
+        path = Path(self.env['RUNNER_TEMP'])/'ship-record/release-manifest.json'
+        raw = path.read_bytes(); doc = c.loads_strict(raw)
+        self.assertEqual((doc['schema_version'], doc['db_change'], doc['dormant'], doc['reversible']),
+                         (2, 'none', False, True))
+        self.assertEqual((doc['compat'], doc['compat_run_id'], doc['old_server_ok'], doc['staging']),
+                         ('bypassed', None, 'unproven', 'bypassed'))
+        self.assertEqual(doc['catalog_sha256'], self.case.expected.resolved.latest.live.catalog.catalog_sha256)
+        self.gh.attested_files[hashlib.sha256(raw).hexdigest()] = self.sha
+        self.assertEqual(self.run_command('record', '--stage', 'publish'), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(self.run_command('record', '--stage', 'verify'), ship.EXIT_OK, self.output.getvalue())
+        self.env['GITHUB_RUN_ATTEMPT'] = '2'
+        for key in flow.record_handoff.OUTPUT_KEYS: self.env['REC_'+key.upper()] = ''
+        with mock.patch.object(flow.record_handoff, 'decode_outage', side_effect=AssertionError('old custody')):
+            self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(path.read_bytes(), raw); self.assertEqual(self.outputs()['state'], 'published')
+        self.assertEqual(self.do.put_count(), 1)
+
+    def test_503_plan_production_and_record_keep_original_evidence_and_unproven_facts(self):
+        self.record_cycle()
+        self.assertFalse(any(phase == 'actions' for phase, _, _ in self.case.calls))
+
+    def test_missing_plan_production_and_record_keep_full_history(self):
+        self.configure(unavailable=False); self.record_cycle()
+        self.assertTrue(any(phase == 'actions' for phase, _, _ in self.case.calls))
+
+    def test_nonempty_protected_refs_refuse_before_provider(self):
+        self.negative_refs()
+        self.refused_before_provider()
+
+    def test_failed_service_response_is_not_an_outage_waiver(self):
+        self.case.negative_world.service = flow.ship_outage_compat.runtime.Capture(
+            1, outage_fixture.index_fixture.http(401), b'PRIVATE')
+        self.refused_before_provider()
+        self.assertNotIn('PRIVATE', self.output.getvalue())
+
+    def test_missing_coverage_refuses_before_provider(self):
+        del self.case.world.files[self.sha, 'release/compat/negative_index.py']
+        self.refused_before_provider()
+
+    def test_current_normal_success_survives_uncovered_publisher_source(self):
+        self.case.negative_world.service = flow.ship_outage_compat.runtime.Capture(
+            0, outage_fixture.index_fixture.http(200), b'')
+        del self.case.world.files[self.sha, 'release/compat/negative_index.py']
+        self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(self.do.put_count(), 1); self.assertEqual(self.outputs()['handoff_version'], '6')
+
+    def test_successful_plan_cannot_cover_a_new_protected_negative_ref(self):
+        self.assertEqual(self.run_command('plan'), ship.EXIT_OK, self.output.getvalue())
+        self.negative_refs()
+        self.refused_before_provider()
+
+    def test_handoff_capacity_failure_occurs_before_provider(self):
+        with mock.patch.object(flow.record_handoff, 'MAX_ENCODED', 8192):
+            self.refused_before_provider()
+        self.assertIn('record-invalid:handoff', self.output.getvalue())
+
+    def mutate_after_encoding(self, change):
+        original = flow.record_handoff.encode_outage
+        def encode(value):
+            outputs = original(value); change(value.preflight); return outputs
+        return mock.patch.object(flow.record_handoff, 'encode_outage', side_effect=encode)
+
+    def test_wall_clock_expiry_after_encoding_refuses_before_provider(self):
+        with self.mutate_after_encoding(lambda proof: setattr(self, 'now', proof.valid_until)):
+            self.refused_before_provider()
+        self.assertIn('candidate-invalid:compat-stale', self.output.getvalue())
+
+    def test_original_monotonic_deadline_cannot_be_renewed_after_encoding(self):
+        with self.mutate_after_encoding(lambda proof: setattr(self.case.clock, 'now', 10000.0)):
+            self.refused_before_provider()
+        self.assertIn('candidate-invalid:compat-stale', self.output.getvalue())
+
+    def test_backward_fractional_clock_after_encoding_refuses_before_provider(self):
+        self.now = self.now.replace(microsecond=900000)
+        with self.mutate_after_encoding(lambda proof: setattr(self, 'now', proof.checked_at-timedelta(microseconds=1))):
+            self.refused_before_provider()
+
+    def test_one_microsecond_before_expiry_passes_and_keeps_whole_second_completion(self):
+        with self.mutate_after_encoding(lambda proof: setattr(self, 'now', proof.valid_until-timedelta(microseconds=1))):
+            self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        self.assertEqual(self.do.put_count(), 1); self.assertEqual(self.outputs()['handoff_version'], '8')
+        self.assertEqual(self.outputs()['deployed_at'], c.format_timestamp(self.now))
+
+    def test_fractional_default_clock_is_preserved_at_provider_boundary(self):
+        self.now = self.now.replace(microsecond=900000)
+        actual_dt = ship.dt
+        with mock.patch.object(ship, 'dt', SimpleNamespace(datetime=SimpleNamespace(now=lambda timezone: self.now),
+                timezone=actual_dt.timezone, timedelta=actual_dt.timedelta)):
+            self.deps.clock = ship.Deps().clock
+            self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        outputs = self.to_record()
+        value = flow.record_handoff.decode_outage(
+            {key: outputs[key] for key in flow.record_handoff.OUTPUT_KEYS}, candidate_sha=self.sha,
+            workflow_sha=self.sha, run_id=int(self.env['GITHUB_RUN_ID']), record_attempt=1)
+        self.assertEqual(value.preflight.checked_at, self.now)
+
+    def test_tampered_custody_or_new_parent_cannot_write_record(self):
+        self.assertEqual(self.production(), ship.EXIT_OK, self.output.getvalue())
+        outputs = self.to_record(); self.env['REC_HANDOFF_01'] = ''
+        self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_REFUSED, self.output.getvalue())
+        self.env['REC_HANDOFF_01'] = outputs['handoff_01']
+        self.case.source.add(kind='restore')
         self.assertEqual(self.run_command('record', '--stage', 'manifest'), ship.EXIT_REFUSED, self.output.getvalue())
         self.assertEqual(self.do.put_count(), 1)
 
