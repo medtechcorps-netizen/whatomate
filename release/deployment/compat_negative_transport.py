@@ -209,7 +209,7 @@ class NegativePublisher(_Client):
         value = policy._load(body, BODY_LIMIT)
         _need(type(value) is dict and set(value) == {"ref", "node_id", "url", "object"})
         _need(value["ref"] == ref and type(value["node_id"]) is str
-              and 0 < len(value["node_id"]) <= 256
+              and 0 < len(value["node_id"]) <= 1024
               and all(33 <= ord(char) <= 126 for char in value["node_id"]))
         _need(value["url"] == "https://api.github.com" + policy.API + "/git/" + ref)
         obj = value["object"]
