@@ -415,16 +415,39 @@ class JobShapeTests(unittest.TestCase):
         self.assertEqual(set(JOBS["plan"]["outputs"]), {"latest_release", "latest_manifest_sha256", "latest_sha",
                                                          "target_release", "target_manifest_sha256"})
         self.assertEqual(set(JOBS["attest"]["outputs"]), {"candidate_b64", "candidate_sha256"})
+        handoff = {"handoff_version", "handoff_sha256", "handoff_raw_length",
+                   "handoff_compressed_length", "handoff_encoded_length", "handoff_chunk_count",
+                   *(f"handoff_{index:02d}" for index in range(1, 33))}
         self.assertEqual(set(JOBS["production"]["outputs"]), {
             "release", "kind", "sha", "web_digest", "meta_relay_digest", "gmail_relay_digest", "previous",
             "rolled_back_from", "deployed_at", "built_at", "reconciled", "environment_values_sha256",
             "non_source_projection_sha256",
-        })
+        } | handoff)
         for key, value in JOBS["production"]["outputs"].items():
             self.assertEqual(value, f"${{{{ steps.ship.outputs.{key} }}}}")
-        env = step("record", "Build the release manifest")["env"]
+        env = JOBS["record"]["env"]
+        self.assertEqual(set(env), {f"REC_{key.upper()}" for key in JOBS["production"]["outputs"]}
+                         | {"SHIP_TARGET_RELEASE"})
+        self.assertEqual(env["SHIP_TARGET_RELEASE"], "${{ inputs.target_release }}")
         for key in JOBS["production"]["outputs"]:
             self.assertEqual(env[f"REC_{key.upper()}"], f"${{{{ needs.production.outputs.{key} }}}}")
+
+    def test_record_stages_cannot_override_same_run_custody_or_selected_target(self) -> None:
+        # All three stages need the original production handoff on record-only
+        # reruns, even after the original Actions artifacts expire.
+        for item in steps("record"):
+            with self.subTest(step=item["name"]):
+                self.assertNotIn("SHIP_TARGET_RELEASE", item.get("env", {}))
+                self.assertFalse(any(key.startswith("REC_") for key in item.get("env", {})))
+        for name in ("Build the release manifest", "Publish the release record", "Verify the published record"):
+            self.assertEqual(step("record", name)["env"], {
+                "GH_TOKEN": "${{ github.token }}", "SHIP_MODE": "${{ inputs.mode }}"})
+
+    def test_source_operation_budgets_leave_job_setup_and_publication_margin(self) -> None:
+        # Verify visibility retries share one stage deadline, not six fresh
+        # source budgets. The Python caller enforces that absolute deadline.
+        self.assertEqual(JOBS["plan"]["timeout-minutes"] * 60, 900 + 300)
+        self.assertEqual(JOBS["record"]["timeout-minutes"] * 60, 3 * 600 + 900)
 
 
 class StepContentTests(unittest.TestCase):
@@ -449,8 +472,22 @@ class StepContentTests(unittest.TestCase):
         self.assertEqual(ship_step["working-directory"], "src")
         self.assertEqual(ship_step["id"], "ship")
         fetch = step("production", "Fetch the dispatched commit without credentials")
-        self.assertIn("--filter=blob:none --no-checkout --single-branch --branch main --no-tags", fetch["run"])
+        self.assertIn("--no-checkout --single-branch --branch main --no-tags", fetch["run"])
+        self.assertNotIn("--filter", fetch["run"])
+        self.assertNotRegex(fetch["run"], r"--(?:depth|shallow|reference|shared|alternate)")
         self.assertEqual(fetch["env"], {"GIT_TERMINAL_PROMPT": "0"})
+
+    def test_staging_source_preflight_has_full_history_without_changing_rollback(self) -> None:
+        deploy = step("deploy-staging", "Fetch the dispatched commit without credentials")
+        self.assertIn("--no-checkout --single-branch --branch main --no-tags", deploy["run"])
+        self.assertNotRegex(deploy["run"], r"--(?:filter|depth|shallow|reference|shared|alternate)")
+        self.assertEqual(deploy["env"], {"GIT_TERMINAL_PROMPT": "0"})
+        self.assertIn('checkout --quiet --detach "$GITHUB_SHA"', deploy["run"])
+        # Rollback uses the existing receipt/CAS path, not the new source reader.
+        rollback = step("staging-rollback", "Fetch the dispatched commit without credentials")
+        self.assertIn("--filter=blob:none", rollback["run"])
+        self.assertEqual(JOBS["deploy-staging"]["timeout-minutes"], 120)
+        self.assertEqual(JOBS["staging-rollback"]["timeout-minutes"], 120)
 
     def test_run_bodies_contain_no_expressions_and_no_debug_escape_hatches(self) -> None:
         for job, item in all_steps():
@@ -577,7 +614,11 @@ class StepContentTests(unittest.TestCase):
                 with self.subTest(job=job):
                     self.assertIs(item["with"]["persist-credentials"], False)
                     self.assertEqual(item["with"]["ref"], "${{ github.sha }}")
-        self.assertEqual(step("plan", "Check out the dispatched commit")["with"]["fetch-depth"], 0)
+        for job in ("plan", "record"):
+            checkout = step(job, "Check out the dispatched commit")["with"]
+            self.assertEqual(checkout["fetch-depth"], 0)
+            self.assertNotIn("filter", checkout)
+            self.assertNotIn("sparse-checkout", checkout)
 
 
 class RepositoryFileTests(unittest.TestCase):

@@ -6,6 +6,7 @@ mutations must fail the policy rather than merely match a source-file hash.
 from __future__ import annotations
 
 import copy
+import ast
 import io
 import json
 import os
@@ -38,6 +39,18 @@ MEASURED = 'compat-measured-' + SUFFIX
 CANONICAL = 'compat-result-${{ github.sha }}-${{ github.run_attempt }}'
 CHECK_COMMAND = '/usr/bin/python3 -I -S -B release/compat/cli.py check'
 PUBLIC_CHECK = '${{ runner.temp }}/compat-check-' + SUFFIX + '/public/compat-result.json'
+PUBLIC_CONTEXT = PUBLIC_CHECK.replace('compat-result.json','compat-context.json')
+PUBLIC_SIGN = PUBLIC_CHECK.replace('/compat-check-','/compat-validate-evidence-')
+PUBLIC_SIGN_CONTEXT = PUBLIC_SIGN.replace('compat-result.json','compat-context.json')
+READY_IF = "${{ always() && !cancelled() && steps.check.outputs.complete == 'true' && steps.canonical.outcome == 'success' }}"
+ATTEST_IF = "${{ always() && !cancelled() && needs.compat.outputs.evidence_ready == 'true' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}"
+INSTALL_IF = "${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' }}"
+INDEX_IF = "${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.install-gh.outcome == 'success' }}"
+SIGN_IF = "${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.install-gh.outcome == 'success' && steps.negative-index.outcome == 'success' }}"
+CONTEXT_SIGN_IF = "${{ !cancelled() && steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' && steps.install-gh.outcome == 'success' && steps.negative-index.outcome == 'success' && steps.sign.outcome == 'success' }}"
+ATTEST_CHECK_COMMAND = '/usr/bin/python3 -I -S -B release/compat/attest_evidence.py'
+PUBLISH_COMMAND = '/usr/bin/python3 -I -S -B release/compat/negative_index.py'
+GH_INSTALL_SCRIPT = 'set -euo pipefail\ntools="$RUNNER_TEMP/compat-tools"\nmkdir -m 0700 "$tools"\ncurl --proto \'=https\' --proto-redir \'=https\' --tlsv1.2 --fail --silent --show-error --location --connect-timeout 10 --max-time 20 \\\n  "$PINNED_GH_URL" -o "$tools/gh.tar.gz"\nprintf \'%s  %s\\n\' "$PINNED_GH_SHA256" "$tools/gh.tar.gz" | sha256sum --check --strict\ntar -xzf "$tools/gh.tar.gz" -C "$tools"\ninstall -m 0755 "$tools/gh_${PINNED_GH_VERSION}_linux_amd64/bin/gh" "$tools/gh"\nprintf \'COMPAT_GH_BIN=%s\\n\' "$tools/gh" >> "$GITHUB_ENV"\n'
 READ_PERMISSIONS = {'contents':'read', 'actions':'read', 'attestations':'read'}
 
 
@@ -60,6 +73,24 @@ def heredoc(script):
     return body
 
 
+def condition(expression, values, *, cancelled=False):
+    """Evaluate the narrow actual job conditions, never external expressions."""
+    require(expression.startswith('${{ ') and expression.endswith(' }}'), 'closed condition')
+    source = expression[4:-3].replace('always()', 'True').replace('cancelled()', str(cancelled))
+    names = {}
+    for index, key in enumerate(sorted(values, key=len, reverse=True)):
+        name = 'value_' + str(index)
+        source = source.replace(key, name)
+        names[name] = values[key]
+    source = source.replace('&&', 'and').replace('||', 'or').replace('!', 'not ')
+    parsed = ast.parse(source, mode='eval')
+    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not,
+               ast.Compare, ast.Eq, ast.Name, ast.Load, ast.Constant)
+    require(all(isinstance(node, allowed) for node in ast.walk(parsed)), 'closed expression grammar')
+    require(all(node.id in names for node in ast.walk(parsed) if isinstance(node, ast.Name)), 'bound names')
+    return bool(eval(compile(parsed, '<workflow-condition>', 'eval'), {'__builtins__': {}}, names))
+
+
 def validate(doc):
     require(doc['on'] == {'push':{'branches':['main']}, 'pull_request':None,
         'workflow_dispatch':{'inputs':{'rollback_target':{'description':'Optional signed record tag or prod-0000',
@@ -75,7 +106,7 @@ def validate(doc):
                 'hosted advisory jobs, no deployment environment or hidden job failure')
         require(job['name'] == ('compat-attest' if name == 'attest' else name), 'non-colliding explicit contexts')
         expected = READ_PERMISSIONS if name in ('release-preview','compat-run') else {'contents':'read','actions':'read'}
-        if name == 'attest': expected = {**expected, 'attestations':'write', 'id-token':'write'}
+        if name == 'attest': expected = {**expected, 'contents':'write', 'attestations':'write', 'id-token':'write'}
         require(job['permissions'] == expected, 'least privilege per job')
         for item in job['steps']:
             if 'uses' in item:
@@ -113,7 +144,7 @@ def validate(doc):
     for job, expected_name, expected_path in [
         (preview, RESOLUTION, '${{ runner.temp }}/compat-preview-'+SUFFIX+'/public/resolution.json'),
         (run, MEASURED, '${{ runner.temp }}/compat-run-'+SUFFIX+'/public/compat-result.json'),
-        (aggregate, CANONICAL, PUBLIC_CHECK)]:
+        (aggregate, CANONICAL, PUBLIC_CHECK + "\n" + PUBLIC_CONTEXT + "\n")]:
         uploads = [item for item in job['steps'] if item.get('uses') == UPLOAD]
         require(len(uploads) == 1, 'one public file upload')
         upload = uploads[0]
@@ -121,6 +152,15 @@ def validate(doc):
             'retention-days':7} and upload['timeout-minutes'] == 1, 'bounded exact-file publication')
         if job is not aggregate:
             require('if' not in upload, 'partial/failed producer never uploads')
+    require(aggregate.get('outputs') == {'evidence_ready':'${{ steps.ready.outputs.evidence_ready }}'},
+            'readiness is from the post-upload guarded marker only')
+    ready = step(aggregate,identifier='ready')
+    require(ready['if'] == READY_IF and ready['run'].strip().splitlines() ==
+            ['set -euo pipefail', r'''printf '%s\n' 'evidence_ready=true' >> "$GITHUB_OUTPUT"'''],
+            'cancelled, incomplete or unpublished evidence never marks ready')
+    require(aggregate['steps'].index(step(aggregate,identifier='canonical')) < aggregate['steps'].index(ready)
+            < aggregate['steps'].index(step(aggregate,name='Require proof and publication success')),
+            'publication precedes readiness, negative verdict enforcement follows')
     require(aggregate['needs'] == ['release-preview','compat-run'] and aggregate['if'] == '${{ always() }}',
             'aggregate observes both failures and successes')
     check = step(aggregate, identifier='check')
@@ -135,20 +175,60 @@ def validate(doc):
         'PREVIEW_RESULT':'${{ needs.release-preview.result }}', 'RUN_RESULT':'${{ needs.compat-run.result }}',
         'CHECK_RESULT':'${{ steps.check.outcome }}', 'UPLOAD_RESULT':'${{ steps.canonical.outcome }}'}, 'real outcomes gate success')
     require(attest['needs'] == ['release-preview','compat-run','compat'] and attest['if'] ==
-        "${{ needs.compat.result == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}",
-        'no PR or failed-result signing')
+        ATTEST_IF, 'only complete published evidence can sign, including measured negatives')
     recheck = step(attest, identifier='check')
-    require(recheck['run'] == CHECK_COMMAND and recheck['env'] == expected_env
-            and 'continue-on-error' not in recheck, 'attestation independently checks canonical identity')
+    require(recheck == {'name':'Revalidate the canonical bytes and frozen selection', 'id':'check',
+        'env':expected_env, 'run':ATTEST_CHECK_COMMAND},
+        'covered standalone preparer is the only repository prelude command')
+    require('env' not in attest and 'defaults' not in attest,
+            'attest cannot inject a shell or module prelude')
+    require(attest['steps'][0] == {'name':'Check out the exact candidate', 'timeout-minutes':1,
+        'uses':CHECKOUT, 'with':{'ref':'${{ github.sha }}', 'persist-credentials':False}},
+        'exact checkout without additional executable fields')
+    for index, name, artifact in ((1, "Download this run's exact resolution", RESOLUTION),
+                                  (2, "Download this run's exact canonical evidence", CANONICAL)):
+        require(attest['steps'][index] == {'name':name, 'timeout-minutes':1, 'uses':DOWNLOAD,
+            'with':{'name':artifact, 'repository':'${{ github.repository }}', 'run-id':'${{ github.run_id }}',
+                    'github-token':'${{ github.token }}', 'path':'${{ runner.temp }}/compat-input'}},
+            'exact artifact download without a repository execution hook')
+    install = step(attest, identifier='install-gh')
+    require(install == {'name':'Install pinned GitHub CLI for negative evidence', 'id':'install-gh',
+        'if':INSTALL_IF, 'timeout-minutes':1, 'run':GH_INSTALL_SCRIPT},
+        'exact bounded pinned installer only after complete revalidation')
+    publisher = step(attest, identifier='negative-index')
+    require(publisher == {'name':'Persist complete negative intent before either signature',
+        'id':'negative-index', 'if':INDEX_IF, 'timeout-minutes':11,
+        'env':{'GH_TOKEN':'${{ github.token }}', **expected_env}, 'run':PUBLISH_COMMAND},
+        'one fixed publisher with original upstream outcomes and no permissive failure')
     sign = step(attest, identifier='sign')
-    require(sign['uses'] == ATTEST and sign['if'] ==
-        "${{ steps.check.outcome == 'success' && steps.check.outputs.complete == 'true' }}" and sign['with'] == {
-        'subject-path':PUBLIC_CHECK, 'push-to-registry':False}, 'attest only the revalidated complete file')
+    require(sign['uses'] == ATTEST and sign['if'] == SIGN_IF and sign['with'] == {
+        'subject-path':PUBLIC_SIGN, 'push-to-registry':False}, 'result signature follows exact intent success')
+    sign_context = step(attest,identifier='sign-context')
+    require(sign_context['uses'] == ATTEST and sign_context['if'] == CONTEXT_SIGN_IF
+        and sign_context['with'] == {'subject-path':PUBLIC_SIGN_CONTEXT, 'push-to-registry':False},
+        'context signature follows exact intent and result success')
+    require([item['name'] for item in attest['steps']] == [
+        'Check out the exact candidate', "Download this run's exact resolution",
+        "Download this run's exact canonical evidence", 'Revalidate the canonical bytes and frozen selection',
+        'Install pinned GitHub CLI for negative evidence',
+        'Persist complete negative intent before either signature',
+        'Attest the complete result without changing its verdict',
+        'Attest the context bound to the exact result digest', 'Require the attestation to complete'],
+        'closed attest sequence forbids source/subject edits around publication')
+    require(attest['timeout-minutes'] == 18 and sign['timeout-minutes'] == sign_context['timeout-minutes'] == 1,
+            'existing five minutes plus install one and publisher eleven leave one minute')
     require(not any(item.get('uses') == ATTEST for name,job in jobs.items() if name != 'attest' for item in job['steps']),
             'no other signer')
     final = step(attest, name='Require the attestation to complete')
     require(final['if'] == '${{ always() }}' and final['env'] == {
-        'CHECK_RESULT':'${{ steps.check.outcome }}', 'SIGN_RESULT':'${{ steps.sign.outcome }}'}, 'skipped signing cannot pass')
+        'CHECK_RESULT':'${{ steps.check.outcome }}', 'INSTALL_RESULT':'${{ steps.install-gh.outcome }}',
+        'INDEX_RESULT':'${{ steps.negative-index.outcome }}', 'SIGN_RESULT':'${{ steps.sign.outcome }}',
+        'CONTEXT_SIGN_RESULT':'${{ steps.sign-context.outcome }}'}, 'missing validation, installer, intent or signature fails')
+    final_body = heredoc(final['run'])
+    require(ast.dump(ast.parse(final_body)) == ast.dump(ast.parse("import os\nimport sys\nnames = ('CHECK_RESULT', 'INSTALL_RESULT', 'INDEX_RESULT', 'SIGN_RESULT', 'CONTEXT_SIGN_RESULT')\nsys.exit(0 if all(os.environ.get(name) == 'success' for name in names) else 1)\n")),
+            'final assertion consumes every actual outcome without a favorable shortcut')
+    require(preview['timeout-minutes'] == 15 and step(preview,identifier='preview')['timeout-minutes'] == 11,
+            'full-chain preview has 600 seconds inside 660 seconds and 900-second job')
     require(run['timeout-minutes'] == 45 and step(run,identifier='experiment')['timeout-minutes'] == 41,
             'canonical job and one aggregate experiment budget')
     setup = [step(run,name=name) for name in ('Check out the exact candidate',"Download this run's exact resolution",
@@ -162,12 +242,141 @@ def validate(doc):
         script = install['run']
         require('sha256sum --check --strict' in script and '--connect-timeout 10 --max-time 20' in script
                 and 'mkdir -m 0700 "$tools"' in script and '--retry' not in script, 'bounded pinned tools in fresh scratch')
+    require(doc['env']['PINNED_GH_VERSION'] == '2.98.0'
+            and doc['env']['PINNED_GH_URL'] == 'https://github.com/cli/cli/releases/download/v2.98.0/gh_2.98.0_linux_amd64.tar.gz',
+            'fixed release and platform for the attestation installer')
     require(doc['env']['PINNED_GH_SHA256'] == '3b8ac6b30336802fc1a858d7c084e11cdf24ac1a761ca90b68022d7d729208de'
             and doc['env']['PINNED_BUILDX_SHA256'] == '48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778',
             'repository-precedent tool pins')
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_signing_prelude_rejects_every_extra_repository_command_shape(self):
+        mutations = [
+            lambda d:step(d['jobs']['attest'],identifier='check').update(run=CHECK_COMMAND.replace(' check',' validate-evidence')),
+            lambda d:step(d['jobs']['attest'],identifier='check').update(run=ATTEST_CHECK_COMMAND+'\npython release/compat/cli.py check'),
+            lambda d:step(d['jobs']['attest'],identifier='check').update(run='python release/compat/cli.py check\n'+ATTEST_CHECK_COMMAND),
+            lambda d:step(d['jobs']['attest'],identifier='check').update(run=ATTEST_CHECK_COMMAND+' --input arbitrary'),
+            lambda d:step(d['jobs']['attest'],identifier='check').update(shell='python'),
+            lambda d:d['jobs']['attest']['steps'][0].update(run='python release/compat/cli.py check'),
+            lambda d:d['jobs']['attest']['steps'][1].update(run='python release/compat/cli.py check'),
+            lambda d:d['jobs']['attest']['steps'][2].update(env={'BASH_ENV':'release/compat/prelude'}),
+            lambda d:d['jobs']['attest']['steps'].insert(3, {'name':'Extra preparation','run':'python release/compat/cli.py check'}),
+            lambda d:d['jobs']['attest'].update(env={'BASH_ENV':'release/compat/prelude'}),
+            lambda d:d['jobs']['attest'].update(defaults={'run':{'shell':'python'}}),
+            lambda d:step(d['jobs']['attest'],identifier='install-gh').update(run=GH_INSTALL_SCRIPT+'python release/compat/cli.py check\n'),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                document = copy.deepcopy(DOCUMENT); mutate(document)
+                with self.assertRaises(AssertionError): validate(document)
+
+    def test_signing_prelude_has_only_fixed_covered_preparer_and_publisher(self):
+        attest = DOCUMENT['jobs']['attest']
+        index = attest['steps'].index(step(attest, identifier='negative-index'))
+        commands = [item['run'] for item in attest['steps'][:index+1] if 'run' in item]
+        self.assertEqual(commands, [ATTEST_CHECK_COMMAND, GH_INSTALL_SCRIPT, PUBLISH_COMMAND])
+        self.assertNotIn('cli.py', '\n'.join(commands))
+        self.assertEqual(step(attest,identifier='check')['env'],
+            {'COMPAT_PREVIEW_OUTCOME':'${{ needs.release-preview.result }}',
+             'COMPAT_RUN_OUTCOME':'${{ needs.compat-run.result }}'})
+
+    def test_public_rollback_negative_uses_unchanged_upload_sign_and_failed_verdict_guards(self):
+        import test_cli_rollback as rollback_tests
+        case = rollback_tests.PublicRollbackCLITests()
+        case.setUpClass()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.w.false_case = 'read'
+        measured, pair, attempt = case.published(negative=True)
+        self.assertFalse(measured.positive)
+        self.assertEqual(attempt.conclusion, 'failure')
+        self.assertEqual(json.loads(pair.context)['version'], 4)
+        self.assertEqual(case.output.read_text(), 'complete=true\n')
+        aggregate, attest = DOCUMENT['jobs']['compat'], DOCUMENT['jobs']['attest']
+        ready_if = step(aggregate, identifier='ready')['if']
+        values = {'steps.check.outputs.complete': 'true', 'steps.canonical.outcome': 'success'}
+        self.assertTrue(condition(ready_if, values))
+        self.assertTrue(condition(attest['if'], {'needs.compat.outputs.evidence_ready': 'true',
+                                               'github.event_name': 'workflow_dispatch', 'github.ref': 'refs/heads/main'}))
+        self.assertFalse(condition(ready_if, values, cancelled=True))
+        values['steps.canonical.outcome'] = 'failure'
+        self.assertFalse(condition(ready_if, values))
+        gate = heredoc(step(aggregate, name='Require proof and publication success')['run'])
+        with patch.dict(os.environ, {'PREVIEW_RESULT': 'success', 'RUN_RESULT': 'success',
+                                    'CHECK_RESULT': 'failure', 'UPLOAD_RESULT': 'success'}), \
+             self.assertRaises(SystemExit) as stopped:
+            exec(compile(gate, '<rollback-aggregate>', 'exec'), {})
+        self.assertNotEqual(stopped.exception.code, 0)
+        self.assertNotIn('continue-on-error', aggregate)
+        self.assertNotIn('continue-on-error', attest)
+
+    def test_intent_dependency_and_schedule_mutations_refuse(self):
+        def move_publisher_after_sign(doc):
+            steps = doc['jobs']['attest']['steps']
+            publisher = step(doc['jobs']['attest'], identifier='negative-index')
+            steps.remove(publisher)
+            steps.insert(steps.index(step(doc['jobs']['attest'], identifier='sign')) + 1, publisher)
+        mutations = [
+            lambda d:d['jobs']['attest'].update(**{'timeout-minutes':6}),
+            lambda d:d['jobs']['attest']['permissions'].update(contents='read'),
+            lambda d:d['jobs']['compat']['permissions'].update(contents='write'),
+            lambda d:d['jobs']['attest'].update(**{'if':ATTEST_IF.replace(" && github.ref == 'refs/heads/main'", '')}),
+            lambda d:step(d['jobs']['attest'],identifier='install-gh').update(**{'if':'${{ always() }}'}),
+            lambda d:step(d['jobs']['attest'],identifier='install-gh').update(**{'timeout-minutes':2}),
+            lambda d:step(d['jobs']['attest'],identifier='install-gh').update(run=GH_INSTALL_SCRIPT.replace('sha256sum --check --strict','true')),
+            lambda d:step(d['jobs']['attest'],identifier='install-gh').update(run=GH_INSTALL_SCRIPT.replace('--max-time 20','--retry 10 --max-time 20')),
+            lambda d:d['env'].update(PINNED_GH_URL='https://example.invalid/gh.tar.gz'),
+            lambda d:d['env'].update(PINNED_GH_VERSION='latest'),
+            lambda d:step(d['jobs']['attest'],identifier='negative-index').update(**{'if':'${{ always() }}'}),
+            lambda d:step(d['jobs']['attest'],identifier='negative-index').update(**{'continue-on-error':True}),
+            lambda d:step(d['jobs']['attest'],identifier='negative-index').update(**{'timeout-minutes':10}),
+            lambda d:step(d['jobs']['attest'],identifier='negative-index').update(run='python release/compat/negative_index.py'),
+            lambda d:step(d['jobs']['attest'],identifier='negative-index')['env'].update(COMPAT_RUN_OUTCOME='success'),
+            lambda d:step(d['jobs']['attest'],identifier='negative-index')['env'].pop('GH_TOKEN'),
+            lambda d:step(d['jobs']['attest'],identifier='sign').update(**{'if':INSTALL_IF}),
+            lambda d:step(d['jobs']['attest'],identifier='sign-context').update(**{'if':SIGN_IF}),
+            lambda d:step(d['jobs']['attest'],identifier='sign').update(**{'if':SIGN_IF.replace('!cancelled() && ', '')}),
+            lambda d:step(d['jobs']['attest'],name='Require the attestation to complete')['env'].pop('INDEX_RESULT'),
+            lambda d:step(d['jobs']['attest'],name='Require the attestation to complete').update(run="set -euo pipefail\n/usr/bin/python3 -I -S -B - <<'PY'\nraise SystemExit(0)\nPY\n"),
+            move_publisher_after_sign,
+            lambda d:d['jobs']['attest']['steps'].insert(-1, {'name':'Rewrite subjects', 'run':'true'}),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                document = copy.deepcopy(DOCUMENT)
+                mutate(document)
+                with self.assertRaises(AssertionError):
+                    validate(document)
+
+    def test_main_only_intent_then_both_signatures_has_no_failure_or_cancellation_path(self):
+        attest = DOCUMENT['jobs']['attest']
+        for event in ('push','workflow_dispatch','pull_request'):
+            for ref in ('refs/heads/main','refs/heads/other','refs/tags/rereply-compat-negative-v1-example'):
+                for cancelled in (False,True):
+                    with self.subTest(event=event,ref=ref,cancelled=cancelled):
+                        values = {'needs.compat.outputs.evidence_ready':'true',
+                                  'github.event_name':event, 'github.ref':ref}
+                        self.assertEqual(condition(attest['if'], values, cancelled=cancelled),
+                                         event in ('push','workflow_dispatch') and ref == 'refs/heads/main' and not cancelled)
+        names = ('steps.check.outcome','steps.check.outputs.complete','steps.install-gh.outcome',
+                 'steps.negative-index.outcome','steps.sign.outcome')
+        successful = dict.fromkeys(names,'success')
+        successful['steps.check.outputs.complete'] = 'true'
+        for identifier in ('sign','sign-context'):
+            expression = step(attest,identifier=identifier)['if']
+            relevant = names[:-1] if identifier == 'sign' else names
+            self.assertTrue(condition(expression, successful))
+            self.assertFalse(condition(expression, successful, cancelled=True))
+            for name in relevant:
+                for value in ('failure','cancelled','skipped',''):
+                    with self.subTest(identifier=identifier,name=name,value=value):
+                        self.assertFalse(condition(expression,{**successful,name:value}))
+        # Intent success permits signing either complete measured verdict, while
+        # the existing compat aggregate independently retains a false verdict.
+        self.assertNotIn('tags', DOCUMENT['on']['push'])
+        self.assertEqual(DOCUMENT['on']['push'], {'branches':['main']})
+
     def test_current_workflow_contract(self):
         validate(DOCUMENT)
 
@@ -197,6 +406,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(45*60-(180+images._TOTAL+5+60),55)
         self.assertGreater(41*60,images._TOTAL+5)
 
+    def test_preview_budget_and_exact_collector_workflow_binding(self):
+        import hashlib
+        import compat_collect
+        raw = (ROOT/'.github/workflows/compat.yml').read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), compat_collect.WORKFLOW_SHA256)
+        request = compat_collect.CollectionRequest(test_cli.SHA, raw)
+        self.assertEqual(set(compat_collect._workflow(request)), {'release-preview','compat-run','compat','compat-attest'})
+        with self.assertRaises(compat_collect.evidence.CompatRefusal):
+            compat_collect._workflow(compat_collect.CollectionRequest(test_cli.SHA, raw+b'\n'))
+        # The internal cap includes version checks and capture cleanup. The
+        # outer step adds 60s; the job adds240s for checkout/install/upload.
+        preview = DOCUMENT['jobs']['release-preview']
+        self.assertEqual(step(preview,identifier='preview')['timeout-minutes']*60-600,60)
+        self.assertEqual(preview['timeout-minutes']*60-11*60,240)
+
     def test_security_and_identity_mutations_refuse(self):
         mutations = [
             lambda d:d['on']['pull_request'].update(paths=['internal/**']) if d['on']['pull_request'] else d['on'].update(pull_request={'paths':['internal/**']}),
@@ -218,7 +442,14 @@ class WorkflowTests(unittest.TestCase):
             lambda d:step(d['jobs']['compat'],name='Require proof and publication success')['env'].update(CHECK_RESULT='${{ steps.check.conclusion }}'),
             lambda d:d['jobs']['attest'].update(**{'if':'${{ success() }}'}),
             lambda d:step(d['jobs']['attest'],identifier='check').update(**{'continue-on-error':True}),
+            lambda d:step(d['jobs']['attest'],identifier='check').update(run=CHECK_COMMAND),
+            lambda d:d['jobs']['attest'].update(**{'if':"${{ needs.compat.result == 'success' }}"}),
+            lambda d:d['jobs']['compat']['outputs'].update(evidence_ready='true'),
+            lambda d:step(d['jobs']['compat'],identifier='ready').update(**{'if':"${{ always() }}"}),
+            lambda d:step(d['jobs']['attest'],identifier='sign-context')['with'].update(**{'subject-path':PUBLIC_SIGN}),
             lambda d:step(d['jobs']['attest'],identifier='sign')['with'].update(**{'subject-path':'${{ runner.temp }}/compat-input/compat-result.json'}),
+            lambda d:d['jobs']['release-preview'].update(**{'timeout-minutes':10}),
+            lambda d:step(d['jobs']['release-preview'],identifier='preview').update(**{'timeout-minutes':5}),
             lambda d:d['jobs']['compat-run'].update(**{'timeout-minutes':90}),
             lambda d:step(d['jobs']['compat-run'],identifier='experiment').update(run='echo ${{ inputs.rollback_target }}'),
             lambda d:step(d['jobs']['compat-run'],name='Check out the exact candidate').update(**{'timeout-minutes':2}),
@@ -237,6 +468,56 @@ class WorkflowTests(unittest.TestCase):
             for value in ('failure','cancelled','skipped',''):
                 with self.subTest(name=name,value=value),patch.dict(os.environ,{**values,name:value}),self.assertRaises(SystemExit):
                     exec(compile(script,'<aggregate>','exec'),{})
+
+    def test_actual_attestation_script_requires_both_signatures_and_revalidation(self):
+        script = heredoc(step(DOCUMENT['jobs']['attest'],name='Require the attestation to complete')['run'])
+        names = ('CHECK_RESULT','INSTALL_RESULT','INDEX_RESULT','SIGN_RESULT','CONTEXT_SIGN_RESULT')
+        values = dict.fromkeys(names,'success')
+        for value in ('success','failure','cancelled','skipped',''):
+            for name in names:
+                with self.subTest(name=name,value=value), patch.dict(os.environ,{**values,name:value}), \
+                     self.assertRaises(SystemExit) as raised:
+                    exec(compile(script,'<attestation>','exec'),{})
+                self.assertEqual(raised.exception.code,0 if value == 'success' else 1)
+
+    def test_complete_negative_can_sign_but_keeps_compat_and_workflow_failed(self):
+        aggregate = DOCUMENT['jobs']['compat']; attest = DOCUMENT['jobs']['attest']
+        gate = heredoc(step(aggregate,name='Require proof and publication success')['run'])
+        ready_if = step(aggregate,identifier='ready')['if']
+        for verdict in ('success','failure'):
+            values = {'steps.check.outputs.complete':'true','steps.canonical.outcome':'success'}
+            self.assertTrue(condition(ready_if,values))
+            for event in ('push','workflow_dispatch','pull_request'):
+                self.assertEqual(condition(attest['if'],{
+                    'needs.compat.outputs.evidence_ready':'true','github.event_name':event,
+                    'github.ref':'refs/heads/main'}),
+                    event != 'pull_request')
+            env = dict(PREVIEW_RESULT='success',RUN_RESULT='success',CHECK_RESULT=verdict,UPLOAD_RESULT='success')
+            if verdict == 'failure':
+                with patch.dict(os.environ,env), self.assertRaises(SystemExit) as raised:
+                    exec(compile(gate,'<aggregate>','exec'),{})
+                self.assertNotEqual(raised.exception.code,0)
+            else:
+                with patch.dict(os.environ,env): exec(compile(gate,'<aggregate>','exec'),{})
+        # The aggregate job failure is not hidden, even though its signing dependent can run.
+        self.assertNotIn('continue-on-error',aggregate)
+        self.assertNotIn('continue-on-error',attest)
+
+    def test_cancellation_incomplete_write_upload_failure_or_missing_marker_never_signs(self):
+        aggregate = DOCUMENT['jobs']['compat']; attest = DOCUMENT['jobs']['attest']
+        ready_if = step(aggregate,identifier='ready')['if']
+        for complete in ('true','false',''):
+            for upload in ('success','failure','cancelled','skipped',''):
+                for cancelled in (False,True):
+                    with self.subTest(complete=complete,upload=upload,cancelled=cancelled):
+                        ready = condition(ready_if,{'steps.check.outputs.complete':complete,
+                            'steps.canonical.outcome':upload},cancelled=cancelled)
+                        self.assertEqual(ready,complete == 'true' and upload == 'success' and not cancelled)
+                        self.assertEqual(condition(attest['if'],{
+                            'needs.compat.outputs.evidence_ready':'true' if ready else '',
+                            'github.event_name':'push','github.ref':'refs/heads/main'},cancelled=cancelled),ready)
+        self.assertFalse(condition(attest['if'],{'needs.compat.outputs.evidence_ready':'true',
+            'github.event_name':'workflow_dispatch','github.ref':'refs/heads/main'},cancelled=True))
 
     def test_actual_setup_clock_boundaries(self):
         script = heredoc(step(DOCUMENT['jobs']['compat-run'],name='Enforce the shared setup allocation')['run'])
@@ -278,6 +559,10 @@ class WorkflowTests(unittest.TestCase):
                 if complete:
                     public=runner/('compat-check-'+ctx.suffix)/'public/compat-result.json'
                     self.assertEqual(public.read_bytes(),raw)
+                    context_raw=public.with_name('compat-context.json').read_bytes()
+                    cli.validate_evidence(context_raw,raw,snapshot,ctx)
+                    self.assertEqual({p.name for p in public.parent.iterdir()},
+                                     {'compat-result.json','compat-context.json'})
                 if case=='partial-write':
                     public=runner/('compat-check-'+ctx.suffix)/'public/compat-result.json'
                     self.assertEqual(public.read_bytes(),raw[:1])

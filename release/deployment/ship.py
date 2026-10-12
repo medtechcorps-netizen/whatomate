@@ -44,6 +44,7 @@ import ship_common as common
 import smoke
 import spec_images
 import trivy_policy
+import ship_flow
 
 
 HERE = Path(__file__).resolve().parent
@@ -131,7 +132,7 @@ class Deps:
         smoke_rounds: int | None = None,
         smoke_delay: float | None = None,
     ) -> None:
-        self.clock = clock or common.utc_now
+        self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.sleeper = sleeper or time.sleep
         self.opener = opener
         self.gh_runner = gh_runner or subprocess.run
@@ -326,6 +327,7 @@ def _digest_lines(images: Mapping[str, str]) -> list[str]:
 
 
 def cmd_plan(ctx: Context) -> int:
+    deadline = time.monotonic() + ship_flow.PLAN_SECONDS
     out = ctx.out
     control = common.validate_context(ctx.env)
     sha = control["sha"]
@@ -341,15 +343,15 @@ def cmd_plan(ctx: Context) -> int:
     if mode in CANDIDATE_MODES:
         require_ci_green(gh, sha)
     require_old_lanes_idle(gh, ctx.repo_dir)
-    bootstrap = ctx.bootstrap()
-    chain = release_record.resolve_chain(gh, ctx.repo_dir, bootstrap=bootstrap, work_dir=ctx.work_dir("plan-chain"))
-    latest = chain.latest
+    gate = ship_flow.gate(ctx, control, mode, target_release, deadline=deadline)
+    chain = gate.resolved.chain
+    latest = gate.resolved.latest
     lines = [
         "## Release plan",
         "",
         f"- Mode: {mode}",
         f"- Commit: {sha}",
-        f"- Latest record: {latest.release} ({latest.kind}, commit {latest.sha})",
+        f"- Latest record: {latest.release} ({chain.entries[-1].kind}, commit {latest.record_sha})",
     ]
     if mode in PRODUCTION_MODES:
         lines.append("- Approval gate: environment production requires the owner's review (admin bypass off, main only)")
@@ -358,14 +360,13 @@ def cmd_plan(ctx: Context) -> int:
     outputs = {
         "latest_release": latest.release,
         "latest_manifest_sha256": latest.manifest_sha256,
-        "latest_sha": latest.sha,
+        "latest_sha": latest.record_sha,
         "target_release": "",
         "target_manifest_sha256": "",
     }
     if mode in CANDIDATE_MODES:
-        release_record.require_no_downgrade(ctx.repo_dir, latest.sha, sha)
-        classification = schema_change.guard(ctx.repo_dir, latest.sha, sha)
-        count, commits = first_parent_commits(out, ctx.repo_dir, latest.sha, sha)
+        classification = gate.classification
+        count, commits = first_parent_commits(out, ctx.repo_dir, latest.record_sha, sha)
         lines += [
             "- No-downgrade: the commit descends from the latest record",
             "- Schema guard: clean",
@@ -385,16 +386,17 @@ def cmd_plan(ctx: Context) -> int:
         else:
             lines += ["", "Staging verifies the configured target, deployment receipt and all thirteen canary checks."]
     else:
-        target, intermediates = release_record.rollback_plan(chain, target_release)
-        classification = schema_change.guard(ctx.repo_dir, target.sha, latest.sha, mode="rollback")
+        target = gate.resolved.selected
+        intermediates = chain.entries[target.index + 1:]
+        classification = gate.classification
         outputs["target_release"] = target.release
         outputs["target_manifest_sha256"] = target.manifest_sha256
         lines += [
-            f"- Rollback target: {target.release} (commit {target.sha})",
-            *_digest_lines(target.images),
-            f"- Records after the target: {len(intermediates)} (none changed the database)",
-            "- Schema guard between target and latest: clean",
-            *schema_summary(classification),
+            f"- Rollback target: {target.release} (commit {target.record_sha})",
+            *_digest_lines(dict(target.images)),
+            f"- Records after the target: {len(intermediates)}",
+            "- Source and exact-target rollback policy: passed",
+            *(schema_summary(classification) if classification is not None else []),
             "- Old release lanes: idle",
             "",
             "The production job reads live digests and decides: rollback (live equals the latest "
@@ -402,6 +404,7 @@ def cmd_plan(ctx: Context) -> int:
             "record only) or restore (target is the latest record and live matches no record; one "
             "PUT back to the latest record).",
         ]
+    lines += ship_flow.details(gate)
     if mode in PRODUCTION_MODES:
         lines += ["", APPROVAL_BANNER]
     if mode == BYPASS_MODE:
@@ -1053,6 +1056,7 @@ def _same_state(left: do_app.Snapshot, right: do_app.Snapshot) -> bool:
 
 
 def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
+    deadline = time.monotonic() + ship_flow.PLAN_SECONDS
     env = ctx.env
     out = ctx.out
     deps = ctx.deps
@@ -1097,30 +1101,50 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     require_old_lanes_idle(gh, ctx.repo_dir)
     # P3 the verified record chain, bound to what the owner approved.
     bootstrap = ctx.bootstrap()
-    chain = release_record.resolve_chain(gh, ctx.repo_dir, bootstrap=bootstrap, work_dir=ctx.work_dir("production-chain"))
-    latest = chain.latest
+    gate = ship_flow.gate(ctx, control, dispatched_mode, target_release, deadline=deadline)
+    chain = gate.resolved.chain
+    latest = gate.resolved.latest
     if latest.release != env.get("PLAN_LATEST_RELEASE") or latest.manifest_sha256 != env.get("PLAN_LATEST_MANIFEST_SHA256"):
         common.fail("latest-changed-since-plan")
     # P4 desired images.
     candidate: dict[str, Any] | None = None
-    target_entry: release_record.Entry | None = None
+    target_entry: ship_flow.record_resolver.ReleaseSelection | None = None
+    handoff_outputs = None
     if mode in {"dry-run", "promote"}:
         candidate = decode_candidate(env, control, ctx.now())
         desired_images = dict(candidate["images"])
         if set(desired_images.values()) & set(bootstrap["images"].values()):
             common.fail("candidate-invalid:bootstrap-digest")
         release_record.verify_images(gh, desired_images, sha, bootstrap)
-        release_record.require_no_downgrade(ctx.repo_dir, latest.sha, sha)
-        classification = schema_change.guard(ctx.repo_dir, latest.sha, sha)
+        classification = gate.classification
+        # Encoding, size and full decode/replay must succeed before even the
+        # first provider read. Oversized evidence cannot strand a deployment.
+        handoff_outputs = ship_flow.promotion_outputs(gate, control, desired_images,
+            staging="passed" if dispatched_mode == "promote" else "bypassed", private=out.private)
     else:
-        target_entry, _intermediates = release_record.rollback_plan(chain, target_release)
+        target_entry = gate.resolved.selected
         if target_entry.manifest_sha256 != env.get("PLAN_TARGET_MANIFEST_SHA256"):
             common.fail("latest-changed-since-plan:target")
-        release_record.verify_images(gh, target_entry.images, target_entry.sha, bootstrap)
-        classification = schema_change.guard(ctx.repo_dir, target_entry.sha, latest.sha, mode="rollback")
+        # The concrete full-chain reader verified every selected image.
+        classification = gate.classification
         desired_images = dict(target_entry.images)
-    for line in schema_summary(classification):
+        handoff_outputs = ship_flow.rollback_outputs(gate, control, private=out.private)
+    for line in (schema_summary(classification) if classification is not None else []) + ship_flow.details(gate):
         safe_text(out, line)
+    if gate.qualified_rollback is not None:
+        # Custody encoding may consume time. This is a fresh production clock
+        # check before provider I/O, never a record-retry qualification clock.
+        proof = gate.qualified_rollback
+        try:
+            observed = ship_flow.ship_rollback_compat._utc(ctx.deps.clock())
+        except ship_flow.compat_evidence.CompatRefusal:
+            common.fail("candidate-invalid:compat-stale")
+        if not proof.checked_at <= observed < proof.artifact_expires_at:
+            common.fail("candidate-invalid:compat-stale")
+    if gate.outage is not None:
+        # Use the original deadline and the full-precision clock after custody
+        # encoding. Completion/record retries do not get a new admission clock.
+        ship_flow.require_outage_freshness(gate, deadline=deadline, observed_at=ctx.deps.clock())
     # P5 two identical double reads, digest sources, topology and VPC.
     client = do_app.DOAppClient(
         secret["app_id"],
@@ -1142,12 +1166,12 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
     live_images = spec_images.extract_image_digests(before.spec)
     # P6 drift.
     if mode in {"dry-run", "promote"}:
-        if live_images != latest.images:
+        if live_images != dict(latest.images):
             common.fail("drift")
         case = mode
     else:
         assert target_entry is not None
-        case = release_record.decide_rollback_case(live_images, chain, target_entry)
+        case = ship_flow.rollback_case(live_images, gate.resolved)
         desired_images = dict(latest.images if case == "restore" else target_entry.images)
     # P7 backup gate (every mode, dry-run included).
     backup = backup_check.check(client, target=target, now=ctx.now())
@@ -1163,14 +1187,15 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         _finish(
             ctx,
             kind="rollback",
-            sha=target_entry.sha,
-            images=target_entry.images,
+            sha=target_entry.record_sha,
+            images=dict(target_entry.images),
             previous=latest.release,
             rolled_back_from=latest.release,
             built_at="",
             reconciled=True,
             state=before,
             summary=[f"- Outcome: reconcile (no PUT); production runs {target_entry.release}"],
+            handoff_outputs=handoff_outputs,
         )
         return EXIT_OK
     # P8 the image-only desired spec and the sanitized digest diff.
@@ -1289,9 +1314,9 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         kind, record_sha, built_at, rolled_back_from = "promote", sha, candidate["built_at"], ""
     elif case == "rollback":
         assert target_entry is not None
-        kind, record_sha, built_at, rolled_back_from = "rollback", target_entry.sha, "", latest.release
+        kind, record_sha, built_at, rolled_back_from = "rollback", target_entry.record_sha, "", latest.release
     else:
-        kind, record_sha, built_at, rolled_back_from = "restore", latest.sha, "", ""
+        kind, record_sha, built_at, rolled_back_from = "restore", latest.record_sha, "", ""
     out.text(
         f"{kind} complete: health {health['health']}; one PUT"
         + (" (ambiguous, reconciled)" if ambiguous else "")
@@ -1307,6 +1332,7 @@ def _production(ctx: Context, token: str, target_raw: Any, run: _Run) -> int:
         reconciled=False,
         state=settled,
         summary=[f"- Outcome: {kind} deployed, health {health['health']}, one PUT"],
+        handoff_outputs=handoff_outputs,
     )
     return EXIT_OK
 
@@ -1332,6 +1358,7 @@ def _finish(
     reconciled: bool,
     state: do_app.Snapshot,
     summary: Sequence[str],
+    handoff_outputs: Mapping[str, str] | None = None,
 ) -> None:
     deployed_at = common.format_timestamp(ctx.now())
     release = f"prod-{common.compact_timestamp(deployed_at)}-{sha[:8]}"
@@ -1349,6 +1376,8 @@ def _finish(
     }
     for component in common.COMPONENTS:
         outputs[OUTPUT_DIGEST_KEYS[component]] = images[component]
+    if handoff_outputs is not None:
+        outputs.update(handoff_outputs)
     ctx.out.set_outputs(outputs)
     ctx.out.summary([*summary, f"- Record to write: {release}", ""])
 
@@ -1368,7 +1397,7 @@ class _Rollback:
         before: do_app.Snapshot,
         desired_spec: Mapping[str, Any],
         live_images: Mapping[str, str],
-        latest: release_record.Entry,
+        latest: ship_flow.record_resolver.ReleaseSelection,
         origin: str,
     ) -> None:
         self.ctx = ctx
@@ -1435,7 +1464,7 @@ class _Rollback:
         except common.ReleaseError:
             return self._manual("rollback-failed:health")
         restored = (
-            self.latest.release if self.live_images == self.latest.images else "the pre-run state"
+            self.latest.release if self.live_images == dict(self.latest.images) else "the pre-run state"
         )
         safe_text(out, f"{reason}; rolled back to {restored}; health {health['health']}; no record written")
         try:
@@ -1509,22 +1538,13 @@ def _find_draft(gh: release_record.Gh, tag: str) -> bool:
     return bool(drafts)
 
 
-def _record_state(ctx: Context, gh: release_record.Gh, raw: bytes, manifest: Mapping[str, Any]) -> str:
-    chain = release_record.resolve_chain(
-        gh, None, bootstrap=ctx.bootstrap(), work_dir=ctx.work_dir("record-chain")
-    )
-    index = chain.find(manifest["release"])
-    if index is not None:
-        if index != len(chain.entries) - 1:
-            common.fail("latest-changed-since-production")
-        if common.canonical_file_bytes(chain.latest.document) != raw:
-            common.fail("record-invalid:published-differs")
-        return "published"
-    if chain.latest.release != manifest["previous"]:
-        common.fail("latest-changed-since-production")
-    # The new record must extend the verified chain exactly (a published
-    # record that breaks the chain would wedge every later run).
-    release_record.require_link(list(chain.entries), release_record.manifest_entry(manifest, raw), None)
+def _record_state(ctx: Context, gh: release_record.Gh, raw: bytes, manifest: Mapping[str, Any],
+                  control: Mapping[str, Any], fields: Mapping[str, Any], deadline: float) -> str:
+    expected, state = ship_flow.record_bytes(ctx, control, fields, deadline=deadline)
+    if expected != raw:
+        common.fail("record-invalid:production-differs")
+    if state == "published":
+        return state
     return "draft" if _find_draft(gh, manifest["release"]) else "new"
 
 
@@ -1554,20 +1574,30 @@ def render_notes(manifest: Mapping[str, Any], *, mode: str = "") -> list[str]:
         lines.append(f"- Rolled back from: {manifest['rolled_back_from']}")
     if manifest["reconciled"]:
         lines.append("- Reconciled: production already ran these digests; no PUT")
+    if manifest["schema_version"] == 2:
+        lines += [f"- Database change: {manifest['db_change']}; dormant: {str(manifest['dormant']).lower()}",
+            f"- Catalog: version {manifest['catalog_version']}; minimum reader {manifest['min_reader_version']}",
+            f"- Measured catalog SHA256: {manifest['catalog_sha256']}",
+            f"- Compatibility: {manifest['compat']}; run: {manifest['compat_run_id'] or 'none'}",
+            f"- Reversible: {str(manifest['reversible']).lower()}; old server: {str(manifest['old_server_ok']).lower()}",
+            f"- Staging: {manifest['staging']}"]
     if mode == BYPASS_MODE:
         lines += ["", *BYPASS_BANNER]
     return lines
 
 
 def cmd_record(ctx: Context, stage: str) -> int:
+    # All visibility retries in this command share one original source budget.
+    deadline = time.monotonic() + ship_flow.SOURCE_SECONDS
     control = common.validate_context(ctx.env, allow_rerun=True)
     out = ctx.out
     gh = ctx.gh()
     if stage == "manifest":
         fields = _record_fields(ctx.env, control)
-        raw = release_record.build_manifest(fields)
+        raw, state = ship_flow.record_bytes(ctx, control, fields, deadline=deadline)
         manifest = release_record.validate_manifest(common.loads_strict(raw, code="record-invalid"))
-        state = _record_state(ctx, gh, raw, manifest)
+        if state != "published":
+            state = "draft" if _find_draft(gh, manifest["release"]) else "new"
         directory, path = _record_paths(ctx)
         directory.mkdir(mode=0o700, exist_ok=True)
         if path.exists() and path.read_bytes() != raw:
@@ -1577,7 +1607,8 @@ def cmd_record(ctx: Context, stage: str) -> int:
         out.text(f"record {manifest['release']}: {state}")
     elif stage == "publish":
         raw, manifest, path = _load_local_manifest(ctx)
-        state = _record_state(ctx, gh, raw, manifest)
+        fields = _record_fields(ctx.env, control)
+        state = _record_state(ctx, gh, raw, manifest, control, fields, deadline)
         tag = manifest["release"]
         if state == "published":
             out.text(f"record {tag} is already published")
@@ -1605,22 +1636,15 @@ def cmd_record(ctx: Context, stage: str) -> int:
         last_error: common.ReleaseError | None = None
         for attempt in range(6):
             try:
-                downloaded = gh.download_manifest(tag, ctx.work_dir("record-verify") / f"attempt-{attempt}")
-                if downloaded != raw:
-                    common.fail("record-invalid:published-differs")
-                workflow_sha = manifest["signer"]["workflow_sha"]
-                gh.verify_file(path, signer_digest=workflow_sha, source_digest=workflow_sha)
-                chain = release_record.resolve_chain(
-                    gh, None, bootstrap=ctx.bootstrap(), work_dir=ctx.work_dir(f"record-verify-chain-{attempt}")
-                )
-                if chain.latest.release != tag or common.canonical_file_bytes(chain.latest.document) != raw:
-                    common.fail("record-invalid:not-latest")
+                ship_flow.verify_published(ctx, raw, deadline=deadline)
                 last_error = None
                 break
             except common.ReleaseError as exc:
                 last_error = exc
-                if attempt < 5:
+                if attempt < 5 and time.monotonic() + 10 < deadline:
                     ctx.deps.sleeper(10)
+                else:
+                    break
         if last_error is not None:
             raise last_error
         out.text(f"record {tag} verified: attested, tag bound to {manifest['sha']}, latest in the chain")

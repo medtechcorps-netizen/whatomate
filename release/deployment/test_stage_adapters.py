@@ -6,12 +6,15 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import release_record
 import ship
 import ship_common as common
 import stage_adapters
+import test_compat_request as composition
 import test_ship_support as support
+import test_stage as lifecycle
 
 
 class DiscoveryGh(support.FakeGh):
@@ -46,6 +49,17 @@ class DiscoveryGh(support.FakeGh):
 
 
 class AdapterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Typed mixed-v2 projection from controlled resolver/Actions captures.
+        # Adapter tests mock the top-level gate, never claim live qualification.
+        composition.source.ForwardResolverTests.setUpClass()
+        forward = composition.resolution()
+        history = composition.collected(forward)
+        normal = stage_adapters.ship_flow.ship_compat.NormalPreflight(forward,
+            composition.bridge.qualify(forward, history), history, 1, 1)
+        cls.gate_value = stage_adapters.ship_flow.Gate(forward.resolved, normal, None)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -83,15 +97,94 @@ class AdapterTests(unittest.TestCase):
                 self.h.env.clear(); self.h.env.update(saved)
         self.assertEqual(self.h.gh.calls, [])
 
-    def test_actual_plan_rechecks_chain_ci_schema_policy_and_binding(self):
-        self.assertTrue(self.verify_plan())
+    def planned_latest(self):
+        latest = self.gate_value.resolved.latest
+        self.h.env.update(PLAN_LATEST_RELEASE=latest.release,
+                         PLAN_LATEST_MANIFEST_SHA256=latest.manifest_sha256)
+
+    def test_plan_consumes_mixed_gate_and_forwards_exact_context(self):
+        self.planned_latest()
+        self.assertIsNotNone(self.gate_value.resolved.latest.live)
+        self.assertNotEqual(self.gate_value.resolved.latest.actual_web_source_sha,
+                            self.gate_value.resolved.latest.live.origin_source.sha)
+        with mock.patch.object(stage_adapters.ship_flow, "gate", autospec=True,
+                return_value=self.gate_value) as gate, \
+                mock.patch.object(stage_adapters.time, "monotonic", return_value=10.0), \
+                mock.patch.object(release_record, "resolve_chain", side_effect=AssertionError("legacy chain used")):
+            self.assertTrue(self.verify_plan())
+        gate.assert_called_once_with(self.ctx, self.control, mode="stage", target="", deadline=910.0)
         self.assertFalse(any("/approvals" in str(args) for args, _ in self.h.gh.calls))
         self.assertEqual(self.h.do.requests, [])
-        self.h.env["PLAN_LATEST_MANIFEST_SHA256"] = "0" * 64
-        with self.assertRaisesRegex(common.ReleaseError, "latest-changed-since-plan"):
-            self.verify_plan()
+
+    def test_planned_latest_tag_or_hash_must_match_fresh_gate(self):
+        for field in ("PLAN_LATEST_RELEASE", "PLAN_LATEST_MANIFEST_SHA256"):
+            with self.subTest(field=field):
+                self.planned_latest()
+                self.h.env[field] = "0" * 64
+                with mock.patch.object(stage_adapters.ship_flow, "gate", autospec=True,
+                        return_value=self.gate_value) as gate:
+                    with self.assertRaisesRegex(common.ReleaseError, "latest-changed-since-plan"):
+                        self.verify_plan()
+                gate.assert_called_once()
+                self.assertEqual(self.h.do.requests, [])
+
+    def test_source_deadline_precedes_clients_and_is_not_reset_after_ci(self):
+        self.planned_latest()
+        clock = [10.0]
+        gh = self.ctx.gh
+        ci = ship.require_ci_green
+        old_lanes = ship.require_old_lanes_idle
+        def make_gh():
+            clock[0] += 20.0
+            return gh()
+        def check_ci(*args):
+            clock[0] += 30.0
+            return ci(*args)
+        def check_lanes(*args):
+            clock[0] += 40.0
+            return old_lanes(*args)
+        def gated(ctx, control, mode, target, *, deadline):
+            self.assertEqual(clock[0], 100.0)
+            self.assertEqual(deadline, 910.0)
+            return self.gate_value
+        with mock.patch.object(stage_adapters.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.ctx, "gh", side_effect=make_gh), \
+                mock.patch.object(ship, "require_ci_green", side_effect=check_ci), \
+                mock.patch.object(ship, "require_old_lanes_idle", side_effect=check_lanes), \
+                mock.patch.object(stage_adapters.ship_flow, "gate", autospec=True, side_effect=gated):
+            self.assertTrue(self.verify_plan())
+
+    def test_source_refusals_propagate_before_provider_or_image_verification(self):
+        for code in ("candidate-invalid:compat-stale", "candidate-invalid:compat-missing",
+                     "candidate-invalid:compat-old-server-incompatible", "schema-change-blocked:fixture",
+                     "record-chain-invalid:source-deadline"):
+            with self.subTest(code=code), \
+                    mock.patch.object(stage_adapters.ship_flow, "gate", autospec=True,
+                        side_effect=common.ReleaseError(code)) as gate:
+                with self.assertRaises(common.ReleaseError) as caught:
+                    self.verify_plan()
+                self.assertEqual(caught.exception.code, code)
+                gate.assert_called_once()
+                self.assertEqual(self.h.do.requests, [])
+                self.assertFalse(any(args[1:3] == ["attestation", "verify"] for args, _ in self.h.gh.calls))
+
+    def test_real_lane_does_not_construct_provider_after_gate_refusal(self):
+        world = lifecycle.World()
+        lane = world.lane(verify_plan=self.adapters.verify_plan)
+        with mock.patch.object(stage_adapters.ship_flow, "gate", autospec=True,
+                side_effect=common.ReleaseError("candidate-invalid:compat-stale")):
+            with self.assertRaisesRegex(common.ReleaseError, "candidate-invalid:compat-stale"):
+                lane.deploy(self.candidate, candidate_sha256=self.h.env["CANDIDATE_SHA256"],
+                            run_id=self.control["run_id"])
+        self.assertEqual(world.clients, [])
+        self.assertEqual(world.writes, [])
+        self.assertEqual(world.probes, [])
+        self.assertEqual(world.verified, [])
 
     def test_candidate_tampering_run_binding_freshness_and_trivy_fail_before_gh(self):
+        patcher = mock.patch.object(stage_adapters.ship_flow, "gate", autospec=True)
+        gate = patcher.start()
+        self.addCleanup(patcher.stop)
         original = copy.deepcopy(self.candidate)
         for change in ({"built_at": "2026-10-01T00:00:00Z"}, {"sha": "f" * 40},
                        {"trivy": {"db_updated_at": "2026-10-01T00:00:00Z", "active_exceptions": 0}},
@@ -104,26 +197,17 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(self.h.gh.calls, [])
         with self.assertRaises(common.ReleaseError):
             self.adapters.verify_plan(original, "0" * 64, "99999")
+        gate.assert_not_called()
 
-    def test_missing_ci_old_lane_and_schema_change_stop_plan(self):
-        self.h.gh.ci_runs["test.yml"] = []
-        with self.assertRaisesRegex(common.ReleaseError, "ci-not-green"): self.verify_plan()
-        self.h.gh.ci_green(self.head)
-        self.h.gh.active["waiting"] = [support.run_record(".github/workflows/old-lane.yml", status="waiting", conclusion=None)]
-        with self.assertRaisesRegex(common.ReleaseError, "old-lane-active"): self.verify_plan()
-        self.h.gh.active["waiting"] = []
-        self.repo.commit({"internal/database/changed.go": "package database\n"})
-        # The candidate must identify that changed commit, not merely a dirty file.
-        new_head = self.repo.head()
-        self.h.env.update(support.context_env(new_head, self.root))
-        self.h.gh.ci_green(new_head)
-        encoded, digest = support.candidate_b64(support.NEW, new_head, support.NOW)
-        self.h.env.update(CANDIDATE_B64=encoded, CANDIDATE_SHA256=digest)
-        control = common.validate_context(self.h.env)
-        adapters = stage_adapters.make_adapters(self.ctx, control)
-        candidate = ship.decode_candidate(self.h.env, control, self.ctx.now())
-        with self.assertRaisesRegex(common.ReleaseError, "schema-change-blocked"):
-            adapters.verify_plan(candidate, digest, control["run_id"])
+    def test_missing_ci_and_old_lane_stop_before_source_gate(self):
+        with mock.patch.object(stage_adapters.ship_flow, "gate", autospec=True) as gate:
+            self.h.gh.ci_runs["test.yml"] = []
+            with self.assertRaisesRegex(common.ReleaseError, "ci-not-green"): self.verify_plan()
+            self.h.gh.ci_green(self.head)
+            self.h.gh.active["waiting"] = [support.run_record(".github/workflows/old-lane.yml", status="waiting", conclusion=None)]
+            with self.assertRaisesRegex(common.ReleaseError, "old-lane-active"): self.verify_plan()
+        gate.assert_not_called()
+        self.assertEqual(self.h.do.requests, [])
 
     def test_prior_staging_source_need_not_be_a_production_record(self):
         self.assertEqual(self.h.gh.releases, [])

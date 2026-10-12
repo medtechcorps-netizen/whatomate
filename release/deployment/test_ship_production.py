@@ -33,7 +33,8 @@ class ProductionCase(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.repo, self.base = support.base_repo(self.root / "repo")
         self.head = self.repo.commit({"README.md": "readme v2\n"}, "feature")
-        self.h = support.Harness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h = support.PostGateHarness(self.root, repo=self.repo, head=self.head, bootstrap_sha=self.base)
+        self.h.install(self)
         self.clients: list[do_app.DOAppClient] = []
         original = do_app.DOAppClient
 
@@ -89,10 +90,11 @@ class DryRunTests(ProductionCase):
         for mode in ("dry-run", "promote"):
             with self.subTest(mode=mode):
                 blocked = ship.schema_change.SchemaChangeBlocked(["migration-path-changed:synthetic"])
-                with mock.patch.object(ship.schema_change, "guard", side_effect=blocked) as guard:
+                with mock.patch.object(ship.ship_flow, "gate", side_effect=blocked) as guard:
                     self.assertEqual(self.production(mode), ship.EXIT_REFUSED, self.h.text())
                 self.assertEqual(guard.call_count, 1)
-                self.assertEqual(guard.call_args.kwargs.get("mode", "forward"), "forward")
+                self.assertEqual(guard.call_args.args[2:], (mode, ""))
+                self.assertIsInstance(guard.call_args.kwargs["deadline"], float)
                 self.assertEqual(self.clients, [])
                 self.assertEqual(self.h.do.requests, [])
                 self.assertEqual(self.h.https.calls, [])
@@ -629,10 +631,10 @@ class RollbackModeTests(ProductionCase):
         self.h.do = support.FakeDO(spec=support.make_spec(support.NEW))
         self.rollback_env("prod-0000", self.h.bootstrap_sha256)
         blocked = ship.schema_change.SchemaChangeBlocked(["guarded-tree:internal/models/example.go"])
-        with mock.patch.object(ship.schema_change, "guard", side_effect=blocked) as guard:
+        with mock.patch.object(ship.ship_flow, "gate", side_effect=blocked) as guard:
             self.assertEqual(self.h.run("production"), ship.EXIT_REFUSED, self.h.text())
-        self.assertEqual(guard.call_args.args[1:], (self.base, self.head))
-        self.assertEqual(guard.call_args.kwargs, {"mode": "rollback"})
+        self.assertEqual(guard.call_args.args[2:], ("rollback", "prod-0000"))
+        self.assertIsInstance(guard.call_args.kwargs["deadline"], float)
         self.assertEqual(self.clients, [])
         self.assertIn("schema-change-blocked", self.h.text())
         self.assertEqual(self.h.do.put_count(), 0)
@@ -656,7 +658,7 @@ class InterruptTests(ProductionCase):
         self.assertTrue(all(client._token == "" for client in self.clients))
 
     def test_cancel_before_the_put_is_refused(self) -> None:
-        with mock.patch.object(ship.release_record, "resolve_chain", side_effect=KeyboardInterrupt):
+        with mock.patch.object(ship.ship_flow, "gate", side_effect=KeyboardInterrupt):
             self.assertEqual(self.production(), ship.EXIT_REFUSED, self.h.text())
         self.assertIn("cancelled before the PUT; production unchanged", self.h.text())
         self.assertEqual(self.h.do.put_count(), 0)
@@ -669,7 +671,7 @@ class InterruptTests(ProductionCase):
             seen.append(signal.getsignal(signal.SIGTERM))
             raise KeyboardInterrupt
 
-        with mock.patch.object(ship.release_record, "resolve_chain", side_effect=check_handler):
+        with mock.patch.object(ship.ship_flow, "gate", side_effect=check_handler):
             self.assertEqual(self.production(), ship.EXIT_REFUSED)
         self.assertEqual(seen, [ship._interrupt])
         self.assertIs(signal.getsignal(signal.SIGTERM), before)
@@ -700,7 +702,7 @@ class EntrypointTests(unittest.TestCase):
             repo, base = support.base_repo(root / "repo")
             harness = support.Harness(root, repo=repo, head=repo.commit({"x": "y"}), bootstrap_sha=base)
             harness.production_env()
-            with mock.patch.object(ship.release_record, "resolve_chain", side_effect=KeyError(support.APP_ID)):
+            with mock.patch.object(ship.ship_flow, "gate", side_effect=KeyError(support.APP_ID)):
                 self.assertEqual(harness.run("production"), ship.EXIT_REFUSED)
             self.assertIn("refused: internal-error", harness.text())
             self.assertNotIn("Traceback", harness.text())

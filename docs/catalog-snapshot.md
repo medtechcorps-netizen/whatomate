@@ -50,6 +50,26 @@ no workflow asks an owner to publish the raw identifier list.
 This observation does not authorize a schema change. A production overlay or
 migration requires its separate review and release steps.
 
+## Fixed production baseline graph
+
+The preparatory `-mode nullable-v2-baseline` command captures a complete graph
+for the compiled `organizations` probe. It uses the runtime connection and the
+same bounded read-only transaction. It accepts neither `-seed-counts` nor
+`-list-unknown`, and cannot execute the probe's schema operation.
+
+This mode requires complete equality with the independently reconstructed
+production-v0 catalog (`1c85a9ad...`) and the two reviewed default-ACL rows.
+It prints the complete validated V2 observation only after those checks pass;
+a failure emits no partial observation. The fixed catalog and probe are
+embedded source inputs, separate from the application golden.
+
+The compatibility caller binds this one-shot capture to its admitted candidate
+image and immutable source, removes the owned process before parsing its
+complete output, and rechecks the image before returning. Only this fixed log
+capture permits up to 4 MiB of stdout; ordinary process captures retain their
+existing limits. Neither the command nor its private result qualifies a
+migration, a before/after transition, a release, or a rollback.
+
 ## Synthetic reference and tests
 
 The reference lives in `internal/dbcatalog/golden/catalog.json`, with baseline

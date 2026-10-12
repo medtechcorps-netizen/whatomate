@@ -34,7 +34,24 @@ Do not use it:
      want (or the newest record, if that was healthy).
    - If `previous` is `prod-0000`, release #0's digests are in
      `release/deployment/ship-bootstrap-record.json`.
-3. Copy that record's three digests: web, meta-relay, gmail-relay.
+3. Validate the exact target against the live database contract before choosing
+   its images. `previous` is a candidate, not proof that the target can read the
+   database. In a mixed schema-v1/v2 history, every intervening database change
+   must be reversible and the target reader must meet the retained live minimum
+   reader version. Image rollback never rewinds that database contract. The
+   bounded reviewed-v0 Release implementation accepts spans with fewer than two
+   records whose `db_change` is non-`none`, including dormant data records;
+   two or more require fresh exact target/live/span signed rollback compatibility
+   through the Release plan and production gates. That route is restricted to
+   the unchanged reviewed-v0 seven-artifact source profile and retains complete
+   same-run custody for the record job. Missing, stale, failed or unsupported
+   evidence refuses before provider access. Do not
+   use the console to bypass that refusal. A wholly schema-v1 history uses its
+   original equal-catalog source guard. See [Release admission](release.md) and
+   [the catalog contract](catalog.md). If live database state is uncertain after
+   a failed migration, do not infer safety from the most recent signed record.
+   Once the target is eligible, copy all three exact digests: web, meta-relay,
+   gmail-relay.
 4. Cancel any Release run that is waiting for review or running.
 
 ## Steps
@@ -45,7 +62,9 @@ Do not use it:
    most recent successful deployments are eligible for rollback.
 3. Choose Rollback on that deployment. Database data is not rolled back.
 4. Wait until the deployment is Active. The PRE_DEPLOY `rls-migrate` job runs
-   verify-only with the old web image.
+   from the selected web image. The current reviewed-v0 images are verify-only;
+   this is not a promise about future images with an apply engine. Confirm the
+   selected source's migration behavior before a console rollback.
 5. Verify health in a browser or terminal against the app's URL:
    - `/health` and `/ready` return 200;
    - `/meta-relay/livez`, `/meta-relay/readyz`, `/gmail-relay/livez` and
@@ -91,3 +110,28 @@ image digests only and will not notice.
    (`drift:live-matches-record`); reconcile with that record instead.
 4. Open an issue describing what happened (no identifiers or hostnames).
 5. If health still fails, contact DigitalOcean support.
+
+## Compatibility outage preparation
+
+The separate compatibility-outage consumer remains disabled because its fixed
+`release/deployment/compat-negative-consumer-v1.json` data is absent. Producer
+setup is installed and the main-only Compatibility workflow publishes complete
+negative intent before both signatures; that configuration is not hosted
+permission or outage qualification. After protected merge, an exact-main normal
+positive and a distinct synthetic ordinary-token qualification must each receive
+independent acceptance before a separate data-only V activation PR. Synthetic
+qualification uses separate subjects and signer identity, never release proof.
+The consumer belongs only to the owner-dispatched `promote-without-staging` path.
+It does not change rollback eligibility, provide missing rollback proof, or
+authorize console overrides.
+
+An eligible future outage promotion must retain the live catalog and all database
+artifacts, have no migration or dormant change, and preserve complete bounded
+source, complete Python import namespaces and negative-index evidence before
+provider access. The reviewed source includes the signing evidence preparer;
+relevant checkout attributes and tracked bytecode or native extensions refuse
+outage coverage. Its record states
+compatibility and staging were bypassed and old-server compatibility is unproven.
+Record-only retries reuse the original evidence and exact parent; they do not
+renew admission. Existing rollback reconcile and promotion recovery behavior
+remain unchanged. See [Release admission](release.md) for the complete boundary.

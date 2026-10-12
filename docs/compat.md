@@ -7,8 +7,9 @@ The ordered experiment, source-built image admission and hosted entry points
 are implemented and enabled in this source for hosted qualification. The
 local positive experiment and swallowed-UPDATE fixture-branch advisory have
 separate source-bound evidence described below. Hosted CI qualifies each
-candidate; three accepted consecutive main compatibility runs remain required
-before PR16. Component tests do not establish release compatibility.
+candidate. The three accepted consecutive main compatibility runs remain an
+accepted prerequisite; this producer still requires its own exact-main
+qualification. Component tests do not establish release compatibility.
 
 ## Result and failure contract
 
@@ -22,8 +23,8 @@ reversible, catalog_sha256, run_id, run_attempt
 ```
 
 `classification` contains only `{kind, dormant}`. Current classifier outputs
-are `none/false` and `data/true`; future `expand` (with either dormant value) and
-`contract/false` are representable for their planned proof rules. This module
+are `none/false`, `data/true` and source-bound pending `expand/true`; active
+`expand/false` and `contract/false` are representable for their planned proof rules. This module
 does not make or authorize a classification. The runner must bind the actual
 verified classifier output, including rejection reasons, before evaluating a
 proof. It must not substitute a more permissive kind. Source paths/reasons and
@@ -437,35 +438,419 @@ accepted local advisory does not replace hosted qualification.
 
 ## Advisory workflow and release selection
 
-`cli.py preview` freezes the latest and selected release identities from one
-verified record chain and classifies latest-to-candidate. An explicit dispatch
-rollback target selects a verified record without silently replacing the
-latest-release preview base. `cli.py run` verifies the selected tag again and
-requires its exact source SHA, then runs the experiment. There is no second
-moving-latest selection.
+`cli.py preview` freezes the latest and selected release identities, retained
+database origin and actual web-image source from one authenticated source
+operation. Normal classification compares that database origin to the candidate;
+after an image rollback, it need not equal the latest record's source. `cli.py run`
+authenticates the sources again and requires exact agreement of the canonical
+version-4 snapshot with the preview before image admission or an experiment.
+An explicit rollback target selects the separate proof lane only on a validated
+`workflow_dispatch` of `refs/heads/main`. Other events or refs refuse before
+client construction. The source resolver independently binds the tooling source
+to captured current `main`; supplying a target does not authorize a deployment.
+
+Read-only source preparation for that experiment uses a distinct resolution.
+It binds the producer to captured current `main`, keeps both actual signed web-image
+sources separate from their release records and the retained database origin, and
+retains the complete ordered target-through-latest span. The
+source gate requires the same seven active artifacts across complete producer and
+span source material, in addition to the existing five fixed v0 profile pins; it
+therefore refuses seed or registry transitions. Only the existing exact released
+source exception permits absent profile/overlay files at a legacy image endpoint.
+This is source consistency data, not a measured database result or signed rollback
+proof. Normal snapshot4/context3 and the standalone no-proof rollback refusal
+remain unchanged; the operational qualified route additionally requires fresh
+signed evidence and complete custody.
+
+The private rollback producer consumes that distinct resolution and keeps three
+image roles separate: the exact signed target runs as the previous application,
+the exact signed live release runs as the candidate application, and current-main
+tooling supplies the catalog collector, controller, graph and fixture. Its four
+tooling builds retain their real source and build receipts. Target and live pulls
+share the existing build and overall deadlines; equal digests can share a pull only
+when their source and recipe bindings also agree.
+
+The experiment retains the existing migration, read/write, worker, reverse and
+cleanup phases. Catalog collection and terminal failure evidence bind to the
+tooling source, independently of the live application source. The proof lane does
+not change normal snapshot4/context3, release admission or retry custody.
+Controlled tests of the path are not actual database or hosted qualification.
+
+The public preview/run commands bind that experiment to a separate
+version-1 snapshot with purpose `rollback-v0` and context version 4. They require
+an explicit target on current-main workflow dispatch, re-resolve the full source
+projection inside the original deadline, and compare the fresh snapshot before
+image admission. The binding retains both endpoint identities and actual image
+sources, the retained database origin, the full ordered span commitment and a
+digest derived from raw workflow, source material and both endpoint recipes.
+That compact digest does not replace complete source validation or custody.
+
+The separately named rollback adapter verifies both subjects through the same
+pinned verifier and file-ownership checks as normal evidence. Its pure parser
+accepts only the closed context4 shape; normal parsers reject it, and contexts1-3
+cannot enter the rollback parser. Complete negative measurements retain their
+actual flags and final catalog hash. Parsing or signing them does not make them
+successful. File limits remain 16 KiB for results and 4 KiB for context.
+
+For this lane, `check` and `validate-evidence` use a separate closed validator and
+create-only writer for the same two canonical artifact names. Both files must
+round-trip exactly before the complete marker. A complete negative fails `check`
+but remains eligible for upload and independent signing after the protected
+negative-intent publisher succeeds. Infrastructure, partial-write, failed-upload,
+publisher failure and cancellation paths do not become ready evidence. The
+normal and rollback evidence schemas and file limits are unchanged.
+
+Operational rollback across two or more non-none changes uses the dedicated
+fresh source/collection/source gate in both plan and production. Before any
+provider request, it serializes and replays complete format-7 rollback custody,
+then rechecks the selected artifact's expiry at full UTC precision. Missing,
+negative, stale, oversized or mismatched evidence refuses. Successful PUT and
+reconcile both carry that custody to the record job. Zero/one-change requests do
+not fetch this proof, and an all-v1 chain cannot invent a retained v2 live contract.
+The source gate still requires the unchanged reviewed-v0 seven-artifact profile;
+this is not support for arbitrary multi-DDL histories. The record preserves the
+live database tuple, writes the selected image sources and replays original-time
+qualification without fetching expired artifacts or substituting current main.
+The normal snapshot4/context3 contract is unchanged; rollback context4 makes no
+claim about unapplied pending plans. Local synthetic routing and verifier tests
+do not establish exact-source hosted rollback qualification.
+
+The normal resolution format is version 4. Both `latest` and `selected` contain the
+verified release tag, signed manifest SHA-256, source SHA and web digest.
+`database_base` separately binds the supported legacy source or retained v2
+origin record and measured catalog; `selected_web_source_sha` identifies the
+actual selected image source. Mandatory `pending` binds candidate and latest
+record sources, active-three hashes and complete pending file inventories. The
+producer derives it from freshly replayed raw source; the planned target never
+replaces the measured active catalog. Older resolutions are rejected, not silently
+upgraded. The manifest digest comes from the verified record bytes, not a GitHub
+metadata identifier. A legacy source has no invented measured live catalog.
 
 `compat.yml` runs on every pull request, main push and explicit
 dispatch. It has no path filter or first-attempt restriction. `release-preview`
 feeds the exact same-run resolution into `compat-run`; the `compat` aggregator
 requires both actual job outcomes and validates source, release, run and
-attempt identity. Only a completely written, validated result receives the
-upload marker. A measured negative result is retained as an artifact while
+attempt identity. Only a completely written, re-read and validated evidence
+pair receives the upload marker. A measured negative result is retained while
 the compatibility check fails. Missing, malformed or incomplete evidence
 cannot become an artifact by continuing after an error.
 
-The final artifact name is `compat-result-<sha>-<run_attempt>`. The `attest`
-job runs only after successful aggregation on push or dispatch, downloads the
-same-run canonical result and revalidates it before signing. Pull requests
-cannot sign results. Read jobs use contents/actions/attestations read access;
-only the signing job has attestations and OIDC write permissions. No deployment
-environment, provider credentials or production action is part of this
-workflow. The existing CI release-tests job also discovers the compatibility
+The final artifact name is `compat-result-<sha>-<run_attempt>` and contains
+exactly `compat-result.json` and `compat-context.json`. The result schema and
+verdict are unchanged. The current normal producer emits context version 3
+with exactly these fields:
+
+- `version`, `repository`, `workflow_path`, `workflow_sha`, `event`, `ref`,
+  `sha`, `run_id`, `run_attempt` and `requested_rollback_target`;
+- `latest` and `selected`, each with `release`, `manifest_sha256`, `sha` and
+  `web_digest`;
+- `preview`, with `kind`, `dormant` and `blocked`;
+- `database_base`, with `mode`, `source_sha`, `origin` and `catalog`, and
+  `selected_web_source_sha`, copied from the authenticated resolution;
+- `pending`, the closed source binding from the authenticated resolution,
+  including explicit observed empty inventories when no plan exists;
+- `result_sha256`, covering the exact canonical result bytes, including LF.
+
+Both files are sorted compact ASCII JSON with a final LF. The result remains
+bounded to 16 KiB and the context to 4 KiB. Normal selection requires the
+result classification to equal the frozen database-origin-to-candidate preview.
+The current normal admission requires the source-bound context-v3 pair;
+historical context-v1/v2 positives do not establish this newer contract. Their
+actual false flags remain available for negative auditing. Exact old context-v2
+record retries retain a separate closed historical replay path.
+Active schema changes remain unsupported. The qualified rollback route is
+separate from normal evidence and never accepts a normal forward receipt.
+
+After successful upload, a separate guarded `evidence_ready` output permits
+the `attest` job on main push or main dispatch, including a complete measured
+negative.
+Cancellation, partial writes or failed uploads cannot set that marker.
+`attest_evidence.py` revalidates the exact two files against the same-run
+resolution and current job context without importing the experiment CLI or
+resolving latest again. It returns success for complete negative evidence while
+the earlier CLI `check` still returns failure. After that validation, the signing job installs the
+pinned GitHub CLI and runs the negative-intent publisher against the exact two
+public subject files. A validated positive performs no index write; a complete
+negative must have its exact protected marker read back before either signature.
+Both signing steps and the final assertion require publisher success. The job
+attests the result and context as two individually required subjects; the signed
+context binds the exact result digest. A consumer must authenticate both subjects
+and their matching source, workflow, run and attempt. Successful signing does
+not make a failed `compat` job or the overall workflow successful. Pull requests
+cannot sign either file. Read jobs retain contents/actions/attestations read
+access; only this main-only signing job has contents, attestations and OIDC write
+permissions. No deployment environment, provider credentials or production action
+is part of this workflow. The existing CI release-tests job also discovers the compatibility
 unit and workflow tests.
 
 The experiment job is capped at 45 minutes. Checkout, artifact download and
 tool setup share 180 seconds; the core uses 2,400 seconds, the client version
 probe at most five seconds and result upload at most 60 seconds, leaving
 55 seconds of margin. The step ceiling does not extend the core deadline.
+The separate signing job has an 18-minute ceiling: checkout and two downloads
+have one minute each, pinned GitHub CLI installation one minute, publisher
+execution 11 minutes, and the two signing steps one minute each, leaving one
+minute for local revalidation and final enforcement. The publisher retains its
+600-second internal allowance and unchanged 10-command/2-MiB transport bounds;
+the step ceiling does not extend them. Both signatures are required.
+
+The required Test workflow uses a CI-only source predicate for the sole legacy
+migration-closure endpoint refusal. Its narrow exception requires full valid
+v2 history, class `none` with dormant false, an actually changed closure hash,
+unchanged present active artifacts and complete unchanged pending inventory.
+Legacy public checks and rollback keep their existing decisions. Required Go
+tests independently validate generated closure bytes and reviewed caps.
+The existing compatibility producer still runs its complete experiment; neither
+source classification nor a plausible generated hash supplies measured proof.
+
+Test and Compatibility are separate workflows. Before the planned owner step
+makes `compat` required, the controlled merge gate must bind both successes to
+the current PR head/base/test-merge and exact run/attempt. Actions metadata can
+identify the PR head while result/context identify its synthetic merge; neither
+may be substituted for the actual main commit after merging. Main requires its
+own signed qualification. This CI source predicate does not configure
+repository-wide enforcement. The separate main-only publisher permission and
+signing-order changes are described above.
+
+The bounded PR16 implementation now connects this normal producer to Release
+plan, staging and production admission and schema-v2 records. It authenticates
+the complete mixed record history, retained database origin, actual image
+sources and compatibility pair. The consumer vetoes later or overlapping
+incomplete attempts or authenticated negative results; a fresh later
+positive may supersede older infrastructure gaps. The original collection
+window and full visible attempt history cross to the record job unchanged.
+
+The source classifier, producer and consumer recognize complete immutable
+all-expand dormant pending plans. Both forward passes, N-1 read-write/read-only
+checks, the independent 25006 control, old-server sweeps, worker observation,
+reverse sweep and cleanup still run. The active catalog, 127-table inventory
+and empty modification allowlists remain unchanged. Pending gates are source
+metadata, not assertions that a migration ran or a gate passed.
+Release handoff format 6 preserves complete raw pending material, original drill
+observation and full visible compatibility history, plus the complete original
+owner-label observation when required by the class. Supported none/dormant
+changes require that owner field to be `None` and remain exempt from restore
+drills. Historical formats 1-5 keep their exact field sets for same-run record
+retry: formats 1-4 use the closed context-v2 route; format 5 retains context-v3
+pending/drill custody without an owner observation. Retry replays preserved UTC
+policy observations without fresh label collection or a new drill clock.
+Snapshot version 4, context version 3 and the result schema are unchanged.
+
+Normal source admission conditionally collects owner-label facts for an active
+contract inside both original source operations, before their final source
+rechecks and under the same client/budget. It binds an exact-main post-merge
+owner event and compares every before/after observation field except ordered
+UTC capture time. Generic PR preview and rollback do not perform this collection.
+Current active semantic proof remains unsupported: valid label facts and a
+closed custody schema do not make an active contract pass compatibility.
+Owner-label collection adds no workflow permissions. Synthetic tests do not
+qualify hosted token access, and these observations do not authorize production
+DDL/data.
+The complete pending fixture passed unsigned PR270 Compatibility
+[run 38145640684, attempt 1](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38145640684)
+at merge source `345571b51fdc7b6e6b45cb0a7fffe7ecd7b55865`. The verified artifacts
+bind the actual empty latest-release inventory to all three candidate pending
+files and the 4,452-object expand target. The full comparison classified as
+`data/dormant`; all measured compatibility flags passed and the active v0 catalog
+hash stayed `1c85a9ad0b9bb652ea21b51faa2ee887592dacb00c7f4b388de5ef5d6085a4e7`.
+The pending declarations remained unapplied. Signing was skipped as required
+for this non-main-base PR; it supplies no main-release authority or active
+DDL/data proof.
+
+Active semantic expansion and contract proof, hosted permission qualification,
+actual dedicated multi-span rollback
+qualification and compatibility-outage bypass remain unfinished PR16 work. Visible API
+pagination cannot establish absence of entirely deleted runs, so it does not
+authorize an outage bypass. This partial implementation does not complete the
+canonical plan or enable active DDL/data. The PR8 qualification prerequisite and
+three distinct signed main runs are accepted; this new source/context contract
+still requires its own signed main qualification and protected release validation.
+See [the Release runbook](release.md) for the current operational boundary.
+
+## Nullable-column observation v1: actual synthetic PG17 qualification
+
+The preparatory v1 observer/explainer has been checked against a complete actual PG17 fixture for adding one nullable, no-default `pg_catalog.int8` column. The source-defined synthetic inventory changes only the new column and its table row type; existing objects, ACL/security observations and old columns remain equal. The actual positive test also verifies runtime DDL rejection, owner DDL success, unchanged old row values and NULL values in both existing rows. These are test assertions; the exported catalog fixture alone does not prove row preservation or statement history.
+
+Saved validation covers 21 actual catalog test groups across the original run and a focused correction, 26 pure Go test roots plus two fuzz seed groups (78 passing test/subtest events), 12 Python cases and 10 registry groups with no-update flags. The generated closure is exactly 229 files. Both actual runs restored the original 12 containers, 12 networks and 540 volume names, and the 18,855-byte fixture remained unchanged. Initial refusals and the original failed negative are retained.
+
+The corrected negative requires a stored non-null default and rejects it. A separate actual test shows that PostgreSQL17 normalizes `SET DEFAULT NULL::bigint` on this ordinary column to no stored default and no change in the complete observation. Endpoint evidence cannot establish whether that catalog no-op SQL was issued. The real application bootstrap remains unsupported by v1 because its default ACLs are nonempty. This qualification does not enable active DDL, classifier/producer admission, constant defaults, concurrent indexes or full old-binary compatibility.
+
+## Nullable-column observation v2: application default ACLs
+
+The separate v2 observer retains complete PostgreSQL17 default-ACL rows,
+including normalized owner, namespace, object kind, grantor, grantee, privilege
+and grant option. Explanation requires the fixed application contract at both
+endpoints: runtime SELECT/USAGE for sequences and DELETE/INSERT/SELECT/UPDATE for
+tables, granted by the migration owner in public. Unexpected complete rows may
+be parsed diagnostically but cannot qualify. Physical ACL shape, raw role and
+namespace evidence, bounded inventory and transaction consistency are checked;
+v1 still requires no default ACLs.
+
+Actual synthetic PostgreSQL17 validation passed 27 catalog test groups and 58
+test/subtest events, with no skips. The separate positive export repeats one of
+those groups. Pure Go passed 34 test roots plus two fuzz seed groups (160 events),
+and the independent Python v1/v2 validators passed 25 cases. Source-contract
+mutation checks and 10 no-update registry groups passed. The reviewed generated
+migration closure is exactly 230 files; all 21 data-step rows, seed declarations
+and the closure-cap manifest remain unchanged. An initial source-contract test
+assumed the wrong transaction signature; that test-only correction and its
+original failure remain recorded separately from these final passing runs.
+
+The 3,537,014-byte actual fixture starts at the complete 4,432-object source
+golden and ends at 4,433 objects. Only organizations.extra and the existing
+organizations row-type definition change. Both expected default-ACL rows, the
+other security observations, old columns and unrelated objects remain equal.
+The positive test asserts runtime DDL rejection, owner DDL success, unchanged old
+row values and NULL in the new column. Every phase retained stable source bytes;
+cleanup verified the original 12 containers, 12 networks and 540 volume names.
+
+This source-golden bootstrap differs from the production-v0 profile and does not
+qualify that live database shape. Complete source/profile and admitted-image
+binding, active classification, named migration-path admission, the apply engine,
+old-binary compatibility and ordered multi-operation proof remain prerequisites.
+V2 supplies no active DDL permission and adds no constant-default, concurrent-index
+or other operation support.
+
+## Preparatory nullable source/profile binding
+
+The pure profile bridge binds the retained origin's release/manifest/source and
+catalog coordinates, the candidate source/coordinates, and four complete source
+documents before it accepts any observations. The closed descriptor fixes one
+nullable int8 operation, its renderer, exact source roles/paths/lengths/hashes,
+complete expected before/after catalogs and the v2 default-ACL contract. Catalog
+files use the existing Go struct serialization; sorted descriptor JSON is a
+different wire format. Logical catalog version, wire version, source-file hashes
+and observed catalog hashes retain their separate meanings.
+
+Explanation reparses all retained inputs, compares both complete observed
+catalogs to the independently bound source expectations, then recomputes the
+unchanged v2 graph/security explanation. Opaque frozen holders do not bypass
+validation: canonical output recomputes from their retained source and observation
+bytes. Every source/observation slot counts toward the original 8 MiB aggregate
+before decoding, even when multiple slots contain the same bytes; individual
+catalogs/observations remain limited to 4 MiB.
+
+The 18 new profile tests and 25 v1/v2 semantic tests passed with no skips and
+1,682 stable source pins. The positive derives both expected catalogs from the
+preexisting source golden and a separately reviewed model/query blueprint before
+opening the actual fixture. Its old row-type definition must match the existing
+golden hash before the declared extra slot may generate the target. It preserves
+4,431 unrelated objects and explains the actual 4,432-to-4,433-object transition.
+The complete six input slots total 7,062,107 bytes; canonical output is 2,223 bytes.
+A complete 9,273,887-byte source/observation combination refuses at the unchanged
+aggregate bound. Other negatives cover source/role mismatches, coherent but wrong
+expected catalogs, malformed graph/security evidence and forged holders.
+
+The tests use controlled source identities. This bridge does not authenticate
+Git, signatures, source history or images, and no runtime caller or classifier
+uses it. A future concrete caller must read fixed immutable source paths under
+the original budget and final checks. Newly authored candidate bytes cannot be
+claimed to have existed at a legacy retained origin. The production-v0 shape
+remains distinct from the tested application golden; neither logical history nor
+active production admission follows from this pure explanation.
+
+### Preparatory production-v0 graph baseline
+
+The fixed `catalog-snapshot -mode nullable-v2-baseline` command uses a complete
+expected catalog reconstructed from the reviewed source profile. The owning adapter
+captures the full V2 observation through the admitted candidate image, requires
+the production-v0 catalog and two exact default-ACL rows, and binds the result
+to that image's source and recipe. The fixed command uses the exclusive catalog
+slot and removes its process before returning accepted bytes. Any failure is
+sticky; a second attempt on the same owner is refused.
+
+Only this command's owned log capture permits 4 MiB of stdout. Ordinary captures
+retain their limits. The command remains read-only and executes no nullable
+column operation. Its returned metadata is a private baseline observation,
+not a transition explanation or release qualification.
+
+Local validation passed 42 catalog tests plus two fuzz seed groups, 12 CLI tests,
+86 Python tests and repository lint. Ten registry groups passed after explicitly
+recording the one newly reached source file: the migration closure contains
+231 files and 3,158 declarations. Data-step, seed and active catalog manifests
+remain unchanged. The controlled graph fixture is synthetic and keeps the
+source-derived expectation independent. A subsequent local qualification at
+`dc6ba90d650884c7ef40ad4ab4fbfd2d266203c6` built fresh source images and matched
+all 4,432 production-v0 objects and both default-ACL rows. Runtime DDL was denied
+with SQLSTATE 42501; final catalog/table checks and cleanup restored the original
+Docker resources. Independent review accepted this as a baseline qualification,
+not an active transition or complete old-server compatibility result. The first
+refused build attempt is retained separately. This does not complete PR16 or
+activate production migrations.
+
+## Source classification for planned columns and indexes
+
+The classifier now consumes fixed optional declarations for one nullable int8
+column, one int8 column with a canonical constant default, and one non-unique
+concurrent btree index over an existing ordinary int8 column. The latter two
+declarations live under `internal/dbcatalog/source-classification/`; the original
+nullable declaration remains under its fixed profile path. These interpret
+source intent. They do not execute SQL or prove that an index was built
+concurrently.
+
+Every declaration binds complete raw before/head catalogs, immutable source
+identities, catalog versions and independent definition preimages. A column
+explains only its new column and changed row type; an index explains only its
+new index row. Combined rules must describe the same raw comparison and explain
+disjoint objects. All remaining changes retain normal security, contract,
+history and data precedence. Existing columns, table permissions and unrelated
+objects cannot be hidden by a parent-wide exception. Nullable and constant
+declarations together are ambiguous and refuse. All raw input roles share the
+existing 8 MiB allowance before decoding.
+
+The constant grammar is a bounded canonical signed-int64 string and uses a
+fixed quoted PostgreSQL bigint literal. An isolated PG17.11 template test passed
+18 precommitted cases, including both nullability modes and range boundaries,
+with unchanged original Docker resources after cleanup. The index grammar is
+limited to one existing int8 key, ascending order, nulls last and the built-in
+btree operator class. It excludes expressions, predicates, included columns and
+uniqueness. Index-name checks cover tables, indexes, sequences and standalone
+composite types without confusing ordinary scalar/array type namespaces.
+
+The combined source regression run passed 243 cases: 53 column, 25 index and
+165 v2 classifier/history cases. The earlier nullable change passed 268 distinct
+cases including the legacy classifier; unchanged legacy definitions were also
+independently checked during the combined review. These source rules retain
+the current producer, apply-engine and active-profile holds. The following
+section describes the additional bounded relation and tenant-profile rules.
+
+## New relation and additive tenant-profile source rules
+
+The classifier also understands a fixed declaration for one new ordinary
+relation. The global form has one nullable bigint column and one new exact
+global-table entry. The direct-tenant form has a nullable organization UUID and
+bigint value, ENABLE and FORCE RLS, and the complete fixed pair of tenant
+policies. Both forms replay the full relation, columns, row/array types,
+definition hashes and closed creation-time ACLs. A new public relation without
+the required RLS bundle or allowlist remains blocked. Existing privileges and
+unexplained catalog changes retain their contract/security precedence.
+
+A separate fixed declaration appends exactly the next additive profile version
+(at least 2), with one newly declared direct-tenant member. Its symbolic
+fingerprint binds canonical policy content independently of PostgreSQL role
+OIDs. Core and version-1 fingerprints remain unchanged. All retained versions,
+source declarations, policies and functions are checked at both endpoints;
+later changes to old tables still pass through the ordinary residual classifier.
+The bounded source grammar admits literal inventories and known read forms;
+it refuses aliases, shadowed builtin calls and unsupported syntax rather than
+evaluating arbitrary Go source.
+
+All five optional declaration roles, both catalogs, both global inventories and
+both tenant sources share the original 8 MiB comparison allowance. Explanations
+must be disjoint, and the full unexplained remainder is recomputed. First-parent
+history checks retained tenant inventory declarations, policies and fingerprint
+identities for replacement or change-then-revert. New invoker
+functions require the migration owner and one exact reviewed creation ACL;
+empty, extra or altered privilege bundles cannot be classified as safe additions.
+
+The relation SQL renderer describes CREATE TABLE and ENABLE/FORCE only. The
+policy rows and symbolic function are separately validated source evidence;
+this is not a complete executable migration or proof that a live migration ran.
+An isolated PostgreSQL 17.11 probe verified the fixed global and direct-tenant
+catalog templates and identical symbolic policy content under two different
+role-OID assignments. All database changes were rolled back and the original
+Docker resources restored. Runtime application, active declarations and engine
+activation remain separate planned work.
 
 ## Validation still required
 
@@ -549,3 +934,159 @@ source-bound result above. Canonical qualification still requires a green PR
 compatibility run and three accepted consecutive main runs before PR16. Unit
 tests and local probes do not replace those hosted outcomes or any existing
 release protection.
+
+### Preparatory all-head rollback history
+
+The pure rollback history and request bridge retain closed raw run, job, check,
+artifact and per-head workflow observations. They derive execution windows only
+from that head's exact reviewed workflow bytes. Missing or unrecognized source
+has no supersedable window. Qualification requires an exact current-H context4
+positive matching the target, live image, retained database origin, complete span
+and source-material binding. Foreign, wrong-binding or unknown evidence that
+cannot be proved finished before the selected execution vetoes qualification.
+Only another complete exact-H, same-binding positive may overlap.
+
+Validation covers at most 500 attempts across all visible push/dispatch main
+heads, 501 workflow observations including H, and 12 MiB of retained workflow,
+envelope and paired raw bytes. It checks contiguous attempts, global identities
+and complete repeated inventories. Fatal collection issues require incomplete
+coverage and cannot qualify. Coverage remains `complete-visible`; whole-run
+deletion detection is explicitly unavailable.
+
+The concrete rollback collector uses the fixed repository and workflow
+API, enumerates all visible main push/dispatch heads without head/status/date
+filters, and reads each head's immutable workflow through the owned Git reader.
+It retains every attempt's closed raw run/job/check/artifact envelope and verifies
+both exact artifact subjects once through the fixed verifier. A second complete
+inventory must match; drift or unavailable coverage cannot qualify. Unknown
+workflow source never borrows the current producer's execution window.
+
+The collector shares one already-open caller allowance across Git, API and
+signature subprocesses, binds its returned observation to actual captured
+transcripts, and closes that collection phase on return or refusal. It does not
+itself authorize provider effects. The rollback preflight resolves
+complete signed source before and after collection using three fresh, closed
+phase budgets under one original outer allowance. It requires complete source
+equality, exact history qualification and a final check of the selected artifact's
+expiry. It preserves the original history observation time rather than treating
+the final source read as a fresh Actions observation. The returned result is data,
+not transferable operational permission. The protected plan and production
+callers construct this result internally for spans of two or more non-none
+records, repeat admission independently and require complete format-7 custody
+before provider access. The standalone no-proof rollback API still refuses
+such spans. Existing normal collection predicates are unchanged.
+
+Format 7 retains all raw source and history inputs rather than a winning receipt
+alone. The record job replays qualification at the original captured times and
+requires the exact signed parent, target, producer and workflow execution.
+It accepts a later plain chain read that omits only the original authenticated
+producer enrichment; it never substitutes later main or fetches old artifacts.
+Exact already-published record bytes remain the first idempotency path.
+Formats 1-6 keep their existing promotion schemas and historical replay routes.
+These code paths and controlled tests do not establish an actual multi-change
+production history, exact-source hosted rollback qualification or deleted-run
+coverage. Existing all-v1 production history remains all-v1.
+
+The preflight and unchanged normal preflight passed 63 synthetic cases (22 new
+rollback cases and 41 normal cases), including source and inventory drift,
+foreign-head vetoes, expiry, shared deadlines and aggregate command/byte limits.
+These checks do not establish hosted signatures, permissions, deleted-run
+coverage, future freshness or operational rollback admission.
+
+The concrete collector and shared verifier/GET seams passed 99 synthetic cases;
+the existing pure history/request bridge passed 43 more. Controlled immutable
+Git, API and signature transcripts exercise the actual transport paths, including
+resolve/collect/fresh-resolve composition. These 142 checks do not establish
+hosted permissions, actual signatures or operational rollback qualification.
+
+Saved synthetic checks cover 396 unique cases: 76 initial passes plus three
+repaired fixture cases, 163 normal-collection cases and 154 custody/workflow cases.
+The initial three fixture failures are retained; there was no fresh all-green
+79-case rerun. These tests do not establish hosted rollback qualification.
+
+### Negative-intent publisher and disabled outage consumer
+
+The producer setup is installed and the main-only Compatibility signing job
+runs the publisher before both signatures. Its embedded witness binds the
+reviewed protected tag rule and records configuration observation only. It does
+not prove hosted token permissions, durable publication or signing order. The
+explicit absent-configuration path still refuses before reading operational
+paths, credentials or network state. The release gate's separate outage consumer
+is connected but disabled: `release/deployment/compat-negative-consumer-v1.json`
+is absent, so `promote-without-staging` still requires normal compatibility.
+
+The signing job first runs a small evidence preparer whose source and local
+imports belong to the reviewed publisher inventory. It uses the shared public
+validators for normal and rollback evidence without importing the experiment
+CLI. It retains complete negative results and marks completion only after both
+public subjects are written and read back. The publisher validates those actual
+two public signature subjects against the fixed resolution snapshot. A complete measured negative derives an exact
+commit/run/attempt/result/context marker, reads the protected rule, creates at
+most one exact ref and reads it back before returning. An existing exact marker
+is idempotent. Ambiguous creation, changed subject or snapshot files or rules, budget expiry,
+partial measurements and malformed responses refuse; they never delete an
+intent. A validated positive makes no index write. Publication receipts are
+ordinary data, not signatures or coverage proof.
+
+The fixed transport shares its caller's original allowance, pins its executable,
+uses a private configuration and permits only its closed API operations. Pure
+replay keeps complete raw rule/ref/HTTP observations with strict bounds. Setup
+installation and local tests do not establish hosted permissions or source
+coverage. The consumer data remains outside publisher imports, reads and its
+future immutable source inventory.
+
+The qualification sequence is complete source review and required CI, protected
+merge of producer P with consumer data absent, then two distinct hosted checks.
+An ordinary successful Compatibility run at exact main must validate the actual
+pair, perform no intent write and verify both signatures after publisher success.
+A separate manual main-only `compat-negative-index-qualification.yml` workflow
+uses the ordinary job token and explicitly synthetic subjects under its own
+signer and predicate. It checks protected-ref create/readback, rule-denied update
+and deletion with unchanged-ref readback, positive no-write and negative intent
+publication before qualification signing. Its fixed pre-P source Q differs from
+the job's actual H and is permanently excluded from eligible producer lineages.
+It never attests a synthetic pair as ordinary compatibility evidence or creates
+a fabricated negative for a covered real candidate. These hosted results have
+not yet been established by this source change.
+
+Only independent acceptance of both the exact-main result and the distinct
+synthetic qualification permits a separately reviewed data-only V activation PR.
+V binds the actual P revision, setup digest and complete final source inventory;
+it cannot include itself or alter imported producer code. Changed producer code
+requires a new reviewed lineage and qualification. Ordinary review and required
+CI still precede the protected V merge. No runtime qualification receipt replaces
+these gates, and synthetic qualification does not claim an actual negative
+database measurement or lifetime administrator continuity.
+
+The disabled consumer retains the same actual normal collection pass plus both
+closed raw inventory snapshots. Replay derives terminal execution windows from
+the attempt's own known workflow and checks complete run/job/check/artifact
+coverage. A failed collector, unknown workflow, active or no-work attempt,
+incorrectly bound positive, or authenticated negative cannot become missing
+evidence. Empty complete visible history is only a possible outage condition;
+it is not proof against whole-run deletion. The protected negative index and
+reviewed producer source coverage are separately required.
+
+Source coverage also retains complete immutable directory listings for both
+Python import roots at P and H. The listings bind names, modes and directory
+structure as well as the inventory's exact imported file bytes. Relevant Git
+attributes, tracked bytecode caches and native extension candidates make an
+outage lineage ineligible. The only namespace exception is the exact regular
+consumer JSON leaf; its bytes are independently bound. Existing unimported
+helper or test contents may change, but adding an import candidate requires a
+new reviewed lineage. Valid normal compatibility proof remains independent of
+this outage-only coverage.
+
+Format-8 custody retains every source, raw directory listing and raw history
+role with the existing logical, encoded and expanded limits. Equal bytes may be losslessly shared in
+the frame; no history or source is omitted to fit. Full publisher-dependency
+capacity must pass before activation. Original timestamps and raw policy are
+replayed without reading current policy or sampling a new clock. Counter replay
+checks bounds and arithmetic, not the authenticity of a missing process
+transcript. Exact old-workflow custody has a named historical route; new encoding
+still requires the current workflow. The immutable W0 workflow remains available
+only through exact historical replay: saved promotion formats 1-6 and rollback
+format 7 retain their original workflow, field sets and times. Fresh collection
+and new encoding require the current workflow; an old head's envelope uses its
+own reviewed steps. Trusted setup continuity and the last observation horizon
+remain explicit limits.

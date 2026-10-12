@@ -11,6 +11,8 @@ verified before any record is trusted, and any anomaly fails closed.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import datetime as dt
 import os
 import re
@@ -19,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, NamedTuple, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ship_common as common
@@ -47,6 +49,13 @@ MANIFEST_KEYS = frozenset(
         "deployed_at", "signer", "fingerprints",
     }
 )
+MANIFEST_V2_KEYS = MANIFEST_KEYS | frozenset(
+    {
+        "dormant", "reversible", "old_server_ok", "catalog_version",
+        "min_reader_version", "catalog_sha256", "data_steps_sha256",
+        "seeds_sha256", "compat_run_id", "compat", "staging", "fixed_forward_from",
+    }
+)
 BOOTSTRAP_KEYS = frozenset(
     {
         "schema_version", "kind", "release", "sha", "images", "db_change",
@@ -55,6 +64,20 @@ BOOTSTRAP_KEYS = frozenset(
 )
 ACTIVE_RUN_STATUSES = ("in_progress", "pending", "queued", "requested", "waiting")
 SOURCE_REF = "refs/heads/main"
+
+
+class _AuthenticatedRecord(NamedTuple):
+    """Immutable authenticated wire bytes, not linked policy or image authority.
+
+    Only the collector produces these internally. A caller must consume the
+    complete iterator and apply its own chain/source policy before using a
+    selection; one yielded item is not proof of a valid complete chain.
+    """
+
+    raw: bytes
+    release: str
+    sha: str
+    manifest_sha256: str
 
 
 class Entry(NamedTuple):
@@ -86,6 +109,35 @@ class Chain(NamedTuple):
             if entry.release == release:
                 return index
         return None
+
+
+class DocumentCatalog(NamedTuple):
+    """Wire claims only; source/profile validation and live origin are not inferred."""
+
+    catalog_version: int
+    min_reader_version: int
+    catalog_sha256: str
+    data_steps_sha256: str
+    seeds_sha256: str
+
+
+class ManifestFacts(NamedTuple):
+    """Immutable, unauthenticated document facts, not release authorization.
+
+    V1's no-change/reversible policy is explicit legacy normalization. Missing
+    catalog, compat and old-server evidence stays absent. Neither version
+    supplies a source-derived reader capability or a live-contract origin.
+    """
+
+    schema_version: int
+    db_change: str
+    dormant: bool
+    reversible: bool
+    old_server_ok: bool | None
+    catalog: DocumentCatalog | None
+    compat: str | None
+    compat_run_id: int | None
+    staging: str | None
 
 
 # --------------------------------------------------------------------------
@@ -441,7 +493,33 @@ def git(repo_dir: Path, args: Sequence[str], *, code: str, runner: Callable[...,
         raise common.ReleaseError(code) from exc
 
 
+_GIT_OUTPUT_TRANSPORT: ContextVar[Callable[..., bytes] | None] = ContextVar("release_git_output_transport", default=None)
+
+
+@contextmanager
+def scoped_git_output(transport: Callable[..., bytes]):
+    """Explicit operation-local reader; never a process-global override.
+
+    Callers must supply their reviewed bounded read-only transport. Ordinary
+    git()/git_output() behavior is unchanged outside this scope. Direct git()
+    calls are deliberately not redirected. Nested overrides are refused.
+    """
+    if not callable(transport) or _GIT_OUTPUT_TRANSPORT.get() is not None:
+        common.fail("git-failed:transport-scope")
+    token = _GIT_OUTPUT_TRANSPORT.set(transport)
+    try:
+        yield
+    finally:
+        _GIT_OUTPUT_TRANSPORT.reset(token)
+
+
 def git_output(repo_dir: Path, args: Sequence[str], *, code: str) -> bytes:
+    transport = _GIT_OUTPUT_TRANSPORT.get()
+    if transport is not None:
+        result = transport(repo_dir, args, code=code)
+        if type(result) is not bytes:
+            common.fail("git-failed:transport-result")
+        return result
     result = git(repo_dir, args, code=code)
     if result.returncode != 0:
         common.fail(code)
@@ -562,14 +640,24 @@ def _tag_or_bootstrap(value: Any, code: str) -> str:
 
 def validate_manifest(value: Any) -> dict[str, Any]:
     code = "record-invalid"
-    manifest = common.exact_keys(value, MANIFEST_KEYS, code)
-    if manifest["schema_version"] != 1 or manifest["kind"] not in KINDS:
+    if type(value) is not dict or type(value.get("schema_version")) is not int:
+        common.fail(code)
+    version = value["schema_version"]
+    if version not in (1, 2):
+        common.fail(code)
+    manifest = common.exact_keys(value, MANIFEST_KEYS if version == 1 else MANIFEST_V2_KEYS, code)
+    if type(manifest["kind"]) is not str or manifest["kind"] not in KINDS:
         common.fail(code)
     release = common.exact_string(manifest["release"], code, common.RECORD_TAG_RE)
     sha = common.require_sha1(manifest["sha"], code)
     _images(manifest["images"], code)
-    if manifest["db_change"] is not False or manifest["schema_guard"] != "clean":
+    if manifest["schema_guard"] != "clean":
         common.fail(code)
+    if version == 1:
+        if manifest["db_change"] is not False:
+            common.fail(code)
+    else:
+        _validate_v2_fields(manifest, code)
     previous = _tag_or_bootstrap(manifest["previous"], code)
     deployed_at = manifest["deployed_at"]
     deployed = common.require_timestamp(deployed_at, code)
@@ -609,6 +697,67 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     return manifest
 
 
+def _validate_v2_fields(manifest: Mapping[str, Any], code: str) -> None:
+    change = common.exact_string(manifest["db_change"], code)
+    if change not in ("none", "expand", "data", "contract"):
+        common.fail(code)
+    dormant = common.exact_bool(manifest["dormant"], code)
+    reversible = common.exact_bool(manifest["reversible"], code)
+    if dormant and change in ("none", "contract"):
+        common.fail(code)
+    version = common.exact_int(manifest["catalog_version"], code)
+    common.exact_int(manifest["min_reader_version"], code, maximum=version)
+    for key in ("catalog_sha256", "data_steps_sha256", "seeds_sha256"):
+        common.require_sha256(manifest[key], code)
+    compat = common.exact_string(manifest["compat"], code)
+    staging = common.exact_string(manifest["staging"], code)
+    if staging not in ("passed", "bypassed") or manifest["fixed_forward_from"] is not None:
+        common.fail(code)
+    if compat == "ok":
+        common.exact_bool(manifest["old_server_ok"], code)
+        if type(manifest["compat_run_id"]) is not int:
+            common.fail(code)
+        common.require_run_id(manifest["compat_run_id"], code)
+    elif compat == "bypassed":
+        if (
+            manifest["compat_run_id"] is not None or manifest["old_server_ok"] != "unproven"
+            or change != "none" or dormant or not reversible or staging != "bypassed"
+        ):
+            common.fail(code)
+    else:
+        common.fail(code)
+    if manifest["kind"] in ("rollback", "restore"):
+        # These are image-only transitions. The later chain adapter must
+        # validate inherited live metadata and the exact requested span.
+        if change != "none" or dormant or not reversible or staging != "bypassed":
+            common.fail(code)
+        if compat == "ok" and manifest["old_server_ok"] is not True:
+            common.fail(code)
+        if manifest["kind"] == "restore" and compat != "bypassed":
+            common.fail(code)
+
+
+def manifest_facts(value: Any) -> ManifestFacts:
+    """Validate and copy immutable wire facts without authentication or I/O."""
+    manifest = validate_manifest(value)
+    if manifest["schema_version"] == 1:
+        return ManifestFacts(1, "none", False, True, None, None, None, None, None)
+    return ManifestFacts(
+        2, manifest["db_change"], manifest["dormant"], manifest["reversible"],
+        None if manifest["old_server_ok"] == "unproven" else manifest["old_server_ok"],
+        DocumentCatalog(*(manifest[key] for key in DocumentCatalog._fields)),
+        manifest["compat"], manifest["compat_run_id"], manifest["staging"],
+    )
+
+
+def _require_legacy_document(document: Mapping[str, Any]) -> None:
+    # Structural v2 support must not activate old bool-based execution paths.
+    # Source-derived normalization, receipt qualification and the v2 writer
+    # are deliberately a later atomic integration.
+    if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
+        common.fail("record-chain-invalid:policy-unavailable")
+
+
 def build_manifest(fields: Mapping[str, Any]) -> bytes:
     manifest = {
         "schema_version": 1,
@@ -634,6 +783,7 @@ def build_manifest(fields: Mapping[str, Any]) -> bytes:
 
 
 def manifest_entry(manifest: Mapping[str, Any], raw: bytes) -> Entry:
+    _require_legacy_document(manifest)
     return Entry(
         release=manifest["release"],
         kind=manifest["kind"],
@@ -650,6 +800,8 @@ def manifest_entry(manifest: Mapping[str, Any], raw: bytes) -> Entry:
 
 def require_link(entries: Sequence[Entry], entry: Entry, repo_dir: Path | None) -> None:
     """Previous links, strictly increasing time and the per-kind rules."""
+    for item in (*entries, entry):
+        _require_legacy_document(item.document)
     code = "record-chain-invalid:link"
     previous = entries[-1]
     if entry.previous != previous.release:
@@ -673,14 +825,19 @@ def require_link(entries: Sequence[Entry], entry: Entry, repo_dir: Path | None) 
         common.fail(code)
 
 
-def resolve_chain(
+def collect_authenticated_records(
     gh: Gh,
-    repo_dir: Path | None,
     *,
-    bootstrap: Mapping[str, Any],
     work_dir: Path,
-) -> Chain:
-    """Section 7.2: every record verified, linked and tag-bound, or nothing."""
+) -> Iterator[_AuthenticatedRecord]:
+    """Validate inventory now, then authenticate each sorted wire record lazily.
+
+    This deliberately does not normalize policy, verify images or supply a
+    bootstrap/live-contract origin. Inventory refusal is eager; download and
+    signature checks happen on each advance, so consumers can reject a link
+    before fetching the next record. Exceptions terminate the iterator without
+    retry. Immutable inventory values and wire bytes are private to this call.
+    """
     releases = gh.releases()
     refs = gh.prod_tags()
     published: dict[str, dict[str, Any]] = {}
@@ -731,29 +888,53 @@ def resolve_chain(
         common.fail("record-chain-invalid:tag-release-parity")
     if len(published) > MAX_RECORDS:
         common.fail("record-chain-invalid:too-many")
+    inventory = tuple(
+        (tag, tags[tag], published[tag]["assets"][0]["size"])
+        for tag in sorted(published)
+    )
+
+    def authenticated() -> Iterator[_AuthenticatedRecord]:
+        for index, (tag, target_sha, size) in enumerate(inventory):
+            directory = work_dir / f"record-{index}"
+            try:
+                raw = gh.download_manifest(tag, directory)
+            except common.ReleaseError as exc:
+                raise common.ReleaseError("record-chain-invalid:download") from exc
+            if len(raw) != size:
+                common.fail("record-chain-invalid:asset-size")
+            try:
+                manifest = validate_manifest(common.loads_strict(raw, code="record-invalid"))
+            except common.ReleaseError as exc:
+                raise common.ReleaseError("record-chain-invalid:manifest") from exc
+            if raw != common.canonical_file_bytes(manifest):
+                common.fail("record-chain-invalid:manifest")
+            if manifest["release"] != tag or target_sha != manifest["sha"]:
+                common.fail("record-chain-invalid:tag-binding")
+            workflow_sha = manifest["signer"]["workflow_sha"]
+            try:
+                gh.verify_file(directory / MANIFEST_ASSET, signer_digest=workflow_sha, source_digest=workflow_sha)
+            except common.ReleaseError as exc:
+                raise common.ReleaseError("record-chain-invalid:attestation") from exc
+            yield _AuthenticatedRecord(raw, tag, manifest["sha"], common.sha256_bytes(raw))
+
+    return authenticated()
+
+
+def resolve_chain(
+    gh: Gh,
+    repo_dir: Path | None,
+    *,
+    bootstrap: Mapping[str, Any],
+    work_dir: Path,
+) -> Chain:
+    """Section 7.2: every record verified, linked and tag-bound, or nothing."""
+    records = collect_authenticated_records(gh, work_dir=work_dir)
     entries: list[Entry] = [bootstrap_entry(bootstrap)]
-    for index, tag in enumerate(sorted(published)):
-        directory = work_dir / f"record-{index}"
-        try:
-            raw = gh.download_manifest(tag, directory)
-        except common.ReleaseError as exc:
-            raise common.ReleaseError("record-chain-invalid:download") from exc
-        if len(raw) != published[tag]["assets"][0]["size"]:
-            common.fail("record-chain-invalid:asset-size")
-        try:
-            manifest = validate_manifest(common.loads_strict(raw, code="record-invalid"))
-        except common.ReleaseError as exc:
-            raise common.ReleaseError("record-chain-invalid:manifest") from exc
-        if raw != common.canonical_file_bytes(manifest):
-            common.fail("record-chain-invalid:manifest")
-        if manifest["release"] != tag or tags[tag] != manifest["sha"]:
-            common.fail("record-chain-invalid:tag-binding")
-        workflow_sha = manifest["signer"]["workflow_sha"]
-        try:
-            gh.verify_file(directory / MANIFEST_ASSET, signer_digest=workflow_sha, source_digest=workflow_sha)
-        except common.ReleaseError as exc:
-            raise common.ReleaseError("record-chain-invalid:attestation") from exc
-        entry = manifest_entry(manifest, raw)
+    for record in records:
+        # Reparse immutable, already validated canonical bytes into a fresh
+        # legacy document; no mutable document escapes the collector.
+        manifest = common.loads_strict(record.raw, code="record-invalid")
+        entry = manifest_entry(manifest, record.raw)
         require_link(entries, entry, repo_dir)
         entries.append(entry)
     return Chain(tuple(entries))
@@ -822,6 +1003,8 @@ def _legacy_predicate_matches(item: Mapping[str, Any], component: str, legacy: M
 def rollback_plan(chain: Chain, tag: str) -> tuple[Entry, tuple[Entry, ...]]:
     """Target = prod-0000 or a chain record (never newer than latest; the
     latest itself means restore intent) plus every record after it."""
+    for entry in chain.entries:
+        _require_legacy_document(entry.document)
     if tag != common.BOOTSTRAP_TAG and common.RECORD_TAG_RE.fullmatch(tag or "") is None:
         common.fail("rollback-target-invalid")
     index = chain.find(tag)
@@ -840,6 +1023,8 @@ def decide_rollback_case(live: Mapping[str, str], chain: Chain, target: Entry) -
     NO record, PUT the latest digests back). A live state equal to an older
     record is a deliberate rollback, so restore refuses it: reconcile with
     that record instead."""
+    for entry in (*chain.entries, target):
+        _require_legacy_document(entry.document)
     live_images = dict(live)
     latest = chain.latest
     if target.release == latest.release:

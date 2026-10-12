@@ -1072,3 +1072,94 @@ class Harness:
 
 def new_temp() -> tempfile.TemporaryDirectory:
     return tempfile.TemporaryDirectory(prefix="ship-test-")
+
+
+class PostGateHarness(Harness):
+    """Opt-in legacy orchestration fixture, NOT compatibility qualification.
+
+    The real source/Actions gate, schema2 handoff and writer have separate
+    controlled-capture suites. This adapter preserves historical all-v1 fakes
+    for provider/CAS/health and GitHub publication-protocol tests. No production
+    callback or trust override is added. An empty promotion output is expressly
+    not a valid handoff and can never pass the real record writer.
+    """
+
+    def install(self, case: Any) -> None:
+        from unittest import mock
+        self.flow_calls: list[dict[str, Any]] = []
+        self.gate_mock = case.enterContext(mock.patch.object(self.ship.ship_flow, "gate",
+            autospec=True, side_effect=self._gate))
+        case.enterContext(mock.patch.object(self.ship.ship_flow, "promotion_outputs",
+            autospec=True, side_effect=self._promotion_outputs))
+        case.enterContext(mock.patch.object(self.ship.ship_flow, "rollback_outputs",
+            autospec=True, side_effect=self._rollback_outputs))
+        case.enterContext(mock.patch.object(self.ship.ship_flow, "record_bytes",
+            autospec=True, side_effect=self._record_bytes))
+        case.enterContext(mock.patch.object(self.ship.ship_flow, "verify_published",
+            autospec=True, side_effect=self._verify_published))
+
+    def _chain(self, ctx: Any) -> Any:
+        return self.ship.release_record.resolve_chain(ctx.gh(), ctx.repo_dir,
+            bootstrap=ctx.bootstrap(), work_dir=ctx.work_dir("test-only-legacy-chain"))
+
+    def _gate(self, ctx: Any, control: Mapping[str, Any], mode: str, target: str, *, deadline: float) -> Any:
+        from types import SimpleNamespace
+        records = self.ship.release_record
+        self.flow_calls.append(dict(operation="gate", sha=control["sha"], mode=mode,
+                                    target=target, deadline=deadline))
+        chain = self._chain(ctx)
+        if mode == "rollback":
+            selected, _ = records.rollback_plan(chain, target)
+            classification = self.ship.schema_change.guard(ctx.repo_dir, selected.sha, chain.latest.sha, mode="rollback")
+            # Preserve the historical selected-image signer checks in these
+            # legacy fixtures; real source adapters verify the complete chain.
+            records.verify_images(ctx.gh(), selected.images, selected.sha, ctx.bootstrap())
+        else:
+            selected = chain.latest
+            records.require_no_downgrade(ctx.repo_dir, chain.latest.sha, control["sha"])
+            classification = self.ship.schema_change.guard(ctx.repo_dir, chain.latest.sha, control["sha"])
+        def projection(entry: Any) -> Any:
+            return SimpleNamespace(index=chain.find(entry.release), release=entry.release,
+                record_sha=entry.sha, manifest_sha256=entry.manifest_sha256,
+                images=tuple(entry.images.items()), actual_web_source_sha=entry.sha, live=None)
+        # Deliberately simple test data, not a forged authenticated dataclass.
+        resolved = SimpleNamespace(chain=chain, latest=projection(chain.latest), selected=projection(selected))
+        return SimpleNamespace(resolved=resolved, classification=classification, normal=None, rollback=None,
+                               qualified_rollback=None, outage=None)
+
+    def _promotion_outputs(self, value: Any, control: Mapping[str, Any], images: Mapping[str, str],
+                           *, staging: str, private: Iterable[str] = ()) -> dict[str, str]:
+        self.flow_calls.append(dict(operation="promotion_outputs", sha=control["sha"],
+                                    images=dict(images), staging=staging))
+        return {}  # Explicitly invalid for a real schema2 record job.
+
+    def _rollback_outputs(self, value: Any, control: Mapping[str, Any],
+                          *, private: Iterable[str] = ()) -> None:
+        self.flow_calls.append(dict(operation="rollback_outputs", sha=control["sha"]))
+        return None  # Explicit legacy-only post-gate provider fixture.
+
+    def _record_bytes(self, ctx: Any, control: Mapping[str, Any], fields: Mapping[str, Any], *, deadline: float) -> tuple[bytes, str]:
+        self.flow_calls.append(dict(operation="legacy-record-bytes", deadline=deadline))
+        records = self.ship.release_record
+        raw = records.build_manifest(fields)
+        manifest = records.validate_manifest(common.loads_strict(raw))
+        chain = self._chain(ctx)
+        index = chain.find(manifest["release"])
+        if index is not None:
+            if index != len(chain.entries) - 1 or chain.entries[index].manifest_sha256 != common.sha256_bytes(raw):
+                common.fail("record-invalid:published-differs")
+            return raw, "published"
+        if chain.latest.release != fields["previous"]:
+            common.fail("latest-changed-since-production")
+        records.require_link(chain.entries, records.manifest_entry(manifest, raw), ctx.repo_dir)
+        return raw, "absent"
+
+    def _verify_published(self, ctx: Any, raw: bytes, *, deadline: float) -> None:
+        self.flow_calls.append(dict(operation="legacy-verify-published", deadline=deadline))
+        manifest = common.loads_strict(raw)
+        _, path = self.ship._record_paths(ctx)
+        signer = manifest["signer"]["workflow_sha"]
+        ctx.gh().verify_file(path, signer_digest=signer, source_digest=signer)
+        chain = self._chain(ctx)
+        if chain.latest.release != manifest["release"] or chain.latest.manifest_sha256 != common.sha256_bytes(raw):
+            common.fail("record-invalid:published-differs")

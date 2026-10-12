@@ -71,7 +71,8 @@ jobs:
   plan:
     name: Release plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Normal preflight is bounded at 900s; retain 300s for setup and gates.
+    timeout-minutes: 20
     permissions:
       actions: read
       attestations: read
@@ -593,7 +594,7 @@ jobs:
           GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
-          git clone --quiet --filter=blob:none --no-checkout --single-branch --branch main --no-tags \
+          git clone --quiet --no-checkout --single-branch --branch main --no-tags \
             "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_WORKSPACE/src"
           git -C "$GITHUB_WORKSPACE/src" checkout --quiet --detach "$GITHUB_SHA"
           [[ "$(git -C "$GITHUB_WORKSPACE/src" rev-parse HEAD)" == "$GITHUB_SHA" ]]
@@ -843,6 +844,44 @@ jobs:
       reconciled: ${{ steps.ship.outputs.reconciled }}
       environment_values_sha256: ${{ steps.ship.outputs.environment_values_sha256 }}
       non_source_projection_sha256: ${{ steps.ship.outputs.non_source_projection_sha256 }}
+      handoff_version: ${{ steps.ship.outputs.handoff_version }}
+      handoff_sha256: ${{ steps.ship.outputs.handoff_sha256 }}
+      handoff_raw_length: ${{ steps.ship.outputs.handoff_raw_length }}
+      handoff_compressed_length: ${{ steps.ship.outputs.handoff_compressed_length }}
+      handoff_encoded_length: ${{ steps.ship.outputs.handoff_encoded_length }}
+      handoff_chunk_count: ${{ steps.ship.outputs.handoff_chunk_count }}
+      handoff_01: ${{ steps.ship.outputs.handoff_01 }}
+      handoff_02: ${{ steps.ship.outputs.handoff_02 }}
+      handoff_03: ${{ steps.ship.outputs.handoff_03 }}
+      handoff_04: ${{ steps.ship.outputs.handoff_04 }}
+      handoff_05: ${{ steps.ship.outputs.handoff_05 }}
+      handoff_06: ${{ steps.ship.outputs.handoff_06 }}
+      handoff_07: ${{ steps.ship.outputs.handoff_07 }}
+      handoff_08: ${{ steps.ship.outputs.handoff_08 }}
+      handoff_09: ${{ steps.ship.outputs.handoff_09 }}
+      handoff_10: ${{ steps.ship.outputs.handoff_10 }}
+      handoff_11: ${{ steps.ship.outputs.handoff_11 }}
+      handoff_12: ${{ steps.ship.outputs.handoff_12 }}
+      handoff_13: ${{ steps.ship.outputs.handoff_13 }}
+      handoff_14: ${{ steps.ship.outputs.handoff_14 }}
+      handoff_15: ${{ steps.ship.outputs.handoff_15 }}
+      handoff_16: ${{ steps.ship.outputs.handoff_16 }}
+      handoff_17: ${{ steps.ship.outputs.handoff_17 }}
+      handoff_18: ${{ steps.ship.outputs.handoff_18 }}
+      handoff_19: ${{ steps.ship.outputs.handoff_19 }}
+      handoff_20: ${{ steps.ship.outputs.handoff_20 }}
+      handoff_21: ${{ steps.ship.outputs.handoff_21 }}
+      handoff_22: ${{ steps.ship.outputs.handoff_22 }}
+      handoff_23: ${{ steps.ship.outputs.handoff_23 }}
+      handoff_24: ${{ steps.ship.outputs.handoff_24 }}
+      handoff_25: ${{ steps.ship.outputs.handoff_25 }}
+      handoff_26: ${{ steps.ship.outputs.handoff_26 }}
+      handoff_27: ${{ steps.ship.outputs.handoff_27 }}
+      handoff_28: ${{ steps.ship.outputs.handoff_28 }}
+      handoff_29: ${{ steps.ship.outputs.handoff_29 }}
+      handoff_30: ${{ steps.ship.outputs.handoff_30 }}
+      handoff_31: ${{ steps.ship.outputs.handoff_31 }}
+      handoff_32: ${{ steps.ship.outputs.handoff_32 }}
     # No `uses:` in this job: only bash, git, the pinned gh tarball and the
     # standard-library ship.py run next to the deploy token.
     steps:
@@ -862,7 +901,7 @@ jobs:
           GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
-          git clone --quiet --filter=blob:none --no-checkout --single-branch --branch main --no-tags \
+          git clone --quiet --no-checkout --single-branch --branch main --no-tags \
             "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_WORKSPACE/src"
           git -C "$GITHUB_WORKSPACE/src" checkout --quiet --detach "$GITHUB_SHA"
           [[ "$(git -C "$GITHUB_WORKSPACE/src" rev-parse HEAD)" == "$GITHUB_SHA" ]]
@@ -910,11 +949,67 @@ jobs:
       - production
     if: ${{ !cancelled() && needs.production.result == 'success' && contains(fromJSON('["promote","rollback","promote-without-staging"]'), inputs.mode) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Three source reads each have one 600s deadline; verify retries share it.
+    # The remaining 900s cover setup, attestation and publication.
+    timeout-minutes: 45
     permissions:
       attestations: write
       contents: write
       id-token: write
+    # Public same-run production handoff is available to all record stages.
+    env:
+      SHIP_TARGET_RELEASE: ${{ inputs.target_release }}
+      REC_RELEASE: ${{ needs.production.outputs.release }}
+      REC_KIND: ${{ needs.production.outputs.kind }}
+      REC_SHA: ${{ needs.production.outputs.sha }}
+      REC_WEB_DIGEST: ${{ needs.production.outputs.web_digest }}
+      REC_META_RELAY_DIGEST: ${{ needs.production.outputs.meta_relay_digest }}
+      REC_GMAIL_RELAY_DIGEST: ${{ needs.production.outputs.gmail_relay_digest }}
+      REC_PREVIOUS: ${{ needs.production.outputs.previous }}
+      REC_ROLLED_BACK_FROM: ${{ needs.production.outputs.rolled_back_from }}
+      REC_DEPLOYED_AT: ${{ needs.production.outputs.deployed_at }}
+      REC_BUILT_AT: ${{ needs.production.outputs.built_at }}
+      REC_RECONCILED: ${{ needs.production.outputs.reconciled }}
+      REC_ENVIRONMENT_VALUES_SHA256: ${{ needs.production.outputs.environment_values_sha256 }}
+      REC_NON_SOURCE_PROJECTION_SHA256: ${{ needs.production.outputs.non_source_projection_sha256 }}
+      REC_HANDOFF_VERSION: ${{ needs.production.outputs.handoff_version }}
+      REC_HANDOFF_SHA256: ${{ needs.production.outputs.handoff_sha256 }}
+      REC_HANDOFF_RAW_LENGTH: ${{ needs.production.outputs.handoff_raw_length }}
+      REC_HANDOFF_COMPRESSED_LENGTH: ${{ needs.production.outputs.handoff_compressed_length }}
+      REC_HANDOFF_ENCODED_LENGTH: ${{ needs.production.outputs.handoff_encoded_length }}
+      REC_HANDOFF_CHUNK_COUNT: ${{ needs.production.outputs.handoff_chunk_count }}
+      REC_HANDOFF_01: ${{ needs.production.outputs.handoff_01 }}
+      REC_HANDOFF_02: ${{ needs.production.outputs.handoff_02 }}
+      REC_HANDOFF_03: ${{ needs.production.outputs.handoff_03 }}
+      REC_HANDOFF_04: ${{ needs.production.outputs.handoff_04 }}
+      REC_HANDOFF_05: ${{ needs.production.outputs.handoff_05 }}
+      REC_HANDOFF_06: ${{ needs.production.outputs.handoff_06 }}
+      REC_HANDOFF_07: ${{ needs.production.outputs.handoff_07 }}
+      REC_HANDOFF_08: ${{ needs.production.outputs.handoff_08 }}
+      REC_HANDOFF_09: ${{ needs.production.outputs.handoff_09 }}
+      REC_HANDOFF_10: ${{ needs.production.outputs.handoff_10 }}
+      REC_HANDOFF_11: ${{ needs.production.outputs.handoff_11 }}
+      REC_HANDOFF_12: ${{ needs.production.outputs.handoff_12 }}
+      REC_HANDOFF_13: ${{ needs.production.outputs.handoff_13 }}
+      REC_HANDOFF_14: ${{ needs.production.outputs.handoff_14 }}
+      REC_HANDOFF_15: ${{ needs.production.outputs.handoff_15 }}
+      REC_HANDOFF_16: ${{ needs.production.outputs.handoff_16 }}
+      REC_HANDOFF_17: ${{ needs.production.outputs.handoff_17 }}
+      REC_HANDOFF_18: ${{ needs.production.outputs.handoff_18 }}
+      REC_HANDOFF_19: ${{ needs.production.outputs.handoff_19 }}
+      REC_HANDOFF_20: ${{ needs.production.outputs.handoff_20 }}
+      REC_HANDOFF_21: ${{ needs.production.outputs.handoff_21 }}
+      REC_HANDOFF_22: ${{ needs.production.outputs.handoff_22 }}
+      REC_HANDOFF_23: ${{ needs.production.outputs.handoff_23 }}
+      REC_HANDOFF_24: ${{ needs.production.outputs.handoff_24 }}
+      REC_HANDOFF_25: ${{ needs.production.outputs.handoff_25 }}
+      REC_HANDOFF_26: ${{ needs.production.outputs.handoff_26 }}
+      REC_HANDOFF_27: ${{ needs.production.outputs.handoff_27 }}
+      REC_HANDOFF_28: ${{ needs.production.outputs.handoff_28 }}
+      REC_HANDOFF_29: ${{ needs.production.outputs.handoff_29 }}
+      REC_HANDOFF_30: ${{ needs.production.outputs.handoff_30 }}
+      REC_HANDOFF_31: ${{ needs.production.outputs.handoff_31 }}
+      REC_HANDOFF_32: ${{ needs.production.outputs.handoff_32 }}
     # No attempt guard: "Re-run failed jobs" reuses the successful production
     # job's outputs, and every stage is idempotent.
     steps:
@@ -922,7 +1017,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned GitHub CLI
@@ -944,19 +1039,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SHIP_MODE: ${{ inputs.mode }}
-          REC_RELEASE: ${{ needs.production.outputs.release }}
-          REC_KIND: ${{ needs.production.outputs.kind }}
-          REC_SHA: ${{ needs.production.outputs.sha }}
-          REC_WEB_DIGEST: ${{ needs.production.outputs.web_digest }}
-          REC_META_RELAY_DIGEST: ${{ needs.production.outputs.meta_relay_digest }}
-          REC_GMAIL_RELAY_DIGEST: ${{ needs.production.outputs.gmail_relay_digest }}
-          REC_PREVIOUS: ${{ needs.production.outputs.previous }}
-          REC_ROLLED_BACK_FROM: ${{ needs.production.outputs.rolled_back_from }}
-          REC_DEPLOYED_AT: ${{ needs.production.outputs.deployed_at }}
-          REC_BUILT_AT: ${{ needs.production.outputs.built_at }}
-          REC_RECONCILED: ${{ needs.production.outputs.reconciled }}
-          REC_ENVIRONMENT_VALUES_SHA256: ${{ needs.production.outputs.environment_values_sha256 }}
-          REC_NON_SOURCE_PROJECTION_SHA256: ${{ needs.production.outputs.non_source_projection_sha256 }}
         run: /usr/bin/python3 -I -S -B release/deployment/ship.py record --stage manifest
 
       - name: Attest the release manifest

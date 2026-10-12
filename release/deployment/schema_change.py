@@ -21,6 +21,11 @@ from typing import Any, Iterable, NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import release_record
 import ship_common as common
+import pending_plan
+import schema_nullable
+import schema_index
+import schema_relation
+import schema_tenant_profile
 
 
 GUARDED_TREES = ("internal/database/", "internal/models/")
@@ -222,6 +227,15 @@ def _integer(value: Any, minimum: int = 0) -> bool:
 def _path(value: Any) -> bool:
     return (type(value) is str and PUBLIC_NAME.fullmatch(value) is not None
             and all(part not in {"", ".", ".."} for part in value.split("/")))
+
+
+def _changed_path(value: Any) -> bool:
+    # Changed files include repository metadata such as .github/workflows.
+    # Registry identifiers retain their separate, narrower _path contract.
+    return (type(value) is str
+            and re.fullmatch(r"[A-Za-z_.][A-Za-z0-9_./-]{0,511}", value) is not None
+            and all(part.casefold() not in {"", ".", "..", ".git"}
+                    for part in value.split("/")))
 
 
 class _Repository:
@@ -640,13 +654,17 @@ def _migration_contract(repo: _Repository, base: str, head: str, reasons: set[st
 
 
 def classify(repo_dir: Path, base: str, head: str, *, mode: str = "forward") -> Classification:
+    return _classify(_Repository(repo_dir), base, head, mode=mode)
+
+
+def _classify(repo: _Repository, base: str, head: str, *, mode: str = "forward") -> Classification:
+    repo_dir = repo.root
     common.require_sha1(base, "internal-error:schema-base")
     common.require_sha1(head, "internal-error:schema-head")
     if mode not in {"forward", "rollback"}:
         common.fail("input-invalid:schema-mode")
     release_record.require_commit(repo_dir, base, "git-failed:schema-guard")
     release_record.require_commit(repo_dir, head, "git-failed:schema-guard")
-    repo = _Repository(repo_dir)
     reasons: set[str] = set()
     summary: list[str] = []
     section = "catalog"
@@ -774,6 +792,627 @@ def main(argv: list[str] | None = None) -> int:
     except common.ReleaseError as exc:
         print(exc.code, file=sys.stderr)
         return 1
+
+
+# Preparation-only policy API. No operational caller above selects this API.
+# Requirements describe missing capabilities/obligations, not satisfied gates.
+class PolicyClassification(NamedTuple):
+    kind: str
+    dormant: bool
+    reasons: tuple[str, ...]
+    summary: tuple[str, ...]
+    migration_changes: tuple[str, ...]
+    requirements: tuple[str, ...]
+
+
+_V2_ATTRIBUTES = {
+    "relations": {"relkind": "kind", "rls": "bool", "force_rls": "bool", "owner": "role", "acl": "acl", "security_invoker": "bool", "view_sha256": "hash", "partition_key_sha256": "hash", "partition_bound_sha256": "hash", "parents_sha256": "hash"},
+    "columns": {"position": "int", "type_sha256": "hash", "not_null": "bool", "default_sha256": "hash", "identity": "identity", "generated": "generated", "collation_sha256": "hash", "acl": "acl"},
+    "constraints": {"type": "constraint", "definition_sha256": "hash", "validated": "bool", "deferrable": "bool", "deferred": "bool"},
+    "indexes": {"definition_sha256": "hash", "valid": "bool", "ready": "bool", "live": "bool", "unique": "bool", "primary": "bool", "exclusion": "bool"},
+    "triggers": {"definition_sha256": "hash", "enabled": "enabled", "internal": "bool", "function_sha256": "hash"},
+    "functions": {"source_sha256": "hash", "definition_sha256": "hash", "security_definer": "bool", "owner": "role", "acl": "acl", "config_sha256": "hash", "volatility": "volatility", "parallel": "parallel", "strict": "bool", "leakproof": "bool", "language_sha256": "hash"},
+    "policies": {"command": "command", "permissive": "bool", "roles": "roles", "using_sha256": "hash", "check_sha256": "hash"},
+    "sequences": {"type_sha256": "hash", "start": "int", "increment": "int", "min": "int", "max": "int", "cache": "int", "cycle": "bool", "owner": "role", "acl": "acl", "owned_by_sha256": "hash"},
+    "types": {"type": "type", "definition_sha256": "hash", "owner": "role", "acl": "acl", "enum_sha256": "hash"},
+    "extensions": {"version_sha256": "hash", "relocatable": "bool", "owner": "role"},
+}
+_V2_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
+_V2_ROLES = {"MIGRATION_OWNER", "RUNTIME", "PUBLIC", "OTHER"}
+_V2_CHILDREN = {"columns", "constraints", "indexes", "triggers", "policies"}
+_V2_PENDING = GOLDEN + "pending/"
+_V2_TENANT = "internal/database/tenant.go"
+
+
+def _v2_attribute(shape: str, value: str) -> bool:
+    if type(value) is not str:
+        return False
+    if shape == "hash":
+        return re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    if shape == "bool":
+        return value in {"true", "false"}
+    if shape == "int":
+        return re.fullmatch(r"-?[0-9]{1,20}", value) is not None
+    if shape == "role":
+        return value in _V2_ROLES
+    if shape == "roles":
+        items = value.split(",")
+        return len(value) <= 64 and items == sorted(set(items)) and all(x in _V2_ROLES for x in items)
+    if shape == "acl":
+        if not value:
+            return True
+        entries = value.split(";")
+        if len(value) > 8192 or entries != sorted(set(entries)):
+            return False
+        privileges = {"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "EXECUTE", "USAGE", "CREATE", "CONNECT", "TEMPORARY", "SET", "ALTER_SYSTEM", "MAINTAIN"}
+        for entry in entries:
+            match = re.fullmatch(r"(MIGRATION_OWNER|RUNTIME|PUBLIC|OTHER)>(MIGRATION_OWNER|RUNTIME|PUBLIC):([A-Z_]+):(true|false)", entry)
+            if match is None or match[3] not in privileges:
+                return False
+        return True
+    enums = {"kind": "rpvmfS", "identity": ("", "a", "d"), "generated": ("", "s", "v"),
+             "constraint": "cfpuxnt", "enabled": "ODRA", "volatility": "isv",
+             "parallel": "sru", "command": "*rawd", "type": "bcdeprm"}
+    options = enums.get(shape, ())
+    return value in options and (not isinstance(options, str) or len(value) == 1)
+
+
+def _v2_catalog(value: Any) -> None:
+    """Closed current object schema; version policy is checked separately.
+
+    This does not infer SQL semantics from a definition hash. Parents must be
+    represented public relations, not unverified names supplied by a caller.
+    """
+    _catalog(value)
+    relations = {r["identity"] for r in value["objects"] if r["kind"] == "relations"}
+    for row in value["objects"]:
+        kind, name, parent = row["kind"], row["identity"], row.get("parent", "")
+        if kind in _V2_CHILDREN:
+            _valid(parent in relations and _V2_IDENTIFIER.fullmatch(parent) is not None
+                   and name.startswith(parent + ".") and _V2_IDENTIFIER.fullmatch(name[len(parent) + 1:]) is not None)
+        elif kind == "functions":
+            _valid(not parent and re.fullmatch(r"[a-z_][a-z0-9_]{0,62}\([0-9a-f]{64}\)", name) is not None)
+        else:
+            _valid(not parent and _V2_IDENTIFIER.fullmatch(name) is not None)
+        attrs = row["attributes"]
+        _valid(set(attrs) == set(_V2_ATTRIBUTES[kind]))
+        _valid(all(_v2_attribute(shape, attrs[key]) for key, shape in _V2_ATTRIBUTES[kind].items()))
+
+
+def _v2_source_budget(declarations, before_raw, after_raw, extra_roles=None):
+    """Charge each source role once before any new declaration is decoded."""
+    _valid(type(declarations) is tuple and len(declarations) in (3, 5))
+    if all(raw is None for raw in declarations):
+        return
+    limits = (schema_nullable.MAX_DOCUMENT, schema_nullable.MAX_DOCUMENT, schema_index.MAX_DECLARATION,
+              schema_relation.MAX_DECLARATION, schema_tenant_profile.MAX_DECLARATION)
+    _valid(all(raw is None or type(raw) is bytes and 0 < len(raw) <= limit
+               for raw, limit in zip(declarations, limits)))
+    _valid(all(type(raw) is bytes and 0 < len(raw) <= schema_nullable.MAX_DOCUMENT
+               for raw in (before_raw, after_raw)))
+    extra = ()
+    if len(declarations) == 5 and any(raw is not None for raw in declarations[3:]):
+        _valid(type(extra_roles) is tuple and len(extra_roles) == 4)
+        _valid(all(type(raw) is bytes and 0 < len(raw) <= limit for raw, limit in zip(extra_roles,
+                   (schema_tenant_profile.MAX_GLOBALS,) * 2 + (schema_tenant_profile.MAX_TENANT,) * 2)))
+        extra = extra_roles
+    else:
+        _valid(extra_roles is None)
+    _valid(sum(len(raw) for raw in declarations if raw is not None)
+           + len(before_raw) + len(after_raw) + sum(map(len, extra)) <= schema_nullable.MAX_TOTAL)
+    _valid(declarations[0] is None or declarations[1] is None)
+
+
+def _v2_catalog_delta(before: dict, after: dict, old_globals: list, new_globals: list,
+                      reasons: set[str], summary: list[str], requirements: set[str], *,
+                      source=None, constant_source=None, index_source=None,
+                      relation_source=None, profile_source=None) -> str:
+    """Direct current-format rules; full transitions include every companion.
+
+    A relation-only synthetic expand example is not a complete table migration.
+    Row/array types and other opaque companions conservatively raise its class
+    unless the complete closed source declaration explains that exact delta.
+    """
+    # Recheck the joint raw boundary even for direct pure callers. Each family
+    # must refer to the same immutable comparison, not just equal parsed JSON.
+    sources = (source, constant_source, index_source, relation_source, profile_source)
+    present = [item for item in sources[:3] if item is not None]
+    extended = [item for item in sources[3:] if item is not None]
+    profile_delta = None
+    if extended:
+        _valid(all(type(item) is tuple and len(item) == 9 for item in extended))
+        _valid(all(item[1:] == extended[0][1:] for item in extended))
+        bc, ac, bg, ag, bt, at, base_sha, head_sha = extended[0][1:]
+        _v2_source_budget(tuple(None if item is None else item[0] for item in sources), bc, ac, (bg, ag, bt, at))
+        _valid(all(type(item) is tuple and len(item) == 5
+                   and item[1:] == (bc, ac, base_sha, head_sha) for item in present))
+        _valid(common.loads_strict(bc) == before and common.loads_strict(ac) == after
+               and common.loads_strict(bg) == old_globals and common.loads_strict(ag) == new_globals)
+    if present:
+        _valid(all(type(item) is tuple and len(item) == 5 for item in present))
+        _valid(all(type(item[1]) is bytes and type(item[2]) is bytes
+                   and type(item[3]) is str and type(item[4]) is str for item in present))
+        before_raw, after_raw, base_sha, head_sha = present[0][1:]
+        if not extended:
+            _v2_source_budget(tuple(None if item is None else item[0] for item in sources[:3]), before_raw, after_raw)
+        _valid(all(item[1:] == present[0][1:] for item in present))
+    _v2_catalog(before)
+    _v2_catalog(after)
+    _globals(old_globals)
+    _globals(new_globals)
+    explained = set()
+    for label, material in zip(("nullable", "constant", "index", "relation", "tenant-profile"), sources):
+        if material is None:
+            continue
+        # Only raw immutable material is accepted here, never a supplied verdict.
+        declaration, before_raw, after_raw = material[:3]
+        base_sha, head_sha = material[-2:]
+        if label == "nullable":
+            delta = schema_nullable.classify_source(declaration, before_raw, after_raw,
+                                                   base_sha=base_sha, head_sha=head_sha)
+        elif label == "constant":
+            delta = schema_nullable.classify_constant_source(declaration, before_raw, after_raw,
+                                                            base_sha=base_sha, head_sha=head_sha)
+        elif label == "index":
+            delta = schema_index.classify_source(declaration, before_raw, after_raw,
+                                                base_sha=base_sha, head_sha=head_sha)
+        elif label == "relation":
+            delta = schema_relation.classify_source(declaration, *material[1:7], base_sha=base_sha, head_sha=head_sha)
+            _valid(delta.operation.mode != "direct-tenant" or profile_source is not None)
+        else:
+            delta = schema_tenant_profile.classify_source(declaration,
+                None if relation_source is None else relation_source[0],
+                *material[1:7], base_sha=base_sha, head_sha=head_sha)
+            profile_delta = delta
+        _valid(common.loads_strict(before_raw) == before and common.loads_strict(after_raw) == after)
+        current = {(ref.kind, ref.identity) for ref in delta.explained}
+        _valid(not current.intersection(explained))
+        explained.update(current)
+        summary.append("source " + label + " declaration: sha256=" + delta.declaration_sha256
+                       + ("; operation=" + delta.operation_sha256 if label != "tenant-profile" else "")
+                       + "; source interpretation only")
+    left = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in before["objects"]}
+    right = {(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in after["objects"]}
+    old_global = {r["name"]: r for r in old_globals}
+    new_global = {r["name"]: r for r in new_globals}
+    validated_profiles = set() if profile_delta is None else {
+        (item.function_ref.kind, item.function_ref.identity) for item in profile_delta.profiles}
+    if any(kind == "functions" and re.fullmatch(r"rereply_tenant_policy_additive_fingerprint_v(?:[2-9]|[1-9][0-9]+)\([0-9a-f]{64}\)", name)
+           and (kind, name) not in validated_profiles for kind, name in right):
+        reasons.add("additive-profile-unsupported")
+        requirements.add("additive-profile-unsupported")
+    old_relations = {name for kind, name in left if kind == "relations"}
+    new_relations = {name for kind, name in right if kind == "relations"} - old_relations
+    # An added exemption is expansion only alongside its new relation. Existing
+    # exemptions (including reason/seed-key changes) remain part of the contract.
+    classification = "none"
+    if any(old_global.get(name) != new_global.get(name) for name in old_global.keys() | new_global.keys()
+           if name not in new_relations or name in old_global):
+        classification = "contract"
+        summary.append("global table policy changed")
+    for key in sorted(left.keys() | right.keys()):
+        old, new = left.get(key), right.get(key)
+        if old == new:
+            continue
+        kind, name = key
+        proposed = "contract"
+        if old is not None:
+            summary.append(("removed " if new is None else "changed ") + kind + " " + name)
+        else:
+            parent, attrs = new
+            summary.append("new " + kind + " " + name)
+            if kind == "relations":
+                relation_kind = attrs["relkind"]
+                if relation_kind in {"r", "p", "f"}:
+                    protected = attrs["rls"] == attrs["force_rls"] == "true"
+                    if not protected and name not in new_global:
+                        reasons.add("unprotected-new-relation:" + name)
+                    elif relation_kind in {"r", "p"}:
+                        proposed = "expand"
+                elif relation_kind == "v":
+                    summary.append("new view " + name)
+                    if attrs["security_invoker"] == "true":
+                        requirements.add("view-dependency-unsupported")
+                elif relation_kind == "m":
+                    summary.append("new materialized view " + name)
+            elif kind == "columns":
+                if (parent in old_relations and attrs["not_null"] == "false"
+                        and attrs["identity"] == attrs["generated"] == attrs["acl"] == ""
+                        and attrs["default_sha256"] == hashlib.sha256(b"").hexdigest()):
+                    proposed = "expand"
+            elif kind == "functions":
+                if attrs["security_definer"] == "true":
+                    summary.append("new definer function " + name)
+                elif attrs["owner"] == "MIGRATION_OWNER" and attrs["acl"] in {
+                        "MIGRATION_OWNER>MIGRATION_OWNER:EXECUTE:false;MIGRATION_OWNER>PUBLIC:EXECUTE:false",
+                        "MIGRATION_OWNER>MIGRATION_OWNER:EXECUTE:false;MIGRATION_OWNER>RUNTIME:EXECUTE:false"}:
+                    proposed = "expand"
+            elif kind == "indexes" and attrs["unique"] == "false" and key not in explained:
+                requirements.add("index-operation-unsupported")
+        if key in explained:
+            proposed = "expand"
+        if proposed == "contract" or classification == "contract":
+            classification = "contract"
+        elif proposed == "expand":
+            classification = "expand"
+    return classification
+
+
+def _v2_history(before: list, after: list, old_catalog: dict, new_catalog: dict,
+                semantic_changed: bool, kind: str, reasons: set[str]) -> bool:
+    _history(before)
+    _history(after)
+    # Absent and explicit false have identical meaning. No other historical
+    # edit, deletion or insertion is an append-only history.
+    normalize = lambda rows: [{**r, "apply_engine": r.get("apply_engine", False)} for r in rows]
+    if normalize(after[:len(before)]) != normalize(before):
+        reasons.add("history-rewritten")
+    if old_catalog["version"] != before[-1]["version"] or new_catalog["version"] != after[-1]["version"]:
+        reasons.add("history-catalog-version-mismatch")
+    rise = new_catalog["version"] > old_catalog["version"]
+    if semantic_changed != rise or new_catalog["version"] < old_catalog["version"]:
+        reasons.add("history-version-change-mismatch")
+    floor = -1
+    for row in after:
+        if row["min_reader_version"] < floor:
+            reasons.add("history-reader-decreased")
+        if row["min_reader_version"] > max(floor, 0) and row["class"] != "contract":
+            reasons.add("history-reader-requires-contract")
+        floor = row["min_reader_version"]
+    if semantic_changed and kind == "contract" and after[-1]["class"] != "contract":
+        reasons.add("history-class-understated")
+    return after[-1].get("apply_engine", False)
+
+
+def _v2_migrations(repo: _Repository, base: str, head: str, changes: list[tuple[str, str]],
+                   reasons: set[str], summary: list[str]) -> tuple[str, ...]:
+    # Reuse the established first-parent/whole-file introduction fences. Only
+    # the exact endpoint closure observation can become nonblocking, and only
+    # after BOTH endpoints validate as existing contracts with unchanged roots.
+    observed: set[str] = set()
+    protected = _migration_contract(repo, base, head, observed, [])
+    old = repo.document(base, MIGRATION_PATH, lambda _: None, optional=True)
+    new = repo.document(head, MIGRATION_PATH, lambda _: None, optional=True)
+    if not protected or new is None:
+        reasons.add("migration-contract-required")
+        return ()
+    fence_failures = observed - {"migration-path-changed:closure"}
+    if fence_failures:
+        reasons.update(fence_failures)
+        return ()
+    if old is None:
+        # A valid first introduction keeps the old full-file anchor result.
+        # It cannot opt a bundled source/endpoint closure change out of a fence.
+        return ()
+    output = []
+    if old != new:
+        reasons.discard("migration-path-changed:closure")
+        output.append("generated migration closure changed")
+    files = set(old["closure_files"]) & set(new["closure_files"])
+    changed = {path for _, path in changes}
+    for path, name in (*GUARDED_FUNCTIONS, *MIGRATION_FUNCTIONS, *GUARDED_DECLS):
+        reason = f"migration-path-changed:{path}#{name}"
+        if reason in reasons and path in changed and path in files:
+            if old["closure_sha256"] == new["closure_sha256"]:
+                reasons.add("migration-contract-stale")
+            else:
+                reasons.remove(reason)
+                output.append("migration path changed: " + path + "#" + name)
+    summary.extend(output)
+    return tuple(output)
+
+
+def _v2_tenant_declarations(source: str | None) -> dict[str, str]:
+    """Recognize only the existing gofmt top-level literal inventory.
+
+    Alternate declaration syntax refuses; there is no parser for a future
+    additive-version grammar and no inference from a fingerprint string.
+    """
+    if source is None:
+        return {}
+    code = _go_code(source)
+    output = {}
+    for name in ("DirectTenantTables", "RelatedTenantTables", "tenantRLSAdditiveProfileV1"):
+        tokens = list(re.finditer(r"\b" + name + r"\b", code))
+        declaration = re.search(r"(?m)^var " + name + r" = (?:\[\]string|map\[string\]string)\{", code)
+        if not tokens:
+            continue
+        _valid(declaration is not None)
+        opening = declaration.end() - 1
+        depth, end = 1, opening + 1
+        while end < len(code) and depth:
+            depth += (code[end] == "{") - (code[end] == "}")
+            end += 1
+        _valid(depth == 0)
+        output[name] = source[declaration.start():end]
+    return output
+
+
+def _v2_pending(repo: _Repository, base: str, head: str, reasons: set[str],
+                summary: list[str], requirements: set[str]) -> bool:
+    """Read the complete immutable pending history; never infer execution.
+
+    Format 1 consumption/activation and non-expand plans remain unsupported.
+    An existing plan is immutable, including its active-byte binding. Empty
+    endpoints do not excuse an invalid or removed intermediate introduction.
+    """
+    raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+    _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+    revisions = raw.decode("ascii").splitlines()
+    _valid(len(revisions) <= MAX_HISTORY_COMMITS and len(set(revisions)) == len(revisions)
+           and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+           and ((base == head and not revisions) or (base != head and revisions and revisions[-1] == head)))
+    prior = None
+    plan = None
+    introduced = False
+    active = None
+    existing_producer_block = "producer-class-unsupported" in requirements
+    for revision in (base, *revisions):
+        # Without the trailing slash, a blob/gitlink masquerading as the
+        # pending directory is visible too and fails the closed path check.
+        raw = _git(repo.root, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING.rstrip("/")])
+        if not raw:
+            _valid(prior is None)
+            continue
+        reasons.add("pending-format-unsupported")
+        requirements.update(("pending-format-unsupported", "producer-class-unsupported"))
+        _valid(len(raw) <= MAX_ARTIFACT_BYTES and raw.endswith(b"\0"))
+        paths = raw[:-1].decode("utf-8", "strict").split("\0")
+        _valid(len(paths) == pending_plan.MAX_ENTRIES + 2 and len(set(paths)) == len(paths)
+               and all(_path(path) and path.startswith(_V2_PENDING) for path in paths))
+        files = {path: repo.blob(revision, path) for path in paths}
+        _valid(all(type(value) is bytes for value in files.values()))
+        current = tuple(repo.blob(revision, path) for path in (CATALOG, GLOBALS, HISTORY))
+        if active is None:
+            active = tuple(repo.blob(base, path) for path in (CATALOG, GLOBALS, HISTORY))
+        _valid(current == active and all(type(value) is bytes for value in active))
+        plan = pending_plan.parse_bundle(active_catalog=current[0], active_globals=current[1],
+                                         active_history=current[2], files=files, prior_files=prior)
+        if prior is None:
+            introduced = revision != base
+        prior = files
+    if plan is None:
+        return False
+    # This is only the source-declared dormant expansion vocabulary. Opaque
+    # target hashes and operation labels are not SQL/CONCURRENTLY proof.
+    supported = all(entry.kind == "expand" for entry in plan.entries)
+    if supported:
+        reasons.discard("pending-format-unsupported")
+        requirements.discard("pending-format-unsupported")
+        if not existing_producer_block:
+            requirements.discard("producer-class-unsupported")
+    summary.append("pending source plan: active=" + str(plan.active_version) + "; target="
+                   + str(plan.entries[0].version) + "; source=" + head)
+    for path, digest in plan.files:
+        summary.append("pending source file: " + path + " sha256=" + digest)
+    for step in plan.steps:
+        summary.append("pending source step: " + step.id + "; operation=" + step.operation
+                       + "; source_sha256=" + step.source_sha256 + "; requires_gates="
+                       + (",".join(step.requires_gates) or "none"))
+    summary.append("pending source plan only; actual ledger/apply state unavailable; gates not evaluated")
+    if len(plan.steps) > 1 and any(step.requires_gates for step in plan.steps):
+        summary.append("pending gates: a failed gate would hold back unrelated steps; holdback review required")
+    return introduced and supported
+
+
+def classify_v2(repo_dir: Path, base: str, head: str) -> PolicyClassification:
+    """Prepare forward policy; does NOT authorize a release or lift guard().
+
+    Source catalog labels are not measured DB shape or signed evidence. Active
+    future catalogs and additive >=2 producers remain explicitly unsupported.
+    A valid immutable pending expansion is dormant metadata; it still needs
+    the exact source-bound compatibility experiment and is not SQL-safety or
+    apply-engine authority. REQUIRE_COMPAT adoption remains atomic.
+    """
+    repo = _Repository(repo_dir)
+    legacy = _classify(repo, base, head)
+    return _classify_v2(repo, base, head, legacy)
+
+
+def _v2_profile_history(repo: _Repository, base: str, head: str) -> None:
+    """Check retained identities at every first parent, in the original scope."""
+    raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+    _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+    revisions = raw.decode("ascii").splitlines()
+    _valid(len(revisions) <= MAX_HISTORY_COMMITS and len(set(revisions)) == len(revisions)
+           and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+           and ((base == head and not revisions) or (base != head and revisions and revisions[-1] == head)))
+    prior = tuple(repo.blob(base, path) for path in (CATALOG, GLOBALS, _V2_TENANT))
+    for revision in revisions:
+        current = tuple(repo.blob(revision, path) for path in (CATALOG, GLOBALS, _V2_TENANT))
+        schema_tenant_profile.validate_retained_pair(prior[0], current[0], prior[1], current[1], prior[2], current[2])
+        prior = current
+
+
+def _v2_tenant_explained(left: str, right: str, delta) -> bool:
+    """Freshly replayed exact declaration hashes, never a whole-file waiver."""
+    before = dict(schema_relation._tenant_inventory(left.encode()).declarations)
+    after = dict(schema_relation._tenant_inventory(right.encode()).declarations)
+    changes = {name: (None if name not in before else hashlib.sha256(before[name]).hexdigest(),
+                     None if name not in after else hashlib.sha256(after[name]).hexdigest())
+               for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+    expected = {item.name: (item.before_declaration_sha256, item.after_declaration_sha256)
+                for item in delta.tenant_changes}
+    return changes == expected
+
+
+def _classify_v2(repo: _Repository, base: str, head: str,
+                 legacy: Classification) -> PolicyClassification:
+    repo_dir = repo.root
+    reasons = set(legacy.reasons)
+    summary = [line for line in legacy.summary if not line.startswith(("history apply_engine:", "classification:"))]
+    requirements = {"compat-required", "generated-migration-closure-ci"}
+    migrations: tuple[str, ...] = ()
+    kind, dormant = legacy.kind, legacy.dormant
+    section = "catalog"
+    try:
+        section = "nullable-source"
+        declaration = repo.blob(head, schema_nullable.SOURCE_PATH)
+        section = "constant-source"
+        constant_declaration = repo.blob(head, schema_nullable.CONSTANT_SOURCE_PATH)
+        section = "index-source"
+        index_declaration = repo.blob(head, schema_index.SOURCE_PATH)
+        section = "relation-source"
+        relation_declaration = repo.blob(head, schema_relation.SOURCE_PATH)
+        section = "tenant-profile-source"
+        profile_declaration = repo.blob(head, schema_tenant_profile.SOURCE_PATH)
+        declarations = (declaration, constant_declaration, index_declaration, relation_declaration, profile_declaration)
+        labels = ("nullable-source", "constant-source", "index-source", "relation-source", "tenant-profile-source")
+        source_section = next((label for label, raw in zip(labels, declarations) if raw is not None), "catalog")
+        if sum(raw is not None for raw in declarations) > 1:
+            source_section = "source-classification"
+        section = "catalog"
+        before_raw = repo.blob(base, CATALOG)
+        after_raw = None
+        extra_roles = None
+        if any(raw is not None for raw in declarations):
+            after_raw = repo.blob(head, CATALOG)
+            if relation_declaration is not None or profile_declaration is not None:
+                section = "global-tables"
+                before_global, after_global = repo.blob(base, GLOBALS), repo.blob(head, GLOBALS)
+                section = "tenant-profile"
+                before_tenant, after_tenant = repo.blob(base, _V2_TENANT), repo.blob(head, _V2_TENANT)
+                extra_roles = (before_global, after_global, before_tenant, after_tenant)
+            section = source_section
+            # Bound all descriptor/catalog roles before this v2 pass decodes;
+            # the unchanged legacy classifier has its own original read bounds.
+            _v2_source_budget(declarations, before_raw, after_raw, extra_roles)
+        if before_raw is None:
+            reasons.add("catalog-baseline-required")
+            return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), (), tuple(sorted(requirements)))
+        section = "catalog"
+        old = repo.document(base, CATALOG, _v2_catalog)
+        new = repo.document(head, CATALOG, _v2_catalog)
+        section = "global-tables"
+        old_global = repo.document(base, GLOBALS, _globals)
+        new_global = repo.document(head, GLOBALS, _globals)
+        section = source_section
+        source = None if declaration is None else (
+            declaration, before_raw, after_raw, base, head)
+        constant_source = None if constant_declaration is None else (
+            constant_declaration, before_raw, after_raw, base, head)
+        index_source = None if index_declaration is None else (
+            index_declaration, before_raw, after_raw, base, head)
+        relation_source = None if relation_declaration is None else (
+            relation_declaration, before_raw, after_raw, *extra_roles, base, head)
+        profile_source = None if profile_declaration is None else (
+            profile_declaration, before_raw, after_raw, *extra_roles, base, head)
+        semantic = _v2_catalog_delta(old, new, old_global, new_global, reasons, summary, requirements,
+                                     source=source, constant_source=constant_source, index_source=index_source,
+                                     relation_source=relation_source, profile_source=profile_source)
+        profile_delta = None
+        if profile_source is not None:
+            profile_delta = schema_tenant_profile.classify_source(profile_declaration, relation_declaration,
+                *profile_source[1:7], base_sha=base, head_sha=head)
+            section = "tenant-profile-history"
+            _v2_profile_history(repo, base, head)
+        section = "history"
+        before = repo.document(base, HISTORY, _history)
+        after = repo.document(head, HISTORY, _history)
+        if after[-1]["min_reader_version"] > before[-1]["min_reader_version"]:
+            semantic = "contract"
+            summary.append("minimum reader version increased")
+        old_sections = ({(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in old["objects"]},
+                        {r["name"]: r for r in old_global})
+        new_sections = ({(r["kind"], r["identity"]): (r.get("parent", ""), r["attributes"]) for r in new["objects"]},
+                        {r["name"]: r for r in new_global})
+        engine = _v2_history(before, after, old, new, old_sections != new_sections, semantic, reasons)
+        for path in (CATALOG, HISTORY, GLOBALS):
+            reasons.discard("catalog-changed:" + path)
+        if semantic == "contract":
+            kind, dormant = "contract", False
+        elif legacy.kind == "data":
+            kind, dormant = "data", not engine
+        elif semantic == "expand":
+            kind, dormant = "expand", False
+        if semantic != "none" and not engine:
+            reasons.add("active-catalog-without-apply-engine")
+        if engine or old["version"] != 0 or new["version"] != 0:
+            requirements.add("catalog-format/profile-unsupported")
+        section = "history-range"
+        _valid(_git(repo_dir, ["merge-base", base, head]).strip() == base.encode())
+        changes = changed_paths(repo_dir, base, head)
+        _valid(len(changes) <= 10000 and all(_changed_path(path) for _, path in changes))
+        section = "migration-path"
+        migrations = _v2_migrations(repo, base, head, changes, reasons, summary)
+        section = "tenant-profile"
+        if any(path == _V2_TENANT for _, path in changes):
+            left, right = repo.text(base, _V2_TENANT), repo.text(head, _V2_TENANT)
+            if _v2_tenant_declarations(left) != _v2_tenant_declarations(right):
+                if profile_delta is None or not _v2_tenant_explained(left, right, profile_delta):
+                    kind, dormant = "contract", False
+                    summary.append("tenant profile declarations changed")
+            for name in ("tenantRLSRoutingVersion", "tenantRLSAdditiveProfileVersion", "tenantPolicyFingerprintSignature", "tenantAdditivePolicyFingerprintSignature"):
+                if _constant_bytes(left, name) != _constant_bytes(right, name):
+                    kind, dormant = "contract", False
+                    requirements.add("additive-profile-unsupported")
+            if (profile_delta is None
+                    and re.search(r"\btenantRLSAdditiveProfileV(?:[2-9]|[1-9][0-9]+)\b", _go_code(right or ""))):
+                reasons.add("additive-profile-unsupported")
+                requirements.add("additive-profile-unsupported")
+        section = "pending"
+        pending_introduced = _v2_pending(repo, base, head, reasons, summary, requirements)
+        if pending_introduced and kind == "none":
+            kind, dormant = "expand", True
+        section = "registry"
+        rows = repo.document(head, REGISTRY, _registry, optional=True) or []
+        if len(rows) > 1 and any(row["requires_gates"] for row in rows):
+            summary.append("gated step inventory: holdback review required; pending/apply state unavailable")
+        if kind == "contract":
+            requirements.add("contract-label")
+        if kind in {"expand", "data", "contract"} and not dormant:
+            requirements.add("restore-drills")
+        if kind != "none" and not (dormant and (kind == "data"
+                or (kind == "expand" and pending_introduced))):
+            requirements.add("producer-class-unsupported")
+        summary.append("policy classification: " + kind + (" (dormant)" if dormant else ""))
+        _valid(len(summary) <= 25000)
+        for line in (*reasons, *summary, *migrations):
+            common.require_public_text(line)
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        reasons.add("classifier-v2-invalid:" + section)
+        if section == "history":
+            requirements.add("history-format-unsupported")
+    return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), migrations, tuple(sorted(requirements)))
+
+
+def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
+    """CI source eligibility only; generated tests AND exact compat must pass.
+
+    Preserve legacy clean/refused decisions except the sole endpoint closure
+    reason under the existing none-class source contract. This does not grant
+    experiment, merge or release authority, or change check()/guard().
+    """
+    repo = _Repository(repo_dir)
+    legacy = _classify(repo, base, head)
+    if legacy.reasons != ("migration-path-changed:closure",):
+        return legacy.reasons
+    policy = _classify_v2(repo, base, head, legacy)
+    if (policy.reasons or policy.kind != "none" or policy.dormant is not False
+            or policy.requirements != ("compat-required", "generated-migration-closure-ci")
+            or policy.migration_changes != ("generated migration closure changed",)):
+        return legacy.reasons
+    try:
+        # _classify_v2 has validated both manifests and the complete history.
+        # File-list-only edits cannot stand in for an actual new closure hash.
+        old = repo.document(base, MIGRATION_PATH, lambda _: None)
+        new = repo.document(head, MIGRATION_PATH, lambda _: None)
+        _valid(old["roots"] == new["roots"] == MIGRATION_ROOTS
+               and old["closure_sha256"] != new["closure_sha256"])
+        for path in (CATALOG, HISTORY, GLOBALS, GOLDEN + "production-v0.json",
+                     "internal/dbcatalog/shape/production-v0.sql", REGISTRY, SEEDS):
+            before, after = repo.blob(base, path), repo.blob(head, path)
+            # blob() enforces regular mode, per-file and shared total bounds.
+            # Absence or two empty blobs are not the active source contract.
+            _valid(type(before) is bytes and type(after) is bytes
+                   and 0 < len(before) <= MAX_ARTIFACT_BYTES and before == after)
+        changes = changed_paths(repo.root, base, head)
+        _valid(len(changes) <= 10000 and all(_changed_path(path) for _, path in changes)
+               and not any(path == _V2_PENDING.rstrip("/") or path.startswith(_V2_PENDING)
+                           for _, path in changes))
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return legacy.reasons
+    return ()
 
 
 if __name__ == "__main__":

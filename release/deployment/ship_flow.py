@@ -1,0 +1,443 @@
+"""Source and record integration for the protected Release workflow.
+
+The public read adapters establish authority. These helpers do not accept an
+external receipt in place of a fresh read. Promotion inputs cross jobs only
+through the successful production job's fixed needs outputs in ship.yml.
+"""
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import wraps
+import math
+from pathlib import Path
+import shutil
+import time
+import uuid
+
+import compat_evidence
+import compat_negative_index
+import record_handoff
+import record_resolver
+import record_writer
+import forward_gates
+import contract_authorization
+import ship_compat
+import ship_outage_compat
+import ship_rollback_compat
+import ship_records
+import ship_common as common
+
+records = record_resolver.records
+policy = record_resolver.policy
+SOURCE_SECONDS = 600
+PLAN_SECONDS = 900
+
+
+def _need(value, code):
+    if not value:
+        common.fail(code)
+
+
+def _fixed(function):
+    @wraps(function)
+    def call(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except compat_evidence.CompatRefusal as exc:
+            code = exc.code if exc.code in ('compat-missing', 'compat-old-server-incompatible',
+                'irreversible-needs-fix-forward-mode') else 'compat-stale'
+            common.fail('candidate-invalid:' + code)
+        except compat_negative_index.NegativeIndexRefusal:
+            common.fail('candidate-invalid:compat-stale')
+        except policy.PolicyRefusal:
+            common.fail('record-chain-invalid:policy')
+        except forward_gates.DrillRefusal as exc:
+            common.fail('schema-change-blocked:' + str(exc))
+        except contract_authorization.ContractRefusal as exc:
+            common.fail('schema-change-blocked:' + str(exc))
+        except record_writer.WriterRefusal:
+            common.fail('record-invalid:writer')
+        except record_handoff.HandoffRefusal:
+            common.fail('record-invalid:handoff')
+    return call
+
+
+def _options(ctx, deadline):
+    _need(type(deadline) in (int, float) and time.monotonic() < deadline, 'record-chain-invalid:source-deadline')
+    binary = shutil.which('git', path=ctx.env.get('PATH'))
+    _need(binary is not None, 'record-chain-invalid:git-unavailable')
+    return dict(gh_binary=Path(ctx.env.get('SHIP_GH_BIN', '')),
+        git_binary=Path(binary).absolute(), token=ctx.env.get('GH_TOKEN', ''),
+        scratch_dir=ctx.work_dir('source-reads') / uuid.uuid4().hex, deadline=deadline)
+
+
+@dataclass(frozen=True, slots=True)
+class Gate:
+    resolved: record_resolver.ResolvedChain
+    normal: ship_compat.NormalPreflight | None
+    rollback: record_resolver.RollbackResolution | None
+    qualified_rollback: ship_rollback_compat.RollbackPreflight | None = None
+    outage: ship_outage_compat.OutagePreflight | None = None
+
+    @property
+    def classification(self):
+        if self.normal is not None:
+            return self.normal.resolution.classification
+        if self.outage is not None:
+            return self.outage.source.admission.resolution.classification
+        if self.qualified_rollback is not None:
+            return None
+        return self.rollback.legacy_classification
+
+
+def _complete_source(resolution, sha):
+    sources = tuple(source for source in resolution.resolved.chain.sources if source.sha == sha)
+    if len(sources) != 1 or sources[0].mode != 'reviewed-v0':
+        return None
+    source = sources[0]
+    if tuple(path for path, _digest in source.artifacts) != policy.SOURCE_PATHS:
+        return None
+    return source
+
+
+def _staging_bypass(result):
+    # This is staging bypass with successful normal compat, NOT compat-outage
+    # bypass. Use only the internally authenticated preflight projection.
+    resolution = result.resolution
+    change = resolution.classification
+    _need(change.kind == 'none' and not change.dormant and not change.reasons
+          and not change.migration_changes, 'schema-change-blocked:staging-bypass')
+    # The migration-path check is against the retained database origin. Until
+    # this projection carries that check against the latest source as well,
+    # refuse their divergence even when all seven artifact hashes are equal.
+    _need(resolution.database_base_source == resolution.resolved.latest.record_sha,
+          'schema-change-blocked:staging-bypass-source-diverged')
+    # Legacy reader0 proves no artifact bytes, so absence is not equality.
+    for sha in {resolution.resolved.latest.record_sha, resolution.database_base_source}:
+        source = _complete_source(resolution, sha)
+        _need(source is not None, 'schema-change-blocked:staging-bypass-source-unavailable')
+        _need(source.artifacts == resolution.candidate.artifacts,
+              'schema-change-blocked:staging-bypass-artifacts')
+
+
+@_fixed
+def gate(ctx, control, mode, target, *, deadline):
+    options = _options(ctx, deadline)
+    if mode == 'rollback':
+        result = ship_rollback_compat.admit(ctx.repo_dir, control['sha'], target, **options)
+        if type(result) is ship_rollback_compat.RollbackPreflight:
+            return Gate(result.resolution.resolved, None, None, result)
+        _need(type(result) is record_resolver.RollbackResolution, 'record-chain-invalid:policy')
+        return Gate(result.resolved, None, result)
+    _need(mode in ('dry-run', 'promote', 'stage', 'promote-without-staging'), 'input-invalid:mode')
+    if mode == 'promote-without-staging':
+        result = ship_outage_compat.preflight(ctx.repo_dir, control['sha'], **options)
+        if type(result) is ship_outage_compat.OutagePreflight:
+            return Gate(result.source.admission.resolution.resolved, None, None, outage=result)
+        _need(type(result) is ship_compat.NormalPreflight, 'candidate-invalid:compat-stale')
+        _staging_bypass(result)
+    else:
+        result = ship_compat.preflight(ctx.repo_dir, control['sha'], **options)
+    return Gate(result.resolution.resolved, result, None)
+
+
+@_fixed
+def _forward_paths(resolution):
+    """Render the complete checked projection; never discover source here."""
+    if type(resolution) is not record_resolver.ForwardResolution:
+        raise policy.PolicyRefusal('record-source-invalid')
+    if resolution.audit is None:
+        return ['- Other changed source paths: unavailable (historical source audit absent)']
+    audit = record_resolver.validate_forward_audit(resolution.audit,
+        candidate_sha=resolution.candidate.sha, database_base_source=resolution.database_base_source,
+        latest_record_sha=resolution.resolved.latest.record_sha,
+        selected_web_source_sha=resolution.resolved.selected.actual_web_source_sha)
+    lines = []
+    for change in audit.changes:
+        lines.append(f'- Changed source range ({", ".join(change.roles)}): '
+            f'{change.base_sha} -> {change.head_sha}; paths: {len(change.rows)}')
+        lines.extend(f'  - {row.status} {row.path}' for row in change.rows)
+    # Row text is shorter than its canonical representation; reserve a small
+    # fixed margin for the at-most-three headers. Never omit a path to fit.
+    _need(sum(len(line) + 1 for line in lines) <= record_resolver.MAX_AUDIT_BYTES + 2048,
+          'output-unsafe:text')
+    return [common.require_public_text(line) for line in lines]
+
+
+@_fixed
+def _drill_details(normal):
+    if normal.drills is None:
+        return ['- Restore drills: unobserved (historical custody)']
+    observation = forward_gates.validate_preserved_drills(normal.resolution, normal.drills)
+    observed = observation.observed_at.isoformat().replace('+00:00', 'Z')
+    if not observation.required:
+        return [f'- Restore drills: not required for none or dormant changes; observed at {observed}']
+    return [f'- Restore drills: current at original observation {observed}; '
+        f'staging restore {observation.staging_restore.isoformat().replace("+00:00", "Z")}; '
+        f'production fork {observation.production_fork.isoformat().replace("+00:00", "Z")}']
+
+
+@_fixed
+def _contract_details(normal):
+    receipt = forward_gates.validate_preserved_contract(normal.resolution, normal.contract_observation)
+    if receipt is None:
+        return ['- Contract owner label: not required for this change']
+    observed = receipt.observed_at.isoformat().replace('+00:00', 'Z')
+    return [f'- Contract owner label: observed at {observed}; PR {receipt.pull_number}; '
+            f'event {receipt.event_node_id} (original observation; no DDL authority)']
+
+
+def details(value):
+    """Public summary values derived from the already checked gate."""
+    latest = value.resolved.latest
+    if value.outage is not None:
+        proof = value.outage
+        resolution = proof.source.admission.resolution
+        catalog = resolution.candidate.catalog
+        unavailable = ('service unavailable' if type(proof.availability) is ship_outage_compat.ServiceUnavailable
+                       else 'complete missing/expired evidence')
+        return ['- Database change: none; dormant: false',
+            '- Reversible: true; old_server_ok: unproven',
+            f'- Compatibility: bypassed; {unavailable}; no new compatibility measurement',
+            f'- Retained catalog: version {catalog.catalog_version}, minimum reader {catalog.min_reader_version}',
+            f'- Retained catalog SHA256: {catalog.catalog_sha256}',
+            f'- Database source before promotion: {resolution.database_base_source}',
+            '- Changed database artifact paths: none (retained live contract)',
+            '- Staging: bypassed; original bounded outage evidence retained',
+            '- Restore drills: not required for a non-dormant none change',
+            *_forward_paths(resolution)]
+    if value.normal is not None:
+        qualified = value.normal.qualified
+        resolution = value.normal.resolution
+        candidate, change = resolution.candidate, resolution.classification
+        base = _complete_source(resolution, resolution.database_base_source)
+        if base is None:
+            changed = 'unavailable (the baseline has no complete artifact facts)'
+        else:
+            prior = dict(base.artifacts)
+            paths = [path for path, digest in candidate.artifacts if prior.get(path) != digest]
+            changed = ', '.join(paths) if paths else 'none'
+        return [f'- Database change: {change.kind}; dormant: {str(change.dormant).lower()}',
+            f'- Reversible: {str(qualified.reversible).lower()}; old_server_ok: {str(qualified.old_server).lower()}',
+            f'- Compatibility: ok; run: {qualified.run_id}',
+            f'- Catalog: version {candidate.catalog.catalog_version}, minimum reader {candidate.catalog.min_reader_version}',
+            f'- Measured catalog SHA256: {candidate.catalog.catalog_sha256}',
+            f'- Database source: {resolution.database_base_source}',
+            f'- Changed database artifact paths: {changed}',
+            *_forward_paths(resolution),
+            *_drill_details(value.normal), *_contract_details(value.normal)]
+    if value.qualified_rollback is not None:
+        proof = value.qualified_rollback
+        qualified, required = proof.qualified, proof.resolution.requirements
+        binding = qualified.binding
+        return ['- Database change: none; dormant: false (image rollback; retained live database)',
+            '- Reversible: true; old_server_ok: true',
+            f'- Compatibility: ok; rollback run: {qualified.run_id}; attempt: {qualified.run_attempt}',
+            f'- Producer source: {binding.producer_sha}',
+            f'- Exact target: {binding.selected.release}; live release: {binding.latest.release}',
+            f'- Database changes after the exact target: {required.non_none_count}',
+            f'- Complete span SHA256: {required.span_sha256}',
+            f'- Retained database source: {binding.database_base.source_sha}',
+            f'- Retained catalog: version {required.live.catalog.catalog_version}, minimum reader {required.live.catalog.min_reader_version}',
+            f'- Retained catalog SHA256: {required.live.catalog.catalog_sha256}',
+            '- Changed database artifact paths: none (retained live contract)',
+            '- Restore drills: not required for rollback or restore']
+    if latest.live is None:
+        return ['- Database history: legacy source checks; measured catalog unavailable',
+                '- Database change: none (image-only decision); dormant: false',
+                '- Reversible: unproven; old_server_ok: unproven',
+                '- Catalog versions and changed artifact paths: unavailable (legacy source guard only)',
+                '- Compatibility run: none (legacy rollback guard)',
+                '- Record format: schema 1 until the first measured promotion']
+    decision = value.rollback.decision
+    facts = decision.image_only_facts
+    return [f'- Database change: {facts.db_change}; dormant: {str(facts.dormant).lower()}',
+        f'- Reversible: {str(facts.reversible).lower()} (image-only decision); old_server_ok: unproven',
+        f'- Database changes after the exact target: {decision.non_none_count}',
+        f'- Retained catalog: version {decision.live.catalog.catalog_version}, minimum reader {decision.live.catalog.min_reader_version}',
+        f'- Target reader version: {decision.target.reader.reader_version}',
+        f'- Retained catalog SHA256: {decision.live.catalog.catalog_sha256}',
+        '- Compatibility run: none (image-only rollback; no new experiment claimed)',
+        '- Changed database artifact paths: none (retained live contract)',
+        '- Other changed source paths: unavailable in the retained rollback projection',
+        '- Restore drills: not required for rollback or restore']
+
+
+def rollback_case(live, resolved):
+    """Retain the existing image-only drift/reconcile/restore behavior."""
+    latest, target = resolved.latest, resolved.selected
+    if target.release == latest.release:
+        if live == dict(latest.images):
+            common.fail('nothing-to-roll-back')
+        if any(dict(entry.images) == live for entry in resolved.chain.entries):
+            common.fail('drift:live-matches-record')
+        return 'restore'
+    if live == dict(target.images):
+        return 'reconcile'
+    if live == dict(latest.images):
+        return 'rollback'
+    common.fail('drift')
+
+
+def _execution(control):
+    # Production can only execute at attempt 1. A record-only rerun must keep
+    # that original identity; it cannot claim a second deployment took place.
+    _need(type(control['run_attempt']) is int and 1 <= control['run_attempt'] <= 500,
+          'record-invalid:run-attempt')
+    return record_writer.WorkflowExecution(common.REPOSITORY, records.SHIP_SIGNER,
+        control['workflow_sha'], int(control['run_id']), 1)
+
+
+@_fixed
+def promotion_outputs(value, control, verified_images, *, staging, private=()):
+    """Call only after candidate image verification and before any provider I/O.
+
+    Complete encode/decode/size validation happens here. Only emit the returned
+    mapping after a successful deployment; failed deployments write no record.
+    """
+    _need(type(value) is Gate and value.rollback is None and value.qualified_rollback is None
+          and control['run_attempt'] == 1, 'record-invalid:production-handoff')
+    sha = control['sha']
+    images = record_writer.CandidateImages(sha,
+        tuple((part, verified_images[part]) for part in common.COMPONENTS),
+        tuple((part, sha) for part in common.COMPONENTS))
+    if value.outage is not None:
+        _need(value.normal is None and staging == 'bypassed'
+              and type(value.outage) is ship_outage_compat.OutagePreflight
+              and value.resolved == value.outage.source.admission.resolution.resolved
+              and sha == value.outage.source.admission.resolution.candidate.sha,
+              'record-invalid:production-handoff')
+        handoff = record_writer.prepare_outage_promotion(value.outage, images, _execution(control))
+        outputs = record_handoff.encode_outage(handoff)
+    else:
+        _need(type(value.normal) is ship_compat.NormalPreflight
+              and type(value.normal.drills) is forward_gates.DrillGate,
+              'record-invalid:production-handoff')
+        handoff = record_writer.prepare_promotion(value.normal.resolution, value.normal.collected,
+            images, _execution(control), staging=staging, drills=value.normal.drills,
+            contract_observation=value.normal.contract_observation)
+        outputs = record_handoff.encode(handoff)
+    for key, text in outputs.items():
+        _need(common.OUTPUT_KEY_RE.fullmatch(key) and common.OUTPUT_VALUE_RE.fullmatch(text),
+              'record-invalid:production-handoff')
+        if text:
+            common.require_public_text(text, private)
+    return outputs
+
+
+@_fixed
+def require_outage_freshness(value, *, deadline, observed_at):
+    """Original production allowance, checked after codec before provider I/O."""
+    _need(type(value) is Gate and type(value.outage) is ship_outage_compat.OutagePreflight
+          and value.normal is None and value.rollback is None and value.qualified_rollback is None,
+          'candidate-invalid:compat-stale')
+    _need(type(deadline) in (int, float) and math.isfinite(deadline)
+          and time.monotonic() < deadline, 'candidate-invalid:compat-stale')
+    _need(type(observed_at) is datetime and observed_at.tzinfo is timezone.utc
+          and observed_at.fold == 0
+          and value.outage.checked_at <= observed_at < value.outage.valid_until,
+          'candidate-invalid:compat-stale')
+
+
+@_fixed
+def rollback_outputs(value, control, *, private=()):
+    """Prepare complete qualified rollback custody before the first provider read."""
+    _need(value.outage is None, 'record-invalid:production-handoff')
+    if value.qualified_rollback is None:
+        _need(value.normal is None and type(value.rollback) is record_resolver.RollbackResolution,
+              'record-invalid:production-handoff')
+        return None
+    proof = value.qualified_rollback
+    _need(value.normal is None and value.rollback is None and control['run_attempt'] == 1
+          and value.resolved == proof.resolution.resolved
+          and proof.resolution.producer.sha == control['sha'], 'record-invalid:production-handoff')
+    handoff = record_writer.prepare_rollback(proof, _execution(control))
+    outputs = record_handoff.encode_rollback(handoff)
+    for key, text in outputs.items():
+        _need(common.OUTPUT_KEY_RE.fullmatch(key) and common.OUTPUT_VALUE_RE.fullmatch(text),
+              'output-unsafe:text')
+        if text:
+            common.require_public_text(text, private=private)
+    return outputs
+
+
+@_fixed
+def read(ctx, *, deadline):
+    return ship_records.read(ctx.repo_dir, **_options(ctx, deadline))
+
+
+def _base_matches(manifest, fields):
+    expected = common.loads_strict(records.build_manifest(fields))
+    # These three fields describe the format/database policy, not the actual
+    # production outcome. The v2 writer derives them from authenticated inputs.
+    return all(manifest.get(key) == value for key, value in expected.items()
+               if key not in ('schema_version', 'db_change', 'schema_guard'))
+
+
+def _publication(control, fields):
+    return record_writer.PublicationFacts(_execution(control), fields['deployed_at'], fields['built_at'],
+        fields['environment_values_sha256'], fields['non_source_projection_sha256'])
+
+
+@_fixed
+def record_bytes(ctx, control, fields, *, deadline):
+    """Resolve exact published idempotency before needing a promotion handoff.
+
+    Each stage performs its own fresh read. The caller cannot supply a resolved
+    chain or replay a cached source receipt.
+    """
+    resolved = read(ctx, deadline=deadline)
+    matches = tuple(entry for entry in resolved.chain.entries if entry.release == fields['release'])
+    if matches:
+        _need(matches == (resolved.chain.entries[-1],), 'latest-changed-since-production')
+        raw = matches[0].record.raw
+        manifest = records.validate_manifest(common.loads_strict(raw))
+        _need(_base_matches(manifest, fields), 'record-invalid:published-differs')
+        _need(record_writer.published_state(resolved, raw) == 'published', 'record-invalid:published-differs')
+        return raw, 'published'
+    _need(resolved.latest.release == fields['previous'], 'latest-changed-since-production')
+    publication = _publication(control, fields)
+    if fields['kind'] == 'promote':
+        outputs = {key: ctx.env.get('REC_' + key.upper(), '') for key in record_handoff.OUTPUT_KEYS}
+        build = (record_handoff.build_outage_record if outputs.get('handoff_version') == '8'
+                 else record_handoff.build_record)
+        raw = build(outputs, workflow_sha=control['workflow_sha'],
+            candidate_sha=fields['sha'], run_id=int(control['run_id']), record_attempt=control['run_attempt'],
+            publication=publication, current_resolution=resolved)
+    else:
+        tag = ctx.env.get('SHIP_TARGET_RELEASE', '')
+        _need(tag == fields['previous'] if fields['kind'] == 'restore' else tag != fields['previous'],
+              'record-invalid:target')
+        outputs = {key: ctx.env.get('REC_' + key.upper(), '') for key in record_handoff.OUTPUT_KEYS}
+        if any(outputs.values()):
+            _need(fields['kind'] == 'rollback', 'record-invalid:handoff')
+            raw = record_handoff.build_rollback_record(outputs, producer_sha=control['sha'],
+                target_release=tag, workflow_sha=control['workflow_sha'], run_id=int(control['run_id']),
+                record_attempt=control['run_attempt'], publication=publication,
+                current_resolution=resolved, reconciled=fields['reconciled'])
+            _need(_base_matches(common.loads_strict(raw), fields), 'record-invalid:production-differs')
+            _need(time.monotonic() < deadline, 'record-chain-invalid:source-deadline')
+            return raw, 'absent'
+        # Source-bound legacy guard and v2 exact-span policy execute within the
+        # same original stage deadline. No new budget is granted for this read.
+        rollback = ship_records.rollback(ctx.repo_dir, tag, **_options(ctx, deadline))
+        _need(rollback.resolved.chain == resolved.chain
+              and rollback.resolved.image_bindings == resolved.image_bindings,
+              'latest-changed-since-production')
+        if rollback.resolved.latest.live is None:
+            _need(rollback.legacy_chain is not None, 'record-invalid:legacy-transition')
+            target = rollback.resolved.selected
+            _need((fields['sha'], fields['images']) == (target.record_sha, dict(target.images)), 'record-invalid:target')
+            raw = records.build_manifest(fields)
+            records.require_link(list(rollback.legacy_chain.entries),
+                records.manifest_entry(common.loads_strict(raw), raw), None)
+        else:
+            raw = record_writer.build_image_only(rollback.resolved, publication, reconciled=fields['reconciled'])
+    _need(_base_matches(common.loads_strict(raw), fields), 'record-invalid:production-differs')
+    _need(time.monotonic() < deadline, 'record-chain-invalid:source-deadline')
+    return raw, 'absent'
+
+
+@_fixed
+def verify_published(ctx, raw, *, deadline):
+    resolved = read(ctx, deadline=deadline)
+    _need(record_writer.published_state(resolved, raw) == 'published', 'record-invalid:not-latest')

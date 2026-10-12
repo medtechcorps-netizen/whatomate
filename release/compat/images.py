@@ -28,6 +28,8 @@ import fixture
 import processes
 import runtime
 import stack
+import record_resolver
+import catalog
 
 proof, common = runtime.proof, runtime.common
 _READY_FOR_EXECUTION = True
@@ -336,6 +338,18 @@ class _Admitted:
     seal: object
     previous: processes.ImageBinding
     candidate: processes.ImageBinding
+    controller: processes.ImageBinding
+    graph: stack.GraphImage
+    fixture: fixture.ExportImage
+    receipt: dict
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _AdmittedRollback:
+    seal: object
+    target: processes.ImageBinding
+    live: processes.ImageBinding
+    catalog_control: processes.ImageBinding
     controller: processes.ImageBinding
     graph: stack.GraphImage
     fixture: fixture.ExportImage
@@ -897,16 +911,182 @@ class _LinuxBuilder:
                 'ownership_bound':self.container_row is not None and self.volume_row is not None}
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedPrevious:
+    digest: str
+    source_sha: str
+    recipe_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedRollback:
+    producer_sha: str
+    target: _ResolvedPrevious
+    live: _ResolvedPrevious
+    target_release: str
+    live_release: str
+
+
+def _resolved_rollback(resolution):
+    """Cross-check authenticated resolver data; typed values are not authority.
+
+    The private caller must obtain the resolution from the concrete source
+    operation. The shared catalog validator checks the complete projection;
+    these additional checks bind each logical signed image and captured recipe.
+    No recipe is reread from Git after that operation has closed.
+    """
+    contract = catalog.CatalogContract.from_rollback_resolution(resolution)
+    r = record_resolver
+    resolved = resolution.resolved
+    bindings = resolved.image_bindings
+    need(type(bindings) is tuple and len(bindings) == len(resolved.chain.entries)
+         and all(type(row) is r.transport.VerifiedImages for row in bindings),
+         'admission-resolution-image')
+    endpoints = []
+    for selected, recipe, source, reference in (
+            (resolved.selected, resolution.target_recipe, contract.previous_sha, contract.previous_web),
+            (resolved.latest, resolution.live_recipe, contract.candidate_sha, contract.candidate_web)):
+        binding = bindings[selected.index]
+        for rows, pattern in ((binding.images, common.DIGEST_RE), (binding.source_shas, common.SHA1_RE)):
+            need(type(rows) is tuple and len(rows) == len(common.COMPONENTS)
+                 and all(type(row) is tuple and len(row) == 2 and type(row[0]) is str
+                         and type(row[1]) is str and pattern.fullmatch(row[1]) for row in rows)
+                 and tuple(row[0] for row in rows) == common.COMPONENTS, 'admission-resolution-image')
+        need(binding.release == selected.release and binding.record_sha == selected.record_sha
+             and binding.images == selected.images
+             and dict(binding.source_shas)['web'] == selected.actual_web_source_sha == source
+             and common.IMAGE_REPOSITORY['web']+'@'+dict(binding.images)['web'] == reference,
+             'admission-resolution-image')
+        need(type(recipe) is r.WebRecipe and recipe.path == _WEB_RECIPE and recipe.source_sha == source
+             and type(recipe.raw) is bytes and 0 < len(recipe.raw) <= r.policy.MAX_SOURCE_FILE_BYTES
+             and type(recipe.sha256) is str and common.SHA256_RE.fullmatch(recipe.sha256)
+             and sha(recipe.raw) == recipe.sha256, 'admission-resolution-recipe')
+        endpoints.append(_ResolvedPrevious(dict(binding.images)['web'], source, recipe.sha256))
+    target, live = endpoints
+    need(target.digest != live.digest or target == live, 'admission-rollback-image-conflict')
+    return _ResolvedRollback(contract.catalog_control_sha, target, live,
+                             resolved.selected.release, resolved.latest.release)
+
+
+def _admit_rollback_resolved(repo,resolution,binary,config,image_work_dir,deadline,*,buildx_binary=None):
+    """Private endpoint admission; no public rollback or wire activation.
+
+    All four local builds retain producer H. The two signed endpoint images
+    retain their actual source identities, and never become local build claims.
+    """
+    need(type(deadline) is _Deadline, 'admission-resolution-deadline')
+    deadline.remaining()
+    rollback = _resolved_rollback(resolution)
+    deadline.remaining()
+    return _admit_core(repo,None,rollback.producer_sha,binary,config,image_work_dir,deadline,
+                       buildx_binary=buildx_binary,rollback=rollback)
+
+
+def _resolved_previous(resolution):
+    """Check cross-bindings, not cryptography or deployment authorization.
+
+    The future operational caller must obtain this exact projection internally
+    from resolve_forward. Constructing its dataclasses cannot authenticate it.
+    Catalog measurement/policy remain separate from image-source admission.
+    """
+    r = record_resolver
+    need(type(resolution) is r.ForwardResolution, 'admission-resolution-invalid')
+    candidate, material = resolution.candidate, resolution.catalog_material
+    need(type(candidate) is r.policy.SourceFacts and candidate.mode == 'reviewed-v0'
+         and type(candidate.sha) is str and common.SHA1_RE.fullmatch(candidate.sha)
+         and type(material) is r.CatalogMaterial and material.candidate_sha == candidate.sha,
+         'admission-resolution-source')
+    try:
+        r.policy._source(candidate)
+    except r.policy.PolicyRefusal:
+        raise proof.EvidenceError('admission-resolution-source') from None
+    pins = dict(r.policy.V0_PINS)
+    blobs = material.candidate_blobs
+    need(type(blobs) is tuple and len(blobs) == len(pins)
+         and all(type(row) is r.policy.SourceBlob and type(row.raw) is bytes
+                 and 0 < len(row.raw) <= r.policy.MAX_SOURCE_FILE_BYTES for row in blobs)
+         and tuple(row.path for row in blobs) == tuple(sorted(pins))
+         and sum(len(row.raw) for row in blobs) <= r.policy.MAX_SOURCE_BYTES,
+         'admission-resolution-material')
+    artifacts = dict(candidate.artifacts)
+    need(all(sha(row.raw) == pins[row.path] == artifacts[row.path] for row in blobs),
+         'admission-resolution-material')
+    resolved = resolution.resolved
+    need(type(resolved) is r.ResolvedChain and type(resolved.chain) is r.policy.PolicyChain,
+         'admission-resolution-selection')
+    chain, selected = resolved.chain, resolved.selected
+    need(chain.runtime_source_supported is True and chain.baseline is None
+         and type(chain.entries) is tuple and 1 <= len(chain.entries) <= 501
+         and all(type(row) is r.policy.PolicyEntry and type(row.record) is r.policy.RecordInput
+                 for row in chain.entries)
+         and type(selected) is r.ReleaseSelection and type(selected.index) is int
+         and 0 <= selected.index < len(chain.entries)
+         and type(resolved.latest) is r.ReleaseSelection
+         and resolved.latest == r._selection(chain, len(chain.entries)-1)
+         and selected == r._selection(chain, selected.index), 'admission-resolution-selection')
+    need(type(resolved.image_bindings) is tuple and len(resolved.image_bindings) == len(chain.entries)
+         and all(type(row) is r.transport.VerifiedImages for row in resolved.image_bindings),
+         'admission-resolution-image')
+    binding = resolved.image_bindings[selected.index]
+    images, sources = binding.images, binding.source_shas
+    for rows, pattern in ((images, common.DIGEST_RE), (sources, common.SHA1_RE)):
+        need(type(rows) is tuple and len(rows) == len(common.COMPONENTS)
+             and all(type(row) is tuple and len(row) == 2 and type(row[0]) is str
+                     and type(row[1]) is str and pattern.fullmatch(row[1]) for row in rows)
+             and tuple(row[0] for row in rows) == common.COMPONENTS,
+             'admission-resolution-image')
+    need(binding.release == selected.release and binding.record_sha == selected.record_sha
+         and images == selected.images and dict(sources)['web'] == selected.actual_web_source_sha
+         and resolution.previous_web_source_sha == selected.actual_web_source_sha,
+         'admission-resolution-image')
+    recipe = resolution.previous_recipe
+    need(type(recipe) is r.WebRecipe and recipe.path == _WEB_RECIPE
+         and recipe.source_sha == selected.actual_web_source_sha
+         and type(recipe.raw) is bytes and 0 < len(recipe.raw) <= r.policy.MAX_SOURCE_FILE_BYTES
+         and type(recipe.sha256) is str and common.SHA256_RE.fullmatch(recipe.sha256)
+         and sha(recipe.raw) == recipe.sha256, 'admission-resolution-recipe')
+    return _ResolvedPrevious(dict(images)['web'], selected.actual_web_source_sha, recipe.sha256)
+
+
+def _admit_resolved(repo,resolution,binary,config,image_work_dir,deadline,*,buildx_binary=None):
+    """Preparatory path; no caller switch or authentication from typed data.
+
+    Reuse the caller's original deadline and source-built ownership lifecycle.
+    Previous recipe bytes came from the closed source operation; no Git read
+    or legacy verifier bridge recovers them after that operation has closed.
+    """
+    need(type(deadline) is _Deadline, 'admission-resolution-deadline')
+    deadline.remaining()
+    previous = _resolved_previous(resolution)
+    deadline.remaining()
+    return _admit_core(repo,None,resolution.candidate.sha,binary,config,image_work_dir,deadline,
+                       buildx_binary=buildx_binary,resolved_previous=previous)
+
+
 def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,buildx_binary=None):
+    """Active legacy entrypoint; retain its original validation and I/O order."""
+    return _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,buildx_binary=buildx_binary)
+
+
+def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,buildx_binary=None,
+                resolved_previous=None,rollback=None):
     """Build four fixed roles once from one immutable, clean source selection.
 
     A location is not evidence: all build receipts originate here. Persistent
     attempts are never resumed, even when the last daemon outcome is unknown.
     Linux driver composition still needs its first real hosted validation.
     """
+    if rollback is not None:
+        need(type(rollback) is _ResolvedRollback and previous is None and resolved_previous is None
+             and candidate == rollback.producer_sha
+             and type(rollback.target) is _ResolvedPrevious and type(rollback.live) is _ResolvedPrevious,
+             'admission-rollback-input')
+        need(rollback.target.digest != rollback.live.digest or rollback.target == rollback.live,
+             'admission-rollback-image-conflict')
+        resolved_previous=rollback.target
     source=_Source(repo,candidate,deadline)
     blobs=source.blobs(source.inventory(candidate));contexts=_role_inputs(blobs)
-    digest=previous.images.get('web')
+    digest=previous.images.get('web') if resolved_previous is None else resolved_previous.digest
     need(type(digest) is str and common.DIGEST_RE.fullmatch(digest),'admission-previous-invalid')
     need(Path(binary).is_absolute() and Path(binary).is_file(),'admission-docker-location')
     reference=common.IMAGE_REPOSITORY['web']+'@'+digest
@@ -925,6 +1105,12 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
              'source_mode':'Git inputs regular100644; host directory export, not Git executable-mode emulation',
              'plugin_sha256':plugin_sha,'build_phase_cap_seconds':_BUILD,'overall_cap_seconds':_TOTAL,
              'cleanup_complete':False}
+    if rollback is not None:
+        receipt.update(purpose='rollback-v0',signed_endpoints={
+            role:{'release':release,'reference':common.IMAGE_REPOSITORY['web']+'@'+endpoint.digest,
+                  'source':endpoint.source_sha,'recipe_sha256':endpoint.recipe_sha256}
+            for role,release,endpoint in (('target',rollback.target_release,rollback.target),
+                                         ('live',rollback.live_release,rollback.live))})
     _save(work/'intent.json',receipt)
     backend=None;error=None;bindings={};rows={};engine=None;build_failure=None
 
@@ -951,13 +1137,27 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
         deadline.build_seconds()  # Includes all immutable pulls, backend setup and all four builds.
         engine=engine_info()
         infrastructure={}
-        for image in (reference,runtime.POSTGRES,runtime.REDIS):
+        pull_images=(reference,runtime.POSTGRES,runtime.REDIS)
+        if rollback is not None:
+            live_reference=common.IMAGE_REPOSITORY['web']+'@'+rollback.live.digest
+            pull_images=tuple(dict.fromkeys((reference,live_reference,runtime.POSTGRES,runtime.REDIS)))
+        for image in pull_images:
             docker.pull(image)
             infrastructure[image]=docker.inspect(image)
         previous_row=infrastructure[reference]
-        previous_recipe=sha(source.git(['cat-file','blob',previous.sha+':'+_WEB_RECIPE]))
-        previous_binding=processes.ImageBinding(reference,previous_row['Id'],previous.sha,previous_recipe)
+        if resolved_previous is None:
+            previous_recipe=sha(source.git(['cat-file','blob',previous.sha+':'+_WEB_RECIPE]))
+            previous_source=previous.sha
+        else:
+            previous_recipe=resolved_previous.recipe_sha256
+            previous_source=resolved_previous.source_sha
+        previous_binding=processes.ImageBinding(reference,previous_row['Id'],previous_source,previous_recipe)
         processes.OwnedProcesses._validate_image(None,'previous',previous_binding,previous_row)
+        if rollback is not None:
+            live_row=infrastructure[live_reference]
+            live_binding=processes.ImageBinding(live_reference,live_row['Id'],rollback.live.source_sha,
+                                                rollback.live.recipe_sha256)
+            processes.OwnedProcesses._validate_image(None,'candidate',live_binding,live_row)
         if _host_linux():
             backend=_LinuxBuilder(binary,config,plugin,build_config,work,candidate,deadline)
             backend.start()
@@ -1032,6 +1232,12 @@ def _admit(repo,previous,candidate,binary,config,image_work_dir,deadline,*,build
         receipt.update(status='BUILT_AND_ADMITTED_UNATTESTED',remaining_seconds=deadline.remaining(),
                        engine_id_sha256=sha(engine['ID'].encode()))
         _save(work/'result.json',receipt)
+        if rollback is not None:
+            return _AdmittedRollback(_SEAL,previous_binding,live_binding,
+                processes.ImageBinding(bindings['candidate'],bindings['candidate'],candidate,_RECIPES['candidate'][1]),
+                processes.ImageBinding(bindings['controller'],bindings['controller'],candidate,_RECIPES['controller'][1]),
+                stack.GraphImage(bindings['graph'],candidate),
+                fixture.ExportImage(bindings['fixture'],candidate,_RECIPES['fixture'][1]),receipt)
         return _Admitted(_SEAL,previous_binding,
             processes.ImageBinding(bindings['candidate'],bindings['candidate'],candidate,_RECIPES['candidate'][1]),
             processes.ImageBinding(bindings['controller'],bindings['controller'],candidate,_RECIPES['controller'][1]),
