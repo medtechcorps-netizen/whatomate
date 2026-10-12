@@ -277,14 +277,24 @@ class PendingRequestTests(unittest.TestCase):
             self.refuse(replace(self.present, classification=changed))
 
     def test_private_original_context2_replay_needs_historical_absence(self):
-        original = replace(self.absent, pending=None)
-        got = bridge._qualify_context2_custody(original, self.legacy_history)
+        # Construct genuine original-epoch source/history through the real
+        # adapters; restore installed P before every replay/refusal assertion.
+        with rf.actions.w0_epoch():
+            historical = rf.resolution()
+            legacy_history = rf.collected(historical, version=2)
+            context3_history = rf.collected(historical)
+        self.assertEqual(bridge.collect.WORKFLOW_SHA256, rf.actions.P_WORKFLOW_SHA256)
+        self.assertEqual(historical.workflow, rf.actions.W0_WORKFLOW)
+        self.assertEqual(historical.workflow_sha256, rf.actions.W0_WORKFLOW_SHA256)
+        original = replace(historical, pending=None)
+        got = bridge._qualify_context2_custody(original, legacy_history)
         self.assertIsNone(got.pending_binding)
-        self.refuse(self.absent, self.legacy_history, private=True)
-        self.refuse(original, self.absent_history, private=True)
-        self.refuse(original, self.legacy_history)
+        self.refuse(historical, legacy_history, private=True)
+        self.refuse(original, context3_history, private=True)
+        self.refuse(original, legacy_history)
         self.refuse(replace(original, classification=original.classification._replace(kind="expand", dormant=True)),
-                    self.legacy_history, private=True)
+                    legacy_history, private=True)
+        self.refuse(replace(self.absent, pending=None), self.legacy_history, private=True)
 
 
 if __name__ == "__main__":
