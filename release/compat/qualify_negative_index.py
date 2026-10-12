@@ -164,8 +164,8 @@ def _stage_case(root, ctx, raw):
         _write(public / name, data)
 
 
-def _frame(result, status, *, success):
-    found, body, headers = policy._http_frame(result.stdout)
+def _frame(result, status, *, success, expected_created_location=None):
+    found, body, headers = policy._http_frame(result.stdout, expected_created_location=expected_created_location)
     need(found == status and result.returncode == (0 if success else 1)
          and (not result.stderr if success else True)
          and headers.get(b"content-type", b"").lower() in
@@ -273,7 +273,8 @@ class Qualification:
         path = policy.API + "/git/refs/" + name[5:]
         absent(self._api("GET", policy.API + "/git/ref/" + name[5:]))
         _, body = _frame(self._api("POST", policy.API + "/git/refs",
-            (("--raw-field", "ref=" + name), ("--raw-field", "sha=" + self.actual.sha))), 201, success=True)
+            (("--raw-field", "ref=" + name), ("--raw-field", "sha=" + self.actual.sha))), 201, success=True,
+            expected_created_location="https://api.github.com" + policy.API + "/git/" + name)
         created = self.transport.NegativePublisher._ref_body(body, name, self.actual.sha)
         need(self.ref(name, self.actual.sha) == created)
         denied(self._api("PATCH", path, (("--raw-field", "sha=" + Q), ("--field", "force=true"))),

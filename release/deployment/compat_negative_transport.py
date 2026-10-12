@@ -250,7 +250,8 @@ class NegativePublisher(_Client):
                 args = self._args("POST", policy.API + "/git/refs", include=True)
                 args.extend(("--raw-field", "ref=" + ref, "--raw-field", "sha=" + request.producer_sha))
                 result = self._capture(args, limit=HTTP_LIMIT)
-                status, body, headers = policy._http_frame(result.stdout)
+                status, body, headers = policy._http_frame(result.stdout,
+                    expected_created_location="https://api.github.com" + policy.API + "/git/" + ref)
                 _need(status == 201 and result.returncode == 0 and not result.stderr
                       and headers.get(b"content-type", b"").lower() in
                       (b"application/json", b"application/json; charset=utf-8"))

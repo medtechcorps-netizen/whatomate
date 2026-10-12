@@ -485,12 +485,12 @@ def replay_refs(raw, *, producer_sha):
     return _safe(_replay_refs, raw, producer_sha)
 
 
-def _http_frame(raw):
+def _http_frame(raw, *, expected_created_location=None):
     """Bounded framing only, no endpoint/status or completed-capture authority."""
-    return _safe(_frame, raw)
+    return _safe(_frame, raw, expected_created_location=expected_created_location)
 
 
-def _frame(raw):
+def _frame(raw, *, expected_created_location=None):
     _need(type(raw) is bytes and 0 < len(raw) <= MAX_HEADERS+MAX_BODY)
     delimiter = b"\r\n\r\n" if b"\r\n\r\n" in raw else b"\n\n"
     head, separator, body = raw.partition(delimiter)
@@ -509,7 +509,14 @@ def _frame(raw):
         key, value = line.split(b":", 1); key = key.lower()
         _need(key not in headers)
         headers[key] = value.strip()
-    _need(b"location" not in headers and b"transfer-encoding" not in headers
+    # Only exact ref-creation callers opt in; this never authorizes a redirect.
+    if expected_created_location is not None:
+        _need(type(expected_created_location) is str and len(expected_created_location) <= 1024
+              and re.fullmatch(re.escape("https://api.github.com" + API + "/git/refs/tags/" + PREFIX)
+                               + r"[A-Za-z0-9-]+", expected_created_location) is not None and status == 201)
+    _need((b"location" not in headers or (expected_created_location is not None
+           and headers[b"location"] == expected_created_location.encode("ascii")))
+          and b"transfer-encoding" not in headers
           and not body.startswith(b"HTTP/") and b"\x00" not in body
           and re.search(rb"(?:\A|[\r\n])[ \t]*HTTP/[0-9]", body) is None)
     if b"content-length" in headers:
