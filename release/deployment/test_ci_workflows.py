@@ -42,7 +42,7 @@ negative cases that break the property and must make the checker fail:
 14. no release image and no workflow that builds or tests one references the
     staging code (release/staging, the graph stub): the Dockerfiles under
     docker/ outside docker/staging/, the production/build/record jobs in
-    ship.yml, e2e-tests.yml, and every Test job except staging-bootstrap.
+    ship.yml, e2e-tests.yml except canary-local, and every Test job except staging-bootstrap.
 15. the required race suite includes every Go package, so the generated
     migration, data-step and seed contracts are checked without regeneration;
     their files must still match the checkout after the tests.
@@ -912,13 +912,14 @@ def assert_staging_bootstrap(sources: dict[str, str]) -> None:
 
 # Staging code: the bootstrap tool, the graph stub and anything else under
 # release/staging. In the workflows that build or test the release images,
-# only the staging-bootstrap job may build or run it. Workflows that exist for
-# staging code (the planned staging-images.yml and canary-local.yml) are not
-# in this list.
+# only the explicitly listed synthetic staging jobs may build or run it. The
+# required local canary is one isolated job within e2e-tests.yml; ordinary E2E
+# shards remain subject to the staging-reference prohibition.
 STAGING_REFERENCE = re.compile(r"release/staging|graph-stub|graphstub")
 STAGING_REFERENCE_WORKFLOWS = ("ship.yml", "test.yml", "e2e-tests.yml")
 STAGING_REFERENCE_JOBS = {
     ("test.yml", STAGING_BOOTSTRAP_JOB), ("test.yml", "release-tests"),
+    ("e2e-tests.yml", "canary-local"),
     ("ship.yml", "deploy-staging"), ("ship.yml", "e2e-staging"), ("ship.yml", "staging-rollback"),
 }
 
@@ -1113,17 +1114,36 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "test.yml", "golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7",
         "golangci/golangci-lint-action@v7")),
     "unpin a uses in E2E": ("triggers-and-pins", lambda: replaced(
-        "e2e-tests.yml", "- uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
-        "- uses: actions/checkout@main")),
+        "e2e-tests.yml", "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+        "    steps:\n"
+        "      - uses: actions/checkout@main")),
     "unpin a uses in Release": ("triggers-and-pins", lambda: replaced(
         "ship.yml", "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6",
         "docker/build-push-action@v6")),
     "unpin a service image": ("triggers-and-pins", lambda: replaced(
-        "e2e-tests.yml", "redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab", "redis:7")),
+        "e2e-tests.yml", "        image: redis:7@sha256:91d0f7e8c748ec7a4c2b4fb2c4f84edab794dd91d01e095e38dc906db9d684ab\n"
+        "        ports:\n"
+        "          - 6379:6379\n",
+        "        image: redis:7\n"
+        "        ports:\n"
+        "          - 6379:6379\n")),
     "test against another PostgreSQL": ("triggers-and-pins", lambda: replaced(
-        "e2e-tests.yml", PG17_IMAGE, "postgres:16@sha256:" + "0" * 64)),
+        "e2e-tests.yml", "        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449\n"
+        "        env:\n"
+        "          POSTGRES_DB: whatomate_test\n",
+        "        image: postgres:16@sha256:0000000000000000000000000000000000000000000000000000000000000000\n"
+        "        env:\n"
+        "          POSTGRES_DB: whatomate_test\n")),
     "persist checkout credentials": ("triggers-and-pins", lambda: replaced(
-        "e2e-tests.yml", "          persist-credentials: false\n", "          persist-credentials: true\n")),
+        "e2e-tests.yml", "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
+        "        with:\n"
+        "          persist-credentials: false\n",
+        "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
+        "        with:\n"
+        "          persist-credentials: true\n")),
     # 4. Concurrency and timeouts.
     "revert the Test concurrency group": ("concurrency-and-timeouts", lambda: replaced(
         "test.yml", "format('run-{0}', github.run_id)", "github.ref")),

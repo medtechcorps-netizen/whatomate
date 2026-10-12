@@ -38,7 +38,7 @@ missing or restarted journal evidence during a check fails the proof.
 
 ## Local/CI
 
-Use an empty, disposable PG17 instance (the digest in `canary-local.yml`) and
+Use an empty, disposable PG17 instance (the digest in `e2e-tests.yml`) and
 Redis7. Set an absolute `RUNNER_TEMP` outside the checkout. Optional port variables
 are `CANARY_PG_PORT`, `CANARY_REDIS_PORT`, `CANARY_BACKEND_PORT`, and
 `CANARY_STUB_PORT`; all connections use loopback. The bootstrap PostgreSQL user
@@ -72,10 +72,12 @@ production profile files beside it, then invokes that executable. It refuses amb
 operation and strips them again from child environments. Configuration refuses existing database roles, so rerunning `configure` requires
 a new disposable PostgreSQL instance. It never drops a database or replaces roles.
 
-The advisory workflow performs these steps on push and pull requests. It has
-read-only repository permission, no GitHub environment, no secrets and no
+The `canary-local` job in `e2e-tests.yml` performs these steps on every push and
+pull request for main. The required `e2e` aggregator succeeds only when both the
+E2E shards and this canary succeed. Required context names are unchanged. The job
+has read-only repository permission, no GitHub environment, no secrets and no
 uploaded artifacts. The application, database roles and stub get random secrets;
-the workflow masks them. It is deliberately not a required branch-protection job.
+the workflow masks them.
 
 ## Staging
 
@@ -117,8 +119,10 @@ GitHub outputs or uploaded artifacts.
 
 `CANARY_STRESS=1 npm run test:canary` runs all 13 checks 120 times, then each
 late-layout check another 80 times. Set `CANARY_STRESS=1` for the verifier too.
-The workflow's manual `stress` input performs the same run. Retries are always
-zero and tests are serial. A normal report must have exactly 13 passed names;
+The required push/PR job runs the normal profile (`CANARY_STRESS=0`). The retired
+standalone workflow's manual `stress` dispatch is no longer available; use the
+local commands above with `CANARY_STRESS=1` for the same stress proof. Retries are
+always zero and tests are serial. A normal report must have exactly 13 passed names;
 a stress report must have exactly 1,720 passes in the specified inventory.
 Any failure, global error, skip, retry or missing/duplicate normal check fails.
 
