@@ -87,7 +87,7 @@ test('bootstrap refusal is propagated without retry', async () => {
 test('both workflow and local command use the tested helper and hosted unit coverage includes it', () => {
   assert.match(source, /else if \(mode === 'bootstrap'\) await bootstrap\(\)/)
   assert.doesNotMatch(source, /\['run', '\.\/release\/staging\/bootstrap'/)
-  const workflow = readFileSync(new URL('../../../.github/workflows/canary-local.yml', import.meta.url), 'utf8')
+  const workflow = readFileSync(new URL('../../../.github/workflows/e2e-tests.yml', import.meta.url), 'utf8')
   assert.match(workflow, /run: node frontend\/e2e\/canary\/local-stack\.mjs bootstrap/)
   const scripts = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).scripts
   assert.ok(scripts['test:canary:unit'].includes('e2e/canary/local-stack.test.mjs'))
