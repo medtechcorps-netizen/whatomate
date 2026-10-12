@@ -44,6 +44,47 @@ def ref_value(name, sha):
                    "url": "https://api.github.com" + policy.API + "/git/commits/" + sha}}
 
 
+# Exact public stdout from H3 run 38209736689, PATCH command 12. Raw stderr
+# was not retained; tests use an explicitly controlled completion wrapper.
+ACTUAL_H3_UPDATE_DENIAL = (
+    b'HTTP/2.0 422 Unprocessable Entity\n'
+    b'Access-Control-Allow-Origin: *\r\n'
+    b'Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning\r\n'
+    b'Content-Length: 181\r\n'
+    b"Content-Security-Policy: default-src 'none'\r\n"
+    b'Content-Type: application/json; charset=utf-8\r\n'
+    b'Date: Mon, 12 Oct 2026 05:50:58 GMT\r\n'
+    b'Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin\r\n'
+    b'Server: github.com\r\n'
+    b'Strict-Transport-Security: max-age=31536000; includeSubdomains; preload\r\n'
+    b'Vary: Accept-Encoding, Accept, X-Requested-With\r\n'
+    b'X-Accepted-Github-Permissions: contents=write; contents=write,workflows=write\r\n'
+    b'X-Content-Type-Options: nosniff\r\n'
+    b'X-Frame-Options: deny\r\n'
+    b'X-Github-Api-Version-Selected: 2022-11-28\r\n'
+    b'X-Github-Edge-Region: iad\r\n'
+    b'X-Github-Media-Type: github.v3; format=json\r\n'
+    b'X-Github-Request-Id: A82F:24133F:A308228:21AE37F9:6ACC7541\r\n'
+    b'X-Ratelimit-Limit: 5000\r\n'
+    b'X-Ratelimit-Remaining: 4982\r\n'
+    b'X-Ratelimit-Reset: 1791787664\r\n'
+    b'X-Ratelimit-Resource: core\r\n'
+    b'X-Ratelimit-Used: 18\r\n'
+    b'X-Xss-Protection: 0\r\n'
+    b'\r\n'
+    b'{"message":"Repository rule violations found\\n\\nCannot update this protected ref.\\n\\n","documentation_url":"https://docs.github.com/rest/git/refs#update-a-reference","status":"422"}'
+)
+ACTUAL_H3_PROBE = "refs/tags/rereply-compat-negative-v1-probe-38209736689-1-permissions"
+
+
+def protected_ref_denial(operation):
+    # The update spelling was observed. Delete is a precommitted synthetic
+    # expectation; real hosted DELETE denial and unchanged-ref readback remain required.
+    return {"message": "Repository rule violations found\n\nCannot " + operation + " this protected ref.\n\n",
+            "documentation_url": "https://docs.github.com/rest/git/refs#" + operation + "-a-reference",
+            "status": "422"}
+
+
 class Capture:
     def __init__(self):
         self.calls = []
@@ -397,6 +438,62 @@ class QualificationTests(unittest.TestCase):
             public.validate_result(statement, snapshot, ctx)
 
 
+    def _protected_denial_capture(self, *, change_after=None, delete_message=None):
+        original = self.capture
+        def capture(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "--method" in argv and argv[5] in ("PATCH", "DELETE"):
+                self.assertEqual(result.returncode, 1)
+                operation = "update" if argv[5] == "PATCH" else "delete"
+                value = protected_ref_denial(operation)
+                if operation == "delete" and delete_message is not None:
+                    value["message"] = delete_message
+                raw = http(422, value).replace(b"\r\n", b"\n", 1)
+                if argv[5] == change_after:
+                    original.refs[q.actual_context(self.env).probe] = q.Q
+                return source.runtime.Capture(1, raw, result.stderr)
+            return result
+        return capture
+
+    def test_protected_ref_denials_complete_real_composition(self):
+        # Both responses are controlled; the DELETE spelling is not hosted evidence.
+        with mock.patch.object(source.runtime, "bounded_command", self._protected_denial_capture()):
+            self.test_real_validator_and_real_publisher_composition_with_one_token()
+
+    def test_precommitted_tag_delete_denial_completes_real_composition(self):
+        # External primary reporting supplies this reason, not a local DELETE capture.
+        message = "Repository rule violations found\n\nCannot delete this tag\n\n"
+        with mock.patch.object(source.runtime, "bounded_command",
+                               self._protected_denial_capture(delete_message=message)):
+            self.test_real_validator_and_real_publisher_composition_with_one_token()
+
+    def test_protected_update_denial_still_requires_unchanged_readback(self):
+        with mock.patch.object(source.runtime, "bounded_command",
+                               self._protected_denial_capture(change_after="PATCH")):
+            self.assertEqual(self.main(), 1)
+        self.assertFalse(any("--method" in row and row[5] == "DELETE" for row in self.capture.calls))
+        self.assertEqual(sum("--method" in row and row[5] == "POST" for row in self.capture.calls), 1)
+        failure = json.loads((self.out / "failure.json").read_bytes())
+        self.assertEqual(failure["commands"][-1]["number"], 13)
+        self.assertEqual(failure["commands"][-1]["argv"][5], "GET")
+        self.assertFalse(failure["repair_or_retry"])
+        self.assertEqual(self.github_output.read_bytes(), b"")
+        self.assertFalse((self.out / "public").exists())
+
+    def test_protected_delete_denial_still_requires_unchanged_readback(self):
+        with mock.patch.object(source.runtime, "bounded_command",
+                               self._protected_denial_capture(change_after="DELETE")):
+            self.assertEqual(self.main(), 1)
+        writes = [row[5] for row in self.capture.calls if "--method" in row and row[5] != "GET"]
+        self.assertEqual(writes, ["POST", "PATCH", "DELETE"])
+        failure = json.loads((self.out / "failure.json").read_bytes())
+        self.assertEqual(failure["commands"][-1]["number"], 15)
+        self.assertEqual(failure["commands"][-1]["argv"][5], "GET")
+        self.assertFalse(failure["repair_or_retry"])
+        self.assertEqual(self.github_output.read_bytes(), b"")
+        self.assertFalse((self.out / "public").exists())
+
+
 class BoundaryTests(unittest.TestCase):
     def test_gh_mixed_frame_keeps_exact_422_denial_and_rejects_403(self):
         ref = f"refs/tags/{policy.PREFIX}probe-123-1-permissions"
@@ -453,6 +550,123 @@ class BoundaryTests(unittest.TestCase):
         with self.assertRaises(source.TransportRefusal):
             budget.capture(["gh"], env={}, timeout=1, stdout_limit=100, stderr_limit=100)
         self.assertTrue(budget.failed)
+
+
+class ProtectedRefDenialTests(unittest.TestCase):
+    def test_actual_h3_stdout_preserves_exact_frame_and_body(self):
+        self.assertEqual(len(ACTUAL_H3_UPDATE_DENIAL), 1408)
+        self.assertEqual(q.digest(ACTUAL_H3_UPDATE_DENIAL),
+                         "a215e234d36d8fdaa632915bf2289f91af9be0f132f1c61bf9c8aff9bd981ab3")
+        head, _, body = ACTUAL_H3_UPDATE_DENIAL.partition(b"\r\n\r\n")
+        self.assertEqual(len(head), 1223)
+        self.assertEqual(len(body), 181)
+        self.assertIn(b"Content-Length: 181\r\n", head + b"\r\n")
+        self.assertTrue(head.startswith(b"HTTP/2.0 422 Unprocessable Entity\n"))
+        value, found_body = q._frame(source.runtime.Capture(1, ACTUAL_H3_UPDATE_DENIAL, b""),
+                                     422, success=False)
+        self.assertEqual(found_body, body)
+        self.assertEqual(value, protected_ref_denial("update"))
+
+    def test_actual_h3_update_denial_is_operation_specific(self):
+        result = source.runtime.Capture(1, ACTUAL_H3_UPDATE_DENIAL, b"controlled stderr")
+        q.denied(result, operation="update", ref=ACTUAL_H3_PROBE)
+        with self.assertRaises(q.Refusal):
+            q.denied(result, operation="delete", ref=ACTUAL_H3_PROBE)
+
+    def test_exact_synthetic_forms_preserve_three_supported_line_endings(self):
+        for operation in ("update", "delete"):
+            raw = http(422, protected_ref_denial(operation))
+            for frame in (raw, raw.replace(b"\r\n", b"\n"), raw.replace(b"\r\n", b"\n", 1)):
+                with self.subTest(operation=operation, frame=frame[:60]):
+                    q.denied(source.runtime.Capture(1, frame, b"controlled stderr"),
+                             operation=operation, ref=ACTUAL_H3_PROBE)
+
+    def test_delete_tag_expectations_are_exact_finite_and_operation_specific(self):
+        prefix = "Repository rule violations found\n\nCannot delete this tag"
+        for punctuation in ("", "."):
+            for ending in ("\n", "\n\n"):
+                message = prefix + punctuation + ending
+                value = dict(protected_ref_denial("delete"), message=message)
+                with self.subTest(message=message):
+                    q.denied(source.runtime.Capture(1, http(422, value), b""),
+                             operation="delete", ref=ACTUAL_H3_PROBE)
+                    # Correct UPDATE documentation cannot launder a DELETE reason.
+                    value["documentation_url"] = protected_ref_denial("update")["documentation_url"]
+                    with self.assertRaises(q.Refusal):
+                        q.denied(source.runtime.Capture(1, http(422, value), b""),
+                                 operation="update", ref=ACTUAL_H3_PROBE)
+        variants = (prefix, prefix + "\n\n\n", prefix + ".\n\n\n", prefix + "!\n\n",
+                    prefix + "s\n\n", prefix + " \n\n", " " + prefix + "\n\n",
+                    prefix.replace("delete", "update") + "\n\n",
+                    prefix.replace("Cannot", "- Cannot") + "\n\n",
+                    prefix.replace("this tag", "this branch") + "\n\n",
+                    prefix.replace("delete this", "delete  this") + "\n\n")
+        for message in variants:
+            with self.subTest(message=message), self.assertRaises(q.Refusal):
+                q.denied(source.runtime.Capture(1, http(422, dict(protected_ref_denial("delete"),
+                         message=message)), b""), operation="delete", ref=ACTUAL_H3_PROBE)
+
+    def test_all_three_legacy_forms_remain_accepted_for_each_operation(self):
+        for operation in ("update", "delete"):
+            reason = "Cannot " + operation + " this ref"
+            messages = ("Repository rule violations found\n\n" + reason + "\n",
+                        "Repository rule violations found\n\n- " + reason + "\n",
+                        "Repository rule violations found for " + ACTUAL_H3_PROBE + ".\n\n- " + reason + "\n")
+            for message in messages:
+                with self.subTest(operation=operation, message=message):
+                    q.denied(source.runtime.Capture(1, http(422, {"message": message}), b""),
+                             operation=operation, ref=ACTUAL_H3_PROBE)
+
+    def test_modern_message_near_misses_are_not_normalized(self):
+        for operation in ("update", "delete"):
+            value = protected_ref_denial(operation)
+            message = value["message"]
+            variants = (message.rstrip("\n"), message[:-1], message + "\n", " " + message,
+                        message.replace("ref.", "ref"), message.replace("Cannot", "- Cannot"),
+                        message.replace("protected ", ""), message.replace("Cannot", "cannot"),
+                        message.replace("\n", "\r\n"), message + "permission denied",
+                        "Repository rule violations found for " + ACTUAL_H3_PROBE + ".\n\nCannot "
+                        + operation + " this protected ref.\n\n")
+            for changed in variants:
+                with self.subTest(operation=operation, message=changed), self.assertRaises(q.Refusal):
+                    q.denied(source.runtime.Capture(1, http(422, dict(value, message=changed)), b""),
+                             operation=operation, ref=ACTUAL_H3_PROBE)
+
+    def test_modern_denial_keeps_closed_semantic_status_and_document_contract(self):
+        for operation in ("update", "delete"):
+            good = protected_ref_denial(operation)
+            other = "delete" if operation == "update" else "update"
+            cases = [(0, 422, good), (1, 403, good), (1, 429, good), (1, 503, good),
+                     (1, 422, dict(good, status=422)), (1, 422, dict(good, status="403")),
+                     (1, 422, dict(good, documentation_url=protected_ref_denial(other)["documentation_url"])),
+                     (1, 422, dict(good, documentation_url="https://evil.invalid")),
+                     (1, 422, dict(good, errors=[])), (1, 422, dict(good, message="Validation Failed")),
+                     (1, 422, dict(good, message="Resource not accessible by integration")),
+                     (1, 422, dict(good, message=protected_ref_denial(other)["message"])),
+                     (1, 422, dict(good, message=None)), (1, 422, [])]
+            for code, status, value in cases:
+                with self.subTest(operation=operation, code=code, status=status, value=value), self.assertRaises(q.Refusal):
+                    q.denied(source.runtime.Capture(code, http(status, value), b"controlled stderr"),
+                             operation=operation, ref=ACTUAL_H3_PROBE)
+
+    def test_actual_message_cannot_bypass_existing_strict_frame_checks(self):
+        raw = ACTUAL_H3_UPDATE_DENIAL
+        variants = (raw.replace(b"Content-Length: 181", b"Content-Length: 180"),
+                    raw.replace(b"Content-Length: 181", b"Content-Length: 181\r\ncontent-length: 181"),
+                    raw.replace(b"\r\n\r\n", b"\r\nLocation: https://api.github.com/elsewhere\r\n\r\n", 1),
+                    raw.replace(b"\r\n\r\n", b"\r\nTransfer-Encoding: chunked\r\n\r\n", 1),
+                    raw + b"\nHTTP/2.0 200 OK\n\n{}", raw + b"\x00")
+        for frame in variants:
+            with self.subTest(frame=frame[:80]), self.assertRaises(policy.NegativeIndexRefusal):
+                q.denied(source.runtime.Capture(1, frame, b""), operation="update", ref=ACTUAL_H3_PROBE)
+
+    def test_modern_denial_keeps_fixed_operation_and_probe_identity(self):
+        result = source.runtime.Capture(1, ACTUAL_H3_UPDATE_DENIAL, b"")
+        for operation, ref in (("PATCH", ACTUAL_H3_PROBE), ("create", ACTUAL_H3_PROBE),
+                               ("update", ACTUAL_H3_PROBE.replace("-1-permissions", "-2-permissions")),
+                               ("update", "refs/heads/main"), ("update", ACTUAL_H3_PROBE + "/extra")):
+            with self.subTest(operation=operation, ref=ref), self.assertRaises(q.Refusal):
+                q.denied(result, operation=operation, ref=ref)
 
 
 CHECKOUT = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"

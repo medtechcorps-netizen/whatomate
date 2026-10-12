@@ -190,7 +190,14 @@ def denied(result, *, operation, ref):
     reason = "Cannot update this ref" if operation == "update" else "Cannot delete this ref"
     messages = {"Repository rule violations found\n\n" + reason + "\n",
                 "Repository rule violations found\n\n- " + reason + "\n",
-                "Repository rule violations found for " + ref + ".\n\n- " + reason + "\n"}
+                "Repository rule violations found for " + ref + ".\n\n- " + reason + "\n",
+                "Repository rule violations found\n\nCannot " + ("update" if operation == "update" else "delete")
+                + " this protected ref.\n\n"}
+    if operation == "delete":
+        messages.update({"Repository rule violations found\n\nCannot delete this tag\n",
+                         "Repository rule violations found\n\nCannot delete this tag\n\n",
+                         "Repository rule violations found\n\nCannot delete this tag.\n",
+                         "Repository rule violations found\n\nCannot delete this tag.\n\n"})
     suffix = "update-a-reference" if operation == "update" else "delete-a-reference"
     need(type(value) is dict and set(value) <= {"message", "documentation_url", "status"}
          and value.get("message") in messages and value.get("status", "422") == "422"
