@@ -29,6 +29,12 @@ def ref_body(ref, sha):
                        "url": "https://api.github.com" + policy.API + "/git/commits/" + sha}}
 
 
+# Exact public stdout from H4 synthetic run 38217227182, command 19.
+# Creation occurred; the run refused before marker readback/signing.
+# Replaying these bytes locally is parser coverage, not hosted qualification.
+ACTUAL_H4_MARKER_CREATED = b'HTTP/2.0 201 Created\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning\r\nCache-Control: private, max-age=60, s-maxage=60\r\nContent-Length: 1047\r\nContent-Security-Policy: default-src \'none\'\r\nContent-Type: application/json; charset=utf-8\r\nDate: Mon, 12 Oct 2026 07:21:11 GMT\r\nEtag: "b0c28daf4dcf35f63e8c0d26b39b3b12ff5a0a087592abbc88f3ebf85a9510de"\r\nLocation: https://api.github.com/repos/medtechcorps-netizen/whatomate/git/refs/tags/rereply-compat-negative-v1-12519b7f2ad020f1aceb2a17432a686a9f87ae6d-38217227182-1-971a88f6fc88c617a8c309c7fab44e02094f7e298fbb7ab6c13497a3f66cbce1-c70a039b77a2a5001bc859691ed7e2e10747ba44c2e6a76fcc40f4730a133734\r\nReferrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin\r\nServer: github.com\r\nStrict-Transport-Security: max-age=31536000; includeSubdomains; preload\r\nVary: Accept, Authorization, Cookie, X-GitHub-OTP,Accept-Encoding, Accept, X-Requested-With\r\nX-Accepted-Github-Permissions: contents=write; contents=write,workflows=write\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: deny\r\nX-Github-Api-Version-Selected: 2022-11-28\r\nX-Github-Edge-Region: iad\r\nX-Github-Media-Type: github.v3; format=json\r\nX-Github-Request-Id: 0411:14A872:7C0B3B5:19914400:6ACC8A67\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 4975\r\nX-Ratelimit-Reset: 1791793143\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Used: 25\r\nX-Xss-Protection: 0\r\n\r\n{"ref":"refs/tags/rereply-compat-negative-v1-12519b7f2ad020f1aceb2a17432a686a9f87ae6d-38217227182-1-971a88f6fc88c617a8c309c7fab44e02094f7e298fbb7ab6c13497a3f66cbce1-c70a039b77a2a5001bc859691ed7e2e10747ba44c2e6a76fcc40f4730a133734","node_id":"REF_kwDOTVPortoA3XJlZnMvdGFncy9yZXJlcGx5LWNvbXBhdC1uZWdhdGl2ZS12MS0xMjUxOWI3ZjJhZDAyMGYxYWNlYjJhMTc0MzJhNjg2YTlmODdhZTZkLTM4MjE3MjI3MTgyLTEtOTcxYTg4ZjZmYzg4YzYxN2E4YzMwOWM3ZmFiNDRlMDIwOTRmN2UyOThmYmI3YWI2YzEzNDk3YTNmNjZjYmNlMS1jNzBhMDM5Yjc3YTJhNTAwMWJjODU5NjkxZWQ3ZTJlMTA3NDdiYTQ0YzJlNmE3NmZjYzQwZjQ3MzBhMTMzNzM0","url":"https://api.github.com/repos/medtechcorps-netizen/whatomate/git/refs/tags/rereply-compat-negative-v1-12519b7f2ad020f1aceb2a17432a686a9f87ae6d-38217227182-1-971a88f6fc88c617a8c309c7fab44e02094f7e298fbb7ab6c13497a3f66cbce1-c70a039b77a2a5001bc859691ed7e2e10747ba44c2e6a76fcc40f4730a133734","object":{"sha":"12519b7f2ad020f1aceb2a17432a686a9f87ae6d","type":"commit","url":"https://api.github.com/repos/medtechcorps-netizen/whatomate/git/commits/12519b7f2ad020f1aceb2a17432a686a9f87ae6d"}}'
+
+
 class Clock:
     def __init__(self): self.now = 100.0
     def __call__(self): return self.now
@@ -340,6 +346,108 @@ class NegativeTransportTests(unittest.TestCase):
         client = self.client()
         self.world.after = lambda key: self.binary.write_bytes(b"swapped")
         self.refused(client, client.read_rule)
+
+    def test_observed_marker_creation_with_312_character_node_id(self):
+        value = json.loads(ACTUAL_H4_MARKER_CREATED.split(b"\r\n\r\n", 1)[1])
+        status, body, headers = policy._http_frame(ACTUAL_H4_MARKER_CREATED,
+            expected_created_location=value["url"])
+        self.assertEqual(status, 201)
+        self.assertEqual(len(body), 1047)
+        self.assertEqual(headers[b"content-length"], b"1047")
+        self.assertEqual(len(value["node_id"]), 312)
+        self.assertEqual(transport.NegativePublisher._ref_body(
+            body, value["ref"], value["object"]["sha"]), value)
+
+    def test_bounded_long_nodes_create_readback_and_final_rule_for_both_protocols(self):
+        observed = json.loads(ACTUAL_H4_MARKER_CREATED.split(b"\r\n\r\n", 1)[1])["node_id"]
+        original = ref_body
+        for protocol in ("normal3", "rollback4"):
+            for node in ("N" * 256, observed, "N" * 1024):
+                with self.subTest(protocol=protocol, length=len(node)):
+                    request = replace(fixtures.request(), protocol=protocol)
+                    ref = policy.marker_ref(request)
+                    world = World(); client = self.client(publisher=True, world=world)
+                    def response(name, sha):
+                        # Controlled opaque metadata; no node ID decoding or authority.
+                        return dict(original(name, sha), node_id=node)
+                    location = ("https://api.github.com" + policy.API + "/git/" + ref).encode()
+                    world.overrides[("POST", policy.API + "/git/refs")] = lambda result: replace(result,
+                        stdout=result.stdout.replace(b"\r\n", b"\n", 1).replace(
+                            b"\r\n\r\n", b"\r\nLocation: " + location + b"\r\n\r\n"))
+                    with mock.patch.dict(globals(), {"ref_body": response}):
+                        receipt = client.publish_intent(request)
+                    self.assertEqual(receipt, policy.IntentPersisted(request, client.setup.sha256, ref))
+                    self.assertEqual(world.refs[ref]["node_id"], node)
+                    self.assertEqual(world.post_count, 1)
+                    self.assertEqual(client.budget.commands, 7)
+                    self.assertEqual(world.calls[-2][0][5], "GET")
+                    self.assertEqual(world.calls[-2][0][6], policy.API + "/git/ref/" + ref[5:])
+                    self.assertEqual(world.calls[-1][0][6], policy.API + "/rulesets/" + str(client.setup.rule_id))
+                    before = len(world.calls)
+                    self.refused(client, lambda: client.publish_intent(request))
+                    self.assertEqual(len(world.calls), before)
+                    self.assertEqual(world.post_count, 1)
+
+    def test_existing_long_marker_remains_idempotent_with_exact_readback(self):
+        request = fixtures.request(); ref = policy.marker_ref(request)
+        for length in (312, 1024):
+            with self.subTest(length=length):
+                world = World(); world.refs[ref] = dict(ref_body(ref, request.producer_sha), node_id="N" * length)
+                client = self.client(publisher=True, world=world)
+                self.assertEqual(client.publish_intent(request).marker_ref, ref)
+                self.assertEqual(world.post_count, 0)
+                self.assertEqual(client.budget.commands, 6)
+
+    def test_invalid_node_metadata_refuses_existing_and_created_refs(self):
+        request = fixtures.request(); ref = policy.marker_ref(request)
+        original = ref_body
+        invalid = ("", "N" * 1025, True, 312, None, [], {}, "N N", "N\tN", "N\nN", "N\rN",
+                   "N\0N", "N\x1fN", "N\x7fN", "N\u0080N", "N\ufffdN")
+        for existing in (False, True):
+            for node in invalid:
+                with self.subTest(existing=existing, node=repr(node)[:60]):
+                    world = World(); client = self.client(publisher=True, world=world)
+                    if existing: world.refs[ref] = dict(original(ref, request.producer_sha), node_id=node)
+                    def response(name, sha): return dict(original(name, sha), node_id=node)
+                    with mock.patch.dict(globals(), {"ref_body": response}):
+                        self.refused(client, lambda: client.publish_intent(request))
+                    self.assertEqual(world.post_count, 0 if existing else 1)
+                    before = len(world.calls)
+                    self.refused(client, lambda: client.publish_intent(request))
+                    self.assertEqual(len(world.calls), before)
+
+    def test_long_node_readback_change_refuses_without_another_post(self):
+        request = fixtures.request(); ref = policy.marker_ref(request)
+        original = ref_body
+        for length in (312, 1024):
+            with self.subTest(length=length):
+                world = World(); client = self.client(publisher=True, world=world)
+                def response(name, sha): return dict(original(name, sha), node_id="N" * length)
+                def after(key):
+                    if key == ("POST", policy.API + "/git/refs"):
+                        world.refs[ref]["node_id"] = "M" + "N" * (length - 1)
+                world.after = after
+                with mock.patch.dict(globals(), {"ref_body": response}):
+                    self.refused(client, lambda: client.publish_intent(request))
+                self.assertEqual(world.post_count, 1)
+                self.assertEqual(client.budget.commands, 6)
+
+    def test_long_node_does_not_relax_ref_object_or_closed_body_bindings(self):
+        request = fixtures.request(); ref = policy.marker_ref(request)
+        for fault in ("ref", "url", "type", "sha", "object-url", "extra", "object-extra"):
+            with self.subTest(fault=fault):
+                world = World(); value = dict(ref_body(ref, request.producer_sha), node_id="N" * 1024)
+                if fault == "ref": value["ref"] = "refs/tags/other"
+                elif fault == "url": value["url"] += "-other"
+                elif fault == "type": value["object"]["type"] = "tag"
+                elif fault == "sha": value["object"]["sha"] = "b" * 40
+                elif fault == "object-url": value["object"]["url"] += "-other"
+                elif fault == "extra": value["extra"] = "unexpected"
+                else: value["object"]["extra"] = "unexpected"
+                world.refs[ref] = value
+                client = self.client(publisher=True, world=world)
+                self.refused(client, lambda: client.publish_intent(request))
+                self.assertEqual(world.post_count, 0)
 
     def test_create_once_exact_fields_readback_and_final_rule(self):
         client = self.client(publisher=True); request = fixtures.request()
