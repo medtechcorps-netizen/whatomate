@@ -1869,5 +1869,286 @@ class CompleteRelationProfileSourcePolicyTests(unittest.TestCase):
                 sc.classify_v2(self.repo.root, base, head)
 
 
+class FixedRemovesWriteCISourceTests(unittest.TestCase):
+    """Immutable Git cases, not a measured Go closure or seed execution claim."""
+
+    POSTGRES = "internal/database/postgres.go"
+    NAME = "SeedSystemRolesForAllOrgs"
+    CHILD = NAME + "/legacy-super-admin-update"
+    BINDINGS = "internal/dbcatalog/registry/coordinator_bindings.json"
+    REASON = "migration-path-changed:" + POSTGRES + "#" + NAME
+    BEFORE_FUNCTION = 'func SeedSystemRolesForAllOrgs(db *gorm.DB) error {\n\tvar orgs []models.Organization\n\tif err := db.Scopes(ExcludePlatformComplianceOrganizations).Find(&orgs).Error; err != nil {\n\t\treturn fmt.Errorf("failed to fetch organizations: %w", err)\n\t}\n\n\tfor _, org := range orgs {\n\t\tif err := seedSystemRolesForOrg(db, org.ID, false); err != nil {\n\t\t\treturn fmt.Errorf("failed to seed roles for org %s: %w", org.ID, err)\n\t\t}\n\t}\n\n\t// Fix any system roles that don\'t have permissions linked\n\tif err := FixSystemRolePermissions(db); err != nil {\n\t\treturn fmt.Errorf("failed to fix role permissions: %w", err)\n\t}\n\n\t// Remove the legacy sensitive Settings grants from system manager roles\n\t// exactly once per organization. The version marker prevents a later\n\t// explicit super-admin grant from being removed on restart.\n\tif err := ApplyManagerSettingsPolicyMigration(db); err != nil {\n\t\treturn fmt.Errorf("failed to apply manager settings policy: %w", err)\n\t}\n\n\t// Migrate existing users from old role column to new role_id\n\tif err := MigrateExistingUserRoles(db); err != nil {\n\t\treturn fmt.Errorf("failed to migrate user roles: %w", err)\n\t}\n\n\t// Make admin@admin.com a super admin if exists\n\tif err := db.Exec("UPDATE users SET is_super_admin = true WHERE email = \'admin@admin.com\'").Error; err != nil {\n\t\treturn fmt.Errorf("failed to set super admin: %w", err)\n\t}\n\n\treturn nil\n}'
+    REMOVED = '\t// Make admin@admin.com a super admin if exists\n\tif err := db.Exec("UPDATE users SET is_super_admin = true WHERE email = \'admin@admin.com\'").Error; err != nil {\n\t\treturn fmt.Errorf("failed to set super admin: %w", err)\n\t}\n\n'
+    OLD_HASH = "8d0b423d4384c1f4427fbe3f0118e98a3ccdcb2ad24b9f29520111ad346f95e1"
+    CHILDREN = ["seedSystemRolesForOrg", "FixSystemRolePermissions",
+                "ApplyManagerSettingsPolicyMigration", "MigrateExistingUserRoles"]
+    RATIONALE = "removes-write: legacy admin@admin.com escalation removed at rev 2; retained inert marker bound to parent closure"
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.repo = support.TempRepo(Path(temp.name) / "repo")
+        self.old_source = "package database\n\n" + self.BEFORE_FUNCTION + "\n\nfunc unrelated() {}\n"
+        self.new_source = self.old_source.replace(self.REMOVED, "", 1)
+        # Independently embedded reviewed source preimage; never copy the gate's
+        # expected source/hash or derive the old function from its new result.
+        self.assertEqual(hashlib.sha256(self.BEFORE_FUNCTION.encode()).hexdigest(),
+                         "4f2f5aa66866133bb2e5cc01a30ed2f726649e660c2bd8a75c6fdcdbd5401b34")
+        self.assertEqual(self.BEFORE_FUNCTION.count(self.REMOVED), 1)
+        self.active = {path: (ROOT / path).read_text(encoding="utf-8") for path in (
+            sc.CATALOG, sc.HISTORY, sc.GLOBALS, sc.SEEDS,
+            "internal/dbcatalog/golden/production-v0.json", "internal/dbcatalog/shape/production-v0.sql")}
+        rows = json.loads((ROOT / sc.REGISTRY).read_bytes())
+        for entry in rows:
+            if entry["id"] in (self.NAME, self.CHILD):
+                entry.update(rev=1, closure_sha256=self.OLD_HASH)
+        self.old_rows = rows
+        self.new_rows = json.loads(text(rows))
+        # A coherent synthetic claim only; real PR17 hashes require Go CI.
+        for entry in self.new_rows:
+            if entry["id"] in (self.NAME, self.CHILD):
+                entry.update(rev=2, closure_sha256=hashlib.sha256(self.new_source.encode()).hexdigest())
+        bindings = json.loads((ROOT / self.BINDINGS).read_bytes())
+        bindings["seed_child_order"] = [*self.CHILDREN, "legacy-super-admin-update"]
+        bindings["inline_sql"] = "UPDATE users SET is_super_admin = true WHERE email = 'admin@admin.com'"
+        bindings["idempotency_rationale"][self.CHILD] = "Existing inline UPDATE sets the same boolean; no permission-policy endorsement"
+        self.old_binding = bindings
+        self.new_binding = json.loads(text(bindings))
+        self.new_binding.update(seed_child_order=self.CHILDREN, inline_sql="")
+        self.new_binding["idempotency_rationale"][self.CHILD] = self.RATIONALE
+        self.old_migration = json.loads((ROOT / sc.MIGRATION_PATH).read_bytes())
+        self.old_migration["closure_sha256"] = H
+        self.new_migration = {**self.old_migration, "closure_sha256": J}
+        self.files = {**self.active, self.POSTGRES: self.old_source,
+            sc.REGISTRY: text(self.old_rows), self.BINDINGS: text(self.old_binding),
+            sc.MIGRATION_PATH: text(self.old_migration),
+            "internal/dbcatalog/registry/registry_test.go": "package registry\n", "README.md": "before\n"}
+        self.target = {self.POSTGRES: self.new_source, sc.REGISTRY: text(self.new_rows),
+                       self.BINDINGS: text(self.new_binding), sc.MIGRATION_PATH: text(self.new_migration)}
+        self.base = self.repo.commit(self.files, "reviewed synthetic before")
+
+    def head(self, extra=None):
+        self.repo.checkout(self.base)
+        return self.repo.commit({**self.target, **(extra or {})}, "synthetic removal")
+
+    def refused(self, head, base=None):
+        result = sc.check_ci_source(self.repo.root, base or self.base, head)
+        self.assertIn(self.REASON, result)
+        return result
+
+    def test_exact_removal_admits_only_ci_and_preserves_release_refusal(self):
+        head = self.head()
+        self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+        policy = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual((policy.kind, policy.dormant, policy.reasons), ("data", True, ()))
+        self.assertEqual(policy.requirements, ("compat-required", "generated-migration-closure-ci"))
+        self.assertEqual(sc.check(self.repo.root, self.base, head), ("migration-path-changed:closure",))
+        with self.assertRaises(sc.SchemaChangeBlocked):
+            sc.guard(self.repo.root, self.base, head)
+
+    def test_allowed_test_commits_surround_one_atomic_transition(self):
+        self.repo.commit({"internal/database/catalog_legacy_admin_test.go": "package database\n"})
+        self.repo.commit(self.target)
+        head = self.repo.commit({"release/deployment/fixtures/classifier/pr17-rev-bump.json": "{}\n",
+            "release/deployment/fixtures/classifier/pr17-no-rev-refused.json": "{}\n",
+            "internal/dbcatalog/registry/registry_test.go": "package registry\n// rev 2 contract\n"})
+        self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+
+    def test_unrelated_legacy_clean_source_path_keeps_existing_behavior(self):
+        head = self.repo.commit({self.POSTGRES: self.old_source.replace("func unrelated() {}", "func unrelated() { println(2) }")})
+        self.assertEqual(sc.check(self.repo.root, self.base, head), ())
+        self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+
+    def test_stale_manifest_cannot_hide_target_behind_clean_fast_path(self):
+        head = self.head({sc.MIGRATION_PATH: text(self.old_migration)})
+        self.assertEqual(sc.check(self.repo.root, self.base, head), ())
+        self.refused(head)
+
+    def test_missing_or_invalid_paired_revision_refuses(self):
+        for names, value in (((self.NAME,), 1), ((self.CHILD,), 1), ((self.NAME, self.CHILD), 1),
+                             ((self.NAME,), True), ((self.CHILD,), 3), ((self.NAME,), 0)):
+            with self.subTest(names=names, value=value):
+                rows = json.loads(text(self.new_rows))
+                for entry in rows:
+                    if entry["id"] in names:
+                        entry["rev"] = value
+                self.refused(self.head({sc.REGISTRY: text(rows)}))
+
+    def test_complete_registry_identity_order_and_unrelated_rows_refuse(self):
+        mutations = []
+        rows = json.loads(text(self.new_rows)); rows = [r for r in rows if r["id"] != self.CHILD]; mutations.append(rows)
+        rows = json.loads(text(self.new_rows)); rows.reverse(); mutations.append(rows)
+        rows = json.loads(text(self.new_rows)); rows.append({**rows[0], "id": "UnreviewedHistoricalID"}); mutations.append(rows)
+        rows = json.loads(text(self.new_rows)); next(r for r in rows if r["id"] not in (self.NAME,self.CHILD))["rev"] += 1; mutations.append(rows)
+        for rows in mutations:
+            with self.subTest(ids=[r["id"] for r in rows]):
+                self.refused(self.head({sc.REGISTRY: text(rows)}))
+
+    def test_parent_child_security_and_closure_metadata_refuse(self):
+        variants = (("func", "example.invalid.Other"), ("kind", "baseline-pre-ledger"), ("baseline", False),
+                    ("idempotent", False), ("n1_safe", True), ("requires_gates", ["new-gate"]),
+                    ("closure_files", ["internal/database/postgres.go"]), ("parent", "Other"))
+        for field, value in variants:
+            with self.subTest(field=field):
+                rows = json.loads(text(self.new_rows))
+                next(r for r in rows if r["id"] == self.CHILD)[field] = value
+                self.refused(self.head({sc.REGISTRY: text(rows)}))
+
+    def test_old_claims_must_also_have_reviewed_parent_child_semantics(self):
+        for field, value in (("n1_safe", True), ("idempotent", False), ("parent", "Other")):
+            with self.subTest(field=field):
+                self.repo.checkout(self.base)
+                old, new = json.loads(text(self.old_rows)), json.loads(text(self.new_rows))
+                for rows in (old, new):
+                    next(r for r in rows if r["id"] == self.CHILD)[field] = value
+                base = self.repo.commit({sc.REGISTRY: text(old)})
+                head = self.repo.commit({**self.target, sc.REGISTRY: text(new)})
+                self.refused(head, base)
+
+    def test_shared_closure_hashes_must_agree_and_advance(self):
+        for names, digest in (((self.CHILD,), H), ((self.NAME, self.CHILD), self.OLD_HASH)):
+            with self.subTest(names=names):
+                rows = json.loads(text(self.new_rows))
+                for entry in rows:
+                    if entry["id"] in names: entry["closure_sha256"] = digest
+                self.refused(self.head({sc.REGISTRY: text(rows)}))
+
+    def test_noop_source_with_plausible_generated_claims_is_not_allowed(self):
+        head = self.head({self.POSTGRES: self.old_source})
+        self.assertTrue(sc.check_ci_source(self.repo.root, self.base, head))
+
+    def test_altered_function_is_not_a_removal(self):
+        for source in (self.old_source.replace("admin@admin.com", "another@example.invalid"),
+                       self.old_source.replace("is_super_admin = true", "is_super_admin = false"),
+                       self.new_source.replace("return nil", "return err", 1),
+                       self.new_source.replace("FixSystemRolePermissions", "UnreviewedWriter")):
+            with self.subTest(source=hashlib.sha256(source.encode()).hexdigest()):
+                self.refused(self.head({self.POSTGRES: source}))
+
+    def test_removal_does_not_allow_other_file_remainder_changes(self):
+        for source in (self.new_source + "func addedWriter() {}\n",
+                       self.new_source.replace("package database", 'package database\nimport "unsafe"'),
+                       self.new_source.replace("func unrelated() {}", "func unrelated() { println(3) }")):
+            with self.subTest(source=hashlib.sha256(source.encode()).hexdigest()):
+                self.refused(self.head({self.POSTGRES: source}))
+
+    def test_missing_duplicate_and_malformed_target_refuse(self):
+        for source in (None, "package database\n", self.new_source + self.BEFORE_FUNCTION,
+                       "package database\nfunc SeedSystemRolesForAllOrgs( {\n"):
+            with self.subTest(source=source is None):
+                self.refused(self.head({self.POSTGRES: source}))
+
+    def test_exact_coordinator_transform_is_required(self):
+        for field, value in (("inline_sql", self.old_binding["inline_sql"]),
+                             ("seed_child_order", self.old_binding["seed_child_order"]),
+                             ("seed_child_calls", self.CHILDREN[:-1]),
+                             ("coordinator_sha256", H), ("callback_sha256", J),
+                             ("model_descriptors", []), ("version", True)):
+            with self.subTest(field=field):
+                binding = {**self.new_binding, field: value}
+                self.refused(self.head({self.BINDINGS: text(binding)}))
+        binding = json.loads(text(self.new_binding)); binding["idempotency_rationale"][self.CHILD] = "removes-write"
+        self.refused(self.head({self.BINDINGS: text(binding)}))
+
+    def test_incomplete_coordinator_cannot_be_retained_at_both_endpoints(self):
+        for key in ("coordinator_sha256", "callback_calls", "model_list_sha256"):
+            with self.subTest(key=key):
+                self.repo.checkout(self.base)
+                old, new = dict(self.old_binding), dict(self.new_binding)
+                del old[key]; del new[key]
+                base = self.repo.commit({self.BINDINGS: text(old)})
+                head = self.repo.commit({**self.target, self.BINDINGS: text(new)})
+                self.refused(head, base)
+
+    def test_changed_before_function_is_not_the_reviewed_preimage(self):
+        before = self.old_source.replace("FixSystemRolePermissions", "OtherSeedWriter")
+        base = self.repo.commit({self.POSTGRES: before})
+        head = self.repo.commit({**self.target, self.POSTGRES: before.replace(self.REMOVED, "", 1)})
+        self.refused(head, base)
+
+    def test_migration_roots_files_and_hash_must_match_fixed_transition(self):
+        for change in ({"roots": self.new_migration["roots"][:-1]},
+                       {"closure_files": self.new_migration["closure_files"][:-1]},
+                       {"closure_sha256": H}, {"version": True}):
+            with self.subTest(change=tuple(change)):
+                self.refused(self.head({sc.MIGRATION_PATH: text({**self.new_migration, **change})}))
+
+    def test_active_material_must_be_present_nonempty_byte_equal(self):
+        for path in self.active:
+            with self.subTest(path=path):
+                self.refused(self.head({path: self.active[path] + "\n"}))
+                self.refused(self.head({path: None}))
+        for path in ("internal/dbcatalog/golden/production-v0.json", "internal/dbcatalog/shape/production-v0.sql"):
+            with self.subTest(empty=path):
+                self.repo.checkout(self.base)
+                base = self.repo.commit({path: ""})
+                head = self.repo.commit(self.target)
+                self.refused(head, base)
+
+    def test_no_other_production_policy_configuration_or_workflow_edit(self):
+        for path in ("internal/config/config.go", "internal/models/models.go", "internal/database/tenant.go",
+                     "cmd/whatomate/main.go", "go.mod", ".github/workflows/test.yml", ".gitattributes",
+                     "release/deployment/schema_change.py", "README.md"):
+            with self.subTest(path=path):
+                self.refused(self.head({path: "unreviewed\n"}))
+
+    def test_pending_and_source_declarations_cannot_be_retained_or_added(self):
+        paths = ("internal/dbcatalog/golden/pending/example.json", sc.schema_nullable.SOURCE_PATH,
+                 sc.schema_nullable.CONSTANT_SOURCE_PATH, sc.schema_index.SOURCE_PATH,
+                 sc.schema_relation.SOURCE_PATH, sc.schema_tenant_profile.SOURCE_PATH)
+        for path in paths:
+            with self.subTest(path=path):
+                self.refused(self.head({path: "{}\n"}))
+                self.repo.checkout(self.base)
+                base = self.repo.commit({path: "{}\n"})
+                head = self.repo.commit(self.target)
+                self.refused(head, base)
+
+    def test_missing_or_malformed_generated_documents_refuse(self):
+        for path in (sc.REGISTRY, sc.MIGRATION_PATH, self.BINDINGS):
+            for raw in (None, "{", '{"version":1,"version":1}\n'):
+                with self.subTest(path=path, raw=raw):
+                    self.refused(self.head({path: raw}))
+
+    def test_active_engine_cannot_enter_dormant_exception(self):
+        active_history = json.loads(self.active[sc.HISTORY])
+        active_history[-1]["apply_engine"] = True
+        base = self.repo.commit({sc.HISTORY: text(active_history)})
+        head = self.repo.commit(self.target)
+        self.refused(head, base)
+
+    def test_partial_first_parent_generated_state_refuses(self):
+        self.repo.commit({self.POSTGRES: self.new_source})
+        head = self.repo.commit(self.target)
+        self.refused(head)
+
+    def test_intermediate_wrong_registry_metadata_cannot_be_restored(self):
+        rows = json.loads(text(self.new_rows)); rows.reverse()
+        self.repo.commit({**self.target, sc.REGISTRY: text(rows)})
+        self.refused(self.repo.commit(self.target))
+
+    def test_atomic_state_cannot_revert_then_reapply(self):
+        self.repo.commit(self.target)
+        self.repo.commit({path: self.files[path] for path in self.target})
+        self.refused(self.repo.commit(self.target))
+
+    def test_transient_unapproved_source_change_cannot_be_laundered(self):
+        self.repo.commit({"internal/config/config.go": "package config\n"})
+        self.refused(self.repo.commit({**self.target, "internal/config/config.go": None}))
+
+    def test_generated_contract_removal_reintroduction_refuses(self):
+        self.repo.commit({sc.MIGRATION_PATH: None})
+        self.refused(self.repo.commit(self.target))
+
+    def test_changed_regular_file_mode_is_not_a_byte_only_removal(self):
+        self.head()
+        self.repo.git("update-index", "--chmod=+x", self.POSTGRES)
+        self.repo.git("commit", "--quiet", "-m", "unsupported mode")
+        self.refused(self.repo.head())
+
+    def test_full_overcap_document_uses_existing_blob_bound(self):
+        self.refused(self.head({self.BINDINGS: " " * (sc.MAX_ARTIFACT_BYTES + 1)}))
+
+
 if __name__ == "__main__":
     unittest.main()

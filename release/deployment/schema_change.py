@@ -1376,15 +1376,159 @@ def _classify_v2(repo: _Repository, base: str, head: str,
     return PolicyClassification(kind, dormant, tuple(sorted(reasons)), tuple(summary), migrations, tuple(sorted(requirements)))
 
 
+# One source-only removes-write exception, not generic dormant-data admission.
+_CI_SEED_PATH = "internal/database/postgres.go"
+_CI_SEED_NAME = "SeedSystemRolesForAllOrgs"
+_CI_SEED_CHILD = _CI_SEED_NAME + "/legacy-super-admin-update"
+_CI_SEED_BINDINGS = "internal/dbcatalog/registry/coordinator_bindings.json"
+_CI_SEED_REASON = "migration-path-changed:" + _CI_SEED_PATH + "#" + _CI_SEED_NAME
+_CI_SEED_SQL = "UPDATE users SET is_super_admin = true WHERE email = 'admin@admin.com'"
+_CI_SEED_REMOVAL = (
+    "\t// Make admin@admin.com a super admin if exists\n"
+    '\tif err := db.Exec("' + _CI_SEED_SQL + '").Error; err != nil {\n'
+    '\t\treturn fmt.Errorf("failed to set super admin: %w", err)\n'
+    "\t}\n\n"
+)
+_CI_SEED_ROLES = (_CI_SEED_PATH, REGISTRY, MIGRATION_PATH, _CI_SEED_BINDINGS)
+_CI_SEED_PATHS = (
+    *(("M", path) for path in _CI_SEED_ROLES),
+    ("M", "internal/dbcatalog/registry/registry_test.go"),
+    ("A", "internal/database/catalog_legacy_admin_test.go"),
+    ("A", "release/deployment/fixtures/classifier/pr17-rev-bump.json"),
+    ("A", "release/deployment/fixtures/classifier/pr17-no-rev-refused.json"),
+)
+
+
+def _ci_seed_changed(repo: _Repository, base: str, head: str) -> bool:
+    if not any(path == _CI_SEED_PATH for _, path in changed_paths(repo.root, base, head)):
+        return False
+    before = _function_bytes(repo.text(base, _CI_SEED_PATH), _CI_SEED_NAME)
+    after = _function_bytes(repo.text(head, _CI_SEED_PATH), _CI_SEED_NAME)
+    return before != after or len(before) > 1 or len(after) > 1
+
+
+def _ci_seed_paths(repo: _Repository, base: str, head: str, *, complete: bool = False) -> None:
+    changes = changed_paths(repo.root, base, head)
+    _valid(len(changes) <= 10000 and len(changes) == len(set(changes))
+           and all(change in _CI_SEED_PATHS for change in changes))
+    if complete:
+        _valid(all(("M", path) in changes for path in _CI_SEED_ROLES))
+    for status, path in changes:
+        # Reject mode-only/type changes too; all reviewed source inputs are 644.
+        for revision in ((head,) if status == "A" else (base, head)):
+            raw = _git(repo.root, ["ls-tree", "-z", revision, "--", path])
+            _valid(re.fullmatch(rb"100644 blob [0-9a-f]{40}\t" + re.escape(path.encode()) + rb"\x00", raw) is not None)
+            _valid(type(repo.blob(revision, path)) is bytes)
+
+
+def _ci_seed_removal(repo: _Repository, base: str, head: str, legacy: Classification) -> None:
+    _valid(legacy.reasons == ("migration-path-changed:closure",))
+    policy = _classify_v2(repo, base, head, legacy)
+    _valid(not policy.reasons and policy.kind == "data" and policy.dormant is True
+           and policy.requirements == ("compat-required", "generated-migration-closure-ci")
+           and policy.migration_changes == ("generated migration closure changed",))
+    before, after = (repo.text(rev, _CI_SEED_PATH) for rev in (base, head))
+    old_fn, new_fn = (_function_bytes(raw, _CI_SEED_NAME) for raw in (before, after))
+    _valid(len(old_fn) == len(new_fn) == 1)
+    _valid(hashlib.sha256(old_fn[0].encode()).hexdigest() ==
+           "4f2f5aa66866133bb2e5cc01a30ed2f726649e660c2bd8a75c6fdcdbd5401b34"
+           and hashlib.sha256(new_fn[0].encode()).hexdigest() ==
+           "4691de0f24459d4274cc553df2cd6cb6f08eff32648df3de93ad72fad92ac5bd")
+    _valid(before.count(_CI_SEED_REMOVAL) == old_fn[0].count(_CI_SEED_REMOVAL) == 1
+           and after == before.replace(_CI_SEED_REMOVAL, "", 1))
+
+    old_rows = repo.document(base, REGISTRY, _registry)
+    new_rows = repo.document(head, REGISTRY, _registry)
+    _valid([row["id"] for row in old_rows] == [row["id"] for row in new_rows])
+    old = {row["id"]: row for row in old_rows}
+    new = {row["id"]: row for row in new_rows}
+    _valid({name for name in old if old[name] != new[name]} == {_CI_SEED_NAME, _CI_SEED_CHILD})
+    for name in (_CI_SEED_NAME, _CI_SEED_CHILD):
+        left, right = old[name], new[name]
+        _valid(left["rev"] == 1 and right["rev"] == 2
+               and left["func"] == "github.com/shridarpatil/whatomate/internal/database.SeedSystemRolesForAllOrgs"
+               and left["kind"] == "seed-reconciler" and left["baseline"] is True
+               and left["idempotent"] is (name == _CI_SEED_CHILD)
+               and left["n1_safe"] is False and left["requires_gates"] == []
+               and ((name == _CI_SEED_NAME and "parent" not in left)
+                    or (name == _CI_SEED_CHILD and left.get("parent") == _CI_SEED_NAME))
+               and {k: v for k, v in left.items() if k not in {"rev", "closure_sha256"}}
+                   == {k: v for k, v in right.items() if k not in {"rev", "closure_sha256"}})
+    _valid(old[_CI_SEED_NAME]["closure_sha256"] == old[_CI_SEED_CHILD]["closure_sha256"]
+           and new[_CI_SEED_NAME]["closure_sha256"] == new[_CI_SEED_CHILD]["closure_sha256"]
+           and old[_CI_SEED_NAME]["closure_sha256"] != new[_CI_SEED_NAME]["closure_sha256"])
+    # The real generator must still prove these claimed closure digests.
+    old_contract = repo.document(base, MIGRATION_PATH, lambda _: None)
+    new_contract = repo.document(head, MIGRATION_PATH, lambda _: None)
+    _valid(old_contract["roots"] == new_contract["roots"] == MIGRATION_ROOTS
+           and old_contract["closure_files"] == new_contract["closure_files"]
+           and old_contract["closure_sha256"] != new_contract["closure_sha256"])
+
+    old_binding = repo.document(base, _CI_SEED_BINDINGS, lambda _: None)
+    new_binding = repo.document(head, _CI_SEED_BINDINGS, lambda _: None)
+    _valid(type(old_binding) is dict and set(old_binding) == {
+        "version", "execution_labels", "model_descriptors", "model_list_sha256",
+        "coordinator_sha256", "coordinator_calls", "seed_child_calls", "seed_child_order",
+        "inline_sql", "callbacks", "callback_calls", "callback_sha256",
+        "idempotency_rationale", "n1_safety_note", "child_semantics"})
+    children = ["seedSystemRolesForOrg", "FixSystemRolePermissions",
+                "ApplyManagerSettingsPolicyMigration", "MigrateExistingUserRoles"]
+    _valid(type(old_binding) is dict and type(old_binding.get("version")) is int
+           and old_binding["version"] == 1 and old_binding["seed_child_order"] == [*children, "legacy-super-admin-update"]
+           and old_binding["seed_child_calls"] == children and old_binding["inline_sql"] == _CI_SEED_SQL
+           and old_binding["idempotency_rationale"][_CI_SEED_CHILD] ==
+               "Existing inline UPDATE sets the same boolean; no permission-policy endorsement")
+    expected = {**old_binding, "seed_child_order": children, "inline_sql": "",
+                "idempotency_rationale": {**old_binding["idempotency_rationale"], _CI_SEED_CHILD:
+                    "removes-write: legacy admin@admin.com escalation removed at rev 2; retained inert marker bound to parent closure"}}
+    _valid(common.canonical_file_bytes(expected) == common.canonical_file_bytes(new_binding))
+
+    for path in (CATALOG, HISTORY, GLOBALS, GOLDEN + "production-v0.json",
+                 "internal/dbcatalog/shape/production-v0.sql", SEEDS):
+        left, right = repo.blob(base, path), repo.blob(head, path)
+        _valid(type(left) is bytes and bool(left) and left == right)
+    for revision in (base, head):
+        _valid(not _git(repo.root, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING.rstrip("/")]))
+        for path in (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
+                     schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH):
+            _valid(repo.blob(revision, path) is None)
+    _ci_seed_paths(repo, base, head, complete=True)
+    raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+    _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+    revisions = raw.decode("ascii").splitlines()
+    _valid(0 < len(revisions) <= MAX_HISTORY_COMMITS and len(set(revisions)) == len(revisions)
+           and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+           and revisions[-1] == head)
+    old_state = tuple(repo.blob(base, path) for path in _CI_SEED_ROLES)
+    new_state = tuple(repo.blob(head, path) for path in _CI_SEED_ROLES)
+    prior, advanced = base, False
+    for revision in revisions:
+        _ci_seed_paths(repo, prior, revision)
+        state = tuple(repo.blob(revision, path) for path in _CI_SEED_ROLES)
+        _valid(state == new_state or (not advanced and state == old_state))
+        advanced = advanced or state == new_state
+        prior = revision
+    _valid(advanced)
+
+
 def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
     """CI source eligibility only; generated tests AND exact compat must pass.
 
-    Preserve legacy clean/refused decisions except the sole endpoint closure
-    reason under the existing none-class source contract. This does not grant
+    Preserve the existing none-class source contract and admit only the fixed
+    legacy escalation removal; incomplete target edits refuse. This does not grant
     experiment, merge or release authority, or change check()/guard().
     """
     repo = _Repository(repo_dir)
     legacy = _classify(repo, base, head)
+    # This fixed target must not disappear behind the legacy clean fast path
+    # when its generated manifest or paired registry revisions are stale.
+    try:
+        target_changed = _ci_seed_changed(repo, base, head)
+        if target_changed:
+            _ci_seed_removal(repo, base, head, legacy)
+            return ()
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {_CI_SEED_REASON}))
     if legacy.reasons != ("migration-path-changed:closure",):
         return legacy.reasons
     policy = _classify_v2(repo, base, head, legacy)
