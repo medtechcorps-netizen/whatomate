@@ -243,7 +243,10 @@ class CallerTests(unittest.TestCase):
         world.pairs[100, 1] = pair
         world.archives[identity] = raw, (100, 1)
         world.artifacts[100][0]['size_in_bytes'] = len(raw)
-        self.refused_in_plan_and_production('staging-bypass', mode='promote-without-staging')
+        absent_consumer = self.case.root / 'absent-consumer.json'
+        self.assertFalse(absent_consumer.exists())
+        with mock.patch.object(flow.ship_outage_compat.loader, '_POLICY_PATH', absent_consumer):
+            self.refused_in_plan_and_production('staging-bypass', mode='promote-without-staging')
 
     def image_only(self, *, restore):
         selected = (self.fixture.expected.resolved.latest if restore else

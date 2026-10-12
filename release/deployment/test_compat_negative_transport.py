@@ -133,7 +133,10 @@ class NegativeTransportTests(unittest.TestCase):
     def test_public_unconfigured_factories_precede_every_argument_effect(self):
         class Bomb:
             def __getattribute__(self, name): raise AssertionError("argument inspected")
-        with mock.patch.object(policy, "_INSTALLED_PRODUCER_SETUP", None):
+        absent_consumer = self.root / "absent-consumer.json"
+        self.assertFalse(absent_consumer.exists())
+        with mock.patch.object(policy, "_INSTALLED_PRODUCER_SETUP", None), \
+             mock.patch.object(outage_loader, "_POLICY_PATH", absent_consumer):
             for factory in (transport.open_reader, transport.open_publisher):
                 with self.subTest(factory=factory.__name__), mock.patch.object(transport, "_open", side_effect=AssertionError("client created")):
                     with self.assertRaisesRegex(policy.NegativeIndexRefusal, "^negative-index-unconfigured$"):
