@@ -382,6 +382,52 @@ class NegativeIndexTests(unittest.TestCase):
             with self.subTest(raw=raw[:80]), self.assertRaises(policy.NegativeIndexRefusal):
                 policy._http_frame(raw)
 
+    def test_created_location_requires_explicit_exact_201_context(self):
+        expected = "https://api.github.com" + policy.API + "/git/" + policy.marker_ref(request())
+        body = b'{"synthetic":true}\r\n'
+        headers = [(b"Content-Length", str(len(body)).encode()), (b"Location", expected.encode())]
+        for newline in (b"\r\n", b"\n"):
+            raw = http(201, body, newline=newline, headers=headers)
+            for framed in ((raw, raw.replace(b"\r\n", b"\n", 1)) if newline == b"\r\n" else (raw,)):
+                with self.subTest(newline=newline):
+                    status, found, parsed = policy._http_frame(framed, expected_created_location=expected)
+                    self.assertEqual((status, found, parsed[b"location"]), (201, body, expected.encode()))
+                    with self.assertRaises(policy.NegativeIndexRefusal): policy._http_frame(framed)
+        self.assertEqual(policy._http_frame(http(201), expected_created_location=expected)[0], 201)
+
+    def test_created_location_cannot_broaden_url_or_status(self):
+        expected = "https://api.github.com" + policy.API + "/git/" + policy.marker_ref(request())
+        wrong = ("", "/git/refs", expected + "?x=1", expected + "#x", expected + "/",
+                 expected + "-other", expected.replace("https:", "http:"),
+                 expected.replace("api.github.com", "api.github.com.evil.invalid"),
+                 expected.replace("whatomate", "other"), expected.replace("refs/tags", "refs%2Ftags"))
+        for value in wrong:
+            with self.subTest(location=value), self.assertRaises(policy.NegativeIndexRefusal):
+                policy._http_frame(http(201, headers=[(b"Location", value.encode())]), expected_created_location=expected)
+        for status in (200, 202, 301, 302, 307, 308, 404, 422, 503):
+            for headers in (None, [(b"Location", expected.encode())]):
+                with self.subTest(status=status, headers=headers), self.assertRaises(policy.NegativeIndexRefusal):
+                    policy._http_frame(http(status, headers=headers), expected_created_location=expected)
+                if headers:
+                    with self.assertRaises(policy.NegativeIndexRefusal): policy._http_frame(http(status, headers=headers))
+        for value in (True, 1, b"url", "", expected + "\u00e9", expected + "\n", expected + "-" * 1024,
+                      expected.replace("whatomate", "other"), expected + "?x=1"):
+            with self.subTest(expected=value), self.assertRaises(policy.NegativeIndexRefusal):
+                policy._http_frame(http(201), expected_created_location=value)
+
+    def test_created_location_preserves_duplicate_and_framing_refusals(self):
+        expected = "https://api.github.com" + policy.API + "/git/" + policy.marker_ref(request())
+        location = (b"Location", expected.encode())
+        bad = [http(201, headers=[location, (b"location", expected.encode())]),
+               http(201, headers=[location, (b"Transfer-Encoding", b"chunked")]),
+               http(201, headers=[location, (b"Content-Length", b"999")]),
+               http(201, b'{}\nHTTP/2.0 201 Created\n\n{}', headers=[location]),
+               http(201, b'{}\x00', headers=[location]),
+               http(201, headers=[location]).replace(b"\r\n", b"\r", 1)]
+        for raw in bad:
+            with self.subTest(raw=raw[:80]), self.assertRaises(policy.NegativeIndexRefusal):
+                policy._http_frame(raw, expected_created_location=expected)
+
     def test_http_malformed_success_payload_does_not_synthesize_unavailability(self):
         for body in (b"not-json",wire({"message":"unknown"}),wire({"total_count":True,"workflow_runs":[]}),
                      wire({"total_count":1,"workflow_runs":[{},{}]}),wire({"total_count":0,"workflow_runs":[{}]})):

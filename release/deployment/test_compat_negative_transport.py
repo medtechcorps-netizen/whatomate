@@ -353,6 +353,54 @@ class NegativeTransportTests(unittest.TestCase):
         self.refused(client, lambda: client.publish_intent(request))
         self.assertEqual(self.world.post_count, 1)
 
+    def test_create_exact_location_keeps_single_post_readback_and_final_rule(self):
+        request = fixtures.request(); ref = policy.marker_ref(request)
+        expected = "https://api.github.com" + policy.API + "/git/" + ref
+        self.world.overrides[("POST", policy.API + "/git/refs")] = lambda result: replace(result,
+            stdout=result.stdout.replace(b"\r\n\r\n", b"\r\nLocation: " + expected.encode() + b"\r\n\r\n"))
+        client = self.client(publisher=True)
+        self.assertEqual(client.publish_intent(request).marker_ref, ref)
+        self.assertEqual(self.world.post_count, 1)
+        self.assertEqual(client.budget.commands, 7)
+        self.assertEqual(self.world.calls[-1][0][6], policy.API + "/rulesets/" + str(client.setup.rule_id))
+        self.refused(client, lambda: client.publish_intent(request))
+        self.assertEqual(self.world.post_count, 1)
+
+    def test_create_location_refusal_is_sticky_and_body_authority_stays_exact(self):
+        request = fixtures.request(); ref = policy.marker_ref(request)
+        expected = "https://api.github.com" + policy.API + "/git/" + ref
+        for fault in ("wrong-location", "wrong-body", "stderr", "exit", "status", "readback", "rule"):
+            with self.subTest(fault=fault):
+                world = World(); client = self.client(publisher=True, world=world)
+                def override(result):
+                    body = ref_body(ref, request.producer_sha)
+                    if fault == "wrong-body": body["object"]["sha"] = "b" * 40
+                    raw = http(200 if fault == "status" else 201, body)
+                    url = expected + "-other" if fault == "wrong-location" else expected
+                    raw = raw.replace(b"\r\n\r\n", b"\r\nLocation: " + url.encode() + b"\r\n\r\n")
+                    if fault == "readback": world.refs[ref]["node_id"] = "changed-node"
+                    if fault == "rule": world.rule += b" "
+                    return rt.runtime.Capture(1 if fault == "exit" else 0, raw, b"error" if fault == "stderr" else b"")
+                world.overrides[("POST", policy.API + "/git/refs")] = override
+                self.refused(client, lambda: client.publish_intent(request))
+                self.assertEqual(world.post_count, 1)
+                before = len(world.calls)
+                self.refused(client, lambda: client.publish_intent(request))
+                self.assertEqual(len(world.calls), before)
+
+    def test_location_on_exact_get_remains_refused(self):
+        request = fixtures.request(); ref = policy.marker_ref(request)
+        for present in (False, True):
+            with self.subTest(existing=present):
+                world = World()
+                if present: world.refs[ref] = ref_body(ref, request.producer_sha)
+                path = policy.API + "/git/ref/" + ref[5:]
+                world.overrides[("GET", path)] = lambda result: replace(result, stdout=result.stdout.replace(
+                    b"\r\n\r\n", b"\r\nLocation: https://api.github.com" + policy.API.encode() + b"/git/" + ref.encode() + b"\r\n\r\n"))
+                client = self.client(publisher=True, world=world)
+                self.refused(client, lambda: client.publish_intent(request))
+                self.assertEqual(world.post_count, 0)
+
     def test_existing_exact_marker_is_idempotent_and_still_reread(self):
         request = fixtures.request(); ref = policy.marker_ref(request)
         self.world.refs[ref] = ref_body(ref, request.producer_sha)

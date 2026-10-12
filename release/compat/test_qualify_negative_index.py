@@ -197,6 +197,51 @@ class QualificationTests(unittest.TestCase):
         with mock.patch.dict(globals(), {"http": gh_include}):
             self.test_real_validator_and_real_publisher_composition_with_one_token()
 
+    def test_both_exact_created_locations_complete_real_composition(self):
+        original_http = http
+        created = []
+        def gh_include(status, value):
+            raw = original_http(status, value).replace(b"\r\n", b"\n", 1)
+            if status == 201:
+                created.append(value["ref"])
+                url = "https://api.github.com" + policy.API + "/git/" + value["ref"]
+                raw = raw.replace(b"\r\n\r\n", b"\r\nLocation: " + url.encode() + b"\r\n\r\n")
+            return raw
+        with mock.patch.dict(globals(), {"http": gh_include}):
+            self.test_real_validator_and_real_publisher_composition_with_one_token()
+        self.assertEqual(len(created), 2)
+        self.assertEqual(created[0], f"refs/tags/{policy.PREFIX}probe-123456789-1-permissions")
+        self.assertTrue(created[1].startswith("refs/tags/" + policy.PREFIX + q.Q + "-"))
+
+    def _refuse_created_location(self, *, marker=False, wrong_body=False):
+        original_http = http
+        def gh_include(status, value):
+            if status != 201: return original_http(status, value)
+            url = "https://api.github.com" + policy.API + "/git/" + value["ref"]
+            if (value["object"]["sha"] == q.Q) == marker:
+                if wrong_body:
+                    value = dict(value, object=dict(value["object"], sha="e" * 40))
+                else: url += "-wrong"
+            return original_http(status, value).replace(b"\r\n\r\n", b"\r\nLocation: " + url.encode() + b"\r\n\r\n")
+        with mock.patch.dict(globals(), {"http": gh_include}):
+            self.assertEqual(self.main(), 1)
+        writes = [row for row in self.capture.calls if "--method" in row and row[5] in ("POST", "PATCH", "DELETE")]
+        self.assertEqual([row[5] for row in writes], ["POST", "PATCH", "DELETE", "POST"] if marker else ["POST"])
+        self.assertEqual(self.github_output.read_bytes(), b"")
+        self.assertFalse((self.out / "result.json").exists())
+
+    def test_wrong_probe_location_stops_without_retry(self):
+        self._refuse_created_location()
+
+    def test_wrong_marker_location_stops_without_retry(self):
+        self._refuse_created_location(marker=True)
+
+    def test_exact_probe_location_cannot_authorize_wrong_body(self):
+        self._refuse_created_location(wrong_body=True)
+
+    def test_exact_marker_location_cannot_authorize_wrong_body(self):
+        self._refuse_created_location(marker=True, wrong_body=True)
+
     def test_absent_setup_has_zero_files_native_and_operational_import_effects(self):
         with mock.patch.object(policy, "_INSTALLED_PRODUCER_SETUP", None), \
              mock.patch.object(q, "modules", side_effect=AssertionError("operational import")):
