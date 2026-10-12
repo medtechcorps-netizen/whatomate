@@ -143,6 +143,35 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # Fresh independent allocators for the required equal-OID bootstrap refusal.
+      postgres_pair_a:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres_pair_b:
+        image: postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -154,6 +183,12 @@ jobs:
         with:
           go-version: "1.26.9"
           cache: true
+
+      - name: Run cross-server empty-bootstrap refusal
+        env:
+          TEST_BOOTSTRAP_PAIR_DATABASE_URL_A: postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable
+          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable
+        run: go test -mod=readonly -tags pr7_bootstrap_two_server -count=1 -v -timeout 5m ./internal/database -run '^TestTenantRLS_CatalogBootstrapCommandEqualOIDsAcrossServersRefusesBeforeWrites$'
 
       - name: Run PostgreSQL tenant isolation tests
         env:

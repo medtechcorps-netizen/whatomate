@@ -56,6 +56,8 @@ func main() {
 		runWorker(os.Args[2:])
 	case "rls-migrate":
 		runRLSMigration(os.Args[2:])
+	case "rls-bootstrap-empty":
+		runRLSBootstrapEmpty(os.Args[2:])
 	case "catalog-snapshot":
 		runCatalogSnapshot(os.Args[2:])
 	case "seed-klinik-relive-sales":
@@ -83,6 +85,7 @@ Commands:
   server    Start the API server (with optional embedded workers)
   worker    Start background workers only (no API server)
   rls-migrate  Run schema migrations and install PostgreSQL tenant RLS
+  rls-bootstrap-empty  Bootstrap an empty staging/test database; optional -production-shape v0
   catalog-snapshot  Compare database structure in a read-only transaction
   seed-klinik-relive-sales  Safely validate or apply Klinik Relive sales fixtures
   bootstrap-platform-compliance  Validate or apply platform compliance tenant markers
@@ -2080,4 +2083,123 @@ func corsWrapper(next fasthttp.RequestHandler, allowedOrigins map[string]bool) f
 
 		next(ctx)
 	}
+}
+
+// runRLSBootstrapEmpty is a dormant staging/test capability. It never falls
+// back to the ordinary migration command or reuses a running server's pools.
+func runRLSBootstrapEmpty(args []string) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	err := rlsBootstrapEmptyCommand(ctx, args)
+	stop()
+	if err != nil {
+		// Connection and database errors can contain DSNs, identifiers or data.
+		// Cleanup has already unwound; never exit from a leased-session callback.
+		fmt.Fprintln(os.Stderr, "rls-bootstrap-empty failed; the database may be partially initialized; inspect before retrying")
+		os.Exit(1)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "rls-bootstrap-empty complete")
+}
+
+func parseRLSBootstrapEmptyArgs(args []string) (string, string, error) {
+	flags := flag.NewFlagSet("rls-bootstrap-empty", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "config.toml", "Path to config file")
+	shape := flags.String("production-shape", "", "Optional fixed v0 column order")
+	seen := map[string]bool{}
+	for index := 0; index < len(args); index++ {
+		name, value, inline := strings.Cut(args[index], "=")
+		if (name != "-config" && name != "-production-shape") || seen[name] {
+			return "", "", errors.New("invalid bootstrap arguments")
+		}
+		seen[name] = true
+		if !inline {
+			index++
+			if index == len(args) {
+				return "", "", errors.New("missing bootstrap argument")
+			}
+			value = args[index]
+		}
+		if value == "" || strings.HasPrefix(value, "-") {
+			return "", "", errors.New("invalid bootstrap argument value")
+		}
+	}
+	if err := flags.Parse(args); err != nil || flags.NArg() != 0 ||
+		(*shape != "" && *shape != "v0") || strings.TrimSpace(*configPath) == "" {
+		return "", "", errors.New("invalid bootstrap arguments")
+	}
+	return *configPath, *shape, nil
+}
+
+func rlsBootstrapEmptyCommand(ctx context.Context, args []string) (returnErr error) {
+	if ctx == nil {
+		return errors.New("bootstrap context is required")
+	}
+	configPath, shape, err := parseRLSBootstrapEmptyArgs(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return errors.New("bootstrap configuration unavailable")
+	}
+	if cfg == nil || (cfg.App.Environment != "staging" && cfg.App.Environment != "test") ||
+		strings.TrimSpace(cfg.Database.URL) == "" || strings.TrimSpace(cfg.Database.MigrationURL) == "" ||
+		cfg.Database.URL == cfg.Database.MigrationURL || cfg.Database.RuntimeRole == "" {
+		return errors.New("bootstrap requires staging/test and distinct explicit database URLs")
+	}
+	if len(cfg.Database.RuntimeRole) > 63 {
+		return errors.New("invalid bootstrap runtime role")
+	}
+	for index, char := range cfg.Database.RuntimeRole {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && char != '_' &&
+			(index <= 0 || char < '0' || char > '9') {
+			return errors.New("invalid bootstrap runtime role")
+		}
+	}
+	// Load fixed embedded bytes before connecting; no cwd/environment profile path.
+	profile, overlay, err := bootstrapEmptyProfile(shape)
+	if err != nil {
+		return err
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	runtimeCfg := cfg.Database
+	runtimeCfg.MaxOpenConns, runtimeCfg.MaxIdleConns = 1, 1
+	runtimeDB, err := database.NewPostgresWithContext(connectCtx, &runtimeCfg, false)
+	if err != nil {
+		return errors.New("bootstrap runtime connection refused")
+	}
+	runtimePool, err := runtimeDB.DB()
+	if err != nil {
+		return errors.New("bootstrap runtime pool unavailable")
+	}
+	defer func() { returnErr = errors.Join(returnErr, runtimePool.Close()) }()
+	ownerCfg := runtimeCfg
+	ownerCfg.URL = cfg.Database.MigrationURL
+	ownerDB, err := database.NewPostgresWithContext(connectCtx, &ownerCfg, false)
+	if err != nil {
+		return errors.New("bootstrap owner connection refused")
+	}
+	ownerPool, err := ownerDB.DB()
+	if err != nil {
+		return errors.New("bootstrap owner pool unavailable")
+	}
+	defer func() { returnErr = errors.Join(returnErr, ownerPool.Close()) }()
+	cancel()
+	lo := logf.New(logf.Opts{
+		Writer: io.Discard,
+		Level:  logf.InfoLevel,
+	})
+	return database.BootstrapEmptyDatabase(
+		ownerDB.WithContext(ctx), runtimeDB.WithContext(ctx), cfg, shape, profile, overlay,
+		func(session *gorm.DB) error {
+			if err := handlers.BackfillChatbotFlowGraph(session, lo); err != nil {
+				return fmt.Errorf("chatbot flow graph backfill: %w", err)
+			}
+			if _, err := channelapi.BackfillLegacyWhatsAppInbox(session, 500); err != nil {
+				return fmt.Errorf("legacy WhatsApp omnichannel backfill: %w", err)
+			}
+			return nil
+		},
+	)
 }

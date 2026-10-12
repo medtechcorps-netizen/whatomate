@@ -1,0 +1,10 @@
+[
+  {
+    "file": "cmd/whatomate/main.go",
+    "func": "rlsBootstrapEmptyCommand"
+  },
+  {
+    "file": "internal/database/postgres.go",
+    "func": "BootstrapEmptyDatabase"
+  }
+]

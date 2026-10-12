@@ -37,3 +37,17 @@ func BuiltinCatalog() (Catalog, error) {
 }
 
 func BuiltinGlobalTables() ([]GlobalTable, error) { return LoadGlobalTables(builtinGlobals) }
+
+// Fixed reviewed inputs for the dormant staging/test empty bootstrap.
+//
+//go:embed golden/production-v0.json
+var bootstrapEmptyProductionV0 []byte
+
+//go:embed shape/production-v0.sql
+var bootstrapEmptyProductionOverlayV0 []byte
+
+// BootstrapEmptyProfileV0 returns separate copies; callers cannot mutate the
+// package's embedded profile or select a filesystem/environment replacement.
+func BootstrapEmptyProfileV0() ([]byte, []byte) {
+	return append([]byte(nil), bootstrapEmptyProductionV0...), append([]byte(nil), bootstrapEmptyProductionOverlayV0...)
+}

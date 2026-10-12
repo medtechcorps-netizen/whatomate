@@ -106,6 +106,7 @@ POSTGRES_JOBS = (("test.yml", "tenant-isolation"), ("test.yml", "go-race"), ("te
 PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
 DIGEST_IMAGE = re.compile(r"[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}")
 TENANT_TEST = "go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'"
+BOOTSTRAP_PAIR_TEST = "go test -mod=readonly -tags pr7_bootstrap_two_server -count=1 -v -timeout 5m ./internal/database -run '^TestTenantRLS_CatalogBootstrapCommandEqualOIDsAcrossServersRefusesBeforeWrites$'"
 RACE_TEST = "-- -mod=readonly -race -p 1 -timeout 150m -skip '^TestTenantRLS_Catalog' -coverprofile=coverage.out \"${packages[@]}\""
 CONTRACT_DIFF = "git diff --exit-code -- go.mod go.sum internal/dbcatalog/registry internal/dbcatalog/golden/seeds.json"
 CONTRACT_UPDATE_VARS = ("REREPLY_UPDATE_MIGRATION_PATH", "REREPLY_UPDATE_REGISTRY", "REREPLY_UPDATE_SEEDS")
@@ -328,8 +329,26 @@ def assert_concurrency_and_timeouts(sources: dict[str, str]) -> None:
     tenant = test_jobs["tenant-isolation"]
     if tenant.get("timeout-minutes") != 60:
         raise AssertionError("tenant-isolation has no explicit 60-minute job timeout")
-    if [line for item in tenant.get("steps", []) for line in run_lines(item) if line.startswith("go test")] != [TENANT_TEST]:
-        raise AssertionError("tenant-isolation does not run its tests with the 45-minute timeout")
+    if [line for item in tenant.get("steps", []) for line in run_lines(item) if line.startswith("go test")] != [BOOTSTRAP_PAIR_TEST, TENANT_TEST]:
+        raise AssertionError("tenant-isolation must run the exact pair test then the 45-minute tenant suite")
+    for service, port in (("postgres_pair_a", 5433), ("postgres_pair_b", 5434)):
+        expected = {
+            "image": PG17_IMAGE,
+            "env": {"POSTGRES_USER": "postgres", "POSTGRES_PASSWORD": "postgres", "POSTGRES_DB": "postgres"},
+            "ports": [f"{port}:5432"],
+            "options": "--health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5",
+        }
+        if tenant.get("services", {}).get(service) != expected:
+            raise AssertionError(f"tenant-isolation lacks the exact fresh bootstrap pair service {service}")
+    if step_named(tenant, "Run cross-server empty-bootstrap refusal") != {
+        "name": "Run cross-server empty-bootstrap refusal",
+        "env": {
+            "TEST_BOOTSTRAP_PAIR_DATABASE_URL_A": "postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable",
+            "TEST_BOOTSTRAP_PAIR_DATABASE_URL_B": "postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable",
+        },
+        "run": BOOTSTRAP_PAIR_TEST,
+    }:
+        raise AssertionError("tenant-isolation must run the exact unconditional bootstrap pair test")
     race = test_jobs["go-race"]
     # The per-package cap stays below the job's ceiling (GitHub's 360 minutes).
     if race.get("timeout-minutes") != 360 or RACE_TEST not in run_lines(step_named(race, "Run tests")):
@@ -1068,6 +1087,31 @@ def without_negative_case() -> dict[str, str]:
     return {**SOURCES, "test.yml": source[:start] + source[end:]}
 
 
+def without_bootstrap_pair_service(service: str) -> dict[str, str]:
+    if service not in {"postgres_pair_a", "postgres_pair_b"}:
+        raise AssertionError("not a bootstrap pair service")
+    source = SOURCES["test.yml"]
+    anchor = f"      {service}:\n"
+    following = "      postgres_pair_b:\n" if service == "postgres_pair_a" else "    steps:\n"
+    start = source.find(anchor)
+    end = source.find(following, start)
+    tenant_start = source.find("  tenant-isolation:\n")
+    tenant_end = source.find("  staging-bootstrap:\n", tenant_start)
+    if source.count(anchor) != 1 or not 0 <= tenant_start < start < end < tenant_end:
+        raise AssertionError("the bootstrap pair service is not where the mutation expects it")
+    return {**SOURCES, "test.yml": source[:start] + source[end:]}
+
+
+def without_bootstrap_pair_step() -> dict[str, str]:
+    source = SOURCES["test.yml"]
+    anchor = "      - name: Run cross-server empty-bootstrap refusal\n"
+    following = "      - name: Run PostgreSQL tenant isolation tests\n"
+    start, end = source.find(anchor), source.find(following)
+    if source.count(anchor) != 1 or source.count(following) != 1 or not 0 <= start < end:
+        raise AssertionError("the bootstrap pair step is not where the mutation expects it")
+    return {**SOURCES, "test.yml": source[:start] + source[end:]}
+
+
 # Each case breaks one property; the checker must fail on the named check.
 NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     # 1. Required check names.
@@ -1145,6 +1189,18 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
         "        with:\n"
         "          persist-credentials: true\n")),
     # 4. Concurrency and timeouts.
+    "remove bootstrap pair service A": ("concurrency-and-timeouts", lambda: without_bootstrap_pair_service("postgres_pair_a")),
+    "remove bootstrap pair service B": ("concurrency-and-timeouts", lambda: without_bootstrap_pair_service("postgres_pair_b")),
+    "remove the bootstrap pair test step": ("concurrency-and-timeouts", without_bootstrap_pair_step),
+    "point bootstrap pair B at A": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable\n",
+        "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable\n")),
+    "condition the bootstrap pair test": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "      - name: Run cross-server empty-bootstrap refusal\n",
+        "      - name: Run cross-server empty-bootstrap refusal\n        if: false\n")),
+    "tolerate bootstrap pair test failure": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", "      - name: Run cross-server empty-bootstrap refusal\n",
+        "      - name: Run cross-server empty-bootstrap refusal\n        continue-on-error: true\n")),
     "revert the Test concurrency group": ("concurrency-and-timeouts", lambda: replaced(
         "test.yml", "format('run-{0}', github.run_id)", "github.ref")),
     "revert the E2E concurrency group": ("concurrency-and-timeouts", lambda: replaced(
