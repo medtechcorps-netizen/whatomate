@@ -328,6 +328,60 @@ class NegativeIndexTests(unittest.TestCase):
         for raw in variants:
             with self.subTest(raw=raw[:60]),self.assertRaises(policy.NegativeIndexRefusal):policy.replay_http(raw,endpoint=policy.ACTIONS_ENDPOINT)
 
+    def test_http_gh_status_lf_crlf_headers_preserves_exact_body(self):
+        body = b'{"message":"synthetic"}\r\n'
+        for status in (200, 403, 422, 502, 503, 504):
+            expected = (status, body, {b"content-type": b"application/json; charset=utf-8",
+                                      b"content-length": str(len(body)).encode()})
+            crlf = http(status, body)
+            mixed = crlf.replace(b"\r\n", b"\n", 1)
+            for raw in (crlf, http(status, body, newline=b"\n"), mixed):
+                with self.subTest(status=status, raw=raw[:80]):
+                    self.assertEqual(policy._http_frame(raw), expected)
+
+    def test_http_gh_mixed_frame_keeps_availability_status_authority(self):
+        for status in (200, 502, 503, 504):
+            raw = http(status).replace(b"\r\n", b"\n", 1)
+            value = policy.replay_http(raw, endpoint=policy.ACTIONS_ENDPOINT)
+            self.assertEqual(value.raw, raw)
+            self.assertEqual(value.status, status)
+            self.assertEqual(value.state, "available" if status == 200 else "unavailable")
+        for status in (403, 422):
+            with self.subTest(status=status), self.assertRaises(policy.NegativeIndexRefusal):
+                policy.replay_http(http(status).replace(b"\r\n", b"\n", 1),
+                                   endpoint=policy.ACTIONS_ENDPOINT)
+
+    def test_http_gh_status_boundary_does_not_allow_other_mixed_headers(self):
+        mixed = http().replace(b"\r\n", b"\n", 1)
+        variants = (
+            mixed.replace(b"\r\n", b"\n", 1),
+            mixed.replace(b"\r\n", b"\r", 1),
+            mixed.replace(b"\r\n", b"\n\r\n", 1),
+            mixed.replace(b"Synthetic\n", b"Synthetic\n\n", 1),
+            mixed.replace(b"Synthetic\n", b"Synthetic\r", 1),
+            http(newline=b"\n").replace(b"Synthetic\n", b"Synthetic\r\n", 1),
+        )
+        for raw in variants:
+            with self.subTest(raw=raw[:100]), self.assertRaises(policy.NegativeIndexRefusal):
+                policy._http_frame(raw)
+
+    def test_http_gh_mixed_frame_keeps_header_body_and_size_rejections(self):
+        variants = [http()[:-1], http() + b"extra",
+                    http(body=b"private\x00value"), http(body=b"\r\nHTTP/2.0 200 OK\r\n\r\n{}"),
+                    http(headers=[(b"Content-Type", b"application/json"),
+                                  (b"content-type", b"application/json")]),
+                    http(headers=[(b" Location", b"/elsewhere")]),
+                    http(headers=[(b"Location", b"https://elsewhere")]),
+                    http(headers=[(b"Transfer-Encoding", b"chunked")]),
+                    http(headers=[(b"X-" + str(i).encode(), b"v") for i in range(129)]),
+                    http(headers=[(b"X-Large", b"x" * policy.MAX_HEADERS)]),
+                    http(body=b"x" * (policy.MAX_BODY + 1)),
+                    http().replace(b"HTTP/2.0", b"HTTP/3", 1)]
+        for raw in variants:
+            raw = raw.replace(b"\r\n", b"\n", 1)
+            with self.subTest(raw=raw[:80]), self.assertRaises(policy.NegativeIndexRefusal):
+                policy._http_frame(raw)
+
     def test_http_malformed_success_payload_does_not_synthesize_unavailability(self):
         for body in (b"not-json",wire({"message":"unknown"}),wire({"total_count":True,"workflow_runs":[]}),
                      wire({"total_count":1,"workflow_runs":[{},{}]}),wire({"total_count":0,"workflow_runs":[{}]})):

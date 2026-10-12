@@ -188,6 +188,15 @@ class QualificationTests(unittest.TestCase):
         self.assertTrue(all("synthetic-token" not in repr(row) for row in self.capture.calls))
         self.assertEqual(os.environ["GITHUB_SHA"], H)
 
+    def test_gh_status_lf_headers_crlf_full_real_composition(self):
+        original_http = http
+        def gh_include(status, value):
+            return original_http(status, value).replace(b"\r\n", b"\n", 1)
+        # Only controlled response framing changes; the real parser, validators,
+        # publisher, budget, marker checks and all existing graph assertions run.
+        with mock.patch.dict(globals(), {"http": gh_include}):
+            self.test_real_validator_and_real_publisher_composition_with_one_token()
+
     def test_absent_setup_has_zero_files_native_and_operational_import_effects(self):
         with mock.patch.object(policy, "_INSTALLED_PRODUCER_SETUP", None), \
              mock.patch.object(q, "modules", side_effect=AssertionError("operational import")):
@@ -344,6 +353,20 @@ class QualificationTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_gh_mixed_frame_keeps_exact_422_denial_and_rejects_403(self):
+        ref = f"refs/tags/{policy.PREFIX}probe-123-1-permissions"
+        for operation, reason in (("update", "Cannot update this ref"),
+                                  ("delete", "Cannot delete this ref")):
+            good = {"message": "Repository rule violations found\n\n" + reason + "\n"}
+            raw = http(422, good).replace(b"\r\n", b"\n", 1)
+            q.denied(source.runtime.Capture(1, raw, b"gh bounded error"), operation=operation, ref=ref)
+            for code, status, value in ((1, 403, good), (0, 422, good),
+                                       (1, 403, {"message": "Resource not accessible by integration"}),
+                                       (1, 422, {"message": "Validation Failed"})):
+                raw = http(status, value).replace(b"\r\n", b"\n", 1)
+                with self.subTest(operation=operation, code=code, status=status), self.assertRaises(q.Refusal):
+                    q.denied(source.runtime.Capture(code, raw, b"bounded error"), operation=operation, ref=ref)
+
     def test_denial_requires_exact_operation_status_message_and_json_types(self):
         ref = f"refs/tags/{policy.PREFIX}probe-123-1-permissions"
         good = {"message": "Repository rule violations found\n\nCannot update this ref\n"}
