@@ -177,6 +177,61 @@ func TestTenantRLS_CatalogBootstrapCommandEqualOIDsAcrossServersRefusesBeforeWri
 	ownerBefore, err := bootstrapCommandReadSession(context.Background(), servers[0].owner.Statement.ConnPool)
 	require.NoError(t, err)
 	runtimeBefore := bootstrapCommandSetOriginalName(t, servers[1].runtime, "pair-runtime-original")
+	// Backend PIDs are local to each server. Keep the first B backend alive
+	// while opening a second real candidate; at least one must differ from A.
+	originalRuntime := servers[1].runtime
+	runtimePool, err := originalRuntime.DB()
+	require.NoError(t, err)
+	leaseContext, cancelLease := context.WithTimeout(context.Background(), 15*time.Second)
+	heldRuntime, err := runtimePool.Conn(leaseContext)
+	cancelLease()
+	require.NoError(t, err)
+	var spareRuntime *gorm.DB
+	t.Cleanup(func() {
+		if heldRuntime != nil && heldRuntime.Close() != nil {
+			t.Error("owned pair held runtime cleanup failed")
+		}
+		if catalogClose(spareRuntime) != nil {
+			t.Error("owned pair spare runtime pool cleanup failed")
+		}
+	})
+	heldBefore, err := bootstrapCommandReadSession(context.Background(), heldRuntime)
+	require.NoError(t, err)
+	require.Equal(t, runtimeBefore, heldBefore)
+	spareRuntime, err = catalogConnect(catalogRoleURL(bases[1], name, runtimeRole, runtimePassword))
+	require.NoError(t, err)
+	sparePool, err := spareRuntime.DB()
+	require.NoError(t, err)
+	sparePool.SetMaxOpenConns(1)
+	sparePool.SetMaxIdleConns(1)
+	candidateBefore := bootstrapCommandSetOriginalName(t, spareRuntime, "pair-runtime-original")
+	candidateContext, cancelCandidate := context.WithTimeout(context.Background(), 15*time.Second)
+	heldCandidate, err := sparePool.Conn(candidateContext)
+	cancelCandidate()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if heldCandidate != nil && heldCandidate.Close() != nil {
+			t.Error("owned pair held candidate cleanup failed")
+		}
+	})
+	candidateHeld, err := bootstrapCommandReadSession(context.Background(), heldCandidate)
+	require.NoError(t, err)
+	require.Equal(t, candidateBefore, candidateHeld)
+	require.NotEqual(t, runtimeBefore.PID, candidateBefore.PID, "overlapping backends on B must have distinct real PIDs")
+	require.Equal(t, runtimeBefore.Role, candidateBefore.Role)
+	heldDuring, err := bootstrapCommandReadSession(context.Background(), heldRuntime)
+	require.NoError(t, err)
+	require.Equal(t, heldBefore, heldDuring, "the first B backend stays live during candidate selection")
+	if candidateBefore.PID != ownerBefore.PID {
+		require.NoError(t, heldCandidate.Close())
+		heldCandidate = nil
+		servers[1].runtime, spareRuntime = spareRuntime, originalRuntime
+		runtimeBefore = candidateBefore
+	} else {
+		require.NoError(t, heldRuntime.Close())
+		heldRuntime = nil
+	}
+	t.Logf("real pair PID selection: owner A=%d, B candidates=%d/%d, selected B=%d", ownerBefore.PID, heldBefore.PID, candidateBefore.PID, runtimeBefore.PID)
 	require.NotEqual(t, ownerBefore.PID, runtimeBefore.PID, "reach the challenge, not the early coincident-PID refusal")
 	var mu sync.Mutex
 	attemptedDDL := []string{}

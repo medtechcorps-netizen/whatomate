@@ -2097,7 +2097,7 @@ func runRLSBootstrapEmpty(args []string) {
 		fmt.Fprintln(os.Stderr, "rls-bootstrap-empty failed; the database may be partially initialized; inspect before retrying")
 		os.Exit(1)
 	}
-	fmt.Fprintln(os.Stdout, "rls-bootstrap-empty complete")
+	_, _ = fmt.Fprintln(os.Stdout, "rls-bootstrap-empty complete")
 }
 
 func parseRLSBootstrapEmptyArgs(args []string) (string, string, error) {
@@ -2151,8 +2151,8 @@ func rlsBootstrapEmptyCommand(ctx context.Context, args []string) (returnErr err
 		return errors.New("invalid bootstrap runtime role")
 	}
 	for index, char := range cfg.Database.RuntimeRole {
-		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || char == '_' ||
-			(index > 0 && char >= '0' && char <= '9')) {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && char != '_' &&
+			(index <= 0 || char < '0' || char > '9') {
 			return errors.New("invalid bootstrap runtime role")
 		}
 	}

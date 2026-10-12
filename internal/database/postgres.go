@@ -6123,7 +6123,7 @@ func BootstrapEmptyDatabase(
 		return errors.New("empty bootstrap requires staging or test")
 	}
 	if owner == nil || runtime == nil || owner == runtime || owner.Dialector == nil || runtime.Dialector == nil ||
-		owner.Dialector.Name() != "postgres" || runtime.Dialector.Name() != "postgres" || owner.Statement == nil || runtime.Statement == nil ||
+		owner.Name() != "postgres" || runtime.Name() != "postgres" || owner.Statement == nil || runtime.Statement == nil ||
 		owner.Statement.Context == nil || backfill == nil {
 		return errors.New("empty bootstrap requires concrete PostgreSQL handles and backfill")
 	}

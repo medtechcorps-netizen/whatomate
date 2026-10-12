@@ -78,7 +78,7 @@ func TestRLSBootstrapEmptyArgumentsPrecedeConfiguration(t *testing.T) {
 	if err == nil || err.Error() != "invalid bootstrap arguments" {
 		t.Fatal("invalid shape did not refuse before loading configuration")
 	}
-	err = rlsBootstrapEmptyCommand(nil, []string{"-config", missing})
+	err = rlsBootstrapEmptyCommand(nil, []string{"-config", missing}) //nolint:staticcheck // SA1012: deliberately verify nil context refuses before configuration or database access.
 	if err == nil || err.Error() != "bootstrap context is required" {
 		t.Fatal("nil context did not refuse before configuration")
 	}
