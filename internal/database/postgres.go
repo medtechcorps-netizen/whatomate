@@ -6108,3 +6108,520 @@ func SeedDefaultWidgetsForOrg(db *gorm.DB, orgID, userID uuid.UUID) error {
 
 	return nil
 }
+
+// BootstrapEmptyDatabase is a staging/test-only, non-atomic empty bootstrap.
+// The caller owns both dedicated pools and closes them after this returns.
+// Existing migration declarations and their wrapper remain unchanged.
+func BootstrapEmptyDatabase(
+	owner, runtime *gorm.DB,
+	cfg *config.Config,
+	productionShape string,
+	profileRaw, overlayRaw []byte,
+	backfill func(*gorm.DB) error,
+) (returnErr error) {
+	if cfg == nil || (cfg.App.Environment != "staging" && cfg.App.Environment != "test") {
+		return errors.New("empty bootstrap requires staging or test")
+	}
+	if owner == nil || runtime == nil || owner == runtime || owner.Dialector == nil || runtime.Dialector == nil ||
+		owner.Dialector.Name() != "postgres" || runtime.Dialector.Name() != "postgres" || owner.Statement == nil || runtime.Statement == nil ||
+		owner.Statement.Context == nil || backfill == nil {
+		return errors.New("empty bootstrap requires concrete PostgreSQL handles and backfill")
+	}
+	if strings.TrimSpace(cfg.Database.URL) == "" || strings.TrimSpace(cfg.Database.MigrationURL) == "" ||
+		cfg.Database.URL == cfg.Database.MigrationURL || len(cfg.Database.RuntimeRole) > 63 {
+		return errors.New("empty bootstrap requires distinct explicit database URLs and runtime role")
+	}
+	if err := validateIdentifier(cfg.Database.RuntimeRole); err != nil {
+		return errors.New("invalid bootstrap runtime role")
+	}
+	// Snapshot scalar command configuration; no profile/provider callbacks.
+	runtimeRole, admin := cfg.Database.RuntimeRole, cfg.DefaultAdmin
+	if len(profileRaw) > 23169 || len(overlayRaw) > 320 {
+		return errors.New("bootstrap profile byte limit")
+	}
+	profileRaw = append([]byte(nil), profileRaw...)
+	overlayRaw = append([]byte(nil), overlayRaw...)
+	profile, err := bootstrapEmptyProfilePlan(productionShape, profileRaw, overlayRaw)
+	if err != nil {
+		return err
+	}
+	challenge, err := uuid.NewRandom()
+	if err != nil {
+		return errors.New("bootstrap challenge entropy unavailable")
+	}
+	marker := "rereply-bootstrap-" + challenge.String()
+	ctx := owner.Statement.Context
+	runtimePool, err := runtime.DB()
+	if err != nil {
+		return fmt.Errorf("bootstrap runtime pool: %w", err)
+	}
+	ownerPool, err := owner.DB()
+	if err != nil || ownerPool == runtimePool {
+		return errors.New("bootstrap requires distinct dedicated pools")
+	}
+	leaseCtx, cancelLease := context.WithTimeout(ctx, 15*time.Second)
+	runtimeConn, err := runtimePool.Conn(leaseCtx)
+	cancelLease()
+	if err != nil {
+		return fmt.Errorf("bootstrap runtime lease: %w", err)
+	}
+	defer func() { returnErr = errors.Join(returnErr, runtimeConn.Close()) }()
+	// Context makes GORM clone Statement before replacing its ConnPool. Keep
+	// the pool's original Statement intact and retain this one lease throughout.
+	pinnedRuntime := runtime.Session(&gorm.Session{NewDB: true, Context: ctx})
+	pinnedRuntime.Statement.ConnPool = runtimeConn
+	wrote := false
+	defer func() {
+		// Preserve cancellation when the SQL driver reports only a connection error.
+		if err := ctx.Err(); err != nil {
+			returnErr = errors.Join(returnErr, err)
+		}
+		if returnErr != nil && wrote {
+			returnErr = errors.Join(returnErr, errors.New("empty bootstrap failed after a persistent phase began; partial state may remain"))
+		}
+	}()
+	return withMigrationSession(owner.WithContext(ctx), func(session *gorm.DB) (sessionErr error) {
+		probeCtx, cancelProbe := context.WithTimeout(ctx, 15*time.Second)
+		defer cancelProbe()
+		ownerID, err := bootstrapEmptyIdentityOnSession(probeCtx, session)
+		if err != nil {
+			return err
+		}
+		runtimeID, err := bootstrapEmptyIdentityOnSession(probeCtx, pinnedRuntime)
+		if err != nil {
+			return err
+		}
+		if runtimeID.CurrentRole != runtimeRole || ownerID.CurrentRole == runtimeRole ||
+			ownerID.CurrentRoleOID == runtimeID.CurrentRoleOID || ownerID.PID == runtimeID.PID ||
+			ownerID.DatabaseOID != runtimeID.DatabaseOID || ownerID.DatabaseName != runtimeID.DatabaseName {
+			return errors.New("bootstrap paired identity mismatch")
+		}
+		// ApplyTenantRLS has this additional spelling guard; reject it before
+		// creating anything, without normalizing either authenticated identity.
+		if strings.EqualFold(ownerID.CurrentRole, runtimeRole) {
+			return errors.New("bootstrap roles fail the RLS installer spelling guard")
+		}
+		restoreNeeded := false
+		defer func() {
+			if !restoreNeeded {
+				return
+			}
+			// This is a SQL cleanup allowance, not a physical pgx disposal bound.
+			cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancelCleanup()
+			if err := bootstrapEmptySetApplicationName(cleanupCtx, pinnedRuntime, runtimeID.ApplicationName); err != nil {
+				sessionErr = errors.Join(sessionErr, fmt.Errorf("restore bootstrap application_name: %w", err))
+				return
+			}
+			restored, err := bootstrapEmptyIdentityOnSession(cleanupCtx, pinnedRuntime)
+			if err != nil {
+				sessionErr = errors.Join(sessionErr, fmt.Errorf("read restored bootstrap identity: %w", err))
+			} else if !bootstrapEmptySameIdentity(runtimeID, restored) || restored.ApplicationName != runtimeID.ApplicationName {
+				sessionErr = errors.Join(sessionErr, errors.New("bootstrap application_name restoration or pin mismatch"))
+			}
+		}()
+		if err := bootstrapEmptyObserve(probeCtx, session, ownerID, runtimeID, marker, 0); err != nil {
+			return err
+		}
+		// A failed/cancelled set_config can still have changed session metadata.
+		restoreNeeded = true
+		if err := bootstrapEmptySetApplicationName(probeCtx, pinnedRuntime, marker); err != nil {
+			return err
+		}
+		if err := bootstrapEmptyPairBarrier(probeCtx, session, pinnedRuntime, ownerID, runtimeID, marker); err != nil {
+			return err
+		}
+		cancelProbe()
+		if err := bootstrapEmptyAuthority(ctx, session, runtimeID, ownerID); err != nil {
+			return err
+		}
+		plans, err := bootstrapEmptyPrecreationPlans(session, profile)
+		if err != nil {
+			return err
+		}
+		if err := bootstrapEmptyPublic(ctx, session); err != nil {
+			return err
+		}
+		if err := bootstrapEmptyPairBarrier(ctx, session, pinnedRuntime, ownerID, runtimeID, marker); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// No outer transaction: the unchanged migration includes concurrent indexes.
+		wrote = true
+		for _, sql := range plans {
+			if err := session.Exec(sql).Error; err != nil {
+				return fmt.Errorf("bootstrap production precreation: %w", err)
+			}
+		}
+		if err := session.AutoMigrate(&models.ChatbotFlowStep{}); err != nil {
+			return fmt.Errorf("bootstrap legacy chatbot table: %w", err)
+		}
+		if err := runMigrationWithProgressOnSession(session, &admin); err != nil {
+			return err
+		}
+		if err := backfill(session); err != nil {
+			return err
+		}
+		if err := ApplyTenantRLS(session, runtimeRole); err != nil {
+			return err
+		}
+		if productionShape == "v0" {
+			if err := session.Exec(string(overlayRaw)).Error; err != nil {
+				return fmt.Errorf("bootstrap fixed production overlay: %w", err)
+			}
+		}
+		if err := bootstrapEmptyPairBarrier(ctx, session, pinnedRuntime, ownerID, runtimeID, marker); err != nil {
+			return err
+		}
+		if err := VerifyTenantRLS(pinnedRuntime, runtimeRole); err != nil {
+			return err
+		}
+		return bootstrapEmptyPairBarrier(ctx, session, pinnedRuntime, ownerID, runtimeID, marker)
+	})
+}
+
+type bootstrapEmptyIdentity struct {
+	PID                  int64     `gorm:"column:pid"`
+	BackendStart         time.Time `gorm:"column:backend_start"`
+	DatabaseOID          int64     `gorm:"column:database_oid"`
+	DatabaseName         string    `gorm:"column:database_name"`
+	CurrentDatabase      string    `gorm:"column:current_database"`
+	AuthenticatedRoleOID int64     `gorm:"column:authenticated_role_oid"`
+	AuthenticatedRole    string    `gorm:"column:authenticated_role"`
+	CurrentRoleOID       int64     `gorm:"column:current_role_oid"`
+	CurrentRole          string    `gorm:"column:current_role"`
+	SessionRoleOID       int64     `gorm:"column:session_role_oid"`
+	SessionRole          string    `gorm:"column:session_role"`
+	BackendType          string    `gorm:"column:backend_type"`
+	ServerVersionNum     int       `gorm:"column:server_version_num"`
+	Superuser            bool      `gorm:"column:superuser"`
+	CreateRole           bool      `gorm:"column:create_role"`
+	BypassRLS            bool      `gorm:"column:bypass_rls"`
+	Replication          bool      `gorm:"column:replication"`
+	InRecovery           bool      `gorm:"column:in_recovery"`
+	ApplicationName      string    `gorm:"column:application_name"`
+	ConfiguredName       string    `gorm:"column:configured_name"`
+	ApplicationBytes     int       `gorm:"column:application_bytes"`
+	ReplicationRole      string    `gorm:"column:replication_role"`
+	StaleTenant          bool      `gorm:"column:stale_tenant"`
+}
+
+func bootstrapEmptyIdentityOnSession(ctx context.Context, db *gorm.DB) (bootstrapEmptyIdentity, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var rows []bootstrapEmptyIdentity
+	result := db.WithContext(probeCtx).Raw(`
+		SELECT a.pid::bigint AS pid, a.backend_start,
+			a.datid::bigint AS database_oid, a.datname::text AS database_name,
+			pg_catalog.current_database()::text AS current_database,
+			a.usesysid::bigint AS authenticated_role_oid, a.usename::text AS authenticated_role,
+			c.oid::bigint AS current_role_oid, current_user::text AS current_role,
+			s.oid::bigint AS session_role_oid, session_user::text AS session_role,
+			a.backend_type::text AS backend_type,
+			pg_catalog.current_setting('server_version_num')::integer AS server_version_num,
+			c.rolsuper AS superuser, c.rolcreaterole AS create_role,
+			c.rolbypassrls AS bypass_rls, c.rolreplication AS replication,
+			pg_catalog.pg_is_in_recovery() AS in_recovery,
+			a.application_name::text AS application_name,
+			pg_catalog.current_setting('application_name') AS configured_name,
+			pg_catalog.octet_length(pg_catalog.current_setting('application_name')) AS application_bytes,
+			pg_catalog.current_setting('session_replication_role') AS replication_role,
+			NULLIF(pg_catalog.current_setting('app.current_organization_id', true), '') IS NOT NULL AS stale_tenant
+		FROM pg_catalog.pg_stat_activity AS a
+		JOIN pg_catalog.pg_database AS d ON d.oid=a.datid AND d.datname=pg_catalog.current_database()
+		JOIN pg_catalog.pg_roles AS c ON c.rolname=current_user
+		JOIN pg_catalog.pg_roles AS s ON s.rolname=session_user
+		WHERE a.pid=pg_catalog.pg_backend_pid() AND a.backend_start IS NOT NULL
+		  AND a.application_name IS NOT NULL AND a.backend_type IS NOT NULL
+	`).Scan(&rows)
+	if result.Error != nil {
+		return bootstrapEmptyIdentity{}, fmt.Errorf("bootstrap session metadata: %w", result.Error)
+	}
+	if result.RowsAffected != 1 || len(rows) != 1 {
+		return bootstrapEmptyIdentity{}, errors.New("bootstrap session metadata row count")
+	}
+	id := rows[0]
+	for _, oid := range []int64{id.PID, id.DatabaseOID, id.AuthenticatedRoleOID, id.CurrentRoleOID, id.SessionRoleOID} {
+		if oid <= 0 || oid >= 1<<32 {
+			return bootstrapEmptyIdentity{}, errors.New("bootstrap session metadata identifier")
+		}
+	}
+	if id.BackendStart.IsZero() || id.DatabaseName == "" || id.DatabaseName != id.CurrentDatabase ||
+		id.AuthenticatedRole == "" || id.AuthenticatedRole != id.CurrentRole || id.CurrentRole != id.SessionRole ||
+		id.AuthenticatedRoleOID != id.CurrentRoleOID || id.CurrentRoleOID != id.SessionRoleOID ||
+		id.BackendType != "client backend" || id.ServerVersionNum/10000 != 17 || id.InRecovery || id.Superuser ||
+		id.ReplicationRole != "origin" || id.StaleTenant || id.ApplicationName != id.ConfiguredName ||
+		len(id.ApplicationName) != id.ApplicationBytes || id.ApplicationBytes > 63 || strings.ContainsRune(id.ApplicationName, 0) {
+		return bootstrapEmptyIdentity{}, errors.New("bootstrap session authentication or identity refused")
+	}
+	return id, nil
+}
+
+func bootstrapEmptySameIdentity(before, after bootstrapEmptyIdentity) bool {
+	if !before.BackendStart.Equal(after.BackendStart) {
+		return false
+	}
+	before.BackendStart, after.BackendStart = time.Time{}, time.Time{}
+	before.ApplicationName, before.ConfiguredName, before.ApplicationBytes = "", "", 0
+	after.ApplicationName, after.ConfiguredName, after.ApplicationBytes = "", "", 0
+	return before == after
+}
+
+func bootstrapEmptySetApplicationName(ctx context.Context, runtime *gorm.DB, name string) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var values []string
+	result := runtime.WithContext(probeCtx).Raw("SELECT pg_catalog.set_config('application_name', ?, false)", name).Scan(&values)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 || len(values) != 1 || values[0] != name {
+		return errors.New("bootstrap application_name set/readback mismatch")
+	}
+	return nil
+}
+
+func bootstrapEmptyObserve(ctx context.Context, owner *gorm.DB, ownerID, runtimeID bootstrapEmptyIdentity, marker string, count int64) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	probe := owner.WithContext(probeCtx)
+	if err := probe.Exec("SELECT pg_catalog.pg_stat_clear_snapshot()").Error; err != nil {
+		return err
+	}
+	var rows []struct {
+		ObserverPID int64 `gorm:"column:observer_pid"`
+		TokenRows   int64 `gorm:"column:token_rows"`
+		MatchedRows int64 `gorm:"column:matched_rows"`
+	}
+	result := probe.Raw(`
+		SELECT pg_catalog.pg_backend_pid()::bigint AS observer_pid,
+			COUNT(*)::bigint AS token_rows,
+			COUNT(*) FILTER (WHERE a.pid=CAST(? AS integer) AND a.datid=CAST(? AS oid)
+				AND a.datname=? AND a.usesysid=CAST(? AS oid) AND a.usename=?)::bigint AS matched_rows
+		FROM pg_catalog.pg_stat_activity AS a WHERE a.application_name=?
+	`, runtimeID.PID, ownerID.DatabaseOID, ownerID.DatabaseName, runtimeID.AuthenticatedRoleOID, runtimeID.AuthenticatedRole, marker).Scan(&rows)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 || len(rows) != 1 || rows[0].ObserverPID != ownerID.PID ||
+		rows[0].TokenRows != count || rows[0].MatchedRows != count {
+		return errors.New("bootstrap paired target challenge mismatch")
+	}
+	return nil
+}
+
+func bootstrapEmptyPairBarrier(ctx context.Context, owner, runtime *gorm.DB, ownerID, runtimeID bootstrapEmptyIdentity, marker string) error {
+	barrierCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := bootstrapEmptyObserve(barrierCtx, owner, ownerID, runtimeID, marker, 1); err != nil {
+		return err
+	}
+	currentOwner, err := bootstrapEmptyIdentityOnSession(barrierCtx, owner)
+	if err != nil {
+		return err
+	}
+	currentRuntime, err := bootstrapEmptyIdentityOnSession(barrierCtx, runtime)
+	if err != nil {
+		return err
+	}
+	if !bootstrapEmptySameIdentity(ownerID, currentOwner) || !bootstrapEmptySameIdentity(runtimeID, currentRuntime) || currentRuntime.ApplicationName != marker {
+		return errors.New("bootstrap paired session changed")
+	}
+	return nil
+}
+
+func bootstrapEmptyAuthority(ctx context.Context, owner *gorm.DB, runtimeID, ownerID bootstrapEmptyIdentity) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	probe := owner.WithContext(probeCtx)
+	if runtimeID.CreateRole || runtimeID.BypassRLS || runtimeID.Replication {
+		return errors.New("bootstrap runtime privilege refused")
+	}
+	if err := validateIdentifier(ownerID.CurrentRole); err != nil {
+		return errors.New("bootstrap owner identifier refused")
+	}
+	member, err := roleHasMembership(probe, runtimeID.CurrentRole, ownerID.CurrentRoleOID)
+	if err != nil {
+		return err
+	}
+	if member {
+		return errors.New("bootstrap runtime inherits owner")
+	}
+	privileged, err := privilegedRoleMemberships(probe, runtimeID.CurrentRole)
+	if err != nil {
+		return err
+	}
+	if len(privileged) != 0 {
+		return errors.New("bootstrap runtime has privileged membership")
+	}
+	canSet, err := roleCanSetSessionReplicationRole(probe, runtimeID.CurrentRoleOID)
+	if err != nil {
+		return err
+	}
+	if canSet {
+		return errors.New("bootstrap runtime replication setting authority")
+	}
+	if err := verifyNoDangerousRuntimeDefaultTablePrivileges(probe, ownerID.CurrentRoleOID, runtimeID.CurrentRoleOID); err != nil {
+		return err
+	}
+	var rows []struct {
+		OwnsDatabase   bool  `gorm:"column:owns_database"`
+		SchemaMember   bool  `gorm:"column:schema_member"`
+		SchemaCreate   bool  `gorm:"column:schema_create"`
+		OwnerMembers   int64 `gorm:"column:owner_members"`
+		RuntimeMembers int64 `gorm:"column:runtime_members"`
+	}
+	result := probe.Raw(`
+		WITH RECURSIVE role_membership(member, inherited_role) AS (
+			SELECT member, roleid FROM pg_catalog.pg_auth_members
+			UNION
+			SELECT role_membership.member, membership.roleid FROM role_membership
+			JOIN pg_catalog.pg_auth_members AS membership ON membership.member=role_membership.inherited_role
+		)
+		SELECT d.datdba=CAST(? AS oid) AS owns_database,
+			pg_catalog.pg_has_role(current_user, n.nspowner, 'MEMBER') AS schema_member,
+			pg_catalog.has_schema_privilege(n.oid, 'CREATE') AS schema_create,
+			(SELECT COUNT(DISTINCT member) FROM role_membership WHERE inherited_role=CAST(? AS oid) AND member<>CAST(? AS oid)) AS owner_members,
+			(SELECT COUNT(DISTINCT member) FROM role_membership WHERE inherited_role=CAST(? AS oid) AND member<>CAST(? AS oid)) AS runtime_members
+		FROM pg_catalog.pg_database AS d CROSS JOIN pg_catalog.pg_namespace AS n
+		WHERE d.oid=CAST(? AS oid) AND d.datname=pg_catalog.current_database() AND n.nspname='public'
+	`, ownerID.CurrentRoleOID, ownerID.CurrentRoleOID, ownerID.CurrentRoleOID,
+		runtimeID.CurrentRoleOID, ownerID.CurrentRoleOID, ownerID.DatabaseOID).Scan(&rows)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 || len(rows) != 1 || !rows[0].OwnsDatabase || !rows[0].SchemaMember ||
+		!rows[0].SchemaCreate || rows[0].OwnerMembers != 0 || rows[0].RuntimeMembers != 0 {
+		return errors.New("bootstrap owner/schema authority or role inheritance refused")
+	}
+	return nil
+}
+
+func bootstrapEmptyPublic(ctx context.Context, owner *gorm.DB) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var rows []struct {
+		Schemas      int64
+		Relations    int64
+		Functions    int64
+		Types        int64
+		Dependencies int64
+	}
+	result := owner.WithContext(probeCtx).Raw(`
+		SELECT
+			(SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname='public') AS schemas,
+			(SELECT COUNT(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public') AS relations,
+			(SELECT COUNT(*) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public') AS functions,
+			(SELECT COUNT(*) FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public') AS types,
+			(SELECT COUNT(*) FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_namespace n ON n.oid=d.refobjid
+			 WHERE d.refclassid='pg_catalog.pg_namespace'::regclass AND n.nspname='public') AS dependencies
+	`).Scan(&rows)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 || len(rows) != 1 || rows[0].Schemas != 1 || rows[0].Relations != 0 ||
+		rows[0].Functions != 0 || rows[0].Types != 0 || rows[0].Dependencies != 0 {
+		return errors.New("bootstrap public schema is not empty")
+	}
+	return nil
+}
+
+type bootstrapEmptyColumnOrder struct {
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+}
+
+func bootstrapEmptyProfilePlan(shape string, profileRaw, overlayRaw []byte) ([]bootstrapEmptyColumnOrder, error) {
+	if shape == "" && len(profileRaw) == 0 && len(overlayRaw) == 0 {
+		return nil, nil
+	}
+	if shape != "v0" || len(profileRaw) != 23169 || len(overlayRaw) != 320 ||
+		fmt.Sprintf("%x", sha256.Sum256(profileRaw)) != "808e11a5fdab638adc6f0004e9595371d1eee9a51763e12e779b355f7cdd391d" ||
+		fmt.Sprintf("%x", sha256.Sum256(overlayRaw)) != "48b2558aaa0c54f0de886093c875ff70fbc65231ee80d8b560df91afc97c131d" {
+		return nil, errors.New("bootstrap requires exact reviewed v0 profile bytes")
+	}
+	// The complete raw hash is the closed grammar, including every field and
+	// canonical delimiter. Decode only the ordered columns used by this path.
+	var profile struct {
+		Version              int                         `json:"version"`
+		BootstrapColumnOrder []bootstrapEmptyColumnOrder `json:"bootstrap_column_order"`
+	}
+	if err := json.Unmarshal(profileRaw, &profile); err != nil || profile.Version != 0 || len(profile.BootstrapColumnOrder) != 8 {
+		return nil, errors.New("bootstrap production profile shape")
+	}
+	for _, line := range strings.Split(string(overlayRaw), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "--") {
+			return nil, errors.New("bootstrap overlay must contain only comments")
+		}
+	}
+	return profile.BootstrapColumnOrder, nil
+}
+
+func bootstrapEmptyPrecreationPlans(owner *gorm.DB, orders []bootstrapEmptyColumnOrder) ([]string, error) {
+	if len(orders) == 0 {
+		return nil, nil
+	}
+	if len(orders) != 8 {
+		return nil, errors.New("bootstrap production table count")
+	}
+	// Keep schema.Field and clause imports out of database package initializers.
+	// GORM still supplies every type/default/primary key; only identifier quoting
+	// is rendered directly after validation. FullDataTypeOf must have no Vars.
+	modelsByTable := map[string]*gorm.Statement{}
+	for _, model := range GetMigrationModels() {
+		statement := &gorm.Statement{DB: owner}
+		if err := statement.Parse(model.Model); err != nil {
+			return nil, err
+		}
+		if _, duplicate := modelsByTable[statement.Schema.Table]; duplicate {
+			return nil, errors.New("bootstrap duplicate model table")
+		}
+		modelsByTable[statement.Schema.Table] = statement
+	}
+	plans := make([]string, 0, 8)
+	seenTables := map[string]bool{}
+	for _, order := range orders {
+		statement, exists := modelsByTable[order.Table]
+		if !exists || seenTables[order.Table] || validateIdentifier(order.Table) != nil {
+			return nil, errors.New("bootstrap production model identity")
+		}
+		seenTables[order.Table] = true
+		model := statement.Schema
+		fieldCount := 0
+		for _, name := range model.DBNames {
+			if !model.FieldsByDBName[name].IgnoreMigration {
+				fieldCount++
+			}
+		}
+		if len(order.Columns) != fieldCount || len(model.PrimaryFields) == 0 {
+			return nil, errors.New("bootstrap production complete columns")
+		}
+		parts := make([]string, 0, len(order.Columns)+1)
+		seenColumns := map[string]bool{}
+		for _, name := range order.Columns {
+			field, exists := model.FieldsByDBName[name]
+			if !exists || field.IgnoreMigration || seenColumns[name] || validateIdentifier(name) != nil {
+				return nil, errors.New("bootstrap production column identity")
+			}
+			seenColumns[name] = true
+			typ := owner.Migrator().FullDataTypeOf(field)
+			if typ.SQL == "" || len(typ.Vars) != 0 || strings.Contains(strings.ToUpper(typ.SQL), "PRIMARY KEY") {
+				return nil, errors.New("bootstrap production model type")
+			}
+			parts = append(parts, quoteIdentifier(name)+" "+typ.SQL)
+		}
+		keys := make([]string, 0, len(model.PrimaryFields))
+		for _, field := range model.PrimaryFields {
+			if !seenColumns[field.DBName] {
+				return nil, errors.New("bootstrap production primary key")
+			}
+			keys = append(keys, quoteIdentifier(field.DBName))
+		}
+		parts = append(parts, "PRIMARY KEY ("+strings.Join(keys, ",")+")")
+		plans = append(plans, "CREATE TABLE "+quoteIdentifier("public")+"."+quoteIdentifier(order.Table)+" ("+strings.Join(parts, ",")+")")
+	}
+	return plans, nil
+}

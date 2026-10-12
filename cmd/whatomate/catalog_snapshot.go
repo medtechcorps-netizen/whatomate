@@ -173,3 +173,14 @@ func collectCatalogSnapshot(ctx context.Context, cfg config.DatabaseConfig, args
 	}
 	return report.Bytes(), nil
 }
+
+func bootstrapEmptyProfile(shape string) ([]byte, []byte, error) {
+	if shape == "" {
+		return nil, nil, nil
+	}
+	if shape != "v0" {
+		return nil, nil, errors.New("unsupported empty bootstrap profile")
+	}
+	profile, overlay := dbcatalog.BootstrapEmptyProfileV0()
+	return profile, overlay, nil
+}
