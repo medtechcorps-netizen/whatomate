@@ -63,7 +63,7 @@ var stepContracts = []stepContract{
 	{"FixSystemRolePermissions", "", "seed-reconciler", "SeedSystemRolesForAllOrgs", "Adds only absent permitted links and preserves explicit grants", true},
 	{"ApplyManagerSettingsPolicyMigration", "", "seed-reconciler", "SeedSystemRolesForAllOrgs", "Per-organization version marker prevents reapplying the retired-grant removal", true},
 	{"MigrateExistingUserRoles", "", "seed-reconciler", "SeedSystemRolesForAllOrgs", "Only users lacking role_id are repaired", true},
-	{"legacy-super-admin-update", "SeedSystemRolesForAllOrgs", "seed-reconciler", "SeedSystemRolesForAllOrgs", "Existing inline UPDATE sets the same boolean; no permission-policy endorsement", true},
+	{"legacy-super-admin-update", "SeedSystemRolesForAllOrgs", "seed-reconciler", "SeedSystemRolesForAllOrgs", "removes-write: legacy admin@admin.com escalation removed at rev 2; retained inert marker bound to parent closure", true},
 	{"MigrateUserOrganizations", "", "baseline-pre-ledger", "", "LEFT JOIN and NULL membership predicate select only absent live memberships", true},
 	{"CreateDefaultAdmin", "", "baseline-pre-ledger", "", "Only a completely new installation is admitted; partial multi-row creation is not certified", false},
 	{"EnsurePlatformReseller", "", "seed-reconciler", "", "Existing membership writes are unconditional; strict repeat safety is not certified", false},
@@ -97,6 +97,29 @@ func stepID(c stepContract) string {
 	}
 	return c.Name
 }
+
+// reviewedRevision is a closed source contract, not a default for future IDs.
+// The inert legacy child shares its parent's changed function closure.
+func reviewedRevision(id string) (int, error) {
+	switch id {
+	case "SeedSystemRolesForAllOrgs", "SeedSystemRolesForAllOrgs/legacy-super-admin-update":
+		return 2, nil
+	case "PrepareProviderIntegrationManagementMode", "PrepareMessageIngestionOrder",
+		"PrepareMetaInstagramDeletionJournalTenant", "AutoMigrate", "InstallMessageIngestionOrderTrigger",
+		"BackfillProviderIntegrationBindings", "SeedPermissionsAndRoles",
+		"SeedSystemRolesForAllOrgs/seedSystemRolesForOrg",
+		"SeedSystemRolesForAllOrgs/FixSystemRolePermissions",
+		"SeedSystemRolesForAllOrgs/ApplyManagerSettingsPolicyMigration",
+		"SeedSystemRolesForAllOrgs/MigrateExistingUserRoles",
+		"MigrateUserOrganizations", "CreateDefaultAdmin", "EnsurePlatformReseller",
+		"EnsureReReplyProductCatalog", "SeedDefaultWidgets", "BackfillLastInboundAt",
+		"BackfillChatbotFlowGraph", "BackfillLegacyWhatsAppInbox":
+		return 1, nil
+	default:
+		return 0, fmt.Errorf("unreviewed registry step %q", id)
+	}
+}
+
 func digestSource(b []byte) string { sum := sha256.Sum256(b); return hex.EncodeToString(sum[:]) }
 func formatted(node ast.Node) string {
 	var b bytes.Buffer
@@ -233,6 +256,40 @@ func seedChildOrder(body *ast.BlockStmt) []string {
 	return order
 }
 
+// seedChildBindings is shared by actual-source derivation and source mutants.
+// No inline Exec call is permitted, regardless of its receiver or SQL arguments.
+func seedChildBindings(body *ast.BlockStmt) ([]string, []string, error) {
+	child := []string{}
+	inlineExec := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		c, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if name, ok := c.Fun.(*ast.Ident); ok && name.Name != "false" {
+			child = append(child, name.Name)
+		}
+		callee := c.Fun
+		for {
+			wrapped, ok := callee.(*ast.ParenExpr)
+			if !ok {
+				break
+			}
+			callee = wrapped.X
+		}
+		if selector, ok := callee.(*ast.SelectorExpr); ok && selector.Sel.Name == "Exec" {
+			inlineExec = true
+		}
+		return true
+	})
+	wantChild := []string{"seedSystemRolesForOrg", "FixSystemRolePermissions", "ApplyManagerSettingsPolicyMigration", "MigrateExistingUserRoles"}
+	childOrder := seedChildOrder(body)
+	if inlineExec || !reflect.DeepEqual(child, wantChild) || !reflect.DeepEqual(childOrder, wantChild) {
+		return nil, nil, fmt.Errorf("seed child order/inline Exec changed; review metadata explicitly")
+	}
+	return child, childOrder, nil
+}
+
 func deriveBindings(t *testing.T) coordinatorBindings {
 	t.Helper()
 	root := registryRoot(t)
@@ -295,33 +352,9 @@ func deriveBindings(t *testing.T) coordinatorBindings {
 		t.Fatalf("preparation labels do not match coordinator call order: %v versus %v", labels, orderedLabels)
 	}
 	parent := sourceFunction(t, f, "SeedSystemRolesForAllOrgs")
-	child := []string{}
-	inline := []string{}
-	ast.Inspect(parent.Body, func(n ast.Node) bool {
-		c, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if name, ok := c.Fun.(*ast.Ident); ok && name.Name != "false" {
-			child = append(child, name.Name)
-		}
-		if formatted(c.Fun) == "db.Exec" {
-			if len(c.Args) != 1 {
-				t.Fatal("unsupported inline SQL binding")
-			}
-			var s string
-			if err := json.Unmarshal([]byte(formatted(c.Args[0])), &s); err != nil {
-				t.Fatal(err)
-			}
-			inline = append(inline, s)
-		}
-		return true
-	})
-	wantChild := []string{"seedSystemRolesForOrg", "FixSystemRolePermissions", "ApplyManagerSettingsPolicyMigration", "MigrateExistingUserRoles"}
-	wantChildOrder := append(append([]string{}, wantChild...), "legacy-super-admin-update")
-	childOrder := seedChildOrder(parent.Body)
-	if !reflect.DeepEqual(child, wantChild) || !reflect.DeepEqual(childOrder, wantChildOrder) || len(inline) != 1 || inline[0] != "UPDATE users SET is_super_admin = true WHERE email = 'admin@admin.com'" {
-		t.Fatal("seed child order/inline legacy update changed; review metadata explicitly")
+	child, childOrder, err := seedChildBindings(parent.Body)
+	if err != nil {
+		t.Fatal(err)
 	}
 	main := parseSource(t, root, "cmd/whatomate/main.go")
 	callbacks := []string{}
@@ -369,7 +402,7 @@ func deriveBindings(t *testing.T) coordinatorBindings {
 		Version: 1, ExecutionLabels: labels, ModelDescriptors: descriptors,
 		ModelListSHA256:   digestSource([]byte(formatted(models))),
 		CoordinatorSHA256: digestSource([]byte(formatted(fn))),
-		CoordinatorCalls:  calls, SeedChildCalls: child, SeedChildOrder: childOrder, InlineSQL: inline[0],
+		CoordinatorCalls:  calls, SeedChildCalls: child, SeedChildOrder: childOrder, InlineSQL: "",
 		Callbacks: callbacks, CallbackCalls: callbackCalls, CallbackSHA256: callbackSHA,
 		Idempotency:    rationale,
 		N1Safety:       "false means not certified by N-1 compatibility proof; it does not assert a demonstrated incompatibility",
@@ -408,6 +441,88 @@ lo.Info("done")
 	}
 }
 
+func TestReviewedRegistryRevisionInventory(t *testing.T) {
+	if len(stepContracts) != 21 {
+		t.Fatal("reviewed registry inventory changed")
+	}
+	seen := map[string]bool{}
+	advanced := []string{}
+	unchanged := 0
+	for _, c := range stepContracts {
+		id := stepID(c)
+		if seen[id] {
+			t.Fatalf("duplicate source contract %s", id)
+		}
+		seen[id] = true
+		revision, err := reviewedRevision(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch revision {
+		case 1:
+			unchanged++
+		case 2:
+			advanced = append(advanced, id)
+		default:
+			t.Fatalf("unreviewed revision %d for %s", revision, id)
+		}
+		if id == "SeedSystemRolesForAllOrgs" && c.Idempotent {
+			t.Fatal("write removal does not certify the parent's remaining reconciliation")
+		}
+		if id == "SeedSystemRolesForAllOrgs/legacy-super-admin-update" {
+			if symbolFor(c) != databasePath+"SeedSystemRolesForAllOrgs" || c.Parent != "SeedSystemRolesForAllOrgs" || c.Kind != "seed-reconciler" || !c.Idempotent || c.IdempotencyReason != "removes-write: legacy admin@admin.com escalation removed at rev 2; retained inert marker bound to parent closure" {
+				t.Fatal("historical child must remain inert metadata bound to its parent")
+			}
+		}
+	}
+	wantAdvanced := []string{"SeedSystemRolesForAllOrgs", "SeedSystemRolesForAllOrgs/legacy-super-admin-update"}
+	if unchanged != 19 || !reflect.DeepEqual(advanced, wantAdvanced) {
+		t.Fatalf("unexpected revision transition: unchanged=%d advanced=%v", unchanged, advanced)
+	}
+	for _, id := range []string{"", "legacy-super-admin-update", "SeedSystemRolesForAllOrgs/unknown", "UnreviewedStep"} {
+		if _, err := reviewedRevision(id); err == nil {
+			t.Fatalf("unknown registry ID accepted: %q", id)
+		}
+	}
+}
+
+func TestSeedChildBindingsRejectInlineWrites(t *testing.T) {
+	file := parseSource(t, registryRoot(t), "internal/database/postgres.go")
+	parent := sourceFunction(t, file, "SeedSystemRolesForAllOrgs")
+	if _, _, err := seedChildBindings(parent.Body); err != nil {
+		t.Fatalf("actual post-removal source: %v", err)
+	}
+	source := formatted(parent)
+	for _, mutation := range []struct {
+		name, old, replacement string
+	}{
+		{"restored legacy write", "{\n", "{\n\tdb.Exec(\"UPDATE users SET is_super_admin = true WHERE email = 'admin@admin.com'\")\n"},
+		{"write moved to return", "\n\treturn nil\n", "\n\tdb.Exec(\"fixed SQL\")\n\treturn nil\n"},
+		{"write in nested closure", "{\n", "{\n\tfunc() { db.Exec(\"fixed SQL\") }()\n"},
+		{"write on another receiver", "{\n", "{\n\ttx.Exec(\"fixed SQL\")\n"},
+		{"write with unsupported arguments", "{\n", "{\n\tdb.Exec()\n"},
+		{"parenthesized write", "{\n", "{\n\t((db.Exec))(\"fixed SQL\")\n"},
+		{"omitted child", "FixSystemRolePermissions(db)", "nil"},
+		{"changed child", "FixSystemRolePermissions(db)", "UnreviewedSeedWriter(db)"},
+		{"duplicate child", "{\n", "{\n\tFixSystemRolePermissions(db)\n"},
+	} {
+		t.Run(mutation.name, func(t *testing.T) {
+			mutated := strings.Replace(source, mutation.old, mutation.replacement, 1)
+			if mutated == source {
+				t.Fatal("source mutation did not apply")
+			}
+			file, err := parser.ParseFile(token.NewFileSet(), "mutated.go", "package database\n"+mutated, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := sourceFunction(t, file, "SeedSystemRolesForAllOrgs").Body
+			if _, _, err := seedChildBindings(body); err == nil {
+				t.Fatal("changed seed binding accepted")
+			}
+		})
+	}
+}
+
 func TestDataStepRegistryMatchesCoordinator(t *testing.T) {
 	bindings := deriveBindings(t)
 	compareOrUpdate(t, "coordinator_bindings.json", "REREPLY_UPDATE_REGISTRY", bindings)
@@ -425,11 +540,15 @@ func TestDataStepRegistryMatchesCoordinator(t *testing.T) {
 	execution := []string{}
 	for i, c := range stepContracts {
 		e := entries[i]
+		revision, err := reviewedRevision(stepID(c))
+		if err != nil {
+			t.Fatal(err)
+		}
 		if seen[e.ID] {
 			t.Fatalf("duplicate step %s", e.ID)
 		}
 		seen[e.ID] = true
-		if e.ID != stepID(c) || e.Func != symbolFor(c) || e.Rev != 1 || e.Kind != c.Kind || !e.Baseline || e.Parent != c.Parent || e.Idempotent != c.Idempotent || e.N1Safe || e.RequiresGates == nil || len(e.RequiresGates) != 0 {
+		if e.ID != stepID(c) || e.Func != symbolFor(c) || e.Rev != revision || e.Kind != c.Kind || !e.Baseline || e.Parent != c.Parent || e.Idempotent != c.Idempotent || e.N1Safe || e.RequiresGates == nil || len(e.RequiresGates) != 0 {
 			t.Fatalf("entry %d metadata does not match reviewed source contract", i)
 		}
 		if e.Parent == "" && !strings.HasPrefix(e.Func, modulePath+"/internal/handlers.") && !strings.HasPrefix(e.Func, modulePath+"/internal/channel.") {
@@ -464,6 +583,10 @@ func generatedSteps(t *testing.T) []dataStep {
 	p := registryProgram(t)
 	steps := []dataStep{}
 	for _, c := range stepContracts {
+		revision, err := reviewedRevision(stepID(c))
+		if err != nil {
+			t.Fatal(err)
+		}
 		// GORM reaches these naming/lifecycle methods reflectively. The explicit
 		// pinned interface contract includes only reached model receiver types;
 		// unrelated methods (including String) stay outside the closure.
@@ -471,7 +594,7 @@ func generatedSteps(t *testing.T) []dataStep {
 		if err != nil {
 			t.Fatal(err)
 		}
-		steps = append(steps, dataStep{stepID(c), 1, symbolFor(c), c.Kind, true, c.Idempotent, false, []string{}, result.Files, result.SHA256, c.Parent})
+		steps = append(steps, dataStep{stepID(c), revision, symbolFor(c), c.Kind, true, c.Idempotent, false, []string{}, result.Files, result.SHA256, c.Parent})
 	}
 	return steps
 }

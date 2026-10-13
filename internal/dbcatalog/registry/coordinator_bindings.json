@@ -212,10 +212,9 @@
     "seedSystemRolesForOrg",
     "FixSystemRolePermissions",
     "ApplyManagerSettingsPolicyMigration",
-    "MigrateExistingUserRoles",
-    "legacy-super-admin-update"
+    "MigrateExistingUserRoles"
   ],
-  "inline_sql": "UPDATE users SET is_super_admin = true WHERE email = 'admin@admin.com'",
+  "inline_sql": "",
   "callbacks": [
     "handlers.BackfillChatbotFlowGraph",
     "channelapi.BackfillLegacyWhatsAppInbox"
@@ -248,7 +247,7 @@
     "SeedSystemRolesForAllOrgs/ApplyManagerSettingsPolicyMigration": "Per-organization version marker prevents reapplying the retired-grant removal",
     "SeedSystemRolesForAllOrgs/FixSystemRolePermissions": "Adds only absent permitted links and preserves explicit grants",
     "SeedSystemRolesForAllOrgs/MigrateExistingUserRoles": "Only users lacking role_id are repaired",
-    "SeedSystemRolesForAllOrgs/legacy-super-admin-update": "Existing inline UPDATE sets the same boolean; no permission-policy endorsement",
+    "SeedSystemRolesForAllOrgs/legacy-super-admin-update": "removes-write: legacy admin@admin.com escalation removed at rev 2; retained inert marker bound to parent closure",
     "SeedSystemRolesForAllOrgs/seedSystemRolesForOrg": "Existing system-role count skips creation; partial-create recovery is not asserted"
   },
   "n1_safety_note": "false means not certified by N-1 compatibility proof; it does not assert a demonstrated incompatibility",
