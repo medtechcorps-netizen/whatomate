@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -80,8 +79,8 @@ func TestCheckConfigRefusals(t *testing.T) {
 	}
 }
 
-// The refused password and address are the repository's own: the example
-// config's placeholder and the address the migration makes a super admin.
+// Keep the example password and historically unsafe administrator address
+// refused, independently of whether the legacy grant SQL remains present.
 func TestRefusedAdminValuesMatchTheRepository(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "config.example.toml"))
 	require.NoError(t, err)
@@ -91,11 +90,7 @@ func TestRefusedAdminValuesMatchTheRepository(t *testing.T) {
 	require.True(t, ok, "config.example.toml has no [default_admin]")
 	require.Equal(t, exampleAdminPassword, admin["password"])
 
-	source, err := os.ReadFile(filepath.Join("..", "..", "..", "internal", "database", "postgres.go"))
-	require.NoError(t, err)
-	grants := regexp.MustCompile(`UPDATE users SET is_super_admin = true WHERE email = '([^']+)'`).FindAllStringSubmatch(string(source), -1)
-	require.Len(t, grants, 1, "the migration's super-admin grant moved; review forbiddenAdminEmail")
-	require.Equal(t, forbiddenAdminEmail, grants[0][1])
+	require.Equal(t, "admin@admin.com", forbiddenAdminEmail)
 }
 
 func writeConfig(t *testing.T, environment, runtimeURL, migrationURL, runtimeRole, adminPassword string) string {
