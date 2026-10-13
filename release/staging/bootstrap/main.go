@@ -33,9 +33,9 @@
 //   - the owner owns the database, so no third role holds it or (on
 //     PostgreSQL 15+, through pg_database_owner) its public schema, and the
 //     owner can create in that schema;
-//   - the default administrator is not admin@admin.com (which the migration
-//     makes a super admin) and its password is neither config.example.toml's
-//     nor shorter than 16 characters;
+//   - the default administrator is not admin@admin.com (the historically
+//     unsafe legacy administrator address) and its password is neither
+//     config.example.toml's nor shorter than 16 characters;
 //   - the public schema holds no namespace-dependent object, so a production
 //     database, or one this tool already built, is refused by construction.
 //
@@ -91,7 +91,7 @@ const (
 
 	// exampleAdminPassword is config.example.toml's [default_admin] password.
 	exampleAdminPassword = "replace-with-a-strong-random-password"
-	// forbiddenAdminEmail is made a super admin by the migration itself.
+	// forbiddenAdminEmail preserves the historically unsafe legacy admin address.
 	forbiddenAdminEmail   = "admin@admin.com"
 	minAdminPasswordRunes = 16
 	// minOwnerConnections leaves the migration a connection beside the one
