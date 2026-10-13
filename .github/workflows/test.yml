@@ -26,7 +26,7 @@ jobs:
     name: release-tests
     runs-on: ubuntu-24.04
     # Deployment tests alone take about 15 minutes; leave time for staging and compat.
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
