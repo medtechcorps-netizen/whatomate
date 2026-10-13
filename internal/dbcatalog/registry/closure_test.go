@@ -637,6 +637,7 @@ func (p *closureProgram) closureConfigured(modelPackage string, gormInterfaces [
 	seen := map[*closureDeclaration]bool{}
 	visited := map[string]bool{}
 	initialized := map[string]bool{}
+	contextCancelChecked, contextCancelSafe := false, false
 	for len(queue) != 0 {
 		visit := queue[0]
 		queue = queue[1:]
@@ -748,6 +749,18 @@ func (p *closureProgram) closureConfigured(modelPackage string, gormInterfaces [
 				}
 				if _, builtin := obj.(*types.Builtin); builtin {
 					return true
+				}
+				// Only proven immutable standard-library cancellation values are terminals.
+				// Their initializer and any local wrapper remain ordinary closure inputs.
+				if p.contextCancelCall(decl, call) {
+					if !contextCancelChecked {
+						_, err := p.contextCancelSourceUniverse()
+						contextCancelSafe = err == nil
+						contextCancelChecked = true
+					}
+					if contextCancelSafe {
+						return true
+					}
 				}
 				targets := []*closureCallable{}
 				if fn, resolved := obj.(*types.Func); resolved {
