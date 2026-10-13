@@ -1,4 +1,4 @@
-# PR18 actual M-to-C18 source fixture; synthetic histories only, not qualification.
+# PR18 source fixture with reviewed 45-minute release-test budget; synthetic histories only, not qualification.
 @@@ PATCH transition 899608
 --- a/.github/workflows/test.yml
 +++ b/.github/workflows/test.yml
@@ -31,7 +31,7 @@
      name: release-tests
      runs-on: ubuntu-24.04
      # Deployment tests alone take about 15 minutes; leave time for staging and compat.
-     timeout-minutes: 20
+     timeout-minutes: 45
      steps:
        - name: Checkout repository
          uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

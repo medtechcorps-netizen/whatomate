@@ -1534,7 +1534,7 @@ _PR18_OBSERVER_MAIN_STATES = (
     "6da28438261bf29ffe1b02a36c8ed8ff2ba2620df821979b458790e882bc41d8",  # reviewed PR18
 )
 _PR18_OBSERVER_FILES = {
-    '.github/workflows/test.yml': ('990773b11bea5913757783b588c362bf6db4f304269e54d6dd17f5ee42af9f77', '87a5620b20083873532e77c34506b5136c0614f7c9951f5db66b34900ded072e'),
+    '.github/workflows/test.yml': ('8adfd6a64bff17a078e8daa626cecc85d1118ebbc96a063b5c0c5cfc739ff2f9', '3f8d54640780c2e7dee3a59480a9d3a44004c2c8462f367e44bbfad546b04c16'),
     'cmd/whatomate/main.go': ('3a13697d9839c9ef2cf1b2f6b76d53449c81ce2927cc087e7d2773f6f4cf1e0b', '6da28438261bf29ffe1b02a36c8ed8ff2ba2620df821979b458790e882bc41d8'),
     'cmd/whatomate/migration_plan.go': (None, '43bbdc7d9733e5cd0fa76a1129cab1ed70dd70be7d516061278cdd15e17e9dde'),
     'cmd/whatomate/migration_plan_pg_test.go': (None, '49dfd9e27e336b909bd6e2a698863db089bab94616dafc92830c52178cc16814'),

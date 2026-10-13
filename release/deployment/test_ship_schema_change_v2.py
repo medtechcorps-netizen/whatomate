@@ -2151,18 +2151,18 @@ class FixedRemovesWriteCISourceTests(unittest.TestCase):
 
 
 class PR18ObserverTransitionTests(unittest.TestCase):
-    """Pinned real source bytes; commits below are disposable synthetic histories.
+    """Pinned source with one reviewed timing transform; histories are synthetic.
 
     The fixture is self-contained. Neither source currently checked out, private
     predicate constants, generated expectations nor network state supply an
     oracle. The old public classifier remains a refusal authority.
     """
 
-    FIXTURE_SHA = '8b06746a29588f3f9bf2932531a0fe6fa66ab19d2fb42310be46fefc484cbe3f'
-    FIXTURE_BYTES = 3104315
+    FIXTURE_SHA = '8fff1020532785da88e79cac5d2f398cbb2cf94936f9511c40773300a11c3235'
+    FIXTURE_BYTES = 3104343
     SOURCE = {'.github/workflows/test.yml': ['M',
-                                '990773b11bea5913757783b588c362bf6db4f304269e54d6dd17f5ee42af9f77',
-                                '87a5620b20083873532e77c34506b5136c0614f7c9951f5db66b34900ded072e',
+                                '8adfd6a64bff17a078e8daa626cecc85d1118ebbc96a063b5c0c5cfc739ff2f9',
+                                '3f8d54640780c2e7dee3a59480a9d3a44004c2c8462f367e44bbfad546b04c16',
                                 '100644'],
  'cmd/whatomate/main.go': ['M',
                            '3a13697d9839c9ef2cf1b2f6b76d53449c81ce2927cc087e7d2773f6f4cf1e0b',
@@ -2342,7 +2342,7 @@ class PR18ObserverTransitionTests(unittest.TestCase):
         if len(raw) != cls.FIXTURE_BYTES or hashlib.sha256(raw).hexdigest() != cls.FIXTURE_SHA:
             raise AssertionError("PR18 fixture identity changed")
         header, separator, rest = raw.partition(b"\n")
-        if not separator or header != b"# PR18 actual M-to-C18 source fixture; synthetic histories only, not qualification.":
+        if not separator or header != b"# PR18 source fixture with reviewed 45-minute release-test budget; synthetic histories only, not qualification.":
             raise AssertionError("PR18 fixture header")
         sections = {}
         while rest:
@@ -2457,6 +2457,10 @@ class PR18ObserverTransitionTests(unittest.TestCase):
         for path in self.DESCRIPTORS:
             self.assertNotIn(path, self.before)
         self.assertFalse(any(path.startswith("internal/dbcatalog/golden/pending/") for path in self.before))
+        for source in (self.before[".github/workflows/test.yml"], self.after[".github/workflows/test.yml"]):
+            release_job = source.split("  release-tests:\n", 1)[1].split("  schema-guard:\n", 1)[0]
+            self.assertIn("    timeout-minutes: 45\n", release_job)
+            self.assertEqual(release_job.count("timeout-minutes:"), 1)
 
     def test_exact_transition_admits_ci_v2_but_not_legacy_release_guard(self):
         head = self.head()
@@ -2610,6 +2614,9 @@ class PR18ObserverTransitionTests(unittest.TestCase):
         for path in self.SOURCE:
             with self.subTest(path=path):
                 self.refused(self.head({path: self.after[path] + "\n"}))
+        path = ".github/workflows/test.yml"
+        with self.subTest(path=path, release_timeout="old-20-minute-postimage"):
+            self.refused(self.head({path: self.after[path].replace("    timeout-minutes: 45\n", "    timeout-minutes: 20\n", 1)}))
 
     def test_every_modified_preimage_is_fixed(self):
         for path, (status, *_) in self.SOURCE.items():
@@ -2618,6 +2625,11 @@ class PR18ObserverTransitionTests(unittest.TestCase):
                     self.repo.checkout(self.base)
                     base = self.repo.commit({path: self.before[path] + "\n"})
                     self.refused(self.repo.commit(self.after), base)
+        path = ".github/workflows/test.yml"
+        with self.subTest(path=path, release_timeout="old-20-minute-preimage"):
+            self.repo.checkout(self.base)
+            base = self.repo.commit({path: self.before[path].replace("    timeout-minutes: 45\n", "    timeout-minutes: 20\n", 1)})
+            self.refused(self.repo.commit(self.after), base)
 
     def test_every_added_file_must_be_absent_before_atomic_transition(self):
         for path, (status, *_) in self.SOURCE.items():
