@@ -290,6 +290,11 @@ class ImmutableGit:
             return self._call(values, limit=PUBLISHER_NAMESPACE_LIMIT).stdout
         if len(values) == 3 and values[0] == "merge-base" and all(_oid(v) for v in values[1:]):
             return self._call(values, limit=128).stdout
+        if (len(values) == 3 and values[:2] == ["rev-parse", "--verify"]
+                and re.fullmatch(r"[0-9a-f]{40}\^1", values[2])):
+            # One immutable commit's actual first parent, never an arbitrary ref
+            # or revision expression. The classifier validates the exact OID.
+            return self._call(values, limit=128).stdout
         if (len(values) == 4 and values[:3] == ["rev-list", "--first-parent", "--reverse"]
                 and re.fullmatch(r"[0-9a-f]{40}\.\.[0-9a-f]{40}", values[3])):
             return self._call(values, limit=2048 * 41).stdout

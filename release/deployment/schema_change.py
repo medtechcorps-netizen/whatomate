@@ -1365,6 +1365,17 @@ def _classify_v2(repo: _Repository, base: str, head: str,
         if kind != "none" and not (dormant and (kind == "data"
                 or (kind == "expand" and pending_introduced))):
             requirements.add("producer-class-unsupported")
+        if (reasons == {_PR18_OBSERVER_CALL} and kind == "data" and dormant is True
+                and tuple(sorted(requirements)) == _PR18_OBSERVER_REQUIREMENTS
+                and migrations == _PR18_OBSERVER_MIGRATIONS):
+            # Only the reviewed existing-call rewrite can remove this one reason.
+            # Proof/bounded-source refusal preserves it; transport errors propagate.
+            try:
+                _pr18_observer_transition(repo, base, head)
+            except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+                pass
+            else:
+                reasons.remove(_PR18_OBSERVER_CALL)
         summary.append("policy classification: " + kind + (" (dormant)" if dormant else ""))
         _valid(len(summary) <= 25000)
         for line in (*reasons, *summary, *migrations):
@@ -1511,11 +1522,210 @@ def _ci_seed_removal(repo: _Repository, base: str, head: str, legacy: Classifica
     _valid(advanced)
 
 
+# Fixed reviewed PR18 read-only observer transition. These are source fingerprints,
+# not release/commit identities or a general migration-call permission. The same
+# bytes can be recut after a separately qualified policy prerequisite.
+_PR18_OBSERVER_REASON = "ci-source-pr18-observer-transition-required"
+_PR18_OBSERVER_MAIN = "cmd/whatomate/main.go"
+_PR18_OBSERVER_CALL = "migration-call:" + _PR18_OBSERVER_MAIN
+_PR18_OBSERVER_MAIN_STATES = (
+    "6e4555346d9e8ebd41eac8992cb5b5add17a653239938a181e20c2f9f67e2d94",  # before PR7
+    "3a13697d9839c9ef2cf1b2f6b76d53449c81ce2927cc087e7d2773f6f4cf1e0b",  # before PR18
+    "6da28438261bf29ffe1b02a36c8ed8ff2ba2620df821979b458790e882bc41d8",  # reviewed PR18
+)
+_PR18_OBSERVER_FILES = {
+    '.github/workflows/test.yml': ('990773b11bea5913757783b588c362bf6db4f304269e54d6dd17f5ee42af9f77', '87a5620b20083873532e77c34506b5136c0614f7c9951f5db66b34900ded072e'),
+    'cmd/whatomate/main.go': ('3a13697d9839c9ef2cf1b2f6b76d53449c81ce2927cc087e7d2773f6f4cf1e0b', '6da28438261bf29ffe1b02a36c8ed8ff2ba2620df821979b458790e882bc41d8'),
+    'cmd/whatomate/migration_plan.go': (None, '43bbdc7d9733e5cd0fa76a1129cab1ed70dd70be7d516061278cdd15e17e9dde'),
+    'cmd/whatomate/migration_plan_pg_test.go': (None, '49dfd9e27e336b909bd6e2a698863db089bab94616dafc92830c52178cc16814'),
+    'cmd/whatomate/migration_plan_relay_test.go': (None, 'f2f3b65c119c82437ea25b2015d8685242442e423a5736b72f15bab96f7326e6'),
+    'cmd/whatomate/migration_plan_test.go': (None, 'c3ce07dc149bb428142d52a13c17be30be1ac95ff100886313f8d2077c5d6a49'),
+    'cmd/whatomate/migration_plan_two_server_pg_test.go': (None, '5e8225306bd5e4243f9c880ef3079525977bdfee17642e73a04b4dd524f618a3'),
+    'internal/database/catalog_plan_integration_test.go': (None, '7a571e81f11963e73707603af2a1fe339bd69795b9b5d3486c7acd8b5517cc5e'),
+    'internal/database/data_gates.go': (None, 'fdd250d045ba4676262d8e803df14645d8bfd896906a15c12956252facf6513d'),
+    'internal/database/data_gates_export_test.go': (None, 'dd231916a0e9616aef48dd49de376644b23943986fc402c7f783af8378b974d9'),
+    'internal/database/data_gates_integration_test.go': (None, '71b46620c46cb1c6e1e4b9b77ec21102fa8d9f300b4f118e473f97c82be26777'),
+    'internal/database/data_gates_lost_ack_integration_test.go': (None, 'e41c2456cc1a926607e16fd84a19f729202f126ad86c6b2ce503ecab840793aa'),
+    'internal/database/plan.go': (None, '91ab1d7114a42d4166aa88b632d22c56291da2a39d265bba3c12770cf091d3ee'),
+    'internal/database/plan_semantics_test.go': (None, '193b5e7882fdf3df5efbbd503650a0f16ed583292df088612ebf48c5480429cb'),
+    'internal/database/plan_test.go': (None, 'dabb7a6982cbd7b066fa5b41e83d06f9de5e64798e251389395e4351b29f13cb'),
+    'internal/database/plan_visibility.go': (None, 'b9e332f30ca4f03f25bef9e75e8e7ed8d60762c4d1e38e13ffe5d27215e3b9e4'),
+    'internal/database/postgres.go': ('1b7ca0bdcfdf0696ca88aeec8f7a528834ef41cf9c8e47e338a18382719e6fb4', '3dbf326842c2b369551dd2b37c779159ffeff2bd8ea65bd4fd6d031a2d66c76d'),
+    'internal/dbcatalog/builtin.go': ('9e1bf8e46f2eb061a1e841c72b476d7e40c02f0865107060995845250e6f1506', '74b0b9550591e8152f02ed2d0c5d207936f8fb02f5829d3595eedb11c30fa524'),
+    'internal/dbcatalog/capture.go': ('2db6d6f6e7df718f2dbd0afcb7394e9486f1ef08567e2775bd58c1a4e5ca6c42', 'cf8f820421107e59db55af28dfdfa5e601ad8f36493f19770b9eefac25e03b06'),
+    'internal/dbcatalog/capture_plan_test.go': (None, '5b6945842dd89eb2afbad34c1e74666e9d36fae8186a3745f4cdbd8ede7876b8'),
+    'internal/dbcatalog/format.go': ('e374e1ae11f9dbf4b6e2e49736552aece0172be366f586ae8e964dd80339c9d7', '985251243b85ceb04948b00c988c471567df7ccd0197e4d7995b2e466c64c5da'),
+    'internal/dbcatalog/plan.go': (None, 'ffe9b24f4558227f37169c5b15b6677bf7dca2931925905f7349d2b95e50e9f8'),
+    'internal/dbcatalog/plan_source.go': (None, 'b2a7dc810a68606c8349635953e23f57f14d41e107c497d65f165efbd889e35c'),
+    'internal/dbcatalog/plan_source_test.go': (None, 'ad78c536d2637f00f6376f334cce582a82388f0ff2d9cbe33ff48bb31db780ae'),
+    'internal/dbcatalog/plan_test.go': (None, 'e125ae07909633759cfc7992b0a7e317d063684f76a06626a754a809fb0f07db'),
+    'internal/dbcatalog/registry/closure_caps.json': ('02ea976eb866f8fac166b1629803f8c85afe654fec6e3198f1d2e62357c374b6', '9ccfdc7e61e9fb52d7a60a0653fc69ffdc2a82740fc0b5d728e1516fb40c8dcf'),
+    'internal/dbcatalog/registry/data_steps.json': ('25041acd83c2f87921d994746d63a3b00bc937191c13d91cfa59e2d1a09f668a', '7df7b9277ca507ef634e62ae2992d464f4701f5c5084fcb93a18951d6edf019c'),
+    'internal/dbcatalog/registry/migration_path.json': ('55b0b67461813c345b62a2588bc8c85d4ff50ea88b5c78732cc134488765d455', 'bde5e0c8ec946d37d60727ba6b20ede20ba6be19321e103dfe963d2615cf072e'),
+    'internal/dbcatalog/registry/migration_path_test.go': ('9d566011163f0cd2ab78609334948e105f1a552d5dd26a943e9e4f7c24d13c13', '41aa23161c5467d7f4d72cd9e9eeb971e8b223830e749da49d95bc05313830e9'),
+    'internal/dbcatalog/registry/registry_test.go': ('b5082386816506c38da02c508e930f115cbac28fc2071aa380c1d729bdce8c79', '8da9c1d3e143b96590ad4bdca0086a01403e6b7a03696feffebfed1e65e27ef3'),
+    'release/deployment/test_ci_workflows.py': ('6131bf1587594ec935b4aca2e5f2183623dbc16461d54588d0cb6d95ec64043e', '94a85a349b24446c83227d14c88d5f7480adb906a08511e0473d537ebb8b7233'),
+}
+_PR18_OBSERVER_PROTECTED = {
+    'internal/dbcatalog/golden/catalog.json': '17ae6791a73745f3e34ff30760aced9f27b98e189eace34f108ff1d8b93465b8',
+    'internal/dbcatalog/golden/history.json': '9b9a31ec3e2164031abb04ea271fb70a32207fd84528bc7faaea8e22f9864513',
+    'internal/dbcatalog/golden/global_tables.json': 'c125e9283e3eaa80ad5d2cd86a0ee1236b4a71884a59907329b29c4dd3a70ae3',
+    'internal/dbcatalog/golden/seeds.json': 'dac095bdb1d6aff7c54fccd13bcbfa4bbff131154f9589dc5ae476331ffeca77',
+    'internal/dbcatalog/golden/production-v0.json': '808e11a5fdab638adc6f0004e9595371d1eee9a51763e12e779b355f7cdd391d',
+    'internal/dbcatalog/shape/production-v0.sql': '48b2558aaa0c54f0de886093c875ff70fbc65231ee80d8b560df91afc97c131d',
+}
+_PR18_OBSERVER_MIGRATIONS = (
+    "generated migration closure changed",
+    "migration path changed: cmd/whatomate/main.go#runRLSMigration",
+    "migration path changed: internal/database/postgres.go#runRLSMigrationCoordinatorForPhase",
+)
+_PR18_OBSERVER_LEGACY = (
+    _PR18_OBSERVER_CALL,
+    "migration-path-changed:closure",
+    "migration-path-changed:cmd/whatomate/main.go#runRLSMigration",
+    "migration-path-changed:internal/database/postgres.go#runRLSMigrationCoordinatorForPhase",
+)
+_PR18_OBSERVER_REQUIREMENTS = ("compat-required", "generated-migration-closure-ci")
+
+
+def _pr18_observer_blob(repo: _Repository, revision: str, path: str,
+                       digest: str | None) -> bytes | None:
+    raw = _git(repo.root, ["ls-tree", "-z", revision, "--", path])
+    if digest is None:
+        _valid(raw == b"" and repo.blob(revision, path) is None)
+        return None
+    _valid(re.fullmatch(rb"100644 blob [0-9a-f]{40}\t" + re.escape(path.encode()) + rb"\x00", raw) is not None)
+    value = repo.blob(revision, path)
+    _valid(type(value) is bytes and bool(value) and hashlib.sha256(value).hexdigest() == digest)
+    return value
+
+
+def _pr18_observer_changed(repo: _Repository, base: str, head: str) -> bool:
+    # Recognize absent-at-base additions and exact changed postimages before
+    # a legacy-clean return, including workflow/test-only fragments. Existing
+    # PR18 paths alone do not fence unrelated future none-class edits.
+    for _, path in changed_paths(repo.root, base, head):
+        if path not in _PR18_OBSERVER_FILES:
+            continue
+        before, after = _PR18_OBSERVER_FILES[path]
+        if before is None and repo.blob(base, path) is None:
+            return True
+        value = repo.blob(head, path)
+        if (type(value) is bytes and hashlib.sha256(value).hexdigest() == after
+                and repo.blob(base, path) != value):
+            return True
+    return False
+
+
+def _pr18_observer_transition(repo: _Repository, base: str, head: str,
+                             *, ci: bool = False) -> tuple[str, str]:
+    """Prove one exact transition without calling either classifier or CI.
+
+    Older release history may contain only the independently reviewed main.go
+    states, in order. CI additionally admits no unrelated prefix/suffix edits.
+    All reads retain the existing per-blob, aggregate and first-parent bounds.
+    """
+    _valid(base != head and _git(repo.root, ["merge-base", base, head]).strip() == base.encode())
+    raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+    _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+    revisions = raw.decode("ascii").splitlines()
+    _valid(0 < len(revisions) <= MAX_HISTORY_COMMITS and len(revisions) == len(set(revisions))
+           and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+           and revisions[-1] == head)
+    # The range alone does not prove its first included commit descends from
+    # base along first parents: excluded ancestors can hide a second-parent
+    # base. Check every actual first-parent OID below, including the first edge.
+    expected = sorted(("A" if old is None else "M", path)
+                      for path, (old, _) in _PR18_OBSERVER_FILES.items())
+    descriptors = (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
+                   schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH)
+    prior, prior_state, anchor = None, None, None
+    for revision in (base, *revisions):
+        if prior is not None:
+            _valid(_git(repo.root, ["rev-parse", "--verify", revision + "^1"]) == prior.encode() + b"\n")
+        main = repo.blob(revision, _PR18_OBSERVER_MAIN)
+        _valid(type(main) is bytes)
+        digest = hashlib.sha256(main).hexdigest()
+        _valid(digest in _PR18_OBSERVER_MAIN_STATES)
+        state = _PR18_OBSERVER_MAIN_STATES.index(digest)
+        _pr18_observer_blob(repo, revision, _PR18_OBSERVER_MAIN, digest)
+        if prior is None:
+            _valid(state in {0, 1})
+        else:
+            _valid(state in {prior_state, prior_state + 1})
+        # Historical PR7 introduced this exact manifest with the S0->S1 source
+        # transition. Arbitrary dormant declarations cannot hide another call.
+        _pr18_observer_blob(repo, revision, DORMANT, None if state == 0 else
+                            "041af21a905dd160657431d8a4482d8f52f162f312d4cc9148a071400bbd508d")
+        for path, protected in _PR18_OBSERVER_PROTECTED.items():
+            _pr18_observer_blob(repo, revision, path, protected)
+        _valid(not _git(repo.root, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING.rstrip("/")]))
+        for path in descriptors:
+            _pr18_observer_blob(repo, revision, path, None)
+        if state < 2:
+            for path, (old, _) in _PR18_OBSERVER_FILES.items():
+                if old is None:
+                    _pr18_observer_blob(repo, revision, path, None)
+        if prior is not None:
+            changes = changed_paths(repo.root, prior, revision)
+            if prior_state == 1 and state == 2:
+                _valid(anchor is None and sorted(changes) == expected)
+                for path, (old, new) in _PR18_OBSERVER_FILES.items():
+                    _pr18_observer_blob(repo, prior, path, old)
+                    _pr18_observer_blob(repo, revision, path, new)
+                for rev in (prior, revision):
+                    _pr18_observer_blob(repo, rev, "internal/dbcatalog/registry/coordinator_bindings.json",
+                                       "ecc49fb74995dcd121a645fd139ebff2fdc9e22bd2a1b01df91a3eb4e24daee4")
+                anchor = (prior, revision)
+            elif ci or state == 2:
+                _valid(not changes)
+        prior, prior_state = revision, state
+    _valid(anchor is not None and prior_state == 2)
+
+    # Whole-file pins cover imports, implementation, metadata and tests. Also
+    # assert the two reviewed declaration transforms and unchanged remainders.
+    for path, name, old_digest, new_digest in (
+        (_PR18_OBSERVER_MAIN, "runRLSMigration",
+         "62d2f37e594c0027b8ccdb203da87118a8b8e1f58cdb86db812b9c2a615582b5",
+         "beb7595c484b2a9c08847ed3b1fb9efcd7627161a667a6572d698aa07ffd29a7"),
+        ("internal/database/postgres.go", "runRLSMigrationCoordinatorForPhase",
+         "2afd699f059c3f0514f9c43230d05a5560a417d558a3b94b725489e32440954f",
+         "b0c63d1e8d3e460914ccfc8097cf4c52ce564154f470f0b0c5f3487aa090293f"),
+    ):
+        left, right = (repo.text(rev, path) for rev in anchor)
+        old_fn, new_fn = (_function_bytes(text, name) for text in (left, right))
+        _valid(len(old_fn) == len(new_fn) == 1
+               and hashlib.sha256(old_fn[0].encode()).hexdigest() == old_digest
+               and hashlib.sha256(new_fn[0].encode()).hexdigest() == new_digest
+               and left.replace(old_fn[0], "", 1) == right.replace(new_fn[0], "", 1))
+
+    source = repo.text(head, _PR18_OBSERVER_MAIN)
+    spans = _functions(source, "runRLSMigration")
+    _valid(len(spans) == 1)
+    dormant = _dormant(repo, head)
+    offsets, offset = [], 0
+    for line in source.splitlines(keepends=True):
+        offsets.append(offset)
+        offset += len(line)
+    observed = []
+    for number, line in _added_numbered(repo.root, base, head, _PR18_OBSERVER_MAIN):
+        _valid(1 <= number <= len(offsets))
+        for pattern in MIGRATION_CALL_PATTERNS:
+            for match in pattern.finditer(line):
+                begin, end = offsets[number - 1] + match.start(), offsets[number - 1] + match.end()
+                if not any(start <= begin and end <= stop for start, stop in dormant.get(_PR18_OBSERVER_MAIN, [])):
+                    _valid(spans[0][0] <= begin and end <= spans[0][1])
+                    observed.append(line)
+    _valid(observed == ["\tcoordinatorErr := database.RunRLSMigrationCoordinator("])
+    return anchor
+
+
 def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
     """CI source eligibility only; generated tests AND exact compat must pass.
 
     Preserve the existing none-class source contract and admit only the fixed
-    legacy escalation removal; incomplete target edits refuse. This does not grant
+    legacy escalation removal and PR18 observer transition; incomplete target
+    edits refuse. This does not grant
     experiment, merge or release authority, or change check()/guard().
     """
     repo = _Repository(repo_dir)
@@ -1529,6 +1739,17 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
             return ()
     except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
         return tuple(sorted(set(legacy.reasons) | {_CI_SEED_REASON}))
+    try:
+        if legacy.reasons == _PR18_OBSERVER_LEGACY or _pr18_observer_changed(repo, base, head):
+            _valid(legacy.reasons == _PR18_OBSERVER_LEGACY)
+            _pr18_observer_transition(repo, base, head, ci=True)
+            policy = _classify_v2(repo, base, head, legacy)
+            _valid(not policy.reasons and policy.kind == "data" and policy.dormant is True
+                   and policy.requirements == _PR18_OBSERVER_REQUIREMENTS
+                   and policy.migration_changes == _PR18_OBSERVER_MIGRATIONS)
+            return ()
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {_PR18_OBSERVER_REASON}))
     if legacy.reasons != ("migration-path-changed:closure",):
         return legacy.reasons
     policy = _classify_v2(repo, base, head, legacy)
