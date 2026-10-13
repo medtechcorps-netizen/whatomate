@@ -2150,5 +2150,628 @@ class FixedRemovesWriteCISourceTests(unittest.TestCase):
         self.refused(self.head({self.BINDINGS: " " * (sc.MAX_ARTIFACT_BYTES + 1)}))
 
 
+class PR18ObserverTransitionTests(unittest.TestCase):
+    """Pinned real source bytes; commits below are disposable synthetic histories.
+
+    The fixture is self-contained. Neither source currently checked out, private
+    predicate constants, generated expectations nor network state supply an
+    oracle. The old public classifier remains a refusal authority.
+    """
+
+    FIXTURE_SHA = '8b06746a29588f3f9bf2932531a0fe6fa66ab19d2fb42310be46fefc484cbe3f'
+    FIXTURE_BYTES = 3104315
+    SOURCE = {'.github/workflows/test.yml': ['M',
+                                '990773b11bea5913757783b588c362bf6db4f304269e54d6dd17f5ee42af9f77',
+                                '87a5620b20083873532e77c34506b5136c0614f7c9951f5db66b34900ded072e',
+                                '100644'],
+ 'cmd/whatomate/main.go': ['M',
+                           '3a13697d9839c9ef2cf1b2f6b76d53449c81ce2927cc087e7d2773f6f4cf1e0b',
+                           '6da28438261bf29ffe1b02a36c8ed8ff2ba2620df821979b458790e882bc41d8',
+                           '100644'],
+ 'cmd/whatomate/migration_plan.go': ['A',
+                                     None,
+                                     '43bbdc7d9733e5cd0fa76a1129cab1ed70dd70be7d516061278cdd15e17e9dde',
+                                     '100644'],
+ 'cmd/whatomate/migration_plan_pg_test.go': ['A',
+                                             None,
+                                             '49dfd9e27e336b909bd6e2a698863db089bab94616dafc92830c52178cc16814',
+                                             '100644'],
+ 'cmd/whatomate/migration_plan_relay_test.go': ['A',
+                                                None,
+                                                'f2f3b65c119c82437ea25b2015d8685242442e423a5736b72f15bab96f7326e6',
+                                                '100644'],
+ 'cmd/whatomate/migration_plan_test.go': ['A',
+                                          None,
+                                          'c3ce07dc149bb428142d52a13c17be30be1ac95ff100886313f8d2077c5d6a49',
+                                          '100644'],
+ 'cmd/whatomate/migration_plan_two_server_pg_test.go': ['A',
+                                                        None,
+                                                        '5e8225306bd5e4243f9c880ef3079525977bdfee17642e73a04b4dd524f618a3',
+                                                        '100644'],
+ 'internal/database/catalog_plan_integration_test.go': ['A',
+                                                        None,
+                                                        '7a571e81f11963e73707603af2a1fe339bd69795b9b5d3486c7acd8b5517cc5e',
+                                                        '100644'],
+ 'internal/database/data_gates.go': ['A',
+                                     None,
+                                     'fdd250d045ba4676262d8e803df14645d8bfd896906a15c12956252facf6513d',
+                                     '100644'],
+ 'internal/database/data_gates_export_test.go': ['A',
+                                                 None,
+                                                 'dd231916a0e9616aef48dd49de376644b23943986fc402c7f783af8378b974d9',
+                                                 '100644'],
+ 'internal/database/data_gates_integration_test.go': ['A',
+                                                      None,
+                                                      '71b46620c46cb1c6e1e4b9b77ec21102fa8d9f300b4f118e473f97c82be26777',
+                                                      '100644'],
+ 'internal/database/data_gates_lost_ack_integration_test.go': ['A',
+                                                               None,
+                                                               'e41c2456cc1a926607e16fd84a19f729202f126ad86c6b2ce503ecab840793aa',
+                                                               '100644'],
+ 'internal/database/plan.go': ['A',
+                               None,
+                               '91ab1d7114a42d4166aa88b632d22c56291da2a39d265bba3c12770cf091d3ee',
+                               '100644'],
+ 'internal/database/plan_semantics_test.go': ['A',
+                                              None,
+                                              '193b5e7882fdf3df5efbbd503650a0f16ed583292df088612ebf48c5480429cb',
+                                              '100644'],
+ 'internal/database/plan_test.go': ['A',
+                                    None,
+                                    'dabb7a6982cbd7b066fa5b41e83d06f9de5e64798e251389395e4351b29f13cb',
+                                    '100644'],
+ 'internal/database/plan_visibility.go': ['A',
+                                          None,
+                                          'b9e332f30ca4f03f25bef9e75e8e7ed8d60762c4d1e38e13ffe5d27215e3b9e4',
+                                          '100644'],
+ 'internal/database/postgres.go': ['M',
+                                   '1b7ca0bdcfdf0696ca88aeec8f7a528834ef41cf9c8e47e338a18382719e6fb4',
+                                   '3dbf326842c2b369551dd2b37c779159ffeff2bd8ea65bd4fd6d031a2d66c76d',
+                                   '100644'],
+ 'internal/dbcatalog/builtin.go': ['M',
+                                   '9e1bf8e46f2eb061a1e841c72b476d7e40c02f0865107060995845250e6f1506',
+                                   '74b0b9550591e8152f02ed2d0c5d207936f8fb02f5829d3595eedb11c30fa524',
+                                   '100644'],
+ 'internal/dbcatalog/capture.go': ['M',
+                                   '2db6d6f6e7df718f2dbd0afcb7394e9486f1ef08567e2775bd58c1a4e5ca6c42',
+                                   'cf8f820421107e59db55af28dfdfa5e601ad8f36493f19770b9eefac25e03b06',
+                                   '100644'],
+ 'internal/dbcatalog/capture_plan_test.go': ['A',
+                                             None,
+                                             '5b6945842dd89eb2afbad34c1e74666e9d36fae8186a3745f4cdbd8ede7876b8',
+                                             '100644'],
+ 'internal/dbcatalog/format.go': ['M',
+                                  'e374e1ae11f9dbf4b6e2e49736552aece0172be366f586ae8e964dd80339c9d7',
+                                  '985251243b85ceb04948b00c988c471567df7ccd0197e4d7995b2e466c64c5da',
+                                  '100644'],
+ 'internal/dbcatalog/plan.go': ['A',
+                                None,
+                                'ffe9b24f4558227f37169c5b15b6677bf7dca2931925905f7349d2b95e50e9f8',
+                                '100644'],
+ 'internal/dbcatalog/plan_source.go': ['A',
+                                       None,
+                                       'b2a7dc810a68606c8349635953e23f57f14d41e107c497d65f165efbd889e35c',
+                                       '100644'],
+ 'internal/dbcatalog/plan_source_test.go': ['A',
+                                            None,
+                                            'ad78c536d2637f00f6376f334cce582a82388f0ff2d9cbe33ff48bb31db780ae',
+                                            '100644'],
+ 'internal/dbcatalog/plan_test.go': ['A',
+                                     None,
+                                     'e125ae07909633759cfc7992b0a7e317d063684f76a06626a754a809fb0f07db',
+                                     '100644'],
+ 'internal/dbcatalog/registry/closure_caps.json': ['M',
+                                                   '02ea976eb866f8fac166b1629803f8c85afe654fec6e3198f1d2e62357c374b6',
+                                                   '9ccfdc7e61e9fb52d7a60a0653fc69ffdc2a82740fc0b5d728e1516fb40c8dcf',
+                                                   '100644'],
+ 'internal/dbcatalog/registry/data_steps.json': ['M',
+                                                 '25041acd83c2f87921d994746d63a3b00bc937191c13d91cfa59e2d1a09f668a',
+                                                 '7df7b9277ca507ef634e62ae2992d464f4701f5c5084fcb93a18951d6edf019c',
+                                                 '100644'],
+ 'internal/dbcatalog/registry/migration_path.json': ['M',
+                                                     '55b0b67461813c345b62a2588bc8c85d4ff50ea88b5c78732cc134488765d455',
+                                                     'bde5e0c8ec946d37d60727ba6b20ede20ba6be19321e103dfe963d2615cf072e',
+                                                     '100644'],
+ 'internal/dbcatalog/registry/migration_path_test.go': ['M',
+                                                        '9d566011163f0cd2ab78609334948e105f1a552d5dd26a943e9e4f7c24d13c13',
+                                                        '41aa23161c5467d7f4d72cd9e9eeb971e8b223830e749da49d95bc05313830e9',
+                                                        '100644'],
+ 'internal/dbcatalog/registry/registry_test.go': ['M',
+                                                  'b5082386816506c38da02c508e930f115cbac28fc2071aa380c1d729bdce8c79',
+                                                  '8da9c1d3e143b96590ad4bdca0086a01403e6b7a03696feffebfed1e65e27ef3',
+                                                  '100644'],
+ 'release/deployment/test_ci_workflows.py': ['M',
+                                             '6131bf1587594ec935b4aca2e5f2183623dbc16461d54588d0cb6d95ec64043e',
+                                             '94a85a349b24446c83227d14c88d5f7480adb906a08511e0473d537ebb8b7233',
+                                             '100644']}
+    SHARED = {'go.mod': 'a4118a0f3460522627efa2e1074df40ccd3c72fdb39b09e6dd201ca7d3f47e25',
+ 'go.sum': '053cf6edc13c5f2570c9d5bdadca83d8399b0c3c63c7f2f9f8cbb54d1c1ee101',
+ 'internal/channel/legacy_meta.go': '007a73958e8525627dd93a8f40132ddc173a09013a86845e9924ff732266b002',
+ 'internal/database/platform_compliance.go': '20c4532d8d1cb7a3f59c56f85b1f0f3dc100ccae46b13205547906b8a22bd218',
+ 'internal/database/tenant.go': '69101f7f18b2c2fe8b4a16d22033995857580b93e7a658d6aabc55984b2dbf5f',
+ 'internal/dbcatalog/dormant_entrypoints.json': '041af21a905dd160657431d8a4482d8f52f162f312d4cc9148a071400bbd508d',
+ 'internal/dbcatalog/golden/catalog.json': '17ae6791a73745f3e34ff30760aced9f27b98e189eace34f108ff1d8b93465b8',
+ 'internal/dbcatalog/golden/global_tables.json': 'c125e9283e3eaa80ad5d2cd86a0ee1236b4a71884a59907329b29c4dd3a70ae3',
+ 'internal/dbcatalog/golden/history.json': '9b9a31ec3e2164031abb04ea271fb70a32207fd84528bc7faaea8e22f9864513',
+ 'internal/dbcatalog/golden/production-v0.json': '808e11a5fdab638adc6f0004e9595371d1eee9a51763e12e779b355f7cdd391d',
+ 'internal/dbcatalog/golden/seeds.json': 'dac095bdb1d6aff7c54fccd13bcbfa4bbff131154f9589dc5ae476331ffeca77',
+ 'internal/dbcatalog/registry/coordinator_bindings.json': 'ecc49fb74995dcd121a645fd139ebff2fdc9e22bd2a1b01df91a3eb4e24daee4',
+ 'internal/dbcatalog/shape/production-v0.sql': '48b2558aaa0c54f0de886093c875ff70fbc65231ee80d8b560df91afc97c131d'}
+    HISTORICAL_SHA = '6e4555346d9e8ebd41eac8992cb5b5add17a653239938a181e20c2f9f67e2d94'
+    MAIN = "cmd/whatomate/main.go"
+    POSTGRES = "internal/database/postgres.go"
+    DORMANT = "internal/dbcatalog/dormant_entrypoints.json"
+    BINDINGS = "internal/dbcatalog/registry/coordinator_bindings.json"
+    REGISTRY = "internal/dbcatalog/registry/data_steps.json"
+    MIGRATION = "internal/dbcatalog/registry/migration_path.json"
+    ACTIVE = (
+        "internal/dbcatalog/golden/catalog.json",
+        "internal/dbcatalog/golden/history.json",
+        "internal/dbcatalog/golden/global_tables.json",
+        "internal/dbcatalog/golden/seeds.json",
+        "internal/dbcatalog/golden/production-v0.json",
+        "internal/dbcatalog/shape/production-v0.sql",
+    )
+    DESCRIPTORS = (
+        "internal/dbcatalog/profiles/nullable-column-v1/source-shape-v1.json",
+        "internal/dbcatalog/source-classification/int8-constant-column-v1.json",
+        "internal/dbcatalog/source-classification/index-concurrent-v1.json",
+        "internal/dbcatalog/source-classification/relation-v1.json",
+        "internal/dbcatalog/source-classification/tenant-additive-v1.json",
+    )
+    LEGACY_REASONS = (
+        "migration-call:cmd/whatomate/main.go",
+        "migration-path-changed:closure",
+        "migration-path-changed:cmd/whatomate/main.go#runRLSMigration",
+        "migration-path-changed:internal/database/postgres.go#runRLSMigrationCoordinatorForPhase",
+    )
+    REQUIREMENTS = ("compat-required", "generated-migration-closure-ci")
+    MIGRATION_OBSERVATIONS = (
+        "generated migration closure changed",
+        "migration path changed: cmd/whatomate/main.go#runRLSMigration",
+        "migration path changed: internal/database/postgres.go#runRLSMigrationCoordinatorForPhase",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        # Whole-file digest and exact section inventories make this tiny parser
+        # fixture-specific. No generic patch application or external command.
+        path = Path(__file__).parent / "fixtures/pr18-observer-transition.patch"
+        with path.open("rb") as stream:
+            raw = stream.read(cls.FIXTURE_BYTES + 1)
+        if len(raw) != cls.FIXTURE_BYTES or hashlib.sha256(raw).hexdigest() != cls.FIXTURE_SHA:
+            raise AssertionError("PR18 fixture identity changed")
+        header, separator, rest = raw.partition(b"\n")
+        if not separator or header != b"# PR18 actual M-to-C18 source fixture; synthetic histories only, not qualification.":
+            raise AssertionError("PR18 fixture header")
+        sections = {}
+        while rest:
+            header, separator, rest = rest.partition(b"\n")
+            parts = header.decode("ascii").split(" ")
+            if not separator or len(parts) != 4 or parts[0] != "@@@" or not parts[3].isdigit():
+                raise AssertionError("PR18 fixture section")
+            key = (parts[1], parts[2])
+            size = int(parts[3])
+            if key in sections or not 0 < size <= cls.FIXTURE_BYTES or len(rest) < size:
+                raise AssertionError("PR18 fixture section bounds")
+            sections[key], rest = rest[:size], rest[size:]
+        expected = {("PATCH", "transition"), ("HISTORICAL", cls.MAIN)} | {("SHARED", p) for p in cls.SHARED}
+        if set(sections) != expected:
+            raise AssertionError("PR18 fixture section inventory")
+        before, after = {}, {}
+        lines = iter(sections[("PATCH", "transition")].decode("utf-8").splitlines(keepends=True))
+        for name, (status, old_sha, new_sha, mode) in cls.SOURCE.items():
+            old_header = "a/" + name if status == "M" else "/dev/null"
+            if next(lines, None) != "--- " + old_header + "\n" or next(lines, None) != "+++ b/" + name + "\n":
+                raise AssertionError("PR18 fixture patch path")
+            hunk = next(lines, "").strip().split(" ")
+            if len(hunk) != 4 or hunk[0] != "@@" or hunk[3] != "@@":
+                raise AssertionError("PR18 fixture patch hunk")
+            left, right = [], []
+            ranges = []
+            for field, sign in zip(hunk[1:3], ("-", "+")):
+                if not field.startswith(sign):
+                    raise AssertionError("PR18 fixture patch range")
+                parts = field[1:].split(",")
+                if len(parts) not in (1, 2) or not all(p.isdigit() for p in parts):
+                    raise AssertionError("PR18 fixture patch count")
+                start, count = int(parts[0]), int(parts[1]) if len(parts) == 2 else 1
+                if start != (1 if count else 0) or count > cls.FIXTURE_BYTES:
+                    raise AssertionError("PR18 fixture full-context range")
+                ranges.append(count)
+            while len(left) < ranges[0] or len(right) < ranges[1]:
+                line = next(lines, "")
+                if not line or line[0] not in " +-":
+                    raise AssertionError("PR18 fixture patch body")
+                if line[0] in " -":
+                    left.append(line[1:])
+                if line[0] in " +":
+                    right.append(line[1:])
+                if len(left) > ranges[0] or len(right) > ranges[1]:
+                    raise AssertionError("PR18 fixture patch overflow")
+            left, right = "".join(left), "".join(right)
+            if mode != "100644" or hashlib.sha256(right.encode()).hexdigest() != new_sha:
+                raise AssertionError("PR18 fixture postimage identity")
+            if status == "A":
+                if left or old_sha is not None:
+                    raise AssertionError("PR18 fixture preimage must be absent")
+            elif status == "M" and hashlib.sha256(left.encode()).hexdigest() == old_sha:
+                before[name] = left
+            else:
+                raise AssertionError("PR18 fixture preimage identity")
+            after[name] = right
+        if next(lines, None) is not None or len(before) != 12 or len(after) != 31:
+            raise AssertionError("PR18 fixture closed patch inventory")
+        for name, digest in cls.SHARED.items():
+            value = sections[("SHARED", name)]
+            if hashlib.sha256(value).hexdigest() != digest or name in before or name in after:
+                raise AssertionError("PR18 fixture shared identity")
+            before[name] = value.decode("utf-8")
+        historical = sections[("HISTORICAL", cls.MAIN)]
+        if hashlib.sha256(historical).hexdigest() != cls.HISTORICAL_SHA:
+            raise AssertionError("PR18 fixture historical identity")
+        cls.before, cls.after, cls.historical = before, after, historical.decode("utf-8")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = support.TempRepo(Path(self.temp.name) / "repo")
+        self.base = self.repo.commit(self.before, "fixed M source fixture")
+
+    def head(self, extra=None):
+        self.repo.checkout(self.base)
+        return self.repo.commit({**self.after, **(extra or {})}, "fixed C18 source fixture")
+
+    def policy(self, head, base=None):
+        return sc.classify_v2(self.repo.root, base or self.base, head)
+
+    def assert_policy_admitted(self, head, base=None):
+        policy = self.policy(head, base)
+        self.assertEqual((policy.kind, policy.dormant, policy.reasons), ("data", True, ()))
+        self.assertEqual(policy.requirements, self.REQUIREMENTS)
+        self.assertEqual(policy.migration_changes, self.MIGRATION_OBSERVATIONS)
+
+    def refused(self, head, base=None, *, ci=True, policy=True):
+        if ci:
+            self.assertTrue(sc.check_ci_source(self.repo.root, base or self.base, head))
+        if policy:
+            actual = self.policy(head, base)
+            self.assertNotEqual((actual.kind, actual.dormant, actual.reasons, actual.requirements),
+                                ("data", True, (), self.REQUIREMENTS))
+
+    def historical_base(self):
+        self.repo.checkout(self.base)
+        historical = self.repo.commit({self.MAIN: self.historical, self.DORMANT: None}, "synthetic historical B")
+        self.repo.commit({self.MAIN: self.before[self.MAIN], self.DORMANT: self.before[self.DORMANT]},
+                         "reviewed bootstrap and dormant introduction")
+        return historical
+
+    def test_fixture_is_exact_12_modified_19_added_with_fixed_modes(self):
+        head = self.head()
+        expected = "".join(status + "\t" + path + "\n" for path, (status, *_) in self.SOURCE.items())
+        self.assertEqual(self.repo.git("diff", "--name-status", self.base, head), expected)
+        for path, (status, *_) in self.SOURCE.items():
+            self.assertTrue(self.repo.git("ls-tree", head, "--", path).startswith("100644 blob "))
+            if status == "A":
+                self.assertEqual(self.repo.git("ls-tree", self.base, "--", path), "")
+        for path in self.DESCRIPTORS:
+            self.assertNotIn(path, self.before)
+        self.assertFalse(any(path.startswith("internal/dbcatalog/golden/pending/") for path in self.before))
+
+    def test_exact_transition_admits_ci_v2_but_not_legacy_release_guard(self):
+        head = self.head()
+        self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+        self.assert_policy_admitted(head)
+        self.assertEqual(sc.check(self.repo.root, self.base, head), self.LEGACY_REASONS)
+        with self.assertRaises(sc.SchemaChangeBlocked) as caught:
+            sc.guard(self.repo.root, self.base, head)
+        self.assertEqual(caught.exception.reasons, self.LEGACY_REASONS)
+
+    def test_exact_transition_through_real_bounded_immutable_git(self):
+        head = self.head()
+        for call in (sc.check_ci_source, sc.classify_v2):
+            with self.subTest(entrypoint=call.__name__):
+                reader = source_git.ImmutableGit(self.repo.root, Path(shutil.which("git")))
+                with reader.operation():
+                    result = call(self.repo.root, self.base, head)
+                self.assertTrue(reader.closed)
+                self.assertFalse(reader.failed)
+                self.assertGreater(reader.calls, 0)
+                self.assertLessEqual(reader.calls, 4096)
+                self.assertLessEqual(reader.bytes, 64 * 1024 * 1024)
+                if call is sc.check_ci_source:
+                    self.assertEqual(result, ())
+                else:
+                    self.assertEqual((result.kind, result.dormant, result.reasons), ("data", True, ()))
+                    self.assertEqual(result.requirements, self.REQUIREMENTS)
+                    self.assertEqual(result.migration_changes, self.MIGRATION_OBSERVATIONS)
+
+    def test_parent_reader_rejects_nonliteral_or_other_parent_revspecs(self):
+        head = self.head()
+        for revision in ("HEAD^1", head + "^2", head + "~1", "A" * 40 + "^1", head + "^1 "):
+            with self.subTest(revision=revision):
+                reader = source_git.ImmutableGit(self.repo.root, Path(shutil.which("git")))
+                before_calls = None
+                with self.assertRaises(source_git.SourceGitRefusal) as caught:
+                    with reader.operation():
+                        before_calls = reader.calls
+                        reader.output(self.repo.root, ["rev-parse", "--verify", revision], code="unused-test-code")
+                self.assertEqual(str(caught.exception), "git-failed:source-grammar")
+                self.assertTrue(reader.failed and reader.closed)
+                self.assertIsNotNone(before_calls)
+                self.assertEqual(reader.calls, before_calls)
+
+    def test_parent_transport_refusal_is_not_a_semantic_policy_refusal(self):
+        head = self.head()
+        for call in (sc.check_ci_source, sc.classify_v2):
+            with self.subTest(entrypoint=call.__name__):
+                real_git, seen = sc._git, []
+                def refuse(root, args):
+                    if args == ["rev-parse", "--verify", head + "^1"]:
+                        seen.append(tuple(args))
+                        raise source_git.SourceGitRefusal("git-failed:source-budget")
+                    return real_git(root, args)
+                with mock.patch.object(sc, "_git", side_effect=refuse):
+                    with self.assertRaises(source_git.SourceGitRefusal) as caught:
+                        call(self.repo.root, self.base, head)
+                self.assertEqual(str(caught.exception), "git-failed:source-budget")
+                self.assertEqual(len(seen), 1)
+
+    def test_transport_budget_refusal_propagates_without_policy_fallback(self):
+        head = self.head()
+        for call in (sc.check_ci_source, sc.classify_v2):
+            with self.subTest(entrypoint=call.__name__, stage="real-budget"):
+                reader = source_git.ImmutableGit(self.repo.root, Path(shutil.which("git")),
+                                                  limits=source_git.Limits(calls=8))
+                with self.assertRaises(source_git.SourceGitRefusal) as caught:
+                    with reader.operation():
+                        call(self.repo.root, self.base, head)
+                self.assertEqual(str(caught.exception), "git-failed:source-budget")
+                self.assertTrue(reader.failed and reader.closed)
+                self.assertEqual(reader.calls, 8)
+            real_git, observed = sc._git, []
+            def refuse(root, args):
+                # The new proof reads this protected role after legacy/v2 work;
+                # an external transport refusal must not be caught as _Invalid.
+                if args[:2] == ["ls-tree", "-z"] and args[-1] == "internal/dbcatalog/shape/production-v0.sql":
+                    observed.append(tuple(args))
+                    raise source_git.SourceGitRefusal("git-failed:source-budget")
+                return real_git(root, args)
+            with self.subTest(entrypoint=call.__name__, stage="transition-proof"):
+                with mock.patch.object(sc, "_git", side_effect=refuse):
+                    with self.assertRaises(source_git.SourceGitRefusal) as caught:
+                        call(self.repo.root, self.base, head)
+                self.assertEqual(str(caught.exception), "git-failed:source-budget")
+                self.assertEqual(len(observed), 1)
+
+    def test_noop_prefix_and_suffix_do_not_create_another_transition(self):
+        self.repo.commit({}, "empty prefix")
+        self.repo.commit(self.after)
+        head = self.repo.commit({}, "empty suffix")
+        self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+        self.assert_policy_admitted(head)
+
+    def test_exact_transition_on_first_parent_merge_is_not_tied_to_commit_id(self):
+        self.repo.git("checkout", "--quiet", "-b", "candidate")
+        self.repo.commit(self.after)
+        self.repo.checkout(self.base)
+        self.repo.git("merge", "--no-ff", "--no-edit", "candidate")
+        head = self.repo.head()
+        self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+        self.assert_policy_admitted(head)
+
+    def test_base_reachable_only_on_non_first_parent_cannot_supply_anchor(self):
+        self.repo.git("checkout", "--quiet", "-b", "side")
+        side_base = self.repo.commit({}, "base on non-first-parent branch")
+        self.repo.checkout(self.base)
+        self.repo.commit(self.after)
+        self.repo.git("merge", "--no-ff", "--no-edit", "side")
+        self.refused(self.repo.head(), side_base)
+
+    def test_merge_with_base_only_as_second_parent_is_not_a_transition(self):
+        # A -> B, then H with parents [A, B]. B is an ancestor of H, but
+        # B..H --first-parent returns only H; B is not H's actual first parent.
+        self.repo.git("checkout", "--quiet", "-b", "second-parent-base")
+        side_base = self.repo.commit({}, "B descends from A")
+        self.repo.checkout(self.base)
+        self.repo.git("merge", "--no-ff", "--no-commit", "second-parent-base")
+        head = self.repo.commit(self.after, "H product tree with parents A and B")
+        self.assertEqual(self.repo.git("rev-list", "--parents", "-n", "1", head).split(),
+                         [head, self.base, side_base])
+        self.assertEqual(self.repo.git("rev-list", "--first-parent", "--reverse", side_base + ".." + head).split(),
+                         [head])
+        self.refused(head, side_base)
+
+    def test_existing_history_limit_still_refuses(self):
+        self.repo.commit({}, "empty prefix")
+        head = self.repo.commit(self.after)
+        with mock.patch.object(sc, "MAX_HISTORY_COMMITS", 1):
+            self.refused(head)
+
+    def test_each_exact_modified_postimage_alone_is_an_incomplete_bundle(self):
+        for path, (status, *_) in self.SOURCE.items():
+            if status == "M":
+                with self.subTest(path=path):
+                    self.repo.checkout(self.base)
+                    head = self.repo.commit({path: self.after[path]}, "exact but partial PR18 postimage")
+                    self.assertTrue(sc.check_ci_source(self.repo.root, self.base, head))
+
+    def test_unrelated_none_edits_do_not_gain_a_general_source_fence(self):
+        for path, suffix in ((".github/workflows/test.yml", "\n# unrelated comment\n"),
+                             ("release/deployment/test_ci_workflows.py", "\n# unrelated comment\n"),
+                             ("internal/dbcatalog/format.go", "\n// unrelated comment\n")):
+            with self.subTest(path=path):
+                self.repo.checkout(self.base)
+                head = self.repo.commit({path: self.before[path] + suffix}, "unrelated none-class edit")
+                self.assertEqual(sc.check(self.repo.root, self.base, head), ())
+                self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+
+    def test_every_postimage_is_fixed_including_tests_workflow_and_metadata(self):
+        for path in self.SOURCE:
+            with self.subTest(path=path):
+                self.refused(self.head({path: self.after[path] + "\n"}))
+
+    def test_every_modified_preimage_is_fixed(self):
+        for path, (status, *_) in self.SOURCE.items():
+            if status == "M":
+                with self.subTest(path=path):
+                    self.repo.checkout(self.base)
+                    base = self.repo.commit({path: self.before[path] + "\n"})
+                    self.refused(self.repo.commit(self.after), base)
+
+    def test_every_added_file_must_be_absent_before_atomic_transition(self):
+        for path, (status, *_) in self.SOURCE.items():
+            if status == "A":
+                with self.subTest(path=path):
+                    self.repo.checkout(self.base)
+                    base = self.repo.commit({path: self.after[path]})
+                    self.refused(self.repo.commit(self.after), base)
+
+    def test_changed_modes_on_modified_added_or_protected_files_refuse(self):
+        for path in (self.MAIN, "cmd/whatomate/migration_plan.go", self.ACTIVE[0]):
+            with self.subTest(path=path):
+                self.head()
+                self.repo.git("update-index", "--chmod=+x", path)
+                self.repo.git("commit", "--quiet", "-m", "unsupported executable mode")
+                self.repo.git("checkout", "--", path)
+                self.assertEqual(self.repo.git("status", "--porcelain=v1", "--untracked-files=all"), "")
+                self.refused(self.repo.head())
+
+    def test_missing_or_renamed_postimage_refuses(self):
+        path = "internal/database/plan.go"
+        self.refused(self.head({path: None}))
+        self.refused(self.head({path: None, "internal/database/unreviewed_plan.go": self.after[path]}))
+
+    def test_each_active_protected_artifact_is_fixed_at_anchor(self):
+        for path in self.ACTIVE:
+            with self.subTest(path=path):
+                self.refused(self.head({path: self.before[path] + "\n"}))
+
+    def test_different_but_equal_active_endpoints_are_not_reviewed_state(self):
+        path = self.ACTIVE[0]
+        base = self.repo.commit({path: self.before[path] + "\n"})
+        self.refused(self.repo.commit(self.after), base)
+
+    def test_protected_intermediate_edit_cannot_be_restored(self):
+        path = self.ACTIVE[0]
+        self.repo.commit({path: self.before[path] + "\n"})
+        self.repo.commit({path: self.before[path]})
+        self.refused(self.repo.commit(self.after))
+
+    def test_descriptors_and_pending_state_cannot_enter_exception(self):
+        paths = (*self.DESCRIPTORS, "internal/dbcatalog/golden/pending/001.json")
+        for path in paths:
+            with self.subTest(path=path):
+                self.refused(self.head({path: "{}\n"}))
+
+    def test_intermediate_descriptor_cannot_be_removed_to_hide_it(self):
+        path = self.DESCRIPTORS[0]
+        self.repo.commit({path: "{}\n"})
+        self.repo.commit({path: None})
+        self.refused(self.repo.commit(self.after))
+
+    def test_dormant_and_coordinator_bindings_are_not_byte_waivers(self):
+        for path, value in ((self.DORMANT, None), (self.DORMANT, "[]\n"),
+                            (self.DORMANT, self.before[self.DORMANT] + "\n"),
+                            (self.BINDINGS, self.before[self.BINDINGS] + "\n")):
+            with self.subTest(path=path, absent=value is None):
+                self.refused(self.head({path: value}))
+
+    def test_migration_closure_and_seed_revisions_must_be_actual_postimages(self):
+        rows = json.loads(self.after[self.REGISTRY])
+        mutations = []
+        paired = {"SeedSystemRolesForAllOrgs", "SeedSystemRolesForAllOrgs/legacy-super-admin-update"}
+        for row in rows:
+            if row["id"] in paired:
+                row["rev"] = 2
+        mutations.append(text(rows))
+        rows = json.loads(self.after[self.REGISTRY])
+        rows[0]["closure_sha256"] = "0" * 64
+        mutations.append(text(rows))
+        rows = json.loads(self.after[self.REGISTRY])
+        rows.reverse()
+        mutations.append(text(rows))
+        for raw in mutations:
+            with self.subTest(digest=hashlib.sha256(raw.encode()).hexdigest()):
+                self.refused(self.head({self.REGISTRY: raw}))
+        self.refused(self.head({self.MIGRATION: self.before[self.MIGRATION]}))
+
+    def test_partial_source_then_complete_metadata_is_not_atomic(self):
+        self.repo.commit({self.MAIN: self.after[self.MAIN]})
+        self.refused(self.repo.commit(self.after))
+
+    def test_atomic_transition_cannot_revert_and_reapply(self):
+        self.repo.commit(self.after)
+        reset = {path: self.before.get(path) for path in self.SOURCE}
+        self.repo.commit(reset)
+        self.refused(self.repo.commit(self.after))
+
+    def test_mutated_postanchor_state_cannot_be_restored(self):
+        self.repo.commit(self.after)
+        path = "cmd/whatomate/migration_plan.go"
+        self.repo.commit({path: self.after[path] + "\n"})
+        self.refused(self.repo.commit({path: self.after[path]}))
+
+    def test_ci_whole_history_fence_rejects_reverted_unrelated_prefix(self):
+        self.repo.commit({"README.md": "transient unrelated input\n"})
+        self.repo.commit({"README.md": None})
+        self.refused(self.repo.commit(self.after), policy=False)
+
+    def test_ci_whole_history_fence_rejects_unrelated_suffix(self):
+        self.repo.commit(self.after)
+        self.refused(self.repo.commit({"README.md": "unrelated suffix\n"}), policy=False)
+
+    def test_reviewed_historical_main_prefix_is_v2_only_not_ci(self):
+        base = self.historical_base()
+        head = self.repo.commit(self.after)
+        reader = source_git.ImmutableGit(self.repo.root, Path(shutil.which("git")))
+        with reader.operation():
+            self.assert_policy_admitted(head, base)
+        self.assertTrue(reader.closed)
+        self.assertFalse(reader.failed)
+        self.assertTrue(sc.check_ci_source(self.repo.root, base, head))
+        self.assertIn("migration-call:cmd/whatomate/main.go", sc.check(self.repo.root, base, head))
+
+    def test_historical_dormant_manifest_cannot_exist_before_reviewed_introduction(self):
+        base = self.repo.commit({self.MAIN: self.historical}, "wrong dormant state at B")
+        self.repo.commit({self.MAIN: self.before[self.MAIN]})
+        self.refused(self.repo.commit(self.after), base)
+
+    def test_historical_main_states_cannot_revert(self):
+        base = self.historical_base()
+        self.repo.commit({self.MAIN: self.historical, self.DORMANT: None})
+        self.repo.commit({self.MAIN: self.before[self.MAIN], self.DORMANT: self.before[self.DORMANT]})
+        self.refused(self.repo.commit(self.after), base)
+
+    def test_unrelated_historical_main_call_cannot_be_laundered_by_restoration(self):
+        self.repo.checkout(self.base)
+        base = self.repo.commit({self.MAIN: self.historical, self.DORMANT: None})
+        self.repo.commit({self.MAIN: self.historical + "\nfunc unreviewedMigration() { database.RunRLSMigrationCoordinator() }\n"})
+        self.repo.commit({self.MAIN: self.historical})
+        self.repo.commit({self.MAIN: self.before[self.MAIN], self.DORMANT: self.before[self.DORMANT]})
+        self.refused(self.repo.commit(self.after), base)
+
+    def test_added_call_on_another_path_keeps_its_own_refusal(self):
+        path = "cmd/whatomate/unreviewed_migration.go"
+        head = self.head({path: "package main\nfunc unexpected() { database.RunRLSMigrationCoordinator() }\n"})
+        self.refused(head)
+        self.assertIn("migration-call:" + path, self.policy(head).reasons)
+
+    def test_completed_pr18_base_allows_later_test_only_edits(self):
+        completed = self.head()
+        for path in ("cmd/whatomate/migration_plan_test.go", "release/deployment/test_ci_workflows.py"):
+            with self.subTest(path=path):
+                self.repo.checkout(completed)
+                head = self.repo.commit({path: self.after[path] + "\n"}, "later test-only newline")
+                self.assertEqual(sc.check(self.repo.root, completed, head), ())
+                self.assertEqual(sc.check_ci_source(self.repo.root, completed, head), ())
+
+    def test_unchanged_reviewed_base_retains_generic_none_behavior(self):
+        head = self.repo.commit({}, "unchanged source")
+        self.assertEqual(sc.check_ci_source(self.repo.root, self.base, head), ())
+        self.assertEqual(sc.check(self.repo.root, self.base, head), ())
+
+
+
 if __name__ == "__main__":
     unittest.main()
