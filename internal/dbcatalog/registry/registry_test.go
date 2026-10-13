@@ -103,17 +103,18 @@ func stepID(c stepContract) string {
 func reviewedRevision(id string) (int, error) {
 	switch id {
 	case "SeedSystemRolesForAllOrgs", "SeedSystemRolesForAllOrgs/legacy-super-admin-update":
-		return 2, nil
-	case "PrepareProviderIntegrationManagementMode", "PrepareMessageIngestionOrder",
-		"PrepareMetaInstagramDeletionJournalTenant", "AutoMigrate", "InstallMessageIngestionOrderTrigger",
-		"BackfillProviderIntegrationBindings", "SeedPermissionsAndRoles",
+		return 3, nil
+	case "SeedPermissionsAndRoles",
 		"SeedSystemRolesForAllOrgs/seedSystemRolesForOrg",
 		"SeedSystemRolesForAllOrgs/FixSystemRolePermissions",
 		"SeedSystemRolesForAllOrgs/ApplyManagerSettingsPolicyMigration",
 		"SeedSystemRolesForAllOrgs/MigrateExistingUserRoles",
-		"MigrateUserOrganizations", "CreateDefaultAdmin", "EnsurePlatformReseller",
-		"EnsureReReplyProductCatalog", "SeedDefaultWidgets", "BackfillLastInboundAt",
-		"BackfillChatbotFlowGraph", "BackfillLegacyWhatsAppInbox":
+		"EnsurePlatformReseller", "EnsureReReplyProductCatalog", "SeedDefaultWidgets":
+		return 2, nil
+	case "PrepareProviderIntegrationManagementMode", "PrepareMessageIngestionOrder",
+		"PrepareMetaInstagramDeletionJournalTenant", "AutoMigrate", "InstallMessageIngestionOrderTrigger",
+		"BackfillProviderIntegrationBindings", "MigrateUserOrganizations", "CreateDefaultAdmin",
+		"BackfillLastInboundAt", "BackfillChatbotFlowGraph", "BackfillLegacyWhatsAppInbox":
 		return 1, nil
 	default:
 		return 0, fmt.Errorf("unreviewed registry step %q", id)
@@ -447,6 +448,7 @@ func TestReviewedRegistryRevisionInventory(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	advanced := []string{}
+	paired := []string{}
 	unchanged := 0
 	for _, c := range stepContracts {
 		id := stepID(c)
@@ -463,6 +465,8 @@ func TestReviewedRegistryRevisionInventory(t *testing.T) {
 			unchanged++
 		case 2:
 			advanced = append(advanced, id)
+		case 3:
+			paired = append(paired, id)
 		default:
 			t.Fatalf("unreviewed revision %d for %s", revision, id)
 		}
@@ -475,9 +479,17 @@ func TestReviewedRegistryRevisionInventory(t *testing.T) {
 			}
 		}
 	}
-	wantAdvanced := []string{"SeedSystemRolesForAllOrgs", "SeedSystemRolesForAllOrgs/legacy-super-admin-update"}
-	if unchanged != 19 || !reflect.DeepEqual(advanced, wantAdvanced) {
-		t.Fatalf("unexpected revision transition: unchanged=%d advanced=%v", unchanged, advanced)
+	wantAdvanced := []string{
+		"SeedPermissionsAndRoles",
+		"SeedSystemRolesForAllOrgs/seedSystemRolesForOrg",
+		"SeedSystemRolesForAllOrgs/FixSystemRolePermissions",
+		"SeedSystemRolesForAllOrgs/ApplyManagerSettingsPolicyMigration",
+		"SeedSystemRolesForAllOrgs/MigrateExistingUserRoles",
+		"EnsurePlatformReseller", "EnsureReReplyProductCatalog", "SeedDefaultWidgets",
+	}
+	wantPaired := []string{"SeedSystemRolesForAllOrgs", "SeedSystemRolesForAllOrgs/legacy-super-admin-update"}
+	if unchanged != 11 || !reflect.DeepEqual(advanced, wantAdvanced) || !reflect.DeepEqual(paired, wantPaired) {
+		t.Fatalf("unexpected revision transition: unchanged=%d advanced=%v paired=%v", unchanged, advanced, paired)
 	}
 	for _, id := range []string{"", "legacy-super-admin-update", "SeedSystemRolesForAllOrgs/unknown", "UnreviewedStep"} {
 		if _, err := reviewedRevision(id); err == nil {

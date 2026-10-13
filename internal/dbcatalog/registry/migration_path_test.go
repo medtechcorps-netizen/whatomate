@@ -14,7 +14,7 @@ import (
 // callbacks, and the explicit reached-model GORM method contract. A baseline
 // data step can also belong to this protected path: its baseline designation
 // does not waive migration-path protection before a compat-backed lift.
-const migrationPathFileCap = 231
+const migrationPathFileCap = 237
 
 var migrationPathRoots = []string{
 	modulePath + "/cmd/whatomate.requiredStartupDatabaseContract",

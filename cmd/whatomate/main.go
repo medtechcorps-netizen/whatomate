@@ -549,12 +549,11 @@ func runRLSMigration(args []string) {
 
 	migrationCfg := cfg.Database
 	migrationCfg.URL = cfg.Database.MigrationURL
-	db, err := database.NewPostgres(&migrationCfg, false)
-	if err != nil {
-		lo.Fatal("Failed to connect with migration database role", "error", err)
-	}
-
 	if *rollback {
+		db, err := database.NewPostgres(&migrationCfg, false)
+		if err != nil {
+			lo.Fatal("Failed to connect with migration database role", "error", err)
+		}
 		if err := database.RemoveTenantRLS(db); err != nil {
 			lo.Fatal("RLS rollback failed", "error", err)
 		}
@@ -562,7 +561,16 @@ func runRLSMigration(args []string) {
 		return
 	}
 
-	if err := database.RunRLSMigrationCoordinator(
+	ctx := context.Background()
+	db, planner, err := openPlannedMigration(ctx, &cfg.Database)
+	if err != nil {
+		lo.Fatal("Failed to initialize migration database connection")
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		lo.Fatal("Failed to obtain migration database pool")
+	}
+	coordinatorErr := database.RunRLSMigrationCoordinator(
 		db,
 		&cfg.DefaultAdmin,
 		cfg.Database.RuntimeRole,
@@ -585,9 +593,23 @@ func runRLSMigration(args []string) {
 			)
 			return nil
 		},
-		func() error { return verifyRLSMigrationRuntime(&cfg.Database) },
-	); err != nil {
-		lo.Fatal("RLS migration coordinator failed", "error", err)
+		func() error {
+			if err := verifyRLSMigrationRuntime(&cfg.Database); err != nil {
+				return err
+			}
+			observation := planner.observe(ctx)
+			// Informational output cannot replace the original coordinator result.
+			_, _ = fmt.Fprintln(os.Stdout, observation.line())
+			return nil
+		},
+	)
+	// logf.Fatal calls os.Exit: disposal must precede every fatal branch below.
+	closeErr := sqlDB.Close()
+	if coordinatorErr != nil {
+		lo.Fatal("RLS migration coordinator failed", "error", coordinatorErr)
+	}
+	if closeErr != nil {
+		lo.Fatal("Failed to close migration database connection")
 	}
 	lo.Info("Tenant RLS installed", "runtime_role", cfg.Database.RuntimeRole)
 }

@@ -11,6 +11,7 @@
   "closure_files": [
     "cmd/whatomate/catalog_snapshot.go",
     "cmd/whatomate/main.go",
+    "cmd/whatomate/migration_plan.go",
     "internal/access/reseller.go",
     "internal/assignment/assigner.go",
     "internal/assignment/cache.go",
@@ -48,8 +49,11 @@
     "internal/customeractivity/activity.go",
     "internal/database/coexistence_integrity.go",
     "internal/database/contact_policy.go",
+    "internal/database/data_gates.go",
     "internal/database/manager_settings_policy.go",
     "internal/database/message_ingestion_trigger_contract.go",
+    "internal/database/plan.go",
+    "internal/database/plan_visibility.go",
     "internal/database/platform_compliance.go",
     "internal/database/postgres.go",
     "internal/database/product_catalog.go",
@@ -60,6 +64,8 @@
     "internal/dbcatalog/capture.go",
     "internal/dbcatalog/format.go",
     "internal/dbcatalog/nullable_builtin.go",
+    "internal/dbcatalog/plan.go",
+    "internal/dbcatalog/plan_source.go",
     "internal/dbcatalog/queries.go",
     "internal/dbcatalog/seed.go",
     "internal/dbcatalog/semantics.go",
@@ -241,5 +247,5 @@
     "pkg/whatsapp/types.go",
     "pkg/whatsapp/webhook.go"
   ],
-  "closure_sha256": "00713c45b619d585899510188d108518069442a836dc602d41a20f08c1f84a2d"
+  "closure_sha256": "b20a392962c2fd9773f9cd7353c9321568ace3e9e1b69da0b6ed3c052d7d3d47"
 }
