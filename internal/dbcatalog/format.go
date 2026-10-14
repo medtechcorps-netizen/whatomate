@@ -165,45 +165,7 @@ func strictDecode(data []byte, dst any) error {
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.UseNumber()
-	var value func() error
-	value = func() error {
-		t, err := d.Token()
-		if err != nil {
-			return err
-		}
-		if delim, ok := t.(json.Delim); ok {
-			switch delim {
-			case '{':
-				seen := map[string]bool{}
-				for d.More() {
-					k, err := d.Token()
-					if err != nil {
-						return err
-					}
-					s, ok := k.(string)
-					if !ok || seen[s] {
-						return refuse("catalog-format")
-					}
-					seen[s] = true
-					if err = value(); err != nil {
-						return err
-					}
-				}
-			case '[':
-				for d.More() {
-					if err = value(); err != nil {
-						return err
-					}
-				}
-			default:
-				return refuse("catalog-format")
-			}
-			_, err = d.Token()
-			return err
-		}
-		return nil
-	}
-	if err := value(); err != nil {
+	if err := strictDecodeValue(d); err != nil {
 		return refuse("catalog-format")
 	}
 	if _, err := d.Token(); err != io.EOF {
@@ -213,6 +175,44 @@ func strictDecode(data []byte, dst any) error {
 	d.DisallowUnknownFields()
 	if err := d.Decode(dst); err != nil {
 		return refuse("catalog-format")
+	}
+	return nil
+}
+
+func strictDecodeValue(d *json.Decoder) error {
+	t, err := d.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := t.(json.Delim); ok {
+		switch delim {
+		case '{':
+			seen := map[string]bool{}
+			for d.More() {
+				k, err := d.Token()
+				if err != nil {
+					return err
+				}
+				s, ok := k.(string)
+				if !ok || seen[s] {
+					return refuse("catalog-format")
+				}
+				seen[s] = true
+				if err = strictDecodeValue(d); err != nil {
+					return err
+				}
+			}
+		case '[':
+			for d.More() {
+				if err = strictDecodeValue(d); err != nil {
+					return err
+				}
+			}
+		default:
+			return refuse("catalog-format")
+		}
+		_, err = d.Token()
+		return err
 	}
 	return nil
 }

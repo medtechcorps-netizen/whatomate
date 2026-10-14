@@ -13,8 +13,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -57,7 +60,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "f62c5315f24d6f445b2b16ec8e3eadd625a4be172487833cf9cc1afd74b11c04"
+    "closure_sha256": "e83359e30fbf730258b0b40f575c876259c917107f06e147ccf98d187f455da9"
   },
   {
     "id": "PrepareMessageIngestionOrder",
@@ -73,8 +76,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -118,7 +124,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "43d185533a07f3f473bcab915c1e3ee2b22f28f55dc939fef08a6870ea765adc"
+    "closure_sha256": "2633ec5c0d83d6e2e89a70213ec95a7bf9816d10a0e37a98a99ff29ef9fcae91"
   },
   {
     "id": "PrepareMetaInstagramDeletionJournalTenant",
@@ -134,8 +140,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -178,7 +187,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "797d1a209ae19be1995d96640df4703a5fd7475cb15fd9529ad79beba8003c49"
+    "closure_sha256": "e1c2d26494aafe97897a41dfc0dc1f081dd68388e998cbae3caf1d777aea7086"
   },
   {
     "id": "AutoMigrate",
@@ -194,8 +203,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -239,7 +251,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "e6b56bcab6d35f4ac2e0e8f344c958166dff48d6e4c4aa0a25779104925bbddf"
+    "closure_sha256": "96d906f93a582ea537e18a70dc922ab92a6e7ff5e13d37715579c4ccba2a825e"
   },
   {
     "id": "InstallMessageIngestionOrderTrigger",
@@ -255,8 +267,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -300,7 +315,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "7c41fa062743ac2c1d3577de9033331eab0c7706a895b4f7976fc16d3f01e1ca"
+    "closure_sha256": "94dc5f5b9d9abdd1777c6a583c9d35a7295f36cf61e2403cb6002a74a1091483"
   },
   {
     "id": "BackfillProviderIntegrationBindings",
@@ -316,8 +331,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -360,11 +378,11 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "7034753d1868f0f2cda78794b02ab4543d80bd521d087953f61e4a2a195acd08"
+    "closure_sha256": "42f52bf1f23431c6ca83fedc2e59dd9aab02ba32d3d0e5279dabb2724865c426"
   },
   {
     "id": "SeedPermissionsAndRoles",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.SeedPermissionsAndRoles",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -376,8 +394,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -420,11 +441,11 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "590cbe478a058723f632bb1d2528ef3f48ed943c3d00d020d9ebabebdc57e9c7"
+    "closure_sha256": "50a49d5b2e65fe2251a4bf40a4e2850321f31cd424dc30ec750d5346acba704c"
   },
   {
     "id": "SeedSystemRolesForAllOrgs",
-    "rev": 2,
+    "rev": 3,
     "func": "github.com/shridarpatil/whatomate/internal/database.SeedSystemRolesForAllOrgs",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -436,8 +457,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -480,11 +504,11 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "0ec934f0e04b190afa35395b1db0f242b673073bcb349156eaa5c99949f8d319"
+    "closure_sha256": "df122650fcac7b7b2e900b886753df3c13d09c1207247da0601bb6c2d8f62544"
   },
   {
     "id": "SeedSystemRolesForAllOrgs/seedSystemRolesForOrg",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.seedSystemRolesForOrg",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -496,8 +520,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -540,12 +567,12 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "c782e796315b6ecbc7f7b90eee70ac29082b3a9974b17533cac0a3c04cd8ec71",
+    "closure_sha256": "a90a7ae5e4accf7c772c61ace380324d61a04789536fc115a8a8a5ac3bc52ed4",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
     "id": "SeedSystemRolesForAllOrgs/FixSystemRolePermissions",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.FixSystemRolePermissions",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -557,8 +584,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -601,12 +631,12 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "4d35432982616ccd5e8b75afefd5a54420efecf31f35afa27ea135e9f4fa81e0",
+    "closure_sha256": "7115433b36d468f2ffcb7db15ebe51f48d9b9539d4897827b337b3af1cdf36e5",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
     "id": "SeedSystemRolesForAllOrgs/ApplyManagerSettingsPolicyMigration",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.ApplyManagerSettingsPolicyMigration",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -618,8 +648,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -662,12 +695,12 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "1a32941c8d64a306a7c947a6eced497899a1f1b1af549f7aa0235d53e7ae3a73",
+    "closure_sha256": "d7b3cfae4329ce163fe2ae7ea386c37b99ec13b2fee727375282c3589d5d91dd",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
     "id": "SeedSystemRolesForAllOrgs/MigrateExistingUserRoles",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.MigrateExistingUserRoles",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -679,8 +712,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -723,12 +759,12 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "ac88b07b11b4d785ed1f70a11d5d1eecd359134ae281e13783781d9659284651",
+    "closure_sha256": "791333d92fa807d091b37e112449404f37c499bb8586381fce9578ce99f53222",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
     "id": "SeedSystemRolesForAllOrgs/legacy-super-admin-update",
-    "rev": 2,
+    "rev": 3,
     "func": "github.com/shridarpatil/whatomate/internal/database.SeedSystemRolesForAllOrgs",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -740,8 +776,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -784,7 +823,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "0ec934f0e04b190afa35395b1db0f242b673073bcb349156eaa5c99949f8d319",
+    "closure_sha256": "df122650fcac7b7b2e900b886753df3c13d09c1207247da0601bb6c2d8f62544",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
@@ -801,8 +840,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -845,7 +887,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "cddf9382c405b500aea691b9d0b63db744719dae586e2c361c4edfaf3c5dad6f"
+    "closure_sha256": "1361dafc4cf947e403682bbeb02fff3bf0f2d4a1c478e4dcd565561c823823dc"
   },
   {
     "id": "CreateDefaultAdmin",
@@ -861,8 +903,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -905,11 +950,11 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "6e96c7ac33ff9f51711d8c3d3c84a9b628bfea032e4b67089464a4f3a60358af"
+    "closure_sha256": "61138620f200cf28278be07f1fbe2ecada8599e6753e2d59324a80d19c820335"
   },
   {
     "id": "EnsurePlatformReseller",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.EnsurePlatformReseller",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -921,8 +966,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -965,11 +1013,11 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "839f32386b9f41a19ca27df838cf3efa0e6075af34202e72f024b6c3369b61c7"
+    "closure_sha256": "b66261680cee7e5e2195da145cfe94eea3e88ff7cd71f419bac5b668c9534a0a"
   },
   {
     "id": "EnsureReReplyProductCatalog",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.EnsureReReplyProductCatalog",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -981,8 +1029,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -1025,11 +1076,11 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "e76b817ae92966fbb7437b7395a3cce113829dfb281ed87a8b348d4e3b588643"
+    "closure_sha256": "0b8dfbcdbfbe5569846ffd03125c5adecae2f46c767ab33532eb7a79fbc2edfd"
   },
   {
     "id": "SeedDefaultWidgets",
-    "rev": 1,
+    "rev": 2,
     "func": "github.com/shridarpatil/whatomate/internal/database.SeedDefaultWidgets",
     "kind": "seed-reconciler",
     "baseline": true,
@@ -1041,8 +1092,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -1085,7 +1139,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "a23f8079d9da61187657a85674d52dce59d83f2a8acf19ef17ce78f1a35a6236"
+    "closure_sha256": "975cf5eebbb2d52ddf47897b3b355cd935b91c071bf92b6ed46bf40af8394ef7"
   },
   {
     "id": "BackfillLastInboundAt",
@@ -1101,8 +1155,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -1145,7 +1202,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "46237a33bd4680d045f18eb2470a83c8d7bc84ed8ade55cfb01e46fd6aaa9a5e"
+    "closure_sha256": "b17e26f6192022cc70c719cc2e42073e396acb38461062de082e31a857da3e1b"
   },
   {
     "id": "BackfillChatbotFlowGraph",
@@ -1194,8 +1251,11 @@
       "internal/customeractivity/activity.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -1368,7 +1428,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "9370c79a02b731bcb264787fd94ccab313bc271d09877892f7be7a9590e004a3"
+    "closure_sha256": "077f683a714bb344976aff31a284e1ea2cb69ff9e6a7bee0645ec1531cbc8f3f"
   },
   {
     "id": "BackfillLegacyWhatsAppInbox",
@@ -1396,8 +1456,11 @@
       "internal/crypto/crypto.go",
       "internal/database/coexistence_integrity.go",
       "internal/database/contact_policy.go",
+      "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
       "internal/database/message_ingestion_trigger_contract.go",
+      "internal/database/plan.go",
+      "internal/database/plan_visibility.go",
       "internal/database/platform_compliance.go",
       "internal/database/postgres.go",
       "internal/database/product_catalog.go",
@@ -1442,6 +1505,6 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "5ea063ad105edd3ff708e0e504ce818fb03f6106df8560b35cdf5bd88baf274f"
+    "closure_sha256": "1599af618dbaa54ff5f27fe7862dd1cd058b90f49817429c91d06c7a08c5ddfb"
   }
 ]

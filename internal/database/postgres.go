@@ -4075,10 +4075,13 @@ func runRLSMigrationCoordinatorForPhase(
 	}
 
 	return withMigrationSession(db, func(session *gorm.DB) error {
+		if err := observeMigrationDataGates(session, runtimeRole); err != nil {
+			return err
+		}
 		profile, err := detectPlatformComplianceIdentityReviewTriggerProfile(session)
 		if err != nil {
-			// Classification is the first database operation inside the singleton
-			// boundary. A partial/misbound catalog therefore fails before any
+			// Informational read-only observations have finished and restored the
+			// session. A partial/misbound catalog still fails before any
 			// preparer, seed, backfill, policy, or activation can run.
 			return fmt.Errorf("classify RLS migration profile before mutation: %w", err)
 		}

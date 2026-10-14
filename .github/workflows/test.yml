@@ -190,6 +190,12 @@ jobs:
           TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable
         run: go test -mod=readonly -tags pr7_bootstrap_two_server -count=1 -v -timeout 5m ./internal/database -run '^TestTenantRLS_CatalogBootstrapCommandEqualOIDsAcrossServersRefusesBeforeWrites$'
 
+      - name: Run cross-server planner refusal
+        env:
+          TEST_BOOTSTRAP_PAIR_DATABASE_URL_A: postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable
+          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable
+        run: go test -mod=readonly -tags pr7_bootstrap_two_server -count=1 -v -timeout 5m ./cmd/whatomate -run '^TestMigrationPlanPGEqualOIDsAcrossServersRefusesBeforeOwner$'
+
       - name: Run PostgreSQL tenant isolation tests
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/whatomate_tenant_test?sslmode=disable

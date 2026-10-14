@@ -107,6 +107,7 @@ PINNED_USES = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
 DIGEST_IMAGE = re.compile(r"[a-z0-9./_-]+(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}")
 TENANT_TEST = "go test -mod=readonly -v -timeout 45m ./internal/database -run '^TestTenantRLS_'"
 BOOTSTRAP_PAIR_TEST = "go test -mod=readonly -tags pr7_bootstrap_two_server -count=1 -v -timeout 5m ./internal/database -run '^TestTenantRLS_CatalogBootstrapCommandEqualOIDsAcrossServersRefusesBeforeWrites$'"
+PLANNER_PAIR_TEST = "go test -mod=readonly -tags pr7_bootstrap_two_server -count=1 -v -timeout 5m ./cmd/whatomate -run '^TestMigrationPlanPGEqualOIDsAcrossServersRefusesBeforeOwner$'"
 RACE_TEST = "-- -mod=readonly -race -p 1 -timeout 150m -skip '^TestTenantRLS_Catalog' -coverprofile=coverage.out \"${packages[@]}\""
 CONTRACT_DIFF = "git diff --exit-code -- go.mod go.sum internal/dbcatalog/registry internal/dbcatalog/golden/seeds.json"
 CONTRACT_UPDATE_VARS = ("REREPLY_UPDATE_MIGRATION_PATH", "REREPLY_UPDATE_REGISTRY", "REREPLY_UPDATE_SEEDS")
@@ -329,8 +330,8 @@ def assert_concurrency_and_timeouts(sources: dict[str, str]) -> None:
     tenant = test_jobs["tenant-isolation"]
     if tenant.get("timeout-minutes") != 60:
         raise AssertionError("tenant-isolation has no explicit 60-minute job timeout")
-    if [line for item in tenant.get("steps", []) for line in run_lines(item) if line.startswith("go test")] != [BOOTSTRAP_PAIR_TEST, TENANT_TEST]:
-        raise AssertionError("tenant-isolation must run the exact pair test then the 45-minute tenant suite")
+    if [line for item in tenant.get("steps", []) for line in run_lines(item) if line.startswith("go test")] != [BOOTSTRAP_PAIR_TEST, PLANNER_PAIR_TEST, TENANT_TEST]:
+        raise AssertionError("tenant-isolation must run the exact bootstrap pair, planner pair, then 45-minute tenant suite")
     for service, port in (("postgres_pair_a", 5433), ("postgres_pair_b", 5434)):
         expected = {
             "image": PG17_IMAGE,
@@ -349,6 +350,15 @@ def assert_concurrency_and_timeouts(sources: dict[str, str]) -> None:
         "run": BOOTSTRAP_PAIR_TEST,
     }:
         raise AssertionError("tenant-isolation must run the exact unconditional bootstrap pair test")
+    if step_named(tenant, "Run cross-server planner refusal") != {
+        "name": "Run cross-server planner refusal",
+        "env": {
+            "TEST_BOOTSTRAP_PAIR_DATABASE_URL_A": "postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable",
+            "TEST_BOOTSTRAP_PAIR_DATABASE_URL_B": "postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable",
+        },
+        "run": PLANNER_PAIR_TEST,
+    }:
+        raise AssertionError("tenant-isolation must run the exact unconditional planner pair test")
     race = test_jobs["go-race"]
     # The per-package cap stays below the job's ceiling (GitHub's 360 minutes).
     if race.get("timeout-minutes") != 360 or RACE_TEST not in run_lines(step_named(race, "Run tests")):
@@ -1102,10 +1112,26 @@ def without_bootstrap_pair_service(service: str) -> dict[str, str]:
     return {**SOURCES, "test.yml": source[:start] + source[end:]}
 
 
+BOOTSTRAP_PAIR_STEP = (
+    "      - name: Run cross-server empty-bootstrap refusal\n"
+    "        env:\n"
+    "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_A: postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable\n"
+    "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable\n"
+    f"        run: {BOOTSTRAP_PAIR_TEST}\n"
+)
+PLANNER_PAIR_STEP = (
+    "      - name: Run cross-server planner refusal\n"
+    "        env:\n"
+    "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_A: postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable\n"
+    "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable\n"
+    f"        run: {PLANNER_PAIR_TEST}\n"
+)
+
+
 def without_bootstrap_pair_step() -> dict[str, str]:
     source = SOURCES["test.yml"]
     anchor = "      - name: Run cross-server empty-bootstrap refusal\n"
-    following = "      - name: Run PostgreSQL tenant isolation tests\n"
+    following = "      - name: Run cross-server planner refusal\n"
     start, end = source.find(anchor), source.find(following)
     if source.count(anchor) != 1 or source.count(following) != 1 or not 0 <= start < end:
         raise AssertionError("the bootstrap pair step is not where the mutation expects it")
@@ -1193,14 +1219,37 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     "remove bootstrap pair service B": ("concurrency-and-timeouts", lambda: without_bootstrap_pair_service("postgres_pair_b")),
     "remove the bootstrap pair test step": ("concurrency-and-timeouts", without_bootstrap_pair_step),
     "point bootstrap pair B at A": ("concurrency-and-timeouts", lambda: replaced(
-        "test.yml", "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable\n",
-        "          TEST_BOOTSTRAP_PAIR_DATABASE_URL_B: postgres://postgres:postgres@localhost:5433/postgres?sslmode=disable\n")),
+        "test.yml", BOOTSTRAP_PAIR_STEP, BOOTSTRAP_PAIR_STEP.replace("localhost:5434", "localhost:5433", 1))),
     "condition the bootstrap pair test": ("concurrency-and-timeouts", lambda: replaced(
         "test.yml", "      - name: Run cross-server empty-bootstrap refusal\n",
         "      - name: Run cross-server empty-bootstrap refusal\n        if: false\n")),
     "tolerate bootstrap pair test failure": ("concurrency-and-timeouts", lambda: replaced(
         "test.yml", "      - name: Run cross-server empty-bootstrap refusal\n",
         "      - name: Run cross-server empty-bootstrap refusal\n        continue-on-error: true\n")),
+    "remove the planner pair test step": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, "")),
+    "rename the planner pair test step": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("Run cross-server planner refusal", "Run planner smoke", 1))),
+    "condition the planner pair test": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("        env:\n", "        if: false\n        env:\n", 1))),
+    "tolerate planner pair test failure": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("        env:\n", "        continue-on-error: true\n        env:\n", 1))),
+    "run the planner pair test in another package": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("./cmd/whatomate", "./internal/database", 1))),
+    "select a nonexistent planner pair test": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("TestMigrationPlanPGEqualOIDsAcrossServersRefusesBeforeOwner", "TestMigrationPlanPGDoesNotExist", 1))),
+    "drop the planner pair build tag": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("-tags pr7_bootstrap_two_server ", "", 1))),
+    "skip the planner pair test": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace(PLANNER_PAIR_TEST, PLANNER_PAIR_TEST + " -skip '^TestMigrationPlanPG'", 1))),
+    "run the planner pair before bootstrap pair": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", BOOTSTRAP_PAIR_STEP + "\n" + PLANNER_PAIR_STEP, PLANNER_PAIR_STEP + "\n" + BOOTSTRAP_PAIR_STEP)),
+    "point planner pair B at A": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("localhost:5434", "localhost:5433", 1))),
+    "point planner pair A at B": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("localhost:5433", "localhost:5434", 1))),
+    "alias planner pair B to an environment value": ("concurrency-and-timeouts", lambda: replaced(
+        "test.yml", PLANNER_PAIR_STEP, PLANNER_PAIR_STEP.replace("postgres://postgres:postgres@localhost:5434/postgres?sslmode=disable", "${{ env.TEST_BOOTSTRAP_PAIR_DATABASE_URL_A }}", 1))),
     "revert the Test concurrency group": ("concurrency-and-timeouts", lambda: replaced(
         "test.yml", "format('run-{0}', github.run_id)", "github.ref")),
     "revert the E2E concurrency group": ("concurrency-and-timeouts", lambda: replaced(

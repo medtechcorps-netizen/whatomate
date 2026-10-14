@@ -213,81 +213,11 @@ func captureWithNullableGraph(ctx context.Context, dsn string, opt Options, grap
 		defer cancel()
 		_ = tx.Rollback(cleanup)
 	}()
-	var readOnly, isolation, searchPath string
-	var major int
-	if err = tx.QueryRow(ctx, "SELECT pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation'), pg_catalog.current_setting('search_path'), pg_catalog.current_setting('server_version_num')::integer/10000").Scan(&readOnly, &isolation, &searchPath, &major); err != nil || readOnly != "on" || isolation != "repeatable read" || searchPath != "pg_catalog" || (major != 14 && major != 17) {
-		return Snapshot{}, refuse("transaction")
-	}
-	var roles symbols
-	var owner Ownership
-	if err = tx.QueryRow(ctx, identitySQL).Scan(&roles.owner, &roles.runtime, &owner.MigrationOwnerOwnsDatabase, &owner.MigrationOwnerOwnsPublicSchema); err != nil {
-		return Snapshot{}, refuse("identity")
-	}
-	if roles.owner == roles.runtime {
-		return Snapshot{}, refuse("runtime-is-owner")
-	}
-	counts := map[string]int64{}
-	for _, key := range countKeys {
-		counts[key] = 0
-	}
-	values := make([]int64, 8)
-	dest := make([]any, 8)
-	for i := range values {
-		dest[i] = &values[i]
-	}
-	if err = tx.QueryRow(ctx, countsSQL, roles.owner, roles.runtime).Scan(dest...); err != nil {
-		return Snapshot{}, refuse("catalog-read")
-	}
-	for i := range values {
-		counts[countKeys[i]] = values[i]
-	}
-	all := []Object{}
-	totalBytes := 0
-	for _, query := range queries {
-		rows, queryErr := tx.Query(ctx, query.sql)
-		if queryErr != nil {
-			return Snapshot{}, refuse("catalog-read")
-		}
-		for rows.Next() {
-			var name, parent, payload string
-			if rows.Scan(&name, &parent, &payload) != nil || len(payload) > maxAttributeBytes || len(all) >= maxObjects {
-				rows.Close()
-				return Snapshot{}, refuse("catalog-read")
-			}
-			totalBytes += len(name) + len(parent) + len(payload)
-			if totalBytes > maxCatalogBytes {
-				rows.Close()
-				return Snapshot{}, refuse("catalog-limit")
-			}
-			var raw map[string]json.RawMessage
-			if json.Unmarshal([]byte(payload), &raw) != nil {
-				rows.Close()
-				return Snapshot{}, refuse("catalog-row")
-			}
-			attrs, normalizeErr := normalize(query.kind, name, raw, roles, counts)
-			if normalizeErr != nil {
-				rows.Close()
-				return Snapshot{}, normalizeErr
-			}
-			identity := name
-			if query.kind == "functions" {
-				identity = name + "(" + digest([]byte(parent)) + ")"
-				parent = ""
-			} else if parent != "" {
-				identity = parent + "." + name
-			}
-			all = append(all, Object{Kind: query.kind, Identity: identity, Parent: parent, Attributes: attrs})
-		}
-		rowErr := rows.Err()
-		rows.Close()
-		if rowErr != nil {
-			return Snapshot{}, refuse("catalog-read")
-		}
-	}
-	snapshot, err := project(all, known, owner, counts)
+	observed, err := captureCatalogInTx(ctx, tx, known, false)
 	if err != nil {
 		return Snapshot{}, err
 	}
+	snapshot, roles, major, totalBytes := observed.snapshot, observed.roles, observed.major, observed.totalBytes
 	if opt.IncludeSeeds {
 		snapshot.Seeds, err = captureSeeds(ctx, tx, opt.GlobalTables, known)
 		if err != nil {
@@ -314,6 +244,135 @@ func captureWithNullableGraph(ctx context.Context, dsn string, opt Options, grap
 		return Snapshot{}, refuse("transaction")
 	}
 	return snapshot, nil
+}
+
+// catalogCapture retains the complete catalog pass and the facts needed by the
+// optional legacy seed/nullable tails. Transaction lifetime stays with callers.
+type catalogCapture struct {
+	snapshot   Snapshot
+	roles      symbols
+	major      int
+	totalBytes int
+}
+
+func captureCatalogInTx(ctx context.Context, tx pgx.Tx, known Catalog, planner bool) (catalogCapture, error) {
+	if ctx == nil || ctx.Err() != nil || tx == nil {
+		return catalogCapture{}, refuse("transaction")
+	}
+	var readOnly, isolation, searchPath string
+	var major int
+	if err := tx.QueryRow(ctx, "SELECT pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation'), pg_catalog.current_setting('search_path'), pg_catalog.current_setting('server_version_num')::integer/10000").Scan(&readOnly, &isolation, &searchPath, &major); err != nil || readOnly != "on" || isolation != "repeatable read" || searchPath != "pg_catalog" || (major != 14 && major != 17) || (planner && major != 17) {
+		return catalogCapture{}, refuse("transaction")
+	}
+	var roles symbols
+	var owner Ownership
+	if err := tx.QueryRow(ctx, identitySQL).Scan(&roles.owner, &roles.runtime, &owner.MigrationOwnerOwnsDatabase, &owner.MigrationOwnerOwnsPublicSchema); err != nil {
+		return catalogCapture{}, refuse("identity")
+	}
+	if roles.owner == roles.runtime {
+		return catalogCapture{}, refuse("runtime-is-owner")
+	}
+	counts := map[string]int64{}
+	for _, key := range countKeys {
+		counts[key] = 0
+	}
+	values := make([]int64, 8)
+	dest := make([]any, 8)
+	for i := range values {
+		dest[i] = &values[i]
+	}
+	if err := tx.QueryRow(ctx, countsSQL, roles.owner, roles.runtime).Scan(dest...); err != nil {
+		return catalogCapture{}, refuse("catalog-read")
+	}
+	for i := range values {
+		counts[countKeys[i]] = values[i]
+	}
+	all := []Object{}
+	totalBytes := 0
+	for _, query := range queries {
+		if ctx.Err() != nil {
+			return catalogCapture{}, refuse("catalog-cancelled")
+		}
+		rows, queryErr := tx.Query(ctx, query.sql)
+		if queryErr != nil {
+			return catalogCapture{}, refuse("catalog-read")
+		}
+		for rows.Next() {
+			if ctx.Err() != nil {
+				rows.Close()
+				return catalogCapture{}, refuse("catalog-cancelled")
+			}
+			var name, parent, payload string
+			if rows.Scan(&name, &parent, &payload) != nil || len(payload) > maxAttributeBytes || len(all) >= maxObjects {
+				rows.Close()
+				return catalogCapture{}, refuse("catalog-read")
+			}
+			totalBytes += len(name) + len(parent) + len(payload)
+			if totalBytes > maxCatalogBytes {
+				rows.Close()
+				return catalogCapture{}, refuse("catalog-limit")
+			}
+			var raw map[string]json.RawMessage
+			if json.Unmarshal([]byte(payload), &raw) != nil {
+				rows.Close()
+				return catalogCapture{}, refuse("catalog-row")
+			}
+			attrs, normalizeErr := normalize(query.kind, name, raw, roles, counts)
+			if normalizeErr != nil {
+				rows.Close()
+				return catalogCapture{}, normalizeErr
+			}
+			identity := name
+			if query.kind == "functions" {
+				identity = name + "(" + digest([]byte(parent)) + ")"
+				parent = ""
+			} else if parent != "" {
+				identity = parent + "." + name
+			}
+			all = append(all, Object{Kind: query.kind, Identity: identity, Parent: parent, Attributes: attrs})
+		}
+		rowErr := rows.Err()
+		rows.Close()
+		if rowErr != nil {
+			return catalogCapture{}, refuse("catalog-read")
+		}
+	}
+	snapshot, err := project(all, known, owner, counts)
+	if err != nil {
+		return catalogCapture{}, err
+	}
+	if ctx.Err() != nil {
+		return catalogCapture{}, refuse("catalog-cancelled")
+	}
+	return catalogCapture{snapshot: snapshot, roles: roles, major: major, totalBytes: totalBytes}, nil
+}
+
+// CapturePlanInTx observes the complete catalog in the caller's PG17 READ ONLY
+// REPEATABLE READ transaction. It never connects, commits, rolls back or closes.
+// expected must come from the caller's explicitly selected PlanSource.
+func CapturePlanInTx(ctx context.Context, tx pgx.Tx, expected Catalog) (Snapshot, error) {
+	if ctx == nil || ctx.Err() != nil || tx == nil {
+		return Snapshot{}, refuse("transaction")
+	}
+	if err := validateCatalog(expected); err != nil {
+		return Snapshot{}, err
+	}
+	if len(expected.Objects) == 0 {
+		return Snapshot{}, refuse("empty-catalog")
+	}
+	for _, object := range expected.Objects {
+		if ctx.Err() != nil {
+			return Snapshot{}, refuse("catalog-cancelled")
+		}
+		if object.Missing {
+			return Snapshot{}, refuse("catalog-format")
+		}
+	}
+	observed, err := captureCatalogInTx(ctx, tx, expected, true)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return observed.snapshot, nil
 }
 
 func connectionConfig(dsn string, timeout time.Duration) (*pgx.ConnConfig, error) {

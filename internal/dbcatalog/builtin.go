@@ -51,3 +51,12 @@ var bootstrapEmptyProductionOverlayV0 []byte
 func BootstrapEmptyProfileV0() ([]byte, []byte) {
 	return append([]byte(nil), bootstrapEmptyProductionV0...), append([]byte(nil), bootstrapEmptyProductionOverlayV0...)
 }
+
+// Planner declarations are compiled consistency data, never dispatch targets.
+// Actual closure/revision verification remains the registry generator's job.
+//
+//go:embed registry/data_steps.json
+var builtinPlanSteps []byte
+
+//go:embed registry/coordinator_bindings.json
+var builtinPlanBindings []byte
