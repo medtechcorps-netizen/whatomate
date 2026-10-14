@@ -296,6 +296,86 @@ class SourceGitTests(unittest.TestCase):
                 self.assertIn("guarded-function:cmd/whatomate/main.go#runRLSMigration", result.reasons)
 
 
+class SourceGitProfileTests(unittest.TestCase):
+    """Profile validation and time accounting with no Git subprocesses."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name)
+        self.binary = self.repo / "fake-git"
+        self.binary.write_bytes(b"not executed")
+        self.now = 100.0
+        self.captures = []
+
+    def capture(self, argv, **options):
+        self.captures.append((argv, options))
+        return sg.runtime.Capture(0, b"commit\n", b"")
+
+    def reader(self, **kwargs):
+        return sg.ImmutableGit(self.repo, self.binary, capture=self.capture,
+                               clock=lambda: self.now, **kwargs)
+
+    def test_default_ceiling_stays_600_and_normal_profile_is_explicit(self):
+        default = self.reader()
+        self.assertEqual((default.profile, default.limits.seconds, default.deadline), ("default", 600, 700))
+        for kwargs in ({}, {"profile": "default"}):
+            with self.assertRaises(sg.SourceGitRefusal): self.reader(limits=sg.Limits(seconds=900), **kwargs)
+        normal = self.reader(limits=sg.Limits(seconds=900), profile="normal-admission")
+        self.assertEqual((normal.profile, normal.deadline), ("normal-admission", 1000))
+        self.assertEqual(self.reader(profile="normal-admission").limits.seconds, 600)
+        residual = self.reader(limits=sg.Limits(seconds=712.5), profile="normal-admission")
+        self.assertEqual(residual.deadline, 812.5)
+        with self.assertRaises(AttributeError): normal.profile = "default"
+        self.assertEqual(self.captures, [])
+
+    def test_unknown_profiles_and_expanded_other_limits_refuse_before_capture(self):
+        class Derived(str): pass
+        for profile in (None, True, 900, "normal", "outage", "rollback", "DEFAULT", [], {},
+                        Derived("normal-admission")):
+            with self.subTest(profile=profile), self.assertRaises(sg.SourceGitRefusal):
+                self.reader(profile=profile)
+        limits = [sg.Limits(seconds=900.1), sg.Limits(seconds=float("nan")),
+                  sg.Limits(seconds=float("inf")), sg.Limits(seconds=0), sg.Limits(seconds=True),
+                  sg.Limits(calls=4097), sg.Limits(total_bytes=64 * sg.MIB + 1),
+                  sg.Limits(command_seconds=15.1)]
+        for value in limits:
+            with self.subTest(limits=value), self.assertRaises(sg.SourceGitRefusal):
+                self.reader(limits=value, profile="normal-admission")
+        self.assertEqual(self.captures, [])
+
+    def test_normal_profile_retains_per_command_tail_and_poisoned_deadline(self):
+        reader = self.reader(limits=sg.Limits(seconds=900), profile="normal-admission")
+        reader._call(["cat-file", "-t", "a" * 40])
+        self.assertEqual(self.captures[-1][1]["timeout"], 15)
+        self.now = 997
+        reader._call(["cat-file", "-t", "a" * 40])
+        self.assertEqual(self.captures[-1][1]["timeout"], 3 - sg.CLEANUP_RESERVE)
+        self.assertEqual((reader.calls, reader.bytes), (2, 14))
+        self.now = 1000
+        with self.assertRaisesRegex(sg.SourceGitRefusal, "source-deadline$"):
+            reader._call(["cat-file", "-t", "a" * 40])
+        self.now = 100
+        with self.assertRaisesRegex(sg.SourceGitRefusal, "source-closed$"):
+            reader._call(["cat-file", "-t", "a" * 40])
+        self.assertEqual(len(self.captures), 2)
+
+    def test_normal_profile_keeps_shared_call_byte_and_command_grammar_bounds(self):
+        for cap in ("calls", "bytes"):
+            reader = self.reader(limits=sg.Limits(seconds=900), profile="normal-admission")
+            if cap == "calls": reader.calls = reader.limits.calls
+            else: reader.bytes = reader.limits.total_bytes - 4096
+            with self.assertRaisesRegex(sg.SourceGitRefusal, "source-budget$"):
+                reader._call(["cat-file", "-t", "a" * 40])
+            self.assertTrue(reader.failed)
+        for args in (["fetch"], ["checkout", "main"], ["cat-file", "-t", "HEAD"]):
+            reader = self.reader(limits=sg.Limits(seconds=900), profile="normal-admission")
+            reader.active = True
+            with self.assertRaisesRegex(sg.SourceGitRefusal, "source-grammar$"):
+                reader.output(self.repo, args, code="ignored")
+            self.assertTrue(reader.failed)
+        self.assertEqual(self.captures, [])
+
+
 class PublisherNamespaceParserTests(unittest.TestCase):
     def rows(self, extra=()):
         rows = [("release", "040000", "tree", "a" * 40),

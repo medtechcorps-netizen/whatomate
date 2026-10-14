@@ -229,7 +229,7 @@ def validate(doc):
             'final assertion consumes every actual outcome without a favorable shortcut')
     require(preview['timeout-minutes'] == 15 and step(preview,identifier='preview')['timeout-minutes'] == 11,
             'full-chain preview has 600 seconds inside 660 seconds and 900-second job')
-    require(run['timeout-minutes'] == 45 and step(run,identifier='experiment')['timeout-minutes'] == 41,
+    require(run['timeout-minutes'] == 80 and step(run,identifier='experiment')['timeout-minutes'] == 76,
             'canonical job and one aggregate experiment budget')
     setup = [step(run,name=name) for name in ('Check out the exact candidate',"Download this run's exact resolution",
              'Install pinned anonymous build and read-only release tools')]
@@ -402,9 +402,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_internal_budget_fits_without_cutting_off_core_cleanup(self):
         import images
-        self.assertEqual(images._TOTAL,2400)
-        self.assertEqual(45*60-(180+images._TOTAL+5+60),55)
-        self.assertGreater(41*60,images._TOTAL+5)
+        self.assertEqual(images._TOTAL,4500)
+        self.assertEqual(80*60-(180+images._TOTAL+5+60),55)
+        self.assertGreater(76*60,images._TOTAL+5)
 
     def test_preview_budget_and_exact_collector_workflow_binding(self):
         import hashlib

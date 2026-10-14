@@ -253,6 +253,64 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][1][1:], ['--version'])
 
+    def test_complete_two_pass_operation_uses_normal_900_within_2400(self):
+        # Measure this concrete fixture's command inventory first, then spread
+        # elapsed time over real captures without replacing any source facts.
+        self.deadline = 2500
+        self.run_preflight()
+        phases = ('source-before', 'actions', 'source-after')
+        counts = {phase: sum(row[0] == phase for row in self.calls) for phase in phases}
+        self.assertTrue(all(counts.values()))
+        delayed = {phase: sum(row[0] == phase and row[1][1:] != ['--version']
+                              for row in self.calls) for phase in phases}
+        self.assertTrue(all(delayed.values()))
+        self.scenario()
+        self.deadline = 2500
+        delays = {phase: seconds / delayed[phase]
+                  for phase, seconds in zip(phases, (750, 100, 750), strict=True)}
+        def elapsed(phase, argv):
+            if argv[1:] == ['--version']:
+                return
+            delay = delays[phase]
+            self.assertLess(delay + 0.001, self.calls[-1][2]['timeout'])
+            self.case.clock.now += delay
+        self.after = elapsed
+        result = self.run_preflight()
+        self.assertIs(type(result), ship.NormalPreflight)
+        self.assertEqual(result.resolution, self.expected)
+        self.assertEqual(result.command_count, len(self.calls))
+        self.assertEqual({phase: sum(row[0] == phase for row in self.calls) for phase in phases}, counts)
+        self.assertGreater(self.case.clock.now - 100, 1500)
+        self.assertLess(self.case.clock.now - 100, 2400)
+        self.assertLessEqual(result.command_count, 6000)
+        self.assertLessEqual(result.captured_bytes, 128 << 20)
+
+    def test_normal_source_900_limit_survives_the_2400_aggregate(self):
+        self.deadline = 2500
+        self.after = lambda phase, argv: setattr(self.case.clock, 'now', 1001)
+        self.refuse('record-chain-invalid:transport-client')
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][0], 'source-before')
+
+    def test_actions_600_limit_survives_the_2400_aggregate(self):
+        self.deadline = 2500
+        def expire(phase, argv):
+            if phase == 'actions' and argv[1:] == ['--version']:
+                self.case.clock.now += 601
+        self.after = expire
+        self.refuse('compat-stale')
+        self.assertEqual(self.calls[-1][0], 'actions')
+        self.assertNotIn('source-after', [phase for phase, _, _ in self.calls])
+
+    def test_final_normal_source_900_limit_is_not_the_remaining_aggregate(self):
+        self.deadline = 2500
+        def expire(phase, argv):
+            if phase == 'source-after' and argv[1:] == ['--version']:
+                self.case.clock.now += 901
+        self.after = expire
+        self.refuse('record-chain-invalid:transport-client')
+        self.assertEqual(self.calls[-1][0], 'source-after')
+
     def test_actions_constructor_cannot_reset_original_deadline(self):
         self.deadline = 110
         def expire(phase, argv):
@@ -459,7 +517,7 @@ class AggregateBudgetTests(unittest.TestCase):
 
     def test_absolute_maximum_and_backwards_or_nonfinite_clock_refuse(self):
         budget = self.budget(99999)
-        self.assertEqual(budget.end, 1000)
+        self.assertEqual(budget.end, 2500)
         for value in (99, float('nan'), float('inf'), True):
             budget = self.budget()
             self.clock.now = value

@@ -331,6 +331,9 @@ class JobShapeTests(unittest.TestCase):
 
     def test_production_timeout_covers_the_worst_case_deploy_and_rollback(self) -> None:
         budget = ship.production_worst_case_seconds()
+        self.assertEqual(ship.PREAMBLE_BUDGET_SECONDS, 2700)
+        self.assertEqual(ship.PRODUCTION_TIMEOUT_MINUTES, 140)
+        self.assertEqual(budget, 7620)
         # At least ten minutes of margin over the computed bound.
         self.assertGreaterEqual(ship.PRODUCTION_TIMEOUT_MINUTES * 60, budget + 600)
         self.assertLessEqual(ship.PRODUCTION_TIMEOUT_MINUTES, 360)
@@ -446,7 +449,7 @@ class JobShapeTests(unittest.TestCase):
     def test_source_operation_budgets_leave_job_setup_and_publication_margin(self) -> None:
         # Verify visibility retries share one stage deadline, not six fresh
         # source budgets. The Python caller enforces that absolute deadline.
-        self.assertEqual(JOBS["plan"]["timeout-minutes"] * 60, 900 + 300)
+        self.assertEqual(JOBS["plan"]["timeout-minutes"] * 60, 2400 + 300)
         self.assertEqual(JOBS["record"]["timeout-minutes"] * 60, 3 * 600 + 900)
 
 

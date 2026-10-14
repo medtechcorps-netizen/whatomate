@@ -112,7 +112,7 @@ class AdapterTests(unittest.TestCase):
                 mock.patch.object(stage_adapters.time, "monotonic", return_value=10.0), \
                 mock.patch.object(release_record, "resolve_chain", side_effect=AssertionError("legacy chain used")):
             self.assertTrue(self.verify_plan())
-        gate.assert_called_once_with(self.ctx, self.control, mode="stage", target="", deadline=910.0)
+        gate.assert_called_once_with(self.ctx, self.control, mode="stage", target="", deadline=2410.0)
         self.assertFalse(any("/approvals" in str(args) for args, _ in self.h.gh.calls))
         self.assertEqual(self.h.do.requests, [])
 
@@ -145,7 +145,7 @@ class AdapterTests(unittest.TestCase):
             return old_lanes(*args)
         def gated(ctx, control, mode, target, *, deadline):
             self.assertEqual(clock[0], 100.0)
-            self.assertEqual(deadline, 910.0)
+            self.assertEqual(deadline, 2410.0)
             return self.gate_value
         with mock.patch.object(stage_adapters.time, "monotonic", side_effect=lambda: clock[0]), \
                 mock.patch.object(self.ctx, "gh", side_effect=make_gh), \

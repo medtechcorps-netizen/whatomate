@@ -856,6 +856,11 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
         raise transport.TransportRefusal("record-chain-invalid:resolver-client")
     budget = client.budget
     try:
+        if budget.profile == "normal-admission" and not (
+                forward is True and admission is True and selected_tag is None
+                and rollback is False and rollback_proof is False
+                and nullable_profile is False and rollback_admission is False and outage is False):
+            budget.fail("resolver-profile")
         if outage and (not forward or not admission or rollback or rollback_proof
                        or nullable_profile or rollback_admission or selected_tag is not None):
             budget.fail("resolver-selection")
@@ -914,8 +919,13 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             # contract must win there too, with one consistent SourceFacts.
             required.add(candidate_sha)
             commits.add(candidate_sha)
-        reader = source_git.ImmutableGit(repo_dir, git_binary,
-            limits=source_git.Limits(seconds=budget.remaining()), capture=budget.capture, clock=budget.clock)
+        if budget.profile == "normal-admission":
+            reader = source_git.ImmutableGit(repo_dir, git_binary,
+                limits=source_git.Limits(seconds=budget.remaining()), capture=budget.capture,
+                clock=budget.clock, profile="normal-admission")
+        else:
+            reader = source_git.ImmutableGit(repo_dir, git_binary,
+                limits=source_git.Limits(seconds=budget.remaining()), capture=budget.capture, clock=budget.clock)
         with reader.operation():
             for sha in sorted(commits):
                 if reader.output(repo_dir, ["cat-file", "-t", sha], code="git-failed:source-commit") != b"commit\n":
@@ -1011,6 +1021,16 @@ def _resolve(client, repo_dir, git_binary, selected_tag, candidate_sha, *, forwa
             # structured classifier reasons, never arbitrary driver output.
             budget.failed = True
             raise
+        budget.fail("resolver")
+    except source_git.SourceGitRefusal as exc:
+        # Preserve only exact module-owned cause categories before the existing
+        # public normalization; never serialize an exception message or path.
+        if budget._failure_category is None:
+            budget._failure_category = {
+                "git-failed:source-deadline": "deadline",
+                "git-failed:source-capture": "capture",
+                "git-failed:source-budget": "bound",
+            }.get(exc.code, "other")
         budget.fail("resolver")
     except Exception:
         # Neither source/CLI errors nor arbitrary driver messages are public.

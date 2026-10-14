@@ -131,7 +131,7 @@ class RollbackCLITests(unittest.TestCase):
         self.assertEqual(self.w.trace[-4:], ['ledger.seal', 'catalog.final', 'manager.close', 'stack.cleanup'])
         self.assertTrue(self.w.owner._closed); self.assertTrue(self.w.manager._closed)
         self.assertTrue(all(client.budget.closed for client in self.clients))
-        self.assertEqual(self.deadline.end, self.started + 2400)
+        self.assertEqual(self.deadline.end, self.started + 4500)
         self.assertEqual(self.w.clock.now, self.started + 180)  # Three constructors plus actual quiet interval.
 
     def test_complete_actual_read_false_is_signed_shape_evidence_with_real_reverse(self):
@@ -345,7 +345,7 @@ class PublicRollbackCLITests(unittest.TestCase):
             return self.w.owner.raw_capture(argv, **options)
         def build(repo, resolution, binary, config, work, deadline, *, buildx_binary):
             self.assertIs(deadline, self.public_deadlines[-1][0])
-            self.assertEqual(deadline.end, self.public_deadlines[-1][1] + 2400)
+            self.assertEqual(deadline.end, self.public_deadlines[-1][1] + 4500)
             self.assertEqual(resolution, self.resolution)
             self.assertTrue(self.public_clients[-1].budget.closed)
             self.assertIsNone(cli.records._GIT_OUTPUT_TRANSPORT.get())
@@ -582,10 +582,10 @@ class PublicRollbackCLITests(unittest.TestCase):
         self.stage_preview()
         def elapsed(argv):
             if argv == [str(self.case.gh), '--version']:
-                self.w.clock.sleep(2401)
+                self.w.clock.sleep(4501)
         self.case.world.before = elapsed
         self.refuse('run'); self.assertEqual(self.admissions, [])
-        self.assertEqual(self.public_deadlines[-1][0].end, self.public_deadlines[-1][1] + 2400)
+        self.assertEqual(self.public_deadlines[-1][0].end, self.public_deadlines[-1][1] + 4500)
 
     def test_normal_snapshot_does_not_select_normal_parser_for_explicit_target(self):
         snapshot = normal_tests.snapshot(self.ctx)
