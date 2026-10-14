@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import math
 import os
+import sys
 from pathlib import Path
 import threading
 import time
@@ -24,10 +25,12 @@ import forward_gates
 import contract_authorization as contract
 
 common, runtime = transport.common, transport.runtime
-MAX_SECONDS = 900
+MAX_SECONDS = 2400
 MAX_COMMANDS = 6000
 MAX_BYTES = 128 * 1024 * 1024
 CLEANUP_RESERVE = 2.25
+_DIAGNOSTIC_PHASES = frozenset(("input", "source-before", "actions", "source-after", "qualification"))
+_DIAGNOSTIC_CATEGORIES = frozenset(("deadline", "capture", "command-nonzero", "signature", "bound", "other"))
 
 
 def _need(value, detail):
@@ -66,13 +69,38 @@ class _Budget:
         now = clock()
         _need(_finite(now) and _finite(deadline) and now < deadline, "deadline")
         self.end, self._last = min(deadline, now + MAX_SECONDS), now
+        self._started = now
+        self._phase = "input"
+        self._failure_category = self._failure_phase = None
         self.clock, self._capture = clock, capture
         self.commands = self.captured_bytes = 0
         self.failed = self.closed = False
         self._paths = ()
         self._lock = threading.Lock()
 
+    def note_failure(self, category, phase=None):
+        # Never serialize arbitrary exception text, arguments or capture data.
+        if self._failure_category is None:
+            self._failure_category = category if category in _DIAGNOSTIC_CATEGORIES else "other"
+            self._failure_phase = phase if phase in _DIAGNOSTIC_PHASES else self._phase
+
+    def report_refusal(self):
+        # This is only a lower bound from the existing monotonic samples. No
+        # new clock/read, policy result, transferable evidence or authority.
+        phase = self._phase if self._phase in _DIAGNOSTIC_PHASES else "input"
+        category = self._failure_category if self._failure_category in _DIAGNOSTIC_CATEGORIES else "other"
+        first = self._failure_phase if self._failure_phase in _DIAGNOSTIC_PHASES else phase
+        elapsed = max(0, int((self._last - self._started) * 1000))
+        try:
+            print(f"verification-refused phase={phase} first_failure_phase={first} "
+                  f"first_failure_category={category} sampled_elapsed_ms_lower_bound={elapsed} "
+                  f"commands={self.commands} captured_bytes={self.captured_bytes}", file=sys.stderr)
+        except Exception:
+            pass  # A diagnostic output failure must not replace the refusal.
+
     def fail(self, detail):
+        self.note_failure({"deadline": "deadline", "capture": "capture",
+                           "capture-input": "capture", "bound": "bound"}.get(detail, "other"))
         self.failed = True
         raise evidence.CompatRefusal("compat-stale", "preflight-" + detail) from None
 
@@ -131,6 +159,8 @@ class _Budget:
                     or len(result.stdout) > limit or len(result.stderr) > stderr_limit):
                 self.fail("capture")
             self.captured_bytes += len(result.stdout) + len(result.stderr)
+            if self._phase == "actions" and result.returncode != 0:
+                self.note_failure("command-nonzero")
             self.check()
             return result
         finally:
@@ -154,12 +184,13 @@ def _scratch(path, repo):
 
 def _source(budget, repo, sha, gh, git, token, phase, env):
     budget.check()
-    operation = transport.OperationBudget(budget.end, capture=budget.capture, clock=budget.clock)
+    operation = transport.OperationBudget(budget.end, profile="normal-admission", capture=budget.capture, clock=budget.clock)
     try:
         client = transport.ReleaseGh(gh, token, phase / "config", phase / "work",
                                      budget=operation, base_env=env)
         return resolver.resolve_admission_forward(client, repo, git, sha)
     except Exception:
+        budget.note_failure(operation._failure_category)
         # close must not mask the primary source refusal on construction errors.
         operation.failed = True
         raise
@@ -191,6 +222,7 @@ def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch
                deadline, capture, clock, wall_clock, base_env):
     """Private test seams control commands/time, never supplied evidence facts."""
     budget = _Budget(deadline, capture=capture, clock=clock)
+    client = None
     try:
         _need(type(candidate_sha) is str and common.SHA1_RE.fullmatch(candidate_sha), "source")
         _need(type(token) is str and 0 < len(token) <= 8192
@@ -201,19 +233,25 @@ def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch
         _scratch(scratch_dir, repo_dir)
         budget.bind(scratch_dir, gh_binary, git_binary)
         env = common.scrubbed_env(base=base_env)
+        budget._phase = "source-before"
         before = _source(budget, repo_dir, candidate_sha, gh_binary, git_binary, token,
                          scratch_dir / "source-before", env)
         budget.check()
         _need(before.resolution.resolved.inventory.main_sha == candidate_sha, "main-changed")
+        budget._phase = "actions"
         phase = scratch_dir / "actions"
         client = collect.ActionsGh(str(gh_binary), token, phase / "config",
             seconds=min(600, budget.remaining()), base_env=env, capture=budget.capture, clock=budget.clock)
         history = collect.collect_history(collect.CollectionRequest(candidate_sha, before.resolution.workflow),
                                            client, phase / "work", wall_clock=wall_clock)
         budget.check()
+        if client._failure_category is not None:
+            budget.note_failure(client._failure_category, "actions")
+        budget._phase = "source-after"
         after = _source(budget, repo_dir, candidate_sha, gh_binary, git_binary, token,
                         scratch_dir / "source-after", env)
         budget.check()
+        budget._phase = "qualification"
         observation = _contract_pair(before, after, history.history.observed_at)
         qualified = bridge.qualify(after.resolution, history)
         budget.check()
@@ -234,7 +272,13 @@ def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch
     except Exception:
         budget.fail("invalid")
     finally:
-        budget.close()
+        if budget.failed and client is not None and client._failure_category is not None:
+            budget.note_failure(client._failure_category, "actions")
+        try:
+            budget.close()
+        finally:
+            if budget.failed:
+                budget.report_refusal()
 
 
 def preflight(repo_dir: Path, candidate_sha: str, *, gh_binary: Path, git_binary: Path,
@@ -242,7 +286,7 @@ def preflight(repo_dir: Path, candidate_sha: str, *, gh_binary: Path, git_binary
     """Resolve, collect, re-resolve and qualify under one caller-owned deadline.
 
     deadline is an absolute time.monotonic value created by the caller before
-    invoking this function. The operation caps itself at 900 seconds and never
+    invoking this function. The operation caps itself at 2400 seconds and never
     fetches Git history. scratch_dir must be a fresh private location outside
     the repository; failed/successful evidence is retained, never replayed.
     No caller-supplied clients, source facts or proof receipts are accepted.

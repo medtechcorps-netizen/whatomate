@@ -71,8 +71,8 @@ jobs:
   plan:
     name: Release plan
     runs-on: ubuntu-24.04
-    # Normal preflight is bounded at 900s; retain 300s for setup and gates.
-    timeout-minutes: 20
+    # Normal preflight is bounded at 2400s; retain 300s for setup and gates.
+    timeout-minutes: 45
     permissions:
       actions: read
       attestations: read
@@ -821,7 +821,7 @@ jobs:
     runs-on: ubuntu-24.04
     # Above the worst-case deploy + rollback path (ship.py
     # production_worst_case_seconds, checked by test_ship_workflow).
-    timeout-minutes: 120
+    timeout-minutes: 140
     environment: production
     concurrency:
       group: ship-production

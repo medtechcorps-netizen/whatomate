@@ -29,7 +29,7 @@ import ship_common as common
 records = record_resolver.records
 policy = record_resolver.policy
 SOURCE_SECONDS = 600
-PLAN_SECONDS = 900
+PLAN_SECONDS = 2400
 
 
 def _need(value, code):
