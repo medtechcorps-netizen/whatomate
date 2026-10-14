@@ -473,7 +473,17 @@ def _build_failure_diagnostic(error):
     return None
 
 
+def _build_progress_diagnostic(deadline):
+    value = images._BuildProgress.public(deadline)
+    if value is not None:
+        raw = canonical(value)
+        if len(raw) <= 2048:
+            return 'compatibility-build-progress: ' + raw.decode('ascii').rstrip('\n')
+    return None
+
+
 def main(argv=None):
+    deadline = None
     try:
         args = sys.argv[1:] if argv is None else argv
         need(type(args) is list and len(args) == 1 and type(args[0]) is str
@@ -559,6 +569,9 @@ def main(argv=None):
         build_diagnostic = _build_failure_diagnostic(error)
         if build_diagnostic is not None:
             print(build_diagnostic, file=sys.stderr)
+        progress = _build_progress_diagnostic(deadline)
+        if progress is not None:
+            print(progress, file=sys.stderr)
         return 1
 
 

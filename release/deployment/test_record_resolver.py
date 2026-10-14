@@ -1565,5 +1565,101 @@ class AdmissionResolverTests(unittest.TestCase):
         self.assertEqual(self.graph.graph_calls, [])
 
 
+class NormalAdmissionProfileTests(unittest.TestCase):
+    setUpClass = AdmissionResolverTests.__dict__["setUpClass"]
+
+    def scenario(self):
+        case = AdmissionResolverTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        sha = case.scenario("none")
+        return case, sha
+
+    def client(self, case, *, profile="normal-admission", deadline=1600):
+        config, work = case.root / "profile-config", case.root / "profile-work"
+        config.mkdir(); work.mkdir()
+        budget = rt.OperationBudget(deadline, capture=case.capture, clock=case.clock, profile=profile)
+        case.client = rt.ReleaseGh(case.gh, support.GH_TOKEN, config, work, budget=budget, base_env={})
+        return case.client
+
+    def test_normal_admission_propagates_original_remaining_900_profile_to_real_git(self):
+        case, sha = self.scenario()
+        client = self.client(case)
+        original = resolver.source_git.ImmutableGit
+        with mock.patch.object(resolver.source_git, "ImmutableGit", wraps=original) as construction:
+            value = resolver.resolve_admission_forward(client, case.repo, case.git, sha)
+        self.assertIs(type(value), resolver.ForwardAdmission)
+        self.assertEqual(value.resolution.candidate.sha, sha)
+        self.assertEqual(construction.call_count, 1)
+        self.assertEqual(construction.call_args.kwargs["profile"], "normal-admission")
+        self.assertGreater(construction.call_args.kwargs["limits"].seconds, 600)
+        self.assertLessEqual(construction.call_args.kwargs["limits"].seconds, 900)
+        self.assertTrue(client.budget.closed and client._finished)
+        self.assertFalse(client.budget.failed)
+        self.assertEqual(client.budget.commands, len(case.world.trace))
+        self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+
+    def test_default_admission_retains_exact_ordinary_git_call_shape(self):
+        case, sha = self.scenario()
+        client = self.client(case, profile="default")
+        original = resolver.source_git.ImmutableGit
+        with mock.patch.object(resolver.source_git, "ImmutableGit", wraps=original) as construction:
+            value = resolver.resolve_admission_forward(client, case.repo, case.git, sha)
+        self.assertIs(type(value), resolver.ForwardAdmission)
+        self.assertEqual(set(construction.call_args.kwargs), {"limits", "capture", "clock"})
+        self.assertLessEqual(construction.call_args.kwargs["limits"].seconds, 600)
+        self.assertTrue(client.budget.closed and client._finished)
+
+    def test_normal_profile_refuses_every_other_selection_before_snapshot(self):
+        variants = ({"forward": False}, {"admission": False}, {"selected_tag": common.BOOTSTRAP_TAG},
+                    {"rollback": True}, {"rollback_proof": True}, {"nullable_profile": True},
+                    {"rollback_admission": True}, {"outage": True}, {"forward": 1}, {"admission": 1})
+        for changed in variants:
+            with self.subTest(changed=changed):
+                case, sha = self.scenario()
+                client = self.client(case)
+                count = len(case.world.trace)
+                options = {"forward": True, "admission": True}
+                options.update(changed)
+                selected = options.pop("selected_tag", None)
+                with mock.patch.object(client, "capture_snapshot", side_effect=AssertionError("snapshot reached")) as snapshot:
+                    with self.assertRaisesRegex(rt.TransportRefusal, "^record-chain-invalid:transport-resolver$"):
+                        resolver._resolve(client, case.repo, case.git, selected, sha, **options)
+                snapshot.assert_not_called()
+                self.assertEqual(len(case.world.trace), count)
+                self.assertTrue(client.budget.failed and client.budget.closed)
+                self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+
+    def test_normal_profile_keeps_shorter_original_caller_deadline(self):
+        case, sha = self.scenario()
+        client = self.client(case, deadline=400)
+        def after(argv):
+            if argv[0] == str(case.git):
+                case.clock.now = 397.76
+        case.world.after = after
+        with self.assertRaisesRegex(rt.TransportRefusal, "^record-chain-invalid:transport-resolver$"):
+            resolver.resolve_admission_forward(client, case.repo, case.git, sha)
+        self.assertTrue(client.budget.closed and client.budget.failed)
+        self.assertEqual(client.budget._failure_category, "deadline")
+        self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+
+    def test_only_fixed_source_git_codes_survive_as_safe_cause_categories(self):
+        for code, category in (("git-failed:source-deadline", "deadline"),
+                               ("git-failed:source-capture", "capture"),
+                               ("git-failed:source-budget", "bound"),
+                               ("git-failed:source-PRIVATE", "other")):
+            with self.subTest(code=code):
+                case, sha = self.scenario()
+                client = self.client(case)
+                with mock.patch.object(resolver.source_git.ImmutableGit, "output",
+                        side_effect=resolver.source_git.SourceGitRefusal(code)):
+                    with self.assertRaisesRegex(rt.TransportRefusal, "^record-chain-invalid:transport-resolver$") as caught:
+                        resolver.resolve_admission_forward(client, case.repo, case.git, sha)
+                self.assertNotIn("PRIVATE", str(caught.exception))
+                self.assertEqual(client.budget._failure_category, category)
+                self.assertTrue(client.budget.closed and client.budget.failed)
+                self.assertIsNone(records._GIT_OUTPUT_TRANSPORT.get())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,8 @@ from types import SimpleNamespace
 import compat_evidence as evidence
 import ship_common as common
 
-WORKFLOW_SHA256 = "56005fe2015e8385e6ecfc621a403c06a534ed9a5712e5ec4ec4f9c70407b941"
+WORKFLOW_SHA256 = "73c655c829fa36a109dfee621f1efa4529cf89ffa112599a8ff1bb8391b7eff9"
+P0_WORKFLOW_SHA256 = "56005fe2015e8385e6ecfc621a403c06a534ed9a5712e5ec4ec4f9c70407b941"
 W0_WORKFLOW_SHA256 = "0f8ae9f3079d4a3c0749721e5100d6df60842b4811059aee02a2ee4d8ced4f6b"
 REPOSITORY_ID = 1297344686
 API = "/repos/" + evidence.REPOSITORY
@@ -256,7 +257,7 @@ def validate_workflow(value):
 
 def _reviewed_steps(value):
     validate_workflow(value)
-    if value.raw is None or hashlib.sha256(value.raw).hexdigest() not in (W0_WORKFLOW_SHA256, WORKFLOW_SHA256):
+    if value.raw is None or hashlib.sha256(value.raw).hexdigest() not in (W0_WORKFLOW_SHA256, P0_WORKFLOW_SHA256, WORKFLOW_SHA256):
         return None
     steps, job = {}, None
     for line in value.raw.decode('ascii').splitlines():

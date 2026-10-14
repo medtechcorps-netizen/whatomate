@@ -33,8 +33,8 @@ import catalog
 
 proof, common = runtime.proof, runtime.common
 _READY_FOR_EXECUTION = True
-_TOTAL = 2400  # Leaves300s inside the canonical45-minute workflow job.
-_BUILD = 1500
+_TOTAL = 4500  # Leaves300s inside the canonical80-minute workflow job.
+_BUILD = 3600
 _EXPERIMENT_MIN = 720
 _CLEANUP = 180
 _MAX_CONTEXT = 64 * runtime.MIB
@@ -142,6 +142,153 @@ class _BuildFailure(proof.EvidenceError):
                 'family_scope': 'matched-wording-only', 'cleanup_complete': cleanup}
 
 
+_PROGRESS_STAGES = frozenset(('source-resolution', 'source-inputs', 'engine-check', 'pull',
+    'pull-check', 'builder-start', 'builder-create', 'builder-bootstrap', 'builder-check',
+    'role-precheck', 'role-export', 'role-build', 'role-verify', 'role-complete',
+    'final-checks', 'builder-cleanup'))
+_PROGRESS_ROLES = ('graph', 'controller', 'fixture', 'candidate')
+
+
+class _BuildProgress:
+    """Diagnostic-only primitives; no clock reads, authority or retained streams."""
+    __slots__ = ('started', 'active', 'failure', 'completed', 'cleanup', 'resolution_end',
+                 'role_started', 'role_times')
+
+    def __init__(self, sampled):
+        self.started = sampled
+        self.active = ('source-resolution', 'none', sampled, None, None)
+        self.failure = None
+        self.completed = ()
+        self.cleanup = None
+        self.resolution_end = None
+        self.role_started = None
+        self.role_times = ()
+
+    @staticmethod
+    def _state(deadline):
+        if type(deadline) is not _Deadline:
+            return None
+        state = vars(deadline).get('_build_progress')
+        if type(state) is not _BuildProgress:
+            return None
+        return state
+
+    @staticmethod
+    def _number(value):
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+    @staticmethod
+    def _label(stage, role):
+        if type(stage) is not str or stage not in _PROGRESS_STAGES or type(role) is not str:
+            return False
+        if stage.startswith('role-'):
+            return role in _PROGRESS_ROLES
+        if stage in ('pull', 'pull-check'):
+            return role in ('previous', 'live', 'postgres', 'redis')
+        return role == 'none'
+
+    @staticmethod
+    def mark(deadline, stage, role='none'):
+        state = _BuildProgress._state(deadline)
+        if state is None or not _BuildProgress._label(stage, role):
+            return
+        sampled = vars(deadline).get('last')
+        if (not _BuildProgress._number(sampled) or not _BuildProgress._number(state.started)
+                or not 0 <= sampled - state.started <= _TOTAL + _CLEANUP + 5):
+            return
+        state.active = (stage, role, sampled, None, None)
+        elapsed = sampled - state.started
+        if stage == 'source-inputs' and state.resolution_end is None:
+            state.resolution_end = elapsed
+        if stage == 'role-build':
+            state.role_started = (role, elapsed)
+        if (stage == 'role-complete' and type(state.completed) is tuple
+                and all(type(name) is str for name in state.completed)
+                and state.completed == _PROGRESS_ROLES[:len(state.completed)]):
+            if len(state.completed) < 4 and role == _PROGRESS_ROLES[len(state.completed)]:
+                state.completed += (role,)
+                if (type(state.role_started) is tuple and len(state.role_started) == 2
+                        and state.role_started[0] == role and _BuildProgress._number(state.role_started[1])
+                        and state.role_started[1] <= elapsed and type(state.role_times) is tuple
+                        and len(state.role_times) < 4):
+                    state.role_times += ((role, state.role_started[1], elapsed),)
+
+    @staticmethod
+    def capture(deadline, seconds):
+        state = _BuildProgress._state(deadline)
+        if state is None or not _BuildProgress._number(seconds) or not 0 < seconds <= _BUILD:
+            return
+        active = state.active
+        if type(active) is tuple and len(active) == 5:
+            state.active = (*active[:3], seconds, deadline.last)
+
+    @staticmethod
+    def failed(deadline):
+        state = _BuildProgress._state(deadline)
+        if state is None or state.failure is not None:
+            return
+        active = state.active
+        if type(active) is not tuple or len(active) != 5:
+            return
+        stage, role, entered, cap, capture_start = active
+        sampled, end = deadline.last, deadline.end
+        if (not _BuildProgress._label(stage, role)
+                or not all(_BuildProgress._number(v) for v in
+                           (state.started, entered, cap, capture_start, sampled, end))
+                or not state.started <= entered <= capture_start <= sampled
+                or not 0 < cap <= _BUILD or sampled - state.started > _TOTAL + _CLEANUP + 5
+                or type(state.completed) is not tuple
+                or not all(type(name) is str for name in state.completed)
+                or state.completed != _PROGRESS_ROLES[:len(state.completed)]):
+            return
+        state.failure = (stage, role, sampled - state.started, sampled - entered,
+                         sampled - capture_start, cap, max(0, end - sampled),
+                         max(0, end - _EXPERIMENT_MIN - _CLEANUP - sampled), state.completed,
+                         state.resolution_end, state.role_times)
+
+    @staticmethod
+    def finish_cleanup(deadline, complete):
+        state = _BuildProgress._state(deadline)
+        if state is not None:
+            state.cleanup = complete if type(complete) is bool else None
+
+    @staticmethod
+    def public(deadline):
+        state = _BuildProgress._state(deadline)
+        if state is None:
+            return None
+        value, cleanup = state.failure, state.cleanup
+        if (type(value) is not tuple or len(value) != 11
+                or cleanup is not None and type(cleanup) is not bool):
+            return None
+        (stage, role, elapsed, stage_elapsed, capture_elapsed, cap, remaining, build_remaining,
+         completed, resolution_end, role_times) = value
+        if (not _BuildProgress._label(stage, role)
+                or not all(_BuildProgress._number(v) and v <= _TOTAL + _CLEANUP + 5
+                           for v in (elapsed, stage_elapsed, capture_elapsed, cap, remaining, build_remaining))
+                or not capture_elapsed <= stage_elapsed <= elapsed or not 0 < cap <= _BUILD
+                or build_remaining > remaining or type(completed) is not tuple
+                or not all(type(name) is str for name in completed)
+                or completed != _PROGRESS_ROLES[:len(completed)]
+                or resolution_end is not None and (not _BuildProgress._number(resolution_end) or resolution_end > elapsed)
+                or type(role_times) is not tuple or len(role_times) != len(completed)):
+            return None
+        for name, row in zip(completed, role_times):
+            if (type(row) is not tuple or len(row) != 3 or type(row[0]) is not str or row[0] != name
+                    or not all(_BuildProgress._number(v) for v in row[1:])
+                    or not 0 <= row[1] <= row[2] <= elapsed):
+                return None
+        return {'version': 1, 'stage': stage, 'role': role,
+                'elapsed_seconds': round(elapsed, 3), 'stage_elapsed_seconds': round(stage_elapsed, 3),
+                'capture_elapsed_seconds': round(capture_elapsed, 3), 'capture_cap_seconds': round(cap, 3),
+                'remaining_seconds': round(remaining, 3), 'build_remaining_seconds': round(build_remaining, 3),
+                'completed_roles': list(completed), 'cleanup_complete': cleanup,
+                'pre_admission_end_seconds': None if resolution_end is None else round(resolution_end, 3),
+                'role_boundaries': [{'role': row[0], 'build_start_seconds': round(row[1], 3),
+                                     'verified_end_seconds': round(row[2], 3)} for row in role_times],
+                'scope': 'last-sampled-clock; diagnostic-only; capture-incomplete'}
+
+
 class _Deadline:
     """One private clock for verification, build, experiment AND cleanup."""
     def __init__(self, *, clock=time.monotonic):
@@ -149,6 +296,7 @@ class _Deadline:
         self.last = None
         self.end = self.now() + _TOTAL
         self.build_end = None
+        self._build_progress = _BuildProgress(self.last)
 
     def now(self):
         value = self.clock()
@@ -619,6 +767,7 @@ def _build_capture(argv, env, seconds, deadline, *, cwd=None):
     end=min(deadline.end-5,deadline.now()+seconds)
     teardown_end=min(deadline.end,end+5)
     need(end>deadline.now(),'admission-build-reserve')
+    _BuildProgress.capture(deadline, seconds)
     child=job=None; pipes=()
     try:
         command=argv
@@ -663,6 +812,9 @@ def _build_capture(argv, env, seconds, deadline, *, cwd=None):
             # but even this fixed short poll remains below the output/time bounds.
             time.sleep(min(.001,max(0,end-deadline.now())))
         return runtime.Capture(code,bytes(buffers[0]),bytes(buffers[1]))
+    except BaseException:
+        _BuildProgress.failed(deadline)
+        raise
     finally:
         unresolved=False
         try:
@@ -689,7 +841,9 @@ def _build_capture(argv, env, seconds, deadline, *, cwd=None):
         finally:
             for pipe in pipes: pipe.close()
             if job is not None: job.close()  # Kill-on-close is also the final fail-closed backstop.
-        if unresolved: raise proof.InfrastructureFailure('admission-build-teardown-unresolved')
+        if unresolved:
+            _BuildProgress.failed(deadline)
+            raise proof.InfrastructureFailure('admission-build-teardown-unresolved')
 
 
 def _save(path,value):
@@ -873,13 +1027,16 @@ class _LinuxBuilder:
         need(re.fullmatch(rb'[0-9a-f]{64}\n',raw),'admission-builder-mutation-unbound')
         self.identifier=raw[:-1].decode();event['outcome']='acknowledged'
         self.container_row=self._container(running=False)
+        _BuildProgress.mark(self.deadline, 'builder-create')
         self._plugin(['create','--name',self.name,'--node',self.node,'--driver','docker-container',
             '--driver-opt','image='+_BUILDKIT,'--driver-opt','restart-policy=no',
             '--driver-opt','provenance-add-gha=false','--buildkitd-flags=--debug','default'])
         self._metadata();self._volume();self._container(running=False)
+        _BuildProgress.mark(self.deadline, 'builder-bootstrap')
         self._plugin(['inspect','--bootstrap',self.name])
         # Do not trust inspect's textual success: its source can print node errors
         # and return zero. Actual owned container state is authoritative here.
+        _BuildProgress.mark(self.deadline, 'builder-check')
         self.container_row=self._container(running=True);self.check()
 
     def close(self):
@@ -1084,6 +1241,7 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
         need(rollback.target.digest != rollback.live.digest or rollback.target == rollback.live,
              'admission-rollback-image-conflict')
         resolved_previous=rollback.target
+    _BuildProgress.mark(deadline, 'source-inputs')
     source=_Source(repo,candidate,deadline)
     blobs=source.blobs(source.inventory(candidate));contexts=_role_inputs(blobs)
     digest=previous.images.get('web') if resolved_previous is None else resolved_previous.digest
@@ -1135,6 +1293,7 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
 
     try:
         deadline.build_seconds()  # Includes all immutable pulls, backend setup and all four builds.
+        _BuildProgress.mark(deadline, 'engine-check')
         engine=engine_info()
         infrastructure={}
         pull_images=(reference,runtime.POSTGRES,runtime.REDIS)
@@ -1142,7 +1301,11 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
             live_reference=common.IMAGE_REPOSITORY['web']+'@'+rollback.live.digest
             pull_images=tuple(dict.fromkeys((reference,live_reference,runtime.POSTGRES,runtime.REDIS)))
         for image in pull_images:
+            pull_role = ('previous' if image == reference else 'postgres' if image == runtime.POSTGRES
+                         else 'redis' if image == runtime.REDIS else 'live')
+            _BuildProgress.mark(deadline, 'pull', pull_role)
             docker.pull(image)
+            _BuildProgress.mark(deadline, 'pull-check', pull_role)
             infrastructure[image]=docker.inspect(image)
         previous_row=infrastructure[reference]
         if resolved_previous is None:
@@ -1160,10 +1323,13 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
             processes.OwnedProcesses._validate_image(None,'candidate',live_binding,live_row)
         if _host_linux():
             backend=_LinuxBuilder(binary,config,plugin,build_config,work,candidate,deadline)
+            _BuildProgress.mark(deadline, 'builder-start')
             backend.start()
         for role in ('graph','controller','fixture','candidate'):
+            _BuildProgress.mark(deadline, 'role-precheck', role)
             recheck()
             role_work=work/role;role_work.mkdir();context=role_work/'context'
+            _BuildProgress.mark(deadline, 'role-export', role)
             _export(context,contexts[role])
             manifest=[{'path':name,'mode':'100644','bytes':len(raw),'sha256':sha(raw),
                        'git_blob':hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()}
@@ -1179,7 +1345,9 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
             command=_build_command(plugin,context,role_work,candidate,role,backend.name if backend else 'default')
             # Last identity check immediately before Buildx. Missing/replaced
             # Linux resources must never enter the driver's implicit create path.
+            _BuildProgress.mark(deadline, 'role-precheck', role)
             recheck()
+            _BuildProgress.mark(deadline, 'role-build', role)
             value=_build_capture(command,build_env,deadline.build_seconds(),deadline)
             need(type(value) is runtime.Capture and type(value.returncode) is int
                  and type(value.stdout) is bytes and type(value.stderr) is bytes,'admission-build-capture')
@@ -1188,6 +1356,7 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
             if value.returncode != 0:
                 build_failure=_BuildFailure(role,value)
                 raise build_failure
+            _BuildProgress.mark(deadline, 'role-verify', role)
             deadline.build_seconds();_check_export(context,contexts[role]);recheck()
             need(_build_environment(build_config,role_work)==build_env,'admission-build-environment-changed')
             iid=_regular(role_work/'image.id',128).decode('ascii','strict').strip()
@@ -1203,6 +1372,8 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
             bindings[role]=iid
             role_receipt.update(image_id=iid,metadata_sha256=sha((role_work/'build-metadata.json').read_bytes()))
             _save(role_work/'result.json',role_receipt)
+            _BuildProgress.mark(deadline, 'role-complete', role)
+        _BuildProgress.mark(deadline, 'final-checks')
         recheck()
         for role,iid in bindings.items():
             _check_export(work/role/'context',contexts[role])
@@ -1217,12 +1388,14 @@ def _admit_core(repo,previous,candidate,binary,config,image_work_dir,deadline,*,
         error=caught
     finally:
         if backend is not None:
+            _BuildProgress.mark(deadline, 'builder-cleanup')
             try:backend.close()
             except BaseException as caught:
                 if error is not None and caught is not error:caught.__cause__=error
                 error=caught
             receipt['builder']=backend.summary()
         receipt['cleanup_complete']=backend is None or backend.closed
+        _BuildProgress.finish_cleanup(deadline, receipt['cleanup_complete'])
         if build_failure is not None:
             _BuildFailure._finish_cleanup(build_failure,receipt['cleanup_complete'])
     try:

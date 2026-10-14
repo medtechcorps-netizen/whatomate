@@ -23,7 +23,10 @@ WORKFLOW = (Path(__file__).resolve().parents[2] / ".github/workflows/compat.yml"
 REQUEST = collect.CollectionRequest(fixture.SHA, WORKFLOW)
 NOW = fixture.T0 + timedelta(days=1)
 W0_WORKFLOW_SHA256 = "0f8ae9f3079d4a3c0749721e5100d6df60842b4811059aee02a2ee4d8ced4f6b"
-P_WORKFLOW_SHA256 = "56005fe2015e8385e6ecfc621a403c06a534ed9a5712e5ec4ec4f9c70407b941"
+P_WORKFLOW_SHA256 = "73c655c829fa36a109dfee621f1efa4529cf89ffa112599a8ff1bb8391b7eff9"
+P0_WORKFLOW_SHA256 = "56005fe2015e8385e6ecfc621a403c06a534ed9a5712e5ec4ec4f9c70407b941"
+P0_WORKFLOW = (Path(__file__).resolve().parent / "fixtures/compat-workflow-p0.yml").read_bytes()
+assert hashlib.sha256(P0_WORKFLOW).hexdigest() == P0_WORKFLOW_SHA256
 W0_WORKFLOW = (Path(__file__).resolve().parent / "fixtures/compat-workflow-w0.yml").read_bytes()
 assert hashlib.sha256(W0_WORKFLOW).hexdigest() == W0_WORKFLOW_SHA256
 
@@ -57,6 +60,44 @@ def w0_epoch():
              mock.patch.object(sys.modules[__name__], 'REQUEST', collect.CollectionRequest(fixture.SHA, W0_WORKFLOW)), \
              mock.patch.object(old_history, 'WORKFLOW', W0_WORKFLOW), \
              mock.patch.object(old_collector, 'WORKFLOW', W0_WORKFLOW), \
+             mock.patch.object(Path, 'read_bytes', read_source):
+            yield
+    finally:
+        assert (collect.WORKFLOW_SHA256, WORKFLOW, REQUEST) == before
+        assert (old_history.WORKFLOW, old_collector.WORKFLOW) == before_fixture_workflows
+        assert Path.read_bytes is original_read
+        assert compat_envelope.WORKFLOW_SHA256 == P_WORKFLOW_SHA256
+
+
+@contextmanager
+def p0_epoch():
+    """Construct previous-P custody with fixed old raw source, never a verdict mock.
+
+    Only the exact original current pin and synthetic fixture inputs change.
+    Every qualification/codec/verifier stays real. All transition assertions
+    run after this scope restores installed P, including on fixture failure.
+    """
+    import test_compat_rollback_history as old_history
+    import test_compat_rollback_collect as old_collector
+    import compat_envelope
+    global WORKFLOW, REQUEST
+    assert hashlib.sha256(P0_WORKFLOW).hexdigest() == P0_WORKFLOW_SHA256
+    before = collect.WORKFLOW_SHA256, WORKFLOW, REQUEST
+    before_fixture_workflows = old_history.WORKFLOW, old_collector.WORKFLOW
+    assert before[0] in (P_WORKFLOW_SHA256, P0_WORKFLOW_SHA256)
+    assert compat_envelope.WORKFLOW_SHA256 == P_WORKFLOW_SHA256
+    original_read = Path.read_bytes
+    source_path = Path(__file__).resolve().parents[2] / '.github/workflows/compat.yml'
+    def read_source(path):
+        # This only controls the source-fixture's one immutable workflow blob.
+        # It does not replace any production resolver/verifier/parser result.
+        return P0_WORKFLOW if path == source_path else original_read(path)
+    try:
+        with mock.patch.object(collect, 'WORKFLOW_SHA256', P0_WORKFLOW_SHA256), \
+             mock.patch.object(sys.modules[__name__], 'WORKFLOW', P0_WORKFLOW), \
+             mock.patch.object(sys.modules[__name__], 'REQUEST', collect.CollectionRequest(fixture.SHA, P0_WORKFLOW)), \
+             mock.patch.object(old_history, 'WORKFLOW', P0_WORKFLOW), \
+             mock.patch.object(old_collector, 'WORKFLOW', P0_WORKFLOW), \
              mock.patch.object(Path, 'read_bytes', read_source):
             yield
     finally:
@@ -1010,6 +1051,21 @@ class OutageCollectorTests(unittest.TestCase):
         with self.assertRaises(evidence.CompatRefusal):
             collect._validate_outage_history_custody(result, workflow=W0_WORKFLOW+b'\n', producer_sha=fixture.SHA)
 
+    def test_previous_p_custody_replays_but_cannot_create_current_evidence(self):
+        with p0_epoch():
+            result = self.retained(empty=True)
+            request = self.request(result)
+        self.assertEqual(collect.WORKFLOW_SHA256, P_WORKFLOW_SHA256)
+        with self.assertRaises(evidence.CompatRefusal) as caught:
+            collect.validate_outage_history(result, workflow=P0_WORKFLOW, producer_sha=fixture.SHA)
+        self.assertEqual(caught.exception.detail, 'collect-workflow-source')
+        self.assertIs(collect._validate_outage_history_custody(result, workflow=P0_WORKFLOW,
+            producer_sha=fixture.SHA), result)
+        self.assertIs(collect._require_missing_expired_custody(request, result,
+            workflow=P0_WORKFLOW), result)
+        with self.assertRaises(evidence.CompatRefusal):
+            collect._validate_outage_history_custody(result, workflow=P0_WORKFLOW+b'\n', producer_sha=fixture.SHA)
+
     def test_request_identity_and_observation_are_required(self):
         result = self.retained(empty=True)
         for request in (replace(self.request(result), observation_id='a'*64),
@@ -1059,6 +1115,26 @@ class WorkflowTransitionTests(unittest.TestCase):
                     client, scratch, wall_clock=lambda:NOW)
             self.assertEqual(world.calls, before)
         self.assertEqual([args[1:] for args, _ in world.calls], [['--version']])
+
+    def test_current_collector_refuses_previous_p_before_fetch(self):
+        world = World(); world.add()
+        with harness(world) as (world, client, scratch):
+            before = list(world.calls)
+            with self.assertRaises(evidence.CompatRefusal):
+                collect.collect_history(collect.CollectionRequest(fixture.SHA, P0_WORKFLOW),
+                    client, scratch, wall_clock=lambda:NOW)
+            self.assertEqual(world.calls, before)
+        self.assertEqual([args[1:] for args, _ in world.calls], [['--version']])
+
+    def test_previous_epoch_restores_current_on_fixture_failure(self):
+        original = WORKFLOW, REQUEST
+        with self.assertRaisesRegex(RuntimeError, '^fixture-failed$'):
+            with p0_epoch():
+                self.assertEqual(collect.WORKFLOW_SHA256, P0_WORKFLOW_SHA256)
+                self.assertEqual(WORKFLOW, P0_WORKFLOW)
+                raise RuntimeError('fixture-failed')
+        self.assertEqual(collect.WORKFLOW_SHA256, P_WORKFLOW_SHA256)
+        self.assertEqual((WORKFLOW, REQUEST), original)
 
     def test_original_epoch_restores_actual_p_on_fixture_failure(self):
         original = WORKFLOW, REQUEST

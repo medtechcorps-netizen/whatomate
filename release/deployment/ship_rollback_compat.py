@@ -20,6 +20,7 @@ import record_transport as transport
 import ship_compat as normal
 
 common, runtime = transport.common, transport.runtime
+ROLLBACK_MAX_SECONDS = 900
 
 
 def _need(value, detail):
@@ -99,6 +100,8 @@ def _preflight(repo_dir, producer_sha, target_tag, *, gh_binary, git_binary, tok
                scratch_dir, deadline, capture, clock, wall_clock, base_env, admission=False):
     """Only command/time seams are injectable here, never favorable facts."""
     budget = normal._Budget(deadline, capture=capture, clock=clock)
+    # Preserve the rollback window using the original constructor clock sample.
+    budget.end = min(budget.end, budget._last + ROLLBACK_MAX_SECONDS)
     try:
         entry_utc = _utc(wall_clock())
         _need(type(producer_sha) is str and common.SHA1_RE.fullmatch(producer_sha), 'source')
@@ -150,8 +153,8 @@ def preflight(repo_dir: Path, producer_sha: str, target_tag: str, *, gh_binary: 
               deadline: float) -> RollbackPreflight:
     """Prepare exact target/live proof from fresh concrete source and history.
 
-    deadline is the caller's original absolute monotonic deadline. The unchanged
-    outer maximum is 900 seconds, 6000 commands and 128MiB across all three
+    deadline is the caller's original absolute monotonic deadline. The shared
+    outer maximum remains 900 seconds, 6000 commands and 128MiB across all three
     phases. Each phase closes independently and never renews those allowances.
     Scratch is create-only and outside the repository. Artifacts are retained
     facts, not deleted-history coverage or a promise of future source freshness.

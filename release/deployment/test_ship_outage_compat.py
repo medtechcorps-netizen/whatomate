@@ -499,5 +499,74 @@ class PublisherNamespacePreflightTests(unittest.TestCase):
                     coverage=replace(coverage, blobs=blobs))))
 
 
+class OutageWindowPreservationTests(unittest.TestCase):
+    make = OutagePreflightTests.make
+
+    def track_budget(self):
+        original = ship.normal._Budget
+        budgets = []
+        def create(*args, **kwargs):
+            value = original(*args, **kwargs)
+            budgets.append(value)
+            return value
+        return budgets, mock.patch.object(ship.normal, "_Budget", side_effect=create)
+
+    def test_installed_policy_keeps_original_900_for_unavailable_and_normal_results(self):
+        for unavailable in (True, False):
+            with self.subTest(unavailable=unavailable):
+                case = self.make()
+                case.deadline = 2000.0
+                if not unavailable:
+                    case.negative_world.service = ship.runtime.Capture(0, index_fixture.http(200), b"")
+                budgets, tracking = self.track_budget()
+                with case.installed(), tracking:
+                    value = case.run()
+                self.assertEqual(len(budgets), 1)
+                self.assertEqual(budgets[0].end, 1000.0)
+                self.assertTrue(budgets[0].closed)
+                self.assertFalse(budgets[0].failed)
+                self.assertEqual(value.command_count, len(case.calls))
+                if unavailable:
+                    self.assertIs(type(value), ship.OutagePreflight)
+                    self.assertLessEqual(value.remaining_us, 900000000)
+                    self.assertLessEqual(value.valid_until, value.entry_at + timedelta(seconds=900))
+                    self.assertEqual(ship.validate_preserved(value), value)
+                else:
+                    self.assertIs(type(value), ship.normal.NormalPreflight)
+
+    def test_installed_policy_expiry_and_shorter_caller_deadline_do_not_reset(self):
+        for deadline, expected_end in ((2000.0, 1000.0), (250.0, 250.0)):
+            with self.subTest(deadline=deadline):
+                case = self.make()
+                case.deadline = deadline
+                case.after = lambda phase, argv: setattr(case.clock, "now", expected_end)
+                budgets, tracking = self.track_budget()
+                with case.installed(), tracking, self.assertRaises((ship.evidence.CompatRefusal, ship.common.ReleaseError)):
+                    case.run()
+                self.assertEqual(len(budgets), 1)
+                self.assertEqual(budgets[0].end, expected_end)
+                self.assertTrue(budgets[0].closed)
+                self.assertTrue(budgets[0].failed)
+                self.assertEqual(len(case.calls), 1)
+                self.assertFalse(any(phase in ("actions", "negative-index", "source-after")
+                                     for phase, _, _ in case.calls))
+                self.assertIsNone(source.records._GIT_OUTPUT_TRANSPORT.get())
+
+    def test_absent_policy_uses_normal_2400_without_creating_outage_allowance(self):
+        case = self.make()
+        case.policy_path.unlink()
+        case.deadline = 3000.0
+        budgets, tracking = self.track_budget()
+        with case.installed(), tracking:
+            value = case.run()
+        self.assertEqual(len(budgets), 1)
+        self.assertEqual(budgets[0].end, 2500.0)
+        self.assertTrue(budgets[0].closed)
+        self.assertFalse(budgets[0].failed)
+        self.assertIs(type(value), ship.normal.NormalPreflight)
+        self.assertEqual(value.command_count, len(case.calls))
+        self.assertEqual(case.negative_world.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
