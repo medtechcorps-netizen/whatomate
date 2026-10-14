@@ -244,13 +244,20 @@ class _Repository:
     def __init__(self, root: Path):
         self.root = root
         self.cache: dict[tuple[str, str], bytes | None] = {}
+        self._trees: dict[tuple[str, str], bytes] = {}
         self.total = 0
+
+    def _tree(self, revision: str, path: str) -> bytes:
+        key = (revision, path)
+        if key not in self._trees:
+            self._trees[key] = _git(self.root, ["ls-tree", "-z", revision, "--", path])
+        return self._trees[key]
 
     def blob(self, revision: str, path: str) -> bytes | None:
         key = (revision, path)
         if key in self.cache:
             return self.cache[key]
-        raw = _git(self.root, ["ls-tree", "-z", revision, "--", path])
+        raw = self._tree(revision, path)
         rows = [row for row in raw.split(b"\0") if row]
         value = None
         if rows:
@@ -1246,6 +1253,9 @@ def _classify_v2(repo: _Repository, base: str, head: str,
     kind, dormant = legacy.kind, legacy.dormant
     section = "catalog"
     try:
+        section = "pr18-verification-repair"
+        if _pr18_verification_repair_changed(repo, base, head):
+            _pr18_verification_repair_local(repo, base, head)
         section = "nullable-source"
         declaration = repo.blob(head, schema_nullable.SOURCE_PATH)
         section = "constant-source"
@@ -1590,7 +1600,7 @@ _PR18_OBSERVER_REQUIREMENTS = ("compat-required", "generated-migration-closure-c
 
 def _pr18_observer_blob(repo: _Repository, revision: str, path: str,
                        digest: str | None) -> bytes | None:
-    raw = _git(repo.root, ["ls-tree", "-z", revision, "--", path])
+    raw = repo._tree(revision, path)
     if digest is None:
         _valid(raw == b"" and repo.blob(revision, path) is None)
         return None
@@ -1617,6 +1627,155 @@ def _pr18_observer_changed(repo: _Repository, base: str, head: str) -> bool:
     return False
 
 
+# One finite verification repair after the original PR18 product transition.
+# This is a historical fingerprint under the reviewed consumer, not a policy
+# supplied by a caller. Preserve the original transition and these pins when
+# adding future policies. External source review binds this consumer's bytes.
+_PR18_VERIFICATION_REPAIR_POLICY = "release/deployment/schema_change.py"
+_PR18_VERIFICATION_REPAIR_POLICY_SHA256 = 'b9ae6adc38cb284f51b74a9a6ba00136924048b97e4751d2f59535ada52d7837'
+_PR18_VERIFICATION_REPAIR_REASON = "pr18-verification-repair-incomplete"
+_PR18_VERIFICATION_REPAIR_FILES = {'.github/workflows/ship.yml': ('30663f4c8c3978d6a504e294a57d58cd66af76b2375d76ba2658623ab1613f6a',
+                                '36b18f4ebe049755ced6693b93c755507c75ce9763da72ccba976168b980a74f'),
+ 'release/deployment/compat_collect.py': ('42694ecff0cd35013eac2c85f84442f483489d1bb345ca3fc3347fb3d73b4c7b',
+                                          '8bf796595a577e92c7e8f45f49131fb099836ef52e05b41f86775eb8754acc3d'),
+ 'release/deployment/fixtures/pr18-verification-repair.json': (None,
+                                                               '43d993a9cc28898da302ae8918c3fc6ba6801a3f0da82fdcd11ebab4077d4676'),
+ 'release/deployment/record_resolver.py': ('9367358d7db9fffb2507d785d0256135c14e6a87590d67ab2030137d2b467c52',
+                                           '3a4cd096b701ca92ac8023a834de320891620a889d1314ec90a85fd9b70e6d67'),
+ 'release/deployment/record_transport.py': ('125764da4008a029a07f13b69a19958a951834617085d3a1f2317f63649a14f3',
+                                            'a683969db650e819fa7a4bc79d2d12dd948cedb75a715489e12ff6f6d4a49fd0'),
+ 'release/deployment/schema_change.py': ('832d346aeb377f9b54358b69f8fad74146927c20a6957ce66bcfdc797a06ba86',
+                                         'reviewed-policy-slot'),
+ 'release/deployment/ship.py': ('d2d3f4c413f907293fc0f591cb18e291be1143f2ae676bb849abb5b678ae238d',
+                                '91d134d2af2044ccd6679cb6b9c51ffc6926c5de0c52cfdd13a41e5ce097b921'),
+ 'release/deployment/ship_compat.py': ('946a7d3c0e30c96deae43e45640bd34b00e04e9720677bef314815210e1ea836',
+                                       'f3db82a76e9ca8d8f4b6f44053649dcf0cc872cae360f770f141b6eebd19362c'),
+ 'release/deployment/ship_flow.py': ('14acc4ff9a5f1fab8cb927d61c817127efd5a781f391c5581eff32c752c0972a',
+                                     'bd259294554413dd36a9c7143d07485393698e75575c46c819ffb132c1dc12ab'),
+ 'release/deployment/ship_outage_compat.py': ('d03ef4387fe9e9a54a34a7db13584ac5e35254ca26781fcaead9d7e7f88e9a8a',
+                                              'a4d472659f2d200b9ba6f81782b16db1fcde2dc772270729f7147bd96630edee'),
+ 'release/deployment/ship_rollback_compat.py': ('c31bd6cd7208d5ec194b1e5212a68d02a8a2d4563bc3265b00ecbe988793b47f',
+                                                '75dcf78d8e50a3b0f6a33c2e90fa8e199ce4aa52c8258ea4f12e720906f37482'),
+ 'release/deployment/source_git.py': ('bb3fc7dd032aac31683a1afe442c28107f4b85b0382ebd695b308ac88be1fcac',
+                                      'e2b47e5be4ad1c774e3d6587008d2d98b0931e7c77b8e94630485a13b502de73'),
+ 'release/deployment/test_pr18_verification_repair.py': (None,
+                                                         '3146da8917234b026a3d285fe6f4cf00d93ada28799675ef6c5f132a84a2cbf9'),
+ 'release/deployment/test_record_resolver.py': ('fb59fb0ee39fe3acd5f15c5e56c975bf5275e4de5d5c5ea31f6f9c7330ac85fb',
+                                                'd99f208bdc3ef18fe4130e1ac5a346e8f20f00633727b8ea50b1e76e4769a57a'),
+ 'release/deployment/test_record_transport.py': ('c411ddcad55c18d7064add4b2d7f89a2f75d10c970dc3701854db7ad231a4117',
+                                                 '4c87aba34c30d05bc0dc95624155fb4f841b72d44c54d2c86be08d136080894c'),
+ 'release/deployment/test_record_transport_asset_retry.py': (None,
+                                                             '3b76939cb1f20c8841e7cab4f5293439fb88530990b90682db3c9e5fe3867bcf'),
+ 'release/deployment/test_ship_compat.py': ('d4a7b4559a8b2fc074fadc79196acb0722f2a70397fd1f0a34ad9a5a60c12b5d',
+                                            'd750579985000e9cbc3cf88163b8aab2a90f9114a70f43dfa2c5471f8ebae7ac'),
+ 'release/deployment/test_ship_outage_compat.py': ('2f41cbbb365391c1837aee705ba7323d7c8b689ad9045e002f0739844c766495',
+                                                   '7c784099e2b0a07d696fca19323db40755fef2b2adf5b7b3435f507253fabcce'),
+ 'release/deployment/test_ship_rollback_compat.py': ('8170c47ee1e6774cbdb78295f6bf38c108d25a7612b47b6648e667f5af7b9230',
+                                                     '6e4d5b977de0b789abbb78ccba6c8319c3b943a4077e156396a48f7bc9229841'),
+ 'release/deployment/test_ship_workflow.py': ('92c6292826a3c10f8f880387e83ad16e9fee2623cdc77ac0d95abd0a65408cf3',
+                                              'b86143a5038dabdfc7f44658f946523d22c74d4a73f5cd6b58295c13a982121d'),
+ 'release/deployment/test_source_git.py': ('ef1a0d3b29e02f8b614b70e2334beecf6fdad7c04e1653497795fd8dbf933103',
+                                           '6ea0637697cecfafabb9d48134c1dae66e0e4f6129cbff49905ac522452f6d22'),
+ 'release/deployment/test_verification_diagnostics.py': (None,
+                                                         '5c513c539c17a6fd8845dbce1c342deba918d2fa812c1b45d504e5647181be37')}
+
+
+def _pr18_verification_repair_blob(repo, revision, path, digest):
+    if digest != "reviewed-policy-slot":
+        return _pr18_observer_blob(repo, revision, path, digest)
+    _valid(path == _PR18_VERIFICATION_REPAIR_POLICY)
+    raw = repo._tree(revision, path)
+    _valid(re.fullmatch(rb"100644 blob [0-9a-f]{40}\t" + re.escape(path.encode()) + rb"\x00", raw) is not None)
+    value = repo.blob(revision, path)
+    _valid(type(value) is bytes and bool(value))
+    slot = re.compile(rb"(?m)^_PR18_VERIFICATION_REPAIR_POLICY_SHA256 = '([0-9a-f]{64})'\n")
+    matches = list(slot.finditer(value))
+    _valid(len(matches) == 1)
+    match = matches[0]
+    _valid(match.group(1).decode("ascii") == _PR18_VERIFICATION_REPAIR_POLICY_SHA256)
+    canonical = value[:match.start(1)] + b"0" * 64 + value[match.end(1):]
+    _valid(hashlib.sha256(canonical).hexdigest() == _PR18_VERIFICATION_REPAIR_POLICY_SHA256)
+    return value
+
+
+def _pr18_verification_repair_product(repo, revision):
+    for path, (_, digest) in _PR18_OBSERVER_FILES.items():
+        _pr18_observer_blob(repo, revision, path, digest)
+    for path, digest in _PR18_OBSERVER_PROTECTED.items():
+        _pr18_observer_blob(repo, revision, path, digest)
+    _pr18_observer_blob(repo, revision, DORMANT,
+                       "041af21a905dd160657431d8a4482d8f52f162f312d4cc9148a071400bbd508d")
+    _pr18_observer_blob(repo, revision, "internal/dbcatalog/registry/coordinator_bindings.json",
+                       "ecc49fb74995dcd121a645fd139ebff2fdc9e22bd2a1b01df91a3eb4e24daee4")
+    _valid(not _git(repo.root, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING.rstrip("/")]))
+    for path in (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
+                 schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH):
+        _pr18_observer_blob(repo, revision, path, None)
+
+
+def _pr18_verification_repair_before(repo, revision):
+    _valid(bool(_PR18_VERIFICATION_REPAIR_FILES)
+           and not set(_PR18_VERIFICATION_REPAIR_FILES) & set(_PR18_OBSERVER_FILES))
+    for path, (old, _) in _PR18_VERIFICATION_REPAIR_FILES.items():
+        _pr18_verification_repair_blob(repo, revision, path, old)
+    _pr18_verification_repair_product(repo, revision)
+
+
+def _pr18_verification_repair_history(repo, base, head):
+    _valid(base != head and _git(repo.root, ["merge-base", base, head]).strip() == base.encode())
+    raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+    _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+    revisions = raw.decode("ascii").splitlines()
+    _valid(0 < len(revisions) <= MAX_HISTORY_COMMITS and len(revisions) == len(set(revisions))
+           and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+           and revisions[-1] == head)
+    prior, edges = base, []
+    for revision in revisions:
+        _valid(_git(repo.root, ["rev-parse", "--verify", revision + "^1"]) == prior.encode() + b"\n")
+        edges.append((prior, revision))
+        prior = revision
+    return tuple(edges)
+
+
+def _pr18_verification_repair_changed(repo, base, head):
+    # Reserve only this complete unrepaired profile, not these filenames for
+    # all future releases. Full-origin admission separately proves the anchor.
+    if base == head or not _PR18_VERIFICATION_REPAIR_FILES:
+        return False
+    try:
+        _pr18_verification_repair_before(repo, base)
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return False
+    if any(path in _PR18_VERIFICATION_REPAIR_FILES for _, path in changed_paths(repo.root, base, head)):
+        return True
+    # A repair followed by its complete undo has no net changed path. It must
+    # not disappear through a clean local CI/policy fast return.
+    return any(path in _PR18_VERIFICATION_REPAIR_FILES
+               for prior, revision in _pr18_verification_repair_history(repo, base, head)
+               for _, path in changed_paths(repo.root, prior, revision))
+
+
+def _pr18_verification_repair_edge(repo, base, head):
+    _pr18_verification_repair_before(repo, base)
+    expected = sorted(("A" if old is None else "M", path)
+                      for path, (old, _) in _PR18_VERIFICATION_REPAIR_FILES.items())
+    _valid(sorted(changed_paths(repo.root, base, head)) == expected)
+    _pr18_verification_repair_product(repo, head)
+    for path, (_, new) in _PR18_VERIFICATION_REPAIR_FILES.items():
+        _pr18_verification_repair_blob(repo, head, path, new)
+
+
+def _pr18_verification_repair_local(repo, base, head):
+    _pr18_verification_repair_before(repo, base)
+    repaired = False
+    for prior, revision in _pr18_verification_repair_history(repo, base, head):
+        if changed_paths(repo.root, prior, revision):
+            _valid(not repaired)
+            _pr18_verification_repair_edge(repo, prior, revision)
+            repaired = True
+    _valid(repaired)
+
+
 def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                              *, ci: bool = False) -> tuple[str, str]:
     """Prove one exact transition without calling either classifier or CI.
@@ -1639,7 +1798,7 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                       for path, (old, _) in _PR18_OBSERVER_FILES.items())
     descriptors = (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
                    schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH)
-    prior, prior_state, anchor = None, None, None
+    prior, prior_state, anchor, repaired = None, None, None, False
     for revision in (base, *revisions):
         if prior is not None:
             _valid(_git(repo.root, ["rev-parse", "--verify", revision + "^1"]) == prior.encode() + b"\n")
@@ -1677,6 +1836,10 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                     _pr18_observer_blob(repo, rev, "internal/dbcatalog/registry/coordinator_bindings.json",
                                        "ecc49fb74995dcd121a645fd139ebff2fdc9e22bd2a1b01df91a3eb4e24daee4")
                 anchor = (prior, revision)
+            elif prior_state == state == 2 and changes:
+                _valid(anchor is not None and not repaired)
+                _pr18_verification_repair_edge(repo, prior, revision)
+                repaired = True
             elif ci or state == 2:
                 _valid(not changes)
         prior, prior_state = revision, state
@@ -1730,6 +1893,17 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
     """
     repo = _Repository(repo_dir)
     legacy = _classify(repo, base, head)
+    try:
+        if _pr18_verification_repair_changed(repo, base, head):
+            _pr18_verification_repair_local(repo, base, head)
+            _valid(not legacy.reasons and legacy.kind == "none" and legacy.dormant is False)
+            policy = _classify_v2(repo, base, head, legacy)
+            _valid(not policy.reasons and policy.kind == "none" and policy.dormant is False
+                   and policy.requirements == _PR18_OBSERVER_REQUIREMENTS
+                   and policy.migration_changes == ())
+            return ()
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {_PR18_VERIFICATION_REPAIR_REASON}))
     # This fixed target must not disappear behind the legacy clean fast path
     # when its generated manifest or paired registry revisions are stale.
     try:

@@ -471,6 +471,58 @@ class ReleaseTransportTests(unittest.TestCase):
             self.assertLess(len(str(caught.exception)),100)
             self.assertTrue(client.budget.failed)
 
+    def test_operation_profile_is_closed_readonly_and_clamps_caller_deadline(self):
+        for kwargs, expected in (({}, 700), ({"profile": "default"}, 700),
+                                 ({"profile": "normal-admission"}, 1000)):
+            budget = rt.OperationBudget(2000, capture=self.world, clock=self.clock, **kwargs)
+            self.assertEqual(budget._deadline, expected)
+            self.assertEqual(budget.profile, kwargs.get("profile", "default"))
+            with self.assertRaises(AttributeError): budget.profile = "normal-admission"
+        for profile in ("default", "normal-admission"):
+            budget = rt.OperationBudget(450, capture=self.world, clock=self.clock, profile=profile)
+            self.assertEqual(budget._deadline, 450)
+        self.assertEqual(self.world.calls, [])
+
+    def test_invalid_operation_profile_refuses_before_clock_or_capture(self):
+        class Derived(str): pass
+        for profile in (None, True, 900, "normal", "outage", "rollback", "DEFAULT", [], {},
+                        Derived("normal-admission")):
+            with self.subTest(profile=profile):
+                clock = mock.Mock(side_effect=AssertionError("unexpected clock"))
+                capture = mock.Mock(side_effect=AssertionError("unexpected capture"))
+                with self.assertRaisesRegex(rt.TransportRefusal, "transport-profile$"):
+                    rt.OperationBudget(2000, capture=capture, clock=clock, profile=profile)
+                clock.assert_not_called(); capture.assert_not_called()
+
+    def test_normal_operation_profile_preserves_call_tail_and_sticky_expiry(self):
+        captures = []
+        def capture(argv, **options):
+            captures.append((argv, options))
+            return rt.runtime.Capture(0, b"complete", b"")
+        budget = rt.OperationBudget(2000, capture=capture, clock=self.clock, profile="normal-admission")
+        self.clock.now = 997
+        budget.capture(["fake"], env={}, timeout=30, stdout_limit=100, stderr_limit=0)
+        self.assertEqual(captures[0][1]["timeout"], 3 - rt.CLEANUP_RESERVE)
+        self.assertEqual((budget.commands, budget.captured_bytes), (1, 8))
+        self.clock.now = 1000
+        with self.assertRaisesRegex(rt.TransportRefusal, "transport-deadline$"): budget.remaining()
+        self.assertEqual(budget._failure_category, "deadline")
+        self.clock.now = 100
+        with self.assertRaisesRegex(rt.TransportRefusal, "transport-closed$"): budget.remaining()
+        self.assertEqual(len(captures), 1)
+
+    def test_normal_operation_profile_cannot_expand_call_or_byte_allowance(self):
+        for cap in ("calls", "bytes"):
+            capture = mock.Mock(side_effect=AssertionError("capture exceeded shared cap"))
+            budget = rt.OperationBudget(2000, capture=capture, clock=self.clock, profile="normal-admission")
+            if cap == "calls": budget.commands = rt.MAX_COMMANDS
+            else: budget.captured_bytes = rt.MAX_BYTES - 4096
+            with self.assertRaisesRegex(rt.TransportRefusal, "transport-bound$"):
+                budget.capture(["fake"], env={}, timeout=30, stdout_limit=100, stderr_limit=4096)
+            self.assertTrue(budget.failed)
+            self.assertEqual(budget._failure_category, "bound")
+            capture.assert_not_called()
+
     def test_shared_budget_counts_real_disposable_git_and_restores_scope(self):
         repo=support.TempRepo(self.root/"repo")
         base=repo.commit({"README.md":"one\n"})

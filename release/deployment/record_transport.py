@@ -28,6 +28,9 @@ PAGE_LIMIT = 20
 CLEANUP_RESERVE = 2.25
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_ASSET_TLS_FIRST_RECORD = re.compile(
+    rb'Get "https://release-assets\.githubusercontent\.com/[^"\x00-\x20\x7f\\]+": '
+    rb'tls: first record does not look like a TLS handshake(?:\r?\n)?')
 
 
 
@@ -64,22 +67,37 @@ class OperationBudget:
     does not widen that module's command grammar. A failed operation cannot
     acquire a new allowance by creating another client around this budget.
     """
-    def __init__(self, deadline, *, capture=runtime.bounded_command, clock=time.monotonic):
+    def __init__(self, deadline, *, capture=runtime.bounded_command, clock=time.monotonic,
+                 profile="default"):
+        if type(profile) is not str or profile not in ("default", "normal-admission"):
+            raise _failure("profile")
+        self._profile = profile
         now = clock()
         if not _finite(now) or not _finite(deadline) or deadline <= now:
             raise _failure("deadline")
         self._clock, self._capture = clock, capture
         self._last = now
-        self._deadline = min(deadline, now + 600)
+        self._deadline = min(deadline, now + (900 if profile == "normal-admission" else 600))
         self.commands = self.captured_bytes = 0
         self.failed = self.closed = False
+        self._failure_category = None
         self._lock = threading.Lock()
+
+    @property
+    def profile(self):
+        return self._profile
 
     @property
     def clock(self):
         return self._clock
 
     def fail(self, detail):
+        if self._failure_category is None:
+            self._failure_category = {
+                "deadline": "deadline", "capture": "capture", "capture-input": "capture",
+                "command-failed": "command-nonzero", "signature": "signature",
+                "image-verification": "signature", "bound": "bound",
+            }.get(detail, "other")
         self.failed = True
         raise _failure(detail) from None
 
@@ -224,6 +242,7 @@ class ReleaseGh(records.Gh):
         self._check()
         args = list(args)
         limit, duration = 4 * MIB, 30
+        asset_get = False
         allowed = args == ["--version"]
         if allowed:
             duration = 5
@@ -237,7 +256,7 @@ class ReleaseGh(records.Gh):
         if (len(args) == 7 and args[:3] == ["api", "--method", "GET"]
                 and args[4:] == ["-H", "Accept: application/octet-stream", "--allow-escape-sequences"]):
             identities = {row.asset_id for row in self._snapshot.records} if self._snapshot else set()
-            allowed = any(args[3] == API + f"/releases/assets/{identity}" for identity in identities)
+            allowed = asset_get = any(args[3] == API + f"/releases/assets/{identity}" for identity in identities)
             limit = records.MAX_MANIFEST_BYTES
         if self._scope is not None and args == self._verification_args:
             allowed, duration = True, 60
@@ -248,9 +267,21 @@ class ReleaseGh(records.Gh):
         self._need(allowed, "command")
         env = dict(self._env)
         env["GH_HOST"] = "github.com"
-        result = self.budget.capture([self.gh_bin, *args], env=env, timeout=duration,
+        argv = [self.gh_bin, *args]
+        remaining_before = self.budget.remaining() if asset_get else None
+        result = self.budget.capture(argv, env=env, timeout=duration,
                                      stdout_limit=limit, stderr_limit=65536)
         self._check()
+        if (asset_get and contract is None and self._scope is None
+                and result.returncode == 1 and not result.stdout
+                and _ASSET_TLS_FIRST_RECORD.fullmatch(result.stderr) is not None):
+            # One identical owned-asset read may use the first call's remaining
+            # time. Both physical attempts spend the same shared allowances.
+            remaining = duration - (remaining_before - self.budget.remaining())
+            if _finite(remaining) and 0 < remaining <= duration:
+                result = self.budget.capture(argv, env=env, timeout=remaining,
+                                             stdout_limit=limit, stderr_limit=65536)
+                self._check()
         self._need(result.returncode == 0, "command-failed")
         if contract is not None:
             self._need(not result.stderr, "contract-response")

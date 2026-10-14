@@ -22,6 +22,7 @@ import record_transport as transport
 import ship_compat as normal
 
 common, runtime, policy = transport.common, transport.runtime, resolver.policy
+OUTAGE_FRESHNESS_SECONDS = 900
 
 
 def _need(value, detail):
@@ -154,11 +155,11 @@ def _preserved_common(value):
     _need(type(value) is OutagePreflight, "preserved-type")
     _need(type(value.command_count) is int and 0 < value.command_count <= normal.MAX_COMMANDS
           and type(value.captured_bytes) is int and 0 < value.captured_bytes <= normal.MAX_BYTES
-          and type(value.remaining_us) is int and 0 < value.remaining_us <= normal.MAX_SECONDS * 1_000_000,
+          and type(value.remaining_us) is int and 0 < value.remaining_us <= OUTAGE_FRESHNESS_SECONDS * 1_000_000,
           "bounds")
     entry, checked, until = _utc(value.entry_at), _utc(value.checked_at), _utc(value.valid_until)
     _need(entry <= checked < until and until == min(
-        checked + timedelta(microseconds=value.remaining_us), entry + timedelta(seconds=normal.MAX_SECONDS)),
+        checked + timedelta(microseconds=value.remaining_us), entry + timedelta(seconds=OUTAGE_FRESHNESS_SECONDS)),
         "validity")
     parsed = _coverage(value.source)
     _eligible(value.source, checked)
@@ -252,6 +253,9 @@ def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch
             token=token, scratch_dir=scratch_dir, deadline=deadline, capture=capture,
             clock=clock, wall_clock=wall_clock, base_env=base_env)
     budget = normal._Budget(deadline, capture=capture, clock=clock)
+    # Keep the configured outage operation and wire8 validity on their original
+    # clock/window; the ordinary normal fallback above uses the larger window.
+    budget.end = min(budget.end, budget._last + OUTAGE_FRESHNESS_SECONDS)
     index_operation = None
     try:
         entry = _utc(wall_clock())
@@ -324,7 +328,7 @@ def _preflight(repo_dir, candidate_sha, *, gh_binary, git_binary, token, scratch
         budget.check()
         checked = _utc(wall_clock())
         remaining = int(budget.remaining() * 1_000_000)
-        until = min(checked + timedelta(microseconds=remaining), entry + timedelta(seconds=normal.MAX_SECONDS))
+        until = min(checked + timedelta(microseconds=remaining), entry + timedelta(seconds=OUTAGE_FRESHNESS_SECONDS))
         value = OutagePreflight(after, availability, snapshot, entry, checked, remaining, until,
                                budget.commands, budget.captured_bytes)
         validate_preserved(value)
