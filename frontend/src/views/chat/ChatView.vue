@@ -86,9 +86,7 @@ import {
   UserMinus,
   Play,
   PauseCircle,
-  Reply,
   X,
-  SmilePlus,
   MapPin,
   ExternalLink,
   Loader2,
@@ -99,7 +97,6 @@ import {
   Mail,
   Globe,
   Code,
-  RotateCw,
   Filter,
   StickyNote,
   Plus,
@@ -116,6 +113,8 @@ import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
+import MessageActions from '@/components/chat/MessageActions.vue'
+import MessageContextMenu from '@/components/chat/MessageContextMenu.vue'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
@@ -1311,11 +1310,14 @@ function getReplyPreviewContent(message: Message): string {
 function scrollToMessage(messageId: string | undefined) {
   if (!messageId) return
   const messageEl = document.getElementById(`message-${messageId}`)
-  if (messageEl) {
-    messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    messageEl.classList.add('highlight-message')
-    setTimeout(() => messageEl.classList.remove('highlight-message'), 2000)
+  if (!messageEl) {
+    // The quoted message is older than the loaded page (or no longer exists).
+    toast.info(t('chat.messageActions.originalNotLoaded'))
+    return
   }
+  messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  messageEl.classList.add('highlight-message')
+  setTimeout(() => messageEl.classList.remove('highlight-message'), 2000)
 }
 
 function extractCannedTokens(content: string): string[] {
@@ -2733,7 +2735,11 @@ async function sendMediaMessage() {
                 <div
                   v-if="message.is_reply && message.reply_to_message"
                   class="reply-preview cursor-pointer text-xs"
+                  role="button"
+                  tabindex="0"
                   @click="scrollToMessage(message.reply_to_message_id)"
+                  @keydown.enter.prevent="scrollToMessage(message.reply_to_message_id)"
+                  @keydown.space.prevent="scrollToMessage(message.reply_to_message_id)"
                 >
                   <p class="font-medium">
                     {{ message.reply_to_message.direction === 'incoming' ? (contactsStore.currentContact?.profile_name || contactsStore.currentContact?.name || 'Customer') : 'You' }}
@@ -2906,78 +2912,17 @@ async function sendMediaMessage() {
                   <span>{{ message.error_message || 'Failed to send' }}</span>
                 </span>
               </div>
-              <!-- Action buttons for incoming messages -->
-              <div v-if="message.direction === 'incoming'" class="flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity self-center ml-1">
-                <Popover :open="reactionPickerMessageId === message.id" @update:open="(open: boolean) => reactionPickerMessageId = open ? message.id : null">
-                  <PopoverTrigger as-child>
-                    <Button variant="ghost" size="icon" class="h-6 w-6">
-                      <SmilePlus class="h-3 w-3" />
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent side="top" class="w-auto p-2">
-                    <div class="flex gap-1">
-                      <button
-                        v-for="emoji in quickReactionEmojis"
-                        :key="emoji"
-                        class="text-lg hover:bg-muted p-1 rounded cursor-pointer"
-                        @click="sendReaction(message.id, emoji)"
-                      >
-                        {{ emoji }}
-                      </button>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  class="h-6 w-6"
-                  @click="replyToMessage(message)"
-                >
-                  <Reply class="h-3 w-3" />
-                </Button>
-              </div>
-              <!-- Reply button for outgoing messages (shown on hover) -->
-              <div v-if="message.direction === 'outgoing'" class="flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity self-center ml-1">
-                <Popover :open="reactionPickerMessageId === message.id" @update:open="(open: boolean) => reactionPickerMessageId = open ? message.id : null">
-                  <PopoverTrigger as-child>
-                    <Button variant="ghost" size="icon" class="h-6 w-6">
-                      <SmilePlus class="h-3 w-3" />
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent side="top" class="w-auto p-2">
-                    <div class="flex gap-1">
-                      <button
-                        v-for="emoji in quickReactionEmojis"
-                        :key="emoji"
-                        class="text-lg hover:bg-muted p-1 rounded cursor-pointer"
-                        @click="sendReaction(message.id, emoji)"
-                      >
-                        {{ emoji }}
-                      </button>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  class="h-6 w-6"
-                  @click="replyToMessage(message)"
-                >
-                  <Reply class="h-3 w-3" />
-                </Button>
-                <Button
-                  v-if="message.status === 'failed' && message.message_type !== 'template'"
-                  variant="ghost"
-                  size="icon"
-                  class="h-6 w-6 text-destructive hover:text-destructive"
-                  :disabled="retryingMessageId === message.id"
-                  @click="retryMessage(message)"
-                  title="Retry sending"
-                >
-                  <Loader2 v-if="retryingMessageId === message.id" class="h-3 w-3 animate-spin" />
-                  <RotateCw v-else class="h-3 w-3" />
-                </Button>
-              </div>
+              <!-- Hover/touch action strip: react, reply, retry -->
+              <MessageActions
+                :message="message"
+                :quick-reactions="quickReactionEmojis"
+                :reaction-open="reactionPickerMessageId === message.id"
+                :retrying="retryingMessageId === message.id"
+                @update:reaction-open="(open: boolean) => reactionPickerMessageId = open ? message.id : null"
+                @react="sendReaction"
+                @reply="replyToMessage"
+                @retry="retryMessage"
+              />
             </div>
             </template>
             <div ref="messagesEndRef" />
@@ -3004,14 +2949,14 @@ async function sendMediaMessage() {
         >
           <div class="flex-1 min-w-0">
             <p class="text-xs font-medium text-white/50 light:text-gray-500">
-              Replying to {{ contactsStore.replyingTo.direction === 'incoming' ? (contactsStore.currentContact?.profile_name || contactsStore.currentContact?.name || 'Customer') : 'Yourself' }}
+              {{ $t('chat.replyingTo') }} {{ contactsStore.replyingTo.direction === 'incoming' ? (contactsStore.currentContact?.profile_name || contactsStore.currentContact?.name || 'Customer') : 'Yourself' }}
             </p>
             <p class="text-sm truncate text-white/70 light:text-gray-700">
               {{ getMessageContent(contactsStore.replyingTo) || '[Media]' }}
             </p>
           </div>
-          <button class="w-6 h-6 rounded hover:bg-white/[0.08] light:hover:bg-gray-200 flex items-center justify-center shrink-0 transition-colors" @click="contactsStore.clearReplyingTo">
-            <X class="h-4 w-4 text-white/50 light:text-gray-500" />
+          <button type="button" class="w-6 h-6 rounded hover:bg-white/[0.08] light:hover:bg-gray-200 flex items-center justify-center shrink-0 transition-colors" :aria-label="$t('chat.cancelReply')" :title="$t('chat.cancelReply')" @click="contactsStore.clearReplyingTo">
+            <X class="h-4 w-4 text-white/50 light:text-gray-500" aria-hidden="true" />
           </button>
         </div>
 
@@ -3421,6 +3366,7 @@ async function sendMediaMessage() {
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
     />
+    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :get-text="getMessageContent" @react="sendReaction" @reply="replyToMessage" />
   </div>
 </template>
 
