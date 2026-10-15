@@ -69,11 +69,12 @@ const observer = () => FakeIntersectionObserver.instances.at(-1)!
 
 type FakeRender = { page: number; canvas: HTMLCanvasElement; width: number; done: ReturnType<typeof deferred<void>>; cancel: ReturnType<typeof vi.fn> }
 
-function fakePdf(pageCount: number, previewed = Math.min(pageCount, 30)) {
+function fakePdf(pageCount: number, previewed = Math.min(pageCount, 30), hasOversizedImages = false) {
   const renders: FakeRender[] = []
   const document = {
     pageCount,
     pageSizes: Array.from({ length: previewed }, () => ({ width: 612, height: 792 })),
+    hasOversizedImages,
     renderPage: vi.fn((page: number, canvas: HTMLCanvasElement, width: number) => {
       const done = deferred<void>()
       const cancel = vi.fn(() => done.reject(new DOMException('closed', 'AbortError')))
@@ -363,6 +364,22 @@ describe('MediaPreviewDialog', () => {
     await openPdf(fakePdf(30))
     expect(pages()).toHaveLength(30)
     expect(document.body.querySelector('[data-testid="chat-media-preview-page-limit"]')).toBeNull()
+  })
+
+  it('says when images too large to preview were left out, and offers the download', async () => {
+    await openPdf(fakePdf(1, 1, true))
+    const notice = document.body.querySelector('[data-testid="chat-media-preview-image-limit"]')!
+    expect(notice.getAttribute('role')).toBe('status')
+    expect(notice.textContent).toContain('chat.mediaPreview.imageLimit')
+    expect(notice.querySelector('a[download]')?.getAttribute('href')).toBe('blob:opaque')
+    expect(notice.querySelector('a[download]')?.getAttribute('download')).toBe('lab-report.pdf')
+    // The rest of the page is still drawn.
+    expect(pages()).toHaveLength(1)
+  })
+
+  it('shows no image notice for a file whose images all fit', async () => {
+    await openPdf(fakePdf(1))
+    expect(document.body.querySelector('[data-testid="chat-media-preview-image-limit"]')).toBeNull()
   })
 
   it.each([

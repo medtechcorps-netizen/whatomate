@@ -44,6 +44,42 @@ export const PDF_PREVIEW_PAGE_LIMIT = 30
 const MAX_CANVAS_PIXELS = 3_000_000
 const MAX_OUTPUT_SCALE = 2
 
+// pdf.js leaves out any embedded image larger than this before decoding it,
+// so a hostile or huge image cannot exhaust the worker's memory. 4096x4096
+// still covers an A4 page scanned at 400 dpi.
+export const PDF_PREVIEW_MAX_IMAGE_PIXELS = 4096 * 4096
+
+// pdf.js says nothing when it leaves an image out, and a scanned page that is
+// one large image would then look blank. Image XObjects are streams, which
+// never sit inside compressed object streams, so their dictionaries are plain
+// text in the file (encryption covers only strings and stream data). Reading
+// their sizes here lets the preview say so and offer the download instead.
+export function hasOversizedImage(bytes: Uint8Array, maxPixels = PDF_PREVIEW_MAX_IMAGE_PIXELS): boolean {
+  // Read in windows so a large file is never one huge string; latin1 keeps
+  // one character per byte, and each window overlaps its neighbours by the
+  // longest dictionary looked at.
+  const decoder = new TextDecoder('latin1')
+  const windowSize = 1 << 20
+  const reach = 4096
+  for (let offset = 0; offset < bytes.length; offset += windowSize) {
+    const from = Math.max(0, offset - reach)
+    const text = decoder.decode(bytes.subarray(from, Math.min(bytes.length, offset + windowSize + reach)))
+    const image = /\/Subtype\s*\/Image\b/g
+    image.lastIndex = offset - from
+    for (let match = image.exec(text); match && match.index < offset - from + windowSize; match = image.exec(text)) {
+      // The dictionary runs from its object header to the stream keyword.
+      const start = text.lastIndexOf('obj', match.index)
+      const end = text.indexOf('stream', match.index)
+      if (start < 0 || end < 0 || end - start > reach) continue
+      const dictionary = text.slice(start, end)
+      const width = /\/Width\s+(\d+)/.exec(dictionary)
+      const height = /\/Height\s+(\d+)/.exec(dictionary)
+      if (width && height && Number(width[1]) * Number(height[1]) > maxPixels) return true
+    }
+  }
+  return false
+}
+
 export type PdfPreviewFailure = 'password' | 'invalid' | 'unavailable'
 
 export class PdfPreviewError extends Error {
@@ -68,6 +104,8 @@ export interface PdfPreviewDocument {
   readonly pageCount: number
   // Size of each previewed page in PDF points; the preview keeps its proportions.
   readonly pageSizes: readonly PdfPageSize[]
+  // The file has images over PDF_PREVIEW_MAX_IMAGE_PIXELS, which the preview leaves out.
+  readonly hasOversizedImages: boolean
   renderPage(pageNumber: number, canvas: HTMLCanvasElement, cssWidth: number): PdfPageRender
   destroy(): void
 }
@@ -132,10 +170,13 @@ export async function openPdfPreview(blob: Blob, options: { signal?: AbortSignal
   }
   if (signal?.aborted) throw abortError()
 
+  // Read before getDocument, which hands the bytes to the worker.
+  const hasOversizedImages = hasOversizedImage(data)
   const files = runtimeFilesURL(pdfjs.version)
   const params = {
     // Transferred to the worker; this copy is not used again.
     data,
+    maxImageSize: PDF_PREVIEW_MAX_IMAGE_PIXELS,
     // CJK text in fonts the file does not embed needs Adobe's CMaps.
     cMapUrl: `${files}cmaps/`,
     // Other standard fonts fall back to system fonts; Symbol and ZapfDingbats
@@ -191,6 +232,7 @@ export async function openPdfPreview(blob: Blob, options: { signal?: AbortSignal
   return {
     pageCount: pdf.numPages,
     pageSizes,
+    hasOversizedImages,
     renderPage(pageNumber, canvas, cssWidth) {
       let task: RenderTask | null = null
       let cancelled = false

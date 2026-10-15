@@ -94,6 +94,7 @@ const pdfStatus = ref<'idle' | 'loading' | 'ready' | 'error'>('idle')
 const pdfFailure = ref<PdfPreviewFailure>('invalid')
 const pages = ref<PreviewPage[]>([])
 const pageCount = ref(0)
+const hasOversizedImages = ref(false)
 let pdf: PdfPreviewDocument | null = null
 let loadController: AbortController | null = null
 let observer: IntersectionObserver | null = null
@@ -252,6 +253,7 @@ function closePdf() {
   pdf = null
   pages.value = []
   pageCount.value = 0
+  hasOversizedImages.value = false
   pdfStatus.value = 'idle'
 }
 
@@ -268,6 +270,7 @@ async function loadPdf(blob: Blob) {
     loadController = null
     pdf = document
     pageCount.value = document.pageCount
+    hasOversizedImages.value = document.hasOversizedImages
     pages.value = document.pageSizes.map((size, index) => ({ number: index + 1, ...size, state: 'idle' }))
     pdfStatus.value = 'ready'
     await nextTick()
@@ -377,6 +380,19 @@ onBeforeUnmount(closePdf)
         </div>
 
         <template v-else>
+          <!-- Images too large to preview are left out of the pages below. -->
+          <div
+            v-if="hasOversizedImages"
+            role="status"
+            class="mx-auto mt-4 flex max-w-4xl flex-wrap items-center justify-center gap-3 rounded-md border border-border bg-background/80 px-4 py-3 text-center text-sm"
+            data-testid="chat-media-preview-image-limit"
+          >
+            <p>{{ t('chat.mediaPreview.imageLimit') }}</p>
+            <Button as="a" variant="outline" size="sm" :href="downloadUrl" :download="downloadName">
+              <Download aria-hidden="true" />
+              {{ t('chat.mediaPreview.download') }}
+            </Button>
+          </div>
           <ol
             ref="pageList"
             class="mx-auto flex flex-col gap-4 p-4"

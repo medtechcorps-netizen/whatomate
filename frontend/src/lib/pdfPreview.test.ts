@@ -3,8 +3,10 @@ import { createRequire } from 'node:module'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   documentPreviewType,
+  hasOversizedImage,
   isPdfPreviewAbort,
   openPdfPreview,
+  PDF_PREVIEW_MAX_IMAGE_PIXELS,
   PDF_PREVIEW_PAGE_LIMIT,
   PdfPreviewError,
 } from './pdfPreview'
@@ -64,6 +66,41 @@ function fakeDocument(numPages: number, page = fakePage()) {
 
 const canvas = () => ({ width: 0, height: 0 }) as HTMLCanvasElement
 
+// A PDF body holding one image XObject with the given dictionary entries.
+const imageObject = (entries: string) =>
+  `4 0 obj\n<< /Type /XObject /Subtype /Image ${entries} /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 3 >>\nstream\nabc\nendstream\nendobj\n`
+const pdfWith = (...objects: string[]) => encoder.encode(`%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n${objects.join('')}%%EOF\n`)
+
+describe('hasOversizedImage', () => {
+  it('limits images to 4096 x 4096 pixels', () => {
+    expect(PDF_PREVIEW_MAX_IMAGE_PIXELS).toBe(16_777_216)
+    expect(hasOversizedImage(pdfWith(imageObject('/Width 4096 /Height 4096')))).toBe(false)
+    expect(hasOversizedImage(pdfWith(imageObject('/Width 4097 /Height 4096')))).toBe(true)
+    expect(hasOversizedImage(pdfWith(imageObject('/Width 30000 /Height 30000')))).toBe(true)
+  })
+
+  it.each([
+    ['compact syntax', '4 0 obj<</Subtype/Image/Width 5000/Height 5000/Length 3>>stream\nabc\nendstream endobj'],
+    ['height before width', imageObject('/Height 5000 /Width 5000')],
+    ['a nested parameters dictionary', imageObject('/DecodeParms << /Columns 5000 /K -1 >> /Width 5000 /Height 5000')],
+  ])('reads the size of an image in %s', (_, object) => {
+    expect(hasOversizedImage(pdfWith(object))).toBe(true)
+  })
+
+  it('ignores files without a large image', () => {
+    expect(hasOversizedImage(pdfWith())).toBe(false)
+    expect(hasOversizedImage(pdfWith(imageObject('/Width 2480 /Height 3508')))).toBe(false)
+    // A form XObject is not an image, whatever its bounding box.
+    expect(hasOversizedImage(pdfWith('5 0 obj\n<< /Subtype /Form /Width 9000 /Height 9000 >>\nstream\nq Q\nendstream\nendobj\n'))).toBe(false)
+  })
+
+  it('finds an image whose dictionary straddles the boundary between two reading windows', () => {
+    const before = '%PDF-1.7\n' + ' '.repeat((1 << 20) - 40)
+    const bytes = encoder.encode(before + imageObject('/Width 6000 /Height 6000'))
+    expect(hasOversizedImage(bytes)).toBe(true)
+  })
+})
+
 describe('documentPreviewType', () => {
   it.each([
     ['a PDF', [0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37], 'application/pdf'],
@@ -118,12 +155,22 @@ describe('openPdfPreview', () => {
     expect(mocks.workerOptions.workerSrc).not.toMatch(/^(https?:)?\/\/(?!localhost)/)
     expect(mocks.getDocument).toHaveBeenCalledTimes(1)
     const params = mocks.getDocument.mock.calls[0][0]
-    expect(params).toMatchObject({ isEvalSupported: false, enableXfa: false })
+    expect(params).toMatchObject({ isEvalSupported: false, enableXfa: false, maxImageSize: 16_777_216 })
     expect(params).not.toHaveProperty('url')
     expect(params).not.toHaveProperty('onPassword')
     expect(new TextDecoder().decode(params.data)).toBe('%PDF-1.7 lab report')
     expect(preview.pageCount).toBe(2)
     expect(preview.pageSizes).toEqual([{ width: 612, height: 792 }, { width: 612, height: 792 }])
+    expect(preview.hasOversizedImages).toBe(false)
+  })
+
+  it('tells the preview when pdf.js will leave out an oversized image', async () => {
+    mocks.getDocument.mockReturnValueOnce(fakeLoadingTask(Promise.resolve(fakeDocument(1))))
+    const bytes = pdfWith(imageObject('/Width 8000 /Height 8000'))
+    const preview = await openPdfPreview(new Blob([bytes]))
+    expect(preview.hasOversizedImages).toBe(true)
+    // The same file still goes to pdf.js, which skips the image itself.
+    expect(mocks.getDocument.mock.calls[0][0].maxImageSize).toBe(PDF_PREVIEW_MAX_IMAGE_PIXELS)
   })
 
   it('points pdf.js at same-origin CMaps, fonts and JavaScript image decoders, never WebAssembly', async () => {
