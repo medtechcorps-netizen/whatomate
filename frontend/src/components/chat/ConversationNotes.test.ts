@@ -98,6 +98,9 @@ describe('ConversationNotes', () => {
     expect(del.attributes('type')).toBe('button')
     // Not hidden behind hover.
     expect(edit.element.parentElement?.className).not.toContain('opacity-0')
+    // The e2e ChatPage helpers select the action buttons by these classes.
+    expect(edit.classes()).toEqual(expect.arrayContaining(['h-5', 'w-5']))
+    expect(del.classes()).toEqual(expect.arrayContaining(['h-5', 'w-5']))
   })
 
   it("hides the actions on other people's notes", async () => {

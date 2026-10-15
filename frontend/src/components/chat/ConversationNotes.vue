@@ -252,7 +252,8 @@ function formatNoteTime(dateStr: string) {
                   <div class="flex items-center justify-between mb-1">
                     <span class="text-xs font-medium text-white/70 light:text-gray-700">{{ note.created_by_name }}</span>
                     <div class="flex items-center gap-1">
-                      <!-- Actions (own notes only), always visible -->
+                      <!-- Actions (own notes only), always visible. Keep h-5 w-5:
+                           the e2e ChatPage helpers select these buttons by it. -->
                       <div
                         v-if="note.created_by_id === authStore.user?.id"
                         class="flex gap-0.5"
@@ -262,7 +263,7 @@ function formatNoteTime(dateStr: string) {
                           data-testid="note-edit-button"
                           :aria-label="t('conversationNotes.editNote')"
                           :title="t('conversationNotes.editNote')"
-                          class="h-6 w-6 rounded-md flex items-center justify-center hover:bg-white/[0.08] light:hover:bg-gray-200 text-white/50 hover:text-white/80 light:text-gray-500 light:hover:text-gray-700 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-500/60 transition-colors"
+                          class="h-5 w-5 rounded-md flex items-center justify-center hover:bg-white/[0.08] light:hover:bg-gray-200 text-white/50 hover:text-white/80 light:text-gray-500 light:hover:text-gray-700 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-500/60 transition-colors"
                           @click="startEditing(note.id, note.content)"
                         >
                           <Pencil class="h-3.5 w-3.5" aria-hidden="true" />
@@ -272,7 +273,7 @@ function formatNoteTime(dateStr: string) {
                           data-testid="note-delete-button"
                           :aria-label="t('conversationNotes.deleteNote')"
                           :title="t('conversationNotes.deleteNote')"
-                          class="h-6 w-6 rounded-md flex items-center justify-center hover:bg-red-500/10 text-white/50 hover:text-red-400 light:text-gray-500 light:hover:text-red-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-red-500/60 transition-colors"
+                          class="h-5 w-5 rounded-md flex items-center justify-center hover:bg-red-500/10 text-white/50 hover:text-red-400 light:text-gray-500 light:hover:text-red-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-red-500/60 transition-colors"
                           @click="deleteNote(note.id)"
                         >
                           <Trash2 class="h-3.5 w-3.5" aria-hidden="true" />
