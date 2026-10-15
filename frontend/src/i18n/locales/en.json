@@ -176,6 +176,11 @@
     "ssoLoginFailed": "Failed to complete SSO login",
     "returnToLogin": "Return to login"
   },
+  "sessionSecurity": {
+    "reconnecting": "Reconnecting…",
+    "reconnectFailed": "Can't reach the server right now",
+    "reconnectFailedDesc": "You're still signed in. We'll try again with your next action."
+  },
   "resources": {
     "account": "account",
     "accounts": "accounts",

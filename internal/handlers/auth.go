@@ -276,6 +276,19 @@ func (a *App) Register(r *fastglue.Request) error {
 // RefreshToken refreshes access token using refresh token with rotation.
 // The old refresh token is invalidated (single-use) and a new one is issued.
 func (a *App) RefreshToken(r *fastglue.Request) error {
+	// Failures are logged with a reason code and the user ID only — never a
+	// token value. Definitive rejections answer 401, and the client ends the
+	// session. Infrastructure failures answer 503 without consuming the
+	// refresh token, so the client keeps the user signed in and retries.
+	reject := func(status int, message, reason string, userID any) error {
+		if status == fasthttp.StatusServiceUnavailable {
+			a.Log.Error("Token refresh failed", "reason", reason, "user_id", userID)
+		} else {
+			a.Log.Warn("Token refresh rejected", "reason", reason, "user_id", userID)
+		}
+		return r.SendErrorEnvelope(status, message, nil, "")
+	}
+
 	// Read refresh token from cookie first, fall back to JSON body.
 	refreshTokenStr := string(r.RequestCtx.Request.Header.Cookie(cookieRefreshName))
 	if refreshTokenStr == "" {
@@ -284,7 +297,7 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		refreshTokenStr = req.RefreshToken
 	}
 	if refreshTokenStr == "" {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Missing refresh token", nil, "")
+		return reject(fasthttp.StatusUnauthorized, "Missing refresh token", "missing_token", nil)
 	}
 
 	// Parse and validate refresh token
@@ -298,35 +311,91 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 	)
 
 	if err != nil || !token.Valid {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid refresh token", nil, "")
+		return reject(fasthttp.StatusUnauthorized, "Invalid refresh token", "invalid_token", nil)
 	}
 
 	claims, ok := token.Claims.(*middleware.JWTClaims)
 	if !ok || !middleware.IsRefreshJWTClaims(claims) {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid token claims", nil, "")
+		return reject(fasthttp.StatusUnauthorized, "Invalid token claims", "invalid_claims", nil)
 	}
 
-	// Validate JTI in Redis (single-use: delete on consumption)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	deleted, err := a.Redis.Del(ctx, refreshTokenKey(claims.ID)).Result()
-	if err != nil || deleted == 0 {
-		// Token was already used or revoked
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Refresh token has been revoked", nil, "")
+
+	// Rotation grace: for 30 seconds after a rotation, the consumed token maps
+	// to the pair it was exchanged for. A client whose refresh response was
+	// lost (proxy 504, dropped connection) still holds the old cookie; replaying
+	// it within the window returns that same pair instead of revoking the
+	// session. It never mints a second token chain.
+	graceKey := "refresh_grace:" + claims.ID
+	graceAccess, graceRefresh := "", ""
+	exists, err := a.Redis.Exists(ctx, refreshTokenKey(claims.ID)).Result()
+	if err != nil {
+		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "session_store_unavailable", claims.UserID)
+	}
+	if exists == 0 {
+		pair := a.Redis.Get(ctx, graceKey).Val()
+		for i := 0; i < len(pair); i++ {
+			if pair[i] == ' ' {
+				graceAccess, graceRefresh = pair[:i], pair[i+1:]
+				break
+			}
+		}
+		if graceAccess == "" || graceRefresh == "" {
+			// Token was already used (outside the grace window) or revoked
+			return reject(fasthttp.StatusUnauthorized, "Refresh token has been revoked", "revoked_or_reused", claims.UserID)
+		}
+	}
+	inGrace := graceRefresh != ""
+
+	// A definitive rejection still consumes the credential so it cannot be
+	// replayed.
+	consume := func() {
+		consumeCtx, consumeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer consumeCancel()
+		a.Redis.Del(consumeCtx, refreshTokenKey(claims.ID), graceKey)
 	}
 
 	// Get user
 	var user models.User
-	if err := a.DB.Where("id = ?", claims.UserID).First(&user).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "User not found", nil, "")
+	if err := a.DB.WithContext(ctx).Where("id = ?", claims.UserID).First(&user).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			consume()
+			return reject(fasthttp.StatusUnauthorized, "User not found", "user_not_found", claims.UserID)
+		}
+		return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "user_lookup_failed", claims.UserID)
 	}
 
 	if !user.IsActive {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Account is disabled", nil, "")
+		consume()
+		return reject(fasthttp.StatusUnauthorized, "Account is disabled", "account_disabled", claims.UserID)
 	}
 
 	if err := a.applyOrganizationMembership(&user, claims.OrganizationID, false); err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Organization access is no longer available", nil, "")
+		if err != gorm.ErrRecordNotFound && err != database.ErrPlatformComplianceTenant {
+			return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
+		}
+		consume()
+		return reject(fasthttp.StatusUnauthorized, "Organization access is no longer available", "membership_revoked", claims.UserID)
+	}
+
+	if inGrace {
+		a.Log.Info("Token refresh replayed within rotation grace", "reason", "rotation_grace", "user_id", claims.UserID)
+		a.setAuthCookies(r, graceAccess, graceRefresh)
+		return r.SendEnvelope(CookieAuthResponse{
+			ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
+			User:      user,
+		})
+	}
+
+	// Validate JTI in Redis (single-use: delete on consumption)
+	deleted, err := a.Redis.Del(ctx, refreshTokenKey(claims.ID)).Result()
+	if err != nil {
+		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "session_store_unavailable", claims.UserID)
+	}
+	if deleted == 0 {
+		// A concurrent refresh consumed the same token first.
+		return reject(fasthttp.StatusUnauthorized, "Refresh token has been revoked", "revoked_or_reused", claims.UserID)
 	}
 
 	// Generate new tokens (rotation: new refresh token with new JTI)
@@ -339,6 +408,12 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+	}
+
+	graceCtx, graceCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer graceCancel()
+	if err := a.Redis.Set(graceCtx, graceKey, accessToken+" "+newRefreshToken, 30*time.Second).Err(); err != nil {
+		a.Log.Warn("Failed to record refresh rotation grace", "reason", "grace_store_failed", "user_id", claims.UserID)
 	}
 
 	a.setAuthCookies(r, accessToken, newRefreshToken)

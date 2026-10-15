@@ -266,7 +266,16 @@ func TestApp_RefreshToken_RotatesJTI_ReplayFails(t *testing.T) {
 	require.NoError(t, app.RefreshToken(req1))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req1))
 
-	// Replay must fail.
+	// A replay inside the rotation grace window (lost response) gets the same
+	// rotated pair back — never a second token chain.
+	replay := testutil.NewJSONRequest(t, map[string]string{"refresh_token": token})
+	require.NoError(t, app.RefreshToken(replay))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(replay))
+	assert.Equal(t, testutil.GetResponseCookie(req1, "whm_refresh"), testutil.GetResponseCookie(replay, "whm_refresh"))
+	assert.Equal(t, testutil.GetResponseCookie(req1, "whm_access"), testutil.GetResponseCookie(replay, "whm_access"))
+
+	// Once the grace window has passed, a replay must fail.
+	require.NoError(t, app.Redis.Del(ctx, "refresh_grace:"+jti).Err())
 	req2 := testutil.NewJSONRequest(t, map[string]string{"refresh_token": token})
 	require.NoError(t, app.RefreshToken(req2))
 	testutil.AssertErrorResponse(t, req2, fasthttp.StatusUnauthorized, "revoked")

@@ -1,8 +1,11 @@
 import axios, {
   type AxiosInstance,
   type AxiosError,
+  type AxiosResponse,
   type InternalAxiosRequestConfig,
 } from "axios";
+import { toast } from "vue-sonner";
+import { i18n } from "@/i18n";
 import { resolveOrganizationHeader } from "@/lib/organizationHeaders";
 import {
   clearBrowserOrganizationIdentity,
@@ -51,9 +54,369 @@ export function getRequestHeaders(opts?: {
   return headers;
 }
 
+// ---------------------------------------------------------------------------
+// Session refresh coordination
+//
+// The access token lives in an httpOnly cookie that every tab shares. When it
+// expires, the first 401 rotates it via POST /auth/refresh (single-use refresh
+// token). The rules below keep a burst of 401s — across tabs, or staggered in
+// one tab right after a refresh — from logging the user out:
+//
+// - Every request is stamped with the shared "auth epoch" it was sent under.
+//   The epoch advances (in localStorage, so all tabs see it) after each
+//   successful login or refresh. A 401 for a request sent under an older epoch
+//   is stale: the cookie has already been rotated, so it is retried once
+//   without refreshing again.
+// - Refreshes are serialized across tabs with the Web Locks API, and inside the
+//   lock a tab skips its own refresh when another tab advanced the epoch while
+//   it waited.
+// - Only a definitive 401/403 from /auth/refresh ends the session. Network
+//   errors, 5xx and 429 are retried with backoff behind a non-blocking
+//   "Reconnecting…" toast, and the user stays signed in if they still fail.
+// - While a tab is visible the access token is refreshed shortly before it
+//   expires, using expires_in from the login/refresh responses.
+// ---------------------------------------------------------------------------
+
+const AUTH_EPOCH_KEY = "whm_auth_epoch";
+const AUTH_EXPIRES_AT_KEY = "whm_auth_expires_at";
+// Same lock name as earlier builds so tabs on old and new bundles still
+// serialize their refreshes during a deploy.
+const REFRESH_LOCK_NAME = "whm-token-refresh";
+const PROACTIVE_REFRESH_LEAD_MS = 60_000;
+// Delays before each retry of a transient refresh failure (~10 s in total).
+const REFRESH_RETRY_DELAYS_MS = [1_000, 3_000, 6_000];
+const REFRESH_REQUEST_TIMEOUT_MS = 15_000;
+const RECONNECT_TOAST_ID = "whm-session-reconnect";
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Window event fired with `{ state }` whenever the session state changes. */
+export const AUTH_SESSION_EVENT = "whm:auth-session";
+export type AuthSessionState =
+  | "refreshed"
+  | "reconnecting"
+  | "reconnected"
+  | "unavailable"
+  | "expired";
+
+type AuthAwareRequestConfig = InternalAxiosRequestConfig & {
+  _retry?: boolean;
+  _authEpoch?: number;
+};
+
+// Login/refresh responses whose Set-Cookie starts a new auth epoch.
+const SESSION_ISSUING_PATHS = ["/auth/login", "/auth/register", "/auth/switch-org"];
+
+let memoryAuthEpoch = 0;
+let refreshInFlight: Promise<void> | null = null;
+let proactiveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function readStoredNumber(key: string): number {
+  try {
+    const value = Number(localStorage.getItem(key));
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeStoredValue(key: string, value: string | null) {
+  try {
+    if (value === null) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, value);
+    }
+  } catch {
+    // In-memory state still covers this tab when storage is denied.
+  }
+}
+
+function readAuthEpoch(): number {
+  return Math.max(memoryAuthEpoch, readStoredNumber(AUTH_EPOCH_KEY));
+}
+
+function advanceAuthEpoch() {
+  memoryAuthEpoch = Math.max(Date.now(), readAuthEpoch() + 1);
+  writeStoredValue(AUTH_EPOCH_KEY, String(memoryAuthEpoch));
+}
+
+function emitAuthSessionState(state: AuthSessionState) {
+  try {
+    window.dispatchEvent(
+      new CustomEvent(AUTH_SESSION_EVENT, { detail: { state } }),
+    );
+  } catch {
+    // Observers are optional.
+  }
+}
+
+function showReconnectToast(state: "reconnecting" | "dismiss" | "unavailable") {
+  const t = i18n.global.t;
+  try {
+    if (state === "reconnecting") {
+      toast.loading(t("sessionSecurity.reconnecting"), {
+        id: RECONNECT_TOAST_ID,
+      });
+    } else if (state === "dismiss") {
+      toast.dismiss(RECONNECT_TOAST_ID);
+    } else {
+      toast.error(t("sessionSecurity.reconnectFailed"), {
+        id: RECONNECT_TOAST_ID,
+        description: t("sessionSecurity.reconnectFailedDesc"),
+      });
+    }
+  } catch {
+    // A toast failure must never affect the request flow.
+  }
+}
+
+function requestPath(url?: string): string {
+  if (!url) return "";
+  const path = url.split("?")[0];
+  const apiIndex = path.indexOf("/api/auth/");
+  return apiIndex >= 0 ? path.slice(apiIndex + 4) : path;
+}
+
+// Endpoints that must never trigger a refresh: they either establish or end
+// the session themselves, or are public.
+function isSessionlessAuthEndpoint(url?: string): boolean {
+  const path = requestPath(url);
+  return (
+    path === "/auth/login" ||
+    path === "/auth/register" ||
+    path === "/auth/refresh" ||
+    path === "/auth/logout" ||
+    path === "/auth/sso" ||
+    path.startsWith("/auth/sso/")
+  );
+}
+
+function isDefinitiveRefreshFailure(error: unknown): boolean {
+  const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+  return status === 401 || status === 403;
+}
+
+function hasStoredUser(): boolean {
+  try {
+    return !!localStorage.getItem("user");
+  } catch {
+    return false;
+  }
+}
+
+function clearSessionTiming() {
+  if (proactiveRefreshTimer !== null) {
+    clearTimeout(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+  writeStoredValue(AUTH_EXPIRES_AT_KEY, null);
+}
+
+function recordSessionExpiry(expiresInSeconds: unknown) {
+  if (typeof expiresInSeconds !== "number" || !(expiresInSeconds > 0)) return;
+  writeStoredValue(
+    AUTH_EXPIRES_AT_KEY,
+    String(Date.now() + expiresInSeconds * 1000),
+  );
+  scheduleProactiveRefresh();
+}
+
+function onSessionIssued(expiresInSeconds: unknown) {
+  advanceAuthEpoch();
+  recordSessionExpiry(expiresInSeconds);
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+// postRefresh rotates the cookies via POST /auth/refresh. It carries the CSRF
+// double-submit header: whenever a fresh whm_access cookie rides along (path
+// /api covers /api/auth/refresh), the CSRF middleware of older servers rejects
+// a header-less refresh with 403.
+function postRefresh() {
+  const headers: Record<string, string> = {};
+  const csrfToken = getCookie("whm_csrf");
+  if (csrfToken) {
+    headers["X-CSRF-Token"] = csrfToken;
+  }
+  return axios.post(
+    `${API_BASE_URL}/auth/refresh`,
+    {},
+    { withCredentials: true, timeout: REFRESH_REQUEST_TIMEOUT_MS, headers },
+  );
+}
+
+// refreshWithRetry refreshes once, retrying transient failures (network,
+// timeout, 5xx, 429) with backoff. It throws the last error when the refresh
+// is definitively rejected or every retry failed.
+async function refreshWithRetry(requestEpoch: number): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await postRefresh();
+      onSessionIssued(response?.data?.data?.expires_in);
+      if (attempt > 0) showReconnectToast("dismiss");
+      emitAuthSessionState(attempt > 0 ? "reconnected" : "refreshed");
+      return;
+    } catch (refreshError) {
+      // Without Web Locks another tab may have rotated the cookie while this
+      // request was in flight; its success is ours too.
+      if (readAuthEpoch() > requestEpoch) {
+        if (attempt > 0) showReconnectToast("dismiss");
+        return;
+      }
+      if (isDefinitiveRefreshFailure(refreshError)) {
+        if (attempt > 0) showReconnectToast("dismiss");
+        throw refreshError;
+      }
+      if (attempt >= REFRESH_RETRY_DELAYS_MS.length) {
+        showReconnectToast("unavailable");
+        emitAuthSessionState("unavailable");
+        throw refreshError;
+      }
+      if (attempt === 0) {
+        showReconnectToast("reconnecting");
+        emitAuthSessionState("reconnecting");
+      }
+      await delay(REFRESH_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+// refreshAcrossTabs serializes the refresh across all same-origin tabs. Each
+// tab re-checks the shared epoch once it holds the lock, so a tab whose 401
+// predates another tab's refresh just retries with the rotated cookie instead
+// of spending (and losing) the single-use refresh token again. Falls back to a
+// plain refresh where Web Locks is unavailable (older browsers / insecure
+// contexts).
+async function refreshAcrossTabs(requestEpoch: number): Promise<void> {
+  const run = async () => {
+    if (readAuthEpoch() > requestEpoch) return;
+    await refreshWithRetry(requestEpoch);
+  };
+  const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+  if (locks?.request) {
+    await locks.request(REFRESH_LOCK_NAME, run);
+  } else {
+    await run();
+  }
+}
+
+// ensureFreshSession resolves once the session is newer than requestEpoch. A
+// single refresh per tab is in flight at a time; concurrent callers share it.
+function ensureFreshSession(requestEpoch: number): Promise<void> {
+  if (readAuthEpoch() > requestEpoch) return Promise.resolve();
+  if (!refreshInFlight) {
+    refreshInFlight = refreshAcrossTabs(requestEpoch).finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
+function isOnLoginPage(): boolean {
+  try {
+    return window.location.pathname.replace(/\/+$/, "").endsWith("/login");
+  } catch {
+    return false;
+  }
+}
+
+// expireSession ends the session after a definitive refresh rejection: clear
+// the browser identity and send the user to the login page.
+function expireSession() {
+  clearSessionTiming();
+  showReconnectToast("dismiss");
+  emitAuthSessionState("expired");
+
+  clearBrowserOrganizationIdentity();
+  for (const key of [
+    "user",
+    "auth_token",
+    "refresh_token",
+    "break_started_at",
+  ]) {
+    let removed = false;
+    try {
+      localStorage.removeItem(key);
+      removed = localStorage.getItem(key) === null;
+    } catch {
+      // Fall through to a non-sensitive tombstone where writes work.
+    }
+    if (!removed) {
+      try {
+        localStorage.setItem(key, "");
+      } catch {
+        // A denied storage backend must not skip redirect/isolation.
+      }
+    }
+  }
+  if (!isOnLoginPage()) {
+    window.location.href = basePath + "/login";
+  }
+}
+
+async function runProactiveRefresh() {
+  proactiveRefreshTimer = null;
+  // Hidden tabs wait for visibilitychange; a visible tab keeps the session warm.
+  if (document.visibilityState === "hidden" || !hasStoredUser()) return;
+  const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
+  if (!expiresAt) return;
+  if (expiresAt - Date.now() > PROACTIVE_REFRESH_LEAD_MS) {
+    // Another tab already extended the session.
+    scheduleProactiveRefresh();
+    return;
+  }
+  try {
+    await ensureFreshSession(readAuthEpoch());
+  } catch (refreshError) {
+    if (isDefinitiveRefreshFailure(refreshError)) {
+      expireSession();
+    }
+    // Transient failures keep the user signed in; the next 401 retries.
+  }
+}
+
+function scheduleProactiveRefresh() {
+  if (proactiveRefreshTimer !== null) {
+    clearTimeout(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+  const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
+  if (!expiresAt) return;
+  const wait = Math.min(
+    Math.max(0, expiresAt - PROACTIVE_REFRESH_LEAD_MS - Date.now()),
+    MAX_TIMER_DELAY_MS,
+  );
+  proactiveRefreshTimer = setTimeout(() => {
+    void runProactiveRefresh();
+  }, wait);
+}
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
+    if (expiresAt && expiresAt - Date.now() <= PROACTIVE_REFRESH_LEAD_MS) {
+      void runProactiveRefresh();
+    } else {
+      scheduleProactiveRefresh();
+    }
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === AUTH_EXPIRES_AT_KEY) scheduleProactiveRefresh();
+  });
+  scheduleProactiveRefresh();
+}
+
 // Request interceptor to add CSRF token and organization header
 api.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
+    // Stamp the auth epoch the request is sent under (see above).
+    (config as AuthAwareRequestConfig)._authEpoch = readAuthEpoch();
+    if (requestPath(config.url) === "/auth/logout") {
+      clearSessionTiming();
+    }
     // Add CSRF token on mutating requests (cookie-based auth sends cookies automatically)
     const method = (config.method || "").toUpperCase();
     if (
@@ -83,116 +446,39 @@ api.interceptors.request.use(
   },
 );
 
-// Token refresh mutex — ensures only one refresh runs at a time.
-// Without this, multiple concurrent 401s each trigger a refresh, but the
-// single-use refresh token (JTI deleted from Redis) causes all but the first
-// to fail, which clears auth and logs the user out.
-let isRefreshing = false;
-let refreshSubscribers: Array<(success: boolean) => void> = [];
-
-function onRefreshComplete(success: boolean) {
-  refreshSubscribers.forEach((cb) => cb(success));
-  refreshSubscribers = [];
-}
-
-// refreshAccessToken posts to /auth/refresh. The refresh token is single-use
-// with rotation, so two tabs refreshing at once would have the loser's token
-// rejected as "revoked" and get logged out. The Web Locks API serializes the
-// refresh across all same-origin tabs: each tab refreshes in turn using the
-// cookie rotated by the previous holder, so every refresh succeeds instead of
-// racing. The in-tab `isRefreshing` mutex still dedupes concurrent 401s within
-// a single tab. Falls back to a plain request where Web Locks is unavailable
-// (older browsers / insecure contexts).
-async function refreshAccessToken(): Promise<void> {
-  const doRefresh = () =>
-    axios.post(`${API_BASE_URL}/auth/refresh`, {}, { withCredentials: true });
-
-  if (navigator.locks?.request) {
-    await navigator.locks.request("whm-token-refresh", async () => {
-      await doRefresh();
-    });
-  } else {
-    await doRefresh();
-  }
-}
-
-// Response interceptor for error handling
+// Response interceptor: session bookkeeping and 401 handling
 api.interceptors.response.use(
-  (response) => response,
+  (response: AxiosResponse) => {
+    if (SESSION_ISSUING_PATHS.includes(requestPath(response.config?.url))) {
+      onSessionIssued(response.data?.data?.expires_in);
+    }
+    return response;
+  },
   async (error: AxiosError) => {
-    const originalRequest = error.config as InternalAxiosRequestConfig & {
-      _retry?: boolean;
-    };
+    const originalRequest = error.config as AuthAwareRequestConfig | undefined;
 
-    // Skip token refresh logic for auth endpoints
-    const isAuthEndpoint = originalRequest?.url?.startsWith("/auth/");
-
-    // Handle 401 errors - try to refresh token (but not for auth endpoints)
     if (
-      error.response?.status === 401 &&
-      !originalRequest._retry &&
-      !isAuthEndpoint
+      error.response?.status !== 401 ||
+      !originalRequest ||
+      originalRequest._retry ||
+      isSessionlessAuthEndpoint(originalRequest.url)
     ) {
-      originalRequest._retry = true;
-
-      // If a refresh is already in flight, queue this request to wait for it
-      if (isRefreshing) {
-        return new Promise((resolve, reject) => {
-          refreshSubscribers.push((success: boolean) => {
-            if (success) {
-              resolve(api(originalRequest));
-            } else {
-              reject(error);
-            }
-          });
-        });
-      }
-
-      isRefreshing = true;
-
-      try {
-        // Browser sends whm_refresh cookie automatically via withCredentials.
-        // Serialized across tabs via Web Locks to avoid single-use-token races.
-        await refreshAccessToken();
-
-        // Cookies are updated by the server response — notify waiting requests
-        onRefreshComplete(true);
-        isRefreshing = false;
-
-        // Retry the original request
-        return api(originalRequest);
-      } catch {
-        // Refresh failed — notify waiting requests and redirect to login
-        onRefreshComplete(false);
-        isRefreshing = false;
-
-        clearBrowserOrganizationIdentity();
-        for (const key of [
-          "user",
-          "auth_token",
-          "refresh_token",
-          "break_started_at",
-        ]) {
-          let removed = false;
-          try {
-            localStorage.removeItem(key);
-            removed = localStorage.getItem(key) === null;
-          } catch {
-            // Fall through to a non-sensitive tombstone where writes work.
-          }
-          if (!removed) {
-            try {
-              localStorage.setItem(key, "");
-            } catch {
-              // A denied storage backend must not skip redirect/isolation.
-            }
-          }
-        }
-        window.location.href = basePath + "/login";
-      }
+      return Promise.reject(error);
     }
 
-    return Promise.reject(error);
+    // One retry per request: either after a refresh, or straight away when
+    // the cookie was already rotated after this request was sent.
+    originalRequest._retry = true;
+    try {
+      await ensureFreshSession(originalRequest._authEpoch ?? 0);
+    } catch (refreshError) {
+      if (isDefinitiveRefreshFailure(refreshError)) {
+        expireSession();
+      }
+      // Transient failure: keep the user signed in and surface the 401.
+      return Promise.reject(error);
+    }
+    return api(originalRequest);
   },
 );
 
