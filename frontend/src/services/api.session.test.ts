@@ -1,7 +1,7 @@
 /** @vitest-environment happy-dom */
 
 import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const toastMock = vi.hoisted(() => ({
   loading: vi.fn(),
@@ -105,12 +105,18 @@ function setCookie(value: string) {
   document.cookie = value
 }
 
-describe('session refresh interceptor', () => {
+describe('session refresh interceptor', { timeout: 20_000 }, () => {
   let postSpy: ReturnType<typeof vi.spyOn>
   let sessionEvents: string[]
   const onSessionEvent = (event: Event) => {
     sessionEvents.push((event as CustomEvent<{ state: string }>).detail.state)
   }
+
+  // Transform the module graph (i18n locales included) once, so a cold first
+  // import cannot eat into a test's own time budget.
+  beforeAll(async () => {
+    await import('./api')
+  }, 60_000)
 
   beforeEach(() => {
     localStorage.clear()
