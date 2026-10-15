@@ -28,13 +28,14 @@ export const WHATSAPP_MARKERS: Record<WhatsAppFormatKind, string> = {
   mono: '```',
 }
 
-const INLINE_MARKERS: Record<string, 'bold' | 'italic' | 'strike'> = {
-  '*': 'bold',
-  _: 'italic',
-  '~': 'strike',
-}
-
 const MONO_FENCE = '```'
+
+/**
+ * Lines longer than this render as plain text. WhatsApp caps messages at
+ * 4096 characters, so only pasted or imported text ever reaches it; it
+ * bounds the work and the number of nodes a hostile message can create.
+ */
+export const MAX_FORMATTED_LINE_LENGTH = 8192
 
 const WORD_CHAR = /[\p{L}\p{N}]/u
 const SPACE_CHAR = /\s/u
@@ -43,28 +44,111 @@ function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && WORD_CHAR.test(ch)
 }
 
-function isSpace(ch: string | undefined): boolean {
-  return ch !== undefined && SPACE_CHAR.test(ch)
-}
+// Character classes; 0 = anything else.
+const CLASS_WORD = 1
+const CLASS_SPACE = 2
 
-function canOpen(text: string, index: number): boolean {
-  const marker = text[index]
-  const next = text[index + 1]
-  if (next === undefined || isSpace(next) || next === marker) return false
-  return index === 0 || !isWordChar(text[index - 1])
-}
+// Links are detected first and their characters never open or close a
+// marker, as in WhatsApp: "https://x.test/a_b_c_" keeps its underscores.
+const URL_PATTERN = /\b(?:https?:\/\/|www\.)[^\s<>"]+/giu
+// Trailing punctuation and markers belong to the sentence, not the link
+// ("*see https://x.test*"). Trimmed with a loop: a regex here backtracks
+// quadratically on a link padded with thousands of dots.
+const URL_TRAILING = new Set(['.', ',', ';', ':', '!', '?', "'", '"', ')', ']', '}', '*', '_', '~', '`'])
 
-function findClose(text: string, open: number): number {
-  const marker = text[open]
-  for (let j = open + 2; j < text.length; j++) {
-    const ch = text[j]
-    if (ch === '\n') return -1
-    if (ch !== marker) continue
-    if (isSpace(text[j - 1])) continue
-    if (isWordChar(text[j + 1])) continue
-    return j
+const MARKER_TYPES = ['bold', 'italic', 'strike', 'code'] as const
+const CODE_MARKER = 3
+
+function markerIndex(ch: string): number {
+  switch (ch) {
+    case '*':
+      return 0
+    case '_':
+      return 1
+    case '~':
+      return 2
+    case '`':
+      return CODE_MARKER
+    default:
+      return -1
   }
-  return -1
+}
+
+/**
+ * Everything the parser needs, precomputed in one pass so each marker is
+ * checked in O(1): parsing is linear in the text length. (The previous
+ * version rescanned the rest of the line for every unmatched opener, which
+ * a message of " *a" repeated turned into seconds of work.)
+ */
+interface ParseContext {
+  text: string
+  charClass: Uint8Array
+  inUrl: Uint8Array
+  /** Index of the newline ending the line that contains i (or text.length). */
+  lineEnd: Int32Array
+  /** 1 when the line that contains i is too long to format. */
+  longLine: Uint8Array
+  /** nextCloser[marker][i]: first index >= i that can close that marker, or -1. */
+  nextCloser: Int32Array[]
+}
+
+function classify(text: string): Uint8Array {
+  const classes = new Uint8Array(text.length)
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code < 128) {
+      if ((code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)) {
+        classes[i] = CLASS_WORD
+      } else if (code === 32 || (code >= 9 && code <= 13)) {
+        classes[i] = CLASS_SPACE
+      }
+    } else if (WORD_CHAR.test(text[i])) {
+      classes[i] = CLASS_WORD
+    } else if (SPACE_CHAR.test(text[i])) {
+      classes[i] = CLASS_SPACE
+    }
+  }
+  return classes
+}
+
+function createContext(text: string, maxLineLength: number): ParseContext {
+  const n = text.length
+  const charClass = classify(text)
+
+  const inUrl = new Uint8Array(n)
+  URL_PATTERN.lastIndex = 0
+  for (let match = URL_PATTERN.exec(text); match; match = URL_PATTERN.exec(text)) {
+    let urlEnd = match.index + match[0].length
+    while (urlEnd > match.index && URL_TRAILING.has(text[urlEnd - 1])) urlEnd--
+    inUrl.fill(1, match.index, urlEnd)
+  }
+
+  const lineEnd = new Int32Array(n + 1)
+  lineEnd[n] = n
+  for (let i = n - 1; i >= 0; i--) lineEnd[i] = text.charCodeAt(i) === 10 ? i : lineEnd[i + 1]
+  const longLine = new Uint8Array(n)
+  for (let start = 0; start < n; ) {
+    const end = lineEnd[start]
+    if (end - start > maxLineLength) longLine.fill(1, start, end)
+    start = end + 1
+  }
+
+  const nextCloser = MARKER_TYPES.map(() => new Int32Array(n + 2).fill(-1))
+  for (let j = n - 1; j >= 0; j--) {
+    for (const closers of nextCloser) closers[j] = closers[j + 1]
+    const marker = markerIndex(text[j])
+    if (
+      marker >= 0 &&
+      j > 0 &&
+      !inUrl[j] &&
+      charClass[j - 1] !== CLASS_SPACE &&
+      (j + 1 >= n || charClass[j + 1] !== CLASS_WORD)
+    ) {
+      nextCloser[marker][j] = j
+    }
+  }
+
+  return { text, charClass, inUrl, lineEnd, longLine, nextCloser }
 }
 
 function pushText(nodes: WhatsAppNode[], text: string) {
@@ -74,20 +158,41 @@ function pushText(nodes: WhatsAppNode[], text: string) {
   else nodes.push({ type: 'text', text })
 }
 
-function parseInline(text: string): WhatsAppNode[] {
-  const nodes: WhatsAppNode[] = []
-  let textStart = 0
-  let i = 0
-  while (i < text.length) {
-    const ch = text[i]
-    const isMarker = ch === '`' || ch in INLINE_MARKERS
-    if (isMarker && canOpen(text, i)) {
-      const close = findClose(text, i)
-      if (close > 0) {
+function canOpen(ctx: ParseContext, i: number, end: number): boolean {
+  if (ctx.inUrl[i] || ctx.longLine[i] || i + 1 >= end) return false
+  if (ctx.charClass[i + 1] === CLASS_SPACE || ctx.text[i + 1] === ctx.text[i]) return false
+  return i === 0 || ctx.charClass[i - 1] !== CLASS_WORD
+}
+
+function findClose(ctx: ParseContext, open: number, marker: number, end: number): number {
+  const close = open + 2 < ctx.nextCloser[marker].length ? ctx.nextCloser[marker][open + 2] : -1
+  if (close < 0 || close >= end || close >= ctx.lineEnd[open]) return -1
+  return close
+}
+
+/**
+ * Parses text[start, end). A span closes at the first valid closer of its
+ * marker, so a span never contains a complete span of the same marker and
+ * nesting is at most four levels deep: each character is visited a bounded
+ * number of times.
+ */
+function parseRange(ctx: ParseContext, start: number, end: number, nodes: WhatsAppNode[] = []): WhatsAppNode[] {
+  const { text } = ctx
+  let textStart = start
+  let i = start
+  while (i < end) {
+    const marker = markerIndex(text[i])
+    if (marker >= 0 && canOpen(ctx, i, end)) {
+      const close = findClose(ctx, i, marker, end)
+      if (close >= 0) {
         pushText(nodes, text.slice(textStart, i))
-        const inner = text.slice(i + 1, close)
-        if (ch === '`') nodes.push({ type: 'code', text: inner })
-        else nodes.push({ type: INLINE_MARKERS[ch], children: parseInline(inner) })
+        if (marker === CODE_MARKER) nodes.push({ type: 'code', text: text.slice(i + 1, close) })
+        else {
+          nodes.push({
+            type: MARKER_TYPES[marker] as 'bold' | 'italic' | 'strike',
+            children: parseRange(ctx, i + 1, close),
+          })
+        }
         i = close + 1
         textStart = i
         continue
@@ -95,13 +200,22 @@ function parseInline(text: string): WhatsAppNode[] {
     }
     i++
   }
-  pushText(nodes, text.slice(textStart))
+  pushText(nodes, text.slice(textStart, end))
   return nodes
 }
 
+export interface ParseWhatsAppFormatOptions {
+  /** Lines longer than this stay plain text. */
+  maxFormattedLineLength?: number
+}
+
 /** Tokenizes WhatsApp-formatted text into a tree that renders without HTML injection. */
-export function parseWhatsAppFormat(text: string | null | undefined): WhatsAppNode[] {
+export function parseWhatsAppFormat(
+  text: string | null | undefined,
+  options: ParseWhatsAppFormatOptions = {},
+): WhatsAppNode[] {
   if (!text) return []
+  const ctx = createContext(text, options.maxFormattedLineLength ?? MAX_FORMATTED_LINE_LENGTH)
   const nodes: WhatsAppNode[] = []
   let plainStart = 0
   let i = text.indexOf(MONO_FENCE)
@@ -109,24 +223,18 @@ export function parseWhatsAppFormat(text: string | null | undefined): WhatsAppNo
     const close = text.indexOf(MONO_FENCE, i + MONO_FENCE.length)
     if (close < 0) break
     const inner = text.slice(i + MONO_FENCE.length, close)
-    if (inner.trim()) {
-      for (const node of parseInline(text.slice(plainStart, i))) {
-        if (node.type === 'text') pushText(nodes, node.text)
-        else nodes.push(node)
-      }
+    if (inner.trim() && !ctx.longLine[i]) {
+      parseRange(ctx, plainStart, i, nodes)
       nodes.push({ type: 'mono', text: inner })
       plainStart = close + MONO_FENCE.length
       i = text.indexOf(MONO_FENCE, plainStart)
     } else {
-      // "``````" or a whitespace-only block: not monospace; keep scanning
-      // from the closing fence.
+      // "``````", a whitespace-only block, or a fence on an over-long line:
+      // not monospace; keep scanning from the closing fence.
       i = close
     }
   }
-  for (const node of parseInline(text.slice(plainStart))) {
-    if (node.type === 'text') pushText(nodes, node.text)
-    else nodes.push(node)
-  }
+  parseRange(ctx, plainStart, text.length, nodes)
   return nodes
 }
 

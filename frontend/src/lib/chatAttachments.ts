@@ -273,16 +273,23 @@ export function dataTransferHasFiles(dataTransfer: DataTransfer | null | undefin
  */
 export function filesFromClipboard(clipboard: DataTransfer | null | undefined): File[] {
   if (!clipboard) return []
-  const text = clipboard.getData?.('text/plain') ?? ''
-  if (text.trim()) return []
-  const files = Array.from(clipboard.files ?? [])
-  if (files.length > 0) return files
-  // Some browsers expose pasted screenshots only through items.
-  const fromItems: File[] = []
-  for (const item of Array.from(clipboard.items ?? [])) {
-    if (item.kind !== 'file') continue
-    const file = item.getAsFile()
-    if (file) fromItems.push(file)
+  let files = Array.from(clipboard.files ?? [])
+  if (files.length === 0) {
+    // Some browsers expose pasted screenshots only through items.
+    for (const item of Array.from(clipboard.items ?? [])) {
+      if (item.kind !== 'file') continue
+      const file = item.getAsFile()
+      if (file) files.push(file)
+    }
   }
-  return fromItems
+  if (files.length === 0) return []
+  // Files win (macOS Finder puts the file name in text/plain next to the
+  // file), except for a rich-text copy: Excel/Word put text, HTML and a
+  // rendered image of the selection on the clipboard, and the agent wants
+  // the text.
+  const text = clipboard.getData?.('text/plain') ?? ''
+  const html = clipboard.getData?.('text/html') ?? ''
+  const richTextCopy = !!text.trim() && !!html.trim() && files.every(file => file.type.startsWith('image/'))
+  files = richTextCopy ? [] : files
+  return files
 }

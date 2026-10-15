@@ -349,7 +349,12 @@ describe('ChatView composer', () => {
 
     const textPaste = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent
     Object.defineProperty(textPaste, 'clipboardData', {
-      value: { getData: () => 'hello', files: [png('x.png')], items: [], types: ['text/plain'] },
+      value: {
+        getData: (type: string) => (type === 'text/html' ? '<p>hello</p>' : 'hello'),
+        files: [png('x.png')],
+        items: [],
+        types: ['text/plain', 'text/html'],
+      },
     })
     textarea.element.dispatchEvent(textPaste)
     expect(textPaste.defaultPrevented).toBe(false)

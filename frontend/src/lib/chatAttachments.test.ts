@@ -166,9 +166,9 @@ describe('helpers', () => {
 })
 
 describe('filesFromClipboard', () => {
-  function clipboard(opts: { text?: string; files?: File[]; items?: Array<{ kind: string; getAsFile: () => File | null }> }) {
+  function clipboard(opts: { text?: string; html?: string; files?: File[]; items?: Array<{ kind: string; getAsFile: () => File | null }> }) {
     return {
-      getData: (type: string) => (type === 'text/plain' ? opts.text ?? '' : ''),
+      getData: (type: string) => (type === 'text/plain' ? opts.text ?? '' : type === 'text/html' ? opts.html ?? '' : ''),
       files: opts.files ?? [],
       items: opts.items ?? [],
       types: [],
@@ -187,9 +187,11 @@ describe('filesFromClipboard', () => {
     ).toEqual([shot])
   })
 
-  it('prefers text when the clipboard holds both (e.g. cells copied from Excel)', () => {
+  it('prefers text for a rich-text copy (cells copied from Excel), but files otherwise (macOS Finder)', () => {
     const render = new File(['png'], 'image.png', { type: 'image/png' })
-    expect(filesFromClipboard(clipboard({ text: 'Qty\t2', files: [render] }))).toEqual([])
+    expect(filesFromClipboard(clipboard({ text: 'Qty\t2', html: '<table></table>', files: [render] }))).toEqual([])
+    const pdf = new File(['%PDF'], 'lab.pdf', { type: 'application/pdf' })
+    expect(filesFromClipboard(clipboard({ text: 'lab.pdf', files: [pdf] }))).toEqual([pdf])
     expect(filesFromClipboard(null)).toEqual([])
   })
 })
