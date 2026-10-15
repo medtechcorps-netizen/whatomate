@@ -324,7 +324,11 @@ def _snapshot(client, request, steps, observed, *, retain=False, retention_limit
             _need(run["id"] == rid and run["attempt"] == number and run["number"] == latest["number"]
                   and run["event"] == latest["event"] and run["created"] == latest["created"], "collect-attempt")
             if number == latest["attempt"]:
-                _need(run == latest, "collect-latest-changed")
+                # List and attempt endpoints have distinct update clocks. Both
+                # stay in the snapshot; only cross-endpoint identity excludes them.
+                _need(run.keys() == latest.keys()
+                      and all(value == latest[key] for key, value in run.items()
+                              if key != "updated"), "collect-latest-changed")
             raw_jobs = _pages(client, API + f"/actions/runs/{rid}/attempts/{number}/jobs?", "jobs", 4)
             raw_checks = _pages(client, API + f"/check-suites/{run['suite']}/check-runs?filter=all", "check_runs", 4*latest["attempt"])
             checks = {c["id"]:c for c in raw_checks}
@@ -545,7 +549,11 @@ def _outage_snapshot(snapshot, workflow):
               and run['number'] == latest['number'] and run['event'] == latest['event']
               and run['created'] == latest['created'], 'outage-history-run')
         if attempt.run_attempt == latest['attempt']:
-            _need(value['run'] == listings[attempt.run_id], 'outage-history-latest')
+            # Match the collector without changing either retained raw timestamp.
+            listing = listings[attempt.run_id]
+            _need(value['run'].keys() == listing.keys()
+                  and all(item == listing[key] for key, item in value['run'].items()
+                          if key != 'updated_at'), 'outage-history-latest')
         for jid in result.job_ids:
             _need(jid not in jobs, 'outage-history-job-duplicate'); jobs.add(jid)
         for cid in result.check_ids:

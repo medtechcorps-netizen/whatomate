@@ -472,3 +472,117 @@ class CurrentWorkflowTransitionTests(unittest.TestCase):
         with harness(world) as (world, repo, options):
             with self.assertRaises(evidence.CompatRefusal): execute(world,repo,options)
         self.assertFalse(any(a[1:3]==['attestation','verify'] for a,_ in world.trace))
+
+
+
+class RollbackRunMetadataEndpointTests(unittest.TestCase):
+    def world(self, *, negative=False, list_seconds=0, attempt_seconds=1):
+        world = World(); world.add(server_false='workers' if negative else None)
+        world.runs[100] = copy.deepcopy(world.runs[100])
+        updated = envelope._date(world.runs[100]['updated_at'])
+        world.runs[100]['updated_at'] = actions.stamp(updated + timedelta(seconds=list_seconds))
+        world.attempts[100, 1]['updated_at'] = actions.stamp(updated + timedelta(seconds=attempt_seconds))
+        return world
+
+    def test_stable_endpoint_updates_are_preserved_in_rollback_snapshots_and_commitments(self):
+        for listing, attempt in ((0, 0), (0, 1), (120, 1)):
+            world = self.world(list_seconds=listing, attempt_seconds=attempt)
+            captured = []
+            original = collect._snapshot
+            def snapshot(*args, **kwargs):
+                result = original(*args, **kwargs)
+                captured.append(result)
+                return result
+            with self.subTest(listing=listing, attempt=attempt), harness(world) as (w, repo, options):
+                with mock.patch.object(collect, '_snapshot', side_effect=snapshot):
+                    result = execute(w, repo, options)
+                self.assertEqual(qualify(w, result).binding, w.binding)
+                self.assertEqual(result.history.enumeration, 'complete-visible')
+                self.assertEqual(result.issues, ())
+                self.assertEqual(w.workflow_reads, 2)
+                self.assertEqual(len(captured), 2)
+                self.assertEqual(captured[0], captured[1])
+                listing_raw = json.loads(captured[0].inventory)
+                attempt_raw = json.loads(captured[0].rows[0].envelope.raw)
+                self.assertEqual(listing_raw['runs'][0]['updated_at'], w.runs[100]['updated_at'])
+                self.assertEqual(attempt_raw['run']['updated_at'], w.attempts[100, 1]['updated_at'])
+                original_commit = collect._commit(captured[0])
+                listing_raw['runs'][0]['updated_at'] = actions.stamp(NOW)
+                changed_listing = replace(captured[0], inventory=collect.common.canonical_file_bytes(listing_raw))
+                self.assertNotEqual(collect._commit(changed_listing), original_commit)
+                attempt_raw['run']['updated_at'] = actions.stamp(NOW)
+                changed_fact = envelope.EnvelopeFacts(collect.common.canonical_file_bytes(attempt_raw))
+                changed_row = replace(captured[0].rows[0], envelope=changed_fact)
+                self.assertNotEqual(collect._commit(replace(captured[0], rows=(changed_row,))), original_commit)
+
+    def test_rollback_update_drift_in_either_or_both_endpoints_remains_incomplete(self):
+        for endpoint in ('listing', 'attempt', 'both'):
+            world = self.world()
+            def change(path, value):
+                if world.workflow_reads == 2:
+                    if endpoint in ('listing', 'both') and 'workflow_runs' in value:
+                        for row in value['workflow_runs']:
+                            row['updated_at'] = actions.stamp(envelope._date(row['updated_at']) + timedelta(seconds=1))
+                    if endpoint in ('attempt', 'both') and path.endswith('/attempts/1'):
+                        value['updated_at'] = actions.stamp(envelope._date(value['updated_at']) + timedelta(seconds=1))
+                return value
+            world.hook = change
+            with self.subTest(endpoint=endpoint), harness(world) as (w, repo, options):
+                result = execute(w, repo, options)
+                self.assertEqual(w.workflow_reads, 2)
+                self.assertEqual(result.history.enumeration, 'incomplete')
+                self.assertIn('inventory-changed', result.issues)
+                with self.assertRaises(evidence.CompatRefusal):
+                    qualify(w, result)
+
+    def test_rollback_non_update_fields_still_require_exact_latest_identity(self):
+        for key, value in (('run_number', 999), ('check_suite_id', 999), ('conclusion', 'cancelled')):
+            world = self.world(); world.attempts[100, 1][key] = value
+            with self.subTest(key=key), harness(world) as (w, repo, options):
+                with self.assertRaises(evidence.CompatRefusal):
+                    execute(w, repo, options)
+                self.assertFalse(any('/zip' in arg for argv, _ in w.trace for arg in argv))
+
+    def test_rollback_each_endpoint_update_remains_valid_ordered_and_not_future(self):
+        for endpoint in ('listing', 'attempt'):
+            for kind in ('absent', 'boolean', 'malformed', 'future', 'before-start'):
+                world = self.world()
+                row = world.runs[100] if endpoint == 'listing' else world.attempts[100, 1]
+                updated = {'absent':None, 'boolean':True, 'malformed':'tomorrow',
+                           'future':actions.stamp(NOW + timedelta(seconds=1)),
+                           'before-start':actions.stamp(envelope._date(row['run_started_at']) - timedelta(seconds=1))}[kind]
+                row['updated_at'] = updated
+                with self.subTest(endpoint=endpoint, kind=kind), harness(world) as (w, repo, options):
+                    with self.assertRaises(evidence.CompatRefusal):
+                        execute(w, repo, options)
+                    self.assertFalse(any('/zip' in arg for argv, _ in w.trace for arg in argv))
+
+    def test_rollback_authentic_negative_with_distinct_updates_remains_a_veto(self):
+        world = self.world(negative=True)
+        with harness(world) as (w, repo, options):
+            result = execute(w, repo, options)
+            self.assertEqual(result.history.enumeration, 'complete-visible')
+            self.assertIsInstance(result.history.attempts[0].measurement, evidence.AuthenticatedPair)
+            with self.assertRaises(evidence.CompatRefusal) as caught:
+                qualify(w, result)
+            self.assertEqual(caught.exception.code, 'compat-old-server-incompatible')
+
+    def test_rollback_retains_authenticated_negative_on_either_endpoint_update_drift(self):
+        for endpoint in ('listing', 'attempt'):
+            world = self.world(negative=True)
+            def change(path, value):
+                if world.workflow_reads == 2:
+                    if endpoint == 'listing' and 'workflow_runs' in value:
+                        for row in value['workflow_runs']:
+                            row['updated_at'] = actions.stamp(envelope._date(row['updated_at']) + timedelta(seconds=1))
+                    if endpoint == 'attempt' and path.endswith('/attempts/1'):
+                        value['updated_at'] = actions.stamp(envelope._date(value['updated_at']) + timedelta(seconds=1))
+                return value
+            world.hook = change
+            with self.subTest(endpoint=endpoint), harness(world) as (w, repo, options):
+                result = execute(w, repo, options)
+                self.assertEqual(result.history.enumeration, 'incomplete')
+                self.assertIn('inventory-changed', result.issues)
+                self.assertIsInstance(result.history.attempts[0].measurement, evidence.AuthenticatedPair)
+                with self.assertRaises(evidence.CompatRefusal):
+                    qualify(w, result)

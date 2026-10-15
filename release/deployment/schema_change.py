@@ -564,8 +564,10 @@ def _added_numbered(repo_dir: Path, base: str, head: str, path: str):
 def _registry_changes(repo: _Repository, base: str, head: str, reasons: set[str], summary: list[str]) -> bool:
     old = repo.document(base, REGISTRY, _registry, optional=True)
     new = repo.document(head, REGISTRY, _registry, optional=True)
-    commits = _git(repo.root, ["rev-list", "--first-parent", "--reverse", f"{base}..{head}"]).splitlines()
+    history_raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", f"{base}..{head}"])
+    commits = history_raw.splitlines()
     _valid(len(commits) <= MAX_HISTORY_COMMITS)
+    _pr18_run_metadata_remember_history(repo, base, head, history_raw)
     introduced = old is not None
     prior = {row["id"]: row for row in old or []}
     for raw in commits:
@@ -637,8 +639,10 @@ def _migration_contract(repo: _Repository, base: str, head: str, reasons: set[st
                and re.fullmatch(r"[0-9a-f]{64}", row["closure_sha256"]) is not None)
     old = repo.document(base, MIGRATION_PATH, validate, optional=True)
     new = repo.document(head, MIGRATION_PATH, validate, optional=True)
-    commits = _git(repo.root, ["rev-list", "--first-parent", "--reverse", f"{base}..{head}"]).splitlines()
+    history_raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", f"{base}..{head}"])
+    commits = history_raw.splitlines()
     _valid(len(commits) <= MAX_HISTORY_COMMITS)
+    _pr18_run_metadata_remember_history(repo, base, head, history_raw)
     introduced = old is not None
     for raw in commits:
         revision = raw.decode("ascii")
@@ -1259,6 +1263,12 @@ def _classify_v2(repo: _Repository, base: str, head: str,
         section = "pr18-managed-owner-repair"
         if _pr18_managed_owner_changed(repo, base, head):
             _pr18_managed_owner_local(repo, base, head)
+        section = "pr18-run-metadata-repair"
+        # An existing classifier-invalid refusal is never cleared below. Keep
+        # its original validation/error ownership instead of adding a new scan.
+        if (not any(reason.startswith("classifier-invalid:") for reason in legacy.reasons)
+                and _pr18_run_metadata_changed(repo, base, head)):
+            _pr18_run_metadata_local(repo, base, head)
         section = "nullable-source"
         declaration = repo.blob(head, schema_nullable.SOURCE_PATH)
         section = "constant-source"
@@ -1902,6 +1912,177 @@ def _pr18_managed_owner_local(repo, base, head):
     _valid(repaired)
 
 
+# One exact run-metadata consistency repair after the historical managed edge.
+_PR18_RUN_METADATA_REPAIR_POLICY_SHA256 = '46fc37c0f5717fc2688434884c359a6b23db492a8062c7bb1307b4af00d070e6'
+_PR18_RUN_METADATA_REPAIR_REASON = "pr18-run-metadata-repair-incomplete"
+_PR18_RUN_METADATA_REPAIR_FILES = {'release/deployment/compat_collect.py': ('b4a9d1a38be1900cb3bc9b895ee3f10f231f9726106730f243f7f779d5455b69',
+                                          '716667cbcc15af9bbc15b21cd8f15976429502a4c99219662d2f0f232e5363ec'),
+ 'release/deployment/compat_rollback_collect.py': ('21eb2ddce2b6d12cb90b10331262f5d0382845b544cf9c4769e48873b78faf6d',
+                                                   '519177f147065c3cd9445ed7c614c85f537e04a6d041da1fecf0fdf84dde7ba6'),
+ 'release/deployment/schema_change.py': ('39f5cc68495cb53ab01129ad40d0817bbf796b6cff173644a0ac5028937bccf6',
+                                         'reviewed-run-metadata-policy-slot'),
+ 'release/deployment/test_compat_collect.py': ('4fe4620d576a317cae9265fbf4001e28d14a21514d37513b8d7eb651554426e3',
+                                               'c73010ee0544470b37816d21a2d06243fa551fba66d505d651924c1319d279e3'),
+ 'release/deployment/test_compat_rollback_collect.py': ('b4f984089d57a9dc2fc5ebc790e692f2b693538e91508ad547b33a9cbfaa0a6e',
+                                                        'cb24389b719dc04b442d6116962cd1d0441f446274ea51c0f328f70983b2c8ca'),
+ 'release/deployment/test_pr18_managed_owner_repair.py': ('c0d7253bbd3f3873ef659710d01275d5264dbaa11203a76f2a78ac0e0b805f8e',
+                                                          '9aeae54eb05bf150b7db3d82622698388cf149196c60091163527531d8bcb70c'),
+ 'release/deployment/test_pr18_run_metadata_repair.py': (None,
+                                                         'ebd8f028d75e8ad095ffc031ab02e8bbe078a8dadbadf17d5ede80d2d163b49f'),
+ 'release/deployment/test_ship_outage_compat.py': ('7c784099e2b0a07d696fca19323db40755fef2b2adf5b7b3435f507253fabcce',
+                                                  '151d087b92a362ee5e6de8469e56dd51332a238e11d5ffd94178eb8192cdb134')}
+
+
+def _pr18_run_metadata_blob(repo, revision, path, digest):
+    if digest != "reviewed-run-metadata-policy-slot":
+        return _pr18_observer_blob(repo, revision, path, digest)
+    _valid(path == _PR18_VERIFICATION_REPAIR_POLICY)
+    raw = repo._tree(revision, path)
+    _valid(re.fullmatch(rb"100644 blob [0-9a-f]{40}\t" + re.escape(path.encode()) + rb"\x00", raw) is not None)
+    value = repo.blob(revision, path)
+    _valid(type(value) is bytes and bool(value))
+    slot = re.compile(rb"(?m)^_PR18_RUN_METADATA_REPAIR_POLICY_SHA256 = '([0-9a-f]{64})'\n")
+    matches = list(slot.finditer(value))
+    _valid(len(matches) == 1)
+    match = matches[0]
+    _valid(match.group(1).decode("ascii") == _PR18_RUN_METADATA_REPAIR_POLICY_SHA256)
+    canonical = value[:match.start(1)] + b"0" * 64 + value[match.end(1):]
+    _valid(hashlib.sha256(canonical).hexdigest() == _PR18_RUN_METADATA_REPAIR_POLICY_SHA256)
+    return value
+
+
+def _pr18_run_metadata_before(repo, revision):
+    _valid(len(_PR18_RUN_METADATA_REPAIR_FILES) == 8)
+    # Later fixed edges supersede overlapping historical postimages. In
+    # particular, never validate the managed policy using the older slot.
+    expected = {path: digest for path, (_, digest) in _PR18_OBSERVER_FILES.items()}
+    expected.update({path: digest for path, (_, digest) in _PR18_VERIFICATION_REPAIR_FILES.items()})
+    expected.update({path: digest for path, (_, digest) in _PR18_MANAGED_OWNER_FILES.items()})
+    for path, digest in expected.items():
+        _pr18_managed_owner_blob(repo, revision, path, digest)
+    for path, digest in _PR18_OBSERVER_PROTECTED.items():
+        _pr18_observer_blob(repo, revision, path, digest)
+    _pr18_observer_blob(repo, revision, DORMANT,
+                       "041af21a905dd160657431d8a4482d8f52f162f312d4cc9148a071400bbd508d")
+    _pr18_observer_blob(repo, revision, "internal/dbcatalog/registry/coordinator_bindings.json",
+                       "ecc49fb74995dcd121a645fd139ebff2fdc9e22bd2a1b01df91a3eb4e24daee4")
+    _valid(not _git(repo.root, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING.rstrip("/")]))
+    for path in (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
+                 schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH):
+        _pr18_observer_blob(repo, revision, path, None)
+    for path, (digest, _) in _PR18_RUN_METADATA_REPAIR_FILES.items():
+        _pr18_observer_blob(repo, revision, path, digest)
+
+
+def _pr18_run_metadata_remember_history(repo, base, head, raw):
+    """Retain a successful immutable read, without replacing its old caller."""
+    if (not all(type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value)
+                for value in (base, head))
+            or type(raw) is not bytes or len(raw) > MAX_HISTORY_COMMITS * 41):
+        return
+    try:
+        revisions = raw.decode("ascii").splitlines()
+    except UnicodeError:
+        return
+    if (len(revisions) > MAX_HISTORY_COMMITS or len(revisions) != len(set(revisions))
+            or not all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+            or not ((base == head and not revisions)
+                    or (base != head and revisions and revisions[-1] == head))):
+        return
+    # Both legacy callers still perform their original reads and validation.
+    # This is invocation-local read custody, not cached admission or failure.
+    key = (base, head)
+    retained = getattr(repo, "_run_metadata_history_reads", {})
+    _valid(key not in retained or retained[key] == raw)
+    retained[key] = raw
+    repo._run_metadata_history_reads = retained
+
+
+def _pr18_run_metadata_changed(repo, base, head):
+    if base == head or not _PR18_RUN_METADATA_REPAIR_FILES:
+        return False
+    _valid(all(type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value)
+               for value in (base, head)))
+    key = (base, head)
+    checked = getattr(repo, "_run_metadata_introductions_checked", set())
+    if key in checked:
+        # The invocation-local success cache never replaces the active reader's
+        # deadline/failure checks, and never accepts mutable revision aliases.
+        _valid(_git(repo.root, ["cat-file", "-t", base]) == b"commit\n")
+        return False
+    marker, = (path for path, (old, _) in _PR18_RUN_METADATA_REPAIR_FILES.items()
+               if old is None)
+    if repo._tree(base, marker):
+        # A completed/marked base has no permanent path reservation.
+        _valid(_git(repo.root, ["cat-file", "-t", base]) == b"commit\n")
+        checked.add(key)
+        repo._run_metadata_introductions_checked = checked
+        return False
+    # This exact historical blob OID is only a cheap negative discriminator.
+    # A match still requires the complete before-profile and SHA256 proof.
+    policy_tree = (b"100644 blob 02e2dee827a2e1ce3109cdd5229cc3c511183989\t"
+                   + _PR18_VERIFICATION_REPAIR_POLICY.encode() + b"\x00")
+    before = False
+    if repo._tree(base, _PR18_VERIFICATION_REPAIR_POLICY) == policy_tree:
+        try:
+            _pr18_run_metadata_before(repo, base)
+        except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+            pass
+        else:
+            before = True
+    if not before:
+        raw = getattr(repo, "_run_metadata_history_reads", {}).get(key)
+        if raw is None:
+            raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+        else:
+            # Reuse is confined to this invocation and the current source reader.
+            _valid(_git(repo.root, ["cat-file", "-t", base]) == b"commit\n")
+        _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+        revisions = raw.decode("ascii").splitlines()
+        _valid(len(revisions) <= MAX_HISTORY_COMMITS and len(revisions) == len(set(revisions))
+               and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+               and (not revisions or revisions[-1] == head))
+        # Absence grants no repair authority or new ordinary-lineage rule.
+        # Only a range containing the marker needs the strict edge proof.
+        if any(repo._tree(revision, marker) for revision in revisions):
+            present = False
+            # Endpoint equality cannot hide introduction followed by undo.
+            for prior, revision in _pr18_verification_repair_history(repo, base, head):
+                now = bool(repo._tree(revision, marker))
+                if now and not present:
+                    _pr18_run_metadata_edge(repo, prior, revision)
+                present = now
+        checked.add(key)
+        repo._run_metadata_introductions_checked = checked
+        return False
+    if any(path in _PR18_RUN_METADATA_REPAIR_FILES for _, path in changed_paths(repo.root, base, head)):
+        return True
+    # Observe complete undo as well as net changes before clean fast returns.
+    return any(path in _PR18_RUN_METADATA_REPAIR_FILES
+               for prior, revision in _pr18_verification_repair_history(repo, base, head)
+               for _, path in changed_paths(repo.root, prior, revision))
+
+
+def _pr18_run_metadata_edge(repo, base, head):
+    _pr18_run_metadata_before(repo, base)
+    expected = sorted(("A" if old is None else "M", path)
+                      for path, (old, _) in _PR18_RUN_METADATA_REPAIR_FILES.items())
+    _valid(sorted(changed_paths(repo.root, base, head)) == expected)
+    for path, (_, digest) in _PR18_RUN_METADATA_REPAIR_FILES.items():
+        _pr18_run_metadata_blob(repo, head, path, digest)
+
+
+def _pr18_run_metadata_local(repo, base, head):
+    _pr18_run_metadata_before(repo, base)
+    repaired = False
+    for prior, revision in _pr18_verification_repair_history(repo, base, head):
+        if changed_paths(repo.root, prior, revision):
+            _valid(not repaired)
+            _pr18_run_metadata_edge(repo, prior, revision)
+            repaired = True
+    _valid(repaired)
+
+
 def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                              *, ci: bool = False) -> tuple[str, str]:
     """Prove one exact transition without calling either classifier or CI.
@@ -1924,7 +2105,7 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                       for path, (old, _) in _PR18_OBSERVER_FILES.items())
     descriptors = (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
                    schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH)
-    prior, prior_state, anchor, repaired, managed = None, None, None, False, False
+    prior, prior_state, anchor, repaired, managed, metadata_repaired = None, None, None, False, False, False
     for revision in (base, *revisions):
         if prior is not None:
             _valid(_git(repo.root, ["rev-parse", "--verify", revision + "^1"]) == prior.encode() + b"\n")
@@ -1967,10 +2148,13 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                 if not repaired:
                     _pr18_verification_repair_edge(repo, prior, revision)
                     repaired = True
-                else:
-                    _valid(not managed)
+                elif not managed:
                     _pr18_managed_owner_edge(repo, prior, revision)
                     managed = True
+                else:
+                    _valid(not metadata_repaired)
+                    _pr18_run_metadata_edge(repo, prior, revision)
+                    metadata_repaired = True
             elif ci or state == 2:
                 _valid(not changes)
         prior, prior_state = revision, state
@@ -2047,6 +2231,20 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
             return ()
     except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
         return tuple(sorted(set(legacy.reasons) | {_PR18_MANAGED_OWNER_REASON}))
+    try:
+        # An existing classifier-invalid refusal is never cleared below. Keep
+        # its original validation/error ownership instead of adding a new scan.
+        if (not any(reason.startswith("classifier-invalid:") for reason in legacy.reasons)
+                and _pr18_run_metadata_changed(repo, base, head)):
+            _pr18_run_metadata_local(repo, base, head)
+            _valid(not legacy.reasons and legacy.kind == "none" and legacy.dormant is False)
+            policy = _classify_v2(repo, base, head, legacy)
+            _valid(not policy.reasons and policy.kind == "none" and policy.dormant is False
+                   and policy.requirements == _PR18_OBSERVER_REQUIREMENTS
+                   and policy.migration_changes == ())
+            return ()
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {_PR18_RUN_METADATA_REPAIR_REASON}))
     # This fixed target must not disappear behind the legacy clean fast path
     # when its generated manifest or paired registry revisions are stale.
     try:

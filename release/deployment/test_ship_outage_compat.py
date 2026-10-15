@@ -81,7 +81,10 @@ class OutageCase:
                     # tracked caches are installed explicitly by tests below.
                     if path.is_file() and "__pycache__" not in path.parts and path.suffix not in (".pyc", ".pyo"):
                         relative = path.relative_to(source.ROOT).as_posix()
-                        for sha in (self.producer, self.sha): self.world.files[sha, relative] = path.read_bytes()
+                        # Model tooling already present at the synthetic database
+                        # origin; full closure is not a new finite repair at H.
+                        for sha in (self.origin["sha"], self.producer, self.sha):
+                            self.world.files[sha, relative] = path.read_bytes()
         for path, raw in files.items(): self._install_blob(path, raw)
         self.namespace_response = lambda sha, raw: raw
         # One shared Git seam serves both direct resolver captures and the

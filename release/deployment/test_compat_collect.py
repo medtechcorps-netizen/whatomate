@@ -1146,3 +1146,176 @@ class WorkflowTransitionTests(unittest.TestCase):
         self.assertEqual(collect.WORKFLOW_SHA256, P_WORKFLOW_SHA256)
         self.assertEqual((WORKFLOW, REQUEST), original)
         self.assertEqual(hashlib.sha256(WORKFLOW).hexdigest(), P_WORKFLOW_SHA256)
+
+
+
+class RunMetadataEndpointTests(unittest.TestCase):
+    """Endpoint update clocks remain distinct, validated and snapshot-stable."""
+    def world(self, *, negative=False, list_seconds=0, attempt_seconds=1):
+        world = World(); world.add(negative=negative)
+        # World normally aliases these dictionaries; model two independent API rows.
+        world.runs[100] = copy.deepcopy(world.runs[100])
+        updated = collect._date(world.runs[100]['updated_at'])
+        world.runs[100]['updated_at'] = stamp(updated + timedelta(seconds=list_seconds))
+        world.attempts[100, 1]['updated_at'] = stamp(updated + timedelta(seconds=attempt_seconds))
+        return world
+
+    def retained(self, world):
+        with harness(world) as (world, client, scratch):
+            result = collect.collect_outage_history(REQUEST, client, scratch, wall_clock=lambda:NOW)
+        self.assertEqual(world.workflow_reads, 2)
+        return result
+
+    def test_stable_endpoint_updates_are_both_preserved_in_normal_snapshots(self):
+        for listing, attempt in ((0, 0), (0, 1), (120, 1)):
+            world = self.world(list_seconds=listing, attempt_seconds=attempt)
+            captured = []
+            original = collect._snapshot
+            def snapshot(*args, **kwargs):
+                result = original(*args, **kwargs)
+                captured.append(result[1])
+                return result
+            with self.subTest(listing=listing, attempt=attempt), harness(world) as (w, c, scratch):
+                with mock.patch.object(collect, '_snapshot', side_effect=snapshot):
+                    result = execute(c, scratch)
+                self.assertEqual(qualify(result).run_id, 100)
+                self.assertEqual(result.history.enumeration, 'complete-visible')
+                self.assertEqual(result.issues, ())
+                self.assertEqual(w.workflow_reads, 2)
+                self.assertEqual(len(captured), 2)
+                self.assertEqual(captured[0], captured[1])
+                self.assertEqual(captured[0][1][100]['updated'], collect._date(w.runs[100]['updated_at']))
+                self.assertEqual(captured[0][2][0][0]['updated'], collect._date(w.attempts[100, 1]['updated_at']))
+                self.assertEqual(len([a for a, _ in w.calls if a[1:3] == ['attestation', 'verify']]), 2)
+
+    def test_second_snapshot_update_change_in_either_or_both_endpoints_refuses(self):
+        for endpoint in ('listing', 'attempt', 'both'):
+            world = self.world()
+            def change(path, value):
+                if world.workflow_reads == 2:
+                    if endpoint in ('listing', 'both') and 'workflow_runs' in value:
+                        for row in value['workflow_runs']:
+                            row['updated_at'] = stamp(collect._date(row['updated_at']) + timedelta(seconds=1))
+                    if endpoint in ('attempt', 'both') and path.endswith('/attempts/1'):
+                        value['updated_at'] = stamp(collect._date(value['updated_at']) + timedelta(seconds=1))
+                return value
+            world.hook = change
+            with self.subTest(endpoint=endpoint), harness(world) as (w, c, scratch):
+                result = execute(c, scratch)
+                self.assertEqual(w.workflow_reads, 2)
+                self.assertEqual(result.history.enumeration, 'incomplete')
+                self.assertIn('inventory-changed', result.issues)
+                with self.assertRaises(evidence.CompatRefusal):
+                    qualify(result)
+
+    def test_other_latest_attempt_fields_still_require_equality(self):
+        for key, value in (('run_number', 11), ('check_suite_id', 100002),
+                           ('created_at', stamp(fixture.T0 + timedelta(minutes=9))),
+                           ('run_started_at', stamp(fixture.T0 + timedelta(minutes=10, seconds=2))),
+                           ('conclusion', 'cancelled'), ('head_sha', fixture.OTHER)):
+            world = self.world(); world.attempts[100, 1][key] = value
+            with self.subTest(key=key), harness(world) as (w, c, scratch):
+                with self.assertRaises(evidence.CompatRefusal):
+                    execute(c, scratch)
+                self.assertFalse(any('/zip' in arg for argv, _ in w.calls for arg in argv))
+
+    def test_each_endpoint_update_still_requires_valid_bounded_ordered_time(self):
+        for endpoint in ('listing', 'attempt'):
+            for updated in (None, True, 'tomorrow', stamp(NOW + timedelta(seconds=1)),
+                            stamp(fixture.T0), stamp(fixture.T0 + timedelta(minutes=10))):
+                world = self.world()
+                row = world.runs[100] if endpoint == 'listing' else world.attempts[100, 1]
+                row['updated_at'] = updated
+                with self.subTest(endpoint=endpoint, updated=updated), harness(world) as (w, c, scratch):
+                    with self.assertRaises(evidence.CompatRefusal):
+                        execute(c, scratch)
+                    self.assertFalse(any('/zip' in arg for argv, _ in w.calls for arg in argv))
+
+    def test_distinct_update_clocks_do_not_hide_authentic_negative(self):
+        world = self.world(negative=True)
+        with harness(world) as (w, c, scratch):
+            result = execute(c, scratch)
+            self.assertEqual(result.history.enumeration, 'complete-visible')
+            self.assertIsInstance(result.history.attempts[0].measurement, evidence.AuthenticatedPair)
+            with self.assertRaisesRegex(evidence.CompatRefusal, 'compat-old-server-incompatible'):
+                qualify(result)
+            self.assertEqual(evidence.assess_bypass_history(fixture.SHA, result.history).state,
+                             evidence.BypassState.VETO_AUTHENTICATED_NEGATIVE)
+
+    def test_authentic_negative_survives_either_endpoint_update_drift(self):
+        for endpoint in ('listing', 'attempt'):
+            world = self.world(negative=True)
+            def change(path, value):
+                if world.workflow_reads == 2:
+                    if endpoint == 'listing' and 'workflow_runs' in value:
+                        for row in value['workflow_runs']:
+                            row['updated_at'] = stamp(collect._date(row['updated_at']) + timedelta(seconds=1))
+                    if endpoint == 'attempt' and path.endswith('/attempts/1'):
+                        value['updated_at'] = stamp(collect._date(value['updated_at']) + timedelta(seconds=1))
+                return value
+            world.hook = change
+            with self.subTest(endpoint=endpoint), harness(world) as (w, c, scratch):
+                result = execute(c, scratch)
+                self.assertEqual(result.history.enumeration, 'incomplete')
+                self.assertIn('inventory-changed', result.issues)
+                self.assertIsInstance(result.history.attempts[0].measurement, evidence.AuthenticatedPair)
+                self.assertEqual(evidence.assess_bypass_history(fixture.SHA, result.history).state,
+                                 evidence.BypassState.VETO_AUTHENTICATED_NEGATIVE)
+
+    def test_retained_replay_preserves_both_raw_updates_without_schema_change(self):
+        world = self.world()
+        result = self.retained(world)
+        self.assertEqual(qualify(result.normal).run_id, 100)
+        for snapshot in (result.before, result.after):
+            listing = json.loads(snapshot.runs)[0]
+            attempt = json.loads(snapshot.attempts[0].raw)['run']
+            self.assertEqual(listing['updated_at'], world.runs[100]['updated_at'])
+            self.assertEqual(attempt['updated_at'], world.attempts[100, 1]['updated_at'])
+            self.assertNotEqual(listing['updated_at'], attempt['updated_at'])
+        self.assertIs(collect.validate_outage_history(result, workflow=WORKFLOW, producer_sha=fixture.SHA), result)
+
+    def test_retained_endpoint_update_change_between_snapshots_refuses(self):
+        for endpoint in ('listing', 'attempt'):
+            world = self.world()
+            def change(path, value):
+                if world.workflow_reads == 2:
+                    if endpoint == 'listing' and 'workflow_runs' in value:
+                        for row in value['workflow_runs']:
+                            row['updated_at'] = stamp(collect._date(row['updated_at']) + timedelta(seconds=1))
+                    if endpoint == 'attempt' and path.endswith('/attempts/1'):
+                        value['updated_at'] = stamp(collect._date(value['updated_at']) + timedelta(seconds=1))
+                return value
+            world.hook = change
+            with self.subTest(endpoint=endpoint), harness(world) as (w, c, scratch):
+                with self.assertRaises(evidence.CompatRefusal):
+                    collect.collect_outage_history(REQUEST, c, scratch, wall_clock=lambda:NOW)
+                self.assertEqual(w.workflow_reads, 2)
+
+    def test_retained_replay_still_rejects_non_update_endpoint_difference(self):
+        result = self.retained(self.world())
+        raw = json.loads(result.before.attempts[0].raw)
+        raw['run']['run_started_at'] = stamp(collect._date(raw['run']['run_started_at']) + timedelta(seconds=1))
+        facts = (collect.envelope.EnvelopeFacts(fixture.canonical(raw)),)
+        changed = replace(result, before=replace(result.before, attempts=facts),
+                          after=replace(result.after, attempts=facts))
+        with self.assertRaises(evidence.CompatRefusal) as caught:
+            collect.validate_outage_history(changed, workflow=WORKFLOW, producer_sha=fixture.SHA)
+        self.assertEqual(caught.exception.detail, 'outage-history-latest')
+
+    def test_each_retained_update_is_bound_to_the_observation_commitment(self):
+        result = self.retained(self.world())
+        for endpoint in ('listing', 'attempt'):
+            if endpoint == 'listing':
+                rows = json.loads(result.before.runs)
+                rows[0]['updated_at'] = stamp(collect._date(rows[0]['updated_at']) + timedelta(seconds=1))
+                raw = fixture.canonical(rows)
+                before, after = replace(result.before, runs=raw), replace(result.after, runs=raw)
+            else:
+                row = json.loads(result.before.attempts[0].raw)
+                row['run']['updated_at'] = stamp(collect._date(row['run']['updated_at']) + timedelta(seconds=1))
+                facts = (collect.envelope.EnvelopeFacts(fixture.canonical(row)),)
+                before, after = replace(result.before, attempts=facts), replace(result.after, attempts=facts)
+            changed = replace(result, before=before, after=after)
+            with self.subTest(endpoint=endpoint), self.assertRaises(evidence.CompatRefusal) as caught:
+                collect.validate_outage_history(changed, workflow=WORKFLOW, producer_sha=fixture.SHA)
+            self.assertEqual(caught.exception.detail, 'outage-history-observation')
