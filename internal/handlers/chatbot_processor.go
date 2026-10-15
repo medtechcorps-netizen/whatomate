@@ -3997,8 +3997,10 @@ func (a *App) persistIncomingMessageWithFlow(account *models.WhatsAppAccount, co
 				preview, eventContent = "[deleted]", ""
 			} else if msgType != "text" && msgType != "button_reply" && msgType != "nfm_reply" {
 				preview = "[" + msgType + "]"
-			} else if len(preview) > 100 {
-				preview = preview[:97] + "..."
+			} else {
+				// Rune-safe: a byte cut inside an emoji is invalid UTF-8 and fails the
+				// whole inbound persist, which Meta then redelivers indefinitely.
+				preview = truncateString(preview, 100)
 			}
 			if err := tx.Model(&canonicalContact).Updates(map[string]any{
 				"last_message_at": now, "last_message_preview": preview, "is_read": false,

@@ -846,11 +846,8 @@ func inboundContinuationError(err error) string {
 		return ""
 	}
 	const maxLength = 2000
-	value := err.Error()
-	if len(value) > maxLength {
-		return value[:maxLength]
-	}
-	return value
+	// Rune-safe so a stored error never contains a split multi-byte character.
+	return truncateString(err.Error(), maxLength)
 }
 
 func cloneInboundContinuationJSONB(source models.JSONB) models.JSONB {

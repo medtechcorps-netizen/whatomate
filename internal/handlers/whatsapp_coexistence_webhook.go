@@ -2508,10 +2508,10 @@ func coexistenceMessageTime(timestamp string, fallback time.Time) time.Time {
 }
 
 func coexistenceMessagePreview(messageType, content string) string {
-	preview := content
-	if len(preview) > 100 {
-		preview = preview[:97] + "..."
-	}
+	// Truncate by rune, never by byte: cutting a multi-byte character (an emoji
+	// at byte 97) produced invalid UTF-8 that PostgreSQL rejects, failing the
+	// whole coexistence history/echo write and its retries.
+	preview := truncateString(content, 100)
 	if messageType != "text" && messageType != "button_reply" && messageType != "nfm_reply" {
 		preview = "[" + messageType + "]"
 	}
