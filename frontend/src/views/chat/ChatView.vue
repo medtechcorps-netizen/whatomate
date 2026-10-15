@@ -120,6 +120,9 @@ import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNo
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 import MessageActions from '@/components/chat/MessageActions.vue'
 import MessageContextMenu from '@/components/chat/MessageContextMenu.vue'
+import ForwardMessageDialog from '@/components/chat/ForwardMessageDialog.vue'
+import ForwardedChip from '@/components/chat/ForwardedChip.vue'
+import { isForwardedMessage } from '@/components/chat/messageForward'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
 import MediaSendDialog from '@/components/chat/MediaSendDialog.vue'
@@ -1854,6 +1857,21 @@ function replyToMessage(message: Message) {
   })
 }
 
+// Forward: a new outbound message per target, built server-side.
+const canForwardMessages = computed(() => authStore.hasPermission('chat', 'write'))
+const forwardingMessage = ref<Message | null>(null)
+const isForwardDialogOpen = ref(false)
+const forwardPreview = computed(() => {
+  const message = forwardingMessage.value
+  if (!message) return ''
+  return getMessageContent(message) || `[${message.message_type}]`
+})
+
+function openForwardDialog(message: Message) {
+  forwardingMessage.value = message
+  isForwardDialogOpen.value = true
+}
+
 // Watch for slash commands in message input
 watch(messageInput, (val) => {
   if (val.startsWith('/')) {
@@ -2846,6 +2864,7 @@ watch(contactId, () => chatAttachments.reset())
                   message.direction === 'outgoing' ? 'chat-bubble-outgoing' : 'chat-bubble-incoming'
                 ]"
               >
+                <ForwardedChip v-if="isForwardedMessage(message)" />
                 <!-- Reply preview (if this message is replying to another) -->
                 <div
                   v-if="message.is_reply && message.reply_to_message"
@@ -3033,6 +3052,8 @@ watch(contactId, () => chatAttachments.reset())
                 :quick-reactions="quickReactionEmojis"
                 :reaction-open="reactionPickerMessageId === message.id"
                 :retrying="retryingMessageId === message.id"
+                :can-forward="canForwardMessages"
+                @forward="openForwardDialog"
                 @update:reaction-open="(open: boolean) => reactionPickerMessageId = open ? message.id : null"
                 @react="sendReaction"
                 @reply="replyToMessage"
@@ -3429,7 +3450,8 @@ watch(contactId, () => chatAttachments.reset())
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
     />
-    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" @react="sendReaction" @reply="replyToMessage" />
+    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" :can-forward="canForwardMessages" @react="sendReaction" @reply="replyToMessage" @forward="openForwardDialog" />
+    <ForwardMessageDialog v-model:open="isForwardDialogOpen" :message="forwardingMessage" :preview="forwardPreview" />
   </div>
 </template>
 

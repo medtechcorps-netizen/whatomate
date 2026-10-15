@@ -1960,6 +1960,9 @@ export const messagesService = {
         first_screen?: string;
         header?: string;
       };
+      // Re-send a stored message of this organization to contactId. The
+      // server derives type and content; type/content are ignored.
+      forward_of_message_id?: string;
     },
   ) => api.post(`/contacts/${contactId}/messages`, data),
   sendTemplate: (

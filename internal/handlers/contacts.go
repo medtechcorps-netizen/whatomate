@@ -78,6 +78,9 @@ type MessageResponse struct {
 	IngestedAt          *time.Time           `json:"ingested_at,omitempty"`
 	CreatedAt           time.Time            `json:"created_at"`
 	UpdatedAt           time.Time            `json:"updated_at"`
+	// IsForwarded marks an agent forward for the CRM only; the customer
+	// receives an ordinary message.
+	IsForwarded bool `json:"is_forwarded,omitempty"`
 }
 
 // ReplyPreview contains a preview of the replied-to message
@@ -1177,6 +1180,7 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 			IngestedAt:          m.IngestedAt,
 			CreatedAt:           m.CreatedAt,
 			UpdatedAt:           m.UpdatedAt,
+			IsForwarded:         messageIsForwarded(m.Metadata),
 		}
 
 		if m.IsReply && m.ReplyToMessageID != nil {
@@ -1840,6 +1844,10 @@ type SendMessageRequest struct {
 	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
 	WhatsAppAccount  string `json:"whatsapp_account,omitempty"`
 
+	// ForwardOfMessageID re-sends a stored message of this organization to
+	// the path contact. The server derives the type and content.
+	ForwardOfMessageID string `json:"forward_of_message_id,omitempty"`
+
 	// Interactive message fields (for type="interactive")
 	Interactive *InteractiveContent `json:"interactive,omitempty"`
 }
@@ -1889,6 +1897,9 @@ func (a *App) SendMessage(r *fastglue.Request) error {
 	var req SendMessageRequest
 	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
+	}
+	if strings.TrimSpace(req.ForwardOfMessageID) != "" {
+		return a.forwardMessage(r, orgID, userID, contactID, &req)
 	}
 
 	// Get contact (users without full read permission can only message their assigned contacts)
@@ -2162,6 +2173,17 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 		formWhatsAppAccount = accountValues[0]
 	}
 
+	// Optional reply context. The unified sender reloads this ID under the
+	// canonical-contact lock and validates organization and contact ownership.
+	var replyToMessage *models.Message
+	if replyValues := form.Value["reply_to_message_id"]; len(replyValues) > 0 && strings.TrimSpace(replyValues[0]) != "" {
+		replyToID, parseErr := uuid.Parse(strings.TrimSpace(replyValues[0]))
+		if parseErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid reply message ID", nil, "")
+		}
+		replyToMessage = &models.Message{BaseModel: models.BaseModel{ID: replyToID}}
+	}
+
 	// Get uploaded file
 	files := form.File["file"]
 	if len(files) == 0 {
@@ -2216,14 +2238,15 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 
 	// Build and send via unified message sender
 	msgReq := OutgoingMessageRequest{
-		Account:       account,
-		Contact:       &contact,
-		Type:          models.MessageType(mediaType),
-		MediaData:     fileData,
-		MediaURL:      mediaPath,
-		MediaMimeType: mimeType,
-		MediaFilename: fileHeader.Filename,
-		Caption:       caption,
+		Account:        account,
+		Contact:        &contact,
+		Type:           models.MessageType(mediaType),
+		MediaData:      fileData,
+		MediaURL:       mediaPath,
+		MediaMimeType:  mimeType,
+		MediaFilename:  fileHeader.Filename,
+		Caption:        caption,
+		ReplyToMessage: replyToMessage,
 	}
 
 	opts := DefaultSendOptions()
@@ -2258,6 +2281,7 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 		CreatedAt:       message.CreatedAt,
 		UpdatedAt:       message.UpdatedAt,
 	}
+	a.attachMediaReplyPreview(orgID, message, &response)
 
 	return r.SendEnvelope(response)
 }

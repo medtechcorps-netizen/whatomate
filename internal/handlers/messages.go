@@ -88,6 +88,10 @@ type OutgoingMessageRequest struct {
 	// Reply context
 	ReplyToMessage *models.Message
 
+	// forwardedFrom is set only by the forward handler from a server-loaded
+	// source message and is recorded as metadata.forwarded_from.
+	forwardedFrom *messageForwardSource
+
 	// legacyWhatsAppReply is populated only by the fail-closed, exact
 	// Omnichannel reply endpoint. Established Chat callers cannot opt into or
 	// influence this server-derived binding.
@@ -465,13 +469,13 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			// Send the appropriate media type
 			switch req.Type {
 			case models.MessageTypeImage:
-				return a.WhatsApp.SendImageMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption)
+				return a.WhatsApp.SendImageMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption, replyToMsgID)
 			case models.MessageTypeVideo:
-				return a.WhatsApp.SendVideoMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption)
+				return a.WhatsApp.SendVideoMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption, replyToMsgID)
 			case models.MessageTypeAudio:
-				return a.WhatsApp.SendAudioMessage(sendCtx, waAccount, rcpt, mediaID)
+				return a.WhatsApp.SendAudioMessage(sendCtx, waAccount, rcpt, mediaID, replyToMsgID)
 			default: // document
-				return a.WhatsApp.SendDocumentMessage(sendCtx, waAccount, rcpt, mediaID, req.MediaFilename, req.Caption)
+				return a.WhatsApp.SendDocumentMessage(sendCtx, waAccount, rcpt, mediaID, req.MediaFilename, req.Caption, replyToMsgID)
 			}
 
 		case models.MessageTypeInteractive:
@@ -1631,6 +1635,13 @@ func (a *App) createOutgoingMessage(req OutgoingMessageRequest, opts MessageSend
 		msg.ReplyToMessageID = &replyID
 	}
 
+	if req.forwardedFrom != nil {
+		if msg.Metadata == nil {
+			msg.Metadata = models.JSONB{}
+		}
+		msg.Metadata[forwardedFromMetadataKey] = req.forwardedFrom.metadata()
+	}
+
 	return msg
 }
 
@@ -2508,4 +2519,384 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		UpdatedAt:       message.UpdatedAt,
 	}
 	return r.SendEnvelope(response)
+}
+
+// ============================================================================
+// Message forwarding
+// ============================================================================
+
+// The WhatsApp Cloud API has no forward call and no settable "Forwarded"
+// label, so a forward is a new outbound message built from a stored message of
+// the same organization. Text is copied; media bytes are read from tenant
+// storage, stored again for the new row, and uploaded to Meta through the
+// MediaData path. Inbound Meta media IDs are never reused.
+
+const (
+	forwardedFromMetadataKey = "forwarded_from"
+
+	// forwardMediaCopyTimeout bounds the tenant-storage read and write of one
+	// forwarded attachment.
+	forwardMediaCopyTimeout = 20 * time.Second
+
+	// forwardPersistTimeout bounds the pending-message transaction. Provider
+	// delivery runs after commit with its own deadline.
+	forwardPersistTimeout = 15 * time.Second
+
+	forwardErrorInvalid            fastglue.ErrorType = "forward_invalid"
+	forwardErrorSourceNotFound     fastglue.ErrorType = "forward_source_not_found"
+	forwardErrorUnsupportedType    fastglue.ErrorType = "forward_unsupported_type"
+	forwardErrorMediaPending       fastglue.ErrorType = "forward_media_pending"
+	forwardErrorMediaUnavailable   fastglue.ErrorType = "forward_media_unavailable"
+	forwardErrorWindowClosed       fastglue.ErrorType = "forward_window_closed"
+	forwardErrorIdentityReview     fastglue.ErrorType = "forward_identity_review"
+	forwardErrorTargetNotFound     fastglue.ErrorType = "forward_target_not_found"
+	forwardErrorAccountUnavailable fastglue.ErrorType = "forward_account_unavailable"
+)
+
+// messageForwardSource is the server-derived provenance of a forwarded message.
+type messageForwardSource struct {
+	MessageID uuid.UUID
+	ContactID uuid.UUID
+}
+
+func (s *messageForwardSource) metadata() map[string]any {
+	return map[string]any{
+		"message_id": s.MessageID.String(),
+		"contact_id": s.ContactID.String(),
+	}
+}
+
+// messageIsForwarded reports whether stored metadata carries forward provenance.
+func messageIsForwarded(metadata models.JSONB) bool {
+	if metadata == nil {
+		return false
+	}
+	value, ok := metadata[forwardedFromMetadataKey]
+	return ok && value != nil
+}
+
+// forwardableMessageType lists the message types a forward can rebuild from
+// stored content. Stickers, locations, contacts, interactive and template
+// messages need provider objects or approvals this server cannot replay.
+func forwardableMessageType(messageType models.MessageType) bool {
+	switch messageType {
+	case models.MessageTypeText,
+		models.MessageTypeImage,
+		models.MessageTypeVideo,
+		models.MessageTypeAudio,
+		models.MessageTypeDocument:
+		return true
+	default:
+		return false
+	}
+}
+
+// messageForwardRefusal is a forward the server declines before it persists a
+// message or calls Meta.
+type messageForwardRefusal struct {
+	Status    int
+	ErrorType fastglue.ErrorType
+	Message   string
+}
+
+func (refusal *messageForwardRefusal) send(r *fastglue.Request) error {
+	return r.SendErrorEnvelope(refusal.Status, refusal.Message, nil, refusal.ErrorType)
+}
+
+// messageForwardAudit is the audit-log payload for one forwarded message. It
+// records provenance only, never message content.
+type messageForwardAudit struct {
+	Operation              string `json:"operation"`
+	ForwardedFromMessageID string `json:"forwarded_from_message_id"`
+	ForwardedFromContactID string `json:"forwarded_from_contact_id"`
+	TargetContactID        string `json:"target_contact_id"`
+	MessageType            string `json:"message_type"`
+}
+
+// loadForwardSource loads the message to forward and checks that the user may
+// read it: same organization, a contact visible to the user, and inside the
+// user's current-conversation window. Every miss is the same 404 so a forward
+// cannot probe for messages the user cannot see.
+func (a *App) loadForwardSource(
+	orgID, userID, sourceID uuid.UUID,
+) (*models.Message, *messageForwardRefusal, error) {
+	notFound := &messageForwardRefusal{
+		Status:    fasthttp.StatusNotFound,
+		ErrorType: forwardErrorSourceNotFound,
+		Message:   "Message to forward not found",
+	}
+	var source models.Message
+	if err := a.DB.Where("id = ? AND organization_id = ?", sourceID, orgID).
+		First(&source).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, notFound, nil
+		}
+		return nil, nil, fmt.Errorf("load forward source: %w", err)
+	}
+
+	var visible int64
+	visibleQuery := a.scopeAssignedContact(
+		a.DB.Model(&models.Contact{}).Where("id = ? AND organization_id = ?", source.ContactID, orgID),
+		userID,
+		orgID,
+	)
+	if err := visibleQuery.Count(&visible).Error; err != nil {
+		return nil, nil, fmt.Errorf("check forward source visibility: %w", err)
+	}
+	if visible == 0 {
+		return nil, notFound, nil
+	}
+	restricted, cutoff, err := a.customerConversationScope(orgID, userID, []uuid.UUID{source.ContactID})
+	if err != nil {
+		return nil, nil, fmt.Errorf("scope forward source conversation: %w", err)
+	}
+	if (restricted && cutoff == nil) || (cutoff != nil && source.CreatedAt.Before(cutoff.UTC())) {
+		return nil, notFound, nil
+	}
+
+	if !forwardableMessageType(source.MessageType) {
+		return nil, &messageForwardRefusal{
+			Status:    fasthttp.StatusUnprocessableEntity,
+			ErrorType: forwardErrorUnsupportedType,
+			Message:   fmt.Sprintf("%s messages cannot be forwarded", source.MessageType),
+		}, nil
+	}
+	if source.MessageType == models.MessageTypeText {
+		if strings.TrimSpace(source.Content) == "" {
+			return nil, &messageForwardRefusal{
+				Status:    fasthttp.StatusUnprocessableEntity,
+				ErrorType: forwardErrorUnsupportedType,
+				Message:   "This message has no text to forward",
+			}, nil
+		}
+		return &source, nil, nil
+	}
+	if strings.TrimSpace(source.MediaURL) == "" {
+		// Coexistence and inbound media are hydrated asynchronously; until the
+		// bytes are in tenant storage there is nothing this server may resend.
+		return nil, &messageForwardRefusal{
+			Status:    fasthttp.StatusConflict,
+			ErrorType: forwardErrorMediaPending,
+			Message:   "This attachment has not finished downloading yet. Try again shortly.",
+		}, nil
+	}
+	return &source, nil, nil
+}
+
+// checkForwardTarget refuses a target contact that cannot receive a free-form
+// message now. Meta reports a closed customer-service window (131047) only
+// asynchronously, after the message was accepted, so the window is checked
+// before anything is persisted.
+func (a *App) checkForwardTarget(orgID uuid.UUID, contact *models.Contact, now time.Time) *messageForwardRefusal {
+	state, err := a.GetWhatsAppIdentityReviewEffectiveState(a.DB, orgID, contact.ID)
+	if err != nil || state.Blocked {
+		if err != nil {
+			a.Log.Error("Failed to read identity-review state for forward target",
+				"error", err, "organization_id", orgID, "contact_id", contact.ID)
+		}
+		return &messageForwardRefusal{
+			Status:    fasthttp.StatusConflict,
+			ErrorType: forwardErrorIdentityReview,
+			Message:   "This contact's WhatsApp identity is under review. Resolve the review before forwarding to it.",
+		}
+	}
+	if contact.LastInboundAt == nil || now.Sub(*contact.LastInboundAt) >= 24*time.Hour {
+		return &messageForwardRefusal{
+			Status:    fasthttp.StatusConflict,
+			ErrorType: forwardErrorWindowClosed,
+			Message:   "The 24-hour service window for this contact is closed. Send an approved template instead.",
+		}
+	}
+	return nil
+}
+
+// copyForwardMedia reads the source attachment from tenant storage and stores
+// an independent copy for the new message, so later cleanup of either object
+// cannot break the other row. Both storage calls share one deadline.
+func (a *App) copyForwardMedia(
+	orgID uuid.UUID,
+	source *models.Message,
+) (data []byte, mediaPath, mimeType string, refusal *messageForwardRefusal, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
+	defer cancel()
+
+	data, storedContentType, loadErr := a.loadTenantMedia(ctx, orgID, source.MediaURL)
+	if loadErr != nil || len(data) == 0 {
+		a.Log.Error("Failed to read media to forward",
+			"error", loadErr, "organization_id", orgID, "message_id", source.ID)
+		return nil, "", "", &messageForwardRefusal{
+			Status:    fasthttp.StatusConflict,
+			ErrorType: forwardErrorMediaUnavailable,
+			Message:   "This attachment is no longer available to forward",
+		}, nil
+	}
+	mimeType = strings.TrimSpace(source.MediaMimeType)
+	if mimeType == "" {
+		mimeType = strings.TrimSpace(storedContentType)
+	}
+	if mimeType == "" {
+		ext := ""
+		if dot := strings.LastIndex(source.MediaURL, "."); dot >= 0 {
+			ext = strings.ToLower(source.MediaURL[dot:])
+		}
+		mimeType = getMimeTypeFromExtension(ext)
+	}
+	mediaPath, err = a.saveMessageMedia(ctx, orgID, data, mimeType, source.MediaFilename)
+	if err != nil {
+		return nil, "", "", nil, fmt.Errorf("store forwarded media: %w", err)
+	}
+	return data, mediaPath, mimeType, nil, nil
+}
+
+// forwardMessage serves POST /api/contacts/{id}/messages with
+// forward_of_message_id: {id} is the target contact. SendMessage has already
+// checked chat:write and parsed the body. One request forwards to one target;
+// the UI sends at most five, one by one, and reports each result.
+func (a *App) forwardMessage(
+	r *fastglue.Request,
+	orgID, userID, targetContactID uuid.UUID,
+	req *SendMessageRequest,
+) error {
+	if !a.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
+	}
+	sourceID, err := uuid.Parse(strings.TrimSpace(req.ForwardOfMessageID))
+	if err != nil || sourceID == uuid.Nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid forward message ID", nil, forwardErrorInvalid)
+	}
+	if strings.TrimSpace(req.ReplyToMessageID) != "" ||
+		req.Interactive != nil ||
+		strings.TrimSpace(req.Content.Body) != "" {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
+			"A forward cannot also carry a reply, new text, or interactive content", nil, forwardErrorInvalid)
+	}
+
+	source, refusal, err := a.loadForwardSource(orgID, userID, sourceID)
+	if err != nil {
+		a.Log.Error("Failed to load message to forward", "error", err, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to forward message", nil, "")
+	}
+	if refusal != nil {
+		return refusal.send(r)
+	}
+
+	var contact models.Contact
+	targetQuery := a.scopeAssignedContact(
+		a.DB.Where("id = ? AND organization_id = ?", targetContactID, orgID),
+		userID,
+		orgID,
+	)
+	if err := targetQuery.First(&contact).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, forwardErrorTargetNotFound)
+	}
+	if refusal := a.checkForwardTarget(orgID, &contact, time.Now()); refusal != nil {
+		return refusal.send(r)
+	}
+
+	accountName := contact.WhatsAppAccount
+	if req.WhatsAppAccount != "" {
+		accountName = req.WhatsAppAccount
+	}
+	account, err := a.resolveWhatsAppAccount(orgID, accountName)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Failed to resolve WhatsApp account", nil, forwardErrorAccountUnavailable)
+	}
+
+	msgReq := OutgoingMessageRequest{
+		Account: account,
+		Contact: &contact,
+		Type:    source.MessageType,
+		forwardedFrom: &messageForwardSource{
+			MessageID: source.ID,
+			ContactID: source.ContactID,
+		},
+	}
+	if source.MessageType == models.MessageTypeText {
+		msgReq.Content = source.Content
+	} else {
+		data, mediaPath, mimeType, mediaRefusal, mediaErr := a.copyForwardMedia(orgID, source)
+		if mediaErr != nil {
+			a.Log.Error("Failed to copy media to forward", "error", mediaErr, "organization_id", orgID, "message_id", source.ID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to forward message", nil, "")
+		}
+		if mediaRefusal != nil {
+			return mediaRefusal.send(r)
+		}
+		msgReq.MediaData = data
+		msgReq.MediaURL = mediaPath
+		msgReq.MediaMimeType = mimeType
+		msgReq.MediaFilename = source.MediaFilename
+		if source.MessageType != models.MessageTypeAudio {
+			msgReq.Caption = source.Content
+		}
+	}
+
+	opts := DefaultSendOptions()
+	opts.SentByUserID = &userID
+
+	ctx, cancel := context.WithTimeout(context.Background(), forwardPersistTimeout)
+	defer cancel()
+	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
+	if err != nil {
+		a.Log.Error("Failed to forward message", "error", err, "organization_id", orgID, "source_message_id", source.ID)
+		if errors.Is(err, errOutgoingContactNotFound) ||
+			errors.Is(err, errOutgoingContactAccessRevoked) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, forwardErrorTargetNotFound)
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to forward message", nil, "")
+	}
+
+	// One entry per target, in the request's own transaction.
+	a.logAudit(orgID, userID, "message", message.ID, models.AuditActionCreated, nil, messageForwardAudit{
+		Operation:              "forwarded",
+		ForwardedFromMessageID: source.ID.String(),
+		ForwardedFromContactID: source.ContactID.String(),
+		TargetContactID:        message.ContactID.String(),
+		MessageType:            string(message.MessageType),
+	})
+
+	return r.SendEnvelope(MessageResponse{
+		ID:              message.ID,
+		ContactID:       message.ContactID,
+		Direction:       message.Direction,
+		MessageType:     message.MessageType,
+		Content:         map[string]string{"body": message.Content},
+		MediaURL:        message.MediaURL,
+		MediaMimeType:   message.MediaMimeType,
+		MediaFilename:   message.MediaFilename,
+		Status:          message.Status,
+		WhatsAppAccount: message.WhatsAppAccount,
+		IngestedAt:      message.IngestedAt,
+		CreatedAt:       message.CreatedAt,
+		UpdatedAt:       message.UpdatedAt,
+		IsForwarded:     true,
+	})
+}
+
+// attachMediaReplyPreview fills the reply fields of a media-send response. The
+// unified sender already validated the reply; a failed reload only drops the
+// preview and never undoes the send.
+func (a *App) attachMediaReplyPreview(orgID uuid.UUID, message *models.Message, response *MessageResponse) {
+	if message == nil || response == nil || !message.IsReply || message.ReplyToMessageID == nil {
+		return
+	}
+	response.IsReply = true
+	replyToID := message.ReplyToMessageID.String()
+	response.ReplyToMessageID = &replyToID
+	var reply models.Message
+	if err := a.DB.Where(
+		"id = ? AND organization_id = ? AND contact_id = ?",
+		*message.ReplyToMessageID,
+		orgID,
+		message.ContactID,
+	).First(&reply).Error; err != nil {
+		a.Log.Error("Failed to reload validated reply message", "error", err, "message_id", message.ID)
+		return
+	}
+	response.ReplyToMessage = &ReplyPreview{
+		ID:          reply.ID.String(),
+		Content:     map[string]string{"body": reply.Content},
+		MessageType: reply.MessageType,
+		Direction:   reply.Direction,
+	}
 }

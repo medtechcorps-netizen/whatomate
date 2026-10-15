@@ -522,7 +522,10 @@ export const useContactsStore = defineStore('contacts', () => {
     content: any,
     replyToMessageId?: string,
     whatsappAccount?: string,
-    extra?: { interactive?: Parameters<typeof messagesService.send>[1]['interactive'] },
+    extra?: {
+      interactive?: Parameters<typeof messagesService.send>[1]['interactive']
+      forwardOfMessageId?: string
+    },
   ) {
     const identity = identityGeneration
     const organizationScope = activeOrganizationScope.value
@@ -533,6 +536,7 @@ export const useContactsStore = defineStore('contacts', () => {
         reply_to_message_id: replyToMessageId,
         whatsapp_account: whatsappAccount,
         ...(extra?.interactive ? { interactive: extra.interactive } : {}),
+        ...(extra?.forwardOfMessageId ? { forward_of_message_id: extra.forwardOfMessageId } : {}),
       })
       // API returns { status: "success", data: { ... } }
       const newMessage = response.data.data || response.data
