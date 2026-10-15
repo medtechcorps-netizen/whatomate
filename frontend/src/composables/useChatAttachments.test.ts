@@ -1,0 +1,331 @@
+/** @vitest-environment happy-dom */
+
+import { effectScope } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useChatAttachments, type SendChatMedia, type SendChatMediaRequest } from './useChatAttachments'
+
+const mocks = vi.hoisted(() => ({ sendMedia: vi.fn() }))
+vi.mock('@/services/api', () => ({ messagesService: { sendMedia: mocks.sendMedia } }))
+
+const MiB = 1024 * 1024
+
+function file(name: string, type: string, size = 100) {
+  const f = new File(['x'], name, { type })
+  Object.defineProperty(f, 'size', { value: size })
+  return f
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+type Call = {
+  request: SendChatMediaRequest
+  progress: (loaded: number, total: number | undefined) => void
+  result: ReturnType<typeof deferred<unknown>>
+}
+
+function setup(overrides: Partial<Parameters<typeof useChatAttachments>[0]> = {}) {
+  const calls: Call[] = []
+  const send: SendChatMedia = (request, options) => {
+    const result = deferred<unknown>()
+    calls.push({ request, progress: options.onUploadProgress, result })
+    return result.promise
+  }
+  const state = { contactId: 'contact-a', active: true }
+  const onSent = vi.fn()
+  const onBatchFinished = vi.fn()
+  const scope = effectScope()
+  const attachments = scope.run(() =>
+    useChatAttachments({
+      resolveTarget: () => {
+        const id = state.contactId
+        return { contactId: id, isActive: () => state.active && state.contactId === id }
+      },
+      getWhatsAppAccount: () => 'clinic-main',
+      onSent,
+      onBatchFinished,
+      send,
+      ...overrides,
+    }),
+  )!
+  return { attachments, calls, state, onSent, onBatchFinished, scope }
+}
+
+async function settle() {
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+}
+
+beforeEach(() => {
+  vi.stubGlobal('URL', Object.assign(URL, {
+    createObjectURL: vi.fn(() => 'blob:preview'),
+    revokeObjectURL: vi.fn(),
+  }))
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.clearAllMocks()
+})
+
+describe('useChatAttachments staging', () => {
+  it('stages files with validation and opens the dialog', () => {
+    const { attachments } = setup()
+    const result = attachments.stage([
+      file('photo.jpg', 'image/jpeg'),
+      file('IMG_1.heic', 'image/heic'),
+      file('lab.pdf', 'application/pdf'),
+    ])
+    expect(result).toEqual({ added: 3, overflow: 0, refused: null })
+    expect(attachments.isOpen.value).toBe(true)
+    expect(attachments.items.value.map(item => item.status)).toEqual(['ready', 'invalid', 'ready'])
+    expect(attachments.items.value[0].previewUrl).toBe('blob:preview')
+    expect(attachments.items.value[2].previewUrl).toBeNull()
+    expect(attachments.sendableCount.value).toBe(2)
+    expect(attachments.invalidCount.value).toBe(1)
+  })
+
+  it('keeps at most 10 files per batch and reports the overflow', () => {
+    const { attachments } = setup()
+    const twelve = Array.from({ length: 12 }, (_, i) => file(`p${i}.png`, 'image/png'))
+    expect(attachments.stage(twelve)).toEqual({ added: 10, overflow: 2, refused: null })
+    expect(attachments.stage([file('more.png', 'image/png')])).toEqual({ added: 0, overflow: 1, refused: null })
+    expect(attachments.items.value).toHaveLength(10)
+  })
+
+  it('refuses to stage without an open conversation', () => {
+    const { attachments } = setup({ resolveTarget: () => null })
+    expect(attachments.stage([file('a.png', 'image/png')]).refused).toBe('no-conversation')
+    expect(attachments.isOpen.value).toBe(false)
+  })
+
+  it('drops files staged for another conversation before staging new ones', () => {
+    const { attachments, state } = setup()
+    attachments.stage([file('for-a.png', 'image/png')])
+    state.contactId = 'contact-b'
+    attachments.stage([file('for-b.png', 'image/png')])
+    expect(attachments.items.value.map(item => item.file.name)).toEqual(['for-b.png'])
+  })
+
+  it('removes files, revokes previews and closes when the list empties', () => {
+    const { attachments } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    attachments.remove(attachments.items.value[0].id)
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:preview')
+    expect(attachments.items.value).toHaveLength(0)
+    expect(attachments.isOpen.value).toBe(false)
+  })
+
+  it('switches an oversized photo to a document on request', () => {
+    const { attachments } = setup()
+    attachments.stage([file('scan.jpg', 'image/jpeg', 8 * MiB)])
+    const item = attachments.items.value[0]
+    expect(item.status).toBe('invalid')
+    attachments.sendAsDocument(item.id)
+    expect(attachments.items.value[0]).toMatchObject({ status: 'ready', asDocument: true })
+    expect(attachments.items.value[0].validation).toMatchObject({ ok: true, kind: 'document' })
+  })
+
+  it('caps captions at 1024 characters', () => {
+    const { attachments } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    attachments.setCaption(attachments.items.value[0].id, 'x'.repeat(2000))
+    expect(attachments.items.value[0].caption).toHaveLength(1024)
+  })
+})
+
+describe('useChatAttachments sending', () => {
+  it('sends one request per file, strictly one after another, in order', async () => {
+    const { attachments, calls, onSent, onBatchFinished } = setup()
+    attachments.stage([
+      file('one.jpg', 'image/jpeg'),
+      file('two.pdf', 'application/pdf'),
+      file('three.ogg', 'audio/ogg'),
+    ])
+    attachments.setCaption(attachments.items.value[0].id, '  Your X-ray  ')
+    attachments.setCaption(attachments.items.value[2].id, 'audio has no caption')
+
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].request).toMatchObject({
+      contact_id: 'contact-a',
+      type: 'image',
+      caption: 'Your X-ray',
+      whatsapp_account: 'clinic-main',
+    })
+    expect(attachments.isSending.value).toBe(true)
+
+    calls[0].progress(50, 100)
+    expect(attachments.items.value[0]).toMatchObject({ status: 'sending', progress: 50 })
+
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(attachments.items.value[0].status).toBe('sent')
+    expect(onSent).toHaveBeenCalledWith({ id: 'm1' })
+    expect(calls).toHaveLength(2)
+    expect(calls[1].request).toMatchObject({ type: 'document' })
+    expect(calls[1].request.caption).toBeUndefined()
+
+    calls[1].result.resolve({ id: 'm2' })
+    await settle()
+    expect(calls).toHaveLength(3)
+    expect(calls[2].request).toMatchObject({ type: 'audio' })
+    expect(calls[2].request.caption).toBeUndefined()
+
+    calls[2].result.resolve({ id: 'm3' })
+    await done
+    expect(onBatchFinished).toHaveBeenCalledWith({ sent: 3, failed: 0 })
+    // Everything went out: the dialog closes and the list clears.
+    expect(attachments.isOpen.value).toBe(false)
+    expect(attachments.items.value).toHaveLength(0)
+  })
+
+  it('skips invalid files and sends oversized photos as documents', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('bad.heic', 'image/heic'), file('big.png', 'image/png', 6 * MiB)])
+    attachments.sendAsDocument(attachments.items.value[1].id)
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].request).toMatchObject({ type: 'document' })
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    // Only the skipped invalid file is left, so the batch is finished.
+    expect(attachments.isOpen.value).toBe(false)
+  })
+
+  it('records per-file failures and retries only the failed files', async () => {
+    const { attachments, calls, onBatchFinished } = setup()
+    attachments.stage([
+      file('a.png', 'image/png'),
+      file('b.png', 'image/png'),
+      file('c.png', 'image/png'),
+    ])
+    const first = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    calls[1].result.reject(Object.assign(new Error('Failed to send message'), {}))
+    await settle()
+    calls[2].result.resolve({ id: 'm3' })
+    await first
+
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'failed', 'sent'])
+    expect(attachments.items.value[1].errorMessage).toBe('Failed to send message')
+    expect(attachments.failedCount.value).toBe(1)
+    expect(attachments.isOpen.value).toBe(true)
+    expect(onBatchFinished).toHaveBeenLastCalledWith({ sent: 2, failed: 1 })
+
+    // Send does nothing now: nothing is ready.
+    await attachments.sendAll()
+    expect(calls).toHaveLength(3)
+
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls).toHaveLength(4)
+    expect(calls[3].request.file.name).toBe('b.png')
+    calls[3].result.resolve({ id: 'm2' })
+    await retry
+    expect(onBatchFinished).toHaveBeenLastCalledWith({ sent: 1, failed: 0 })
+    expect(attachments.isOpen.value).toBe(false)
+  })
+
+  it('ignores a second send while a batch is uploading', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    void attachments.sendAll()
+    await settle()
+    await attachments.sendAll()
+    expect(calls).toHaveLength(1)
+    expect(attachments.stage([file('b.png', 'image/png')]).refused).toBe('busy')
+    attachments.close()
+    expect(attachments.isOpen.value).toBe(true)
+  })
+
+  it('stops the queue when the conversation changes and never reports into the new one', async () => {
+    const { attachments, calls, state, onSent } = setup()
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    state.contactId = 'contact-b'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+    expect(attachments.isSending.value).toBe(false)
+  })
+
+  it('reset() abandons an in-flight batch without touching the new state', async () => {
+    const { attachments, calls, onBatchFinished } = setup()
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    attachments.reset()
+    attachments.stage([file('new.png', 'image/png')])
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.items.value.map(item => [item.file.name, item.status])).toEqual([['new.png', 'ready']])
+  })
+
+  it('attaches replyTo to the first file of the batch only', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(calls[1].request.reply_to_message_id).toBeUndefined()
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+  })
+
+  it('types untyped files from their extension before upload', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('Results.docx', '')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.file.type).toBe(
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    )
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+  })
+
+  it('uses messagesService.sendMedia by default and unwraps the envelope', async () => {
+    mocks.sendMedia.mockResolvedValue({ data: { status: 'success', data: { id: 'server-message' } } })
+    const onSent = vi.fn()
+    const scope = effectScope()
+    const attachments = scope.run(() =>
+      useChatAttachments({
+        resolveTarget: () => ({ contactId: 'c1', isActive: () => true }),
+        onSent,
+      }),
+    )!
+    attachments.stage([file('a.png', 'image/png')])
+    await attachments.sendAll()
+    expect(mocks.sendMedia).toHaveBeenCalledTimes(1)
+    expect(mocks.sendMedia.mock.calls[0][0]).toMatchObject({ contact_id: 'c1', type: 'image' })
+    expect(mocks.sendMedia.mock.calls[0][0]).not.toHaveProperty('whatsapp_account')
+    expect(onSent).toHaveBeenCalledWith({ id: 'server-message' })
+    scope.stop()
+  })
+
+  it('cleans up previews when its scope is disposed', () => {
+    const { attachments, scope } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    scope.stop()
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:preview')
+    expect(attachments.items.value).toHaveLength(0)
+  })
+})

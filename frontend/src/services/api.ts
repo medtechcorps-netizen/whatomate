@@ -1975,6 +1975,43 @@ export const messagesService = {
     api.post(`/contacts/${contactId}/messages/${messageId}/reaction`, {
       emoji,
     }),
+  // One file per request: the WhatsApp Cloud API carries a single media
+  // object per message. Goes through the shared client so CSRF, workspace and
+  // token-refresh handling match every other call; uploads of up to 15 MB on
+  // a slow link take minutes, so there is no fixed timeout.
+  sendMedia: (
+    data: {
+      file: File;
+      contact_id: string;
+      type: "image" | "video" | "audio" | "document";
+      caption?: string;
+      whatsapp_account?: string;
+      reply_to_message_id?: string;
+    },
+    options: {
+      signal?: AbortSignal;
+      onUploadProgress?: (loaded: number, total: number | undefined) => void;
+    } = {},
+  ) => {
+    const formData = new FormData();
+    formData.append("file", data.file);
+    formData.append("contact_id", data.contact_id);
+    formData.append("type", data.type);
+    if (data.caption) formData.append("caption", data.caption);
+    if (data.whatsapp_account) {
+      formData.append("whatsapp_account", data.whatsapp_account);
+    }
+    if (data.reply_to_message_id) {
+      formData.append("reply_to_message_id", data.reply_to_message_id);
+    }
+    return api.post("/messages/media", formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+      timeout: 0,
+      signal: options.signal,
+      onUploadProgress: (event) =>
+        options.onUploadProgress?.(event.loaded, event.total),
+    });
+  },
   // Native <img>/<video>/<audio>/<a> requests carry the auth cookie but not the
   // X-Organization-ID header, so the server would resolve them against the
   // login (default) workspace. Chat media is fetched through this client
