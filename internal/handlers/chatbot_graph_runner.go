@@ -235,8 +235,29 @@ func (a *App) completeChatbotFlow(
 	if err := a.requireActiveChatSession(session); err != nil {
 		return err
 	}
+	previousStatus := session.Status
 	session.Status = models.SessionStatusCompleted
-	a.notifyChatbotFlowCompletion(flow, session)
+	if err := a.executeChatbotCompletionWebhook(flow, session); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && !inboundContinuationRequiresManualReview(err) {
+			// H1: a bounded pool/fence/claim wait expired before the webhook's action
+			// claim committed (a post-request checkpoint failure is manual review, see
+			// executeChatbotCompletionWebhookGuarded). Retry before the session-complete
+			// commit: the replay re-sends no earlier graph message (flow/node-scoped
+			// action keys) and claims the never-committed webhook action afresh.
+			session.Status = previousStatus
+			return err
+		}
+		// Same as notifyChatbotFlowCompletion: never log the error itself.
+		flowID := uuid.Nil
+		if flow != nil {
+			flowID = flow.ID
+		}
+		a.Log.Warn(
+			"chatbot completion webhook did not succeed; session will still complete",
+			"flow", flowID,
+			"session", session.ID,
+		)
+	}
 	return a.persistChatSession(session)
 }
 
@@ -358,7 +379,16 @@ func (a *App) executeChatbotCompletionWebhookGuarded(
 		result,
 	)
 	if resolveErr != nil {
-		return fmt.Errorf("resolve chatbot completion webhook checkpoint: %w", resolveErr)
+		// H1: the request was made, so its committed pre_attempt can never be replayed;
+		// type the uncertainty so completeChatbotFlow never retries it (it still logs and
+		// completes the session, as before).
+		return errors.Join(
+			&inboundContinuationManualReviewError{
+				ActionKey: claim.Key,
+				Reason:    "chatbot completion webhook result is uncertain",
+			},
+			fmt.Errorf("resolve chatbot completion webhook checkpoint: %w", resolveErr),
+		)
 	}
 	if requestErr != nil {
 		return errors.New("chatbot completion webhook request failed")

@@ -960,9 +960,13 @@ func (a *App) continuePersistedIncomingMessage(
 		a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled)
 		// H1: createTransferToQueue logs and discards saveAndFinalizeTransfer errors
 		// (agent_transfers.go:1505-1511) and that phase now has a bounded wait. Never
-		// complete the continuation without the handover: retry instead.
+		// complete the continuation without the handover: retry instead. The cause is
+		// not visible here; its likeliest source is exactly that bounded wait (this is
+		// the agent-only path that wedged production), so label it as congestion and let
+		// p.fail refund the attempt. Its 16-deferral cap still bounds a deterministic
+		// transfer failure (it was logged by createTransferToQueue).
 		if !a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-			return errors.New("chatbot-disabled queue transfer was not committed; retrying continuation")
+			return fmt.Errorf("wedge guard: chatbot-disabled queue transfer was not committed (presumed pool or lock congestion; see the logged transfer error); retrying continuation: %w", context.DeadlineExceeded)
 		}
 		return nil
 	}
@@ -1054,10 +1058,11 @@ func (a *App) continuePersistedIncomingMessage(
 			}
 		}
 		a.createTransferFromKeyword(account, contact)
-		// H1: see the chatbot-disabled branch. The transfer body already sent is replayed
-		// from the action ledger on retry, never resent.
+		// H1: see the chatbot-disabled branch (same congestion label and refund). The
+		// transfer body already sent is replayed from the action ledger on retry, never
+		// resent.
 		if !a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-			return errors.New("keyword transfer was not committed; retrying continuation")
+			return fmt.Errorf("wedge guard: keyword transfer was not committed (presumed pool or lock congestion; see the logged transfer error); retrying continuation: %w", context.DeadlineExceeded)
 		}
 		return nil
 	}
@@ -1567,20 +1572,29 @@ func (a *App) getOrCreateSession(
 	var result models.ChatbotSession
 	isNew := false
 
+	// H1: the session commits independently of the continuation transaction, so a
+	// bounded-wait retry of the SAME inbound message must still see the session it
+	// created as new, or the greeting is silently skipped. Record the creating inbound
+	// message under a reserved ("__") key; replays of the greeting are made safe by the
+	// action ledger's deterministic key, never by this marker.
+	const sessionOriginKey = "__inbound_session_origin"
+	creatingInbound := ""
+	if a.inboundContinuation != nil && a.inboundContinuation.MessageID != uuid.Nil {
+		creatingInbound = a.inboundContinuation.MessageID.String()
+	}
+
 	sessionLocksExpired := false
 	write := func(tx *gorm.DB) error {
-		// Admission and every policy writer take the organization fence before
-		// contact/session locks. Recheck after that fence: the earlier transfer
-		// lookup is only an optimization, not permission to start another session.
-		if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
-			return err
-		}
 		if a.inboundContinuation != nil {
-			// H1: this nested fence transaction must not hold the organization fence
-			// indefinitely while waiting on a contact/session row held by another
-			// continuation's open transaction (e.g. the session-log FK share lock): that wait
-			// closes a lock cycle through Go. Bound only the waits after the fence; the
-			// COMMIT keeps the transaction context.
+			// H1: this nested transaction runs while the caller holds its continuation
+			// transaction. (1) It must not hold the organization fence indefinitely while
+			// waiting on a contact/session row held by another continuation's open
+			// transaction (e.g. the session-log FK share lock): that wait closes a lock
+			// cycle through Go. (2) Its wait FOR the fence queues behind every in-flight
+			// AI-attempt guard's KEY SHARE while pinning two pooled connections; a guard
+			// holder waiting for a pooled connection then closes a pool+lock cycle. Bound
+			// the fence and every lock wait after it (20s in total, before any post-claim
+			// wait inside the fence, 45s); the COMMIT keeps the transaction context.
 			lockParent := tx.Statement.Context
 			if lockParent == nil {
 				lockParent = context.Background()
@@ -1593,6 +1607,12 @@ func (a *App) getOrCreateSession(
 				cancelLocks()
 			}()
 			tx = tx.WithContext(lockCtx)
+		}
+		// Admission and every policy writer take the organization fence before
+		// contact/session locks. Recheck after that fence: the earlier transfer
+		// lookup is only an optimization, not permission to start another session.
+		if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
+			return err
 		}
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
 		if err != nil {
@@ -1670,13 +1690,18 @@ func (a *App) getOrCreateSession(
 				return err
 			}
 			result.LastActivityAt = now
-			isNew = false
+			origin, _ := result.SessionData[sessionOriginKey].(string)
+			isNew = creatingInbound != "" && origin == creatingInbound
 			return nil
 		}
 
 		canonicalPhone := canonical.PhoneNumber
 		if canonicalPhone == "" {
 			canonicalPhone = phoneNumber
+		}
+		sessionData := models.JSONB{}
+		if creatingInbound != "" {
+			sessionData[sessionOriginKey] = creatingInbound
 		}
 		result = models.ChatbotSession{
 			BaseModel:       models.BaseModel{ID: uuid.New()},
@@ -1685,7 +1710,7 @@ func (a *App) getOrCreateSession(
 			WhatsAppAccount: accountName,
 			PhoneNumber:     canonicalPhone,
 			Status:          models.SessionStatusActive,
-			SessionData:     models.JSONB{},
+			SessionData:     sessionData,
 			StartedAt:       now,
 			LastActivityAt:  now,
 		}
@@ -1730,7 +1755,7 @@ func (a *App) getOrCreateSession(
 		}
 	}
 	if err != nil && sessionLocksExpired {
-		err = fmt.Errorf("wedge guard: chatbot session locks not acquired within 20s while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
+		err = fmt.Errorf("wedge guard: chatbot session fence and locks not acquired within 20s while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
 	}
 	if err != nil {
 		return nil, false, err

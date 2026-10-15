@@ -1796,11 +1796,41 @@ func (a *App) finalizeMessageSend(
 	if opts.MarkIncomingRead {
 		if a.inboundContinuation != nil {
 			// H1: markMessagesAsRead's continuation branch (contacts.go:1078-1085), entered
-			// through this nested App so its pool wait is bounded.
-			if err := a.WithCommittedTenantApp(req.Account.OrganizationID, func(scoped *App) error {
-				return scoped.markMessagesAsReadInCurrentScope(req.Account.OrganizationID, req.Contact.ID, req.Contact)
-			}); err != nil {
-				a.Log.Error("Failed to mark independently committed inbound messages as read", "error", err, "organization_id", req.Account.OrganizationID)
+			// through this nested App so its pool wait is bounded. Inside the AI-attempt
+			// fence this goroutine holds the organization KEY SHARE that policy writers
+			// queue behind while they pin pooled connections, so this best-effort write
+			// waits at most 2s there (the unread badge then stays) instead of 45s.
+			orgID := req.Account.OrganizationID
+			root := a.rootApp()
+			readWait := time.Duration(0) // derived: 15s nested
+			if a.inboundContinuation.attemptGuarded {
+				readWait = 2 * time.Second
+			}
+			var afterCommit []func()
+			err := a.withBoundedRootConnection(nil, readWait, func(db *gorm.DB) error {
+				if orgID == uuid.Nil {
+					return database.ErrMissingTenant
+				}
+				phase := func(tx *gorm.DB) error {
+					if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+						return err
+					}
+					scoped := root.scopedApp(tx, orgID)
+					if err := scoped.markMessagesAsReadInCurrentScope(orgID, req.Contact.ID, req.Contact); err != nil {
+						return err
+					}
+					afterCommit = scoped.takeAfterCommit()
+					return nil
+				}
+				if a.rlsEnabled() {
+					return database.WithTenant(db, orgID, phase)
+				}
+				return db.Transaction(phase)
+			})
+			if err != nil {
+				a.Log.Error("Failed to mark independently committed inbound messages as read", "error", err, "organization_id", orgID)
+			} else {
+				a.runAfterCommit(afterCommit)
 			}
 		} else {
 			a.markMessagesAsRead(req.Account.OrganizationID, req.Contact.ID, req.Contact)

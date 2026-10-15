@@ -764,10 +764,22 @@ func (a *App) recoverNativeBookingSend(claim *inboundContinuationActionClaim) er
 }
 
 func (a *App) markNativeBookingBlocked(prepared *nativeBookingPrepared, cause error) error {
+	// H1: a wedge-guard deferral (bounded pool or fence wait) is a refunded retry, not a
+	// staff decision. When it struck before the dispatch marker committed (that marker is
+	// written in the same transaction as claimNativeBookingDispatchTx), the prepared
+	// booking is demonstrably unattempted and loadNativeBookingPreparedTx dispatches it
+	// on the retry, so marking it would turn a clean retry into manual review. A marker
+	// that did commit means a provider attempt may have started: mark as before (the
+	// retry also refuses that pre_attempt state on its own).
+	deferral := cause != nil && !inboundContinuationRequiresManualReview(cause) &&
+		errors.Is(cause, context.DeadlineExceeded) && strings.Contains(cause.Error(), "wedge guard")
 	return a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
 		return database.WithTenantReadCommitted(db, prepared.Message.OrganizationID, func(tx *gorm.DB) error {
-			return tx.Model(&models.Message{}).Where("id = ? AND organization_id = ?", prepared.Message.ID, prepared.Message.OrganizationID).
-				Updates(map[string]any{"error_message": "AI booking message requires staff review", "metadata": gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", models.JSONB{"ai_booking_manual_confirmation_required": true})}).Error
+			query := tx.Model(&models.Message{}).Where("id = ? AND organization_id = ?", prepared.Message.ID, prepared.Message.OrganizationID)
+			if deferral {
+				query = query.Where("jsonb_exists(COALESCE(metadata, '{}'::jsonb), CAST(? AS text))", automaticAIDispatchStateMetadataKey)
+			}
+			return query.Updates(map[string]any{"error_message": "AI booking message requires staff review", "metadata": gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", models.JSONB{"ai_booking_manual_confirmation_required": true})}).Error
 		})
 	})
 }

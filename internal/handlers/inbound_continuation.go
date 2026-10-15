@@ -444,14 +444,32 @@ func (p *InboundContinuationProcessor) processClaimed(
 	// Revalidate durable identity and repair the one proven display projection
 	// in a short committed phase. Authority/contact/message locks must be
 	// released before the provider scope and its independent action ledger.
+	phaseOneFenceExpired := false
 	scopeErr := p.app.WithCommittedTenantApp(organizationID, func(scoped *App) error {
-		if err := database.LockOrganizationPolicyScope(scoped.DB, organizationID); err != nil {
-			return err
+		// H1: this phase holds a pooled connection while it waits for the organization
+		// fence. Every in-flight AI-attempt guard holds that fence's KEY SHARE, and a guard
+		// holder may itself be waiting for a pooled connection, so an unbounded wait here
+		// closes a pool+lock cycle. Nothing has been claimed yet: bound only the fence
+		// statements (the COMMIT keeps the transaction context) so this waiter yields
+		// (20s) before any post-claim wait inside the fence (45s) and retries cleanly.
+		fenceParent := scoped.DB.Statement.Context
+		if fenceParent == nil {
+			fenceParent = context.Background()
+		}
+		fenceCtx, cancelFence := context.WithTimeout(fenceParent, 20*time.Second)
+		fenceErr := database.LockOrganizationPolicyScope(scoped.DB.WithContext(fenceCtx), organizationID)
+		phaseOneFenceExpired = fenceErr != nil && errors.Is(fenceCtx.Err(), context.DeadlineExceeded)
+		cancelFence()
+		if fenceErr != nil {
+			return fenceErr
 		}
 		var loadErr error
 		work, loadErr = loadInboundContinuationWork(scoped, organizationID, job)
 		return loadErr
 	})
+	if scopeErr != nil && phaseOneFenceExpired {
+		scopeErr = fmt.Errorf("wedge guard: organization policy fence not acquired within 20s before the continuation: %w: %w", context.DeadlineExceeded, scopeErr)
+	}
 	if scopeErr == nil {
 		scopeErr = p.app.WithTenantApp(organizationID, func(scoped *App) error {
 			if p.process == nil {
@@ -506,10 +524,15 @@ func (p *InboundContinuationProcessor) processClaimed(
 	if processErr == nil {
 		processErr = heartbeatErr
 	}
+	// H1: the job's terminal bookkeeping must not inherit the run's deadline. The
+	// fast-path ctx (2 min) can expire during these writes' pool wait; the inner write
+	// then fails and the job stays 'processing' until its 5-minute lease goes stale.
+	// Both writes are lease-guarded (locked_by), so an uncancellable write is safe.
+	settleCtx := context.WithoutCancel(ctx)
 	if processErr != nil {
-		return p.fail(ctx, organizationID, job, processErr)
+		return p.fail(settleCtx, organizationID, job, processErr)
 	}
-	if err := p.complete(ctx, organizationID, job.ID); err != nil {
+	if err := p.complete(settleCtx, organizationID, job.ID); err != nil {
 		return fmt.Errorf("complete inbound continuation %s: %w", job.ID, err)
 	}
 	return nil

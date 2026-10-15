@@ -332,9 +332,14 @@ func TestInboundContinuation_ChatbotDisabledTransferFailureRetries(t *testing.T)
 
 		err := processor.ProcessMessage(context.Background(), organization.ID, work.Persisted.ID)
 		require.ErrorContains(t, err, "chatbot-disabled queue transfer was not committed")
+		// The swallowed transfer error is presumed congestion (the bounded transfer
+		// phase): a refunded deferral, so agent-only orgs cannot exhaust MaxAttempts.
+		h1RequireWedgeGuard(t, err)
 		job := loadInboundContinuationJob(t, &App{DB: shared}, organization.ID, work.Persisted.ID)
 		assert.Equal(t, models.ScheduledJobStatusPending, job.Status)
-		assert.Equal(t, 1, job.Attempts)
+		assert.Equal(t, 0, job.Attempts, "a handover post-check failure is a refunded deferral")
+		deferrals, _ := inboundContinuationExactInteger(job.Payload["wedge_guard_deferrals"])
+		assert.Equal(t, 1, deferrals)
 		assert.Zero(t, h1ActiveTransfers(t, shared, organization.ID, work.Contact.ID))
 
 		require.NoError(t, app.DB.Callback().Create().Remove("h1:fail_first_transfer"))
@@ -444,9 +449,13 @@ func TestInboundContinuation_KeywordTransferFailureRetriesWithoutResend(t *testi
 
 	err = processor.ProcessMessage(context.Background(), organization.ID, work.Persisted.ID)
 	require.ErrorContains(t, err, "keyword transfer was not committed")
+	h1RequireWedgeGuard(t, err)
 	assert.EqualValues(t, 1, calls.Load())
 	job := loadInboundContinuationJob(t, &App{DB: shared}, organization.ID, work.Persisted.ID)
 	assert.Equal(t, models.ScheduledJobStatusPending, job.Status)
+	assert.Equal(t, 0, job.Attempts, "a handover post-check failure is a refunded deferral")
+	deferrals, _ := inboundContinuationExactInteger(job.Payload["wedge_guard_deferrals"])
+	assert.Equal(t, 1, deferrals)
 	assert.Zero(t, h1ActiveTransfers(t, shared, organization.ID, work.Contact.ID))
 
 	require.NoError(t, pool.Callback().Create().Remove("h1:fail_first_keyword_transfer"))
