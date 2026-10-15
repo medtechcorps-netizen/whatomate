@@ -181,6 +181,12 @@
     "reconnectFailed": "Can't reach the server right now",
     "reconnectFailedDesc": "You're still signed in. We'll try again with your next action."
   },
+  "conversationNotes": {
+    "editNote": "Edit note",
+    "deleteNote": "Delete note",
+    "edited": "(edited)",
+    "editedAt": "Edited {time}"
+  },
   "resources": {
     "account": "account",
     "accounts": "accounts",

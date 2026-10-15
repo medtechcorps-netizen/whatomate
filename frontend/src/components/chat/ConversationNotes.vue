@@ -143,6 +143,15 @@ async function deleteNote(noteId: string) {
   }
 }
 
+// The server stamps created_at and updated_at together on create, so a gap of
+// more than a second means the note was edited afterwards.
+function isEdited(note: { created_at: string; updated_at?: string }) {
+  if (!note.updated_at) return false
+  const created = Date.parse(note.created_at)
+  const updated = Date.parse(note.updated_at)
+  return Number.isFinite(created) && Number.isFinite(updated) && updated - created > 1000
+}
+
 function formatNoteTime(dateStr: string) {
   const date = new Date(dateStr)
   const now = new Date()
@@ -243,25 +252,39 @@ function formatNoteTime(dateStr: string) {
                   <div class="flex items-center justify-between mb-1">
                     <span class="text-xs font-medium text-white/70 light:text-gray-700">{{ note.created_by_name }}</span>
                     <div class="flex items-center gap-1">
-                      <!-- Hover actions (own notes only) -->
+                      <!-- Actions (own notes only), always visible -->
                       <div
                         v-if="note.created_by_id === authStore.user?.id"
-                        class="opacity-0 group-hover:opacity-100 transition-opacity flex gap-0.5"
+                        class="flex gap-0.5"
                       >
                         <button
-                          class="h-5 w-5 rounded-md flex items-center justify-center hover:bg-white/[0.08] light:hover:bg-gray-200 text-white/30 hover:text-white/60 light:text-gray-400 light:hover:text-gray-600 transition-colors"
+                          type="button"
+                          data-testid="note-edit-button"
+                          :aria-label="t('conversationNotes.editNote')"
+                          :title="t('conversationNotes.editNote')"
+                          class="h-6 w-6 rounded-md flex items-center justify-center hover:bg-white/[0.08] light:hover:bg-gray-200 text-white/50 hover:text-white/80 light:text-gray-500 light:hover:text-gray-700 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-500/60 transition-colors"
                           @click="startEditing(note.id, note.content)"
                         >
-                          <Pencil class="h-3 w-3" />
+                          <Pencil class="h-3.5 w-3.5" aria-hidden="true" />
                         </button>
                         <button
-                          class="h-5 w-5 rounded-md flex items-center justify-center hover:bg-red-500/10 text-white/30 hover:text-red-400 light:text-gray-400 light:hover:text-red-500 transition-colors"
+                          type="button"
+                          data-testid="note-delete-button"
+                          :aria-label="t('conversationNotes.deleteNote')"
+                          :title="t('conversationNotes.deleteNote')"
+                          class="h-6 w-6 rounded-md flex items-center justify-center hover:bg-red-500/10 text-white/50 hover:text-red-400 light:text-gray-500 light:hover:text-red-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-red-500/60 transition-colors"
                           @click="deleteNote(note.id)"
                         >
-                          <Trash2 class="h-3 w-3" />
+                          <Trash2 class="h-3.5 w-3.5" aria-hidden="true" />
                         </button>
                       </div>
                       <span class="text-[10px] text-white/30 light:text-gray-400">{{ formatNoteTime(note.created_at) }}</span>
+                      <span
+                        v-if="isEdited(note)"
+                        data-testid="note-edited-marker"
+                        class="text-[10px] italic text-white/30 light:text-gray-400"
+                        :title="t('conversationNotes.editedAt', { time: formatNoteTime(note.updated_at) })"
+                      >{{ t('conversationNotes.edited') }}</span>
                     </div>
                   </div>
                   <p class="text-[13px] text-white/60 light:text-gray-600 leading-relaxed whitespace-pre-wrap break-words">{{ note.content }}</p>
