@@ -101,14 +101,20 @@ import {
   Plus,
   CalendarClock,
   CalendarPlus,
-  Copy
+  Copy,
+  MailCheck,
+  MailOpen
 } from 'lucide-vue-next'
 import { getInitials, getAvatarGradient } from '@/lib/utils'
+import { contactHasUnread } from '@/lib/chatInboxState'
 import { contactAddressDisplay, contactDisplayName, isPlaceholderPhone } from '@/lib/contactAddress'
 import type { WorkspaceRequestedAction } from '@/lib/crmFlow'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
+import ChatListFilters from '@/components/chat/ChatListFilters.vue'
+import ChatRowActionsMenu from '@/components/chat/ChatRowActionsMenu.vue'
+import ContactAssigneeBadge from '@/components/chat/ContactAssigneeBadge.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
@@ -491,6 +497,7 @@ async function acknowledgeVisibleChatBoundary() {
 
   const contactID = currentContact.id
   const cursorKey = `${contactID}:${messageID}`
+  releaseManualUnreadCursor(currentContact)
   if (acknowledgedReadCursorByContact.get(contactID) === messageID) return
   if (readCursorInFlightKey === cursorKey) return
   if (readCursorInFlightKey !== null) {
@@ -558,23 +565,15 @@ const activeTransfer = computed(() => {
 
 const activeTransferId = computed(() => activeTransfer.value?.id || null)
 
-// Check if current user can assign contacts (admin or manager only)
-const canAssignContacts = computed(() => {
-  // Try store first, then fallback to localStorage
-  let role = authStore.userRole
-  if (!role || role === 'agent') {
-    try {
-      const storedUser = localStorage.getItem('user')
-      if (storedUser) {
-        const user = JSON.parse(storedUser)
-        role = user.role?.name || user.role // Support both old and new format
-      }
-    } catch {
-      // ignore
-    }
-  }
-  return role === 'admin' || role === 'manager'
-})
+// Assigning a contact is authorized by contacts:write on the server
+// (AssignContact), so the UI uses the same permission instead of role names.
+const canAssignContacts = computed(() => authStore.hasPermission('contacts', 'write'))
+// Without contacts:read a user only ever sees their own chats, so the
+// Unassigned view would always be empty for them.
+const canSeeUnassignedChats = computed(() => authStore.hasPermission('contacts', 'read'))
+// Manual unread is team-shared state, authorized like the shared read path.
+const canMarkChatUnread = computed(() => authStore.hasPermission('chat', 'write'))
+const currentUserId = computed(() => authStore.user?.id ?? null)
 
 // "Next step" menu gates. These mirror the gates CustomerRevenueWorkspace
 // applies to its own buttons, plus the product entitlement for each module.
@@ -1276,6 +1275,48 @@ function handleContactClick(contact: Contact) {
   router.push(`/chat/${contact.id}`)
 }
 
+// A chat marked unread by hand must be acknowledged again when its boundary is
+// next read, even if this session acknowledged the same latest message before
+// the mark. Clearing the local flag first keeps it to one acknowledgement.
+function releaseManualUnreadCursor(contact: Contact) {
+  if (!contact.manual_unread) return
+  contact.manual_unread = false
+  acknowledgedReadCursorByContact.delete(contact.id)
+}
+
+async function markChatRead(contactID: string) {
+  try {
+    await contactsStore.markContactReadState(contactID, 'read')
+    if (contactsStore.currentContact?.id === contactID) {
+      newMessagesCount.value = 0
+      firstUnreadId.value = null
+    }
+    // The navbar badge follows this user's inbox cursor, which a manual read
+    // advances on the server.
+    const organizationID = organizationsStore.selectedOrgId || authStore.organizationId
+    const userID = authStore.user?.id
+    if (organizationID && userID) void omnichannelUnreadStore.refresh(organizationID, userID)
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('chat.readState.markReadFailed')))
+  }
+}
+
+async function markChatUnread(contactID: string) {
+  try {
+    await contactsStore.markContactReadState(contactID, 'unread')
+    acknowledgedReadCursorByContact.delete(contactID)
+    // Leave an open chat, as messaging apps do: reading it in place would
+    // acknowledge it straight away and undo the mark.
+    if (contactsStore.currentContact?.id === contactID) {
+      contactsStore.setCurrentContact(null)
+      contactsStore.clearMessages()
+      router.push('/chat')
+    }
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('chat.readState.markUnreadFailed')))
+  }
+}
+
 async function sendMessage() {
   if (!messageInput.value.trim() || !contactsStore.currentContact) return
 
@@ -1833,7 +1874,10 @@ async function assignContactToUser(userId: string | null) {
     // Update current contact with new assignment
     contactsStore.currentContact = {
       ...contactsStore.currentContact,
-      assigned_user_id: userId || undefined
+      assigned_user_id: userId || undefined,
+      assigned_user_name: userId
+        ? usersStore.users.find(user => user.id === userId)?.full_name
+        : undefined,
     }
     // Refresh contacts list
     await contactsStore.fetchContacts()
@@ -1924,9 +1968,12 @@ async function resumeChatbot() {
       })
     }
 
-    // Check if current contact is still in the list (may have been unassigned)
+    // Check if current contact is still in the list (may have been unassigned).
+    // Under a chip filter the list is narrower than what the user may see,
+    // so absence there does not mean the contact became invisible.
     if (currentContactId && contactsStore.currentContact?.id === currentContactId) {
-      const stillExists = contactsStore.contacts.some(c => c.id === currentContactId)
+      const stillExists = (contactsStore.listFilter ?? 'all') !== 'all'
+        || contactsStore.contacts.some(c => c.id === currentContactId)
       if (!stillExists) {
         // Contact no longer visible to this user, navigate away
         contactsStore.setCurrentContact(null)
@@ -2350,6 +2397,11 @@ watch(contactId, () => chatAttachments.reset())
             <X class="h-3 w-3 ml-1" />
           </TagBadge>
         </div>
+        <ChatListFilters
+          :model-value="contactsStore.listFilter"
+          :show-unassigned="canSeeUnassignedChats"
+          @update:model-value="contactsStore.setListFilter"
+        />
       </div>
 
       <!-- Held messages that have no contact yet (protected staged queue) -->
@@ -2364,7 +2416,7 @@ watch(contactId, () => chatAttachments.reset())
             data-testid="chat-contact"
             :data-contact-id="contact.id"
             :class="[
-              'flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-white/[0.04] light:hover:bg-gray-50 transition-colors',
+              'group relative flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-white/[0.04] light:hover:bg-gray-50 transition-colors',
               contactsStore.currentContact?.id === contact.id && 'bg-white/[0.08] light:bg-gray-100'
             ]"
             @click="handleContactClick(contact)"
@@ -2391,9 +2443,18 @@ watch(contactId, () => chatAttachments.reset())
                 <p class="flex-1 min-w-0 text-xs text-white/50 light:text-gray-500 truncate">
                   {{ contactListAddress(contact) }}
                 </p>
+                <ContactAssigneeBadge :contact="contact" :current-user-id="currentUserId" />
                 <Badge v-if="contact.unread_count > 0" class="flex-shrink-0 h-5 text-[10px] bg-emerald-500/20 text-emerald-400 light:bg-emerald-100 light:text-emerald-700">
                   {{ contact.unread_count }}
                 </Badge>
+                <span
+                  v-else-if="contact.manual_unread"
+                  data-testid="chat-contact-manual-unread"
+                  class="flex-shrink-0 h-2.5 w-2.5 rounded-full bg-emerald-400 light:bg-emerald-600"
+                  role="img"
+                  :aria-label="$t('chat.readState.markedUnread')"
+                  :title="$t('chat.readState.markedUnread')"
+                />
                 <Badge
                   v-if="!effectiveAIIsAllowed(contact.identity_review_ai_state)"
                   class="flex-shrink-0 h-5 text-[10px] bg-amber-500/20 text-amber-300 light:bg-amber-100 light:text-amber-800"
@@ -2403,6 +2464,12 @@ watch(contactId, () => chatAttachments.reset())
                 </Badge>
               </div>
             </div>
+            <ChatRowActionsMenu
+              :contact="contact"
+              :can-mark-unread="canMarkChatUnread"
+              @mark-read="markChatRead"
+              @mark-unread="markChatUnread"
+            />
           </div>
 
           <!-- Loading indicator for infinite scroll -->
@@ -2412,7 +2479,9 @@ watch(contactId, () => chatAttachments.reset())
 
           <div v-if="contactsStore.sortedContacts.length === 0" class="p-3 text-center text-white/40 light:text-gray-500">
             <User class="h-6 w-6 mx-auto mb-1.5 opacity-50" />
-            <p class="text-sm">{{ $t('chat.noContacts') }}</p>
+            <p class="text-sm">
+              {{ (contactsStore.listFilter ?? 'all') === 'all' ? $t('chat.noContacts') : $t('chat.filters.noMatches') }}
+            </p>
           </div>
         </div>
       </ScrollArea>
@@ -2460,6 +2529,11 @@ watch(contactId, () => chatAttachments.reset())
                 <Badge v-if="activeTransferId" class="text-[10px] h-5 bg-orange-500/20 text-orange-400 light:bg-orange-100 light:text-orange-700">
                   AI paused
                 </Badge>
+                <ContactAssigneeBadge
+                  :contact="contactsStore.currentContact"
+                  :current-user-id="currentUserId"
+                  variant="header"
+                />
                 <button
                   v-if="currentContactAIBlocked"
                   type="button"
@@ -2656,6 +2730,22 @@ watch(contactId, () => chatAttachments.reset())
                 >
                   <UserPlus class="mr-2 h-4 w-4" aria-hidden="true" />
                   <span>{{ $t('chat.assignToAgent') }}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-if="contactHasUnread(contactsStore.currentContact)"
+                  data-testid="chat-menu-mark-read"
+                  @select="markChatRead(contactsStore.currentContact.id)"
+                >
+                  <MailCheck class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>{{ $t('chat.readState.markRead') }}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-else-if="canMarkChatUnread"
+                  data-testid="chat-menu-mark-unread"
+                  @select="markChatUnread(contactsStore.currentContact.id)"
+                >
+                  <MailOpen class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>{{ $t('chat.readState.markUnread') }}</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

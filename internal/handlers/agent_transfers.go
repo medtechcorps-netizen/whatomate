@@ -1239,6 +1239,7 @@ func (a *App) hasActiveAgentTransfer(orgID, contactID uuid.UUID) bool {
 // WebSocket broadcast helpers
 
 func (a *App) broadcastTransferCreated(transfer *models.AgentTransfer, contact *models.Contact) {
+	a.broadcastContactUpdate(transfer.OrganizationID, transfer.ContactID, "transfer")
 	if a.WSHub == nil {
 		return
 	}
@@ -1275,6 +1276,7 @@ func (a *App) broadcastTransferCreated(transfer *models.AgentTransfer, contact *
 }
 
 func (a *App) broadcastTransferResumed(transfer *models.AgentTransfer) {
+	a.broadcastContactUpdate(transfer.OrganizationID, transfer.ContactID, "transfer")
 	if a.WSHub == nil {
 		return
 	}
@@ -1299,6 +1301,7 @@ func (a *App) broadcastTransferResumed(transfer *models.AgentTransfer) {
 }
 
 func (a *App) broadcastTransferAssigned(transfer *models.AgentTransfer) {
+	a.broadcastContactUpdate(transfer.OrganizationID, transfer.ContactID, "transfer")
 	if a.WSHub == nil {
 		return
 	}

@@ -395,6 +395,30 @@
     "addReaction": "Add reaction",
     "filterByTags": "Filter by tags",
     "noTagsAvailable": "No tags available",
+    "filters": {
+      "label": "Filter conversations",
+      "all": "All",
+      "unread": "Unread",
+      "mine": "Mine",
+      "unassigned": "Unassigned",
+      "unreadHint": "Chats with unread customer messages, or chats a teammate marked unread. Chats the chatbot handled are stored as read.",
+      "noMatches": "No conversations match this filter"
+    },
+    "assignment": {
+      "you": "You",
+      "assignedTo": "Assigned to {name}",
+      "handledBy": "Handled by {name}",
+      "assignedToYou": "Assigned to you",
+      "teammate": "Teammate"
+    },
+    "readState": {
+      "actions": "Chat actions",
+      "markRead": "Mark as read",
+      "markUnread": "Mark as unread",
+      "markedUnread": "Marked unread",
+      "markReadFailed": "Could not mark the chat as read",
+      "markUnreadFailed": "Could not mark the chat as unread"
+    },
     "paused": "Paused",
     "assignedTo": "Assigned to",
     "unassigned": "Unassigned",

@@ -1749,6 +1749,11 @@ export const contactsService = {
     page?: number;
     limit?: number;
     tags?: string;
+    // Inbox filters. unread is team-shared read state (incoming messages not
+    // yet read, or a manual "Mark as unread"); assigned=me also counts an
+    // active transfer to the current user.
+    unread?: "true";
+    assigned?: "me" | "unassigned";
   }, signal?: AbortSignal) => api.get("/contacts", { params, signal }),
   get: (id: string) => api.get(`/contacts/${id}`),
   create: (data: any) => api.post("/contacts", data),
@@ -1814,6 +1819,15 @@ export const contactsService = {
       { headers: { "X-Organization-ID": explicitOrganizationId } },
     );
   },
+  // Manual inbox actions share the mark-read endpoint. "read" resolves the
+  // latest incoming message on the server; "unread" sets a team-shared flag
+  // and never sends anything to WhatsApp. The automatic markRead body above is
+  // deliberately left unchanged.
+  markManualReadState: (id: string, mark: "read" | "unread") =>
+    api.post<{ status: string; cursor_synced: boolean; manual_unread: boolean }>(
+      `/contacts/${encodeURIComponent(id)}/mark-read`,
+      { mark },
+    ),
 };
 
 // Generic Import/Export Service

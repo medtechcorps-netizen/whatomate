@@ -56,6 +56,9 @@ const WS_TYPE_PONG = 'pong'
 // Reaction types
 const WS_TYPE_REACTION_UPDATE = 'reaction_update'
 
+// Contact inbox state (assignment, transfer agent, manual read state)
+const WS_TYPE_CONTACT_UPDATE = 'contact_update'
+
 // Agent transfer types
 const WS_TYPE_AGENT_TRANSFER = 'agent_transfer'
 const WS_TYPE_AGENT_TRANSFER_RESUME = 'agent_transfer_resume'
@@ -325,6 +328,9 @@ class WebSocketService {
         case WS_TYPE_REACTION_UPDATE:
           this.handleReactionUpdate(store, message.payload)
           break
+        case WS_TYPE_CONTACT_UPDATE:
+          this.handleContactUpdate(store, message.payload)
+          break
         case WS_TYPE_PONG:
           this.recordPong()
           break
@@ -460,6 +466,13 @@ class WebSocketService {
     if (currentContact && payload.contact_id === currentContact.id) {
       store.updateMessageReactions(payload.message_id, payload.reactions)
     }
+  }
+
+  // The event carries identifiers only. Refetch the list so assignee names,
+  // unread markers and the active filter's membership come from the server.
+  private handleContactUpdate(store: ReturnType<typeof useContactsStore>, payload: any) {
+    if (typeof payload?.contact_id !== 'string' || payload.contact_id === '') return
+    store.scheduleContactsRefresh(payload.contact_id)
   }
 
   private handleAgentTransfer(payload: any) {

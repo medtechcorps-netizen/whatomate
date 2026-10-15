@@ -146,6 +146,9 @@ const messages = ref<InboxMessage[]>([])
 const messagesViewport = ref<HTMLElement | null>(null)
 const messagesContent = ref<HTMLElement | null>(null)
 const channelFilter = ref<ChannelType | 'all'>('all')
+// Per-user unread view (GET /api/conversations?unread=true). Off by default so
+// the default list is unchanged.
+const unreadOnly = ref(false)
 const search = ref('')
 const composer = ref('')
 const createdConnection = ref<CreatedConnection | null>(null)
@@ -795,6 +798,7 @@ async function load(silent = false, append = false) {
     const page = append ? conversationPage.value + 1 : 1
     const conversationParams: Record<string, string | number> = { page, limit: 100 }
     if (channelFilter.value !== 'all') conversationParams.channel = channelFilter.value
+    if (unreadOnly.value) conversationParams.unread = 'true'
     if (search.value.trim()) conversationParams.search = search.value.trim()
     const [accountResponse, conversationResponse] = await Promise.all([
       channelsService.accounts(),
@@ -2198,7 +2202,7 @@ watch(activeOrganizationId, (organizationId, previousOrganizationId) => {
   void loadMetaInstagramOnboardingStatus()
 })
 
-watch([search, channelFilter], () => {
+watch([search, channelFilter, unreadOnly], () => {
   if (filterDebounceTimer !== null) window.clearTimeout(filterDebounceTimer)
   filterDebounceTimer = window.setTimeout(() => {
     filterDebounceTimer = null
@@ -2824,6 +2828,17 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
               @click="channelFilter = channel.key"
             >
               {{ channel.label }}
+            </button>
+            <button
+              type="button"
+              data-testid="omnichannel-filter-unread"
+              class="min-h-11 shrink-0 rounded-full px-3 py-1 text-xs font-semibold transition lg:min-h-0 lg:px-2.5 lg:text-[10px] lg:font-medium"
+              :class="unreadOnly ? 'bg-sky-300 text-black' : 'bg-white/[0.04] text-white/45 light:bg-slate-200 light:text-slate-700'"
+              :aria-pressed="unreadOnly"
+              title="Conversations with messages you have not read yet"
+              @click="unreadOnly = !unreadOnly"
+            >
+              Unread
             </button>
           </div>
         </div>

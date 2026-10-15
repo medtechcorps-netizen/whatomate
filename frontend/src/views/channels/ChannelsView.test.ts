@@ -392,6 +392,28 @@ describe('ChannelsView messaging behavior', () => {
     vi.unstubAllGlobals()
   })
 
+  it('requests the per-user unread view only while its chip is on', async () => {
+    setInbox()
+    const view = await mountAndSelectConversation()
+    expect(mocks.conversations.mock.calls[0][0]).not.toHaveProperty('unread')
+    expect(view.findAll('[data-testid="omnichannel-conversation"]').length).toBeGreaterThan(0)
+    const chip = view.get('[data-testid="omnichannel-filter-unread"]')
+    expect(chip.attributes('aria-pressed')).toBe('false')
+
+    mocks.conversations.mockClear()
+    await chip.trigger('click')
+    await new Promise(resolve => setTimeout(resolve, 350))
+    await flushPromises()
+    expect(mocks.conversations.mock.calls.at(-1)![0]).toMatchObject({ page: 1, unread: 'true' })
+    expect(view.get('[data-testid="omnichannel-filter-unread"]').attributes('aria-pressed')).toBe('true')
+
+    mocks.conversations.mockClear()
+    await view.get('[data-testid="omnichannel-filter-unread"]').trigger('click')
+    await new Promise(resolve => setTimeout(resolve, 350))
+    await flushPromises()
+    expect(mocks.conversations.mock.calls.at(-1)![0]).not.toHaveProperty('unread')
+  })
+
   it('keeps native AI booking default-off and submits only its dedicated field', async () => {
     setInbox()
     const view = await mountAndSelectConversation()

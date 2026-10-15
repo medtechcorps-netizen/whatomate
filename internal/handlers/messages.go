@@ -1964,6 +1964,31 @@ func (a *App) broadcastReactionUpdate(orgID uuid.UUID, messageID, contactID uuid
 	})
 }
 
+// broadcastContactUpdate tells connected clients that a contact's inbox state
+// (assignment, transfer agent or manual read state) changed. The payload holds
+// identifiers only and clients refetch the canonical row. It is queued until
+// the surrounding tenant transaction commits and does no database work, so it
+// is safe on paths that already hold a transaction.
+func (a *App) broadcastContactUpdate(orgID, contactID uuid.UUID, reason string) {
+	if a == nil || orgID == uuid.Nil || contactID == uuid.Nil {
+		return
+	}
+	payload := map[string]any{
+		"contact_id": contactID.String(),
+		"reason":     reason,
+	}
+	a.afterTenantCommit(func() {
+		root := a.rootApp()
+		if root == nil || root.WSHub == nil {
+			return
+		}
+		root.WSHub.BroadcastToOrg(orgID, websocket.WSMessage{
+			Type:    websocket.TypeContactUpdate,
+			Payload: payload,
+		})
+	})
+}
+
 // dispatchMessageSentWebhook dispatches webhook for message.sent event
 func (a *App) dispatchMessageSentWebhook(account *models.WhatsAppAccount, contact *models.Contact, msg *models.Message) {
 	var sentByUserID string
