@@ -78,6 +78,11 @@ describe('MessageActions', () => {
     expect(source).toMatch(/@media \(hover: none\)\s*\{\s*\.message-actions\s*\{\s*opacity: 1;/)
   })
 
+  it('reveals the strip on row hover with its own rule, not only group-hover', () => {
+    // Tailwind currently emits no group-* rules (postcss-selector-parser 6.1.3).
+    expect(source).toMatch(/\.group:hover \.message-actions\s*\{\s*opacity: 1;/)
+  })
+
   it('emits reply with the message', async () => {
     const wrapper = mountActions()
     await wrapper.get('[data-testid="chat-message-reply"]').trigger('click')

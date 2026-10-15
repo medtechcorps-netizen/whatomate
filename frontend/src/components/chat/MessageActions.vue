@@ -119,6 +119,15 @@ const canRetry = computed(() =>
 </template>
 
 <style scoped>
+/*
+ * Reveal on row hover without Tailwind's group-hover variant: with the locked
+ * postcss-selector-parser 6.1.3, Tailwind 3.4 emits no group-* or peer-* rules
+ * at all, so `group-hover:opacity-100` alone left the strip invisible.
+ */
+.group:hover .message-actions {
+  opacity: 1;
+}
+
 /* Touch screens cannot hover, so the actions must not hide behind it. */
 @media (hover: none) {
   .message-actions {
