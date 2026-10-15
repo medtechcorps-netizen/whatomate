@@ -1256,6 +1256,9 @@ def _classify_v2(repo: _Repository, base: str, head: str,
         section = "pr18-verification-repair"
         if _pr18_verification_repair_changed(repo, base, head):
             _pr18_verification_repair_local(repo, base, head)
+        section = "pr18-managed-owner-repair"
+        if _pr18_managed_owner_changed(repo, base, head):
+            _pr18_managed_owner_local(repo, base, head)
         section = "nullable-source"
         declaration = repo.blob(head, schema_nullable.SOURCE_PATH)
         section = "constant-source"
@@ -1808,6 +1811,97 @@ def _pr18_verification_repair_local(repo, base, head):
     _valid(repaired)
 
 
+# One finite managed-owner observation correction after the exact PR18 repair.
+# These fixed source fingerprints do not authorize arbitrary later edits.
+_PR18_MANAGED_OWNER_POLICY_SHA256 = '4d9c597c2e6f689a1190aee3725765229fa0899f6abc35501f18fde011fc97cb'
+_PR18_MANAGED_OWNER_REASON = "pr18-managed-owner-repair-incomplete"
+_PR18_MANAGED_OWNER_FILES = {'cmd/whatomate/migration_plan.go': ('43bbdc7d9733e5cd0fa76a1129cab1ed70dd70be7d516061278cdd15e17e9dde',
+                                     '46e40d028a5b341b1ff966c5f51defde6c89d63850093f6aba828bf5ecff5fc8'),
+ 'cmd/whatomate/migration_plan_managed_owner_admission_pg_test.go': (None,
+                                                                     '1f65a0b7da0d8b0637416e64bf061f7fd7fbdbcf27dd95799c06ea1fb04b6abb'),
+ 'cmd/whatomate/migration_plan_managed_owner_pg_test.go': (None,
+                                                           'b8cc9cc0090e03a06d657f1af5d70bf97c60dabd8dd0f6e65aa211007bd8d5d4'),
+ 'docs/catalog.md': ('7fec0d54292d16d617eb5b596b539f1ffad55091f1d88b9b5b3b9af235eb7fd7',
+                     '29f182362f3128732ea55f6a3ba43dcc099e84fb2f1e3b3a599db4b3cbe115dc'),
+ 'internal/database/data_gates.go': ('fdd250d045ba4676262d8e803df14645d8bfd896906a15c12956252facf6513d',
+                                     'b8cb4b1b608f87069e2724ae29d4b6b38bcdbcf85e5c2bf085734015902953cd'),
+ 'internal/database/plan.go': ('91ab1d7114a42d4166aa88b632d22c56291da2a39d265bba3c12770cf091d3ee',
+                               '83d6f4e83ced0c9a02f3ce18470e3da54914cb63c77f70f9a8fda7cb44c68365'),
+ 'internal/database/plan_test.go': ('dabb7a6982cbd7b066fa5b41e83d06f9de5e64798e251389395e4351b29f13cb',
+                                    '083ed1514dda2ddb0d7ef5081fd471e1de34412ebba44f64fb954dcc7ca7f763'),
+ 'internal/dbcatalog/registry/migration_path.json': ('bde5e0c8ec946d37d60727ba6b20ede20ba6be19321e103dfe963d2615cf072e',
+                                                     '4acecb4e3caed65bb71f8d61ea2b3e760129523bfc599130fa3aee5ed421969d'),
+ 'release/deployment/fixtures/pr18-managed-owner-repair.json': (None,
+                                                                'd57a0e1437923340549b8ca0a64166ba7d83e3ea256fe670277d3fd78077f525'),
+ 'release/deployment/schema_change.py': ('421802386bdfcc1948b8a33f976660281ed426ed11ff7f81a75f96a3bb688917',
+                                         'reviewed-managed-owner-policy-slot'),
+ 'release/deployment/test_pr18_managed_owner_repair.py': (None,
+                                                          'c0d7253bbd3f3873ef659710d01275d5264dbaa11203a76f2a78ac0e0b805f8e'),
+ 'release/deployment/test_pr18_verification_repair.py': ('280ea8149708e1780c19f02f3625ff1a8a0cf209c8ceb65cd425d0c5a64ba761',
+                                                         'eed47103a70d533d7d8e2687111025ff469bd05f264d9e9bbbe0defa826fc9e1')}
+
+
+def _pr18_managed_owner_blob(repo, revision, path, digest):
+    if digest != "reviewed-managed-owner-policy-slot":
+        return _pr18_observer_blob(repo, revision, path, digest)
+    _valid(path == _PR18_VERIFICATION_REPAIR_POLICY)
+    raw = repo._tree(revision, path)
+    _valid(re.fullmatch(rb"100644 blob [0-9a-f]{40}\t" + re.escape(path.encode()) + rb"\x00", raw) is not None)
+    value = repo.blob(revision, path)
+    _valid(type(value) is bytes and bool(value))
+    slot = re.compile(rb"(?m)^_PR18_MANAGED_OWNER_POLICY_SHA256 = '([0-9a-f]{64})'\n")
+    matches = list(slot.finditer(value))
+    _valid(len(matches) == 1)
+    match = matches[0]
+    _valid(match.group(1).decode("ascii") == _PR18_MANAGED_OWNER_POLICY_SHA256)
+    canonical = value[:match.start(1)] + b"0" * 64 + value[match.end(1):]
+    _valid(hashlib.sha256(canonical).hexdigest() == _PR18_MANAGED_OWNER_POLICY_SHA256)
+    return value
+
+
+def _pr18_managed_owner_before(repo, revision):
+    _valid(bool(_PR18_MANAGED_OWNER_FILES))
+    _pr18_verification_repair_product(repo, revision)
+    for path, (_, digest) in _PR18_VERIFICATION_REPAIR_FILES.items():
+        _pr18_verification_repair_blob(repo, revision, path, digest)
+    for path, (digest, _) in _PR18_MANAGED_OWNER_FILES.items():
+        _pr18_managed_owner_blob(repo, revision, path, digest)
+
+
+def _pr18_managed_owner_changed(repo, base, head):
+    if base == head or not _PR18_MANAGED_OWNER_FILES:
+        return False
+    try:
+        _pr18_managed_owner_before(repo, base)
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return False
+    if any(path in _PR18_MANAGED_OWNER_FILES for _, path in changed_paths(repo.root, base, head)):
+        return True
+    return any(path in _PR18_MANAGED_OWNER_FILES
+               for prior, revision in _pr18_verification_repair_history(repo, base, head)
+               for _, path in changed_paths(repo.root, prior, revision))
+
+
+def _pr18_managed_owner_edge(repo, base, head):
+    _pr18_managed_owner_before(repo, base)
+    expected = sorted(("A" if old is None else "M", path)
+                      for path, (old, _) in _PR18_MANAGED_OWNER_FILES.items())
+    _valid(sorted(changed_paths(repo.root, base, head)) == expected)
+    for path, (_, digest) in _PR18_MANAGED_OWNER_FILES.items():
+        _pr18_managed_owner_blob(repo, head, path, digest)
+
+
+def _pr18_managed_owner_local(repo, base, head):
+    _pr18_managed_owner_before(repo, base)
+    repaired = False
+    for prior, revision in _pr18_verification_repair_history(repo, base, head):
+        if changed_paths(repo.root, prior, revision):
+            _valid(not repaired)
+            _pr18_managed_owner_edge(repo, prior, revision)
+            repaired = True
+    _valid(repaired)
+
+
 def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                              *, ci: bool = False) -> tuple[str, str]:
     """Prove one exact transition without calling either classifier or CI.
@@ -1830,7 +1924,7 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                       for path, (old, _) in _PR18_OBSERVER_FILES.items())
     descriptors = (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
                    schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH)
-    prior, prior_state, anchor, repaired = None, None, None, False
+    prior, prior_state, anchor, repaired, managed = None, None, None, False, False
     for revision in (base, *revisions):
         if prior is not None:
             _valid(_git(repo.root, ["rev-parse", "--verify", revision + "^1"]) == prior.encode() + b"\n")
@@ -1869,9 +1963,14 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                                        "ecc49fb74995dcd121a645fd139ebff2fdc9e22bd2a1b01df91a3eb4e24daee4")
                 anchor = (prior, revision)
             elif prior_state == state == 2 and changes:
-                _valid(anchor is not None and not repaired)
-                _pr18_verification_repair_edge(repo, prior, revision)
-                repaired = True
+                _valid(anchor is not None)
+                if not repaired:
+                    _pr18_verification_repair_edge(repo, prior, revision)
+                    repaired = True
+                else:
+                    _valid(not managed)
+                    _pr18_managed_owner_edge(repo, prior, revision)
+                    managed = True
             elif ci or state == 2:
                 _valid(not changes)
         prior, prior_state = revision, state
@@ -1936,6 +2035,18 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
             return ()
     except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
         return tuple(sorted(set(legacy.reasons) | {_PR18_VERIFICATION_REPAIR_REASON}))
+    try:
+        if _pr18_managed_owner_changed(repo, base, head):
+            _pr18_managed_owner_local(repo, base, head)
+            _valid(legacy.reasons == ("migration-path-changed:closure",)
+                   and legacy.kind == "none" and legacy.dormant is False)
+            policy = _classify_v2(repo, base, head, legacy)
+            _valid(not policy.reasons and policy.kind == "none" and policy.dormant is False
+                   and policy.requirements == _PR18_OBSERVER_REQUIREMENTS
+                   and policy.migration_changes == ("generated migration closure changed",))
+            return ()
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {_PR18_MANAGED_OWNER_REASON}))
     # This fixed target must not disappear behind the legacy clean fast path
     # when its generated manifest or paired registry revisions are stale.
     try:
