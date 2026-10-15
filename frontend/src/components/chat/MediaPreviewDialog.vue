@@ -40,26 +40,40 @@ const { t } = useI18n()
 
 const viewport = ref<HTMLElement | null>(null)
 const image = ref<HTMLImageElement | null>(null)
+const pageList = ref<HTMLElement | null>(null)
 const zoomedWidth = ref<number | null>(null)
 const imageFailed = ref(false)
 
 const zoomed = computed(() => zoomedWidth.value !== null)
 
-// Zooming doubles the size the image has while it fits the screen, so small
-// images grow too, and the view starts at the image's centre.
+// Zooming doubles the width the image or the pages have while they fit, so
+// small images grow too. An image is then viewed from its centre; a PDF keeps
+// the reader's place, shows the start of its lines and redraws the pages in
+// view at the new size.
 async function toggleZoom() {
+  const element = viewport.value
+  const place = element?.scrollHeight ? element.scrollTop / element.scrollHeight : 0
   if (zoomed.value) {
     zoomedWidth.value = null
-    return
+  } else {
+    const fitted =
+      props.source.type === 'image'
+        ? image.value?.getBoundingClientRect().width || image.value?.naturalWidth || 0
+        : pageList.value?.getBoundingClientRect().width || 0
+    if (!fitted) return
+    zoomedWidth.value = fitted * 2
   }
-  const fitted = image.value?.getBoundingClientRect().width || image.value?.naturalWidth || 0
-  if (!fitted) return
-  zoomedWidth.value = fitted * 2
   await nextTick()
-  const element = viewport.value
+  if (props.source.type === 'pdf') redrawPages()
   if (!element) return
-  element.scrollLeft = (element.scrollWidth - element.clientWidth) / 2
-  element.scrollTop = (element.scrollHeight - element.clientHeight) / 2
+  if (props.source.type === 'image') {
+    if (!zoomed.value) return
+    element.scrollLeft = (element.scrollWidth - element.clientWidth) / 2
+    element.scrollTop = (element.scrollHeight - element.clientHeight) / 2
+  } else {
+    element.scrollLeft = 0
+    element.scrollTop = place * element.scrollHeight
+  }
 }
 
 type PageState = 'idle' | 'queued' | 'rendering' | 'rendered' | 'failed'
@@ -94,6 +108,8 @@ const status = computed(() => {
   return imageFailed.value ? 'error' : 'ready'
 })
 
+const canZoom = computed(() => status.value === 'ready')
+
 const failureMessage = computed(() =>
   props.source.type === 'pdf' && pdfFailure.value === 'password'
     ? t('chat.mediaPreview.passwordProtected')
@@ -118,18 +134,37 @@ function unqueue(page: PreviewPage) {
   page.state = 'idle'
 }
 
+function clearCanvas(page: PreviewPage) {
+  const canvas = pageElements.get(page.number)?.querySelector('canvas')
+  if (!canvas) return
+  canvas.width = 0
+  canvas.height = 0
+}
+
 function releaseFarPages() {
   while (drawnPages.length > MAX_DRAWN_PAGES) {
     const index = drawnPages.findIndex(page => !nearbyPages.has(page.number))
     if (index < 0) return
     const [page] = drawnPages.splice(index, 1)
-    const canvas = pageElements.get(page.number)?.querySelector('canvas')
-    if (canvas) {
-      canvas.width = 0
-      canvas.height = 0
-    }
+    clearCanvas(page)
     page.state = 'idle'
   }
+}
+
+// After a zoom, pages in view are drawn again at their new width; until then
+// the browser scales their old drawing. Pages out of view give theirs back.
+function redrawPages() {
+  const render = activeRender?.render
+  activeRender = null
+  render?.cancel()
+  drawnPages.length = 0
+  for (const page of pages.value) {
+    const drawn = page.state === 'rendered' || page.state === 'rendering'
+    if (drawn) page.state = 'idle'
+    if (nearbyPages.has(page.number)) queue(page)
+    else if (drawn) clearCanvas(page)
+  }
+  drawNext()
 }
 
 // One page is drawn at a time, top to bottom, so the page in view is never
@@ -279,7 +314,7 @@ onBeforeUnmount(closePdf)
         </DialogTitle>
         <DialogDescription class="sr-only">{{ t('chat.mediaPreview.description') }}</DialogDescription>
         <Button
-          v-if="source.type === 'image' && !imageFailed"
+          v-if="canZoom"
           type="button"
           variant="ghost"
           size="sm"
@@ -342,7 +377,13 @@ onBeforeUnmount(closePdf)
         </div>
 
         <template v-else>
-          <ol class="mx-auto flex w-full max-w-4xl flex-col gap-4 p-4" :aria-label="t('chat.mediaPreview.pages')">
+          <ol
+            ref="pageList"
+            class="mx-auto flex flex-col gap-4 p-4"
+            :class="zoomed ? 'max-w-none' : 'w-full max-w-4xl'"
+            :style="zoomedWidth !== null ? { width: `${zoomedWidth}px` } : undefined"
+            :aria-label="t('chat.mediaPreview.pages')"
+          >
             <li
               v-for="page in pages"
               :key="page.number"

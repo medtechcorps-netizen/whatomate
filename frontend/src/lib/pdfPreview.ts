@@ -92,6 +92,16 @@ function loadPdfjs(): Promise<PdfjsModule> {
   return pdfjsModule
 }
 
+// Where pdf.js finds the files it loads by name: copied next to the built
+// assets by pdfjsRuntimeFiles in vite.config.ts, served from the package
+// itself by the dev server. The URL is built from a variable so Vite does not
+// treat it as an asset import of its own.
+function runtimeFilesURL(version: string): string {
+  if (import.meta.env.DEV) return '/node_modules/pdfjs-dist/'
+  const moduleURL = import.meta.url
+  return new URL(`pdfjs-${version}/`, moduleURL).href
+}
+
 function abortError(): DOMException {
   return new DOMException('PDF preview closed', 'AbortError')
 }
@@ -122,9 +132,21 @@ export async function openPdfPreview(blob: Blob, options: { signal?: AbortSignal
   }
   if (signal?.aborted) throw abortError()
 
+  const files = runtimeFilesURL(pdfjs.version)
   const params = {
     // Transferred to the worker; this copy is not used again.
     data,
+    // CJK text in fonts the file does not embed needs Adobe's CMaps.
+    cMapUrl: `${files}cmaps/`,
+    // Other standard fonts fall back to system fonts; Symbol and ZapfDingbats
+    // (check marks on forms) have none.
+    standardFontDataUrl: `${files}standard_fonts/`,
+    // Scanned pages (JBIG2, CCITT fax) and JPEG 2000 images decode in pdf.js
+    // 6 only through these modules. Their WebAssembly builds would need
+    // 'wasm-unsafe-eval', which the CSP does not grant, so the JavaScript
+    // builds are used and no WebAssembly is ever compiled.
+    wasmUrl: `${files}wasm/`,
+    useWasm: false,
     // pdf.js 6 has no eval-based code left, and dropped this option with it.
     // It is still set so a downgrade to a 5.x build stays eval-free: the CSP
     // has no 'unsafe-eval', and CVE-2024-4367 ran through pdf.js's eval path.

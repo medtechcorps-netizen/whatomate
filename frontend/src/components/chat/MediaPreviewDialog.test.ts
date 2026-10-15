@@ -292,6 +292,64 @@ describe('MediaPreviewDialog', () => {
     expect(pdf.renders.at(-1)!.page).toBe(1)
   })
 
+  it('zooms PDF pages to twice their fitted width and redraws the pages in view', async () => {
+    vi.spyOn(HTMLOListElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 800 } as DOMRect)
+    const pdf = fakePdf(3)
+    await openPdf(pdf)
+    const zoom = () => document.body.querySelector<HTMLButtonElement>('[data-testid="chat-media-preview-zoom"]')!
+    const list = () => document.body.querySelector<HTMLOListElement>('ol')!
+
+    // Page 3 is drawn, then scrolled away; pages 1 and 2 stay in view.
+    observer().report([3], true)
+    await settle()
+    pdf.renders[0].done.resolve()
+    await settle()
+    observer().report([3], false)
+    observer().report([1, 2], true)
+    await settle()
+    pdf.renders[1].done.resolve()
+    await settle()
+    expect(pdf.renders.map(render => render.page)).toEqual([3, 1, 2])
+    expect(zoom().textContent).toContain('chat.mediaPreview.zoomIn')
+
+    zoom().click()
+    await settle()
+    expect(list().style.width).toBe('1600px')
+    expect(list().className).toContain('max-w-none')
+    expect(zoom().textContent).toContain('chat.mediaPreview.fitToScreen')
+    // Page 2 was still drawing at the old width: it is stopped and drawn again.
+    expect(pdf.renders[2].cancel).toHaveBeenCalled()
+    expect(pdf.renders[3].page).toBe(1)
+    expect(pageState(2)).toBe('queued')
+    // Page 3 is out of view: its old drawing is given back, not redrawn.
+    expect(pageState(3)).toBe('idle')
+    expect(pages()[2].querySelector('canvas')!.width).toBe(0)
+
+    pdf.renders[3].done.resolve()
+    await settle()
+    expect(pdf.renders[4].page).toBe(2)
+    pdf.renders[4].done.resolve()
+    await settle()
+    expect(pdf.renders).toHaveLength(5)
+
+    zoom().click()
+    await settle()
+    expect(list().style.width).toBe('')
+    expect(list().className).toContain('max-w-4xl')
+    expect(pdf.renders.slice(5).map(render => render.page)).toEqual([1])
+  })
+
+  it('offers zoom only once the PDF is ready', async () => {
+    const parsing = deferred<PdfPreviewDocument>()
+    mocks.openPdfPreview.mockReturnValueOnce(parsing.promise)
+    mountPreview({ source: pdfSource })
+    await settle()
+    expect(document.body.querySelector('[data-testid="chat-media-preview-zoom"]')).toBeNull()
+    parsing.resolve(fakePdf(1).document)
+    await settle()
+    expect(document.body.querySelector('[data-testid="chat-media-preview-zoom"]')).not.toBeNull()
+  })
+
   it('previews the first pages of a long PDF and offers the download for the rest', async () => {
     await openPdf(fakePdf(45, 30))
     expect(pages()).toHaveLength(30)
@@ -324,6 +382,7 @@ describe('MediaPreviewDialog', () => {
     expect(download.getAttribute('href')).toBe('blob:opaque')
     expect(download.getAttribute('download')).toBe('lab-report.pdf')
     expect(pages()).toHaveLength(0)
+    expect(document.body.querySelector('[data-testid="chat-media-preview-zoom"]')).toBeNull()
   })
 
   it('marks a page that fails to draw and goes on with the next', async () => {

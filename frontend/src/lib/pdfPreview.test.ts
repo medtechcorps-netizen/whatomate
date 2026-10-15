@@ -21,6 +21,7 @@ vi.mock('pdfjs-dist/legacy/build/pdf.mjs', () => {
     getDocument: mocks.getDocument,
     GlobalWorkerOptions: mocks.workerOptions,
     VerbosityLevel: { ERRORS: 0 },
+    version: '6.3.289',
   }
 })
 
@@ -123,6 +124,33 @@ describe('openPdfPreview', () => {
     expect(new TextDecoder().decode(params.data)).toBe('%PDF-1.7 lab report')
     expect(preview.pageCount).toBe(2)
     expect(preview.pageSizes).toEqual([{ width: 612, height: 792 }, { width: 612, height: 792 }])
+  })
+
+  it('points pdf.js at same-origin CMaps, fonts and JavaScript image decoders, never WebAssembly', async () => {
+    mocks.getDocument.mockReturnValueOnce(fakeLoadingTask(Promise.resolve(fakeDocument(1))))
+    await openPdfPreview(pdfBytes())
+    const params = mocks.getDocument.mock.calls[0][0]
+    // The dev server serves the package itself; builds copy the same files
+    // (pdfjsRuntimeFiles in vite.config.ts).
+    expect(params).toMatchObject({
+      cMapUrl: '/node_modules/pdfjs-dist/cmaps/',
+      standardFontDataUrl: '/node_modules/pdfjs-dist/standard_fonts/',
+      wasmUrl: '/node_modules/pdfjs-dist/wasm/',
+      useWasm: false,
+    })
+    expect(params).not.toHaveProperty('cMapPacked', false)
+    expect(params).not.toHaveProperty('useWorkerFetch', false)
+  })
+
+  it.each([
+    'cmaps/UniGB-UTF16-H.bcmap',
+    'standard_fonts/FoxitDingbats.pfb',
+    'standard_fonts/FoxitSymbol.pfb',
+    'wasm/jbig2_nowasm_fallback.js',
+    'wasm/openjpeg_nowasm_fallback.js',
+  ])('the pinned pdf.js package has the runtime file %s', file => {
+    const root = createRequire(import.meta.url).resolve('pdfjs-dist/package.json').replace(/package\.json$/, '')
+    expect(readFileSync(root + file).length).toBeGreaterThan(0)
   })
 
   it(`previews only the first ${PDF_PREVIEW_PAGE_LIMIT} pages of a long file`, async () => {
