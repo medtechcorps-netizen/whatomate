@@ -49,6 +49,29 @@ Optional seed summaries use the committed global-table allowlist. The current
 seed comparison reports the permission-key count and key hash. It does not
 export key values, tenant counts or business records.
 
+## Migration planner owner sessions
+
+The `rls-migrate` planner and data gates observe the native migration owner
+already held by the coordinator. A managed owner with `CREATEROLE` or
+`BYPASSRLS` must own the current database and remain a non-superuser without
+replication privileges. This supersedes the earlier planner design's
+non-`BYPASSRLS` owner precondition and the implementation's additional
+`NOCREATEROLE` restriction. Restricted schema/table owners retain their existing
+observation path, including when they do not own the database.
+
+Seed observation through `ObservePlanSeedsOnHeldOwner` independently checks the
+coordinator's exact PID, database and role identity, canonical nonce marker,
+and unique live advisory-lock witness before and after reading. Its observer
+uses a distinct backend. Data-gate counts use the coordinator's own held
+connection and verify its native identity and lock. Missing or ambiguous
+witnesses remain incomplete observations.
+
+The separate runtime role retains its strict privilege and visibility checks.
+The generic `ObservePlanSeeds` API still rejects `CREATEROLE` and `BYPASSRLS`.
+Read-only transactions, table ownership, grants, canonical tenant policies,
+timeouts and connection cleanup remain required. Observation changes no data,
+roles, grants, schema or seed state; it grants no mutation or release authority.
+
 ## Reviewing the production shape
 
 O-1 must come from the accepted catalog-bearing production release. Retain its

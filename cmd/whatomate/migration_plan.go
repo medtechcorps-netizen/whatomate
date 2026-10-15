@@ -347,7 +347,10 @@ func (s *migrationPlanState) captureSeeds(ctx context.Context, d planDeadline, c
 	if _, err = readPlanHeld(ctx, tx, self, s.marker, s.owner.User, s.owner.Database, &held); err != nil {
 		return seeds, "target"
 	}
-	seeds, err = database.ObservePlanSeeds(ctx, tx)
+	seeds, err = database.ObservePlanSeedsOnHeldOwner(ctx, tx, database.PlanSeedHeldOwner{
+		PID: held.PID, DatabaseOID: held.DatabaseOID, DatabaseName: held.DatabaseName,
+		RoleOID: held.RoleOID, RoleName: held.RoleName, Marker: held.ApplicationName,
+	})
 	if err != nil || !d.alive(ctx) {
 		return seeds, "seeds"
 	}
