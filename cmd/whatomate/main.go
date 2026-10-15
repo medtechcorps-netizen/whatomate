@@ -634,6 +634,96 @@ func verifyRLSMigrationRuntime(cfg *config.DatabaseConfig) error {
 // SERVER COMMAND
 // ============================================================================
 
+// This is the whole shutdown owner's wait budget. Reporting never holds it. It is
+// deliberately below the published 30s and 120s platform defaults; it is not a
+// claim about the effective grace period of a particular deployment.
+const serverShutdownBudget = 25 * time.Second
+
+type serverShutdownTask struct {
+	name string
+	run  func(context.Context) error
+}
+
+type serverShutdownResult struct {
+	completed       []string
+	pending         []string
+	failed          map[string]error
+	deadlineExpired bool
+}
+
+// Only the return of the owned top-level function counts as a join. Stop and
+// Close calls may merely request cancellation (or do nothing at all).
+func startServerLoop(name string, run func()) serverShutdownTask {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		run()
+	}()
+	return serverShutdownTask{name, func(ctx context.Context) error {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}}
+}
+
+// No callback, logger, or cancellation propagation runs on the deadline owner.
+// In particular, ShutdownWithContext can block on a lock/listener before it
+// checks its context. The independent timer also bounds that case.
+func shutdownServer(deadline time.Time, tasks []serverShutdownTask, report func(serverShutdownResult)) (result serverShutdownResult) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer func() { go cancel() }()
+	defer func() {
+		if report != nil {
+			go report(result)
+		}
+	}()
+	type completion struct {
+		index int
+		err   error
+	}
+	// Every task can finish after this function returns without blocking a send.
+	finished := make(chan completion, len(tasks))
+	pending := make([]bool, len(tasks))
+	result.failed = make(map[string]error)
+	for i, task := range tasks {
+		pending[i] = true
+		go func() { finished <- completion{i, task.run(ctx)} }()
+	}
+	remaining := len(tasks)
+	for remaining > 0 {
+		if !time.Now().Before(deadline) {
+			result.deadlineExpired = true
+			break
+		}
+		select {
+		case <-timer.C:
+			result.deadlineExpired = true
+		case item := <-finished:
+			pending[item.index] = false
+			remaining--
+			if item.err != nil {
+				result.failed[tasks[item.index].name] = item.err
+			} else {
+				result.completed = append(result.completed, tasks[item.index].name)
+			}
+		}
+		if result.deadlineExpired {
+			break
+		}
+	}
+	for i, waiting := range pending {
+		if waiting {
+			result.pending = append(result.pending, tasks[i].name)
+		}
+	}
+	return result
+}
+
 func runServer(args []string) {
 	serverFlags := flag.NewFlagSet("server", flag.ExitOnError)
 	configPath := serverFlags.String("config", "config.toml", "Path to config file")
@@ -870,17 +960,22 @@ func runServer(args []string) {
 		}
 	}()
 
+	var ownedLoops []serverShutdownTask
+	startLoop := func(name string, run func()) {
+		ownedLoops = append(ownedLoops, startServerLoop(name, run))
+	}
+
 	// Start SLA processor (runs every minute)
 	slaProcessor := handlers.NewSLAProcessor(app, time.Minute)
 	slaCtx, slaCancel := context.WithCancel(context.Background())
-	go slaProcessor.Start(slaCtx)
+	startLoop("SLA loop", func() { slaProcessor.Start(slaCtx) })
 	lo.Info("SLA processor started")
 
 	// Start the durable care-continuity processor. It creates internal tasks
 	// and agent reminders only; it never sends customer messages.
 	careProcessor := handlers.NewCareContinuityProcessor(app, 30*time.Second)
 	careCtx, careCancel := context.WithCancel(context.Background())
-	go careProcessor.Start(careCtx)
+	startLoop("care continuity loop", func() { careProcessor.Start(careCtx) })
 	lo.Info("Care continuity processor started")
 
 	// Enforce Copilot data retention independently of HTTP traffic. Expired
@@ -888,7 +983,7 @@ func runServer(args []string) {
 	// linked feedback, in tenant-scoped batches.
 	copilotRetentionProcessor := handlers.NewCopilotRetentionProcessor(app, time.Hour)
 	copilotRetentionCtx, copilotRetentionCancel := context.WithCancel(context.Background())
-	go copilotRetentionProcessor.Start(copilotRetentionCtx)
+	startLoop("Copilot retention loop", func() { copilotRetentionProcessor.Start(copilotRetentionCtx) })
 	lo.Info("Copilot retention processor started")
 
 	// Execute immutable visual automation versions from the dedicated customer
@@ -896,7 +991,7 @@ func runServer(args []string) {
 	// than one API instance is running.
 	automationProcessor := handlers.NewAutomationPolicyProcessor(app, 5*time.Second)
 	automationCtx, automationCancel := context.WithCancel(context.Background())
-	go automationProcessor.Start(automationCtx)
+	startLoop("automation policy loop", func() { automationProcessor.Start(automationCtx) })
 	lo.Info("Automation policy processor started")
 
 	// Recover the post-ACK media/chatbot side of inbound WhatsApp messages.
@@ -904,7 +999,7 @@ func runServer(args []string) {
 	// processing the same WAMID concurrently.
 	inboundProcessor := handlers.NewInboundContinuationProcessor(app, 2*time.Second)
 	inboundCtx, inboundCancel := context.WithCancel(context.Background())
-	go inboundProcessor.Start(inboundCtx)
+	startLoop("inbound continuation loop", func() { inboundProcessor.Start(inboundCtx) })
 	lo.Info("Inbound continuation processor started")
 
 	// Hydrate media identifiers delivered by WhatsApp Coexistence history and
@@ -912,30 +1007,30 @@ func runServer(args []string) {
 	// without holding tenant database transactions across provider I/O.
 	coexistenceMediaProcessor := handlers.NewCoexistenceMediaProcessor(app, 2*time.Second)
 	coexistenceMediaCtx, coexistenceMediaCancel := context.WithCancel(context.Background())
-	go coexistenceMediaProcessor.Start(coexistenceMediaCtx)
+	startLoop("Coexistence media loop", func() { coexistenceMediaProcessor.Start(coexistenceMediaCtx) })
 	lo.Info("Coexistence media processor started")
 
 	var metaLifecycleCancel context.CancelFunc
 	if cfg.MetaMessenger.Enabled {
 		var metaLifecycleCtx context.Context
 		metaLifecycleCtx, metaLifecycleCancel = context.WithCancel(context.Background())
-		go func() {
+		startLoop("Messenger lifecycle loop", func() {
 			lo.Info("Messenger ownership lifecycle processor started")
 			if err := app.RunMetaMessengerLifecycle(metaLifecycleCtx); err != nil && err != context.Canceled {
 				lo.Error("Messenger ownership lifecycle processor stopped", "error", err)
 			}
-		}()
+		})
 	}
 	var metaInstagramLifecycleCancel context.CancelFunc
 	if cfg.MetaInstagram.Enabled {
 		var metaInstagramLifecycleCtx context.Context
 		metaInstagramLifecycleCtx, metaInstagramLifecycleCancel = context.WithCancel(context.Background())
-		go func() {
+		startLoop("Instagram lifecycle loop", func() {
 			lo.Info("Instagram ownership lifecycle processor started")
 			if err := app.RunMetaInstagramLifecycle(metaInstagramLifecycleCtx); err != nil && err != context.Canceled {
 				lo.Error("Instagram ownership lifecycle processor stopped", "error", err)
 			}
-		}()
+		})
 	}
 
 	// Start embedded workers
@@ -953,121 +1048,123 @@ func runServer(args []string) {
 			workers = append(workers, w)
 
 			workerNum := i + 1
-			go func() {
+			startLoop(fmt.Sprintf("worker %d message loop", workerNum), func() {
 				lo.Info("Worker started", "worker_num", workerNum)
 				if err := w.Run(workerCtx); err != nil && err != context.Canceled {
 					lo.Error("Worker error", "error", err, "worker_num", workerNum)
 				}
-			}()
-			go func() {
+			})
+			startLoop(fmt.Sprintf("worker %d outbox loop", workerNum), func() {
 				lo.Info("Channel outbox worker started", "worker_num", workerNum)
 				if err := w.RunChannelOutbox(workerCtx); err != nil && err != context.Canceled {
 					lo.Error("Channel outbox worker error", "error", err, "worker_num", workerNum)
 				}
-			}()
-			go func() {
+			})
+			startLoop(fmt.Sprintf("worker %d AI reply loop", workerNum), func() {
 				lo.Info("Channel AI reply worker started", "worker_num", workerNum)
 				if err := w.RunChannelAIReplies(workerCtx); err != nil && err != context.Canceled {
 					lo.Error("Channel AI reply worker error", "error", err, "worker_num", workerNum)
 				}
-			}()
-			go func() {
+			})
+			startLoop(fmt.Sprintf("worker %d Threads credential loop", workerNum), func() {
 				lo.Info("Threads credential refresh worker started", "worker_num", workerNum)
 				if err := w.RunThreadsCredentialRefresh(workerCtx); err != nil && err != context.Canceled {
 					lo.Error("Threads credential refresh worker error", "error", err, "worker_num", workerNum)
 				}
-			}()
+			})
 		}
 		lo.Info("Embedded workers started", "count", *numWorkers)
 	} else {
 		lo.Info("Embedded workers disabled, run workers separately")
 	}
 
-	// Graceful shutdown
+	// One signal owns shutdown. Establish the deadline before any logging,
+	// cancellation or cleanup; a second signal must not invoke Stop twice.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
+	deadline := time.Now().Add(serverShutdownBudget)
 
-	lo.Info("Shutting down...")
-
-	// Stop campaign stats subscriber
-	lo.Info("Stopping campaign stats subscriber...")
-	app.StopRealtimeSubscriber()
-	app.StopCampaignStatsSubscriber()
-	lo.Info("Campaign stats subscriber stopped")
-
+	// Keep shared DB/Redis clients available to settling work. Callbacks are
+	// independent: a stuck subscriber or worker close must not delay HTTP
+	// listener shutdown or cancellation of another processor.
+	tasks := []serverShutdownTask{
+		{"HTTP shutdown", server.ShutdownWithContext},
+		{"realtime subscriber stop call", func(context.Context) error {
+			app.StopRealtimeSubscriber()
+			return nil
+		}},
+		{"campaign stats stop request", func(context.Context) error {
+			app.StopCampaignStatsSubscriber()
+			return nil
+		}},
+		{"Coexistence media stop request", func(context.Context) error {
+			coexistenceMediaCancel()
+			coexistenceMediaProcessor.Stop()
+			return nil
+		}},
+		{"inbound continuation stop request", func(context.Context) error {
+			inboundCancel()
+			inboundProcessor.Stop()
+			return nil
+		}},
+		{"automation policy stop request", func(context.Context) error {
+			automationCancel()
+			automationProcessor.Stop()
+			return nil
+		}},
+		{"Copilot retention stop request", func(context.Context) error {
+			copilotRetentionCancel()
+			copilotRetentionProcessor.Stop()
+			return nil
+		}},
+		{"care continuity stop request", func(context.Context) error {
+			careCancel()
+			careProcessor.Stop()
+			return nil
+		}},
+		{"SLA stop request", func(context.Context) error {
+			slaCancel()
+			slaProcessor.Stop()
+			return nil
+		}},
+	}
 	if metaLifecycleCancel != nil {
-		lo.Info("Stopping Messenger ownership lifecycle processor...")
-		metaLifecycleCancel()
-		lo.Info("Messenger ownership lifecycle processor stopped")
+		tasks = append(tasks, serverShutdownTask{"Messenger lifecycle stop request", func(context.Context) error {
+			metaLifecycleCancel()
+			return nil
+		}})
 	}
 	if metaInstagramLifecycleCancel != nil {
-		lo.Info("Stopping Instagram ownership lifecycle processor...")
-		metaInstagramLifecycleCancel()
-		lo.Info("Instagram ownership lifecycle processor stopped")
+		tasks = append(tasks, serverShutdownTask{"Instagram lifecycle stop request", func(context.Context) error {
+			metaInstagramLifecycleCancel()
+			return nil
+		}})
 	}
-
-	// Stop Coexistence media recovery before closing the shared database pool.
-	lo.Info("Stopping Coexistence media processor...")
-	coexistenceMediaCancel()
-	coexistenceMediaProcessor.Stop()
-	coexistenceMediaShutdownCtx, coexistenceMediaShutdownCancel := context.WithTimeout(
-		context.Background(),
-		15*time.Second,
-	)
-	if err := coexistenceMediaProcessor.Wait(coexistenceMediaShutdownCtx); err != nil {
-		lo.Warn("Timed out waiting for Coexistence media processor", "error", err)
-	}
-	coexistenceMediaShutdownCancel()
-	lo.Info("Coexistence media processor stopped")
-
-	// Stop inbound continuation recovery.
-	lo.Info("Stopping inbound continuation processor...")
-	inboundCancel()
-	inboundProcessor.Stop()
-	lo.Info("Inbound continuation processor stopped")
-
-	// Stop visual automation before legacy care so neither can claim new
-	// customer lifecycle work during shutdown.
-	lo.Info("Stopping automation policy processor...")
-	automationCancel()
-	automationProcessor.Stop()
-	lo.Info("Automation policy processor stopped")
-
-	// Stop Copilot retention before the shared database pool is closed.
-	lo.Info("Stopping Copilot retention processor...")
-	copilotRetentionCancel()
-	copilotRetentionProcessor.Stop()
-	lo.Info("Copilot retention processor stopped")
-
-	// Stop care continuity processor
-	lo.Info("Stopping care continuity processor...")
-	careCancel()
-	careProcessor.Stop()
-	lo.Info("Care continuity processor stopped")
-
-	// Stop SLA processor
-	lo.Info("Stopping SLA processor...")
-	slaCancel()
-	slaProcessor.Stop()
-	lo.Info("SLA processor stopped")
-
-	// Stop workers first
 	if workerCancel != nil {
-		lo.Info("Stopping workers...", "count", len(workers))
-		workerCancel()
-		for _, w := range workers {
-			_ = w.Close()
+		tasks = append(tasks, serverShutdownTask{"worker stop request", func(context.Context) error {
+			workerCancel()
+			return nil
+		}})
+		for i, w := range workers {
+			tasks = append(tasks, serverShutdownTask{fmt.Sprintf("worker %d close call", i+1), func(context.Context) error {
+				return w.Close()
+			}})
 		}
-		lo.Info("Workers stopped")
 	}
-
-	// Then stop server
-	lo.Info("Stopping server...")
-	if err := server.Shutdown(); err != nil {
-		lo.Error("Server shutdown error", "error", err)
-	}
-	lo.Info("Server stopped")
+	tasks = append(tasks, ownedLoops...)
+	shutdownServer(deadline, tasks, func(result serverShutdownResult) {
+		// Best effort only: a blocked log sink must not keep main alive. Even
+		// success below joins only the tracked top-level loops, not WebSockets,
+		// subscriber internals, worker heartbeats or other detached app work.
+		if result.deadlineExpired || len(result.failed) > 0 {
+			lo.Warn("Server shutdown incomplete", "deadline_expired", result.deadlineExpired,
+				"pending", result.pending, "failed", result.failed)
+		} else {
+			lo.Info("Server shutdown callbacks and tracked loops finished; detached work not joined")
+		}
+	})
+	// No blocking cleanup or logging after this point: main returns next.
 }
 
 // ============================================================================
