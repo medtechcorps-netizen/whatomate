@@ -707,7 +707,8 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 // contactManualUnreadKey is the contacts.metadata key that records a
 // team-shared "Mark as unread". It is internal state: responses report it as
 // manual_unread and strip it from the returned metadata, so a contact edit
-// form never echoes it back.
+// form never echoes it back. A person's read clears it; a chatbot reply,
+// which stores the exchange as read, does not.
 const contactManualUnreadKey = "manual_unread"
 
 // contactStateQueryTimeout bounds each supplementary contact-state statement
@@ -762,7 +763,8 @@ func contactMetadataWithoutManualUnread() clause.Expr {
 // whereContactUnread keeps contacts the team has not read: an incoming,
 // not-deleted message whose status is not read, or a manual "Mark as unread".
 // Read state is shared by the whole team. Chatbot-handled exchanges are stored
-// as read, so they only reappear when a person marks them unread.
+// as read, so they only reappear when a person marks them unread; a chatbot
+// reply does not clear that mark, only a person reading the chat does.
 func whereContactUnread(query *gorm.DB, orgID uuid.UUID) *gorm.DB {
 	manualUnread := contactManualUnreadJSON()
 	return query.Where(`(contacts.metadata @> ?::jsonb OR EXISTS (
@@ -1591,15 +1593,19 @@ func (a *App) markSelectedMessagesAsRead(
 			  AND unread_message.direction = ?
 			  AND unread_message.status != ?
 		)`, orgID, contactID, models.DirectionIncoming, models.MessageStatusRead)
-		// Any read, automatic or manual, also ends a manual "Mark as unread".
-		// The same statement writes both columns of the contact row locked
-		// above, so the flag takes no extra lock or connection.
+		contactUpdates := map[string]any{"is_read": isReadExpression}
+		if !mirrorEntireContact {
+			// A person's visible-cursor read (Chat, automatic or manual, and
+			// Omnichannel) also ends a manual "Mark as unread". The
+			// whole-contact path also serves chatbot replies, which must not
+			// dismiss a teammate's reminder. The same statement writes the
+			// contact row locked above, so the flag takes no extra lock or
+			// connection.
+			contactUpdates["metadata"] = contactMetadataWithoutManualUnread()
+		}
 		updated := tx.Model(&models.Contact{}).
 			Where("id = ? AND organization_id = ?", contactID, orgID).
-			Updates(map[string]any{
-				"is_read":  isReadExpression,
-				"metadata": contactMetadataWithoutManualUnread(),
-			})
+			Updates(contactUpdates)
 		if updated.Error != nil {
 			return updated.Error
 		}

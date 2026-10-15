@@ -451,6 +451,39 @@ func TestLaneDManualReadStateWithoutIncomingMessagesOrSharedWrite(t *testing.T) 
 	assert.NotEqual(t, models.MessageStatusRead, message.Status)
 }
 
+func TestLaneDChatbotReadKeepsATeammatesManualUnread(t *testing.T) {
+	db := testutil.SetupTestDB(t)
+	organization := testutil.CreateTestOrganization(t, db)
+	adminRole := testutil.CreateAdminRole(t, db, organization.ID)
+	reader := testutil.CreateTestUser(t, db, organization.ID, testutil.WithRoleID(&adminRole.ID))
+	account := testutil.CreateTestWhatsAppAccount(t, db, organization.ID)
+	contact := testutil.CreateTestContactWith(t, db, organization.ID, testutil.WithContactAccount(account.Name))
+	conversation := createLegacyChatConversation(t, db, account, contact.ID)
+	app := &App{DB: db, Log: testutil.NopLogger()}
+
+	_, status := laneDMarkRead(t, app, organization.ID, reader.ID, contact.ID, map[string]any{"mark": "unread"})
+	require.Equal(t, fasthttp.StatusOK, status)
+
+	// A new customer message that the chatbot answers is stored as read
+	// through the whole-contact path (ChatbotSendOptions.MarkIncomingRead).
+	incoming := createLegacyChatMessage(t, db, organization.ID, account.Name, contact.ID, conversation.ID, uuid.New(), time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond))
+	var stored models.Contact
+	require.NoError(t, db.First(&stored, "id = ?", contact.ID).Error)
+	app.markMessagesAsRead(organization.ID, contact.ID, &stored)
+	require.NoError(t, db.First(&incoming, "id = ?", incoming.ID).Error)
+	assert.Equal(t, models.MessageStatusRead, incoming.Status)
+	assert.True(t, laneDManualUnreadStored(t, db, contact.ID), "a chatbot reply keeps the teammate's reminder")
+	unread, status := laneDListContacts(t, app, organization.ID, reader.ID, map[string]string{"unread": "true"})
+	require.Equal(t, fasthttp.StatusOK, status)
+	require.Equal(t, []uuid.UUID{contact.ID}, laneDContactIDs(unread))
+	assert.Zero(t, unread.Contacts[0].UnreadCount)
+	assert.True(t, unread.Contacts[0].ManualUnread)
+
+	// A person reading the chat ends it.
+	markLegacyChatVisible(t, app, organization.ID, reader.ID, contact.ID, incoming.ID, fasthttp.StatusOK)
+	assert.False(t, laneDManualUnreadStored(t, db, contact.ID))
+}
+
 func TestLaneDReadStateToleratesScalarContactMetadata(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	organization := testutil.CreateTestOrganization(t, db)

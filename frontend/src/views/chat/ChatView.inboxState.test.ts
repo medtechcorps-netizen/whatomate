@@ -19,6 +19,8 @@ const mocks = vi.hoisted(() => ({
   setListFilter: vi.fn(),
   markContactReadState: vi.fn(),
   markRead: vi.fn(),
+  assignableMembers: vi.fn(),
+  fetchUsers: vi.fn(),
   refreshUnread: vi.fn(),
   toastError: vi.fn(),
   infiniteControllers: [] as Array<{
@@ -153,7 +155,7 @@ vi.mock('@/stores/organizations', () => ({
   useOrganizationsStore: () => ({ selectedOrgId: null }),
 }))
 vi.mock('@/stores/users', () => ({
-  useUsersStore: () => ({ users: [], fetchUsers: vi.fn().mockResolvedValue(undefined) }),
+  useUsersStore: () => ({ users: [], fetchUsers: mocks.fetchUsers }),
 }))
 vi.mock('@/stores/transfers', async () => {
   const { reactive } = await import('vue')
@@ -187,6 +189,7 @@ vi.mock('@/services/api', () => ({
   contactsService: {
     getSessionData: vi.fn().mockRejectedValue(new Error('not configured')),
     markRead: mocks.markRead,
+    assignableMembers: mocks.assignableMembers,
     assign: vi.fn(),
   },
   chatbotService: { createTransfer: vi.fn(), resumeTransfer: vi.fn() },
@@ -278,6 +281,8 @@ describe('ChatView inbox state', () => {
     mocks.fetchMessages.mockResolvedValue(undefined)
     mocks.markRead.mockResolvedValue({ data: { data: { cursor_synced: true } } })
     mocks.markContactReadState.mockResolvedValue(undefined)
+    mocks.fetchUsers.mockResolvedValue(undefined)
+    mocks.assignableMembers.mockResolvedValue({ data: { data: { members: [], total: 0 } } })
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       callback(0)
       return 1
@@ -347,6 +352,20 @@ describe('ChatView inbox state', () => {
     grant('contacts:write')
     view = await mountSettled()
     expect(view.find('[aria-label="chat.assignToAgent"]').exists()).toBe(true)
+  })
+
+  it('loads assignable people from organization members without users:read', async () => {
+    grant('contacts:write', 'organizations:read')
+    await mountSettled()
+    expect(mocks.assignableMembers).toHaveBeenCalledTimes(1)
+    expect(mocks.fetchUsers).not.toHaveBeenCalled()
+  })
+
+  it('keeps the users list for callers with users:read', async () => {
+    grant('contacts:write', 'users:read', 'organizations:read')
+    await mountSettled()
+    expect(mocks.fetchUsers).toHaveBeenCalledTimes(1)
+    expect(mocks.assignableMembers).not.toHaveBeenCalled()
   })
 
   it('marks a row read and refreshes the navbar unread count', async () => {

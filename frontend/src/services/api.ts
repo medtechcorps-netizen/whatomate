@@ -1823,6 +1823,20 @@ export const contactsService = {
   // latest incoming message on the server; "unread" sets a team-shared flag
   // and never sends anything to WhatsApp. The automatic markRead body above is
   // deliberately left unchanged.
+  // People a contact can be assigned to, for callers without users:read:
+  // the organization's members (organizations:read), membership-aware like
+  // the server's assignee check.
+  assignableMembers: (signal?: AbortSignal) =>
+    api.get<{
+      members: Array<{
+        user_id: string;
+        full_name?: string | null;
+        email?: string | null;
+        is_active?: boolean | null;
+        role_name?: string | null;
+      }>;
+      total: number;
+    }>("/organizations/members", { params: { page: 1, limit: 100 }, signal }),
   markManualReadState: (id: string, mark: "read" | "unread") =>
     api.post<{ status: string; cursor_synced: boolean; manual_unread: boolean }>(
       `/contacts/${encodeURIComponent(id)}/mark-read`,

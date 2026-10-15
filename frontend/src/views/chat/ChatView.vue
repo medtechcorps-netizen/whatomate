@@ -12,7 +12,6 @@ import {
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
-import { useUsersStore } from '@/stores/users'
 import { useTransfersStore } from '@/stores/transfers'
 import { wsService } from '@/services/websocket'
 import { contactsService, chatbotService, messagesService, customActionsService, accountsService, cannedResponsesService, effectiveAIIsAllowed, type ContactIdentityReviewEffectiveState, type CustomAction, type ActionResult, type CannedResponse } from '@/services/api'
@@ -111,6 +110,7 @@ import { contactAddressDisplay, contactDisplayName, isPlaceholderPhone } from '@
 import type { WorkspaceRequestedAction } from '@/lib/crmFlow'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
+import { useAssignableUsers } from '@/composables/useAssignableUsers'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
 import ChatListFilters from '@/components/chat/ChatListFilters.vue'
 import ChatRowActionsMenu from '@/components/chat/ChatRowActionsMenu.vue'
@@ -145,7 +145,6 @@ const contactsStore = useContactsStore()
 const authStore = useAuthStore()
 const organizationsStore = useOrganizationsStore()
 const omnichannelUnreadStore = useOmnichannelUnreadStore()
-const usersStore = useUsersStore()
 const transfersStore = useTransfersStore()
 const tagsStore = useTagsStore()
 const notesStore = useNotesStore()
@@ -703,9 +702,13 @@ function toggleConversationAI() {
 }
 
 // Get list of users for assignment
-const assignableUsers = computed(() => {
-  return usersStore.users.filter(u => u.is_active)
-})
+// Members offered by the Assign dialog. Without users:read (default
+// managers) they come from the organization member list.
+const {
+  users: assignableUsers,
+  load: loadAssignableUsers,
+  nameOf: assignableUserName,
+} = useAssignableUsers()
 
 // Icon mapping for custom actions
 const actionIconMap: Record<string, any> = {
@@ -841,11 +844,9 @@ onMounted(async () => {
   // Fetch transfers to track active transfers
   transfersStore.fetchTransfers({ status: 'active' })
 
-  // Fetch users if can assign contacts
+  // Fetch the people a contact can be assigned to
   if (canAssignContacts.value) {
-    usersStore.fetchUsers().catch(() => {
-      // Silently fail if user list can't be loaded
-    })
+    void loadAssignableUsers()
   }
 
   // Fetch custom actions for admins/managers
@@ -1875,9 +1876,7 @@ async function assignContactToUser(userId: string | null) {
     contactsStore.currentContact = {
       ...contactsStore.currentContact,
       assigned_user_id: userId || undefined,
-      assigned_user_name: userId
-        ? usersStore.users.find(user => user.id === userId)?.full_name
-        : undefined,
+      assigned_user_name: assignableUserName(userId),
     }
     // Refresh contacts list
     await contactsStore.fetchContacts()
@@ -3383,7 +3382,7 @@ watch(contactId, () => chatAttachments.reset())
                   class="ml-auto h-4 w-4 text-primary"
                 />
                 <Badge v-else variant="outline" class="ml-auto text-xs">
-                  {{ user.role?.name }}
+                  {{ user.role_name }}
                 </Badge>
               </Button>
               <p v-if="filteredAssignableUsers.length === 0" class="text-sm text-muted-foreground text-center py-4">
