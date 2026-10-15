@@ -901,11 +901,15 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 	// Broadcast only after optional hydration so a media message reaches the UI
 	// once, with its durable object-store URL when download succeeded.
-	// The inbound fact and optional media hydration are already durable. Publish
-	// through the root app so realtime delivery completes before the first
+	// The inbound fact and optional media hydration are already durable.
+	// H1: read the mask flag and reply preview through this continuation's own tenant
+	// transaction (plain SELECTs, no row locks) instead of a second pooled connection,
+	// then deliver the publication at once so it still precedes the first
 	// automatic-action boundary instead of waiting for the continuation's
 	// bookkeeping transaction to finish after provider I/O.
-	a.rootApp().broadcastNewMessage(work.OrganizationID, &work.Persisted, contact)
+	publisher := a.rootApp().scopedApp(a.DB, work.OrganizationID)
+	publisher.broadcastNewMessage(work.OrganizationID, &work.Persisted, contact)
+	a.rootApp().runAfterCommit(publisher.takeAfterCommit())
 	if incomingMessageAutomaticAISuppressed(&work.Persisted) {
 		reason, _ := work.Persisted.Metadata[incomingAutomaticAISuppressionReasonKey].(string)
 		return &inboundContinuationPolicyStop{Reason: reason}
@@ -940,8 +944,26 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 	if !settings.IsEnabled {
 		a.Log.Debug("Chatbot not enabled for this account, creating transfer for agent queue", "account", account.Name, "settings_id", settings.ID)
+		// H1: answer out of hours here so a failed reply is retried (createTransferToQueue
+		// discards that send error, agent_transfers.go:1488), and hand over only within hours.
+		if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 &&
+			!a.isWithinBusinessHours(settings.BusinessHours.Hours) {
+			a.Log.Info("Outside business hours, sending out-of-hours message instead of queue transfer", "contact_id", contact.ID, "source", models.TransferSourceChatbotDisabled)
+			if settings.BusinessHours.OutOfHoursMessage != "" {
+				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
+					return fmt.Errorf("send chatbot-disabled out-of-hours response: %w", err)
+				}
+			}
+			return nil
+		}
 		// Create transfer to agent queue when chatbot is disabled
 		a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled)
+		// H1: createTransferToQueue logs and discards saveAndFinalizeTransfer errors
+		// (agent_transfers.go:1505-1511) and that phase now has a bounded wait. Never
+		// complete the continuation without the handover: retry instead.
+		if !a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
+			return errors.New("chatbot-disabled queue transfer was not committed; retrying continuation")
+		}
 		return nil
 	}
 	a.Log.Info("Chatbot settings loaded", "settings_id", settings.ID, "is_enabled", settings.IsEnabled, "ai_enabled", settings.AI.Enabled, "ai_provider", settings.AI.Provider, "default_response", settings.DefaultResponse)
@@ -1032,6 +1054,11 @@ func (a *App) continuePersistedIncomingMessage(
 			}
 		}
 		a.createTransferFromKeyword(account, contact)
+		// H1: see the chatbot-disabled branch. The transfer body already sent is replayed
+		// from the action ledger on retry, never resent.
+		if !a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
+			return errors.New("keyword transfer was not committed; retrying continuation")
+		}
 		return nil
 	}
 
@@ -1540,12 +1567,32 @@ func (a *App) getOrCreateSession(
 	var result models.ChatbotSession
 	isNew := false
 
+	sessionLocksExpired := false
 	write := func(tx *gorm.DB) error {
 		// Admission and every policy writer take the organization fence before
 		// contact/session locks. Recheck after that fence: the earlier transfer
 		// lookup is only an optimization, not permission to start another session.
 		if err := database.LockOrganizationPolicyScope(tx, orgID); err != nil {
 			return err
+		}
+		if a.inboundContinuation != nil {
+			// H1: this nested fence transaction must not hold the organization fence
+			// indefinitely while waiting on a contact/session row held by another
+			// continuation's open transaction (e.g. the session-log FK share lock): that wait
+			// closes a lock cycle through Go. Bound only the waits after the fence; the
+			// COMMIT keeps the transaction context.
+			lockParent := tx.Statement.Context
+			if lockParent == nil {
+				lockParent = context.Background()
+			}
+			lockCtx, cancelLocks := context.WithTimeout(lockParent, 20*time.Second)
+			defer func() {
+				if errors.Is(lockCtx.Err(), context.DeadlineExceeded) {
+					sessionLocksExpired = true
+				}
+				cancelLocks()
+			}()
+			tx = tx.WithContext(lockCtx)
 		}
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
 		if err != nil {
@@ -1659,12 +1706,19 @@ func (a *App) getOrCreateSession(
 	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
 		// The policy query after a contended organization lock must see the
 		// writer's commit even if the pool defaults to REPEATABLE READ.
-		err = database.WithTenantReadCommitted(db, orgID, func(tx *gorm.DB) error {
-			if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
-				return err
-			}
-			return write(tx)
-		})
+		runAttempt := func(attemptDB *gorm.DB) error {
+			return database.WithTenantReadCommitted(attemptDB, orgID, func(tx *gorm.DB) error {
+				if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+					return err
+				}
+				return write(tx)
+			})
+		}
+		if a.inboundContinuation != nil {
+			err = a.withBoundedRootConnection(context.Background(), 0, runAttempt) // released before the backoff
+		} else {
+			err = runAttempt(db)
+		}
 		if !isRetryableCanonicalContactWrite(err) {
 			break
 		}
@@ -1674,6 +1728,9 @@ func (a *App) getOrCreateSession(
 				break
 			}
 		}
+	}
+	if err != nil && sessionLocksExpired {
+		err = fmt.Errorf("wedge guard: chatbot session locks not acquired within 20s while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
 	}
 	if err != nil {
 		return nil, false, err

@@ -1265,7 +1265,7 @@ func (a *App) UpdateContactChatbotMessage(contactID uuid.UUID) {
 	}
 	if a.inboundContinuation != nil {
 		orgID := a.inboundContinuationOrganizationID()
-		if err := a.rootApp().WithCommittedTenantApp(
+		if err := a.WithCommittedTenantApp(
 			orgID,
 			func(scoped *App) error { return update(scoped.DB) },
 		); err != nil {
@@ -1292,7 +1292,7 @@ func (a *App) ClearContactChatbotTracking(contactID uuid.UUID) {
 	}
 	if a.inboundContinuation != nil {
 		orgID := a.inboundContinuationOrganizationID()
-		if err := a.rootApp().WithCommittedTenantApp(
+		if err := a.WithCommittedTenantApp(
 			orgID,
 			func(scoped *App) error { return update(scoped.DB) },
 		); err != nil {
@@ -1391,7 +1391,7 @@ func (a *App) clearContactChatbotTrackingForInbound(contactID uuid.UUID) error {
 		}
 		return nil
 	}
-	if err := a.rootApp().WithCommittedTenantApp(organizationID, func(scoped *App) error {
+	if err := a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
 		return update(scoped.DB)
 	}); err != nil {
 		return err

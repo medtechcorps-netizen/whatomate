@@ -1478,11 +1478,12 @@ func (a *App) outgoingTenantTransaction(
 	write func(tx *gorm.DB) error,
 ) error {
 	root := a.rootApp()
-	db := root.DB.WithContext(ctx)
-	if root.rlsEnabled() {
-		return database.WithTenant(db, organizationID, write)
-	}
-	return db.Transaction(write)
+	return a.withBoundedRootConnection(ctx, 0, func(db *gorm.DB) error {
+		if root.rlsEnabled() {
+			return database.WithTenant(db, organizationID, write)
+		}
+		return db.Transaction(write)
+	})
 }
 
 // lockOutgoingContactVisibility rechecks an agent's live claim after the
@@ -1793,7 +1794,17 @@ func (a *App) finalizeMessageSend(
 	// gone out. Keeps the agent's contact-list unread count clean for
 	// conversations the bot is auto-handling. See issue #280.
 	if opts.MarkIncomingRead {
-		a.markMessagesAsRead(req.Account.OrganizationID, req.Contact.ID, req.Contact)
+		if a.inboundContinuation != nil {
+			// H1: markMessagesAsRead's continuation branch (contacts.go:1078-1085), entered
+			// through this nested App so its pool wait is bounded.
+			if err := a.WithCommittedTenantApp(req.Account.OrganizationID, func(scoped *App) error {
+				return scoped.markMessagesAsReadInCurrentScope(req.Account.OrganizationID, req.Contact.ID, req.Contact)
+			}); err != nil {
+				a.Log.Error("Failed to mark independently committed inbound messages as read", "error", err, "organization_id", req.Account.OrganizationID)
+			}
+		} else {
+			a.markMessagesAsRead(req.Account.OrganizationID, req.Contact.ID, req.Contact)
+		}
 	}
 }
 

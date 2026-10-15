@@ -1059,7 +1059,10 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 	if body := stringFromConfig(node.Config, "body", "message", "text"); body != "" {
 		message := processTemplate(body, ctx.session.SessionData)
 		if err := a.sendAndSaveTextMessage(ctx.account, ctx.contact, message); err != nil {
-			if inboundContinuationStoppedByPolicy(err) || inboundContinuationRequiresManualReview(err) {
+			if inboundContinuationStoppedByPolicy(err) || inboundContinuationRequiresManualReview(err) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				// H1: a bounded pool/lock wait expired before dispatch: retry before the
+				// session-complete commit; the action ledger replays the body without a resend.
 				return nodeOutcome{}, err
 			}
 			a.Log.Error("transfer node failed to send body",
@@ -1080,16 +1083,18 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 	// handover's independent organization/contact/session transaction.
 	appendChatPath(ctx.session, node, "")
 	ctx.session.Status = models.SessionStatusCompleted
-	if err := database.WithTenantReadCommitted(
-		a.rootApp().DB,
-		ctx.session.OrganizationID,
-		func(tx *gorm.DB) error {
-			if err := requireOrdinaryTenantOrganization(tx, ctx.session.OrganizationID); err != nil {
-				return err
-			}
-			return a.scopedApp(tx, ctx.session.OrganizationID).persistChatSession(ctx.session)
-		},
-	); err != nil {
+	if err := a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(
+			db,
+			ctx.session.OrganizationID,
+			func(tx *gorm.DB) error {
+				if err := requireOrdinaryTenantOrganization(tx, ctx.session.OrganizationID); err != nil {
+					return err
+				}
+				return a.scopedApp(tx, ctx.session.OrganizationID).persistChatSession(ctx.session)
+			},
+		)
+	}); err != nil {
 		return nodeOutcome{}, err
 	}
 
@@ -1390,8 +1395,10 @@ func (a *App) requireActiveChatSession(s *models.ChatbotSession) error {
 	}
 	// Do not reuse the continuation's possibly older transaction snapshot.
 	// This short read releases its connection before the provider/action fence.
-	return database.WithTenantReadCommitted(a.rootApp().DB, s.OrganizationID, func(tx *gorm.DB) error {
-		return check(a.scopedApp(tx, s.OrganizationID))
+	return a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, s.OrganizationID, func(tx *gorm.DB) error {
+			return check(a.scopedApp(tx, s.OrganizationID))
+		})
 	})
 }
 
@@ -1400,8 +1407,10 @@ func (a *App) requireActiveChatSession(s *models.ChatbotSession) error {
 // + dedicated columns. Called after every yield and on the completion path.
 func (a *App) persistChatSession(s *models.ChatbotSession) error {
 	if s != nil && a.inboundContinuation != nil && a.inboundContinuation.nativeBookingCheckpoint {
-		return database.WithTenantReadCommitted(a.rootApp().DB, s.OrganizationID, func(tx *gorm.DB) error {
-			return a.scopedApp(tx, s.OrganizationID).persistChatSessionState(s)
+		return a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+			return database.WithTenantReadCommitted(db, s.OrganizationID, func(tx *gorm.DB) error {
+				return a.scopedApp(tx, s.OrganizationID).persistChatSessionState(s)
+			})
 		})
 	}
 	return a.persistChatSessionState(s)

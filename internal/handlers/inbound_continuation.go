@@ -743,7 +743,15 @@ func (p *InboundContinuationProcessor) fail(
 			maxAttempts = defaultInboundContinuationMaxTry
 		}
 		manualReview := inboundContinuationRequiresManualReview(cause)
-		if manualReview || job.Attempts >= maxAttempts {
+		// H1: a "wedge guard" timeout is pool/lock congestion met while this job held
+		// its continuation transaction, not a fault of the job. Refund the attempt (at
+		// most 16 times per job) so a busy period cannot exhaust MaxAttempts; the
+		// backoff below still grows with the deferrals.
+		wedgeDeferrals, _ := inboundContinuationExactInteger(job.Payload["wedge_guard_deferrals"])
+		wedgeGuard := !manualReview && wedgeDeferrals < 16 &&
+			errors.Is(cause, context.DeadlineExceeded) &&
+			strings.Contains(cause.Error(), "wedge guard")
+		if manualReview || (job.Attempts >= maxAttempts && !wedgeGuard) {
 			status = models.ScheduledJobStatusFailed
 		}
 		updates := map[string]any{
@@ -761,9 +769,15 @@ func (p *InboundContinuationProcessor) fail(
 			)
 			updates["payload"] = payload
 		}
+		if wedgeGuard {
+			deferredPayload := cloneInboundContinuationJSONB(job.Payload)
+			deferredPayload["wedge_guard_deferrals"] = wedgeDeferrals + 1
+			updates["payload"] = deferredPayload
+			updates["attempts"] = gorm.Expr("GREATEST(attempts - 1, 0)")
+		}
 		if status == models.ScheduledJobStatusPending {
 			updates["run_at"] = p.now().UTC().Add(
-				inboundContinuationBackoff(job.Attempts),
+				inboundContinuationBackoff(job.Attempts + wedgeDeferrals),
 			)
 		}
 		result := tx.Model(&models.ScheduledJob{}).
@@ -988,15 +1002,20 @@ func (a *App) withInboundContinuationPhysicalAIAttempt(
 	attemptCtx, cancel := context.WithTimeout(ctx, defaultInboundAIAttemptTimeout)
 	defer cancel()
 
-	return database.WithTenantReadCommitted(
-		root.DB.WithContext(attemptCtx),
-		execution.OrganizationID,
-		func(guardTx *gorm.DB) error {
-			if err := database.LockOrganizationAIAttemptScope(
-				guardTx,
-				execution.OrganizationID,
-			); err != nil {
-				return &inboundContinuationPolicyStop{Reason: err.Error()}
+	return a.withBoundedRootConnection(attemptCtx, 0, func(guardDB *gorm.DB) error {
+		return database.WithTenantReadCommitted(guardDB, execution.OrganizationID, func(guardTx *gorm.DB) error {
+			// H1: bound only the organization-lock wait. Expiry means a policy writer held
+			// the fence (possibly while waiting on this continuation's own transaction):
+			// retry, never a silent policy stop.
+			lockCtx, cancelLock := context.WithTimeout(attemptCtx, 30*time.Second)
+			lockErr := database.LockOrganizationAIAttemptScope(guardTx.WithContext(lockCtx), execution.OrganizationID)
+			lockExpired := lockCtx.Err() != nil
+			cancelLock()
+			if lockErr != nil {
+				if lockExpired {
+					return fmt.Errorf("wedge guard: organization AI attempt fence not acquired within 30s: %w: %w", context.DeadlineExceeded, lockErr)
+				}
+				return &inboundContinuationPolicyStop{Reason: lockErr.Error()}
 			}
 			if err := a.requireInboundContinuationPolicyTx(guardTx); err != nil {
 				return err
@@ -1004,8 +1023,8 @@ func (a *App) withInboundContinuationPhysicalAIAttempt(
 			execution.attemptGuarded = true
 			defer func() { execution.attemptGuarded = false }()
 			return attempt()
-		},
-	)
+		})
+	})
 }
 
 // requireInboundContinuationPolicyTx shares the current-contact and sticky
@@ -1128,11 +1147,16 @@ func (a *App) claimInboundContinuationAction(
 	if !execution.attemptGuarded {
 		return nil, &inboundContinuationPolicyStop{Reason: "provider action has no organization attempt guard"}
 	}
+	// H1: a claim precedes every provider effect, so an expired wait here is a clean
+	// retry that frees this goroutine's continuation and guard connections. Give it
+	// the shortest budget so claim waiters yield before post-claim waiters.
+	claimCtx, cancelClaim := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelClaim()
 
 	now := time.Now().UTC()
 	var claimed *inboundContinuationActionClaim
 	err = a.withIndependentInboundContinuationAction(
-		ctx,
+		claimCtx,
 		organizationID,
 		func(tx *gorm.DB) error {
 			actionPayload := models.JSONB{
@@ -1279,10 +1303,90 @@ func (a *App) withIndependentInboundContinuationAction(
 	if a == nil || a.rootApp() == nil || fn == nil {
 		return errors.New("independent inbound action transaction is required")
 	}
-	root := a.rootApp()
-	return root.WithTenantApp(organizationID, func(scoped *App) error {
-		return scoped.DB.WithContext(ctx).Transaction(fn)
+	if organizationID == uuid.Nil {
+		return database.ErrMissingTenant
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// H1: enter through this nested App so the pool wait is bounded. A deadline on ctx is
+	// the explicit WAIT budget only; the ledger transaction itself runs without it, so its
+	// COMMIT can never be cancelled into an ambiguous outcome.
+	wait := time.Duration(0)
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		if wait = time.Until(deadline); wait <= 0 {
+			return fmt.Errorf("wedge guard: inbound action ledger wait budget already spent: %w", context.DeadlineExceeded)
+		}
+		ctx = context.WithoutCancel(ctx)
+	}
+	return a.withBoundedRootConnection(ctx, wait, func(db *gorm.DB) error {
+		if !a.rlsEnabled() {
+			if err := requireOrdinaryTenantOrganization(db, organizationID); err != nil {
+				return err
+			}
+			return db.Transaction(fn)
+		}
+		return database.WithTenant(db, organizationID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+				return err
+			}
+			return tx.Transaction(fn) // savepoint, as today
+		})
 	})
+}
+
+// withBoundedRootConnection runs run on its own root-pool connection (H1 pool-wedge
+// guard). A goroutine that may already own a pooled connection (its App's DB is a
+// transaction, or it carries an inbound continuation) must never wait forever for
+// another. Only the WAIT is bounded; the transaction run begins uses ctx (or the root
+// context) exactly as before. wait > 0 is an explicit budget; wait == 0 derives it:
+// 15s nested, 45s inside the AI-attempt fence, unbounded for a root receiver.
+// run must finish every transaction it begins before returning; callers run
+// after-commit callbacks only after this returns (connection already released).
+func (a *App) withBoundedRootConnection(ctx context.Context, wait time.Duration, run func(db *gorm.DB) error) error {
+	root := a.rootApp()
+	if root == nil || root.DB == nil || root.DB.Statement == nil || run == nil {
+		return errors.New("database connection is required")
+	}
+	txDB := root.DB
+	if ctx != nil {
+		txDB = root.DB.WithContext(ctx)
+	}
+	if _, rootIsTx := root.DB.Statement.ConnPool.(gorm.TxCommitter); rootIsTx {
+		return run(txDB) // transaction-rooted test App: savepoints, no pool wait
+	}
+	if wait <= 0 {
+		execution := a.inboundContinuation
+		nested := execution != nil
+		if a.DB != nil && a.DB.Statement != nil {
+			if _, ownsTx := a.DB.Statement.ConnPool.(gorm.TxCommitter); ownsTx {
+				nested = true
+			}
+		}
+		if !nested {
+			return run(txDB) // root receiver holds nothing: unchanged, unbounded
+		}
+		wait = 15 * time.Second
+		if execution != nil && execution.attemptGuarded {
+			wait = 45 * time.Second // post-claim waits here end in manual review
+		}
+	}
+	txCtx := txDB.Statement.Context
+	if txCtx == nil {
+		txCtx = context.Background()
+	}
+	waitCtx, cancelWait := context.WithTimeout(txCtx, wait)
+	defer cancelWait()
+	acquired := false
+	err := txDB.WithContext(waitCtx).Connection(func(pinned *gorm.DB) error {
+		acquired = true
+		cancelWait() // *sql.Conn keeps no reference to waitCtx
+		return run(pinned.WithContext(txCtx))
+	})
+	if err != nil && !acquired && errors.Is(err, context.DeadlineExceeded) && (ctx == nil || ctx.Err() == nil) {
+		return fmt.Errorf("wedge guard: no pooled database connection within %s while this goroutine may hold another: %w", wait, err)
+	}
+	return err
 }
 
 func validateInboundContinuationActionProof(
@@ -1577,7 +1681,7 @@ func (a *App) recoverResolvedInboundContinuationSend(
 		}
 
 		organizationID := a.inboundContinuationOrganizationID()
-		restoreErr := a.rootApp().WithCommittedTenantApp(
+		restoreErr := a.WithCommittedTenantApp(
 			organizationID,
 			func(scoped *App) error {
 				var contact models.Contact

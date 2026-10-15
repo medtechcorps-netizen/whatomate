@@ -231,8 +231,15 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 		a.Log.Error("Database connection error", "error", err)
 		return r.SendErrorEnvelope(500, "Database connection error", nil, "")
 	}
-	if err := sqlDB.Ping(); err != nil {
-		a.Log.Error("Database ping failed", "error", err)
+	pingCtx, cancelPing := context.WithTimeout(context.Background(), 2*time.Second)
+	pingErr := sqlDB.PingContext(pingCtx)
+	cancelPing()
+	if pingErr != nil {
+		stats := sqlDB.Stats()
+		a.Log.Error("Database ping failed", "error", pingErr,
+			"max_open", stats.MaxOpenConnections, "open", stats.OpenConnections,
+			"in_use", stats.InUse, "idle", stats.Idle,
+			"wait_count", stats.WaitCount, "wait_duration", stats.WaitDuration.String())
 		return r.SendErrorEnvelope(500, "Database ping failed", nil, "")
 	}
 
@@ -246,7 +253,8 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 			"",
 		)
 	}
-	readinessContext := context.Background()
+	readinessContext, cancelReadiness := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelReadiness()
 	if err := a.Redis.Ping(readinessContext).Err(); err != nil {
 		a.Log.Error("Redis connection error", "error", err)
 		return r.SendErrorEnvelope(

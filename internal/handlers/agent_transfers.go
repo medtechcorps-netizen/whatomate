@@ -1422,7 +1422,7 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		// completion callback under the independent organization AI fence. Commit
 		// the transfer policy first so that callback cannot wait on an UPDATE lock
 		// held by its own outer transaction.
-		err = a.rootApp().WithCommittedTenantApp(
+		err = a.WithCommittedTenantApp(
 			baseTransfer.OrganizationID,
 			func(scoped *App) error {
 				return canonicalContactWriteTransaction(scoped.DB, write)

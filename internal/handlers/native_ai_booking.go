@@ -183,14 +183,24 @@ func (a *App) nativeBookingAuthorityTx(tx *gorm.DB, accountID, sessionID uuid.UU
 
 func (a *App) readNativeBookingAuthority(account *models.WhatsAppAccount, session *models.ChatbotSession) (booking.Binding, error) {
 	var binding booking.Binding
-	err := database.WithTenantReadCommitted(a.rootApp().DB, account.OrganizationID, func(tx *gorm.DB) error {
-		if err := database.LockOrganizationAIAttemptScope(tx, account.OrganizationID); err != nil {
+	// H1: KEY SHARE organization-lock read while the caller holds its continuation
+	// transaction. Bound the whole read-only transaction so a policy writer waiting on
+	// that continuation cannot close a lock cycle through Go; expiry is retryable.
+	authorityCtx, cancelAuthority := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelAuthority()
+	err := a.withBoundedRootConnection(authorityCtx, 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, account.OrganizationID, func(tx *gorm.DB) error {
+			if err := database.LockOrganizationAIAttemptScope(tx, account.OrganizationID); err != nil {
+				return err
+			}
+			var err error
+			binding, _, err = a.nativeBookingAuthorityTx(tx, account.ID, session.ID)
 			return err
-		}
-		var err error
-		binding, _, err = a.nativeBookingAuthorityTx(tx, account.ID, session.ID)
-		return err
+		})
 	})
+	if err != nil && authorityCtx.Err() != nil {
+		err = errors.Join(errors.New("wedge guard: native booking authority not read within 30s"), context.DeadlineExceeded, err)
+	}
 	return binding, err
 }
 
@@ -210,10 +220,12 @@ func (a *App) processNativeAIBooking(account *models.WhatsAppAccount, contact *m
 	// Recovery is keyed before generation. A prepared response is immutable;
 	// neither a second model answer nor a newly randomized offer replaces it.
 	var existing *nativeBookingPrepared
-	err = database.WithTenantReadCommitted(a.rootApp().DB, account.OrganizationID, func(tx *gorm.DB) error {
-		var loadErr error
-		existing, loadErr = a.loadNativeBookingPreparedTx(tx, identity)
-		return loadErr
+	err = a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, account.OrganizationID, func(tx *gorm.DB) error {
+			var loadErr error
+			existing, loadErr = a.loadNativeBookingPreparedTx(tx, identity)
+			return loadErr
+		})
 	})
 	if err != nil {
 		return true, false, err
@@ -260,55 +272,57 @@ func (a *App) processNativeAIBooking(account *models.WhatsAppAccount, contact *m
 		}
 	}
 	var prepared *nativeBookingPrepared
-	err = database.WithTenantReadCommitted(a.rootApp().DB, account.OrganizationID, func(tx *gorm.DB) error {
-		if err := database.LockOrganizationPolicyScope(tx, account.OrganizationID); err != nil {
-			return err
-		}
-		current, native, err := a.nativeBookingAuthorityTx(tx, account.ID, session.ID)
-		if err != nil {
-			return err
-		}
-		if current != binding {
-			return &inboundContinuationPolicyStop{Reason: "booking channel approval changed"}
-		}
-		canonical, err := contactutil.ResolveCanonicalContactForUpdate(tx, account.OrganizationID, contact.ID)
-		if err != nil {
-			return err
-		}
-		if canonical.ID != binding.ContactID {
-			return &inboundContinuationPolicyStop{Reason: "booking contact identity changed"}
-		}
-		var stored models.ChatbotSession
-		if err := tx.Clauses(clause.Locking{Strength: "NO KEY UPDATE"}).Where("id = ? AND organization_id = ?", session.ID, account.OrganizationID).First(&stored).Error; err != nil {
-			return err
-		}
-		if stored.Status != models.SessionStatusActive || !stored.LastActivityAt.Equal(session.LastActivityAt) {
-			return &inboundContinuationPolicyStop{Reason: "booking session was superseded"}
-		}
-		if intent.Action == "handoff" {
-			const reason = "AI booking requires human attention"
-			handoff, err := contacthandoff.HandoffTx(tx, contacthandoff.Request{OrganizationID: account.OrganizationID, ContactID: canonical.ID,
-				AccountName: native.Name, Reason: reason, Source: models.TransferSourceFlow})
+	err = a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, account.OrganizationID, func(tx *gorm.DB) error {
+			if err := database.LockOrganizationPolicyScope(tx, account.OrganizationID); err != nil {
+				return err
+			}
+			current, native, err := a.nativeBookingAuthorityTx(tx, account.ID, session.ID)
 			if err != nil {
 				return err
 			}
-			if handoff.Contact.ID != canonical.ID {
-				return errors.New("native AI booking handoff contact changed")
+			if current != binding {
+				return &inboundContinuationPolicyStop{Reason: "booking channel approval changed"}
 			}
-			// Staff attention and its system timeline/webhook fact are one intent.
-			// Neither a failed activity/outbox insertion nor a replay may leave a
-			// transfer without its fact or fabricate a staff actor/acknowledgment.
-			_, err = customeractivity.RecordTx(tx, account.OrganizationID, customeractivity.Input{
-				ContactID: canonical.ID, EventType: "booking.staff_requested", Category: models.CustomerActivityCategoryBooking,
-				Title: "Booking needs staff assistance", ActorType: models.CustomerActivityActorSystem,
-				SourceObjectType: "agent_transfer", SourceObjectID: &handoff.Transfer.ID,
-				IdempotencyKey: "ai-booking-handoff:" + a.inboundContinuation.MessageID.String(),
-				Metadata:       models.JSONB{"source": "ai_booking", "reason": reason, "inbound_message_id": a.inboundContinuation.MessageID.String()},
-			})
+			canonical, err := contactutil.ResolveCanonicalContactForUpdate(tx, account.OrganizationID, contact.ID)
+			if err != nil {
+				return err
+			}
+			if canonical.ID != binding.ContactID {
+				return &inboundContinuationPolicyStop{Reason: "booking contact identity changed"}
+			}
+			var stored models.ChatbotSession
+			if err := tx.Clauses(clause.Locking{Strength: "NO KEY UPDATE"}).Where("id = ? AND organization_id = ?", session.ID, account.OrganizationID).First(&stored).Error; err != nil {
+				return err
+			}
+			if stored.Status != models.SessionStatusActive || !stored.LastActivityAt.Equal(session.LastActivityAt) {
+				return &inboundContinuationPolicyStop{Reason: "booking session was superseded"}
+			}
+			if intent.Action == "handoff" {
+				const reason = "AI booking requires human attention"
+				handoff, err := contacthandoff.HandoffTx(tx, contacthandoff.Request{OrganizationID: account.OrganizationID, ContactID: canonical.ID,
+					AccountName: native.Name, Reason: reason, Source: models.TransferSourceFlow})
+				if err != nil {
+					return err
+				}
+				if handoff.Contact.ID != canonical.ID {
+					return errors.New("native AI booking handoff contact changed")
+				}
+				// Staff attention and its system timeline/webhook fact are one intent.
+				// Neither a failed activity/outbox insertion nor a replay may leave a
+				// transfer without its fact or fabricate a staff actor/acknowledgment.
+				_, err = customeractivity.RecordTx(tx, account.OrganizationID, customeractivity.Input{
+					ContactID: canonical.ID, EventType: "booking.staff_requested", Category: models.CustomerActivityCategoryBooking,
+					Title: "Booking needs staff assistance", ActorType: models.CustomerActivityActorSystem,
+					SourceObjectType: "agent_transfer", SourceObjectID: &handoff.Transfer.ID,
+					IdempotencyKey: "ai-booking-handoff:" + a.inboundContinuation.MessageID.String(),
+					Metadata:       models.JSONB{"source": "ai_booking", "reason": reason, "inbound_message_id": a.inboundContinuation.MessageID.String()},
+				})
+				return err
+			}
+			prepared, err = a.prepareNativeBookingTx(tx, identity, binding, native, canonical, &stored, session, intent, token, confirmation)
 			return err
-		}
-		prepared, err = a.prepareNativeBookingTx(tx, identity, binding, native, canonical, &stored, session, intent, token, confirmation)
-		return err
+		})
 	})
 	if err != nil {
 		return true, false, err
@@ -742,14 +756,18 @@ func (a *App) dispatchNativeBookingPrepared(prepared *nativeBookingPrepared, acc
 }
 
 func (a *App) recoverNativeBookingSend(claim *inboundContinuationActionClaim) error {
-	return database.WithTenantReadCommitted(a.rootApp().DB, a.inboundContinuation.OrganizationID, func(tx *gorm.DB) error {
-		return a.scopedApp(tx, a.inboundContinuation.OrganizationID).recoverResolvedInboundContinuationSend(claim)
+	return a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, a.inboundContinuation.OrganizationID, func(tx *gorm.DB) error {
+			return a.scopedApp(tx, a.inboundContinuation.OrganizationID).recoverResolvedInboundContinuationSend(claim)
+		})
 	})
 }
 
 func (a *App) markNativeBookingBlocked(prepared *nativeBookingPrepared, cause error) error {
-	return database.WithTenantReadCommitted(a.rootApp().DB, prepared.Message.OrganizationID, func(tx *gorm.DB) error {
-		return tx.Model(&models.Message{}).Where("id = ? AND organization_id = ?", prepared.Message.ID, prepared.Message.OrganizationID).
-			Updates(map[string]any{"error_message": "AI booking message requires staff review", "metadata": gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", models.JSONB{"ai_booking_manual_confirmation_required": true})}).Error
+	return a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, prepared.Message.OrganizationID, func(tx *gorm.DB) error {
+			return tx.Model(&models.Message{}).Where("id = ? AND organization_id = ?", prepared.Message.ID, prepared.Message.OrganizationID).
+				Updates(map[string]any{"error_message": "AI booking message requires staff review", "metadata": gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", models.JSONB{"ai_booking_manual_confirmation_required": true})}).Error
+		})
 	})
 }
