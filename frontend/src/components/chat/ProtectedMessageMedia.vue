@@ -1,10 +1,18 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { AlertCircle, FileText, Loader2, Play, RotateCw } from 'lucide-vue-next'
 import { messagesService } from '@/services/api'
-import { chatMediaLoadLimiter, displaySafeMediaBlob, INLINE_IMAGE_TYPES, type ChatMediaKind } from '@/lib/chatMedia'
+import {
+  chatMediaLoadLimiter,
+  displaySafeMediaBlob,
+  INLINE_IMAGE_TYPES,
+  mediaDownloadName,
+  type ChatMediaKind,
+} from '@/lib/chatMedia'
+import { documentPreviewType, type DocumentPreviewType } from '@/lib/pdfPreview'
 import type { Message } from '@/stores/contacts'
+import MediaPreviewDialog, { type MediaPreviewSource } from './MediaPreviewDialog.vue'
 
 // Renders chat media from the authenticated API client instead of a native
 // src=/api/media/{id} URL. Native element requests cannot send the
@@ -24,6 +32,14 @@ const mediaElement = ref<HTMLMediaElement | null>(null)
 const status = ref<'idle' | 'loading' | 'ready' | 'error'>('idle')
 const mediaURL = ref('')
 const loadedType = ref('')
+const loadedBlob = shallowRef<Blob | null>(null)
+// What a loaded document's bytes turned out to be, if it can be previewed.
+const documentPreview = ref<DocumentPreviewType | null>(null)
+// A JPEG or PNG sent as a document: an image-typed URL used only by the preview.
+const previewImageURL = ref('')
+const previewOpen = ref(false)
+// The preview mounts on first use; a transcript can hold hundreds of images.
+const previewMounted = ref(false)
 const progress = ref<number | null>(null)
 let requestController: AbortController | null = null
 let releaseSlot: (() => void) | null = null
@@ -59,8 +75,26 @@ const imageAlt = computed(() => {
   return props.message.content?.body || t('chat.image')
 })
 
-// Only raster images open in a new tab (see displaySafeMediaBlob).
-const previewable = computed(() => status.value === 'ready' && INLINE_IMAGE_TYPES.has(loadedType.value))
+// Only raster images, PDFs and documents whose bytes are JPEG or PNG open in
+// the in-app preview (see displaySafeMediaBlob); nothing opens in a new tab.
+const previewSource = computed<MediaPreviewSource | null>(() => {
+  if (status.value !== 'ready' || !mediaURL.value) return null
+  if (kind.value === 'image' || kind.value === 'sticker') {
+    return INLINE_IMAGE_TYPES.has(loadedType.value) ? { type: 'image', url: mediaURL.value, alt: imageAlt.value } : null
+  }
+  if (kind.value !== 'document') return null
+  if (documentPreview.value === 'application/pdf' && loadedBlob.value) return { type: 'pdf', blob: loadedBlob.value }
+  if (previewImageURL.value) return { type: 'image', url: previewImageURL.value, alt: documentName.value }
+  return null
+})
+const previewable = computed(() => previewSource.value !== null)
+
+const previewTitle = computed(
+  () => props.message.media_filename?.trim() || (kind.value === 'document' ? documentName.value : imageAlt.value),
+)
+const downloadName = computed(() =>
+  kind.value === 'document' ? documentName.value : mediaDownloadName(props.message.media_filename, loadedType.value, 'image'),
+)
 
 function releaseMedia() {
   generation++
@@ -69,9 +103,14 @@ function releaseMedia() {
   releaseSlot?.()
   releaseSlot = null
   progress.value = null
+  previewOpen.value = false
   if (mediaURL.value) URL.revokeObjectURL(mediaURL.value)
   mediaURL.value = ''
+  if (previewImageURL.value) URL.revokeObjectURL(previewImageURL.value)
+  previewImageURL.value = ''
   loadedType.value = ''
+  loadedBlob.value = null
+  documentPreview.value = null
 }
 
 async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<string> {
@@ -106,8 +145,17 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
     const blob = response.data
     if (!(blob instanceof Blob) || blob.size === 0) throw new Error('Empty media response')
     const displayBlob = displaySafeMediaBlob(blob, kind.value)
+    // A document's preview depends on what its bytes are, never on the type
+    // the sender declared.
+    const previewType = kind.value === 'document' ? await documentPreviewType(blob) : null
+    if (requestGeneration !== generation) return ''
     mediaURL.value = URL.createObjectURL(displayBlob)
     loadedType.value = displayBlob.type
+    loadedBlob.value = displayBlob
+    documentPreview.value = previewType
+    if (previewType === 'image/jpeg' || previewType === 'image/png') {
+      previewImageURL.value = URL.createObjectURL(new Blob([blob], { type: previewType }))
+    }
     status.value = 'ready'
     return mediaURL.value
   } catch {
@@ -121,10 +169,16 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
   }
 }
 
-// Documents download from the protected bytes once they are loaded.
-async function downloadDocument() {
+// Documents load when the agent opens them. PDFs, and JPEG or PNG files sent
+// as documents, open in the preview; anything else downloads from the
+// protected bytes.
+async function openDocument() {
   const url = await loadMedia({ userInitiated: true })
   if (!url) return
+  if (previewable.value) {
+    openPreview()
+    return
+  }
   await nextTick()
   if (mediaURL.value === url) documentLink.value?.click()
 }
@@ -144,14 +198,15 @@ async function playMedia() {
 }
 
 function retry() {
-  if (kind.value === 'document') void downloadDocument()
+  if (kind.value === 'document') void openDocument()
   else if (kind.value === 'video' || kind.value === 'audio') void playMedia()
   else void loadMedia({ userInitiated: true })
 }
 
 function openPreview() {
-  if (!previewable.value || !mediaURL.value) return
-  window.open(mediaURL.value, '_blank')
+  if (!previewable.value) return
+  previewMounted.value = true
+  previewOpen.value = true
 }
 
 function handleImageError(event: Event) {
@@ -217,7 +272,7 @@ onBeforeUnmount(releaseMedia)
       v-else-if="status === 'idle' && kind === 'document'"
       type="button"
       class="flex items-center gap-2 px-3 py-2 bg-background/50 rounded-lg hover:bg-background/80 transition-colors text-start focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
-      @click="downloadDocument"
+      @click="openDocument"
     >
       <FileText class="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
       <span class="text-sm truncate max-w-[200px]">{{ documentName }}</span>
@@ -255,6 +310,7 @@ onBeforeUnmount(releaseMedia)
       <button
         v-if="previewable"
         type="button"
+        aria-haspopup="dialog"
         class="block w-fit rounded-lg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
         @click="openPreview"
       >
@@ -287,6 +343,16 @@ onBeforeUnmount(releaseMedia)
       controls
       class="max-w-[280px]"
     />
+    <button
+      v-else-if="previewable"
+      type="button"
+      aria-haspopup="dialog"
+      class="flex items-center gap-2 px-3 py-2 bg-background/50 rounded-lg hover:bg-background/80 transition-colors text-start focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
+      @click="openPreview"
+    >
+      <FileText class="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
+      <span class="text-sm truncate max-w-[200px]">{{ documentName }}</span>
+    </button>
     <a
       v-else
       ref="documentLink"
@@ -297,5 +363,13 @@ onBeforeUnmount(releaseMedia)
       <FileText class="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
       <span class="text-sm truncate max-w-[200px]">{{ documentName }}</span>
     </a>
+    <MediaPreviewDialog
+      v-if="previewMounted && previewSource"
+      v-model:open="previewOpen"
+      :source="previewSource"
+      :title="previewTitle"
+      :download-url="mediaURL"
+      :download-name="downloadName"
+    />
   </div>
 </template>

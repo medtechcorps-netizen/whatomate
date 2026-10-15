@@ -5,8 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ProtectedMessageMedia from './ProtectedMessageMedia.vue'
 import { chatMediaLoadLimiter } from '@/lib/chatMedia'
 
-const mocks = vi.hoisted(() => ({ getMedia: vi.fn() }))
+const mocks = vi.hoisted(() => ({ getMedia: vi.fn(), openPdfPreview: vi.fn() }))
 vi.mock('@/services/api', () => ({ messagesService: { getMedia: mocks.getMedia } }))
+// Sniffing stays real; pdf.js itself is covered by pdfPreview.test.ts.
+vi.mock('@/lib/pdfPreview', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/lib/pdfPreview')>()),
+  openPdfPreview: mocks.openPdfPreview,
+}))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 
 type MediaOptions = { signal: AbortSignal; onProgress?: (loaded: number, total: number | undefined) => void }
@@ -28,8 +33,19 @@ const imageMessage = {
   media_mime_type: 'image/jpeg',
   content: { body: 'Customer photo' },
 }
-const mediaResponse = (type = 'image/jpeg', body = 'media bytes') => ({ data: new Blob([body], { type }) })
+const mediaResponse = (type = 'image/jpeg', body: BlobPart = 'media bytes') => ({ data: new Blob([body], { type }) })
 const requestOptions = (call = 0) => mocks.getMedia.mock.calls[call][2] as MediaOptions
+const pdfBody = '%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\n'
+const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46])
+const documentMessage = (overrides: Record<string, unknown> = {}) => ({
+  ...imageMessage,
+  message_type: 'document',
+  media_mime_type: 'application/pdf',
+  media_filename: 'lab-report.pdf',
+  ...overrides,
+})
+const previewDialog = () => document.body.querySelector<HTMLElement>('[data-testid="chat-media-preview"]')
+const pressEscape = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
 
 describe('ProtectedMessageMedia', () => {
   let wrappers: VueWrapper[] = []
@@ -56,7 +72,8 @@ describe('ProtectedMessageMedia', () => {
 
   beforeEach(() => {
     mocks.getMedia.mockReset().mockResolvedValue(mediaResponse())
-    createURL = vi.fn<(value: Blob | MediaSource) => string>().mockReturnValue('blob:protected-photo')
+    mocks.openPdfPreview.mockReset().mockReturnValue(new Promise(() => undefined))
+    createURL =vi.fn<(value: Blob | MediaSource) => string>().mockReturnValue('blob:protected-photo')
     revokeURL = vi.fn<(url: string) => void>()
     vi.stubGlobal('URL', class extends URL {
       static createObjectURL = createURL
@@ -67,6 +84,7 @@ describe('ProtectedMessageMedia', () => {
   afterEach(() => {
     for (const wrapper of wrappers) wrapper.unmount()
     wrappers = []
+    document.body.innerHTML = ''
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
     // Every download slot is returned, whatever state a bubble was left in.
@@ -165,14 +183,49 @@ describe('ProtectedMessageMedia', () => {
     expect(mocks.getMedia.mock.calls[4][0]).toBe('video-1')
   })
 
-  it('opens a loaded raster image in a new tab from its object URL', async () => {
+  it('opens a loaded raster image in the in-app preview instead of a new tab', async () => {
     const open = vi.fn()
     vi.stubGlobal('open', open)
     const view = await mountLoaded()
-
     expect(createdBlob().type).toBe('image/jpeg')
+    expect(previewDialog()).toBeNull()
+
+    const thumbnail = view.get('button')
+    expect(thumbnail.attributes('aria-haspopup')).toBe('dialog')
+    await thumbnail.trigger('click')
+    await flushPromises()
+    expect(open).not.toHaveBeenCalled()
+
+    const preview = previewDialog()!
+    expect(preview.dataset.previewKind).toBe('image')
+    expect(preview.getAttribute('role')).toBe('dialog')
+    // Portaled out of the bubble, which keeps only its thumbnail.
+    expect(view.element.contains(preview)).toBe(false)
+    expect(view.findAll('button')).toHaveLength(1)
+    expect(preview.textContent).toContain('Customer photo')
+    const image = preview.querySelector('img')!
+    expect(image.getAttribute('src')).toBe('blob:protected-photo')
+    expect(image.getAttribute('alt')).toBe('Customer photo')
+    // Downloads the bytes already shown; nothing is fetched again.
+    const download = preview.querySelector('a[download]')!
+    expect(download.getAttribute('href')).toBe('blob:protected-photo')
+    expect(download.getAttribute('download')).toBe('image.jpg')
+    expect(mocks.getMedia).toHaveBeenCalledTimes(1)
+    expect(createURL).toHaveBeenCalledTimes(1)
+
+    pressEscape()
+    await flushPromises()
+    expect(previewDialog()).toBeNull()
+    expect(revokeURL).not.toHaveBeenCalled()
+    expect(view.get('img').attributes('src')).toBe('blob:protected-photo')
+  })
+
+  it('names the preview and its download after the image file when it has one', async () => {
+    const view = await mountLoaded({ message: { ...imageMessage, media_filename: 'IMG_0001.jpg' } })
     await view.get('button').trigger('click')
-    expect(open).toHaveBeenCalledWith('blob:protected-photo', '_blank')
+    await flushPromises()
+    expect(previewDialog()!.querySelector('h2')?.textContent?.trim()).toBe('IMG_0001.jpg')
+    expect(previewDialog()!.querySelector('a[download]')?.getAttribute('download')).toBe('IMG_0001.jpg')
   })
 
   it('never gives a scriptable image a renderable type or a new-tab preview', async () => {
@@ -187,7 +240,9 @@ describe('ProtectedMessageMedia', () => {
     expect(createdBlob().type).toBe('application/octet-stream')
     expect(view.find('button').exists()).toBe(false)
     await view.get('img').trigger('click')
+    await flushPromises()
     expect(open).not.toHaveBeenCalled()
+    expect(previewDialog()).toBeNull()
   })
 
   it('downloads a customer HTML document as opaque bytes instead of a same-origin page', async () => {
@@ -206,6 +261,122 @@ describe('ProtectedMessageMedia', () => {
     expect(await blob.text()).toBe(html)
     expect(view.get('a[download]').attributes('download')).toBe('visit-summary.html')
     expect(clicked).toHaveBeenCalledTimes(1)
+  })
+
+  it('previews a PDF in the app from its opaque bytes instead of downloading it', async () => {
+    mocks.getMedia.mockResolvedValueOnce(mediaResponse('application/pdf', pdfBody))
+    const clicked = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const view = mountMedia({ message: documentMessage() })
+    await view.get('button').trigger('click')
+    await flushPromises()
+
+    expect(clicked).not.toHaveBeenCalled()
+    // The only object URL is the opaque download; no PDF-typed URL exists.
+    expect(createURL).toHaveBeenCalledTimes(1)
+    expect(createdBlob().type).toBe('application/octet-stream')
+    expect(mocks.openPdfPreview).toHaveBeenCalledTimes(1)
+    expect(await (mocks.openPdfPreview.mock.calls[0][0] as Blob).text()).toBe(pdfBody)
+
+    const preview = previewDialog()!
+    expect(preview.dataset.previewKind).toBe('pdf')
+    expect(preview.querySelector('h2')?.textContent?.trim()).toBe('lab-report.pdf')
+    const download = preview.querySelector('a[download]')!
+    expect(download.getAttribute('href')).toBe('blob:protected-photo')
+    expect(download.getAttribute('download')).toBe('lab-report.pdf')
+
+    // The bubble keeps the filename, now as the way back into the preview.
+    expect(view.attributes('data-media-status')).toBe('ready')
+    expect(view.find('a[download]').exists()).toBe(false)
+    const reopen = view.get('button')
+    expect(reopen.text()).toContain('lab-report.pdf')
+    expect(reopen.attributes('aria-haspopup')).toBe('dialog')
+  })
+
+  it('reopens a closed preview from the bubble without loading the file again', async () => {
+    mocks.getMedia.mockResolvedValueOnce(mediaResponse('application/pdf', pdfBody))
+    const view = mountMedia({ message: documentMessage() })
+    await view.get('button').trigger('click')
+    await flushPromises()
+    pressEscape()
+    await flushPromises()
+    expect(previewDialog()).toBeNull()
+
+    await view.get('button').trigger('click')
+    await flushPromises()
+    expect(previewDialog()?.dataset.previewKind).toBe('pdf')
+    expect(mocks.getMedia).toHaveBeenCalledTimes(1)
+    expect(mocks.openPdfPreview).toHaveBeenCalledTimes(2)
+  })
+
+  it('previews a JPEG sent as a document, with an image type only on the preview URL', async () => {
+    mocks.getMedia.mockResolvedValueOnce(mediaResponse('application/octet-stream', jpegBytes))
+    createURL.mockReturnValueOnce('blob:opaque-scan').mockReturnValueOnce('blob:preview-scan')
+    const clicked = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const view = mountMedia({
+      message: documentMessage({ media_mime_type: 'application/octet-stream', media_filename: 'scan.jpg' }),
+    })
+    await view.get('button').trigger('click')
+    await flushPromises()
+
+    expect(clicked).not.toHaveBeenCalled()
+    expect(createdBlob(0).type).toBe('application/octet-stream')
+    expect(createdBlob(1).type).toBe('image/jpeg')
+    const preview = previewDialog()!
+    expect(preview.dataset.previewKind).toBe('image')
+    expect(preview.querySelector('img')?.getAttribute('src')).toBe('blob:preview-scan')
+    expect(preview.querySelector('img')?.getAttribute('alt')).toBe('scan.jpg')
+    // The download stays the opaque copy.
+    expect(preview.querySelector('a[download]')?.getAttribute('href')).toBe('blob:opaque-scan')
+    expect(preview.querySelector('a[download]')?.getAttribute('download')).toBe('scan.jpg')
+    expect(mocks.openPdfPreview).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['claims to be a PDF but is HTML', 'application/pdf', '<html><script>alert(1)</script></html>'],
+    ['claims to be a PNG but is SVG', 'image/png', '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'],
+    ['is a GIF', 'image/gif', 'GIF89a'],
+  ])('downloads a document that %s instead of previewing it', async (_, mimeType, body) => {
+    mocks.getMedia.mockResolvedValueOnce(mediaResponse(mimeType, body))
+    const clicked = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const view = mountMedia({ message: documentMessage({ media_mime_type: mimeType }) })
+    await view.get('button').trigger('click')
+    await flushPromises()
+
+    expect(clicked).toHaveBeenCalledTimes(1)
+    expect(createURL).toHaveBeenCalledTimes(1)
+    expect(createdBlob().type).toBe('application/octet-stream')
+    expect(view.get('a[download]').attributes('download')).toBe('lab-report.pdf')
+    expect(previewDialog()).toBeNull()
+    expect(mocks.openPdfPreview).not.toHaveBeenCalled()
+  })
+
+  it('closes the preview and revokes both object URLs when the workspace changes', async () => {
+    mocks.getMedia.mockResolvedValueOnce(mediaResponse('application/octet-stream', jpegBytes))
+    createURL.mockReturnValueOnce('blob:opaque-scan').mockReturnValueOnce('blob:preview-scan')
+    const view = mountMedia({ message: documentMessage({ media_filename: 'scan.jpg' }) })
+    await view.get('button').trigger('click')
+    await flushPromises()
+    expect(previewDialog()).not.toBeNull()
+
+    await view.setProps({ organizationId: 'workspace-c' })
+    await flushPromises()
+    expect(revokeURL).toHaveBeenCalledWith('blob:opaque-scan')
+    expect(revokeURL).toHaveBeenCalledWith('blob:preview-scan')
+    expect(previewDialog()).toBeNull()
+    expect(view.attributes('data-media-status')).toBe('idle')
+  })
+
+  it('revokes the preview URL of a document when unmounted', async () => {
+    mocks.getMedia.mockResolvedValueOnce(mediaResponse('application/octet-stream', jpegBytes))
+    createURL.mockReturnValueOnce('blob:opaque-scan').mockReturnValueOnce('blob:preview-scan')
+    const view = mountMedia({ message: documentMessage({ media_filename: 'scan.jpg' }) })
+    await view.get('button').trigger('click')
+    await flushPromises()
+
+    view.unmount()
+    wrappers = []
+    expect(revokeURL).toHaveBeenCalledWith('blob:opaque-scan')
+    expect(revokeURL).toHaveBeenCalledWith('blob:preview-scan')
   })
 
   it('fails closed instead of falling back to the login workspace when no workspace is known', async () => {
