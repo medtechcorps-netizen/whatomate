@@ -35,6 +35,8 @@ function item(
     status,
     progress: 0,
     errorMessage: null,
+    convertedFrom: null,
+    conversionFailed: false,
     ...rest,
   }
 }
@@ -186,5 +188,53 @@ describe('MediaSendDialog', () => {
     for (const icon of ['lucide-x', 'lucide-send', 'lucide-paperclip', 'lucide-smile', 'lucide-reply']) {
       expect(row.find(`[class*="${icon}"]`).exists(), icon).toBe(false)
     }
+  })
+
+  it('offers Convert to JPEG / Compress photo and Convert all for photos the browser can fix', async () => {
+    const heic = item('IMG_0001.HEIC', 'image/heic')
+    const big = item('scan.jpg', 'image/jpeg', { size: 8 * MiB })
+    const svg = item('logo.svg', 'image/svg+xml')
+    const wrapper = mountDialog({ items: [heic, big, svg] })
+    const rows = wrapper.findAll('[data-testid="composer-media-item"]')
+
+    expect(rows[0].get('[data-testid="composer-media-convert"]').text()).toContain('chat.composer.convertToJpeg')
+    expect(rows[0].text()).toContain('chat.composer.problem.unsupportedImage')
+    expect(rows[1].get('[data-testid="composer-media-convert"]').text()).toContain('chat.composer.compressPhoto')
+    expect(rows[1].find('[data-testid="composer-media-as-document"]').exists()).toBe(true)
+    expect(rows[2].find('[data-testid="composer-media-convert"]').exists()).toBe(false)
+    expect(rows[2].text()).toContain('chat.composer.problem.unsupportedImageManual')
+
+    await rows[0].get('[data-testid="composer-media-convert"]').trigger('click')
+    expect(wrapper.emitted('convert')).toEqual([[heic.id]])
+    const convertAll = wrapper.get('[data-testid="composer-media-convert-all"]')
+    expect(convertAll.text()).toContain('chat.composer.convertAll {"count":2}')
+    await convertAll.trigger('click')
+    expect(wrapper.emitted('convert-all')).toHaveLength(1)
+  })
+
+  it('shows conversion progress, results and failures, and holds Send while converting', () => {
+    const wrapper = mountDialog({
+      items: [
+        item('a.webp', 'image/webp', { status: 'converting' }),
+        item('b.jpg', 'image/jpeg', { convertedFrom: 'image/gif' }),
+        item('c.heic', 'image/heic', { conversionFailed: true }),
+        item('d.png', 'image/png'),
+      ],
+    })
+    const rows = wrapper.findAll('[data-testid="composer-media-item"]')
+    expect(rows[0].text()).toContain('chat.composer.converting')
+    expect(rows[1].get('[data-testid="composer-media-converted"]').text()).toContain('chat.composer.convertedFirstFrame')
+    expect(rows[2].get('[data-testid="composer-media-convert-failed"]').text()).toContain('chat.composer.conversionFailed')
+    expect(rows[2].find('[data-testid="composer-media-convert"]').exists()).toBe(false)
+    expect(buttonByTestId(wrapper, 'composer-media-send').attributes('disabled')).toBeDefined()
+  })
+
+  it('warns, without blocking, when the 24-hour window is closed', () => {
+    const open = mountDialog({ items: [item('a.png', 'image/png')] })
+    expect(open.find('[data-testid="composer-media-window-closed"]').exists()).toBe(false)
+
+    const closed = mountDialog({ serviceWindowExpired: true, items: [item('a.png', 'image/png')] })
+    expect(closed.get('[data-testid="composer-media-window-closed"]').text()).toContain('chat.composer.windowClosed')
+    expect(buttonByTestId(closed, 'composer-media-send').attributes('disabled')).toBeUndefined()
   })
 })

@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import {
   AlertTriangle,
   CheckCircle2,
+  Clock,
   FileText,
   Loader2,
   Music,
@@ -12,6 +13,7 @@ import {
   Send,
   ShieldCheck,
   Trash2,
+  Wand2,
 } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -40,8 +42,13 @@ const props = withDefaults(
     recipientDetail?: string
     sending?: boolean
     maxFiles?: number
+    /**
+     * The 24-hour customer-service window is closed. Sending stays allowed,
+     * exactly like the text composer, but WhatsApp will reject the files.
+     */
+    serviceWindowExpired?: boolean
   }>(),
-  { recipientDetail: '', sending: false, maxFiles: 10 },
+  { recipientDetail: '', sending: false, maxFiles: 10, serviceWindowExpired: false },
 )
 
 const emit = defineEmits<{
@@ -49,6 +56,8 @@ const emit = defineEmits<{
   remove: [id: string]
   'update:caption': [id: string, caption: string]
   'send-as-document': [id: string]
+  convert: [id: string]
+  'convert-all': []
   send: []
   'retry-failed': []
   'add-more': []
@@ -60,6 +69,9 @@ const readyCount = computed(() => props.items.filter(item => item.status === 're
 const failedCount = computed(() => props.items.filter(item => item.status === 'failed').length)
 const invalidCount = computed(() => props.items.filter(item => item.status === 'invalid').length)
 const sentCount = computed(() => props.items.filter(item => item.status === 'sent').length)
+const convertingCount = computed(() => props.items.filter(item => item.status === 'converting').length)
+const convertibleCount = computed(() => props.items.filter(item => canConvert(item) && !item.conversionFailed).length)
+const busy = computed(() => props.sending || convertingCount.value > 0)
 const canAddMore = computed(() => !props.sending && props.items.length < props.maxFiles)
 
 const brokenPreviews = ref<Record<string, boolean>>({})
@@ -107,7 +119,9 @@ function problemText(item: StagedAttachment) {
         limit: formatFileSize(validation.limitBytes ?? 0),
       })
     case 'unsupported-image':
-      return t('chat.composer.problem.unsupportedImage')
+      return validation.canConvertToJpeg
+        ? t('chat.composer.problem.unsupportedImage')
+        : t('chat.composer.problem.unsupportedImageManual')
     case 'unsupported-video':
       return t('chat.composer.problem.unsupportedVideo')
     default:
@@ -117,6 +131,22 @@ function problemText(item: StagedAttachment) {
 
 function canSendAsDocument(item: StagedAttachment) {
   return item.status === 'invalid' && !item.validation.ok && item.validation.canSendAsDocument
+}
+
+function canConvert(item: StagedAttachment) {
+  return item.status === 'invalid' && !item.validation.ok && item.validation.canConvertToJpeg
+}
+
+function convertLabel(item: StagedAttachment) {
+  return !item.validation.ok && item.validation.problem === 'too-large'
+    ? t('chat.composer.compressPhoto')
+    : t('chat.composer.convertToJpeg')
+}
+
+function convertedNote(item: StagedAttachment) {
+  return item.convertedFrom === 'image/gif'
+    ? t('chat.composer.convertedFirstFrame')
+    : t('chat.composer.converted')
 }
 
 function onOpenChange(open: boolean) {
@@ -147,6 +177,16 @@ function onOpenChange(open: boolean) {
           </p>
           <p class="text-xs text-muted-foreground">{{ t('chat.composer.recipientCheck') }}</p>
         </div>
+      </div>
+
+      <div
+        v-if="serviceWindowExpired"
+        class="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-500"
+        role="alert"
+        data-testid="composer-media-window-closed"
+      >
+        <Clock class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <span>{{ t('chat.composer.windowClosed') }}</span>
       </div>
 
       <ul class="-mx-1 max-h-[min(50vh,420px)] space-y-2 overflow-y-auto px-1" data-testid="composer-media-list">
@@ -215,18 +255,42 @@ function onOpenChange(open: boolean) {
                 <AlertTriangle class="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
                 <span>{{ problemText(item) }}</span>
               </p>
-              <Button
-                v-if="canSendAsDocument(item)"
-                variant="outline"
-                size="xs"
-                class="text-xs"
-                :disabled="sending"
-                data-testid="composer-media-as-document"
-                @click="emit('send-as-document', item.id)"
-              >
-                {{ t('chat.composer.sendAsDocument') }}
-              </Button>
+              <p v-if="item.conversionFailed" class="text-xs text-muted-foreground" data-testid="composer-media-convert-failed">
+                {{ t('chat.composer.conversionFailed') }}
+              </p>
+              <div v-if="(canConvert(item) && !item.conversionFailed) || canSendAsDocument(item)" class="flex flex-wrap gap-1.5">
+                <Button
+                  v-if="canConvert(item) && !item.conversionFailed"
+                  variant="outline"
+                  size="xs"
+                  class="text-xs"
+                  :disabled="sending"
+                  data-testid="composer-media-convert"
+                  @click="emit('convert', item.id)"
+                >
+                  <Wand2 class="h-3 w-3" aria-hidden="true" />
+                  {{ convertLabel(item) }}
+                </Button>
+                <Button
+                  v-if="canSendAsDocument(item)"
+                  variant="outline"
+                  size="xs"
+                  class="text-xs"
+                  :disabled="sending"
+                  data-testid="composer-media-as-document"
+                  @click="emit('send-as-document', item.id)"
+                >
+                  {{ t('chat.composer.sendAsDocument') }}
+                </Button>
+              </div>
             </div>
+            <p v-else-if="item.status === 'converting'" class="flex items-center gap-1 text-xs text-muted-foreground" role="status">
+              <Loader2 class="h-3 w-3 animate-spin" aria-hidden="true" />
+              {{ t('chat.composer.converting') }}
+            </p>
+            <p v-else-if="item.convertedFrom && item.status === 'ready'" class="text-xs text-muted-foreground" data-testid="composer-media-converted">
+              {{ convertedNote(item) }}
+            </p>
             <p v-else-if="item.asDocument && item.status === 'ready'" class="text-xs text-muted-foreground">
               {{ t('chat.composer.willSendAsDocument') }}
             </p>
@@ -274,7 +338,16 @@ function onOpenChange(open: boolean) {
             {{ sentCount > 0 ? t('common.close') : t('common.cancel') }}
           </Button>
           <Button
-            v-if="failedCount > 0 && !sending"
+            v-if="convertibleCount > 1 && !busy"
+            variant="outline"
+            data-testid="composer-media-convert-all"
+            @click="emit('convert-all')"
+          >
+            <Wand2 class="h-4 w-4" aria-hidden="true" />
+            {{ t('chat.composer.convertAll', { count: convertibleCount }) }}
+          </Button>
+          <Button
+            v-if="failedCount > 0 && !busy"
             variant="outline"
             data-testid="composer-media-retry"
             @click="emit('retry-failed')"
@@ -284,7 +357,7 @@ function onOpenChange(open: boolean) {
           </Button>
           <Button
             v-if="readyCount > 0 || failedCount === 0 || sending"
-            :disabled="sending || readyCount === 0"
+            :disabled="busy || readyCount === 0"
             data-testid="composer-media-send"
             @click="emit('send')"
           >

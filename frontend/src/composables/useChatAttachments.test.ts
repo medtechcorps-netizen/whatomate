@@ -328,4 +328,101 @@ describe('useChatAttachments sending', () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:preview')
     expect(attachments.items.value).toHaveLength(0)
   })
+
+  it('converts a rejected photo to a JPEG and makes it sendable', async () => {
+    const jpeg = file('IMG_1.jpg', 'image/jpeg', 2 * MiB)
+    const convertImage = vi.fn(async () => jpeg)
+    const { attachments, calls } = setup({ convertImage })
+    attachments.stage([file('IMG_1.HEIC', 'image/heic', 3 * MiB)])
+    const id = attachments.items.value[0].id
+    expect(attachments.items.value[0].validation).toMatchObject({ ok: false, canConvertToJpeg: true })
+
+    const converting = attachments.convertToJpeg(id)
+    expect(attachments.items.value[0].status).toBe('converting')
+    expect(attachments.convertingCount.value).toBe(1)
+    // Sending waits for conversions to finish.
+    await attachments.sendAll()
+    expect(calls).toHaveLength(0)
+
+    await expect(converting).resolves.toBe(true)
+    expect(attachments.items.value[0]).toMatchObject({
+      status: 'ready',
+      convertedFrom: 'image/heic',
+      conversionFailed: false,
+      previewUrl: 'blob:preview',
+    })
+    expect(attachments.items.value[0].file).toBe(jpeg)
+    expect(attachments.items.value[0].validation).toMatchObject({ ok: true, kind: 'image' })
+
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request).toMatchObject({ type: 'image' })
+    expect(calls[0].request.file.name).toBe('IMG_1.jpg')
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+  })
+
+  it('marks a failed conversion and keeps the file rejected', async () => {
+    const { attachments } = setup({ convertImage: vi.fn(async () => Promise.reject(new Error('decode'))) })
+    attachments.stage([file('IMG_2.HEIC', 'image/heic', MiB)])
+    await expect(attachments.convertToJpeg(attachments.items.value[0].id)).resolves.toBe(false)
+    expect(attachments.items.value[0]).toMatchObject({ status: 'invalid', conversionFailed: true })
+  })
+
+  it('converts photos one at a time and skips ones that already failed', async () => {
+    const pending: Array<ReturnType<typeof deferred<File>>> = []
+    const convertImage = vi.fn(() => {
+      const next = deferred<File>()
+      pending.push(next)
+      return next.promise
+    })
+    const { attachments } = setup({ convertImage })
+    attachments.stage([
+      file('a.webp', 'image/webp', MiB),
+      file('ok.png', 'image/png', MiB),
+      file('b.gif', 'image/gif', MiB),
+    ])
+    const all = attachments.convertAllToJpeg()
+    await settle()
+    expect(convertImage).toHaveBeenCalledTimes(1)
+    pending[0].resolve(file('a.jpg', 'image/jpeg', MiB))
+    await settle()
+    expect(convertImage).toHaveBeenCalledTimes(2)
+    pending[1].resolve(file('b.jpg', 'image/jpeg', MiB))
+    await all
+    expect(attachments.items.value.map(item => item.status)).toEqual(['ready', 'ready', 'ready'])
+    expect(attachments.items.value[2].convertedFrom).toBe('image/gif')
+  })
+
+  it('drops a conversion that finishes after the conversation changed', async () => {
+    const pending = deferred<File>()
+    const { attachments } = setup({ convertImage: () => pending.promise })
+    attachments.stage([file('a.webp', 'image/webp', MiB)])
+    const converting = attachments.convertToJpeg(attachments.items.value[0].id)
+    attachments.reset()
+    pending.resolve(file('a.jpg', 'image/jpeg', MiB))
+    await expect(converting).resolves.toBe(false)
+    expect(attachments.items.value).toHaveLength(0)
+  })
+
+  it('does not start a conversion while a batch is uploading', async () => {
+    const convertImage = vi.fn(async () => file('a.jpg', 'image/jpeg', MiB))
+    const { attachments, calls } = setup({ convertImage })
+    attachments.stage([file('ready.png', 'image/png'), file('a.webp', 'image/webp', MiB)])
+    const done = attachments.sendAll()
+    await settle()
+    await expect(attachments.convertToJpeg(attachments.items.value[1].id)).resolves.toBe(false)
+    expect(convertImage).not.toHaveBeenCalled()
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+  })
+
+  it('does not convert files that are not convertible', async () => {
+    const convertImage = vi.fn()
+    const { attachments } = setup({ convertImage })
+    attachments.stage([file('ok.png', 'image/png'), file('a.mov', 'video/quicktime', MiB)])
+    await attachments.convertToJpeg(attachments.items.value[0].id)
+    await attachments.convertToJpeg(attachments.items.value[1].id)
+    expect(convertImage).not.toHaveBeenCalled()
+  })
 })

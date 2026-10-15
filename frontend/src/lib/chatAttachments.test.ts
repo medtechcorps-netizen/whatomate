@@ -21,20 +21,27 @@ function fileLike(name: string, type: string, size: number) {
 }
 
 describe('validateChatAttachment', () => {
-  it('accepts JPEG and PNG photos up to Meta’s 5 MB image limit', () => {
-    expect(validateChatAttachment(fileLike('a.jpg', 'image/jpeg', 5 * MiB))).toEqual({
+  it('accepts JPEG and PNG photos up to Meta’s 5 MB image limit (5,000,000 bytes)', () => {
+    expect(validateChatAttachment(fileLike('a.jpg', 'image/jpeg', 5_000_000))).toEqual({
       ok: true,
       kind: 'image',
       mimeType: 'image/jpeg',
-      limitBytes: 5 * MiB,
+      limitBytes: 5_000_000,
     })
+    expect(validateChatAttachment(fileLike('a.jpg', 'image/jpeg', 5_000_001)).ok).toBe(false)
     expect(validateChatAttachment(fileLike('a.png', 'image/png', 1024)).ok).toBe(true)
   })
 
   it('offers "send as document" for an oversized JPEG/PNG and accepts it that way', () => {
     const big = fileLike('scan.jpg', 'image/jpeg', 8 * MiB)
     const verdict = validateChatAttachment(big)
-    expect(verdict).toMatchObject({ ok: false, problem: 'too-large', kind: 'image', canSendAsDocument: true })
+    expect(verdict).toMatchObject({
+      ok: false,
+      problem: 'too-large',
+      kind: 'image',
+      canSendAsDocument: true,
+      canConvertToJpeg: true,
+    })
 
     expect(validateChatAttachment(big, { asDocument: true })).toEqual({
       ok: true,
@@ -51,10 +58,27 @@ describe('validateChatAttachment', () => {
       ['anim.gif', 'image/gif'],
     ]) {
       const verdict = validateChatAttachment(fileLike(name, type, 1000))
-      expect(verdict).toMatchObject({ ok: false, problem: 'unsupported-image', canSendAsDocument: false })
+      expect(verdict).toMatchObject({
+        ok: false,
+        problem: 'unsupported-image',
+        canSendAsDocument: false,
+        canConvertToJpeg: true,
+      })
       // Asking for a document anyway does not bypass Meta's MIME list.
       expect(validateChatAttachment(fileLike(name, type, 1000), { asDocument: true }).ok).toBe(false)
     }
+  })
+
+  it('does not offer in-browser conversion for SVG, very large photos or non-images', () => {
+    expect(validateChatAttachment(fileLike('logo.svg', 'image/svg+xml', 1000))).toMatchObject({
+      problem: 'unsupported-image',
+      canConvertToJpeg: false,
+    })
+    expect(validateChatAttachment(fileLike('pano.heic', 'image/heic', 41 * MiB))).toMatchObject({
+      canConvertToJpeg: false,
+    })
+    expect(validateChatAttachment(fileLike('a.mov', 'video/quicktime', MiB))).toMatchObject({ canConvertToJpeg: false })
+    expect(validateChatAttachment(fileLike('big.mp4', 'video/mp4', 15 * MiB))).toMatchObject({ canConvertToJpeg: false })
   })
 
   it('accepts MP4/3GPP video and rejects other containers', () => {

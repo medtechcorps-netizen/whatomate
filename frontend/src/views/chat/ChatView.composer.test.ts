@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   toastSuccess: vi.fn(),
   toastWarning: vi.fn(),
   toastError: vi.fn(),
+  convertImageToJpeg: vi.fn(),
 }))
 
 vi.mock('vue-router', async () => {
@@ -157,6 +158,7 @@ vi.mock('@/services/api', () => ({
   accountsService: { list: vi.fn(async () => ({ data: { data: { accounts: [] } } })) },
   cannedResponsesService: { use: vi.fn() },
 }))
+vi.mock('@/lib/chatImageConversion', () => ({ convertImageToJpeg: mocks.convertImageToJpeg }))
 vi.mock('vue3-emoji-picker', () => ({
   default: { name: 'EmojiPickerMock', emits: ['select'], template: '<div data-testid="emoji-picker-mock" />' },
 }))
@@ -467,5 +469,27 @@ describe('ChatView composer', () => {
     await settle()
     const texts = wrapper.findAllComponents(WhatsAppText).map(c => c.props('text'))
     expect(texts).toEqual(['*Bold* hello', 'Your _results_'])
+  })
+
+  it('tells the dialog when the 24-hour window is closed and wires conversion', async () => {
+    wrapper = mountView()
+    await settle()
+    expect(wrapper.findComponent(MediaSendDialog).props('serviceWindowExpired')).toBe(false)
+    mocks.contactsStore!.currentContact = { ...mocks.contactsStore!.currentContact, service_window_open: false }
+    await nextTick()
+    expect(wrapper.findComponent(MediaSendDialog).props('serviceWindowExpired')).toBe(true)
+
+    wrapper.findComponent(ChatDropZoneOverlay).vm.$emit('files', [new File(['x'], 'IMG.HEIC', { type: 'image/heic' })])
+    await nextTick()
+    const [heic] = wrapper.findComponent(MediaSendDialog).props('items')
+    expect(heic.status).toBe('invalid')
+    mocks.convertImageToJpeg.mockResolvedValueOnce(new File(['jpg'], 'IMG.jpg', { type: 'image/jpeg' }))
+    wrapper.findComponent(MediaSendDialog).vm.$emit('convert', heic.id)
+    await flushPromises()
+    expect(mocks.convertImageToJpeg).toHaveBeenCalledTimes(1)
+    expect(wrapper.findComponent(MediaSendDialog).props('items')[0]).toMatchObject({
+      status: 'ready',
+      convertedFrom: 'image/heic',
+    })
   })
 })

@@ -1,6 +1,7 @@
-import { computed, getCurrentScope, onScopeDispose, ref } from 'vue'
+import { computed, getCurrentScope, markRaw, onScopeDispose, ref } from 'vue'
 import { messagesService } from '@/services/api'
 import { getErrorMessage } from '@/lib/api-utils'
+import { convertImageToJpeg } from '@/lib/chatImageConversion'
 import {
   MAX_CAPTION_LENGTH,
   MAX_CHAT_ATTACHMENTS,
@@ -11,7 +12,7 @@ import {
   type ChatMediaKind,
 } from '@/lib/chatAttachments'
 
-export type StagedAttachmentStatus = 'ready' | 'invalid' | 'sending' | 'sent' | 'failed'
+export type StagedAttachmentStatus = 'ready' | 'invalid' | 'converting' | 'sending' | 'sent' | 'failed'
 
 export interface StagedAttachment {
   id: string
@@ -26,6 +27,10 @@ export interface StagedAttachment {
   progress: number
   /** Reason the server gave for the last failure, if any. */
   errorMessage: string | null
+  /** MIME type of the original when the file was converted to JPEG here. */
+  convertedFrom: string | null
+  /** The last in-browser JPEG conversion failed (e.g. HEIC outside Safari). */
+  conversionFailed: boolean
 }
 
 /** The conversation a batch was staged for. */
@@ -78,6 +83,8 @@ export interface UseChatAttachmentsOptions {
   onBatchFinished?: (summary: BatchSummary) => void
   /** Uploads one file. Defaults to messagesService.sendMedia. */
   send?: SendChatMedia
+  /** Re-encodes a photo as JPEG. Defaults to convertImageToJpeg. */
+  convertImage?: (file: File) => Promise<File>
 }
 
 const defaultSend: SendChatMedia = async (request, options) => {
@@ -113,6 +120,7 @@ function revokePreviewUrl(url: string | null) {
  */
 export function useChatAttachments(options: UseChatAttachmentsOptions) {
   const send = options.send ?? defaultSend
+  const convertImage = options.convertImage ?? ((file: File) => convertImageToJpeg(file))
   const items = ref<StagedAttachment[]>([])
   const isOpen = ref(false)
   const isSending = ref(false)
@@ -125,6 +133,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   const failedCount = computed(() => items.value.filter(item => item.status === 'failed').length)
   const invalidCount = computed(() => items.value.filter(item => item.status === 'invalid').length)
   const sentCount = computed(() => items.value.filter(item => item.status === 'sent').length)
+  const convertingCount = computed(() => items.value.filter(item => item.status === 'converting').length)
   const remainingSlots = computed(() => Math.max(0, MAX_CHAT_ATTACHMENTS - items.value.length))
 
   function find(id: string): StagedAttachment | undefined {
@@ -156,7 +165,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
       const validation = validateChatAttachment(file)
       items.value.push({
         id: `attachment-${++sequence}`,
-        file,
+        // Files are opaque payloads; never wrap them in reactive proxies.
+        file: markRaw(file),
         previewUrl: createPreviewUrl(file, validation),
         caption: '',
         asDocument: false,
@@ -164,6 +174,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         status: validation.ok ? 'ready' : 'invalid',
         progress: 0,
         errorMessage: null,
+        convertedFrom: null,
+        conversionFailed: false,
       })
     }
     if (items.value.length > 0) isOpen.value = true
@@ -194,9 +206,53 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     item.status = validation.ok ? 'ready' : 'invalid'
   }
 
+  function canConvert(item: StagedAttachment | undefined): item is StagedAttachment {
+    return !!item && item.status === 'invalid' && !item.validation.ok && item.validation.canConvertToJpeg
+  }
+
+  /**
+   * Re-encodes a rejected photo (HEIC/WebP/GIF…, or JPEG/PNG over 5 MB) as a
+   * JPEG under 5 MB so it can go as an inline photo.
+   */
+  async function convertToJpeg(id: string): Promise<boolean> {
+    const item = find(id)
+    if (isSending.value || !canConvert(item)) return false
+    const conversionGeneration = generation
+    const original = item.file
+    item.status = 'converting'
+    item.conversionFailed = false
+    try {
+      const converted = await convertImage(original)
+      const current = find(id)
+      if (conversionGeneration !== generation || !current || current.status !== 'converting') return false
+      const validation = validateChatAttachment(converted)
+      revokePreviewUrl(current.previewUrl)
+      current.file = markRaw(converted)
+      current.validation = validation
+      current.previewUrl = createPreviewUrl(converted, validation)
+      current.asDocument = false
+      current.convertedFrom = original.type || validation.mimeType
+      current.status = validation.ok ? 'ready' : 'invalid'
+      current.conversionFailed = !validation.ok
+      return validation.ok
+    } catch {
+      const current = find(id)
+      if (conversionGeneration !== generation || !current || current.status !== 'converting') return false
+      current.status = 'invalid'
+      current.conversionFailed = true
+      return false
+    }
+  }
+
+  /** Converts every convertible photo, one at a time to keep memory use low. */
+  async function convertAllToJpeg() {
+    const ids = items.value.filter(item => canConvert(item) && !item.conversionFailed).map(item => item.id)
+    for (const id of ids) await convertToJpeg(id)
+  }
+
   async function runBatch(statuses: StagedAttachmentStatus[]): Promise<BatchSummary> {
     const summary: BatchSummary = { sent: 0, failed: 0 }
-    if (isSending.value || !target) return summary
+    if (isSending.value || !target || convertingCount.value > 0) return summary
     if (!target.isActive()) {
       reset()
       return summary
@@ -257,8 +313,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
 
     isSending.value = false
     options.onBatchFinished?.(summary)
-    // Done when nothing is left to send or retry; invalid files were shown as skipped.
-    if (!items.value.some(item => item.status === 'ready' || item.status === 'failed')) reset()
+    // Done when nothing is left to send, retry or convert; invalid files were shown as skipped.
+    if (!items.value.some(item => ['ready', 'failed', 'converting'].includes(item.status))) reset()
     return summary
   }
 
@@ -288,12 +344,15 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     failedCount,
     invalidCount,
     sentCount,
+    convertingCount,
     remainingSlots,
     maxFiles: MAX_CHAT_ATTACHMENTS,
     stage,
     remove,
     setCaption,
     sendAsDocument,
+    convertToJpeg,
+    convertAllToJpeg,
     sendAll,
     retryFailed,
     close,

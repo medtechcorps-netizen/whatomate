@@ -21,13 +21,22 @@ const MULTIPART_OVERHEAD_BYTES = 64 * 1024
 /** Largest file the server can accept in one /api/messages/media request. */
 export const MAX_UPLOAD_FILE_BYTES = SERVER_UPLOAD_CAP_BYTES - MULTIPART_OVERHEAD_BYTES
 
-/** Meta's per-type limits. */
+/**
+ * Meta's per-type limits. Meta's "5 MB" for images is read as 5,000,000
+ * bytes: if Meta means 5 MiB, the safe side only costs about 4%.
+ */
 export const META_MEDIA_LIMIT_BYTES: Record<ChatMediaKind, number> = {
-  image: 5 * MiB,
+  image: 5_000_000,
   video: 16 * MiB,
   audio: 16 * MiB,
   document: 100 * MiB,
 }
+
+/**
+ * Largest photo we try to convert in the browser; decoding bigger files can
+ * exhaust memory on phones and low-end PCs.
+ */
+export const MAX_CONVERTIBLE_IMAGE_BYTES = 40 * MiB
 
 /** Meta accepts a caption on image, video and document messages, up to 1024 characters. */
 export const MAX_CAPTION_LENGTH = 1024
@@ -100,11 +109,25 @@ export type AttachmentValidation =
        * rejects HEIC, WebP, GIF etc. at upload even as documents.
        */
       canSendAsDocument: boolean
+      /**
+       * A photo the browser may be able to re-encode as a JPEG under 5 MB:
+       * other image formats (HEIC, WebP, GIF…) or an oversized JPEG/PNG.
+       */
+      canConvertToJpeg: boolean
     }
 
 export interface ValidateAttachmentOptions {
   /** Send the file as a WhatsApp document instead of inline media. */
   asDocument?: boolean
+}
+
+function isConvertibleImage(mimeType: string, size: number): boolean {
+  return (
+    mimeType.startsWith('image/') &&
+    mimeType !== 'image/svg+xml' &&
+    size > 0 &&
+    size <= MAX_CONVERTIBLE_IMAGE_BYTES
+  )
 }
 
 function extensionOf(name: string): string {
@@ -170,10 +193,18 @@ export function validateChatAttachment(
     if (documentable) {
       const limitBytes = effectiveLimitBytes('document')
       if (file.size <= 0) {
-        return { ok: false, problem: 'empty', kind: 'document', mimeType, limitBytes, canSendAsDocument: false }
+        return { ok: false, problem: 'empty', kind: 'document', mimeType, limitBytes, canSendAsDocument: false, canConvertToJpeg: false }
       }
       if (file.size > limitBytes) {
-        return { ok: false, problem: 'too-large', kind: 'document', mimeType, limitBytes, canSendAsDocument: false }
+        return {
+          ok: false,
+          problem: 'too-large',
+          kind: 'document',
+          mimeType,
+          limitBytes,
+          canSendAsDocument: false,
+          canConvertToJpeg: isConvertibleImage(mimeType, file.size),
+        }
       }
       return { ok: true, kind: 'document', mimeType, limitBytes }
     }
@@ -193,12 +224,13 @@ export function validateChatAttachment(
       mimeType,
       limitBytes: null,
       canSendAsDocument: false,
+      canConvertToJpeg: detectedKind === 'image' && isConvertibleImage(mimeType, file.size),
     }
   }
 
   const limitBytes = effectiveLimitBytes(detectedKind)
   if (file.size <= 0) {
-    return { ok: false, problem: 'empty', kind: detectedKind, mimeType, limitBytes, canSendAsDocument: false }
+    return { ok: false, problem: 'empty', kind: detectedKind, mimeType, limitBytes, canSendAsDocument: false, canConvertToJpeg: false }
   }
   if (file.size > limitBytes) {
     return {
@@ -209,6 +241,7 @@ export function validateChatAttachment(
       limitBytes,
       canSendAsDocument:
         detectedKind === 'image' && file.size <= effectiveLimitBytes('document'),
+      canConvertToJpeg: detectedKind === 'image' && isConvertibleImage(mimeType, file.size),
     }
   }
   return { ok: true, kind: detectedKind, mimeType, limitBytes }
