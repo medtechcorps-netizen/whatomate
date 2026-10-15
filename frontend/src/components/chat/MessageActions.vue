@@ -9,10 +9,11 @@ import type { Message } from '@/stores/contacts'
 
 /**
  * Per-bubble action strip (react, reply, retry). It keeps the established
- * footprint beside the bubble: a 24px-wide column that is transparent until
- * the row is hovered or focused. Touch screens have no hover, so the strip is
- * always shown there. Reply stays a real <button> with the lucide-reply icon
- * inside the message list; the chat-composer E2E spec relies on that.
+ * footprint beside the bubble: a 24px-wide column, visible but muted at rest
+ * and at full strength when the row is hovered or focused. Touch screens have
+ * no hover, so the strip is always at full strength there. Reply stays a real
+ * <button> with the lucide-reply icon inside the message list; the
+ * chat-composer E2E spec relies on that.
  */
 const props = defineProps<{
   message: Message
@@ -46,8 +47,7 @@ const canRetry = computed(() =>
     data-testid="chat-message-actions"
     :class="[
       'message-actions flex flex-col gap-0.5 transition-opacity self-center ml-1',
-      'opacity-0 group-hover:opacity-100 focus-within:opacity-100',
-      reactionOpen && 'opacity-100',
+      reactionOpen && 'is-open',
     ]"
   >
     <Tooltip>
@@ -120,15 +120,22 @@ const canRetry = computed(() =>
 
 <style scoped>
 /*
- * Reveal on row hover without Tailwind's group-hover variant: with the locked
- * postcss-selector-parser 6.1.3, Tailwind 3.4 emits no group-* or peer-* rules
- * at all, so `group-hover:opacity-100` alone left the strip invisible.
+ * Reply and React stay visible at rest, muted, so agents can find them; they
+ * come to full strength on row hover, keyboard focus or an open picker. These
+ * are scoped rules rather than Tailwind's group-hover: with the locked
+ * postcss-selector-parser 6.1.3, Tailwind 3.4 emits no group-* or peer-* rules.
  */
-.group:hover .message-actions {
+.message-actions {
+  opacity: 0.6;
+}
+
+.group:hover .message-actions,
+.message-actions:focus-within,
+.message-actions.is-open {
   opacity: 1;
 }
 
-/* Touch screens cannot hover, so the actions must not hide behind it. */
+/* Touch screens cannot hover, so the actions are always at full strength. */
 @media (hover: none) {
   .message-actions {
     opacity: 1;

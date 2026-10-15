@@ -59,28 +59,32 @@ describe('MessageActions', () => {
     expect(react?.attributes('aria-label')).toBe('chat.messageActions.react')
   })
 
-  it('keeps the established hover strip footprint and reveals it on hover, focus, and open picker', async () => {
+  it('keeps the established strip footprint and marks an open picker', async () => {
     const wrapper = mountActions()
     const strip = wrapper.get('[data-testid="chat-message-actions"]')
-    for (const cls of ['flex', 'flex-col', 'self-center', 'ml-1', 'opacity-0', 'group-hover:opacity-100', 'focus-within:opacity-100']) {
+    for (const cls of ['flex', 'flex-col', 'gap-0.5', 'self-center', 'ml-1']) {
       expect(strip.classes()).toContain(cls)
     }
     for (const button of strip.findAll('button')) {
       expect(button.classes()).toEqual(expect.arrayContaining(['h-6', 'w-6']))
     }
-    expect(strip.classes()).not.toContain('opacity-100')
+    // No Tailwind opacity utility may hide the strip at rest any more.
+    expect(strip.classes().filter(c => c.includes('opacity-'))).toEqual([])
+    expect(strip.classes()).not.toContain('is-open')
 
     await wrapper.setProps({ reactionOpen: true } as never)
-    expect(wrapper.get('[data-testid="chat-message-actions"]').classes()).toContain('opacity-100')
+    expect(wrapper.get('[data-testid="chat-message-actions"]').classes()).toContain('is-open')
   })
 
-  it('always shows the strip on touch screens, which cannot hover', () => {
+  it('stays visible but muted at rest, full on hover, focus or open picker', () => {
+    // Tailwind currently emits no group-* rules (postcss-selector-parser 6.1.3),
+    // so visibility is owned by these scoped rules.
+    expect(source).toMatch(/\.message-actions\s*\{\s*opacity: 0\.6;/)
+    expect(source).toMatch(/\.group:hover \.message-actions,\s*\.message-actions:focus-within,\s*\.message-actions\.is-open\s*\{\s*opacity: 1;/)
+  })
+
+  it('is at full strength on touch screens, which cannot hover', () => {
     expect(source).toMatch(/@media \(hover: none\)\s*\{\s*\.message-actions\s*\{\s*opacity: 1;/)
-  })
-
-  it('reveals the strip on row hover with its own rule, not only group-hover', () => {
-    // Tailwind currently emits no group-* rules (postcss-selector-parser 6.1.3).
-    expect(source).toMatch(/\.group:hover \.message-actions\s*\{\s*opacity: 1;/)
   })
 
   it('emits reply with the message', async () => {
