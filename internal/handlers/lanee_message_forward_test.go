@@ -183,9 +183,15 @@ func TestLaneEForwardMediaCopiesStoredBytesAndUploadsAgain(t *testing.T) {
 	})
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
 
+	var resp struct {
+		Data handlers.MessageResponse `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &resp))
+
 	messages := f.messagesFor(t, f.target.ID)
 	require.Len(t, messages, 1)
 	forwarded := messages[0]
+	assert.Equal(t, resp.Data.MediaURL, forwarded.MediaURL, "the planned key is stored up front; no later write")
 	assert.Equal(t, models.MessageTypeImage, forwarded.MessageType)
 	assert.Equal(t, "X-ray caption", forwarded.Content)
 	assert.Equal(t, "image/jpeg", forwarded.MediaMimeType)
@@ -212,7 +218,6 @@ func TestLaneEForwardRefusesBeforePersistingOrSending(t *testing.T) {
 	f := laneENewForwardFixture(t)
 	text := f.storedMessage(t, f.source, models.MessageTypeText, "hello", "")
 	pendingMedia := f.storedMessage(t, f.source, models.MessageTypeImage, "", "")
-	missingMedia := f.storedMessage(t, f.source, models.MessageTypeImage, "", "images/missing.jpg")
 
 	closed := testutil.CreateTestContactWith(t, f.app.DB, f.org.ID, testutil.WithContactAccount(f.account.Name))
 	expired := testutil.CreateTestContactWith(t, f.app.DB, f.org.ID, testutil.WithContactAccount(f.account.Name))
@@ -240,7 +245,6 @@ func TestLaneEForwardRefusesBeforePersistingOrSending(t *testing.T) {
 		{"unknown source", f.target.ID, map[string]any{"forward_of_message_id": uuid.NewString()}, fasthttp.StatusNotFound, "forward_source_not_found"},
 		{"other organization source", f.target.ID, map[string]any{"forward_of_message_id": foreign.ID.String()}, fasthttp.StatusNotFound, "forward_source_not_found"},
 		{"media not hydrated", f.target.ID, map[string]any{"forward_of_message_id": pendingMedia.ID.String()}, fasthttp.StatusConflict, "forward_media_pending"},
-		{"media missing from storage", f.target.ID, map[string]any{"forward_of_message_id": missingMedia.ID.String()}, fasthttp.StatusConflict, "forward_media_unavailable"},
 		{"window never opened", closed.ID, map[string]any{"forward_of_message_id": text.ID.String()}, fasthttp.StatusConflict, "forward_window_closed"},
 		{"window expired", expired.ID, map[string]any{"forward_of_message_id": text.ID.String()}, fasthttp.StatusConflict, "forward_window_closed"},
 		{"unknown target", uuid.New(), map[string]any{"forward_of_message_id": text.ID.String()}, fasthttp.StatusNotFound, "forward_target_not_found"},
@@ -401,5 +405,22 @@ func TestLaneESendMediaMessageRejectsForeignReply(t *testing.T) {
 	require.NoError(t, f.app.SendMediaMessage(req))
 	f.app.WaitForBackgroundTasks()
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req))
+	assert.Zero(t, f.mock.sentMessageCount())
+}
+
+// Storage and Meta I/O run after the request commits, so a source object that
+// vanished fails the new message asynchronously, before any provider call.
+func TestLaneEForwardMediaMissingFromStorageFailsBeforeMeta(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	missing := f.storedMessage(t, f.source, models.MessageTypeImage, "", "images/missing.jpg")
+
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": missing.ID.String()})
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+
+	messages := f.messagesFor(t, f.target.ID)
+	require.Len(t, messages, 1)
+	assert.Equal(t, models.MessageStatusFailed, messages[0].Status)
+	assert.Contains(t, messages[0].ErrorMessage, "no longer available")
+	assert.Empty(t, f.mock.uploadedMedia)
 	assert.Zero(t, f.mock.sentMessageCount())
 }

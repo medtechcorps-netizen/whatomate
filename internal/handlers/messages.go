@@ -92,6 +92,11 @@ type OutgoingMessageRequest struct {
 	// source message and is recorded as metadata.forwarded_from.
 	forwardedFrom *messageForwardSource
 
+	// forwardMedia defers a forwarded attachment's storage copy and Meta
+	// upload to the asynchronous delivery goroutine, after the request
+	// committed and before any provider transaction opens.
+	forwardMedia *forwardMediaCopy
+
 	// legacyWhatsAppReply is populated only by the fail-closed, exact
 	// Omnichannel reply endpoint. Established Chat callers cannot opt into or
 	// influence this server-derived binding.
@@ -216,6 +221,9 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	}
 	if req.Contact == nil || req.Contact.ID == uuid.Nil {
 		return nil, fmt.Errorf("%w: contact is required", errOutgoingContactNotFound)
+	}
+	if req.forwardMedia != nil && !opts.Async {
+		return nil, errors.New("a forwarded attachment requires asynchronous delivery")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -544,6 +552,27 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			root.wg.Add(1)
 			go func() {
 				defer root.wg.Done()
+				// No transaction is open here: the request has committed and the
+				// provider transaction starts in deliverOutgoingMessage.
+				if req.forwardMedia != nil {
+					if prepareErr := root.prepareForwardedMedia(&req); prepareErr != nil {
+						if settlementErr := root.settleOutgoingFailureBeforeProvider(
+							msg,
+							req,
+							opts,
+							prepareErr,
+						); settlementErr != nil {
+							root.Log.Error(
+								"Failed to settle forwarded message after media preparation failed",
+								"error", settlementErr,
+								"prepare_error", prepareErr,
+								"organization_id", organizationID,
+								"message_id", msg.ID,
+							)
+						}
+						return
+					}
+				}
 				asyncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 
@@ -2535,18 +2564,22 @@ const (
 	forwardedFromMetadataKey = "forwarded_from"
 
 	// forwardMediaCopyTimeout bounds the tenant-storage read and write of one
-	// forwarded attachment.
-	forwardMediaCopyTimeout = 20 * time.Second
+	// forwarded attachment; forwardMediaUploadTimeout bounds its Meta upload.
+	// Both run after the request commits, with no transaction open.
+	forwardMediaCopyTimeout   = 20 * time.Second
+	forwardMediaUploadTimeout = 30 * time.Second
 
-	// forwardPersistTimeout bounds the pending-message transaction. Provider
-	// delivery runs after commit with its own deadline.
-	forwardPersistTimeout = 15 * time.Second
+	// forwardRequestTimeout bounds every statement the forward request runs:
+	// lookups, the pending-message write and the audit entry.
+	forwardRequestTimeout = 15 * time.Second
+
+	// mediaReplyPreviewTimeout bounds the reply-preview reload of a media send.
+	mediaReplyPreviewTimeout = 5 * time.Second
 
 	forwardErrorInvalid            fastglue.ErrorType = "forward_invalid"
 	forwardErrorSourceNotFound     fastglue.ErrorType = "forward_source_not_found"
 	forwardErrorUnsupportedType    fastglue.ErrorType = "forward_unsupported_type"
 	forwardErrorMediaPending       fastglue.ErrorType = "forward_media_pending"
-	forwardErrorMediaUnavailable   fastglue.ErrorType = "forward_media_unavailable"
 	forwardErrorWindowClosed       fastglue.ErrorType = "forward_window_closed"
 	forwardErrorIdentityReview     fastglue.ErrorType = "forward_identity_review"
 	forwardErrorTargetNotFound     fastglue.ErrorType = "forward_target_not_found"
@@ -2710,42 +2743,128 @@ func (a *App) checkForwardTarget(orgID uuid.UUID, contact *models.Contact, now t
 	return nil
 }
 
-// copyForwardMedia reads the source attachment from tenant storage and stores
-// an independent copy for the new message, so later cleanup of either object
-// cannot break the other row. Both storage calls share one deadline.
-func (a *App) copyForwardMedia(
-	orgID uuid.UUID,
-	source *models.Message,
-) (data []byte, mediaPath, mimeType string, refusal *messageForwardRefusal, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
-	defer cancel()
+// forwardMediaCopy is the deferred copy of a forwarded attachment: read
+// SourceKey, write the new message's own object, then upload the bytes to Meta.
+// DestinationKey is planned in the request (no I/O there) and stored as the
+// new row's media_url, so the copy needs no later database write.
+type forwardMediaCopy struct {
+	OrganizationID uuid.UUID
+	SourceKey      string
+	ObjectSubdir   string
+	LocalSubdir    string
+	ObjectName     string
+	DestinationKey string
+	MimeType       string
+}
 
-	data, storedContentType, loadErr := a.loadTenantMedia(ctx, orgID, source.MediaURL)
-	if loadErr != nil || len(data) == 0 {
+// planForwardMedia names the forwarded attachment's own object with the same
+// layout saveMessageMedia uses, without touching storage.
+func (a *App) planForwardMedia(orgID uuid.UUID, source *models.Message) *forwardMediaCopy {
+	mimeType := strings.TrimSpace(source.MediaMimeType)
+	if mimeType == "" {
+		mimeType = getMimeTypeFromExtension(forwardMediaExtension(source.MediaURL))
+	}
+	subdir := "documents"
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		subdir = "images"
+	case strings.HasPrefix(mimeType, "video/"):
+		subdir = "videos"
+	case strings.HasPrefix(mimeType, "audio/"):
+		subdir = "audio"
+	}
+	ext := getExtensionFromMimeType(mimeType)
+	if ext == "" {
+		ext = forwardMediaExtension(source.MediaFilename)
+	}
+	if ext == "" {
+		ext = ".bin"
+	}
+	plan := &forwardMediaCopy{
+		OrganizationID: orgID,
+		SourceKey:      source.MediaURL,
+		ObjectSubdir:   "messages/" + subdir,
+		LocalSubdir:    subdir,
+		ObjectName:     uuid.New().String() + ext,
+		MimeType:       mimeType,
+	}
+	if a.Config != nil && strings.EqualFold(a.Config.Storage.Type, "s3") {
+		plan.DestinationKey = tenantObjectKey(orgID, plan.ObjectSubdir, plan.ObjectName)
+	} else {
+		plan.DestinationKey = plan.LocalSubdir + "/" + plan.ObjectName
+	}
+	return plan
+}
+
+func forwardMediaExtension(name string) string {
+	dot := strings.LastIndex(name, ".")
+	if dot < 0 || strings.ContainsAny(name[dot:], "/\\") {
+		return ""
+	}
+	return strings.ToLower(name[dot:])
+}
+
+// prepareForwardedMedia runs in the delivery goroutine with no transaction or
+// pooled connection held: it copies the attachment in tenant storage and
+// uploads it to Meta, leaving only the send for the provider transaction.
+func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
+	plan := req.forwardMedia
+	if plan == nil || req.Account == nil {
+		return errors.New("forwarded attachment plan is incomplete")
+	}
+	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
+	defer cancelStorage()
+	data, _, err := a.loadTenantMedia(storageCtx, plan.OrganizationID, plan.SourceKey)
+	if err != nil || len(data) == 0 {
 		a.Log.Error("Failed to read media to forward",
-			"error", loadErr, "organization_id", orgID, "message_id", source.ID)
-		return nil, "", "", &messageForwardRefusal{
-			Status:    fasthttp.StatusConflict,
-			ErrorType: forwardErrorMediaUnavailable,
-			Message:   "This attachment is no longer available to forward",
-		}, nil
+			"error", err, "organization_id", plan.OrganizationID)
+		return errors.New("the forwarded attachment is no longer available")
 	}
-	mimeType = strings.TrimSpace(source.MediaMimeType)
-	if mimeType == "" {
-		mimeType = strings.TrimSpace(storedContentType)
-	}
-	if mimeType == "" {
-		ext := ""
-		if dot := strings.LastIndex(source.MediaURL, "."); dot >= 0 {
-			ext = strings.ToLower(source.MediaURL[dot:])
-		}
-		mimeType = getMimeTypeFromExtension(ext)
-	}
-	mediaPath, err = a.saveMessageMedia(ctx, orgID, data, mimeType, source.MediaFilename)
+	key, err := a.saveTenantMedia(
+		storageCtx,
+		plan.OrganizationID,
+		plan.ObjectSubdir,
+		plan.LocalSubdir,
+		plan.ObjectName,
+		data,
+		plan.MimeType,
+	)
 	if err != nil {
-		return nil, "", "", nil, fmt.Errorf("store forwarded media: %w", err)
+		return fmt.Errorf("store forwarded attachment: %w", err)
 	}
-	return data, mediaPath, mimeType, nil, nil
+	if key != plan.DestinationKey {
+		return errors.New("forwarded attachment was stored under an unexpected key")
+	}
+
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), forwardMediaUploadTimeout)
+	defer cancelUpload()
+	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, plan.MimeType, req.MediaFilename)
+	if err != nil {
+		return fmt.Errorf("failed to upload media: %w", err)
+	}
+	req.MediaID = mediaID
+	req.MediaData = nil
+	return nil
+}
+
+// outgoingSessionContext is the context of a request session, so a derived deadline
+// keeps the tenant and realtime values bound to it.
+func outgoingSessionContext(db *gorm.DB) context.Context {
+	if db != nil && db.Statement != nil && db.Statement.Context != nil {
+		return db.Statement.Context
+	}
+	return context.Background()
+}
+
+// forwardSessionApp is a read view of this request's session under ctx: the
+// same connection (the RLS request transaction when there is one), with a
+// deadline on every statement. The request App itself is left untouched, so
+// delivery started after commit never sees the deadline.
+func (a *App) forwardSessionApp(ctx context.Context) *App {
+	session := a.rootApp().scopedApp(a.DB.WithContext(ctx), a.tenantOrgID)
+	session.tenantOrgID = a.tenantOrgID
+	session.afterCommitScoped = a.afterCommitScoped
+	return session
 }
 
 // forwardMessage serves POST /api/contacts/{id}/messages with
@@ -2757,7 +2876,15 @@ func (a *App) forwardMessage(
 	orgID, userID, targetContactID uuid.UUID,
 	req *SendMessageRequest,
 ) error {
-	if !a.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
+	// This handler opens no transaction. Under RLS the Tenant route wrapper
+	// already owns one request transaction; every statement below runs on that
+	// one connection under one deadline, and storage or Meta I/O happens only
+	// after commit, in the delivery goroutine.
+	ctx, cancel := context.WithTimeout(outgoingSessionContext(a.DB), forwardRequestTimeout)
+	defer cancel()
+	session := a.forwardSessionApp(ctx)
+
+	if !session.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
 		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
 	}
 	sourceID, err := uuid.Parse(strings.TrimSpace(req.ForwardOfMessageID))
@@ -2771,7 +2898,7 @@ func (a *App) forwardMessage(
 			"A forward cannot also carry a reply, new text, or interactive content", nil, forwardErrorInvalid)
 	}
 
-	source, refusal, err := a.loadForwardSource(orgID, userID, sourceID)
+	source, refusal, err := session.loadForwardSource(orgID, userID, sourceID)
 	if err != nil {
 		a.Log.Error("Failed to load message to forward", "error", err, "organization_id", orgID)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to forward message", nil, "")
@@ -2781,15 +2908,15 @@ func (a *App) forwardMessage(
 	}
 
 	var contact models.Contact
-	targetQuery := a.scopeAssignedContact(
-		a.DB.Where("id = ? AND organization_id = ?", targetContactID, orgID),
+	targetQuery := session.scopeAssignedContact(
+		session.DB.Where("id = ? AND organization_id = ?", targetContactID, orgID),
 		userID,
 		orgID,
 	)
 	if err := targetQuery.First(&contact).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, forwardErrorTargetNotFound)
 	}
-	if refusal := a.checkForwardTarget(orgID, &contact, time.Now()); refusal != nil {
+	if refusal := session.checkForwardTarget(orgID, &contact, time.Now()); refusal != nil {
 		return refusal.send(r)
 	}
 
@@ -2797,7 +2924,7 @@ func (a *App) forwardMessage(
 	if req.WhatsAppAccount != "" {
 		accountName = req.WhatsAppAccount
 	}
-	account, err := a.resolveWhatsAppAccount(orgID, accountName)
+	account, err := session.resolveWhatsAppAccount(orgID, accountName)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Failed to resolve WhatsApp account", nil, forwardErrorAccountUnavailable)
 	}
@@ -2814,28 +2941,19 @@ func (a *App) forwardMessage(
 	if source.MessageType == models.MessageTypeText {
 		msgReq.Content = source.Content
 	} else {
-		data, mediaPath, mimeType, mediaRefusal, mediaErr := a.copyForwardMedia(orgID, source)
-		if mediaErr != nil {
-			a.Log.Error("Failed to copy media to forward", "error", mediaErr, "organization_id", orgID, "message_id", source.ID)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to forward message", nil, "")
-		}
-		if mediaRefusal != nil {
-			return mediaRefusal.send(r)
-		}
-		msgReq.MediaData = data
-		msgReq.MediaURL = mediaPath
-		msgReq.MediaMimeType = mimeType
+		plan := a.planForwardMedia(orgID, source)
+		msgReq.forwardMedia = plan
+		msgReq.MediaURL = plan.DestinationKey
+		msgReq.MediaMimeType = plan.MimeType
 		msgReq.MediaFilename = source.MediaFilename
 		if source.MessageType != models.MessageTypeAudio {
 			msgReq.Caption = source.Content
 		}
 	}
 
-	opts := DefaultSendOptions()
+	opts := DefaultSendOptions() // Async: provider delivery starts after commit.
 	opts.SentByUserID = &userID
 
-	ctx, cancel := context.WithTimeout(context.Background(), forwardPersistTimeout)
-	defer cancel()
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
 		a.Log.Error("Failed to forward message", "error", err, "organization_id", orgID, "source_message_id", source.ID)
@@ -2846,8 +2964,9 @@ func (a *App) forwardMessage(
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to forward message", nil, "")
 	}
 
-	// One entry per target, in the request's own transaction.
-	a.logAudit(orgID, userID, "message", message.ID, models.AuditActionCreated, nil, messageForwardAudit{
+	// One entry per target, written on the request's own session: inside the
+	// RLS request transaction, or as one bounded statement without RLS.
+	session.logAudit(orgID, userID, "message", message.ID, models.AuditActionCreated, nil, messageForwardAudit{
 		Operation:              "forwarded",
 		ForwardedFromMessageID: source.ID.String(),
 		ForwardedFromContactID: source.ContactID.String(),
@@ -2883,8 +3002,10 @@ func (a *App) attachMediaReplyPreview(orgID uuid.UUID, message *models.Message, 
 	response.IsReply = true
 	replyToID := message.ReplyToMessageID.String()
 	response.ReplyToMessageID = &replyToID
+	ctx, cancel := context.WithTimeout(outgoingSessionContext(a.DB), mediaReplyPreviewTimeout)
+	defer cancel()
 	var reply models.Message
-	if err := a.DB.Where(
+	if err := a.DB.WithContext(ctx).Where(
 		"id = ? AND organization_id = ? AND contact_id = ?",
 		*message.ReplyToMessageID,
 		orgID,
