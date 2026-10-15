@@ -273,8 +273,20 @@ func (a *App) Register(r *fastglue.Request) error {
 	})
 }
 
-// RefreshToken refreshes access token using refresh token with rotation.
-// The old refresh token is invalidated (single-use) and a new one is issued.
+// RefreshToken refreshes the access token using the refresh token, with
+// single-use rotation.
+//
+// Rotation is atomic (one Redis script consumes the old token and records the
+// grace entry), so a retry or a concurrent request that presents the same
+// token after it was rotated gets the pair it was exchanged for, never a 401
+// and never a second token chain. The grace entry stores only the successor's
+// JTI and timestamps, not a token, lasts until the successor is consumed or
+// revoked (at most 10 minutes), and is honoured only while the successor is
+// still live.
+//
+// A body of {"revoke": true} revokes the presented refresh token instead
+// (the logout path: the whm_refresh cookie is only sent to this route). It
+// requires the CSRF double-submit header.
 func (a *App) RefreshToken(r *fastglue.Request) error {
 	// Failures are logged with a reason code and the user ID only — never a
 	// token value. Definitive rejections answer 401, and the client ends the
@@ -289,71 +301,86 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(status, message, nil, "")
 	}
 
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+		Revoke       bool   `json:"revoke"`
+	}
+	_ = r.Decode(&body, "json")
+
 	// Read refresh token from cookie first, fall back to JSON body.
 	refreshTokenStr := string(r.RequestCtx.Request.Header.Cookie(cookieRefreshName))
 	if refreshTokenStr == "" {
-		var req RefreshRequest
-		_ = r.Decode(&req, "json")
-		refreshTokenStr = req.RefreshToken
-	}
-	if refreshTokenStr == "" {
-		return reject(fasthttp.StatusUnauthorized, "Missing refresh token", "missing_token", nil)
+		refreshTokenStr = body.RefreshToken
 	}
 
-	// Parse and validate refresh token
-	token, err := jwt.ParseWithClaims(
-		refreshTokenStr,
-		&middleware.JWTClaims{},
-		func(token *jwt.Token) (any, error) {
-			return []byte(a.Config.JWT.Secret), nil
-		},
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
-	)
-
-	if err != nil || !token.Valid {
-		return reject(fasthttp.StatusUnauthorized, "Invalid refresh token", "invalid_token", nil)
-	}
-
-	claims, ok := token.Claims.(*middleware.JWTClaims)
-	if !ok || !middleware.IsRefreshJWTClaims(claims) {
-		return reject(fasthttp.StatusUnauthorized, "Invalid token claims", "invalid_claims", nil)
+	parseRefresh := func() (*middleware.JWTClaims, bool) {
+		token, err := jwt.ParseWithClaims(
+			refreshTokenStr,
+			&middleware.JWTClaims{},
+			func(token *jwt.Token) (any, error) {
+				return []byte(a.Config.JWT.Secret), nil
+			},
+			jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		)
+		if err != nil || !token.Valid {
+			return nil, false
+		}
+		claims, ok := token.Claims.(*middleware.JWTClaims)
+		return claims, ok
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Rotation grace: for 30 seconds after a rotation, the consumed token maps
-	// to the pair it was exchanged for. A client whose refresh response was
-	// lost (proxy 504, dropped connection) still holds the old cookie; replaying
-	// it within the window returns that same pair instead of revoking the
-	// session. It never mints a second token chain.
-	graceKey := "refresh_grace:" + claims.ID
-	graceAccess, graceRefresh := "", ""
-	exists, err := a.Redis.Exists(ctx, refreshTokenKey(claims.ID)).Result()
+	if body.Revoke {
+		// The refresh route is exempt from the CSRF middleware, so the revoke
+		// variant checks the double-submit token itself: a cross-site page
+		// must not be able to sign the user out.
+		csrfCookie := string(r.RequestCtx.Request.Header.Cookie(cookieCSRFName))
+		csrfHeader := string(r.RequestCtx.Request.Header.Peek("X-CSRF-Token"))
+		if csrfCookie == "" || csrfHeader == "" || csrfCookie != csrfHeader {
+			return reject(fasthttp.StatusForbidden, "CSRF token mismatch", "revoke_csrf_mismatch", nil)
+		}
+		if claims, ok := parseRefresh(); ok && claims.ID != "" {
+			if err := a.revokeRefreshChain(ctx, claims.ID); err != nil {
+				a.clearAuthCookies(r)
+				return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "revoke_store_unavailable", claims.UserID)
+			}
+			a.Log.Info("Refresh token revoked", "reason", "logout", "user_id", claims.UserID)
+		}
+		a.clearAuthCookies(r)
+		return r.SendEnvelope(map[string]string{"status": "revoked"})
+	}
+
+	if refreshTokenStr == "" {
+		return reject(fasthttp.StatusUnauthorized, "Missing refresh token", "missing_token", nil)
+	}
+	claims, ok := parseRefresh()
+	if !ok {
+		return reject(fasthttp.StatusUnauthorized, "Invalid refresh token", "invalid_token", nil)
+	}
+	if !middleware.IsRefreshJWTClaims(claims) {
+		return reject(fasthttp.StatusUnauthorized, "Invalid token claims", "invalid_claims", nil)
+	}
+
+	oldKey := refreshTokenKey(claims.ID)
+	graceKey := refreshGraceKey(claims.ID)
+
+	// Neither the token nor a grace entry left: revoked or long since used.
+	live, err := a.Redis.Exists(ctx, oldKey, graceKey).Result()
 	if err != nil {
 		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "session_store_unavailable", claims.UserID)
 	}
-	if exists == 0 {
-		pair := a.Redis.Get(ctx, graceKey).Val()
-		for i := 0; i < len(pair); i++ {
-			if pair[i] == ' ' {
-				graceAccess, graceRefresh = pair[:i], pair[i+1:]
-				break
-			}
-		}
-		if graceAccess == "" || graceRefresh == "" {
-			// Token was already used (outside the grace window) or revoked
-			return reject(fasthttp.StatusUnauthorized, "Refresh token has been revoked", "revoked_or_reused", claims.UserID)
-		}
+	if live == 0 {
+		return reject(fasthttp.StatusUnauthorized, "Refresh token has been revoked", "revoked_or_reused", claims.UserID)
 	}
-	inGrace := graceRefresh != ""
 
-	// A definitive rejection still consumes the credential so it cannot be
-	// replayed.
+	// A definitive rejection revokes the credential and anything it was
+	// already rotated into, so it cannot be replayed.
 	consume := func() {
-		consumeCtx, consumeCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer consumeCancel()
-		a.Redis.Del(consumeCtx, refreshTokenKey(claims.ID), graceKey)
+		revokeCtx, revokeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer revokeCancel()
+		_ = a.revokeRefreshChain(revokeCtx, claims.ID)
 	}
 
 	// Get user
@@ -375,53 +402,188 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		if err != gorm.ErrRecordNotFound && err != database.ErrPlatformComplianceTenant {
 			return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
 		}
+		// The reseller-membership check reports a database error as "not a
+		// member". Only treat the membership as gone while the database
+		// answers; otherwise the user stays signed in and retries.
+		if err == gorm.ErrRecordNotFound && a.DB.WithContext(ctx).Exec("SELECT 1").Error != nil {
+			return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
+		}
 		consume()
 		return reject(fasthttp.StatusUnauthorized, "Organization access is no longer available", "membership_revoked", claims.UserID)
 	}
 
-	if inGrace {
-		a.Log.Info("Token refresh replayed within rotation grace", "reason", "rotation_grace", "user_id", claims.UserID)
-		a.setAuthCookies(r, graceAccess, graceRefresh)
+	// Mint and register the successor before the old token is consumed. If
+	// it cannot be registered, the old token stays valid and the client
+	// retries; a token the server never registered is never handed out.
+	now := time.Now()
+	successorJTI := uuid.New().String()
+	successorExpiry := now.Add(time.Duration(a.Config.JWT.RefreshExpiryDays) * 24 * time.Hour)
+	successorKey := refreshTokenKey(successorJTI)
+	if err := a.Redis.Set(ctx, successorKey, user.ID.String(), successorExpiry.Sub(now)).Err(); err != nil {
+		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "successor_store_failed", claims.UserID)
+	}
+	dropSuccessor := func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer dropCancel()
+		a.Redis.Del(dropCtx, successorKey, refreshGraceFromKey(successorJTI))
+	}
+
+	// Atomically consume the old token and record the grace entry; if the
+	// old token is already gone, read the grace entry instead.
+	rotation, err := a.Redis.Eval(ctx, `
+if redis.call('DEL', KEYS[1]) == 1 then
+  local previous = redis.call('GET', KEYS[3])
+  if previous then redis.call('DEL', 'refresh_grace:' .. previous) end
+  redis.call('DEL', KEYS[3])
+  redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+  redis.call('SET', KEYS[4], ARGV[3], 'EX', ARGV[2])
+  return 'W'
+end
+local grace = redis.call('GET', KEYS[2])
+if grace then return 'G' .. grace end
+return 'N'`,
+		[]string{oldKey, graceKey, refreshGraceFromKey(claims.ID), refreshGraceFromKey(successorJTI)},
+		fmt.Sprintf("%s|%d|%d", successorJTI, now.Unix(), successorExpiry.Unix()),
+		int((10 * time.Minute).Seconds()),
+		claims.ID,
+	).Text()
+	if err != nil {
+		dropSuccessor()
+		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "rotation_store_failed", claims.UserID)
+	}
+
+	if rotation == "W" {
+		newRefreshToken, err := a.signRefreshToken(&user, successorJTI, now, successorExpiry)
+		if err != nil {
+			a.Log.Error("Failed to generate refresh token", "error", err)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		}
+		accessToken, err := a.generateAccessToken(&user)
+		if err != nil {
+			a.Log.Error("Failed to generate access token", "error", err)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		}
+		a.setAuthCookies(r, accessToken, newRefreshToken)
 		return r.SendEnvelope(CookieAuthResponse{
 			ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
 			User:      user,
 		})
 	}
 
-	// Validate JTI in Redis (single-use: delete on consumption)
-	deleted, err := a.Redis.Del(ctx, refreshTokenKey(claims.ID)).Result()
-	if err != nil {
-		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "session_store_unavailable", claims.UserID)
+	// Another request rotated this token first: this request's successor is
+	// an orphan, and the client gets the pair the token was exchanged for.
+	dropSuccessor()
+	grace := ""
+	if len(rotation) > 1 && rotation[0] == 'G' {
+		grace = rotation[1:]
 	}
-	if deleted == 0 {
-		// A concurrent refresh consumed the same token first.
+	// A rotation in flight elsewhere may not have recorded its grace entry
+	// yet: re-read briefly before concluding the token was revoked.
+	for attempt := 0; grace == "" && attempt < 6; attempt++ {
+		time.Sleep(250 * time.Millisecond)
+		grace, err = a.Redis.Eval(ctx, `return redis.call('GET', KEYS[1]) or ''`, []string{graceKey}).Text()
+		if err != nil {
+			return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "grace_store_unavailable", claims.UserID)
+		}
+	}
+	graceJTI, graceIssuedAt, graceExpiry, ok := parseRefreshGrace(grace)
+	if !ok {
 		return reject(fasthttp.StatusUnauthorized, "Refresh token has been revoked", "revoked_or_reused", claims.UserID)
 	}
-
-	// Generate new tokens (rotation: new refresh token with new JTI)
+	// The grace entry is honoured only while its successor is still live;
+	// logout or the successor's own rotation closes it.
+	successorLive, err := a.Redis.Exists(ctx, refreshTokenKey(graceJTI)).Result()
+	if err != nil {
+		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "grace_store_unavailable", claims.UserID)
+	}
+	if successorLive == 0 {
+		a.Redis.Del(ctx, graceKey)
+		return reject(fasthttp.StatusUnauthorized, "Refresh token has been revoked", "revoked_or_reused", claims.UserID)
+	}
+	graceRefreshToken, err := a.signRefreshToken(&user, graceJTI, graceIssuedAt, graceExpiry)
+	if err != nil {
+		a.Log.Error("Failed to generate refresh token", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+	}
 	accessToken, err := a.generateAccessToken(&user)
 	if err != nil {
 		a.Log.Error("Failed to generate access token", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
 	}
-	newRefreshToken, err := a.generateRefreshToken(&user)
-	if err != nil {
-		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
-	}
-
-	graceCtx, graceCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer graceCancel()
-	if err := a.Redis.Set(graceCtx, graceKey, accessToken+" "+newRefreshToken, 30*time.Second).Err(); err != nil {
-		a.Log.Warn("Failed to record refresh rotation grace", "reason", "grace_store_failed", "user_id", claims.UserID)
-	}
-
-	a.setAuthCookies(r, accessToken, newRefreshToken)
-
+	a.Log.Info("Token refresh replayed within rotation grace", "reason", "rotation_grace", "user_id", claims.UserID)
+	a.setAuthCookies(r, accessToken, graceRefreshToken)
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
 		User:      user,
 	})
+}
+
+// refreshGraceKey returns the Redis key that maps a rotated refresh token's
+// JTI to its successor ("<jti>|<issued unix>|<expiry unix>").
+func refreshGraceKey(jti string) string {
+	return "refresh_grace:" + jti
+}
+
+// refreshGraceFromKey returns the Redis key that maps a refresh token's JTI to
+// the JTI it was rotated from, so rotating it can close that grace entry.
+func refreshGraceFromKey(jti string) string {
+	return "refresh_grace_from:" + jti
+}
+
+// parseRefreshGrace parses a grace entry written by RefreshToken.
+func parseRefreshGrace(value string) (jti string, issuedAt, expiresAt time.Time, ok bool) {
+	for i := 0; i < len(value); i++ {
+		if value[i] != '|' {
+			continue
+		}
+		var issuedUnix, expiryUnix int64
+		if n, err := fmt.Sscanf(value[i+1:], "%d|%d", &issuedUnix, &expiryUnix); err != nil || n != 2 {
+			return "", time.Time{}, time.Time{}, false
+		}
+		if _, err := uuid.Parse(value[:i]); err != nil {
+			return "", time.Time{}, time.Time{}, false
+		}
+		return value[:i], time.Unix(issuedUnix, 0), time.Unix(expiryUnix, 0), true
+	}
+	return "", time.Time{}, time.Time{}, false
+}
+
+// signRefreshToken signs a refresh token for jti without registering it.
+// HMAC signing is deterministic, so the same claims give the same token.
+func (a *App) signRefreshToken(user *models.User, jti string, issuedAt, expiresAt time.Time) (string, error) {
+	claims := middleware.JWTClaims{
+		UserID:         user.ID,
+		OrganizationID: user.OrganizationID,
+		Email:          user.Email,
+		RoleID:         user.RoleID,
+		IsSuperAdmin:   user.IsSuperAdmin,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        jti,
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
+			IssuedAt:  jwt.NewNumericDate(issuedAt),
+			Issuer:    "whatomate",
+			Subject:   middleware.JWTSubjectRefresh,
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(a.Config.JWT.Secret))
+}
+
+// revokeRefreshChain revokes a refresh token JTI together with the successor
+// it may already have been rotated into, and closes the grace entries that
+// point to or from it.
+func (a *App) revokeRefreshChain(ctx context.Context, jti string) error {
+	return a.Redis.Eval(ctx, `
+local grace = redis.call('GET', KEYS[2])
+if grace then
+  local successor = string.match(grace, '^([^|]+)')
+  if successor then redis.call('DEL', 'refresh:' .. successor, 'refresh_grace_from:' .. successor) end
+end
+local previous = redis.call('GET', KEYS[3])
+if previous then redis.call('DEL', 'refresh_grace:' .. previous) end
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
+return 1`,
+		[]string{refreshTokenKey(jti), refreshGraceKey(jti), refreshGraceFromKey(jti)},
+	).Err()
 }
 
 // applyOrganizationMembership updates a user with the current organization and

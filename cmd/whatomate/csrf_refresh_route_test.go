@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/middleware"
+	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -53,12 +55,10 @@ func laneAInvoke(
 	return ctx
 }
 
-// TestCSRFExemptsTokenRefreshThroughMiddlewareChain is the regression test
-// for the silent-refresh logout: a refresh that carries a live whm_access
-// cookie (path /api covers /api/auth/refresh) but no X-CSRF-Token header must
-// not be rejected by the CSRF middleware, while other mutating cookie-auth
-// requests still are.
-func TestCSRFExemptsTokenRefreshThroughMiddlewareChain(t *testing.T) {
+// laneARouteStack builds the production middleware chain (security headers,
+// recovery, CSRF) and routes over the test database and Redis, then signs in.
+func laneARouteStack(t *testing.T) (*fastglue.Fastglue, *redis.Client, *models.Organization, laneACookieJar) {
+	t.Helper()
 	db := testutil.SetupTestDB(t)
 	rdb := testutil.SetupTestRedis(t)
 	if rdb == nil {
@@ -104,6 +104,16 @@ func TestCSRFExemptsTokenRefreshThroughMiddlewareChain(t *testing.T) {
 	require.NotEmpty(t, jar["whm_access"])
 	require.NotEmpty(t, jar["whm_refresh"])
 	require.NotEmpty(t, jar["whm_csrf"])
+	return g, rdb, org, jar
+}
+
+// TestCSRFExemptsTokenRefreshThroughMiddlewareChain is the regression test
+// for the silent-refresh logout: a refresh that carries a live whm_access
+// cookie (path /api covers /api/auth/refresh) but no X-CSRF-Token header must
+// not be rejected by the CSRF middleware, while other mutating cookie-auth
+// requests still are.
+func TestCSRFExemptsTokenRefreshThroughMiddlewareChain(t *testing.T) {
+	g, _, org, jar := laneARouteStack(t)
 
 	// Control: another mutating cookie-auth request without the header is
 	// still rejected, so the middleware is active in this chain.
@@ -131,4 +141,40 @@ func TestCSRFExemptsTokenRefreshThroughMiddlewareChain(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(refresh.Response.Body(), &envelope))
 	assert.Equal(t, 15*60, envelope.Data.ExpiresIn)
+}
+
+// TestRefreshRevokeThroughMiddlewareChain covers the logout revocation: the
+// whm_refresh cookie only reaches /api/auth/refresh, so logout revokes the
+// refresh token there, behind the double-submit CSRF check.
+func TestRefreshRevokeThroughMiddlewareChain(t *testing.T) {
+	g, _, _, jar := laneARouteStack(t)
+	cookies := map[string]string{
+		"whm_access":  jar["whm_access"],
+		"whm_refresh": jar["whm_refresh"],
+		"whm_csrf":    jar["whm_csrf"],
+	}
+	revokeBody := map[string]any{"revoke": true}
+
+	// Without the header (a cross-site form post) nothing is revoked.
+	forged := laneAInvoke(g, fasthttp.MethodPost, "/api/auth/refresh", cookies, nil, revokeBody)
+	require.Equal(t, fasthttp.StatusForbidden, forged.Response.StatusCode(), string(forged.Response.Body()))
+	stillValid := laneAInvoke(g, fasthttp.MethodPost, "/api/auth/refresh", cookies, nil, map[string]any{})
+	require.Equal(t, fasthttp.StatusOK, stillValid.Response.StatusCode(), string(stillValid.Response.Body()))
+	jar.absorb(t, stillValid)
+	cookies = map[string]string{
+		"whm_access":  jar["whm_access"],
+		"whm_refresh": jar["whm_refresh"],
+		"whm_csrf":    jar["whm_csrf"],
+	}
+
+	revoke := laneAInvoke(g, fasthttp.MethodPost, "/api/auth/refresh", cookies,
+		map[string]string{"X-CSRF-Token": jar["whm_csrf"]}, revokeBody)
+	require.Equal(t, fasthttp.StatusOK, revoke.Response.StatusCode(), string(revoke.Response.Body()))
+	revoked := laneACookieJar{}
+	revoked.absorb(t, revoke)
+	assert.Empty(t, revoked["whm_refresh"], "the refresh cookie is cleared")
+
+	// The revoked token no longer refreshes, even replayed.
+	replay := laneAInvoke(g, fasthttp.MethodPost, "/api/auth/refresh", cookies, nil, map[string]any{})
+	assert.Equal(t, fasthttp.StatusUnauthorized, replay.Response.StatusCode(), string(replay.Response.Body()))
 }
