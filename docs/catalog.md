@@ -52,12 +52,12 @@ export key values, tenant counts or business records.
 ## Migration planner owner sessions
 
 The `rls-migrate` planner and data gates observe the native migration owner
-already held by the coordinator. A managed owner with `CREATEROLE` or
-`BYPASSRLS` must own the current database and remain a non-superuser without
-replication privileges. This supersedes the earlier planner design's
-non-`BYPASSRLS` owner precondition and the implementation's additional
-`NOCREATEROLE` restriction. Restricted schema/table owners retain their existing
-observation path, including when they do not own the database.
+already held by the coordinator. A managed owner with `CREATEROLE`,
+`BYPASSRLS` or `REPLICATION` must own the current database and remain a
+non-superuser. The session must retain `session_replication_role=origin`;
+replication capability does not authorize changing that setting. Restricted
+schema/table owners retain their existing observation path, including when
+they do not own the database.
 
 Seed observation through `ObservePlanSeedsOnHeldOwner` independently checks the
 coordinator's exact PID, database and role identity, canonical nonce marker,
@@ -67,7 +67,8 @@ connection and verify its native identity and lock. Missing or ambiguous
 witnesses remain incomplete observations.
 
 The separate runtime role retains its strict privilege and visibility checks.
-The generic `ObservePlanSeeds` API still rejects `CREATEROLE` and `BYPASSRLS`.
+The generic `ObservePlanSeeds` API still rejects `CREATEROLE`, `BYPASSRLS`
+and `REPLICATION`.
 Read-only transactions, table ownership, grants, canonical tenant policies,
 timeouts and connection cleanup remain required. Observation changes no data,
 roles, grants, schema or seed state; it grants no mutation or release authority.
