@@ -944,8 +944,8 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 	if !settings.IsEnabled {
 		a.Log.Debug("Chatbot not enabled for this account, creating transfer for agent queue", "account", account.Name, "settings_id", settings.ID)
-		// H1: answer out of hours here so a failed reply is retried (createTransferToQueue
-		// discards that send error, agent_transfers.go:1488), and hand over only within hours.
+		// H1: decide and send the out-of-hours reply here, before the handover, so a
+		// failed reply is retried; hand over only within hours.
 		if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 &&
 			!a.isWithinBusinessHours(settings.BusinessHours.Hours) {
 			a.Log.Info("Outside business hours, sending out-of-hours message instead of queue transfer", "contact_id", contact.ID, "source", models.TransferSourceChatbotDisabled)
@@ -956,17 +956,11 @@ func (a *App) continuePersistedIncomingMessage(
 			}
 			return nil
 		}
-		// Create transfer to agent queue when chatbot is disabled
-		a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled)
-		// H1: createTransferToQueue logs and discards saveAndFinalizeTransfer errors
-		// (agent_transfers.go:1505-1511) and that phase now has a bounded wait. Never
-		// complete the continuation without the handover: retry instead. The cause is
-		// not visible here; its likeliest source is exactly that bounded wait (this is
-		// the agent-only path that wedged production), so label it as congestion and let
-		// p.fail refund the attempt. Its 16-deferral cap still bounds a deterministic
-		// transfer failure (it was logged by createTransferToQueue).
-		if !a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-			return fmt.Errorf("wedge guard: chatbot-disabled queue transfer was not committed (presumed pool or lock congestion; see the logged transfer error); retrying continuation: %w", context.DeadlineExceeded)
+		// Create transfer to agent queue when chatbot is disabled.
+		// H1: consume the handover's actual error: a bounded pool wait is still a refunded
+		// "wedge guard" deferral in p.fail; any other failure retries as an ordinary attempt.
+		if _, err := a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled, nil); err != nil {
+			return fmt.Errorf("create chatbot-disabled queue transfer: %w", err)
 		}
 		return nil
 	}

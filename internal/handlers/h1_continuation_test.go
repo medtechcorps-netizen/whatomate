@@ -320,7 +320,9 @@ func h1ChatbotDisabledFixture(t *testing.T, hours models.BusinessHoursConfig) (
 }
 
 // The chatbot-disabled handover no longer completes the continuation when
-// the transfer phase failed (createTransferToQueue swallows that error).
+// the transfer phase failed: createTransferToQueue returns its actual error,
+// so a bounded pool wait stays a refunded "wedge guard" deferral and any other
+// failure is retried as an ordinary (counted) attempt.
 func TestInboundContinuation_ChatbotDisabledTransferFailureRetries(t *testing.T) {
 	t.Run("transfer_insert_failure_is_retried", func(t *testing.T) {
 		app, shared, organization, work := h1ChatbotDisabledFixture(t, models.BusinessHoursConfig{})
@@ -331,18 +333,46 @@ func TestInboundContinuation_ChatbotDisabledTransferFailureRetries(t *testing.T)
 		processor.now = func() time.Time { return baseTime }
 
 		err := processor.ProcessMessage(context.Background(), organization.ID, work.Persisted.ID)
-		require.ErrorContains(t, err, "chatbot-disabled queue transfer was not committed")
-		// The swallowed transfer error is presumed congestion (the bounded transfer
-		// phase): a refunded deferral, so agent-only orgs cannot exhaust MaxAttempts.
-		h1RequireWedgeGuard(t, err)
+		require.ErrorContains(t, err, "create chatbot-disabled queue transfer")
+		require.ErrorContains(t, err, "h1 synthetic transfer insert failure")
+		// The actual (non-deadline) transfer error is returned: an ordinary attempt,
+		// never relabelled as congestion.
+		assert.NotContains(t, err.Error(), "wedge guard")
+		assert.NotErrorIs(t, err, context.DeadlineExceeded)
 		job := loadInboundContinuationJob(t, &App{DB: shared}, organization.ID, work.Persisted.ID)
 		assert.Equal(t, models.ScheduledJobStatusPending, job.Status)
-		assert.Equal(t, 0, job.Attempts, "a handover post-check failure is a refunded deferral")
-		deferrals, _ := inboundContinuationExactInteger(job.Payload["wedge_guard_deferrals"])
-		assert.Equal(t, 1, deferrals)
+		assert.Equal(t, 1, job.Attempts, "a real handover failure consumes its attempt")
+		assert.Equal(t, 0, h1JobDeferrals(job))
 		assert.Zero(t, h1ActiveTransfers(t, shared, organization.ID, work.Contact.ID))
 
 		require.NoError(t, app.DB.Callback().Create().Remove("h1:fail_first_transfer"))
+		processor.now = func() time.Time { return baseTime.Add(2 * time.Second) }
+		require.NoError(t, processor.ProcessMessage(context.Background(), organization.ID, work.Persisted.ID))
+		job = loadInboundContinuationJob(t, &App{DB: shared}, organization.ID, work.Persisted.ID)
+		assert.Equal(t, models.ScheduledJobStatusCompleted, job.Status)
+		assert.EqualValues(t, 1, h1ActiveTransfers(t, shared, organization.ID, work.Contact.ID))
+	})
+
+	t.Run("transfer_wedge_guard_is_refunded", func(t *testing.T) {
+		app, shared, organization, work := h1ChatbotDisabledFixture(t, models.BusinessHoursConfig{})
+		h1FailFirstCreate(t, app.DB, "h1:fail_first_transfer_wedge", h1IsAgentTransferCreate,
+			h1SyntheticWedge("handover insert"))
+		baseTime := time.Now().UTC()
+		processor := NewInboundContinuationProcessor(app, time.Second)
+		processor.now = func() time.Time { return baseTime }
+
+		err := processor.ProcessMessage(context.Background(), organization.ID, work.Persisted.ID)
+		require.ErrorContains(t, err, "create chatbot-disabled queue transfer")
+		// A bounded pool wait keeps its wedge-guard identity through the returned
+		// error: a refunded deferral, so agent-only orgs cannot exhaust MaxAttempts.
+		h1RequireWedgeGuard(t, err)
+		job := loadInboundContinuationJob(t, &App{DB: shared}, organization.ID, work.Persisted.ID)
+		assert.Equal(t, models.ScheduledJobStatusPending, job.Status)
+		assert.Equal(t, 0, job.Attempts, "a wedge-guard handover failure is a refunded deferral")
+		assert.Equal(t, 1, h1JobDeferrals(job))
+		assert.Zero(t, h1ActiveTransfers(t, shared, organization.ID, work.Contact.ID))
+
+		require.NoError(t, app.DB.Callback().Create().Remove("h1:fail_first_transfer_wedge"))
 		processor.now = func() time.Time { return baseTime.Add(2 * time.Second) }
 		require.NoError(t, processor.ProcessMessage(context.Background(), organization.ID, work.Persisted.ID))
 		job = loadInboundContinuationJob(t, &App{DB: shared}, organization.ID, work.Persisted.ID)

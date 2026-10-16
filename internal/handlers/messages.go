@@ -1807,7 +1807,12 @@ func (a *App) finalizeMessageSend(
 				readWait = 2 * time.Second
 			}
 			var afterCommit []func()
-			err := a.withBoundedRootConnection(nil, readWait, func(db *gorm.DB) error {
+			// The root pool's own context, as in WithTenantApp (never a nil Context).
+			rootCtx := context.Background()
+			if root.DB != nil && root.DB.Statement != nil && root.DB.Statement.Context != nil {
+				rootCtx = root.DB.Statement.Context
+			}
+			err := a.withBoundedRootConnection(rootCtx, readWait, func(db *gorm.DB) error {
 				if orgID == uuid.Nil {
 					return database.ErrMissingTenant
 				}

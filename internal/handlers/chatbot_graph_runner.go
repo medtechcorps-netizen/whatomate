@@ -53,8 +53,9 @@ type chatNodeCtx struct {
 type nodeOutcome struct {
 	outcome string
 	yield   bool
-	// finalized means this terminal node committed its exact session before
-	// a handover; the runner must not write that terminal session a second time.
+	// finalized means this terminal node committed its exact session atomically
+	// with its handover (or after an intentional business-hours decline); the
+	// runner must not write that terminal session a second time.
 	finalized bool
 }
 
@@ -1073,7 +1074,9 @@ func (a *App) execChatAIResponseDurable(
 // queue. Optionally sends a body message first (e.g. "Connecting you to
 // an agent…"), then creates the transfer row via the same helpers the
 // legacy flow uses (createTransferToTeam / createTransferToQueue, source
-// = TransferSourceFlow), and marks the session completed.
+// = TransferSourceFlow). The session is completed atomically with that
+// handover (or after an intentional business-hours decline); the caller's
+// session is published only after that commit.
 //
 // Terminal: returns yield=true so the runner stops and persists. No
 // outgoing edges are expected on this node.
@@ -1086,6 +1089,15 @@ func (a *App) execChatAIResponseDurable(
 //	  "notes":   "Last seen {{last_query}}"      // optional; templated
 //	}
 func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, error) {
+	// H1: the handover writes in the account's organization. Never send the body for,
+	// or complete, a session or contact of another organization.
+	if ctx.account == nil || ctx.contact == nil || ctx.session == nil {
+		return nodeOutcome{}, errors.New("transfer node requires an account, contact and session")
+	}
+	if ctx.session.OrganizationID != ctx.account.OrganizationID ||
+		(ctx.contact.OrganizationID != uuid.Nil && ctx.contact.OrganizationID != ctx.account.OrganizationID) {
+		return nodeOutcome{}, errors.New("transfer node: chatbot session, contact and account organizations differ")
+	}
 	if body := stringFromConfig(node.Config, "body", "message", "text"); body != "" {
 		message := processTemplate(body, ctx.session.SessionData)
 		if err := a.sendAndSaveTextMessage(ctx.account, ctx.contact, message); err != nil {
@@ -1107,40 +1119,72 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 		notes = processTemplate(rawNotes, ctx.session.SessionData)
 	}
 
-	// Complete only the session this runner still owns, before the handover
-	// cancels other active sessions. This is a short committed phase: keeping
-	// its row lock in the outer continuation transaction would deadlock the
-	// handover's independent organization/contact/session transaction.
-	appendChatPath(ctx.session, node, "")
-	ctx.session.Status = models.SessionStatusCompleted
-	if err := a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
-		return database.WithTenantReadCommitted(
-			db,
-			ctx.session.OrganizationID,
-			func(tx *gorm.DB) error {
+	// H1: stage the terminal checkpoint on a copy and commit it atomically with the
+	// handover (or after an intentional business-hours decline). Until then the caller's
+	// session is untouched, so runChatGraph's error path persists the original active
+	// checkpoint and a retry replays this node at the same visit ordinal (the body is
+	// replayed from the action ledger, never resent).
+	var completed *models.ChatbotSession
+	completeOwned := func(tx *gorm.DB) error {
+		completed = nil
+		if ctx.session.OrganizationID != ctx.account.OrganizationID {
+			return errors.New("transfer node: chatbot session organization does not match the handover")
+		}
+		// Rebuilt from the untouched checkpoint on every canonical-write attempt:
+		// persistChatSessionState advances LastActivityAt/CompletedAt before commit.
+		staged := *ctx.session
+		staged.SessionData = maps.Clone(ctx.session.SessionData)
+		if path, ok := staged.SessionData["__path__"].([]any); ok {
+			staged.SessionData["__path__"] = append([]any(nil), path...)
+		}
+		appendChatPath(&staged, node, "")
+		staged.Status = models.SessionStatusCompleted
+		// Exact owned-session CAS on this transaction only: never persistChatSession (its
+		// booking branch opens an independent transaction). This scoped App queues nothing.
+		if err := a.scopedApp(tx, staged.OrganizationID).persistChatSessionState(&staged); err != nil {
+			return err
+		}
+		completed = &staged
+		return nil
+	}
+	var handedOver bool
+	var err error
+	teamIDStr := stringFromConfig(node.Config, "team_id")
+	if teamIDStr != "" && teamIDStr != "_general" {
+		if parsed, parseErr := uuid.Parse(teamIDStr); parseErr == nil {
+			handedOver, err = a.createTransferToTeam(ctx.account, ctx.contact, parsed, notes, models.TransferSourceFlow, completeOwned)
+		} else {
+			a.Log.Warn("transfer node has invalid team_id, falling back to queue",
+				"node", node.ID, "team_id", teamIDStr, "error", parseErr)
+			handedOver, err = a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow, completeOwned)
+		}
+	} else {
+		handedOver, err = a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow, completeOwned)
+	}
+	if err != nil {
+		// Nothing committed. A bounded pool wait keeps its wedge-guard/DeadlineExceeded
+		// identity for p.fail; lost ownership stays a policy stop.
+		return nodeOutcome{}, fmt.Errorf("transfer node handover: %w", err)
+	}
+	if !handedOver {
+		// Intentional business-hours decline; its reply (if any) succeeded.
+		if err := a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+			return database.WithTenantReadCommitted(db, ctx.session.OrganizationID, func(tx *gorm.DB) error {
 				if err := requireOrdinaryTenantOrganization(tx, ctx.session.OrganizationID); err != nil {
 					return err
 				}
-				return a.scopedApp(tx, ctx.session.OrganizationID).persistChatSession(ctx.session)
-			},
-		)
-	}); err != nil {
-		return nodeOutcome{}, err
-	}
-
-	teamIDStr := stringFromConfig(node.Config, "team_id")
-	if teamIDStr != "" && teamIDStr != "_general" {
-		if parsed, err := uuid.Parse(teamIDStr); err == nil {
-			a.createTransferToTeam(ctx.account, ctx.contact, parsed, notes, models.TransferSourceFlow)
-		} else {
-			a.Log.Warn("transfer node has invalid team_id, falling back to queue",
-				"node", node.ID, "team_id", teamIDStr, "error", err)
-			a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow)
+				return completeOwned(tx)
+			})
+		}); err != nil {
+			return nodeOutcome{}, err
 		}
-	} else {
-		a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow)
 	}
-
+	// Read `completed` only after a nil error: a rolled-back canonical-write attempt can
+	// leave an earlier staged copy behind before a later attempt fails.
+	if completed == nil {
+		return nodeOutcome{}, errors.New("transfer node handover committed without completing its owned session")
+	}
+	*ctx.session = *completed // publish only after commit
 	return nodeOutcome{yield: true, finalized: true}, nil
 }
 

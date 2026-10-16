@@ -1274,7 +1274,12 @@ func (a *App) UpdateContactChatbotMessage(contactID uuid.UUID) {
 		if a.inboundContinuation.attemptGuarded {
 			trackingWait = 2 * time.Second
 		}
-		if err := a.withBoundedRootConnection(nil, trackingWait, func(db *gorm.DB) error {
+		// The root pool's own context, as in WithTenantApp (never a nil Context).
+		rootCtx := context.Background()
+		if root := a.rootApp(); root != nil && root.DB != nil && root.DB.Statement != nil && root.DB.Statement.Context != nil {
+			rootCtx = root.DB.Statement.Context
+		}
+		if err := a.withBoundedRootConnection(rootCtx, trackingWait, func(db *gorm.DB) error {
 			if orgID == uuid.Nil {
 				return database.ErrMissingTenant
 			}
