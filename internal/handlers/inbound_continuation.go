@@ -941,8 +941,9 @@ func (a *App) runInboundContinuationSendGuarded(
 
 	if claim != nil && claim.Key != "" {
 		// The metadata marker is useful for operators, but the separately
-		// committed action ledger is the replay authority. Keep the marker in
-		// the current tenant transaction so it commits with the Message.
+		// committed action ledger is the replay authority. H1: the marker
+		// commits in its own short transaction, never on the continuation
+		// transaction (see markInboundContinuationAction).
 		if markerErr := a.markInboundContinuationAction(
 			message.ID,
 			claim.Key,
@@ -1780,7 +1781,7 @@ func (a *App) markInboundContinuationAction(
 		return nil
 	}
 	organizationID := a.inboundContinuationOrganizationID()
-	return a.DB.Transaction(func(tx *gorm.DB) error {
+	mark := func(tx *gorm.DB) error {
 		var message models.Message
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where(
@@ -1805,6 +1806,33 @@ func (a *App) markInboundContinuationAction(
 		return tx.Model(&models.Message{}).
 			Where("id = ? AND organization_id = ?", messageID, organizationID).
 			Update("metadata", metadata).Error
+	}
+	// H1: commit this operator marker in its own short transaction, never on the
+	// continuation transaction. A FOR UPDATE lock on the independently committed
+	// response, held until the continuation commits, inverts the global
+	// contact-then-message order: a status receipt for this response locks the contact
+	// and waits for the row, and a later handover or send of this same continuation then
+	// waits for that contact while the continuation waits for it in Go (a cycle
+	// PostgreSQL cannot see). The marker is best effort (its caller only logs) and the
+	// action ledger stays the replay authority, so inside the AI-attempt fence it waits
+	// at most 2s for a connection, like the other best-effort writes there.
+	markWait := time.Duration(0) // derived: 15s nested
+	if execution.attemptGuarded {
+		markWait = 2 * time.Second
+	}
+	// The root pool's own context, as in WithTenantApp (never a nil Context).
+	rootCtx := context.Background()
+	if root := a.rootApp(); root != nil && root.DB != nil && root.DB.Statement != nil && root.DB.Statement.Context != nil {
+		rootCtx = root.DB.Statement.Context
+	}
+	return a.withBoundedRootConnection(rootCtx, markWait, func(db *gorm.DB) error {
+		if organizationID == uuid.Nil {
+			return database.ErrMissingTenant
+		}
+		if a.rlsEnabled() {
+			return database.WithTenant(db, organizationID, mark)
+		}
+		return db.Transaction(mark)
 	})
 }
 

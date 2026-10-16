@@ -1360,6 +1360,21 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 
 	write := func(tx *gorm.DB) error {
 		existingProven = false
+		if a.inboundContinuation != nil {
+			// H1 defence in depth: this handover holds the organization fence while it waits
+			// for contact/transfer/session locks, and its continuation waits for it in Go
+			// while holding its own transaction. A holder of one of those locks that waits
+			// (directly or through another session) on that continuation closes a cycle
+			// PostgreSQL cannot detect, and every later inbound message of the organization
+			// then queues behind the fence. Bound each lock wait of this attempt (the fence
+			// included); canonicalContactWriteTransaction retries 55P03, so all attempts
+			// stay within about 20s, and the caller turns a final 55P03 into a refunded
+			// wedge-guard deferral. Nothing commits on expiry. SET LOCAL ends with this
+			// handover's own transaction and is undone when the attempt's savepoint rolls back.
+			if err := tx.Exec("SET LOCAL lock_timeout = '3s'").Error; err != nil {
+				return err
+			}
+		}
 		if lockErr := database.LockOrganizationPolicyScope(
 			tx,
 			baseTransfer.OrganizationID,

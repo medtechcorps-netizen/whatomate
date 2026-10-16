@@ -960,6 +960,11 @@ func (a *App) continuePersistedIncomingMessage(
 		// H1: consume the handover's actual error: a bounded pool wait is still a refunded
 		// "wedge guard" deferral in p.fail; any other failure retries as an ordinary attempt.
 		if _, err := a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled, nil); err != nil {
+			if postgresErrorCode(err) == "55P03" {
+				// H1: every bounded lock wait of the nested handover expired (see
+				// saveAndFinalizeTransfer); refunded like a bounded pool wait.
+				return fmt.Errorf("create chatbot-disabled queue transfer: wedge guard: handover locks not acquired within the nested lock timeout while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
+			}
 			return fmt.Errorf("create chatbot-disabled queue transfer: %w", err)
 		}
 		return nil

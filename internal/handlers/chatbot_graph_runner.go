@@ -1164,6 +1164,12 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 	if err != nil {
 		// Nothing committed. A bounded pool wait keeps its wedge-guard/DeadlineExceeded
 		// identity for p.fail; lost ownership stays a policy stop.
+		if postgresErrorCode(err) == "55P03" {
+			// H1: the nested handover's bounded lock waits (saveAndFinalizeTransfer) all
+			// expired: lock congestion met while holding this continuation's transaction,
+			// refunded like a bounded pool wait.
+			return nodeOutcome{}, fmt.Errorf("transfer node handover: wedge guard: handover locks not acquired within the nested lock timeout while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
+		}
 		return nodeOutcome{}, fmt.Errorf("transfer node handover: %w", err)
 	}
 	if !handedOver {
