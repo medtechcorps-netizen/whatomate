@@ -148,14 +148,16 @@ describe('MessageContextMenu', () => {
     expect(wrapper.emitted('react')?.[0]).toEqual(['m-1', '🙏'])
   })
 
-  it('runs Reply only after the menu has closed, so the composer focus sticks', async () => {
+  it('focuses the composer inside the Reply gesture and keeps it after the menu closes', async () => {
     const composer = document.createElement('textarea')
     document.body.appendChild(composer)
-    const wrapper = mountMenu({ onReply: () => composer.focus() })
+    const wrapper = mountMenu({ composer })
     rightClick('[data-testid="text-1"]')
     await flushPromises()
     menuItem('chat.reply')!.click()
-    // Not yet: the trapped menu would pull focus back while it closes.
+    // Synchronously, inside the click: iOS only raises the keyboard there.
+    expect(document.activeElement).toBe(composer)
+    // The reply bookkeeping still waits for the menu to close.
     expect(wrapper.emitted('reply')).toBeUndefined()
     await settle()
     expect(menu()).toBeNull()
@@ -170,8 +172,9 @@ describe('MessageContextMenu', () => {
     rightClick('[data-testid="text-1"]')
     await flushPromises()
     menuItem('chat.messageActions.copyText')!.click()
-    await settle()
+    // Synchronously, inside the click: WebKit refuses clipboard writes later.
     expect(writeText).toHaveBeenCalledWith('First message')
+    await settle()
     expect(mocks.toastSuccess).toHaveBeenCalledWith('chat.messageActions.copied')
   })
 
@@ -212,17 +215,33 @@ describe('MessageContextMenu', () => {
     expect(menu()).not.toBeNull()
   })
 
-  it('suppresses the native callout and selection only for the pressed bubble', async () => {
+  it('suppresses only the native callout on the pressed bubble, never text selection', async () => {
     vi.useFakeTimers()
     mountMenu()
     const bubble = container.querySelector<HTMLElement>('#message-m-1 .chat-bubble')!
+    const callout = () => bubble.style.getPropertyValue('-webkit-touch-callout') || (bubble.style as any).webkitTouchCallout || ''
     pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch', clientX: 10, clientY: 10 })
-    expect(bubble.style.userSelect).toBe('none')
-    expect(bubble.style.getPropertyValue('-webkit-touch-callout') || (bubble.style as any).webkitTouchCallout).toBe('none')
+    expect(callout()).toBe('none')
+    // Partial selection (an IC or phone number) must stay possible on touch.
+    expect(bubble.style.userSelect).toBe('')
     await vi.advanceTimersByTimeAsync(600)
     expect(menu()).not.toBeNull()
     pointer('pointerup', '[data-testid="text-1"]', { pointerType: 'touch', clientX: 10, clientY: 10 })
-    expect(bubble.style.userSelect).toBe('')
+    expect(callout()).toBe('')
+  })
+
+  it('lets a selection that starts during the press win over the menu', async () => {
+    vi.useFakeTimers()
+    mountMenu()
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch', clientX: 10, clientY: 10 })
+    const range = document.createRange()
+    range.selectNodeContents(container.querySelector('[data-testid="text-1"]')!)
+    window.getSelection()!.removeAllRanges()
+    window.getSelection()!.addRange(range)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(menu()).toBeNull()
+    expect(window.getSelection()!.isCollapsed).toBe(false)
+    window.getSelection()!.removeAllRanges()
   })
 
   it('respects an existing text selection on long-press, like right-click', async () => {
@@ -240,10 +259,14 @@ describe('MessageContextMenu', () => {
     window.getSelection()!.removeAllRanges()
   })
 
-  it('ignores a mouse press and a released touch press', async () => {
+  it('ignores mouse and pen presses and a released touch press', async () => {
     vi.useFakeTimers()
     mountMenu()
     pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'mouse', clientX: 10, clientY: 10 })
+    await vi.advanceTimersByTimeAsync(600)
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'pen', clientX: 10, clientY: 10 })
+    await vi.advanceTimersByTimeAsync(600)
+    expect(menu()).toBeNull()
     pointer('pointerdown', '[data-testid="text-2"]', { pointerType: 'touch', clientX: 10, clientY: 10 })
     pointer('pointerup', '[data-testid="text-2"]', { pointerType: 'touch', clientX: 10, clientY: 10 })
     await vi.advanceTimersByTimeAsync(600)

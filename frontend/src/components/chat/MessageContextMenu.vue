@@ -25,6 +25,8 @@ const props = defineProps<{
   container: HTMLElement | null | undefined
   messages: readonly Message[]
   quickReactions: readonly string[]
+  /** Focused synchronously by Reply, inside the user gesture (iOS keyboard). */
+  composer?: HTMLElement | null
 }>()
 
 const emit = defineEmits<{
@@ -113,29 +115,25 @@ function onContextMenu(event: MouseEvent) {
 
 let longPressTimer = 0
 let pressOrigin: { x: number; y: number } | null = null
-let suppressed: { bubble: HTMLElement; callout: string; select: string; webkitSelect: string } | null = null
+let suppressed: { bubble: HTMLElement; callout: string } | null = null
 
-/** Stop the native callout and text selection on the pressed bubble only. */
+type CalloutStyle = CSSStyleDeclaration & { webkitTouchCallout?: string }
+
+/**
+ * Stop only the native callout on the pressed bubble. Text selection stays
+ * available, so an agent can still select part of a message (an IC or phone
+ * number); a selection that starts during the press wins over the menu.
+ */
 function suppressNativeGesture(bubble: HTMLElement) {
   restoreNativeGesture()
-  const style = bubble.style as CSSStyleDeclaration & { webkitTouchCallout?: string; webkitUserSelect?: string }
-  suppressed = {
-    bubble,
-    callout: style.webkitTouchCallout ?? '',
-    select: style.userSelect,
-    webkitSelect: style.webkitUserSelect ?? '',
-  }
+  const style = bubble.style as CalloutStyle
+  suppressed = { bubble, callout: style.webkitTouchCallout ?? '' }
   style.webkitTouchCallout = 'none'
-  style.userSelect = 'none'
-  style.webkitUserSelect = 'none'
 }
 
 function restoreNativeGesture() {
   if (!suppressed) return
-  const style = suppressed.bubble.style as CSSStyleDeclaration & { webkitTouchCallout?: string; webkitUserSelect?: string }
-  style.webkitTouchCallout = suppressed.callout
-  style.userSelect = suppressed.select
-  style.webkitUserSelect = suppressed.webkitSelect
+  ;(suppressed.bubble.style as CalloutStyle).webkitTouchCallout = suppressed.callout
   suppressed = null
 }
 
@@ -151,7 +149,8 @@ function endPress() {
 }
 
 function onPointerDown(event: PointerEvent) {
-  if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return
+  // Finger only: a pen press is for selecting and writing.
+  if (event.pointerType !== 'touch') return
   const hit = messageAt(event.target)
   // An existing selection keeps the platform's own selection handles/menu.
   if (!hit || hasSelectionIn(hit.bubble)) return
@@ -163,7 +162,6 @@ function onPointerDown(event: PointerEvent) {
     longPressTimer = 0
     pressOrigin = null
     if (hasSelectionIn(hit.bubble)) return
-    window.getSelection?.()?.removeAllRanges()
     lastLongPressOpen = Date.now()
     openAt(origin.x, origin.y, hit.message)
   }, LONG_PRESS_MS)
@@ -200,11 +198,13 @@ watch(
   { immediate: true },
 )
 
-// ---- Actions run after the menu has closed --------------------------------
+// ---- Actions ---------------------------------------------------------------
 //
-// reka-ui's trapped FocusScope pulls focus back into the closing menu and only
-// releases it after unmount, so an action that moves focus (Reply focuses the
-// composer, Forward opens a dialog) runs once the close focus event has fired.
+// Work that needs the user gesture runs synchronously in the select handler:
+// clipboard writes (WebKit refuses them later) and the composer focus that
+// raises the iOS keyboard. The menu is non-modal, so no focus trap pulls that
+// focus back while it animates out. The remaining bookkeeping (Reply's reply
+// state, React, Forward's dialog) runs once the menu's close focus event fired.
 
 let pendingAction: (() => void) | null = null
 let pendingFallback = 0
@@ -252,17 +252,20 @@ function reactWith(emoji: string) {
 
 function replyToTarget() {
   const message = target.value
-  if (message) queueAction(() => emit('reply', message))
+  if (!message) return
+  props.composer?.focus({ preventScroll: true })
+  queueAction(() => emit('reply', message))
 }
 
 function copyTarget() {
+  // Inside the gesture: WebKit only allows clipboard writes there.
   const text = copyText.value
-  if (text) queueAction(() => void copyMessageText(text))
+  if (text) void copyMessageText(text)
 }
 </script>
 
 <template>
-  <ContextMenu>
+  <ContextMenu :modal="false">
     <!-- A template ref through the trigger's as-child slot is not reliable
          across remounts, so the host span locates the trigger element. -->
     <span

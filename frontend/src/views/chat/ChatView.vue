@@ -3366,7 +3366,7 @@ async function sendMediaMessage() {
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
     />
-    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" @react="sendReaction" @reply="replyToMessage" />
+    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" @react="sendReaction" @reply="replyToMessage" />
   </div>
 </template>
 
