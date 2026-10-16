@@ -263,9 +263,10 @@ function postRefresh() {
  * first. Failures never block the logout.
  */
 export async function revokeRefreshToken(): Promise<void> {
-  const csrfToken = getCookie("whm_csrf");
-  if (!csrfToken) return;
   for (let attempt = 0; ; attempt++) {
+    // Read the token on every attempt: a refresh in another tab rotates it.
+    const csrfToken = getCookie("whm_csrf");
+    if (!csrfToken) return;
     try {
       await axios.post(
         `${API_BASE_URL}/auth/refresh`,

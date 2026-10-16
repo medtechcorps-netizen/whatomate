@@ -331,6 +331,27 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(options.withCredentials).toBe(true)
   })
 
+  it('re-reads the CSRF cookie for each revoke attempt', async () => {
+    vi.useFakeTimers()
+    const { api } = await loadTab(async (config) => ok(config))
+    const sent: string[] = []
+    postSpy.mockImplementation(async (_url: string, _body: unknown, options: any) => {
+      sent.push(options.headers['X-CSRF-Token'])
+      if (sent.length === 1) {
+        // Another tab refreshes meanwhile and rotates the CSRF cookie.
+        setCookie('whm_csrf=csrf-token-2; path=/')
+        throw httpError(429)
+      }
+      return { data: { data: {} }, status: 200 }
+    })
+
+    const logout = api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(1_000)
+    await logout
+
+    expect(sent).toEqual(['csrf-token-1', 'csrf-token-2'])
+  })
+
   it('retries a rate-limited revoke before logging out', async () => {
     vi.useFakeTimers()
     const order: string[] = []
