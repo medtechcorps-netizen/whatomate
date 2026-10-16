@@ -122,7 +122,7 @@ import WhatsAppText from '@/components/chat/WhatsAppText.vue'
 import ChatDropZoneOverlay from '@/components/chat/ChatDropZoneOverlay.vue'
 import { useChatAttachments } from '@/composables/useChatAttachments'
 import { useComposerFormatting } from '@/composables/useComposerFormatting'
-import { CHAT_ATTACHMENT_ACCEPT, filesFromClipboard } from '@/lib/chatAttachments'
+import { CHAT_ATTACHMENT_ACCEPT, filesFromClipboard, summarizeFileNames } from '@/lib/chatAttachments'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import ConversationNotes from '@/components/chat/ConversationNotes.vue'
 import CallButton from '@/components/calling/CallButton.vue'
@@ -251,28 +251,47 @@ const chatAttachments = useChatAttachments({
     if (!contact) return null
     const generation = contactSelectionGeneration
     const id = contact.id
-    return { contactId: id, isActive: () => isContactSelectionActive(generation, id) }
+    return {
+      contactId: id,
+      label: currentContactDisplayName.value,
+      isActive: () => isContactSelectionActive(generation, id),
+    }
   },
   getWhatsAppAccount: () => selectedAccount.value,
+  // Paces uploads on each message leaving 'pending' (status_update /
+  // realtime_sync), which keeps a batch from pinning DB pool connections.
+  subscribeRealtime: listener => wsService.onInboxActivity(listener),
   onSent: message => {
     // addMessage dedupes against the WebSocket echo.
     contactsStore.addMessage(message as Message)
     scrollToBottom()
   },
-  onBatchFinished: ({ sent, failed }) => {
-    if (failed === 0) {
-      toast.success(t(sent === 1 ? 'chat.composer.batchSentOne' : 'chat.composer.batchSentMany', { count: sent }))
-    } else if (sent > 0) {
-      toast.warning(t('chat.composer.batchPartial', { sent, failed }))
-    } else {
-      toast.error(t('chat.mediaFailed'), { description: t('chat.mediaFailedDesc') })
+  // Every batch ends with a report, including one that kept sending after the
+  // agent left the chat; it names the patient so nothing goes unnoticed.
+  onBatchFinished: summary => {
+    const { sent, failed, notSent, recipient } = summary
+    if (failed === 0 && notSent === 0) {
+      const key = summary.detached
+        ? (sent === 1 ? 'chat.composer.batchSentToOne' : 'chat.composer.batchSentToMany')
+        : (sent === 1 ? 'chat.composer.batchSentOne' : 'chat.composer.batchSentMany')
+      toast.success(t(key, { count: sent, name: recipient }))
+      return
     }
+    const files = summarizeFileNames([...summary.failedNames, ...summary.notSentNames])
+    const report = t('chat.composer.batchReport', { name: recipient, sent, failed, notSent })
+    const description = t(
+      summary.detached ? 'chat.composer.batchReportDetached' : 'chat.composer.batchReportFiles',
+      { files },
+    )
+    if (sent === 0 && !summary.stopped) toast.error(report, { description })
+    else toast.warning(report, { description })
   },
 })
 const {
   items: stagedAttachments,
   isOpen: isMediaDialogOpen,
   isSending: isUploadingMedia,
+  isStopping: isStoppingMedia,
 } = chatAttachments
 
 // Canned responses slash command state
@@ -2172,6 +2191,10 @@ function openFilePicker() {
 
 function stageAttachments(files: File[]) {
   const result = chatAttachments.stage(files)
+  if (result.refused === 'busy') {
+    toast.warning(t('chat.composer.busySending', { name: chatAttachments.sendingTo.value }))
+    return
+  }
   if (result.overflow > 0 && !result.refused) {
     toast.warning(t('chat.composer.tooManyFiles', { max: chatAttachments.maxFiles, count: result.overflow }))
   }
@@ -3258,6 +3281,7 @@ watch(contactId, () => chatAttachments.reset())
       :recipient-name="currentContactDisplayName"
       :recipient-detail="currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text"
       :sending="isUploadingMedia"
+      :stopping="isStoppingMedia"
       :max-files="chatAttachments.maxFiles"
       :service-window-expired="isServiceWindowExpired"
       @update:open="onMediaDialogOpenChange"
@@ -3268,6 +3292,7 @@ watch(contactId, () => chatAttachments.reset())
       @convert-all="chatAttachments.convertAllToJpeg"
       @send="chatAttachments.sendAll"
       @retry-failed="chatAttachments.retryFailed"
+      @stop="chatAttachments.stop"
       @add-more="openFilePicker"
     />
 

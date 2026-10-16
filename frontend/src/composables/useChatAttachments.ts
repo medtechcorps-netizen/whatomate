@@ -36,6 +36,8 @@ export interface StagedAttachment {
 /** The conversation a batch was staged for. */
 export interface ChatAttachmentTarget {
   contactId: string
+  /** The patient's display name, for reports after the chat was left. */
+  label?: string
   /** False once that conversation is no longer the one on screen. */
   isActive: () => boolean
 }
@@ -51,20 +53,39 @@ export interface SendChatMediaRequest {
 
 export type SendChatMedia = (
   request: SendChatMediaRequest,
-  options: { onUploadProgress: (loaded: number, total: number | undefined) => void },
+  options: {
+    onUploadProgress: (loaded: number, total: number | undefined) => void
+    signal: AbortSignal
+  },
 ) => Promise<unknown>
 
 export interface StageResult {
   added: number
   /** Files over the per-batch limit that were not added. */
   overflow: number
-  /** Nothing was staged: no conversation is open, or a batch is uploading. */
+  /** Nothing was staged: no conversation is open, or a batch is still sending. */
   refused: 'no-conversation' | 'busy' | null
 }
 
 export interface BatchSummary {
   sent: number
   failed: number
+  /** Files the batch never sent (stopped before they started). */
+  notSent: number
+  failedNames: string[]
+  notSentNames: string[]
+  /** The patient the batch went to. */
+  recipient: string
+  /** The agent pressed Stop. */
+  stopped: boolean
+  /** The agent left the chat while the batch kept sending. */
+  detached: boolean
+}
+
+/** A realtime event as wsService.onInboxActivity delivers it. */
+export interface RealtimeActivity {
+  type?: string
+  payload?: any
 }
 
 export interface UseChatAttachmentsOptions {
@@ -85,12 +106,52 @@ export interface UseChatAttachmentsOptions {
   send?: SendChatMedia
   /** Re-encodes a photo as JPEG. Defaults to convertImageToJpeg. */
   convertImage?: (file: File) => Promise<File>
+  /**
+   * Realtime message events (wsService.onInboxActivity). When given, each
+   * file waits for the previous file's message to leave 'pending' before
+   * the next upload starts.
+   */
+  subscribeRealtime?: (listener: (event: RealtimeActivity) => void) => () => void
+  /** Longest wait for a message to leave 'pending'. */
+  settleTimeoutMs?: number
 }
+
+/**
+ * Pacing bound. The server holds the contact row lock across Meta's media
+ * upload in the previous file's provider transaction; starting the next
+ * upload before that finishes pins a second pool connection behind it.
+ */
+export const MEDIA_SETTLE_TIMEOUT_MS = 10_000
+const STATUS_LOG_LIMIT = 500
 
 const defaultSend: SendChatMedia = async (request, options) => {
   const response = await messagesService.sendMedia(request, options)
   const body = response.data as { data?: unknown } | undefined
   return body && typeof body === 'object' && 'data' in body ? body.data : body
+}
+
+export interface MessageStatusUpdate {
+  messageId: string
+  status: string
+  errorMessage?: string
+}
+
+/** Reads a message status change from a status_update or realtime_sync event. */
+export function messageStatusFromRealtimeEvent(event: RealtimeActivity | null | undefined): MessageStatusUpdate | null {
+  const payload = event?.payload
+  if (!payload || typeof payload !== 'object') return null
+  const isStatusEvent =
+    event?.type === 'status_update' ||
+    (event?.type === 'realtime_sync' && payload.kind === 'message_status_changed')
+  if (!isStatusEvent) return null
+  const messageId = payload.message_id
+  const status = payload.status
+  if (typeof messageId !== 'string' || !messageId || typeof status !== 'string' || !status) return null
+  return {
+    messageId,
+    status,
+    ...(typeof payload.error_message === 'string' && payload.error_message ? { errorMessage: payload.error_message } : {}),
+  }
 }
 
 function createPreviewUrl(file: File, validation: AttachmentValidation): string | null {
@@ -113,20 +174,47 @@ function revokePreviewUrl(url: string | null) {
   }
 }
 
+function warnBeforeUnload(event: BeforeUnloadEvent) {
+  // Closing or reloading the tab would cut off the files still queued.
+  event.preventDefault()
+  event.returnValue = ''
+}
+
+interface ActiveBatch {
+  target: ChatAttachmentTarget
+  controller: AbortController | null
+  /** The in-flight file's body has been fully uploaded. */
+  uploadComplete: boolean
+  stopRequested: boolean
+  /** The staging dialog was reset (the agent left the chat); keep sending anyway. */
+  detached: boolean
+  /** Ends a pacing wait early (Stop). */
+  wake: (() => void) | null
+}
+
 /**
  * Staging and sequential sending of chat attachments. Each file becomes its
- * own WhatsApp message; files go one request at a time, in order, and the
- * next starts only after the previous response.
+ * own WhatsApp message; files go one request at a time, in order.
+ *
+ * A batch the agent confirmed always runs to the end for the patient it was
+ * confirmed for, even if the agent leaves the chat, and finishes with a
+ * report (onBatchFinished). Only Stop ends it early.
  */
 export function useChatAttachments(options: UseChatAttachmentsOptions) {
   const send = options.send ?? defaultSend
   const convertImage = options.convertImage ?? ((file: File) => convertImageToJpeg(file))
+  const settleTimeoutMs = options.settleTimeoutMs ?? MEDIA_SETTLE_TIMEOUT_MS
   const items = ref<StagedAttachment[]>([])
   const isOpen = ref(false)
+  /** A batch is in flight; stays true until its last request settles. */
   const isSending = ref(false)
+  const isStopping = ref(false)
+  /** The patient the in-flight batch goes to. */
+  const sendingTo = ref('')
   let target: ChatAttachmentTarget | null = null
+  let activeBatch: ActiveBatch | null = null
   let sequence = 0
-  // Bumped by reset(); a batch that sees a different value stops touching state.
+  // Bumped by reset(); a conversion that sees a different value is dropped.
   let generation = 0
 
   const sendableCount = computed(() => items.value.filter(item => item.status === 'ready').length)
@@ -140,12 +228,16 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     return items.value.find(item => item.id === id)
   }
 
+  /**
+   * Clears the staging dialog. A batch that is already sending is detached,
+   * not cancelled: it keeps sending to its patient and reports at the end.
+   */
   function reset() {
     generation++
+    if (activeBatch) activeBatch.detached = true
     for (const item of items.value) revokePreviewUrl(item.previewUrl)
     items.value = []
     isOpen.value = false
-    isSending.value = false
     target = null
   }
 
@@ -183,8 +275,10 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   }
 
   function remove(id: string) {
+    // Files queued in a running batch stay until it ends.
+    if (isSending.value) return
     const index = items.value.findIndex(item => item.id === id)
-    if (index < 0 || items.value[index].status === 'sending') return
+    if (index < 0) return
     revokePreviewUrl(items.value[index].previewUrl)
     items.value.splice(index, 1)
     if (items.value.length === 0) reset()
@@ -250,71 +344,168 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     for (const id of ids) await convertToJpeg(id)
   }
 
-  async function runBatch(statuses: StagedAttachmentStatus[]): Promise<BatchSummary> {
-    const summary: BatchSummary = { sent: 0, failed: 0 }
-    if (isSending.value || !target || convertingCount.value > 0) return summary
+  async function runBatch(statuses: StagedAttachmentStatus[]): Promise<BatchSummary | null> {
+    if (activeBatch || !target || convertingCount.value > 0) return null
     if (!target.isActive()) {
       reset()
-      return summary
+      return null
     }
-    const batchTarget = target
-    const queue = items.value.filter(item => statuses.includes(item.status)).map(item => item.id)
-    if (queue.length === 0) return summary
+    // The batch holds its own references, so it can finish after the
+    // staging dialog is reset.
+    const queue = items.value.filter(item => statuses.includes(item.status))
+    if (queue.length === 0) return null
 
-    const batchGeneration = generation
+    const batch: ActiveBatch = {
+      target,
+      controller: null,
+      uploadComplete: false,
+      stopRequested: false,
+      detached: false,
+      wake: null,
+    }
+    activeBatch = batch
+    isSending.value = true
+    isStopping.value = false
+    sendingTo.value = batch.target.label ?? ''
     const whatsappAccount = options.getWhatsAppAccount?.() || undefined
     let replyTo = options.replyTo?.() || undefined
-    isSending.value = true
 
-    for (const id of queue) {
-      if (batchGeneration !== generation) return summary
-      const item = find(id)
-      if (!item || !item.validation.ok) continue
-      if (!batchTarget.isActive()) {
-        reset()
-        return summary
-      }
+    // Status changes are logged from the start, so an update that arrives
+    // before its HTTP response still counts.
+    const statusLog = new Map<string, MessageStatusUpdate>()
+    let waiter: { messageId: string; finish: (update: MessageStatusUpdate | null) => void } | null = null
+    let unsubscribe: (() => void) | null = null
+    try {
+      unsubscribe =
+        options.subscribeRealtime?.(event => {
+          const update = messageStatusFromRealtimeEvent(event)
+          if (!update) return
+          statusLog.set(update.messageId, update)
+          if (statusLog.size > STATUS_LOG_LIMIT) statusLog.delete(statusLog.keys().next().value as string)
+          if (waiter && waiter.messageId === update.messageId && update.status !== 'pending') waiter.finish(update)
+        }) ?? null
+    } catch {
+      unsubscribe = null
+    }
+    const canPace = unsubscribe !== null
 
-      const kind = item.validation.kind
-      const caption = kindSupportsCaption(kind) ? item.caption.trim() : ''
-      item.status = 'sending'
-      item.progress = 0
-      item.errorMessage = null
-      try {
-        const message = await send(
-          {
-            file: withInferredMimeType(item.file),
-            contact_id: batchTarget.contactId,
-            type: kind,
-            ...(caption ? { caption } : {}),
-            ...(whatsappAccount ? { whatsapp_account: whatsappAccount } : {}),
-            ...(replyTo ? { reply_to_message_id: replyTo } : {}),
-          },
-          {
-            onUploadProgress: (loaded, total) => {
-              if (batchGeneration !== generation || !total) return
-              item.progress = Math.min(100, Math.round((loaded / total) * 100))
-            },
-          },
-        )
-        if (batchGeneration !== generation) return summary
-        item.status = 'sent'
-        item.progress = 100
-        summary.sent++
-        replyTo = undefined
-        if (message && batchTarget.isActive()) options.onSent?.(message)
-      } catch (error) {
-        if (batchGeneration !== generation) return summary
-        item.status = 'failed'
-        item.errorMessage = getErrorMessage(error, '') || null
-        summary.failed++
-      }
+    function waitForSettle(messageId: string): Promise<MessageStatusUpdate | null> {
+      const known = statusLog.get(messageId)
+      if (known && known.status !== 'pending') return Promise.resolve(known)
+      return new Promise(resolve => {
+        const timer = setTimeout(() => finish(null), settleTimeoutMs)
+        const finish = (update: MessageStatusUpdate | null) => {
+          clearTimeout(timer)
+          waiter = null
+          batch.wake = null
+          resolve(update)
+        }
+        waiter = { messageId, finish }
+        batch.wake = () => finish(null)
+      })
     }
 
-    isSending.value = false
+    const hasWindow = typeof window !== 'undefined'
+    if (hasWindow) window.addEventListener('beforeunload', warnBeforeUnload)
+
+    try {
+      for (const item of queue) {
+        if (batch.stopRequested) break
+        if (!item.validation.ok) continue
+
+        const kind = item.validation.kind
+        const caption = kindSupportsCaption(kind) ? item.caption.trim() : ''
+        const controller = new AbortController()
+        batch.controller = controller
+        batch.uploadComplete = false
+        item.status = 'sending'
+        item.progress = 0
+        item.errorMessage = null
+        try {
+          const message = await send(
+            {
+              file: withInferredMimeType(item.file),
+              contact_id: batch.target.contactId,
+              type: kind,
+              ...(caption ? { caption } : {}),
+              ...(whatsappAccount ? { whatsapp_account: whatsappAccount } : {}),
+              ...(replyTo ? { reply_to_message_id: replyTo } : {}),
+            },
+            {
+              signal: controller.signal,
+              onUploadProgress: (loaded, total) => {
+                if (!total) return
+                item.progress = Math.min(100, Math.round((loaded / total) * 100))
+                if (loaded >= total) batch.uploadComplete = true
+              },
+            },
+          )
+          item.progress = 100
+          replyTo = undefined
+          if (message && batch.target.isActive()) options.onSent?.(message)
+
+          const created = (message && typeof message === 'object' ? message : {}) as {
+            id?: unknown
+            status?: unknown
+            error_message?: unknown
+          }
+          let outcome: MessageStatusUpdate | null = null
+          if (created.status === 'failed') {
+            outcome = {
+              messageId: String(created.id ?? ''),
+              status: 'failed',
+              ...(typeof created.error_message === 'string' ? { errorMessage: created.error_message } : {}),
+            }
+          } else if (canPace && created.status === 'pending' && typeof created.id === 'string' && created.id) {
+            // Pace the batch: the next upload starts once this message leaves
+            // 'pending' at the provider, or after the bounded wait.
+            outcome = await waitForSettle(created.id)
+          }
+          if (outcome?.status === 'failed') {
+            item.status = 'failed'
+            item.errorMessage = outcome.errorMessage ?? null
+          } else {
+            item.status = 'sent'
+          }
+        } catch (error) {
+          if (controller.signal.aborted) {
+            // Stopped before the body finished uploading: the server never
+            // received this file, so it is simply not sent.
+            item.status = 'ready'
+            item.progress = 0
+          } else {
+            item.status = 'failed'
+            item.errorMessage = getErrorMessage(error, '') || null
+          }
+        } finally {
+          batch.controller = null
+        }
+      }
+    } finally {
+      unsubscribe?.()
+      if (hasWindow) window.removeEventListener('beforeunload', warnBeforeUnload)
+      activeBatch = null
+      isSending.value = false
+      isStopping.value = false
+      sendingTo.value = ''
+    }
+
+    const summary: BatchSummary = {
+      sent: queue.filter(item => item.status === 'sent').length,
+      failed: queue.filter(item => item.status === 'failed').length,
+      notSent: queue.filter(item => item.status === 'ready').length,
+      failedNames: queue.filter(item => item.status === 'failed').map(item => item.file.name),
+      notSentNames: queue.filter(item => item.status === 'ready').map(item => item.file.name),
+      recipient: batch.target.label ?? '',
+      stopped: batch.stopRequested,
+      detached: batch.detached,
+    }
     options.onBatchFinished?.(summary)
-    // Done when nothing is left to send, retry or convert; invalid files were shown as skipped.
-    if (!items.value.some(item => ['ready', 'failed', 'converting'].includes(item.status))) reset()
+    // Done when nothing is left to send, retry or convert; invalid files were
+    // shown as skipped. A detached batch leaves the (new) staging alone.
+    if (!batch.detached && !items.value.some(item => ['ready', 'failed', 'converting'].includes(item.status))) {
+      reset()
+    }
     return summary
   }
 
@@ -326,6 +517,20 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   /** Sends only the files whose last attempt failed. */
   function retryFailed() {
     return runBatch(['failed'])
+  }
+
+  /**
+   * Stops the running batch after the current file. A file still uploading
+   * is aborted (the server never got all of it); one already uploaded is
+   * left to finish, so nothing is reported as unsent that was actually sent.
+   */
+  function stop() {
+    const batch = activeBatch
+    if (!batch || batch.detached || batch.stopRequested) return
+    batch.stopRequested = true
+    isStopping.value = true
+    if (!batch.uploadComplete) batch.controller?.abort()
+    batch.wake?.()
   }
 
   /** Closes the staging dialog and drops its files; ignored while uploading. */
@@ -340,6 +545,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     items,
     isOpen,
     isSending,
+    isStopping,
+    sendingTo,
     sendableCount,
     failedCount,
     invalidCount,
@@ -355,6 +562,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     convertAllToJpeg,
     sendAll,
     retryFailed,
+    stop,
     close,
     reset,
   }

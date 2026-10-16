@@ -47,8 +47,10 @@ const props = withDefaults(
      * exactly like the text composer, but WhatsApp will reject the files.
      */
     serviceWindowExpired?: boolean
+    /** Stop was pressed; the current file is finishing. */
+    stopping?: boolean
   }>(),
-  { recipientDetail: '', sending: false, maxFiles: 10, serviceWindowExpired: false },
+  { recipientDetail: '', sending: false, maxFiles: 10, serviceWindowExpired: false, stopping: false },
 )
 
 const emit = defineEmits<{
@@ -60,6 +62,7 @@ const emit = defineEmits<{
   'convert-all': []
   send: []
   'retry-failed': []
+  stop: []
   'add-more': []
 }>()
 
@@ -334,7 +337,16 @@ function onOpenChange(open: boolean) {
         </Button>
         <span v-else />
         <div class="flex flex-wrap justify-end gap-2">
-          <Button variant="outline" :disabled="sending" @click="onOpenChange(false)">
+          <Button
+            v-if="sending"
+            variant="outline"
+            :disabled="stopping"
+            data-testid="composer-media-stop"
+            @click="emit('stop')"
+          >
+            {{ stopping ? t('chat.composer.stopping') : t('chat.composer.stopSending') }}
+          </Button>
+          <Button v-else variant="outline" @click="onOpenChange(false)">
             {{ sentCount > 0 ? t('common.close') : t('common.cancel') }}
           </Button>
           <Button

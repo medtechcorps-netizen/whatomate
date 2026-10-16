@@ -132,10 +132,24 @@ describe('MediaSendDialog', () => {
     expect(wrapper.find('[data-testid="composer-media-add"]').exists()).toBe(false)
     expect(rows[2].get('[data-testid="composer-media-remove"]').attributes('disabled')).toBeDefined()
 
-    const cancel = wrapper.findAll('button').find(button => button.text() === 'common.close')!
-    expect(cancel.attributes('disabled')).toBeDefined()
-    await cancel.trigger('click')
+    // While uploading, Stop replaces Close/Cancel.
+    expect(wrapper.findAll('button').some(button => button.text() === 'common.close')).toBe(false)
+    const stop = buttonByTestId(wrapper, 'composer-media-stop')
+    expect(stop.text()).toBe('chat.composer.stopSending')
+    await stop.trigger('click')
+    expect(wrapper.emitted('stop')).toHaveLength(1)
     expect(wrapper.emitted('update:open')).toBeUndefined()
+  })
+
+  it('shows Stopping while the current file finishes', () => {
+    const wrapper = mountDialog({
+      sending: true,
+      stopping: true,
+      items: [item('a.png', 'image/png', { status: 'sending', progress: 100 })],
+    })
+    const stop = buttonByTestId(wrapper, 'composer-media-stop')
+    expect(stop.text()).toBe('chat.composer.stopping')
+    expect(stop.attributes('disabled')).toBeDefined()
   })
 
   it('reports failures per file and retries only them', async () => {

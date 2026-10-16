@@ -2,7 +2,13 @@
 
 import { effectScope } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { useChatAttachments, type SendChatMedia, type SendChatMediaRequest } from './useChatAttachments'
+import {
+  messageStatusFromRealtimeEvent,
+  useChatAttachments,
+  type RealtimeActivity,
+  type SendChatMedia,
+  type SendChatMediaRequest,
+} from './useChatAttachments'
 
 const mocks = vi.hoisted(() => ({ sendMedia: vi.fn() }))
 vi.mock('@/services/api', () => ({ messagesService: { sendMedia: mocks.sendMedia } }))
@@ -29,13 +35,16 @@ type Call = {
   request: SendChatMediaRequest
   progress: (loaded: number, total: number | undefined) => void
   result: ReturnType<typeof deferred<unknown>>
+  signal: AbortSignal
 }
 
 function setup(overrides: Partial<Parameters<typeof useChatAttachments>[0]> = {}) {
   const calls: Call[] = []
   const send: SendChatMedia = (request, options) => {
     const result = deferred<unknown>()
-    calls.push({ request, progress: options.onUploadProgress, result })
+    // Like axios: an aborted request rejects.
+    options.signal.addEventListener('abort', () => result.reject(Object.assign(new Error('canceled'), { name: 'CanceledError' })))
+    calls.push({ request, progress: options.onUploadProgress, result, signal: options.signal })
     return result.promise
   }
   const state = { contactId: 'contact-a', active: true }
@@ -46,7 +55,7 @@ function setup(overrides: Partial<Parameters<typeof useChatAttachments>[0]> = {}
     useChatAttachments({
       resolveTarget: () => {
         const id = state.contactId
-        return { contactId: id, isActive: () => state.active && state.contactId === id }
+        return { contactId: id, label: `Patient ${id}`, isActive: () => state.active && state.contactId === id }
       },
       getWhatsAppAccount: () => 'clinic-main',
       onSent,
@@ -181,7 +190,9 @@ describe('useChatAttachments sending', () => {
 
     calls[2].result.resolve({ id: 'm3' })
     await done
-    expect(onBatchFinished).toHaveBeenCalledWith({ sent: 3, failed: 0 })
+    expect(onBatchFinished).toHaveBeenCalledWith(
+      expect.objectContaining({ sent: 3, failed: 0, notSent: 0, recipient: 'Patient contact-a', detached: false }),
+    )
     // Everything went out: the dialog closes and the list clears.
     expect(attachments.isOpen.value).toBe(false)
     expect(attachments.items.value).toHaveLength(0)
@@ -221,7 +232,9 @@ describe('useChatAttachments sending', () => {
     expect(attachments.items.value[1].errorMessage).toBe('Failed to send message')
     expect(attachments.failedCount.value).toBe(1)
     expect(attachments.isOpen.value).toBe(true)
-    expect(onBatchFinished).toHaveBeenLastCalledWith({ sent: 2, failed: 1 })
+    expect(onBatchFinished).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sent: 2, failed: 1, notSent: 0, failedNames: ['b.png'] }),
+    )
 
     // Send does nothing now: nothing is ready.
     await attachments.sendAll()
@@ -233,7 +246,7 @@ describe('useChatAttachments sending', () => {
     expect(calls[3].request.file.name).toBe('b.png')
     calls[3].result.resolve({ id: 'm2' })
     await retry
-    expect(onBatchFinished).toHaveBeenLastCalledWith({ sent: 1, failed: 0 })
+    expect(onBatchFinished).toHaveBeenLastCalledWith(expect.objectContaining({ sent: 1, failed: 0 }))
     expect(attachments.isOpen.value).toBe(false)
   })
 
@@ -249,32 +262,74 @@ describe('useChatAttachments sending', () => {
     expect(attachments.isOpen.value).toBe(true)
   })
 
-  it('stops the queue when the conversation changes and never reports into the new one', async () => {
-    const { attachments, calls, state, onSent } = setup()
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+  it('finishes a confirmed batch for its patient after the agent leaves the chat, then reports it', async () => {
+    const { attachments, calls, state, onSent, onBatchFinished } = setup()
+    attachments.stage([file('lab-1.pdf', 'application/pdf'), file('lab-2.pdf', 'application/pdf'), file('lab-3.pdf', 'application/pdf')])
     const done = attachments.sendAll()
     await settle()
-    state.contactId = 'contact-b'
     calls[0].result.resolve({ id: 'm1' })
-    await done
-    expect(calls).toHaveLength(1)
-    expect(onSent).not.toHaveBeenCalled()
+    await settle()
+    expect(onSent).toHaveBeenCalledTimes(1)
+
+    // The agent switches to another patient: ChatView resets the dialog.
+    state.contactId = 'contact-b'
+    attachments.reset()
+    expect(attachments.isOpen.value).toBe(false)
     expect(attachments.items.value).toHaveLength(0)
+    // Still sending, so nothing new can start until the last request settles.
+    expect(attachments.isSending.value).toBe(true)
+    expect(attachments.sendingTo.value).toBe('Patient contact-a')
+    expect(attachments.stage([file('for-b.png', 'image/png')]).refused).toBe('busy')
+
+    calls[1].result.resolve({ id: 'm2' })
+    await settle()
+    expect(calls[2].request.contact_id).toBe('contact-a')
+    calls[2].result.reject(new Error('Failed to send message'))
+    await done
+
+    // Messages for the patient no longer on screen are not added to the open chat.
+    expect(onSent).toHaveBeenCalledTimes(1)
+    expect(onBatchFinished).toHaveBeenCalledWith({
+      sent: 2,
+      failed: 1,
+      notSent: 0,
+      failedNames: ['lab-3.pdf'],
+      notSentNames: [],
+      recipient: 'Patient contact-a',
+      stopped: false,
+      detached: true,
+    })
     expect(attachments.isSending.value).toBe(false)
+    expect(attachments.stage([file('for-b.png', 'image/png')]).refused).toBeNull()
   })
 
-  it('reset() abandons an in-flight batch without touching the new state', async () => {
-    const { attachments, calls, onBatchFinished } = setup()
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+  it('keeps isSending true after reset() until the in-flight upload settles', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('a.png', 'image/png')])
     const done = attachments.sendAll()
     await settle()
     attachments.reset()
-    attachments.stage([file('new.png', 'image/png')])
+    expect(attachments.isSending.value).toBe(true)
+    expect(await attachments.sendAll()).toBeNull()
     calls[0].result.resolve({ id: 'm1' })
     await done
-    expect(calls).toHaveLength(1)
-    expect(onBatchFinished).not.toHaveBeenCalled()
-    expect(attachments.items.value.map(item => [item.file.name, item.status])).toEqual([['new.png', 'ready']])
+    expect(attachments.isSending.value).toBe(false)
+  })
+
+  it('asks before the tab is closed while a batch is sending', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    const during = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(during)
+    expect(during.defaultPrevented).toBe(true)
+
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    const after = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(after)
+    expect(after.defaultPrevented).toBe(false)
   })
 
   it('attaches replyTo to the first file of the batch only', async () => {
@@ -424,5 +479,200 @@ describe('useChatAttachments sending', () => {
     await attachments.convertToJpeg(attachments.items.value[0].id)
     await attachments.convertToJpeg(attachments.items.value[1].id)
     expect(convertImage).not.toHaveBeenCalled()
+  })
+})
+
+function realtime() {
+  const listeners = new Set<(event: RealtimeActivity) => void>()
+  return {
+    subscribeRealtime: (listener: (event: RealtimeActivity) => void) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    emit: (event: RealtimeActivity) => listeners.forEach(listener => listener(event)),
+    get listenerCount() {
+      return listeners.size
+    },
+  }
+}
+
+describe('useChatAttachments pacing', () => {
+  it('starts the next upload only after the previous message leaves pending', async () => {
+    const live = realtime()
+    const { attachments, calls } = setup({ subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    // Accepted by the server but still pending at the provider: hold file 2.
+    expect(calls).toHaveLength(1)
+    expect(attachments.items.value[0]).toMatchObject({ status: 'sending', progress: 100 })
+
+    live.emit({ type: 'status_update', payload: { message_id: 'other', status: 'sent' } })
+    await settle()
+    expect(calls).toHaveLength(1)
+
+    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'sent' } })
+    await settle()
+    expect(calls).toHaveLength(2)
+    expect(attachments.items.value[0].status).toBe('sent')
+
+    calls[1].result.resolve({ id: 'm2', status: 'pending' })
+    await settle()
+    live.emit({ type: 'realtime_sync', payload: { kind: 'message_status_changed', message_id: 'm2', status: 'delivered' } })
+    await done
+    expect(live.listenerCount).toBe(0)
+  })
+
+  it('counts a status update that arrives before the HTTP response', async () => {
+    const live = realtime()
+    const { attachments, calls } = setup({ subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'sent' } })
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    expect(calls).toHaveLength(2)
+    calls[1].result.resolve({ id: 'm2', status: 'sent' })
+    await done
+  })
+
+  it('reports a message the provider rejected as failed', async () => {
+    const live = realtime()
+    const { attachments, calls, onBatchFinished } = setup({ subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'failed', error_message: 'Media upload error' } })
+    await done
+    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', errorMessage: 'Media upload error' })
+    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 0, failed: 1, failedNames: ['a.png'] }))
+  })
+
+  it('moves on after the bounded wait when no status arrives', async () => {
+    const live = realtime()
+    const { attachments, calls } = setup({ subscribeRealtime: live.subscribeRealtime, settleTimeoutMs: 20 })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    expect(calls).toHaveLength(1)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    expect(calls).toHaveLength(2)
+    expect(attachments.items.value[0].status).toBe('sent')
+    calls[1].result.resolve({ id: 'm2', status: 'sent' })
+    await done
+  })
+
+  it('sends without pacing when realtime events are unavailable', async () => {
+    const { attachments, calls } = setup({
+      subscribeRealtime: () => {
+        throw new Error('websocket not ready')
+      },
+    })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    expect(calls).toHaveLength(2)
+    calls[1].result.resolve({ id: 'm2', status: 'pending' })
+    await done
+  })
+})
+
+describe('useChatAttachments stop', () => {
+  it('aborts a file that is still uploading and leaves unstarted files ready', async () => {
+    const { attachments, calls, onBatchFinished } = setup()
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png'), file('c.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    calls[1].progress(30, 100)
+    attachments.stop()
+    expect(attachments.isStopping.value).toBe(true)
+    expect(calls[1].signal.aborted).toBe(true)
+    await done
+
+    expect(calls).toHaveLength(2)
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'ready', 'ready'])
+    expect(onBatchFinished).toHaveBeenCalledWith(
+      expect.objectContaining({ sent: 1, failed: 0, notSent: 2, notSentNames: ['b.png', 'c.png'], stopped: true }),
+    )
+    // The dialog stays open with the unsent files ready to send again.
+    expect(attachments.isOpen.value).toBe(true)
+    expect(attachments.isSending.value).toBe(false)
+    expect(attachments.isStopping.value).toBe(false)
+  })
+
+  it('lets a fully uploaded file finish instead of aborting it', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(100, 100)
+    attachments.stop()
+    expect(calls[0].signal.aborted).toBe(false)
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(calls).toHaveLength(1)
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'ready'])
+  })
+
+  it('ends a pacing wait at once', async () => {
+    const live = realtime()
+    const { attachments, calls } = setup({ subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(100, 100)
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    attachments.stop()
+    await done
+    expect(calls).toHaveLength(1)
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'ready'])
+  })
+
+  it('does nothing without a running batch or once the batch is detached', async () => {
+    const { attachments, calls } = setup()
+    attachments.stop()
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    attachments.reset()
+    attachments.stop()
+    expect(calls[0].signal.aborted).toBe(false)
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+  })
+})
+
+describe('messageStatusFromRealtimeEvent', () => {
+  it('reads status_update and realtime_sync message status events', () => {
+    expect(messageStatusFromRealtimeEvent({ type: 'status_update', payload: { message_id: 'm1', status: 'sent' } })).toEqual({
+      messageId: 'm1',
+      status: 'sent',
+    })
+    expect(
+      messageStatusFromRealtimeEvent({
+        type: 'realtime_sync',
+        payload: { kind: 'message_status_changed', message_id: 'm2', status: 'failed', error_message: 'x' },
+      }),
+    ).toEqual({ messageId: 'm2', status: 'failed', errorMessage: 'x' })
+  })
+
+  it('ignores other events and malformed payloads', () => {
+    expect(messageStatusFromRealtimeEvent({ type: 'new_message', payload: { message_id: 'm1', status: 'sent' } })).toBeNull()
+    expect(messageStatusFromRealtimeEvent({ type: 'realtime_sync', payload: { kind: 'conversation_changed', message_id: 'm1', status: 'sent' } })).toBeNull()
+    expect(messageStatusFromRealtimeEvent({ type: 'status_update', payload: { status: 'sent' } })).toBeNull()
+    expect(messageStatusFromRealtimeEvent({ type: 'status_update' })).toBeNull()
+    expect(messageStatusFromRealtimeEvent(null)).toBeNull()
   })
 })

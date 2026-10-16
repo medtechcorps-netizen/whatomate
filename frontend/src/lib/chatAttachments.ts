@@ -260,6 +260,12 @@ export function formatFileSize(bytes: number): string {
   return `${(bytes / MiB).toFixed(1)} MB`
 }
 
+/** "a.pdf, b.pdf, c.pdf +2" for reports that must not grow without bound. */
+export function summarizeFileNames(names: readonly string[], max = 3): string {
+  const shown = names.slice(0, max).join(', ')
+  return names.length > max ? `${shown} +${names.length - max}` : shown
+}
+
 /** True when a drag or clipboard payload carries files. */
 export function dataTransferHasFiles(dataTransfer: DataTransfer | null | undefined): boolean {
   if (!dataTransfer) return false

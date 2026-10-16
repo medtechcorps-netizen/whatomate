@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   toastWarning: vi.fn(),
   toastError: vi.fn(),
   convertImageToJpeg: vi.fn(),
+  realtimeListeners: new Set<(event: { type?: string; payload?: any }) => void>(),
 }))
 
 vi.mock('vue-router', async () => {
@@ -142,7 +143,15 @@ vi.mock('@/stores/tags', () => ({
 vi.mock('@/stores/notes', () => ({
   useNotesStore: () => ({ notes: [], hasMore: false, fetchNotes: vi.fn(async () => undefined), clearNotes: vi.fn() }),
 }))
-vi.mock('@/services/websocket', () => ({ wsService: { setCurrentContact: vi.fn() } }))
+vi.mock('@/services/websocket', () => ({
+  wsService: {
+    setCurrentContact: vi.fn(),
+    onInboxActivity: (listener: (event: { type?: string; payload?: any }) => void) => {
+      mocks.realtimeListeners.add(listener)
+      return () => mocks.realtimeListeners.delete(listener)
+    },
+  },
+}))
 vi.mock('@/services/api', () => ({
   effectiveAIIsAllowed: () => true,
   contactsService: {
@@ -496,5 +505,84 @@ describe('ChatView composer', () => {
       status: 'ready',
       convertedFrom: 'image/heic',
     })
+  })
+
+  function sendMediaDeferred() {
+    const calls: Array<{ resolve: (value: unknown) => void; reject: (error: unknown) => void; signal: AbortSignal; request: any }> = []
+    mocks.sendMedia.mockImplementation((request: any, options: { signal: AbortSignal }) =>
+      new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new Error('canceled')))
+        calls.push({ resolve, reject, signal: options.signal, request })
+      }),
+    )
+    return calls
+  }
+
+  async function stageAndSend(names: string[]) {
+    wrapper!.findComponent(ChatDropZoneOverlay).vm.$emit('files', names.map(png))
+    await nextTick()
+    wrapper!.findComponent(MediaSendDialog).vm.$emit('send')
+    await flushPromises()
+  }
+
+  it('keeps sending to the confirmed patient after the agent switches chats, and reports by name', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['lab-1.png', 'lab-2.png'])
+    expect(calls).toHaveLength(1)
+
+    mocks.route!.params.contactId = 'second'
+    await settle()
+    expect(wrapper.findComponent(MediaSendDialog).props('open')).toBe(false)
+    // A new batch is refused until the running one settles.
+    wrapper.findComponent(ChatDropZoneOverlay).vm.$emit('files', [png('for-second.png')])
+    await nextTick()
+    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.busySending')
+
+    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+    expect(calls).toHaveLength(2)
+    expect(calls[1].request).toMatchObject({ contact_id: 'first' })
+    calls[1].resolve({ data: { data: { id: 'msg-2', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.toastSuccess).toHaveBeenCalledWith('chat.composer.batchSentToMany')
+    // The second patient's open chat never received the first patient's files.
+    expect(mocks.contactsStore!.addMessage).not.toHaveBeenCalled()
+  })
+
+  it('paces uploads on realtime status events', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png', 'b.png'])
+    calls[0].resolve({ data: { data: { id: 'msg-a', status: 'pending' } } })
+    await flushPromises()
+    expect(calls).toHaveLength(1)
+    for (const listener of mocks.realtimeListeners) {
+      listener({ type: 'status_update', payload: { message_id: 'msg-a', status: 'sent' } })
+    }
+    await flushPromises()
+    expect(calls).toHaveLength(2)
+    calls[1].resolve({ data: { data: { id: 'msg-b', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.realtimeListeners.size).toBe(0)
+  })
+
+  it('stops a running batch from the dialog and reports what was not sent', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png', 'b.png'])
+    expect(wrapper.findComponent(MediaSendDialog).props('sending')).toBe(true)
+    wrapper.findComponent(MediaSendDialog).vm.$emit('stop')
+    await nextTick()
+    expect(calls[0].signal.aborted).toBe(true)
+    await flushPromises()
+    expect(calls).toHaveLength(1)
+    const dialog = wrapper.findComponent(MediaSendDialog)
+    expect(dialog.props('sending')).toBe(false)
+    expect(dialog.props('items').map((item: { status: string }) => item.status)).toEqual(['ready', 'ready'])
+    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.batchReport', { description: 'chat.composer.batchReportFiles' })
   })
 })

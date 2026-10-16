@@ -470,7 +470,14 @@
       "tooManyFiles": "Up to {max} files can be sent at a time. {count} were not added.",
       "batchSentOne": "{count} file sent",
       "batchSentMany": "{count} files sent",
-      "batchPartial": "{sent} sent, {failed} failed. Retry the failed files from the dialog."
+      "batchSentToOne": "{count} file sent to {name}",
+      "batchSentToMany": "{count} files sent to {name}",
+      "batchReport": "{name}: {sent} sent, {failed} failed, {notSent} not sent",
+      "batchReportFiles": "Not sent: {files}",
+      "batchReportDetached": "Not sent: {files}. Open the chat and attach them again.",
+      "busySending": "Still sending files to {name}. Try again when they have finished.",
+      "stopSending": "Stop sending",
+      "stopping": "Stopping..."
     },
     "emoji": "Emoji",
     "cannedResponses": "Canned Responses",
