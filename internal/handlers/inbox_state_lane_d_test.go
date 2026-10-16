@@ -167,7 +167,7 @@ func laneDHub(t *testing.T, organizationID uuid.UUID) (*appwebsocket.Hub, *appwe
 	return hub, client
 }
 
-func laneDExpectContactUpdate(t *testing.T, client *appwebsocket.Client, contactID uuid.UUID, reason string) {
+func laneDExpectContactUpdate(t *testing.T, client *appwebsocket.Client, contactID uuid.UUID, kind string) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
@@ -182,10 +182,32 @@ func laneDExpectContactUpdate(t *testing.T, client *appwebsocket.Client, contact
 				continue
 			}
 			assert.Equal(t, contactID.String(), envelope.Payload["contact_id"])
-			assert.Equal(t, reason, envelope.Payload["reason"])
+			assert.Equal(t, kind, envelope.Payload["kind"])
+			assert.Len(t, envelope.Payload, 2, "the org-wide payload carries only the contact ID and kind")
 			return
 		case <-deadline:
-			t.Fatalf("timed out waiting for contact_update (%s)", reason)
+			t.Fatalf("timed out waiting for contact_update (%s)", kind)
+		}
+	}
+}
+
+// laneDExpectNoContactUpdate fails if a contact_update arrives within wait.
+func laneDExpectNoContactUpdate(t *testing.T, client *appwebsocket.Client, wait time.Duration) {
+	t.Helper()
+	deadline := time.After(wait)
+	for {
+		select {
+		case data := <-client.SendChan():
+			var envelope struct {
+				Type    string         `json:"type"`
+				Payload map[string]any `json:"payload"`
+			}
+			require.NoError(t, json.Unmarshal(data, &envelope))
+			if envelope.Type == appwebsocket.TypeContactUpdate {
+				t.Fatalf("unexpected contact_update: %v", envelope.Payload)
+			}
+		case <-deadline:
+			return
 		}
 	}
 }
@@ -367,7 +389,8 @@ func TestLaneDManualMarkReadAndUnreadFollowTheVisibleCursorPath(t *testing.T) {
 		require.NoError(t, db.First(&message, "id = ?", id).Error)
 		assert.Equal(t, models.MessageStatusRead, message.Status)
 	}
-	laneDExpectContactUpdate(t, client, contact.ID, "read_state")
+	// Nothing was marked unread, so no read_state change reaches other clients.
+	laneDExpectNoContactUpdate(t, client, 300*time.Millisecond)
 
 	payload, status = laneDMarkRead(t, app, organization.ID, reader.ID, contact.ID, map[string]any{"mark": "unread"})
 	require.Equal(t, fasthttp.StatusOK, status)
@@ -384,9 +407,14 @@ func TestLaneDManualMarkReadAndUnreadFollowTheVisibleCursorPath(t *testing.T) {
 	assert.True(t, unreadList.Contacts[0].ManualUnread)
 	assert.Zero(t, unreadList.Contacts[0].UnreadCount)
 
-	// The automatic read body is unchanged and also ends a manual mark.
+	// The automatic read body is unchanged and also ends a manual mark, which
+	// other clients learn about.
 	markLegacyChatVisible(t, app, organization.ID, reader.ID, contact.ID, latest.ID, fasthttp.StatusOK)
 	assert.False(t, laneDManualUnreadStored(t, db, contact.ID))
+	laneDExpectContactUpdate(t, client, contact.ID, "read_state")
+	// A later automatic read with no mark set stays quiet.
+	markLegacyChatVisible(t, app, organization.ID, reader.ID, contact.ID, latest.ID, fasthttp.StatusOK)
+	laneDExpectNoContactUpdate(t, client, 300*time.Millisecond)
 	var refreshed models.Contact
 	require.NoError(t, db.First(&refreshed, "id = ?", contact.ID).Error)
 	assert.True(t, refreshed.IsRead)
@@ -395,9 +423,12 @@ func TestLaneDManualMarkReadAndUnreadFollowTheVisibleCursorPath(t *testing.T) {
 	_, status = laneDMarkRead(t, app, organization.ID, reader.ID, contact.ID, map[string]any{"mark": "unread"})
 	require.Equal(t, fasthttp.StatusOK, status)
 	require.True(t, laneDManualUnreadStored(t, db, contact.ID))
+	laneDExpectContactUpdate(t, client, contact.ID, "read_state")
 	_, status = laneDMarkRead(t, app, organization.ID, reader.ID, contact.ID, map[string]any{"mark": "read"})
 	require.Equal(t, fasthttp.StatusOK, status)
 	assert.False(t, laneDManualUnreadStored(t, db, contact.ID))
+	laneDExpectContactUpdate(t, client, contact.ID, "read_state")
+	laneDExpectNoContactUpdate(t, client, 300*time.Millisecond)
 
 	_, status = laneDMarkRead(t, app, organization.ID, reader.ID, contact.ID, map[string]any{"mark": "later"})
 	assert.Equal(t, fasthttp.StatusBadRequest, status)
@@ -660,6 +691,7 @@ func TestLaneDInboxStateWritesHoldOnlyTheRequestConnection(t *testing.T) {
 	laneDSetManualUnread(t, setupDB, contact, nil)
 	require.Equal(t, fasthttp.StatusOK, run("automatic read", markRead(map[string]any{"last_visible_message_id": latest.ID.String()})))
 	require.False(t, laneDManualUnreadStored(t, setupDB, contact.ID))
+	laneDExpectContactUpdate(t, client, contact.ID, "read_state")
 
 	require.Equal(t, fasthttp.StatusOK, run("assign", func(scoped *App) int {
 		request := testutil.NewJSONRequest(t, map[string]any{"user_id": teammate.ID.String()})

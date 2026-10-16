@@ -93,7 +93,7 @@ describe('WebSocketService contact_update', () => {
 
   it('schedules a list refresh for the changed contact', async () => {
     const socket = await connected()
-    socket.receive({ type: 'contact_update', payload: { contact_id: 'c-1', reason: 'assignment' } })
+    socket.receive({ type: 'contact_update', payload: { contact_id: 'c-1', kind: 'assignment' } })
     expect(mocks.contactsStore.scheduleContactsRefresh).toHaveBeenCalledWith('c-1')
     expect(mocks.contactsStore.fetchContacts).not.toHaveBeenCalled()
   })
@@ -110,7 +110,7 @@ describe('WebSocketService contact_update', () => {
     const socket = await connected()
     const activity = vi.fn()
     service!.onInboxActivity(activity)
-    socket.receive({ type: 'contact_update', payload: { contact_id: 'c-1', reason: 'read_state' } })
+    socket.receive({ type: 'contact_update', payload: { contact_id: 'c-1', kind: 'read_state' } })
     expect(activity).not.toHaveBeenCalled()
   })
 })

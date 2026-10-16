@@ -570,8 +570,9 @@ const canAssignContacts = computed(() => authStore.hasPermission('contacts', 'wr
 // Without contacts:read a user only ever sees their own chats, so the
 // Unassigned view would always be empty for them.
 const canSeeUnassignedChats = computed(() => authStore.hasPermission('contacts', 'read'))
-// Manual unread is team-shared state, authorized like the shared read path.
-const canMarkChatUnread = computed(() => authStore.hasPermission('chat', 'write'))
+// Manual read and unread change team-shared state, authorized like the
+// shared read path.
+const canChangeChatReadState = computed(() => authStore.hasPermission('chat', 'write'))
 const currentUserId = computed(() => authStore.user?.id ?? null)
 
 // "Next step" menu gates. These mirror the gates CustomerRevenueWorkspace
@@ -2415,7 +2416,7 @@ watch(contactId, () => chatAttachments.reset())
             data-testid="chat-contact"
             :data-contact-id="contact.id"
             :class="[
-              'group relative flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-white/[0.04] light:hover:bg-gray-50 transition-colors',
+              'flex items-center gap-2 px-3 py-2 cursor-pointer hover:bg-white/[0.04] light:hover:bg-gray-50 transition-colors',
               contactsStore.currentContact?.id === contact.id && 'bg-white/[0.08] light:bg-gray-100'
             ]"
             @click="handleContactClick(contact)"
@@ -2465,7 +2466,7 @@ watch(contactId, () => chatAttachments.reset())
             </div>
             <ChatRowActionsMenu
               :contact="contact"
-              :can-mark-unread="canMarkChatUnread"
+              :can-change-read-state="canChangeChatReadState"
               @mark-read="markChatRead"
               @mark-unread="markChatUnread"
             />
@@ -2731,7 +2732,7 @@ watch(contactId, () => chatAttachments.reset())
                   <span>{{ $t('chat.assignToAgent') }}</span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  v-if="contactHasUnread(contactsStore.currentContact)"
+                  v-if="canChangeChatReadState && contactHasUnread(contactsStore.currentContact)"
                   data-testid="chat-menu-mark-read"
                   @select="markChatRead(contactsStore.currentContact.id)"
                 >
@@ -2739,7 +2740,7 @@ watch(contactId, () => chatAttachments.reset())
                   <span>{{ $t('chat.readState.markRead') }}</span>
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  v-else-if="canMarkChatUnread"
+                  v-else-if="canChangeChatReadState"
                   data-testid="chat-menu-mark-unread"
                   @select="markChatUnread(contactsStore.currentContact.id)"
                 >

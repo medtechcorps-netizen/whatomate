@@ -35,6 +35,27 @@ const menuStubs = {
   }),
 }
 
+function laneDClassTokens(html: string) {
+  return Array.from(html.matchAll(/class="([^"]*)"/g)).flatMap(match => match[1].split(/\s+/))
+}
+
+describe('lane D chat components', () => {
+  it('use no Tailwind group-/peer- variants, which the production CSS drops', () => {
+    const tokens = [
+      ...laneDClassTokens(mount(ChatListFilters, { global: { stubs: tooltipStubs } }).html()),
+      ...laneDClassTokens(mount(ContactAssigneeBadge, {
+        props: { contact: { assigned_user_id: 'u-1', assigned_user_name: 'Ben Lim' } },
+      }).html()),
+      ...laneDClassTokens(mount(ChatRowActionsMenu, {
+        props: { contact: { id: 'c-1', unread_count: 1 } },
+        global: { stubs: menuStubs },
+      }).html()),
+    ]
+    expect(tokens.length).toBeGreaterThan(0)
+    expect(tokens.filter(token => token.includes('group-') || token.includes('peer-'))).toEqual([])
+  })
+})
+
 describe('ChatListFilters', () => {
   it('renders the four chips with stable test ids and All selected by default', () => {
     const wrapper = mount(ChatListFilters, { global: { stubs: tooltipStubs } })
@@ -148,21 +169,30 @@ describe('ChatRowActionsMenu', () => {
     expect(wrapper.find('[data-testid="chat-row-mark-read"]').exists()).toBe(true)
   })
 
-  it('offers Mark as unread for a read chat when allowed', async () => {
+  it('offers Mark as unread for a read chat', async () => {
     const { wrapper } = mountInRow({ contact: { id: 'c-1', unread_count: 0 } })
     await wrapper.get('[data-testid="chat-row-mark-unread"]').trigger('click')
     expect(wrapper.findComponent(ChatRowActionsMenu).emitted('mark-unread')).toEqual([['c-1']])
   })
 
-  it('renders no trigger when the user cannot change a read chat', () => {
-    const { wrapper } = mountInRow({ contact: { id: 'c-1', unread_count: 0 }, canMarkUnread: false })
-    expect(wrapper.find('[data-testid="chat-row-actions"]').exists()).toBe(false)
+  it('renders nothing for a user who cannot change read state', () => {
+    for (const contact of [{ id: 'c-1', unread_count: 0 }, { id: 'c-2', unread_count: 3 }]) {
+      const { wrapper } = mountInRow({ contact, canChangeReadState: false })
+      expect(wrapper.find('[data-testid="chat-row-actions"]').exists()).toBe(false)
+      expect(wrapper.find('[data-testid="chat-row-mark-read"]').exists()).toBe(false)
+    }
   })
 
-  it('positions the trigger absolutely and avoids canary-reserved icons', () => {
+  it('keeps the trigger visible in the row flow, never invisible-but-clickable', () => {
     const { wrapper } = mountInRow({ contact: { id: 'c-1', unread_count: 1 } })
     const trigger = wrapper.get('[data-testid="chat-row-actions"]')
-    expect(trigger.classes()).toContain('absolute')
+    const classes = trigger.classes()
+    expect(classes).toContain('shrink-0')
+    for (const hidden of ['absolute', 'opacity-0', 'invisible', 'hidden', 'sr-only']) {
+      expect(classes).not.toContain(hidden)
+    }
+    // The production CSS build drops every Tailwind group-/peer- variant.
+    expect(classes.filter(name => /(^|:)(group|peer)(-|\/|$)/.test(name) || name.includes('group-') || name.includes('peer-'))).toEqual([])
     const html = trigger.html()
     for (const reserved of ['lucide-send', 'lucide-paperclip', 'lucide-smile', 'lucide-reply', 'lucide-x']) {
       expect(html).not.toContain(`${reserved}"`)

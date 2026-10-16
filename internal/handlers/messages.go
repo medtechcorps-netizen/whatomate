@@ -1965,17 +1965,19 @@ func (a *App) broadcastReactionUpdate(orgID uuid.UUID, messageID, contactID uuid
 }
 
 // broadcastContactUpdate tells connected clients that a contact's inbox state
-// (assignment, transfer agent or manual read state) changed. The payload holds
-// identifiers only and clients refetch the canonical row. It is queued until
-// the surrounding tenant transaction commits and does no database work, so it
-// is safe on paths that already hold a transaction.
-func (a *App) broadcastContactUpdate(orgID, contactID uuid.UUID, reason string) {
+// (assignment, transfer agent or manual read state) changed. It reaches every
+// socket of the organization, including agents limited to their own chats, so
+// the payload is only the contact ID and the kind of change; clients refetch
+// the canonical row through their own scoped API. It is queued until the
+// surrounding tenant transaction commits and does no database work, so it is
+// safe on paths that already hold a transaction.
+func (a *App) broadcastContactUpdate(orgID, contactID uuid.UUID, kind string) {
 	if a == nil || orgID == uuid.Nil || contactID == uuid.Nil {
 		return
 	}
 	payload := map[string]any{
 		"contact_id": contactID.String(),
-		"reason":     reason,
+		"kind":       kind,
 	}
 	a.afterTenantCommit(func() {
 		root := a.rootApp()
