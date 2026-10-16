@@ -86,6 +86,7 @@ const PROACTIVE_REFRESH_LEAD_MS = 60_000;
 // Delays before each retry of a transient refresh failure (~10 s in total).
 const REFRESH_RETRY_DELAYS_MS = [1_000, 3_000, 6_000];
 const REFRESH_REQUEST_TIMEOUT_MS = 15_000;
+const REVOKE_REQUEST_TIMEOUT_MS = 5_000;
 const RECONNECT_TOAST_ID = "whm-session-reconnect";
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -191,9 +192,16 @@ function isSessionlessAuthEndpoint(url?: string): boolean {
   );
 }
 
+// A 401 from /auth/refresh is the server's verdict. A 403 counts only when it
+// carries the app's own JSON error envelope; an HTML page from a proxy, WAF or
+// edge is treated as transient.
 function isDefinitiveRefreshFailure(error: unknown): boolean {
-  const status = axios.isAxiosError(error) ? error.response?.status : undefined;
-  return status === 401 || status === 403;
+  if (!axios.isAxiosError(error)) return false;
+  const status = error.response?.status;
+  if (status === 401) return true;
+  if (status !== 403) return false;
+  const data = error.response?.data as { status?: unknown } | null | undefined;
+  return !!data && typeof data === "object" && data.status === "error";
 }
 
 function hasStoredUser(): boolean {
@@ -245,6 +253,29 @@ function postRefresh() {
     {},
     { withCredentials: true, timeout: REFRESH_REQUEST_TIMEOUT_MS, headers },
   );
+}
+
+/**
+ * Revokes the server-side refresh token. The whm_refresh cookie is only sent
+ * to /auth/refresh, so /auth/logout alone cannot revoke it; logout calls this
+ * first. Failures never block the logout.
+ */
+export async function revokeRefreshToken(): Promise<void> {
+  const csrfToken = getCookie("whm_csrf");
+  if (!csrfToken) return;
+  try {
+    await axios.post(
+      `${API_BASE_URL}/auth/refresh`,
+      { revoke: true },
+      {
+        withCredentials: true,
+        timeout: REVOKE_REQUEST_TIMEOUT_MS,
+        headers: { "X-CSRF-Token": csrfToken },
+      },
+    );
+  } catch {
+    // The logout itself still clears the session.
+  }
 }
 
 // refreshWithRetry refreshes once, retrying transient failures (network,
@@ -414,7 +445,8 @@ api.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
     // Stamp the auth epoch the request is sent under (see above).
     (config as AuthAwareRequestConfig)._authEpoch = readAuthEpoch();
-    if (requestPath(config.url) === "/auth/logout") {
+    const isLogout = requestPath(config.url) === "/auth/logout";
+    if (isLogout) {
       clearSessionTiming();
     }
     // Add CSRF token on mutating requests (cookie-based auth sends cookies automatically)
@@ -438,6 +470,10 @@ api.interceptors.request.use(
     );
     if (organizationId) {
       config.headers.set("X-Organization-ID", organizationId);
+    }
+    if (isLogout) {
+      // Revoke the refresh token first, then log out as before.
+      return revokeRefreshToken().then(() => config);
     }
     return config;
   },

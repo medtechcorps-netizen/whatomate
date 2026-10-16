@@ -286,6 +286,62 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(sessionEvents).toEqual(['expired'])
   })
 
+  it('treats an HTML 403 from an edge or WAF as transient', async () => {
+    vi.useFakeTimers()
+    const { api } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const edge403 = () => {
+      const error = httpError(403)
+      ;(error.response as { data: unknown }).data = '<html><body>Request blocked</body></html>'
+      return error
+    }
+    postSpy.mockImplementation(async () => {
+      throw edge403()
+    })
+
+    const settled = api.get('/contacts').then(
+      () => 'resolved',
+      (error: AxiosError) => error.response?.status,
+    )
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(await settled).toBe(401)
+    expect(postSpy).toHaveBeenCalledTimes(4)
+    expect(localStorage.getItem('user')).not.toBeNull()
+    expect(assignedHref).toBeNull()
+  })
+
+  it('revokes the refresh token before logging out', async () => {
+    const order: string[] = []
+    const { api } = await loadTab(async (config) => {
+      order.push(`adapter ${config.url}`)
+      return ok(config)
+    })
+    postSpy.mockImplementation(async (_url: string, body: unknown, options: any) => {
+      order.push(`revoke ${JSON.stringify(body)} ${options.headers['X-CSRF-Token']}`)
+      return { data: { data: { status: 'revoked' } }, status: 200 }
+    })
+
+    await api.post('/auth/logout', {})
+
+    expect(order).toEqual(['revoke {"revoke":true} csrf-token-1', 'adapter /auth/logout'])
+    const [url, , options] = postSpy.mock.calls[0] as [string, unknown, { withCredentials: boolean }]
+    expect(url).toMatch(/\/api\/auth\/refresh$/)
+    expect(options.withCredentials).toBe(true)
+  })
+
+  it('still logs out when the revoke fails', async () => {
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+    const { api } = await loadTab(adapter)
+    postSpy.mockRejectedValue(networkError())
+
+    const response = await api.post('/auth/logout', {})
+
+    expect(response.status).toBe(200)
+    expect(adapter).toHaveBeenCalledTimes(1)
+  })
+
   it('logs out on a definitive 403 from /auth/refresh', async () => {
     const { api } = await loadTab(async (config) => {
       throw httpError(401, config)
@@ -314,10 +370,17 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     rotated = false
     postSpy.mockClear()
+    postSpy.mockImplementation(async (_url: string, body: unknown) => {
+      // Logout's revoke call; it rotates nothing.
+      if ((body as { revoke?: boolean })?.revoke) return { data: { data: {} }, status: 200 }
+      rotated = true
+      return refreshOk()
+    })
     for (const url of ['/auth/login', '/auth/register', '/auth/logout', '/auth/sso/google/init']) {
       await expect(api.post(url, {})).rejects.toMatchObject({ response: { status: 401 } })
     }
-    expect(postSpy).not.toHaveBeenCalled()
+    // No refresh was attempted; the only /auth/refresh call is logout's revoke.
+    expect(postSpy.mock.calls.map((call: unknown[]) => call[1])).toEqual([{ revoke: true }])
   })
 
   it('refreshes proactively before expiry while visible, not while hidden', async () => {
