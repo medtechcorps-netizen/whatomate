@@ -472,7 +472,7 @@
       "batchSentMany": "{count} files sent",
       "batchSentToOne": "{count} file sent to {name}",
       "batchSentToMany": "{count} files sent to {name}",
-      "batchReport": "{name}: {sent} sent, {failed} failed, {notSent} not sent",
+      "batchReport": "{name}: {sent} sent, {failed} failed, {notSent} not sent, {unconfirmed} may have been sent",
       "batchReportFiles": "Not sent: {files}",
       "batchReportDetached": "Not sent: {files}. Open the chat and attach them again.",
       "batchReportUnconfirmed": "Check the chat for {files}: they may have been sent.",

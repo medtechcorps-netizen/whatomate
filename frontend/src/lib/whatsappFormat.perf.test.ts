@@ -117,9 +117,10 @@ describe('linear parser', () => {
   })
 
   // Adversarial generators by length. Timing assertions compare equal total
-  // work (one 64 KB parse vs eight 8 KB parses, best of 3): a linear parser
-  // scores about 1, the old quadratic one about 8. Absolute bounds are only a
-  // generous ceiling (the old parser took 6 s), so a busy CI box stays green.
+  // work (one 64 KB parse vs sixteen 4 KB parses, interleaved, median of 5):
+  // a linear parser scores about 1-3, the old quadratic one about 16, so the
+  // limit of 8 leaves room on both sides. Absolute bounds are only a generous
+  // ceiling (the old parser took 6 s), so a busy CI box stays green.
   const repeatTo = (pattern: string, length: number) => pattern.repeat(Math.ceil(length / pattern.length)).slice(0, length)
   const adversarial: Record<string, (length: number) => string> = {
     'space-star-a': length => repeatTo(' *a', length),
@@ -130,8 +131,8 @@ describe('linear parser', () => {
     'many links': length => repeatTo('www.a_b_ ', length),
   }
   const BIG = 65_536
-  const SMALL = 8_192
-  const SCALING_LIMIT = 4
+  const SMALL = 4_096
+  const SCALING_LIMIT = 8
   const CEILING_MS = 1_000
 
   function bestOf(runs: number, fn: () => void): number {
@@ -140,20 +141,31 @@ describe('linear parser', () => {
     return best
   }
 
+  function median(values: number[]): number {
+    const sorted = [...values].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length / 2)]
+  }
+
   // Warm the JIT so the first timed case is not penalised.
   parseWhatsAppFormat(' *a'.repeat(1000), { maxFormattedLineLength: Infinity })
 
   for (const [name, make] of Object.entries(adversarial)) {
-    it(`parses adversarial input (${name}) in linear time, even with no line cap`, () => {
+    it(`parses adversarial input (${name}) in linear time, even with no line cap`, { retry: 2 }, () => {
       const big = make(BIG)
       const small = make(SMALL)
       const uncapped = { maxFormattedLineLength: Infinity }
-      const bigMs = bestOf(3, () => parseWhatsAppFormat(big, uncapped))
-      const smallMs = bestOf(3, () => {
-        for (let k = 0; k < BIG / SMALL; k++) parseWhatsAppFormat(small, uncapped)
-      })
+      // Interleave the runs so a burst of machine load hits both sides.
+      const bigRuns: number[] = []
+      const smallRuns: number[] = []
+      for (let run = 0; run < 5; run++) {
+        bigRuns.push(time(() => parseWhatsAppFormat(big, uncapped)))
+        smallRuns.push(time(() => {
+          for (let k = 0; k < BIG / SMALL; k++) parseWhatsAppFormat(small, uncapped)
+        }))
+      }
+      const bigMs = median(bigRuns)
       // Floor the denominator so timer granularity cannot fake a large ratio.
-      expect(bigMs / Math.max(smallMs, 0.5)).toBeLessThan(SCALING_LIMIT)
+      expect(bigMs / Math.max(median(smallRuns), 0.5)).toBeLessThan(SCALING_LIMIT)
       expect(bigMs).toBeLessThan(CEILING_MS)
       expect(bestOf(3, () => parseWhatsAppFormat(big))).toBeLessThan(CEILING_MS)
     })

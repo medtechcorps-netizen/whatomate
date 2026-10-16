@@ -284,7 +284,7 @@ const chatAttachments = useChatAttachments({
       return
     }
     const missing = [...summary.failedNames, ...summary.notSentNames]
-    const report = t('chat.composer.batchReport', { name: recipient, sent, failed, notSent })
+    const report = t('chat.composer.batchReport', { name: recipient, sent, failed, notSent, unconfirmed })
     const notes: string[] = []
     if (missing.length > 0) {
       notes.push(t(
