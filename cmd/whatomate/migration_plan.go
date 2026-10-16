@@ -312,6 +312,9 @@ func (s *migrationPlanState) captureRuntime(ctx context.Context, d planDeadline,
 	if err != nil || !d.alive(ctx) {
 		return snapshot, held, "capture"
 	}
+	if err = observePlanPublicSchemaOwnership(ctx, tx, &snapshot, held); err != nil || !d.alive(ctx) {
+		return snapshot, held, "ownership"
+	}
 	after, err := readPlanSelf(ctx, tx, planRuntimeName, s.runtime.RuntimeRole, true)
 	if err != nil || !samePlanSelf(self, after) {
 		return snapshot, held, "identity"
@@ -327,6 +330,38 @@ func (s *migrationPlanState) captureRuntime(ctx context.Context, d planDeadline,
 	}
 	committed = true
 	return snapshot, held, ""
+}
+
+// PostgreSQL's built-in pg_database_owner has the current database owner as
+// its sole implicit member and normally owns public in newly created databases.
+// Interpret only that exact ownership form for this planner invocation. Shared
+// catalog capture, public comparison and nullable proofs keep their direct-owner
+// meaning. The caller proves the live held owner before and after this read.
+func observePlanPublicSchemaOwnership(ctx context.Context, tx pgx.Tx, snapshot *dbcatalog.Snapshot, held planHeldIdentity) error {
+	if ctx == nil || ctx.Err() != nil || tx == nil || snapshot == nil {
+		return errors.New("plan schema ownership unavailable")
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return errors.New("plan schema ownership unavailable")
+	}
+	if snapshot.Ownership.MigrationOwnerOwnsPublicSchema || !snapshot.Ownership.MigrationOwnerOwnsDatabase {
+		return nil
+	}
+	var eligible bool
+	err := tx.QueryRow(ctx, `SELECT d.oid::bigint=$1 AND d.datname::text=$2
+ AND d.datdba::bigint=$3 AND owner.oid=d.datdba AND owner.rolname::text=$4
+ AND NOT owner.rolsuper AND c.relowner=owner.oid
+ AND n.nspowner=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname='pg_database_owner')
+ FROM pg_catalog.pg_database d
+ JOIN pg_catalog.pg_namespace n ON n.nspname='public'
+ JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname='organizations' AND c.relkind IN ('r','p')
+ JOIN pg_catalog.pg_roles owner ON owner.oid=c.relowner
+ WHERE d.datname=pg_catalog.current_database()`, held.DatabaseOID, held.DatabaseName, held.RoleOID, held.RoleName).Scan(&eligible)
+	if err != nil || !eligible || ctx.Err() != nil {
+		return errors.New("plan schema ownership unavailable")
+	}
+	snapshot.Ownership.MigrationOwnerOwnsPublicSchema = true
+	return nil
 }
 
 func (s *migrationPlanState) captureSeeds(ctx context.Context, d planDeadline, cfg *pgx.ConnConfig, held planHeldIdentity) (seeds database.PlanSeedObservations, code string) {
