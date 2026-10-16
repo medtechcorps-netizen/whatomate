@@ -30,6 +30,11 @@ def archive(pair=None, entries=None, compression=zipfile.ZIP_DEFLATED):
         warnings.simplefilter("ignore", UserWarning)
         for name, raw in entries if entries is not None else (
                 ("compat-result.json", pair.result), ("compat-context.json", pair.context)):
+            if isinstance(name, str):
+                info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = compression
+                info.external_attr = ((0o40775 << 16) | 0x10) if name.endswith('/') else (0o600 << 16)
+                name = info
             target.writestr(name, raw)
     return data.getvalue()
 
@@ -100,6 +105,36 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "compat-stale")
         self.assertNotIn("PRIVATE", str(caught.exception))
         self.assertNotIn(str(root), str(caught.exception))
+
+    def test_archive_fixture_is_independent_of_wall_clock(self):
+        pair = fixtures.pair()
+        moments = ((2026, 1, 1, 0, 0, 0, 3, 1, -1), (2026, 1, 1, 0, 0, 4, 3, 1, -1))
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2):
+            with self.subTest(compression=compression):
+                with mock.patch.object(zipfile.time, 'localtime', return_value=moments[0]):
+                    first = archive(pair, compression=compression)
+                with mock.patch.object(zipfile.time, 'localtime', return_value=moments[1]):
+                    second = archive(pair, compression=compression)
+                self.assertEqual(first, second)
+                self.assertEqual(fixtures.digest(first), fixtures.digest(second))
+                with zipfile.ZipFile(io.BytesIO(first)) as saved:
+                    rows = saved.infolist()
+                    self.assertEqual([row.filename for row in rows], ['compat-result.json', 'compat-context.json'])
+                    self.assertTrue(all(row.date_time == (1980, 1, 1, 0, 0, 0) for row in rows))
+                    self.assertTrue(all(row.compress_type == compression for row in rows))
+                    self.assertTrue(all(row.external_attr == 0o600 << 16 for row in rows))
+                    self.assertEqual([saved.read(row) for row in rows], [pair.result, pair.context])
+        # Caller-owned special metadata must remain available to adversarial tests.
+        custom = zipfile.ZipInfo('special', date_time=(2004, 2, 3, 4, 5, 6))
+        custom.create_system = 3
+        custom.external_attr = (stat.S_IFLNK | 0o600) << 16
+        custom.compress_type = zipfile.ZIP_STORED
+        raw = archive(entries=[(custom, b'target')], compression=zipfile.ZIP_DEFLATED)
+        with zipfile.ZipFile(io.BytesIO(raw)) as saved:
+            row = saved.infolist()[0]
+            self.assertEqual((row.date_time, row.create_system, row.external_attr, row.compress_type),
+                ((2004, 2, 3, 4, 5, 6), 3, (stat.S_IFLNK | 0o600) << 16, zipfile.ZIP_STORED))
+            self.assertEqual(saved.read(row), b'target')
 
     def test_actual_gh_wrapper_verifies_both_subjects_with_exact_flags(self):
         with harness() as (root, client, fake, row):
