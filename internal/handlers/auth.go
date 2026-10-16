@@ -399,27 +399,34 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 	}
 
 	if err := a.applyOrganizationMembership(&user, claims.OrganizationID, false); err != nil {
-		if err != gorm.ErrRecordNotFound && err != database.ErrPlatformComplianceTenant {
+		if err == gorm.ErrRecordNotFound {
+			// The reseller-membership check reports a database error as "not
+			// a member". Only conclude the membership is gone while the
+			// database answers, and after a second look.
+			if a.DB.WithContext(ctx).Exec("SELECT 1").Error != nil {
+				return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
+			}
+			err = a.applyOrganizationMembership(&user, claims.OrganizationID, false)
+		}
+		if err != nil && err != gorm.ErrRecordNotFound && err != database.ErrPlatformComplianceTenant {
 			return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
 		}
-		// The reseller-membership check reports a database error as "not a
-		// member". Only treat the membership as gone while the database
-		// answers; otherwise the user stays signed in and retries.
-		if err == gorm.ErrRecordNotFound && a.DB.WithContext(ctx).Exec("SELECT 1").Error != nil {
-			return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
+		if err != nil {
+			consume()
+			return reject(fasthttp.StatusUnauthorized, "Organization access is no longer available", "membership_revoked", claims.UserID)
 		}
-		consume()
-		return reject(fasthttp.StatusUnauthorized, "Organization access is no longer available", "membership_revoked", claims.UserID)
 	}
 
-	// Mint and register the successor before the old token is consumed. If
-	// it cannot be registered, the old token stays valid and the client
-	// retries; a token the server never registered is never handed out.
+	// Mint and register the successor before the old token is consumed. It
+	// starts with a short lifetime that the rotation script extends: if the
+	// rotation never runs, or its outcome is unknown, the unissued successor
+	// expires on its own while the old token stays valid for the client's
+	// retry. A token the server never registered is never handed out.
 	now := time.Now()
 	successorJTI := uuid.New().String()
 	successorExpiry := now.Add(time.Duration(a.Config.JWT.RefreshExpiryDays) * 24 * time.Hour)
 	successorKey := refreshTokenKey(successorJTI)
-	if err := a.Redis.Set(ctx, successorKey, user.ID.String(), successorExpiry.Sub(now)).Err(); err != nil {
+	if err := a.Redis.Set(ctx, successorKey, user.ID.String(), 2*time.Minute).Err(); err != nil {
 		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "successor_store_failed", claims.UserID)
 	}
 	dropSuccessor := func() {
@@ -427,32 +434,7 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		defer dropCancel()
 		a.Redis.Del(dropCtx, successorKey, refreshGraceFromKey(successorJTI))
 	}
-
-	// Atomically consume the old token and record the grace entry; if the
-	// old token is already gone, read the grace entry instead.
-	rotation, err := a.Redis.Eval(ctx, `
-if redis.call('DEL', KEYS[1]) == 1 then
-  local previous = redis.call('GET', KEYS[3])
-  if previous then redis.call('DEL', 'refresh_grace:' .. previous) end
-  redis.call('DEL', KEYS[3])
-  redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
-  redis.call('SET', KEYS[4], ARGV[3], 'EX', ARGV[2])
-  return 'W'
-end
-local grace = redis.call('GET', KEYS[2])
-if grace then return 'G' .. grace end
-return 'N'`,
-		[]string{oldKey, graceKey, refreshGraceFromKey(claims.ID), refreshGraceFromKey(successorJTI)},
-		fmt.Sprintf("%s|%d|%d", successorJTI, now.Unix(), successorExpiry.Unix()),
-		int((10 * time.Minute).Seconds()),
-		claims.ID,
-	).Text()
-	if err != nil {
-		dropSuccessor()
-		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "rotation_store_failed", claims.UserID)
-	}
-
-	if rotation == "W" {
+	issueSuccessor := func() error {
 		newRefreshToken, err := a.signRefreshToken(&user, successorJTI, now, successorExpiry)
 		if err != nil {
 			a.Log.Error("Failed to generate refresh token", "error", err)
@@ -470,9 +452,45 @@ return 'N'`,
 		})
 	}
 
-	// Another request rotated this token first: this request's successor is
-	// an orphan, and the client gets the pair the token was exchanged for.
-	dropSuccessor()
+	// Atomically consume the old token, give the successor its full lifetime
+	// and record the grace entry; if the old token is already gone, read the
+	// grace entry instead. The script is idempotent: when a lost reply makes
+	// the client library send it again, the second run finds this request's
+	// own grace entry and reports the same win.
+	rotation, err := a.Redis.Eval(ctx, `
+if redis.call('DEL', KEYS[1]) == 1 then
+  local previous = redis.call('GET', KEYS[3])
+  if previous then redis.call('DEL', 'refresh_grace:' .. previous) end
+  redis.call('DEL', KEYS[3])
+  redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+  redis.call('SET', KEYS[4], ARGV[3], 'EX', ARGV[2])
+  redis.call('EXPIRE', KEYS[5], ARGV[5])
+  return 'W'
+end
+local grace = redis.call('GET', KEYS[2])
+if grace then
+  if string.sub(grace, 1, string.len(ARGV[4]) + 1) == ARGV[4] .. '|' then return 'W' end
+  return 'G' .. grace
+end
+return 'N'`,
+		[]string{oldKey, graceKey, refreshGraceFromKey(claims.ID), refreshGraceFromKey(successorJTI), successorKey},
+		fmt.Sprintf("%s|%d|%d", successorJTI, now.Unix(), successorExpiry.Unix()),
+		int((10 * time.Minute).Seconds()),
+		claims.ID,
+		successorJTI,
+		int(successorExpiry.Sub(now).Seconds()),
+	).Text()
+	if err != nil {
+		// The outcome is unknown: the script may have run. Keep the
+		// successor (it expires on its own if the rotation never happened);
+		// the client's retry is served from the grace entry or rotates anew.
+		return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "rotation_store_failed", claims.UserID)
+	}
+
+	if rotation == "W" {
+		return issueSuccessor()
+	}
+
 	grace := ""
 	if len(rotation) > 1 && rotation[0] == 'G' {
 		grace = rotation[1:]
@@ -487,6 +505,13 @@ return 'N'`,
 		}
 	}
 	graceJTI, graceIssuedAt, graceExpiry, ok := parseRefreshGrace(grace)
+	if ok && graceJTI == successorJTI {
+		// This request's own rotation, seen again.
+		return issueSuccessor()
+	}
+	// Another request rotated this token first: this request's successor is
+	// an orphan, and the client gets the pair the token was exchanged for.
+	dropSuccessor()
 	if !ok {
 		return reject(fasthttp.StatusUnauthorized, "Refresh token has been revoked", "revoked_or_reused", claims.UserID)
 	}

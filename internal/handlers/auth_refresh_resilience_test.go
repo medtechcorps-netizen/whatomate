@@ -2,9 +2,12 @@ package handlers_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -274,7 +277,7 @@ func TestLaneA_RefreshToken_UnregisteredSuccessorIsNeverIssued(t *testing.T) {
 	assert.True(t, laneAJTIExists(t, admin, f.jti), "the old token stays valid when the successor cannot be registered")
 }
 
-func TestLaneA_RefreshToken_RotationFailureKeepsOldTokenAndDropsSuccessor(t *testing.T) {
+func TestLaneA_RefreshToken_RotationFailureKeepsOldTokenAndLetsSuccessorExpire(t *testing.T) {
 	f := newLaneARefreshFixture(t)
 	admin := f.app.Redis
 	f.app.Redis = laneARestrictedRedis(t, admin, "eval")
@@ -282,7 +285,102 @@ func TestLaneA_RefreshToken_RotationFailureKeepsOldTokenAndDropsSuccessor(t *tes
 	req := laneARefresh(t, f.app, f.token)
 	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req))
 	assert.True(t, laneAJTIExists(t, admin, f.jti))
-	assert.Equal(t, 1, laneALiveRefreshKeysFor(t, admin, f.user.ID), "the unissued successor is dropped")
+
+	// The unissued successor is kept only briefly, then expires on its own.
+	ctx := context.Background()
+	iter := admin.Scan(ctx, 0, "refresh:*", 500).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		if key == "refresh:"+f.jti {
+			continue
+		}
+		if value, err := admin.Get(ctx, key).Result(); err == nil && value == f.user.ID.String() {
+			ttl, err := admin.TTL(ctx, key).Result()
+			require.NoError(t, err)
+			assert.LessOrEqual(t, ttl, 2*time.Minute)
+		}
+	}
+	require.NoError(t, iter.Err())
+}
+
+// laneAEvalHook applies the rotation script once and then simulates a lost
+// reply: "retry" re-sends the same EVAL (as go-redis does after a read
+// timeout), anything else surfaces an i/o error to the handler.
+type laneAEvalHook struct {
+	mode  string
+	fired atomic.Bool
+}
+
+func (h *laneAEvalHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *laneAEvalHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *laneAEvalHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		args := cmd.Args()
+		isRotation := len(args) > 1 &&
+			strings.EqualFold(fmt.Sprint(args[0]), "eval") &&
+			strings.Contains(fmt.Sprint(args[1]), "redis.call('DEL', KEYS[1]) == 1")
+		if !isRotation || !h.fired.CompareAndSwap(false, true) {
+			return next(ctx, cmd)
+		}
+		if err := next(ctx, cmd); err != nil {
+			return err
+		}
+		if h.mode == "retry" {
+			return next(ctx, cmd)
+		}
+		cmd.SetErr(errors.New("i/o timeout"))
+		return cmd.Err()
+	}
+}
+
+func laneAHookedRedis(t *testing.T, admin *redis.Client, hook redis.Hook) *redis.Client {
+	t.Helper()
+	opts := *admin.Options()
+	client := redis.NewClient(&opts)
+	client.AddHook(hook)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func TestLaneA_RefreshToken_RotationIsIdempotentWhenTheClientResendsIt(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	admin := f.app.Redis
+	f.app.Redis = laneAHookedRedis(t, admin, &laneAEvalHook{mode: "retry"})
+
+	req := laneARefresh(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	successor := laneAJTIOf(t, testutil.GetResponseCookie(req, "whm_refresh"))
+	assert.True(t, laneAJTIExists(t, admin, successor), "the issued successor stays live")
+	ttl, err := admin.TTL(context.Background(), "refresh:"+successor).Result()
+	require.NoError(t, err)
+	assert.Greater(t, ttl, 24*time.Hour, "the rotation gave the successor its full lifetime")
+	assert.False(t, laneAJTIExists(t, admin, f.jti))
+	assert.Equal(t, 1, laneALiveRefreshKeysFor(t, admin, f.user.ID))
+}
+
+func TestLaneA_RefreshToken_LostRotationReplyStaysRetryable(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	admin := f.app.Redis
+	f.app.Redis = laneAHookedRedis(t, admin, &laneAEvalHook{mode: "lose"})
+
+	lost := laneARefresh(t, f.app, f.token)
+	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(lost))
+	assert.Empty(t, testutil.GetResponseCookie(lost, "whm_refresh"))
+
+	// The script did run: its successor must survive, so the client's retry
+	// with the old token is served that same successor.
+	grace, err := admin.Get(context.Background(), "refresh_grace:"+f.jti).Result()
+	require.NoError(t, err)
+	rotated := strings.SplitN(grace, "|", 2)[0]
+	assert.True(t, laneAJTIExists(t, admin, rotated))
+
+	retry := laneARefresh(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(retry), string(testutil.GetResponseBody(retry)))
+	assert.Equal(t, rotated, laneAJTIOf(t, testutil.GetResponseCookie(retry, "whm_refresh")))
 }
 
 func TestLaneA_RefreshToken_RevokeRequiresCSRF(t *testing.T) {
