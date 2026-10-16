@@ -87,6 +87,8 @@ const PROACTIVE_REFRESH_LEAD_MS = 60_000;
 const REFRESH_RETRY_DELAYS_MS = [1_000, 3_000, 6_000];
 const REFRESH_REQUEST_TIMEOUT_MS = 15_000;
 const REVOKE_REQUEST_TIMEOUT_MS = 5_000;
+// Waits before retrying a rate-limited revoke.
+const REVOKE_RETRY_DELAYS_MS = [1_000, 2_000];
 const RECONNECT_TOAST_ID = "whm-session-reconnect";
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -263,18 +265,26 @@ function postRefresh() {
 export async function revokeRefreshToken(): Promise<void> {
   const csrfToken = getCookie("whm_csrf");
   if (!csrfToken) return;
-  try {
-    await axios.post(
-      `${API_BASE_URL}/auth/refresh`,
-      { revoke: true },
-      {
-        withCredentials: true,
-        timeout: REVOKE_REQUEST_TIMEOUT_MS,
-        headers: { "X-CSRF-Token": csrfToken },
-      },
-    );
-  } catch {
-    // The logout itself still clears the session.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await axios.post(
+        `${API_BASE_URL}/auth/refresh`,
+        { revoke: true },
+        {
+          withCredentials: true,
+          timeout: REVOKE_REQUEST_TIMEOUT_MS,
+          headers: { "X-CSRF-Token": csrfToken },
+        },
+      );
+      return;
+    } catch (error) {
+      // The revoke shares the per-IP refresh rate limit, which a busy
+      // clinic behind one NAT address can exhaust: wait and retry a 429.
+      // Anything else, or a last failure, still lets the logout go ahead.
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status !== 429 || attempt >= REVOKE_RETRY_DELAYS_MS.length) return;
+      await delay(REVOKE_RETRY_DELAYS_MS[attempt]);
+    }
   }
 }
 

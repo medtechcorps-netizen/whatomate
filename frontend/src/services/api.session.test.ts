@@ -331,6 +331,48 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(options.withCredentials).toBe(true)
   })
 
+  it('retries a rate-limited revoke before logging out', async () => {
+    vi.useFakeTimers()
+    const order: string[] = []
+    const { api } = await loadTab(async (config) => {
+      order.push('logout')
+      return ok(config)
+    })
+    postSpy
+      .mockImplementationOnce(async () => {
+        order.push('revoke 429')
+        throw httpError(429)
+      })
+      .mockImplementationOnce(async () => {
+        order.push('revoke 429')
+        throw httpError(429)
+      })
+      .mockImplementationOnce(async () => {
+        order.push('revoke ok')
+        return { data: { data: {} }, status: 200 }
+      })
+
+    const logout = api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(3_000)
+    await logout
+
+    expect(order).toEqual(['revoke 429', 'revoke 429', 'revoke ok', 'logout'])
+  })
+
+  it('logs out after the revoke stays rate-limited', async () => {
+    vi.useFakeTimers()
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+    const { api } = await loadTab(adapter)
+    postSpy.mockRejectedValue(httpError(429))
+
+    const logout = api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    expect((await logout).status).toBe(200)
+    expect(postSpy).toHaveBeenCalledTimes(3)
+    expect(adapter).toHaveBeenCalledTimes(1)
+  })
+
   it('still logs out when the revoke fails', async () => {
     const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
     const { api } = await loadTab(adapter)
