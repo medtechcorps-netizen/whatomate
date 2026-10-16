@@ -432,15 +432,22 @@ func TestLaneEForwardMediaMissingFromStorageFailsBeforeMeta(t *testing.T) {
 // laneEStrictGraph behaves like Graph for uploads: a file part without a
 // file name is rejected, as Graph treats it as no file at all.
 type laneEStrictGraph struct {
-	mu      sync.Mutex
-	uploads []string
-	sends   int
+	mu           sync.Mutex
+	uploads      []string
+	contentTypes []string
+	sends        int
 }
 
 func (g *laneEStrictGraph) snapshot() ([]string, int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]string(nil), g.uploads...), g.sends
+}
+
+func (g *laneEStrictGraph) uploadTypes() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.contentTypes...)
 }
 
 func laneEUseStrictGraph(t *testing.T, f *laneEForwardFixture) *laneEStrictGraph {
@@ -464,10 +471,17 @@ func laneEUseStrictGraph(t *testing.T, f *laneEForwardFixture) *laneEStrictGraph
 				}
 				graph.mu.Lock()
 				graph.uploads = append(graph.uploads, part.FileName())
+				graph.contentTypes = append(graph.contentTypes, part.Header.Get("Content-Type"))
 				graph.mu.Unlock()
 				if part.FileName() == "" {
 					w.WriteHeader(http.StatusBadRequest)
 					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "file is required", "code": 100}})
+					return
+				}
+				// Graph matches bare media types; parameters are rejected.
+				if strings.Contains(part.Header.Get("Content-Type"), ";") {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "unsupported type", "code": 131053}})
 					return
 				}
 			}
@@ -496,7 +510,7 @@ func TestLaneEForwardUploadsUnnamedMediaWithAFileName(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(f.media, "audio", "voice.ogg"), []byte("ogg-bytes"), 0o600))
 	voice := f.storedMessage(t, f.source, models.MessageTypeAudio, "", "audio/voice.ogg")
 	require.NoError(t, f.app.DB.Model(&models.Message{}).Where("id = ?", voice.ID).
-		Updates(map[string]any{"media_filename": "", "media_mime_type": "audio/ogg"}).Error)
+		Updates(map[string]any{"media_filename": "", "media_mime_type": "audio/ogg; codecs=opus"}).Error)
 
 	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": voice.ID.String()})
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
@@ -505,11 +519,33 @@ func TestLaneEForwardUploadsUnnamedMediaWithAFileName(t *testing.T) {
 	require.Len(t, uploads, 1)
 	assert.NotEmpty(t, uploads[0])
 	assert.True(t, strings.HasSuffix(uploads[0], ".ogg"), uploads[0])
+	assert.Equal(t, []string{"audio/ogg"}, graph.uploadTypes(), "uploaded with the bare media type")
 	assert.Equal(t, 1, sends)
 	messages := f.messagesFor(t, f.target.ID)
 	require.Len(t, messages, 1)
 	assert.Equal(t, models.MessageStatusSent, messages[0].Status, messages[0].ErrorMessage)
 	assert.Empty(t, messages[0].MediaFilename, "the forwarded row keeps the source's (empty) display name")
+	assert.Equal(t, "audio/ogg; codecs=opus", messages[0].MediaMimeType, "the stored type is unchanged")
+}
+
+// WhatsApp's media limits are checked before anything is uploaded.
+func TestLaneEForwardRefusesMediaAboveWhatsAppLimits(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	graph := laneEUseStrictGraph(t, f)
+	require.NoError(t, os.MkdirAll(filepath.Join(f.media, "images"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(f.media, "images", "big.jpg"), make([]byte, 5<<20+1), 0o600))
+	big := f.storedMessage(t, f.source, models.MessageTypeImage, "", "images/big.jpg")
+
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": big.ID.String()})
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+
+	messages := f.messagesFor(t, f.target.ID)
+	require.Len(t, messages, 1)
+	assert.Equal(t, models.MessageStatusFailed, messages[0].Status)
+	assert.Contains(t, messages[0].ErrorMessage, "larger than WhatsApp allows (5 MB)")
+	uploads, sends := graph.snapshot()
+	assert.Empty(t, uploads)
+	assert.Zero(t, sends)
 }
 
 func TestLaneEForwardRefusesDeletedSource(t *testing.T) {

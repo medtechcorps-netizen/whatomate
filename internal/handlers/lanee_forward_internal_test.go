@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -127,4 +128,56 @@ func TestLaneEForwardRateLimitPerUser(t *testing.T) {
 	assert.False(t, app.allowForward(orgID, userID))
 	assert.True(t, app.allowForward(orgID, otherUser), "the limit is per user")
 	assert.True(t, (&App{Log: testutil.NopLogger()}).allowForward(orgID, userID), "no Redis: allowed")
+}
+
+// laneESizedStore reports object sizes from its listing and counts downloads.
+type laneESizedStore struct {
+	sizes map[string]int64
+	gets  int
+}
+
+func (s *laneESizedStore) Put(context.Context, string, []byte, string) error { return nil }
+func (s *laneESizedStore) Delete(context.Context, string) error              { return nil }
+func (s *laneESizedStore) Get(_ context.Context, key string) ([]byte, string, error) {
+	s.gets++
+	return make([]byte, s.sizes[key]), "", nil
+}
+func (s *laneESizedStore) ListPrefix(_ context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	var objects []storage.ObjectInfo
+	for key, size := range s.sizes {
+		if strings.HasPrefix(key, prefix) {
+			objects = append(objects, storage.ObjectInfo{Key: key, Size: size})
+		}
+	}
+	return objects, nil
+}
+
+func TestLaneEForwardChecksObjectSizeBeforeDownloading(t *testing.T) {
+	orgID := uuid.New()
+	videoKey := tenantObjectKey(orgID, "messages", "videos", "clip.mp4")
+	docKey := tenantObjectKey(orgID, "messages", "documents", "report.pdf")
+	store := &laneESizedStore{sizes: map[string]int64{
+		videoKey:         16<<20 + 1,
+		videoKey + ".v2": 1, // same prefix, different object
+		docKey:           99 << 20,
+	}}
+	app := &App{Log: testutil.NopLogger(), ObjectStore: store, Config: &config.Config{Storage: config.StorageConfig{Type: "s3"}}}
+	account := &models.WhatsAppAccount{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID}
+
+	video := OutgoingMessageRequest{Account: account, Type: models.MessageTypeVideo,
+		forwardMedia: &forwardMediaCopy{OrganizationID: orgID, SourceKey: videoKey, MimeType: "video/mp4"}}
+	err := app.prepareForwardedMedia(&video)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "larger than WhatsApp allows (16 MB)")
+	assert.Zero(t, store.gets, "an oversized object is never downloaded")
+
+	size, known := app.forwardSourceSize(context.Background(), &forwardMediaCopy{OrganizationID: orgID, SourceKey: docKey})
+	assert.True(t, known)
+	assert.Equal(t, int64(99<<20), size)
+	assert.LessOrEqual(t, size, forwardMediaSizeLimit(models.MessageTypeDocument))
+
+	_, known = app.forwardSourceSize(context.Background(), &forwardMediaCopy{OrganizationID: uuid.New(), SourceKey: docKey})
+	assert.False(t, known, "another tenant's key is never listed")
+	assert.Equal(t, int64(5<<20), forwardMediaSizeLimit(models.MessageTypeImage))
+	assert.Equal(t, int64(16<<20), forwardMediaSizeLimit(models.MessageTypeAudio))
 }

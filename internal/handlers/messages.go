@@ -2599,6 +2599,12 @@ const (
 	// five per action, one request each.
 	forwardRateLimitPerMinute = 30
 
+	// WhatsApp Cloud API media limits. A larger attachment is refused before
+	// its bytes are read, so a delivery goroutine never holds an oversized copy.
+	forwardImageMaxBytes      = 5 << 20
+	forwardAudioVideoMaxBytes = 16 << 20
+	forwardDocumentMaxBytes   = 100 << 20
+
 	forwardErrorInvalid            fastglue.ErrorType = "forward_invalid"
 	forwardErrorSourceNotFound     fastglue.ErrorType = "forward_source_not_found"
 	forwardErrorUnsupportedType    fastglue.ErrorType = "forward_unsupported_type"
@@ -2852,11 +2858,18 @@ func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
 	}
 	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
 	defer cancelStorage()
+	limit := forwardMediaSizeLimit(req.Type)
+	if size, known := a.forwardSourceSize(storageCtx, plan); known && size > limit {
+		return forwardTooLargeError(limit)
+	}
 	data, _, err := a.loadTenantMedia(storageCtx, plan.OrganizationID, plan.SourceKey)
 	if err != nil || len(data) == 0 {
 		a.Log.Error("Failed to read media to forward",
 			"error", err, "organization_id", plan.OrganizationID)
 		return errors.New("the forwarded attachment is no longer available")
+	}
+	if int64(len(data)) > limit {
+		return forwardTooLargeError(limit)
 	}
 	key, err := a.saveTenantMedia(
 		storageCtx,
@@ -2883,9 +2896,15 @@ func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
 	if uploadName == "" {
 		uploadName = plan.ObjectName
 	}
+	// Graph matches bare media types: "audio/ogg; codecs=opus" (a stored
+	// voice note) is uploaded as "audio/ogg". The stored type is unchanged.
+	uploadType := mediaTypeEssence(plan.MimeType)
+	if uploadType == "" {
+		uploadType = plan.MimeType
+	}
 	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), forwardMediaUploadTimeout)
 	defer cancelUpload()
-	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, plan.MimeType, uploadName)
+	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, uploadType, uploadName)
 	if err != nil {
 		return fmt.Errorf("failed to upload media: %w", err)
 	}
@@ -3111,13 +3130,28 @@ func recordForwardAudit(
 func (a *App) requireForwardAccountActive(orgID, accountID uuid.UUID) error {
 	ctx, cancel := context.WithTimeout(context.Background(), forwardAccountCheckTimeout)
 	defer cancel()
+	root := a.rootApp()
+	if root == nil || root.DB == nil {
+		return errors.New("database connection is required")
+	}
 	var account models.WhatsAppAccount
-	err := a.rootApp().WithCommittedTenantApp(orgID, func(scoped *App) error {
-		return scoped.DB.WithContext(ctx).
-			Select("id", "status").
+	read := func(tx *gorm.DB) error {
+		if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+			return err
+		}
+		return tx.Select("id", "status").
 			Where("id = ? AND organization_id = ?", accountID, orgID).
 			First(&account).Error
-	})
+	}
+	// The deadline covers the pool acquisition, BEGIN, the tenant binding and
+	// the read.
+	db := root.DB.WithContext(ctx)
+	var err error
+	if root.rlsEnabled() {
+		err = database.WithTenant(db, orgID, read)
+	} else {
+		err = db.Transaction(read)
+	}
 	if err != nil {
 		return fmt.Errorf("check WhatsApp account before upload: %w", err)
 	}
@@ -3144,4 +3178,39 @@ func (a *App) allowForward(orgID, userID uuid.UUID) bool {
 		_ = root.Redis.Expire(ctx, key, 2*time.Minute).Err()
 	}
 	return count <= forwardRateLimitPerMinute
+}
+
+// forwardMediaSizeLimit is the WhatsApp Cloud API limit for a media type.
+func forwardMediaSizeLimit(messageType models.MessageType) int64 {
+	switch messageType {
+	case models.MessageTypeImage:
+		return forwardImageMaxBytes
+	case models.MessageTypeAudio, models.MessageTypeVideo:
+		return forwardAudioVideoMaxBytes
+	default:
+		return forwardDocumentMaxBytes
+	}
+}
+
+func forwardTooLargeError(limit int64) error {
+	return fmt.Errorf("this attachment is larger than WhatsApp allows (%d MB) and cannot be forwarded", limit>>20)
+}
+
+// forwardSourceSize reads an object-store attachment's size from a listing,
+// without downloading it. Local development storage reports unknown; its
+// bytes are size-checked right after the read instead.
+func (a *App) forwardSourceSize(ctx context.Context, plan *forwardMediaCopy) (int64, bool) {
+	if a.ObjectStore == nil || !isTenantObjectKey(plan.OrganizationID, plan.SourceKey) {
+		return 0, false
+	}
+	objects, err := a.ObjectStore.ListPrefix(ctx, plan.SourceKey)
+	if err != nil {
+		return 0, false
+	}
+	for _, object := range objects {
+		if object.Key == plan.SourceKey {
+			return object.Size, true
+		}
+	}
+	return 0, false
 }
