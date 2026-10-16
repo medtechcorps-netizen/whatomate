@@ -435,8 +435,8 @@ func TestInboundContinuation_ChatbotDisabledTransferFailureRetries(t *testing.T)
 	})
 }
 
-// The keyword handover is retried when its transfer did not commit, and the
-// already-sent transfer body is replayed from the action ledger, not resent.
+// An ordinary keyword handover failure consumes its attempt and is retried;
+// the already-sent transfer body is replayed from the action ledger, not resent.
 func TestInboundContinuation_KeywordTransferFailureRetriesWithoutResend(t *testing.T) {
 	app := newProcessorTestApp(t)
 	shared := app.DB
@@ -471,21 +471,23 @@ func TestInboundContinuation_KeywordTransferFailureRetriesWithoutResend(t *testi
 	app.DB = pool
 	app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
 	calls := h1CountingProvider(t, app, http.StatusOK)
-	h1FailFirstCreate(t, pool, "h1:fail_first_keyword_transfer", h1IsAgentTransferCreate,
-		errors.New("h1 synthetic transfer insert failure"))
+	transferErr := errors.New("h1 synthetic transfer insert failure")
+	h1FailFirstCreate(t, pool, "h1:fail_first_keyword_transfer", h1IsAgentTransferCreate, transferErr)
 	baseTime := time.Now().UTC()
 	processor := NewInboundContinuationProcessor(app, time.Second)
 	processor.now = func() time.Time { return baseTime }
 
 	err = processor.ProcessMessage(context.Background(), organization.ID, work.Persisted.ID)
-	require.ErrorContains(t, err, "keyword transfer was not committed")
-	h1RequireWedgeGuard(t, err)
+	require.ErrorContains(t, err, "create keyword transfer")
+	require.ErrorIs(t, err, transferErr)
+	assert.NotErrorIs(t, err, context.DeadlineExceeded)
+	assert.NotContains(t, err.Error(), "wedge guard")
 	assert.EqualValues(t, 1, calls.Load())
 	job := loadInboundContinuationJob(t, &App{DB: shared}, organization.ID, work.Persisted.ID)
 	assert.Equal(t, models.ScheduledJobStatusPending, job.Status)
-	assert.Equal(t, 0, job.Attempts, "a handover post-check failure is a refunded deferral")
-	deferrals, _ := inboundContinuationExactInteger(job.Payload["wedge_guard_deferrals"])
-	assert.Equal(t, 1, deferrals)
+	assert.Equal(t, 1, job.Attempts, "an ordinary transfer failure consumes its attempt")
+	_, deferred := job.Payload["wedge_guard_deferrals"]
+	assert.False(t, deferred, "an ordinary error must not create a congestion refund")
 	assert.Zero(t, h1ActiveTransfers(t, shared, organization.ID, work.Contact.ID))
 
 	require.NoError(t, pool.Callback().Create().Remove("h1:fail_first_keyword_transfer"))

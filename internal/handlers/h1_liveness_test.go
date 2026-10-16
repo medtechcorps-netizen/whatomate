@@ -554,3 +554,108 @@ func TestH1GraphTransferHandoverLockWaitIsBounded(t *testing.T) {
 	assert.Len(t, replayed.Outgoing, 1)
 	h1RequireLiveAfterRun(t, env)
 }
+
+// P2 on the corrected H1 chain: preserve the genuine handover error boundary.
+// These use the already-reviewed positive fixture3b46 and contract helpersb36b.
+func TestH1KeywordHandoverErrorClassifiesOnlyNestedLockFailure(t *testing.T) {
+	lockErr := &pgconn.PgError{Code: "55P03", Message: "canceling statement due to lock timeout"}
+	for _, tc := range []struct {
+		name   string
+		err    error
+		nested bool
+		refund bool
+	}{
+		{"nested_lock", lockErr, true, true},
+		{"wrapped_nested_lock", fmt.Errorf("handover failed: %w", lockErr), true, true},
+		{"non_nested_lock", lockErr, false, false},
+		{"other_sqlstate", &pgconn.PgError{Code: "23503", Message: "synthetic foreign key failure"}, true, false},
+		{"message_only", fmt.Errorf("55P03: canceling statement due to lock timeout"), true, false},
+		{"nil", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := keywordTransferHandoverError(tc.err, tc.nested)
+			if tc.err == nil {
+				require.NoError(t, got)
+				return
+			}
+			require.ErrorIs(t, got, tc.err, "keep the actual original failure")
+			if tc.refund {
+				h1RequireLockTimeoutDeferral(t, got)
+			} else {
+				assert.NotErrorIs(t, got, context.DeadlineExceeded)
+				assert.NotContains(t, got.Error(), "wedge guard")
+			}
+		})
+	}
+}
+
+func TestH1KeywordNestedLockFailureRefundsAndReplaysBodyOnce(t *testing.T) {
+	env := h1KeywordOutcomeFixture(t)
+	failed, observed := h1FailTransferInsertsWithLockTimeout(t, env.pool,
+		"h1:p2_keyword_lock_timeout", canonicalContactWriteAttempts)
+	err := env.run(env.baseTime)
+	h1RequireLockTimeoutDeferral(t, err)
+	assert.EqualValues(t, canonicalContactWriteAttempts, failed.Load())
+	assert.Equal(t, "3s", observed.Load(), "nested handover installed its real lock timeout")
+	first := env.job(t)
+	assert.Equal(t, models.ScheduledJobStatusPending, first.Status)
+	assert.Equal(t, 0, first.Attempts)
+	assert.Equal(t, 1, h1JobDeferrals(first))
+	assert.Zero(t, h1ActiveTransfers(t, env.shared, env.org.ID, env.work.Contact.ID))
+	assert.Equal(t, []string{h1KeywordTransferBody}, env.bodies())
+	assert.Len(t, h1OutgoingMessages(t, env.shared, env.org.ID, env.work.Contact.ID), 1)
+
+	require.NoError(t, env.run(env.baseTime.Add(2*time.Second)))
+	assert.Equal(t, models.ScheduledJobStatusCompleted, env.job(t).Status)
+	assert.EqualValues(t, 1, h1ActiveTransfers(t, env.shared, env.org.ID, env.work.Contact.ID))
+	var transfers int64
+	require.NoError(t, env.shared.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND contact_id = ?", env.org.ID, env.work.Contact.ID).Count(&transfers).Error)
+	assert.EqualValues(t, 1, transfers, "exactly one committed transfer across both attempts")
+	assert.Equal(t, []string{h1KeywordTransferBody}, env.bodies(), "replay never resends the body")
+	assert.Len(t, h1OutgoingMessages(t, env.shared, env.org.ID, env.work.Contact.ID), 1)
+	var setting string
+	require.NoError(t, env.pool.Raw("SHOW lock_timeout").Row().Scan(&setting))
+	assert.Equal(t, "0", setting, "nested timeout does not escape its transaction")
+}
+
+func TestH1KeywordReadLockFailureConsumesAttempt(t *testing.T) {
+	for _, phase := range []string{"checked_count", "settings_read"} {
+		t.Run(phase, func(t *testing.T) {
+			env := h1KeywordOutcomeFixture(t)
+			original := &pgconn.PgError{Code: "55P03", Message: "synthetic keyword read lock failure"}
+			var armed, failed atomic.Bool
+			fired := env.beforeHelperCount(t, func(tx *gorm.DB) {
+				if phase == "checked_count" {
+					failed.Store(true)
+					_ = tx.AddError(original)
+					return
+				}
+				h1P2ClearSettings(t, env)
+				armed.Store(true)
+			})
+			if phase == "settings_read" {
+				name := "h1:p2_settings_lock_after_body:" + uuid.NewString()
+				require.NoError(t, env.pool.Callback().Query().Before("gorm:query").Register(name, func(tx *gorm.DB) {
+					execution := env.execution.Load()
+					if armed.Load() && execution != nil && tx.Statement.Schema != nil &&
+						tx.Statement.Schema.Table == "chatbot_settings" &&
+						tx.Statement.ConnPool == execution.DB.Statement.ConnPool && failed.CompareAndSwap(false, true) {
+						_ = tx.AddError(original)
+					}
+				}))
+				t.Cleanup(func() { _ = env.pool.Callback().Query().Remove(name) })
+			}
+			err := env.run(env.baseTime)
+			require.True(t, fired.Load())
+			require.True(t, failed.Load())
+			h1P2RequireOrdinaryFailure(t, env, err, original)
+			assert.Equal(t, "55P03", postgresErrorCode(err))
+			require.NoError(t, env.run(env.baseTime.Add(2*time.Second)))
+			assert.Equal(t, models.ScheduledJobStatusCompleted, env.job(t).Status)
+			assert.Equal(t, []string{h1KeywordTransferBody}, env.bodies())
+			assert.Len(t, h1OutgoingMessages(t, env.shared, env.org.ID, env.work.Contact.ID), 1)
+			assert.EqualValues(t, 1, h1ActiveTransfers(t, env.shared, env.org.ID, env.work.Contact.ID))
+		})
+	}
+}

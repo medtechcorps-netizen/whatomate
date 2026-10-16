@@ -1056,12 +1056,10 @@ func (a *App) continuePersistedIncomingMessage(
 				return fmt.Errorf("send transfer response: %w", err)
 			}
 		}
-		a.createTransferFromKeyword(account, contact)
-		// H1: see the chatbot-disabled branch (same congestion label and refund). The
-		// transfer body already sent is replayed from the action ledger on retry, never
-		// resent.
-		if !a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-			return fmt.Errorf("wedge guard: keyword transfer was not committed (presumed pool or lock congestion; see the logged transfer error); retrying continuation: %w", context.DeadlineExceeded)
+		// Existing handover and intentional business-hours decline both consume this
+		// inbound. Preserve real failures; the ledger replays the accepted body on retry.
+		if _, err := a.createTransferFromKeyword(account, contact); err != nil {
+			return fmt.Errorf("create keyword transfer: %w", err)
 		}
 		return nil
 	}
@@ -1256,6 +1254,16 @@ func (a *App) continuePersistedIncomingMessage(
 		a.Log.Info("No fallback message configured for existing session")
 	}
 	return nil
+}
+
+// keywordTransferHandoverError is called only for saveAndFinalizeTransfer failure.
+// Lookup/settings/reply errors never pass here. Only a nested handover installs
+// the bounded lock timeout; preserve the actual SQL cause alongside its refund.
+func keywordTransferHandoverError(err error, nested bool) error {
+	if nested && postgresErrorCode(err) == "55P03" {
+		return fmt.Errorf("wedge guard: keyword handover locks not acquired within the nested lock timeout while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
+	}
+	return err
 }
 
 func incomingMessageAutomaticAISuppressed(message *models.Message) bool {

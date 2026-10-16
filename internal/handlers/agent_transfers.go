@@ -1590,23 +1590,37 @@ func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *mo
 	return true, nil
 }
 
-// createTransferFromKeyword creates an agent transfer triggered by a keyword rule
-func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact *models.Contact) {
-	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
+// createTransferFromKeyword creates an agent transfer triggered by a keyword rule.
+// As for createTransferToQueue, true means a handover exists; false with a nil
+// error is an intentional business-hours decline whose configured reply succeeded.
+// Preserve actual errors so only genuine bounded waits qualify for a refund.
+func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact *models.Contact) (bool, error) {
+	var active int64
+	if err := a.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND contact_id = ? AND status = ?", account.OrganizationID, contact.ID, models.TransferStatusActive).
+		Count(&active).Error; err != nil {
+		return false, err
+	}
+	if active > 0 {
 		a.Log.Info("Contact already has active transfer, skipping keyword transfer", "contact_id", contact.ID)
-		return
+		return true, nil
 	}
 
-	settings, _ := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	settings, err := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	if err != nil {
+		return false, err
+	}
 
 	// Check business hours - if outside hours, send out of hours message instead of transfer
 	if settings != nil && settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
 		if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
 			a.Log.Info("Outside business hours, sending out of hours message instead of transfer", "contact_id", contact.ID)
 			if settings.BusinessHours.OutOfHoursMessage != "" {
-				_ = a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage)
+				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
+					return false, err
+				}
 			}
-			return
+			return false, nil
 		}
 	}
 
@@ -1634,10 +1648,10 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true, nil); err != nil {
 		if errors.Is(err, errActiveAgentTransferExists) {
 			a.Log.Debug("Concurrent active transfer already exists, skipping keyword transfer", "contact_id", contact.ID)
-			return
+			return true, nil
 		}
 		a.Log.Error("Failed to create keyword-triggered transfer", "error", err, "contact_id", contact.ID)
-		return
+		return false, keywordTransferHandoverError(err, a.inboundContinuation != nil)
 	}
 
 	var agentIDStr string
@@ -1649,6 +1663,7 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 		"contact_id", contact.ID,
 		"agent_id", agentIDStr,
 	)
+	return true, nil
 }
 
 // createTransferToTeam creates an agent transfer to a specific team with appropriate assignment.
