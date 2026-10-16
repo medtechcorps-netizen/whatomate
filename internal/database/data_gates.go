@@ -142,12 +142,12 @@ func observeMigrationDataGates(session *gorm.DB, runtimeRole string) (returnErr 
 		}
 	}
 	var eligible bool
-	// A managed migration owner may have CREATEROLE/BYPASSRLS, but only the
+	// A managed migration owner may have CREATEROLE/BYPASSRLS/REPLICATION, but only the
 	// native authenticated database owner on this exact held coordinator lease
 	// may use that path. Restricted schema/table owners retain their old path.
 	if db.Raw(`SELECT current_user = session_user AND current_user <> CAST(? AS text)
- AND NOT r.rolsuper AND NOT r.rolreplication
- AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole) OR
+ AND NOT r.rolsuper
+ AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolreplication) OR
   EXISTS(SELECT 1 FROM pg_catalog.pg_database d WHERE d.datname=pg_catalog.current_database() AND d.datdba=r.oid))
  AND r.oid::bigint=CAST(? AS bigint)
  AND (SELECT d.oid::bigint FROM pg_catalog.pg_database d WHERE d.datname=pg_catalog.current_database())=CAST(? AS bigint)

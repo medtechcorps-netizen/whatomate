@@ -1269,6 +1269,10 @@ def _classify_v2(repo: _Repository, base: str, head: str,
         if (not any(reason.startswith("classifier-invalid:") for reason in legacy.reasons)
                 and _pr18_run_metadata_changed(repo, base, head)):
             _pr18_run_metadata_local(repo, base, head)
+        section = "pr18-managed-replication-repair"
+        if (not any(reason.startswith("classifier-invalid:") for reason in legacy.reasons)
+                and _pr18_managed_replication_changed(repo, base, head)):
+            _pr18_managed_replication_local(repo, base, head)
         section = "nullable-source"
         declaration = repo.blob(head, schema_nullable.SOURCE_PATH)
         section = "constant-source"
@@ -2083,6 +2087,187 @@ def _pr18_run_metadata_local(repo, base, head):
     _valid(repaired)
 
 
+# One exact managed-owner replication observation correction after the
+# historical run-metadata edge. Older fingerprints remain immutable.
+_PR18_MANAGED_REPLICATION_POLICY_SHA256 = 'd8e85cbc6e927079287ddc5c29caaad264319a23b3a9bafc7b0b9c2a4cbbceb7'
+_PR18_MANAGED_REPLICATION_REASON = "pr18-managed-replication-repair-incomplete"
+_PR18_MANAGED_REPLICATION_MARKER = "release/deployment/test_pr18_managed_replication_repair.py"
+_PR18_MANAGED_REPLICATION_FILES = {'cmd/whatomate/migration_plan_managed_owner_admission_pg_test.go': ('1f65a0b7da0d8b0637416e64bf061f7fd7fbdbcf27dd95799c06ea1fb04b6abb',
+                                                                     '3e4ef3d4ffc94f4be16e03eb2c1efef227f5a7869e95d8a586b846e3a78616d5'),
+ 'cmd/whatomate/migration_plan_managed_owner_pg_test.go': ('b8cc9cc0090e03a06d657f1af5d70bf97c60dabd8dd0f6e65aa211007bd8d5d4',
+                                                           'faa099ea8cc47569f1bbaddabf03285b7d0bde8f1d797abd9908a3407e48e215'),
+ 'docs/catalog.md': ('29f182362f3128732ea55f6a3ba43dcc099e84fb2f1e3b3a599db4b3cbe115dc',
+                     '4c2641310c4f316af3a7553579beae81df5431688bfef7687675784fac40dae1'),
+ 'internal/database/data_gates.go': ('b8cb4b1b608f87069e2724ae29d4b6b38bcdbcf85e5c2bf085734015902953cd',
+                                     'a56b6a9281cddb47f845ccd9a9b5920ecfb061f7c87d12d35d54f27c29977d06'),
+ 'internal/database/plan.go': ('83d6f4e83ced0c9a02f3ce18470e3da54914cb63c77f70f9a8fda7cb44c68365',
+                               '922b3f623817045bbe0f45a870bd910844a697a0289d23f94ab6503bed9df67b'),
+ 'internal/dbcatalog/registry/migration_path.json': ('4acecb4e3caed65bb71f8d61ea2b3e760129523bfc599130fa3aee5ed421969d',
+                                                     '08618e383eed2ab9eb771918b0ef618efa2ecce8edb99cfd476bd18980938ba6'),
+ 'release/deployment/fixtures/pr18-managed-replication-repair.json': (None,
+                                                                      '59da4fe651b89d4ef544c07f6e6990db795ce8f255f997c15c88c4f8ed7b0977'),
+ 'release/deployment/schema_change.py': ('3ca123b80da6c8c22dc12bd962d94322135bac6b8da306f99636debd7e3d6c28',
+                                         'reviewed-managed-replication-policy-slot'),
+ 'release/deployment/test_pr18_managed_replication_repair.py': (None, '36fbeee996ea3f8806a0c2b75bc54789bde9b3ad4f8aa2d90583b6c54458c6e2'),
+ 'release/deployment/test_pr18_run_metadata_repair.py': ('ebd8f028d75e8ad095ffc031ab02e8bbe078a8dadbadf17d5ede80d2d163b49f',
+                                                         '750c846b773a4b8cc8d5129c0136f9d3b59dd304d42233f1e83ff30c4a8c384c')}
+
+
+def _pr18_managed_replication_blob(repo, revision, path, digest):
+    if digest != "reviewed-managed-replication-policy-slot":
+        return _pr18_observer_blob(repo, revision, path, digest)
+    _valid(path == _PR18_VERIFICATION_REPAIR_POLICY)
+    raw = repo._tree(revision, path)
+    _valid(re.fullmatch(rb"100644 blob [0-9a-f]{40}\t" + re.escape(path.encode()) + rb"\x00", raw) is not None)
+    value = repo.blob(revision, path)
+    _valid(type(value) is bytes and bool(value))
+    slot = re.compile(rb"(?m)^_PR18_MANAGED_REPLICATION_POLICY_SHA256 = '([0-9a-f]{64})'\n")
+    matches = list(slot.finditer(value))
+    _valid(len(matches) == 1)
+    match = matches[0]
+    _valid(match.group(1).decode("ascii") == _PR18_MANAGED_REPLICATION_POLICY_SHA256)
+    canonical = value[:match.start(1)] + b"0" * 64 + value[match.end(1):]
+    _valid(hashlib.sha256(canonical).hexdigest() == _PR18_MANAGED_REPLICATION_POLICY_SHA256)
+    return value
+
+
+def _pr18_managed_replication_reuse_before_blob(repo, revision, path, digest):
+    """Reuse only a proven immutable preimage; the caller checks reader liveness."""
+    key = (revision, path)
+    if key in repo.cache or re.fullmatch(r"[0-9a-f]{64}", digest or "") is None:
+        return
+    tree = repo._tree(revision, path)
+    match = re.fullmatch(rb"100644 blob ([0-9a-f]{40})\t" + re.escape(path.encode()) + rb"\x00", tree)
+    if match is None:
+        return
+    for prior, value in tuple(repo.cache.items()):
+        if type(value) is not bytes or repo._trees.get(prior) != tree:
+            continue
+        # A cache row is usable only under the fresh current mode/path/OID,
+        # the reviewed SHA256, and the object's own Git blob identity.
+        if (hashlib.sha256(value).hexdigest() != digest
+                or hashlib.sha1(b"blob " + str(len(value)).encode() + b"\x00" + value).hexdigest().encode()
+                != match.group(1)):
+            continue
+        _valid(len(value) <= MAX_ARTIFACT_BYTES)
+        repo.total += len(value)
+        _valid(repo.total <= 64 * 1024 * 1024)
+        repo.cache[key] = value
+        return
+
+
+def _pr18_managed_replication_before(repo, revision):
+    _valid(len(_PR18_MANAGED_REPLICATION_FILES) == 10)
+    # Even an entirely cached profile must observe the active reader budget.
+    _valid(_git(repo.root, ["cat-file", "-t", revision]) == b"commit\n")
+    # Replay the latest historical postimage at overlapping paths, including
+    # the run-metadata policy's own historical slot, never an older slot.
+    expected = {path: digest for path, (_, digest) in _PR18_OBSERVER_FILES.items()}
+    expected.update({path: digest for path, (_, digest) in _PR18_VERIFICATION_REPAIR_FILES.items()})
+    expected.update({path: digest for path, (_, digest) in _PR18_MANAGED_OWNER_FILES.items()})
+    expected.update({path: digest for path, (_, digest) in _PR18_RUN_METADATA_REPAIR_FILES.items()})
+    for path, digest in expected.items():
+        reuse_digest = _PR18_MANAGED_REPLICATION_FILES.get(path, (digest, None))[0]
+        _pr18_managed_replication_reuse_before_blob(repo, revision, path, reuse_digest)
+        _pr18_run_metadata_blob(repo, revision, path, digest)
+    for path, digest in _PR18_OBSERVER_PROTECTED.items():
+        _pr18_observer_blob(repo, revision, path, digest)
+    _pr18_observer_blob(repo, revision, DORMANT,
+                       "041af21a905dd160657431d8a4482d8f52f162f312d4cc9148a071400bbd508d")
+    _pr18_observer_blob(repo, revision, "internal/dbcatalog/registry/coordinator_bindings.json",
+                       "ecc49fb74995dcd121a645fd139ebff2fdc9e22bd2a1b01df91a3eb4e24daee4")
+    _valid(not _git(repo.root, ["ls-tree", "-r", "--name-only", "-z", revision, "--", _V2_PENDING.rstrip("/")]))
+    for path in (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
+                 schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH):
+        _pr18_observer_blob(repo, revision, path, None)
+    for path, (digest, _) in _PR18_MANAGED_REPLICATION_FILES.items():
+        _pr18_observer_blob(repo, revision, path, digest)
+
+
+def _pr18_managed_replication_changed(repo, base, head):
+    if base == head or not _PR18_MANAGED_REPLICATION_FILES:
+        return False
+    _valid(all(type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value)
+               for value in (base, head)))
+    key = (base, head)
+    checked = getattr(repo, "_managed_replication_introductions_checked", set())
+    if key in checked:
+        _valid(_git(repo.root, ["cat-file", "-t", base]) == b"commit\n")
+        return False
+    marker = _PR18_MANAGED_REPLICATION_MARKER
+    if repo._tree(base, marker):
+        # This marker is not a permanent path reservation. Full-origin
+        # admission separately replays every prior nonempty edge.
+        _valid(_git(repo.root, ["cat-file", "-t", base]) == b"commit\n")
+        checked.add(key)
+        repo._managed_replication_introductions_checked = checked
+        return False
+    policy_tree = (b"100644 blob 275140b1ababc4df84a6e47ef6b4844f2d0c674f\t"
+                   + _PR18_VERIFICATION_REPAIR_POLICY.encode() + b"\x00")
+    before = False
+    if repo._tree(base, _PR18_VERIFICATION_REPAIR_POLICY) == policy_tree:
+        try:
+            _pr18_managed_replication_before(repo, base)
+        except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+            pass
+        else:
+            before = True
+    if not before:
+        # Both existing migration/registry readers retain their own reads and
+        # validation. Reuse only successful immutable bytes from this invocation.
+        raw = getattr(repo, "_run_metadata_history_reads", {}).get(key)
+        if raw is None:
+            raw = _git(repo.root, ["rev-list", "--first-parent", "--reverse", base + ".." + head])
+        else:
+            _valid(_git(repo.root, ["cat-file", "-t", base]) == b"commit\n")
+        _valid(len(raw) <= MAX_HISTORY_COMMITS * 41)
+        revisions = raw.decode("ascii").splitlines()
+        _valid(len(revisions) <= MAX_HISTORY_COMMITS and len(revisions) == len(set(revisions))
+               and all(re.fullmatch(r"[0-9a-f]{40}", rev) and rev != base for rev in revisions)
+               and (not revisions or revisions[-1] == head))
+        if any(repo._tree(revision, marker) for revision in revisions):
+            present = False
+            for prior, revision in _pr18_verification_repair_history(repo, base, head):
+                now = bool(repo._tree(revision, marker))
+                if now and not present:
+                    _pr18_managed_replication_edge(repo, prior, revision)
+                present = now
+        checked.add(key)
+        repo._managed_replication_introductions_checked = checked
+        return False
+    # A completed predecessor's test remains an ordinary editable test path.
+    # Once another repair path triggers admission, its exact wrapper bytes are
+    # still mandatory in the ten-path atomic edge, with no prefix or suffix.
+    triggers = _PR18_MANAGED_REPLICATION_FILES.keys() - {
+        "release/deployment/test_pr18_run_metadata_repair.py"}
+    if any(path in triggers for _, path in changed_paths(repo.root, base, head)):
+        return True
+    return any(path in triggers
+               for prior, revision in _pr18_verification_repair_history(repo, base, head)
+               for _, path in changed_paths(repo.root, prior, revision))
+
+
+def _pr18_managed_replication_edge(repo, base, head):
+    _pr18_managed_replication_before(repo, base)
+    expected = sorted(("A" if old is None else "M", path)
+                      for path, (old, _) in _PR18_MANAGED_REPLICATION_FILES.items())
+    _valid(sorted(changed_paths(repo.root, base, head)) == expected)
+    for path, (_, digest) in _PR18_MANAGED_REPLICATION_FILES.items():
+        _pr18_managed_replication_blob(repo, head, path, digest)
+
+
+def _pr18_managed_replication_local(repo, base, head):
+    _pr18_managed_replication_before(repo, base)
+    repaired = False
+    for prior, revision in _pr18_verification_repair_history(repo, base, head):
+        if changed_paths(repo.root, prior, revision):
+            _valid(not repaired)
+            _pr18_managed_replication_edge(repo, prior, revision)
+            repaired = True
+    _valid(repaired)
+
+
+
 def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                              *, ci: bool = False) -> tuple[str, str]:
     """Prove one exact transition without calling either classifier or CI.
@@ -2105,7 +2290,8 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                       for path, (old, _) in _PR18_OBSERVER_FILES.items())
     descriptors = (schema_nullable.SOURCE_PATH, schema_nullable.CONSTANT_SOURCE_PATH,
                    schema_index.SOURCE_PATH, schema_relation.SOURCE_PATH, schema_tenant_profile.SOURCE_PATH)
-    prior, prior_state, anchor, repaired, managed, metadata_repaired = None, None, None, False, False, False
+    prior, prior_state, anchor = None, None, None
+    repaired, managed, metadata_repaired, replication_repaired = False, False, False, False
     for revision in (base, *revisions):
         if prior is not None:
             _valid(_git(repo.root, ["rev-parse", "--verify", revision + "^1"]) == prior.encode() + b"\n")
@@ -2151,10 +2337,13 @@ def _pr18_observer_transition(repo: _Repository, base: str, head: str,
                 elif not managed:
                     _pr18_managed_owner_edge(repo, prior, revision)
                     managed = True
-                else:
-                    _valid(not metadata_repaired)
+                elif not metadata_repaired:
                     _pr18_run_metadata_edge(repo, prior, revision)
                     metadata_repaired = True
+                else:
+                    _valid(not replication_repaired)
+                    _pr18_managed_replication_edge(repo, prior, revision)
+                    replication_repaired = True
             elif ci or state == 2:
                 _valid(not changes)
         prior, prior_state = revision, state
@@ -2245,6 +2434,19 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
             return ()
     except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
         return tuple(sorted(set(legacy.reasons) | {_PR18_RUN_METADATA_REPAIR_REASON}))
+    try:
+        if (not any(reason.startswith("classifier-invalid:") for reason in legacy.reasons)
+                and _pr18_managed_replication_changed(repo, base, head)):
+            _pr18_managed_replication_local(repo, base, head)
+            _valid(legacy.reasons == ("migration-path-changed:closure",)
+                   and legacy.kind == "none" and legacy.dormant is False)
+            policy = _classify_v2(repo, base, head, legacy)
+            _valid(not policy.reasons and policy.kind == "none" and policy.dormant is False
+                   and policy.requirements == _PR18_OBSERVER_REQUIREMENTS
+                   and policy.migration_changes == ("generated migration closure changed",))
+            return ()
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {_PR18_MANAGED_REPLICATION_REASON}))
     # This fixed target must not disappear behind the legacy clean fast path
     # when its generated manifest or paired registry revisions are stale.
     try:

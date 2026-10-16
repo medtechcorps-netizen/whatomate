@@ -22,16 +22,28 @@ import (
 // successful observation, not a translated or suppressed error.
 func TestMigrationPlanPGManagedOwnerObserverRegression(t *testing.T) {
 	f := newMigrationPlanFixture(t, true)
-	for _, managed := range []bool{false, true} {
-		name := "restricted_owner_control"
-		if managed {
-			name = "managed_owner"
+	for _, scenario := range []struct {
+		name        string
+		managed     bool
+		replication bool
+	}{
+		{name: "restricted_owner_control"},
+		{name: "managed_owner", managed: true},
+		// DigitalOcean documents REPLICATION on its managed owner. This
+		// generated role tests that shape without claiming live role facts.
+		{name: "managed_owner_with_replication", managed: true, replication: true},
+	} {
+		if scenario.managed {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			_, err := f.admin.Exec(ctx, "ALTER ROLE "+pgx.Identifier{f.owner}.Sanitize()+" CREATEDB CREATEROLE BYPASSRLS")
+			attributes := "CREATEDB CREATEROLE BYPASSRLS NOREPLICATION"
+			if scenario.replication {
+				attributes = "CREATEDB CREATEROLE BYPASSRLS REPLICATION"
+			}
+			_, err := f.admin.Exec(ctx, "ALTER ROLE "+pgx.Identifier{f.owner}.Sanitize()+" "+attributes)
 			cancel()
 			planPGOK(t, err, "configure generated managed owner")
 		}
-		t.Run(name, func(t *testing.T) {
+		t.Run(scenario.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			var super, createRole, bypass, replication, ownsDatabase bool
@@ -39,10 +51,10 @@ func TestMigrationPlanPGManagedOwnerObserverRegression(t *testing.T) {
  FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=$2 WHERE r.rolname=$1`, f.owner, f.database).Scan(&super, &createRole, &bypass, &replication, &ownsDatabase)
 			planPGOK(t, err, "verify generated owner attributes")
 			require.False(t, super)
-			require.False(t, replication)
+			require.Equal(t, scenario.replication, replication)
 			require.True(t, ownsDatabase)
-			require.Equal(t, managed, createRole)
-			require.Equal(t, managed, bypass)
+			require.Equal(t, scenario.managed, createRole)
+			require.Equal(t, scenario.managed, bypass)
 			t.Run("data_gates", func(t *testing.T) { managedOwnerDataGateProbe(t, f) })
 			t.Run("planner", func(t *testing.T) { managedOwnerPlannerProbe(t, f) })
 		})

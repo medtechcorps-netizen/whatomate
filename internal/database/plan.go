@@ -148,8 +148,8 @@ func planSeedSession(ctx context.Context, tx pgx.Tx, owner *PlanSeedHeldOwner) e
 	}
 	var eligible bool
 	var statement, lock, idle string
-	err := tx.QueryRow(ctx, `SELECT current_user = session_user AND NOT r.rolsuper AND NOT r.rolreplication
- AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole) OR CAST($1 AS boolean))
+	err := tx.QueryRow(ctx, `SELECT current_user = session_user AND NOT r.rolsuper
+ AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolreplication) OR CAST($1 AS boolean))
  AND pg_catalog.current_setting('server_version_num')::integer / 10000 = 17
  AND NOT pg_catalog.pg_is_in_recovery()
  AND pg_catalog.current_setting('transaction_read_only') = 'on'
@@ -502,11 +502,11 @@ func validPlanSeedHeldOwner(owner PlanSeedHeldOwner) bool {
 }
 
 // ObservePlanSeedsOnHeldOwner admits the explicitly bound native migration
-// owner, including a managed owner's CREATEROLE/BYPASSRLS attributes. The
-// ordinary ObservePlanSeeds API retains its strict role restrictions. This path
-// additionally requires an exact live held-lock witness, and actual database
-// ownership for a privileged owner; superuser/replication, transaction and
-// table-policy checks remain.
+// owner, including a managed owner's CREATEROLE/BYPASSRLS/REPLICATION
+// attributes. The ordinary ObservePlanSeeds API retains its strict role
+// restrictions. This path additionally requires an exact live held-lock
+// witness, and actual database ownership for a privileged owner; superuser,
+// transaction, replication-origin and table-policy checks remain.
 func ObservePlanSeedsOnHeldOwner(ctx context.Context, tx pgx.Tx, owner PlanSeedHeldOwner) (PlanSeedObservations, error) {
 	return observePlanSeeds(ctx, tx, &owner)
 }
@@ -533,9 +533,9 @@ func planSeedHeldOwnerSession(ctx context.Context, tx pgx.Tx, owner PlanSeedHeld
  AND l.objid::bigint=1380270905
 )
  SELECT current_user=session_user AND current_user::text=$2 AND r.oid::bigint=$3
- AND NOT r.rolsuper AND NOT r.rolreplication
+ AND NOT r.rolsuper
  AND d.datname::text=$4 AND d.oid::bigint=$5
- AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole) OR d.datdba=r.oid)
+ AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolreplication) OR d.datdba=r.oid)
  AND pg_catalog.pg_backend_pid()::bigint<>$6
  AND pg_catalog.current_setting('application_name')='rereply-plan-owner'
  AND (SELECT count(*) FROM marked)=1 AND (SELECT count(*) FROM held)=1
