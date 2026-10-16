@@ -1,8 +1,9 @@
 /** @vitest-environment happy-dom */
 
-import { effectScope } from 'vue'
+import { effectScope, nextTick, reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  SESSION_ENDING_EVENT,
   messageStatusFromRealtimeEvent,
   useChatAttachments,
   type RealtimeActivity,
@@ -79,6 +80,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  // End batches a test left in flight, so their window listeners go away.
+  window.dispatchEvent(new CustomEvent(SESSION_ENDING_EVENT))
   vi.unstubAllGlobals()
   vi.clearAllMocks()
 })
@@ -293,8 +296,10 @@ describe('useChatAttachments sending', () => {
       sent: 2,
       failed: 1,
       notSent: 0,
+      unconfirmed: 0,
       failedNames: ['lab-3.pdf'],
       notSentNames: [],
+      unconfirmedNames: [],
       recipient: 'Patient contact-a',
       stopped: false,
       detached: true,
@@ -542,15 +547,17 @@ describe('useChatAttachments pacing', () => {
   it('reports a message the provider rejected as failed', async () => {
     const live = realtime()
     const { attachments, calls, onBatchFinished } = setup({ subscribeRealtime: live.subscribeRealtime })
-    attachments.stage([file('a.png', 'image/png')])
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
     const done = attachments.sendAll()
     await settle()
     calls[0].result.resolve({ id: 'm1', status: 'pending' })
     await settle()
     live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'failed', error_message: 'Media upload error' } })
+    await settle()
+    calls[1].result.resolve({ id: 'm2', status: 'sent' })
     await done
     expect(attachments.items.value[0]).toMatchObject({ status: 'failed', errorMessage: 'Media upload error' })
-    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 0, failed: 1, failedNames: ['a.png'] }))
+    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 1, failed: 1, failedNames: ['a.png'] }))
   })
 
   it('moves on after the bounded wait when no status arrives', async () => {
@@ -587,7 +594,7 @@ describe('useChatAttachments pacing', () => {
 })
 
 describe('useChatAttachments stop', () => {
-  it('aborts a file that is still uploading and leaves unstarted files ready', async () => {
+  it('aborts a file still uploading, marks it unconfirmed and leaves unstarted files ready', async () => {
     const { attachments, calls, onBatchFinished } = setup()
     attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png'), file('c.png', 'image/png')])
     const done = attachments.sendAll()
@@ -601,9 +608,18 @@ describe('useChatAttachments stop', () => {
     await done
 
     expect(calls).toHaveLength(2)
-    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'ready', 'ready'])
+    // Progress events lag the network: the server may already have b.png.
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'unconfirmed', 'ready'])
     expect(onBatchFinished).toHaveBeenCalledWith(
-      expect.objectContaining({ sent: 1, failed: 0, notSent: 2, notSentNames: ['b.png', 'c.png'], stopped: true }),
+      expect.objectContaining({
+        sent: 1,
+        failed: 0,
+        notSent: 1,
+        unconfirmed: 1,
+        notSentNames: ['c.png'],
+        unconfirmedNames: ['b.png'],
+        stopped: true,
+      }),
     )
     // The dialog stays open with the unsent files ready to send again.
     expect(attachments.isOpen.value).toBe(true)
@@ -674,5 +690,139 @@ describe('messageStatusFromRealtimeEvent', () => {
     expect(messageStatusFromRealtimeEvent({ type: 'status_update', payload: { status: 'sent' } })).toBeNull()
     expect(messageStatusFromRealtimeEvent({ type: 'status_update' })).toBeNull()
     expect(messageStatusFromRealtimeEvent(null)).toBeNull()
+  })
+})
+
+describe('useChatAttachments session binding', () => {
+  function signedIn(userId: string | null = 'agent-1') {
+    const auth = reactive({ userId: userId as string | null })
+    return {
+      auth,
+      session: { userId: () => auth.userId, isAuthenticated: () => auth.userId !== null },
+    }
+  }
+
+  it('aborts everything, drops the unload prompt and reports nothing when the session is ending', async () => {
+    const { session } = signedIn()
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('lab-1.pdf', 'application/pdf'), file('lab-2.pdf', 'application/pdf')])
+    const done = attachments.sendAll()
+    await settle()
+
+    window.dispatchEvent(new CustomEvent(SESSION_ENDING_EVENT))
+    expect(calls[0].signal.aborted).toBe(true)
+    // Right away, before the request settles: no "Leave site?" over patient data.
+    const unload = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(unload)
+    expect(unload.defaultPrevented).toBe(false)
+    // The staging dialog is cleared too.
+    expect(attachments.isOpen.value).toBe(false)
+    expect(attachments.items.value).toHaveLength(0)
+
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.isSending.value).toBe(false)
+  })
+
+  it('ends the batch when the auth store signs out, without waiting for the event', async () => {
+    const { auth, session } = signedIn()
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    auth.userId = null
+    await nextTick()
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+
+  it('never continues a batch under a different user', async () => {
+    const { auth, session } = signedIn('agent-1')
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    // Another agent signs in in the same tab while file 1 is in flight.
+    auth.userId = 'agent-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+
+  it('does not start a batch when nobody is signed in', async () => {
+    const { session } = signedIn(null)
+    const { attachments, calls } = setup({ session })
+    attachments.stage([file('a.png', 'image/png')])
+    expect(await attachments.sendAll()).toBeNull()
+    expect(calls).toHaveLength(0)
+  })
+
+  it('clears staged files on session end even with no batch running', () => {
+    const { attachments } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    window.dispatchEvent(new CustomEvent(SESSION_ENDING_EVENT))
+    expect(attachments.isOpen.value).toBe(false)
+    expect(attachments.items.value).toHaveLength(0)
+  })
+
+  it('removes its session listeners when its scope is disposed', () => {
+    const { attachments, scope } = setup()
+    scope.stop()
+    attachments.stage([file('a.png', 'image/png')])
+    window.dispatchEvent(new CustomEvent(SESSION_ENDING_EVENT))
+    expect(attachments.items.value).toHaveLength(1)
+  })
+})
+
+describe('useChatAttachments deadlines and the last file', () => {
+  it('marks a file unconfirmed when the server does not answer in time after the upload', async () => {
+    const { attachments, calls, onBatchFinished } = setup({ responseDeadlineMs: 20 })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(100, 100)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    expect(calls[0].signal.aborted).toBe(true)
+    await settle()
+    // The batch moves on to the next file.
+    expect(calls).toHaveLength(2)
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+    expect(attachments.items.value.map(item => item.status)).toEqual(['unconfirmed', 'sent'])
+    expect(onBatchFinished).toHaveBeenCalledWith(
+      expect.objectContaining({ sent: 1, unconfirmed: 1, unconfirmedNames: ['a.png'] }),
+    )
+    // Kept on screen so the agent sees which file to check.
+    expect(attachments.isOpen.value).toBe(true)
+  })
+
+  it('does not hold a one-file batch on Sending for the pacing wait', async () => {
+    const live = realtime()
+    const { attachments, calls } = setup({ subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await done
+    expect(attachments.isSending.value).toBe(false)
+    expect(live.listenerCount).toBe(0)
+  })
+
+  it('still uses a status that arrived for the last file before its response', async () => {
+    const live = realtime()
+    const { attachments, calls } = setup({ subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'failed', error_message: 'Rejected' } })
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await done
+    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', errorMessage: 'Rejected' })
   })
 })

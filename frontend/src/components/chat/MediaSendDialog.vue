@@ -312,6 +312,15 @@ function onOpenChange(open: boolean) {
               <CheckCircle2 class="h-3 w-3" aria-hidden="true" />
               {{ t('chat.composer.sent') }}
             </p>
+            <p
+              v-else-if="item.status === 'unconfirmed'"
+              class="flex items-start gap-1 text-xs text-amber-500"
+              role="status"
+              data-testid="composer-media-unconfirmed"
+            >
+              <AlertTriangle class="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+              <span>{{ t('chat.composer.unconfirmed') }}</span>
+            </p>
             <p v-else-if="item.status === 'failed'" class="flex items-start gap-1 text-xs text-destructive" role="alert">
               <AlertTriangle class="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
               <span>{{ item.errorMessage || t('chat.composer.failedDefault') }}</span>

@@ -251,4 +251,11 @@ describe('MediaSendDialog', () => {
     expect(closed.get('[data-testid="composer-media-window-closed"]').text()).toContain('chat.composer.windowClosed')
     expect(buttonByTestId(closed, 'composer-media-send').attributes('disabled')).toBeUndefined()
   })
+
+  it('flags a file that may already have been sent', () => {
+    const wrapper = mountDialog({ items: [item('a.png', 'image/png', { status: 'unconfirmed' })] })
+    expect(wrapper.get('[data-testid="composer-media-unconfirmed"]').text()).toContain('chat.composer.unconfirmed')
+    // It is not offered for an automatic resend.
+    expect(wrapper.find('[data-testid="composer-media-retry"]').exists()).toBe(false)
+  })
 })

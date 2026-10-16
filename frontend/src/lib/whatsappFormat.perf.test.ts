@@ -116,42 +116,65 @@ describe('linear parser', () => {
     }
   })
 
-  const adversarial = {
-    'space-star-a': ' *a'.repeat(21846).slice(0, 65536),
-    'mixed openers': '*_~`a '.repeat(10923).slice(0, 65536),
-    'underscores': '_a'.repeat(32768),
-    'nested spans': '*a _b ~c `d` c~ b_ a* '.repeat(3000).slice(0, 65536),
-    'dotted link': 'https://' + '.'.repeat(65520) + 'x',
-    'many links': 'www.a_b_ '.repeat(7282).slice(0, 65536),
+  // Adversarial generators by length. Timing assertions compare equal total
+  // work (one 64 KB parse vs eight 8 KB parses, best of 3): a linear parser
+  // scores about 1, the old quadratic one about 8. Absolute bounds are only a
+  // generous ceiling (the old parser took 6 s), so a busy CI box stays green.
+  const repeatTo = (pattern: string, length: number) => pattern.repeat(Math.ceil(length / pattern.length)).slice(0, length)
+  const adversarial: Record<string, (length: number) => string> = {
+    'space-star-a': length => repeatTo(' *a', length),
+    'mixed openers': length => repeatTo('*_~`a ', length),
+    'underscores': length => repeatTo('_a', length),
+    'nested spans': length => repeatTo('*a _b ~c `d` c~ b_ a* ', length),
+    'dotted link': length => 'https://' + '.'.repeat(length - 9) + 'x',
+    'many links': length => repeatTo('www.a_b_ ', length),
+  }
+  const BIG = 65_536
+  const SMALL = 8_192
+  const SCALING_LIMIT = 4
+  const CEILING_MS = 1_000
+
+  function bestOf(runs: number, fn: () => void): number {
+    let best = Infinity
+    for (let run = 0; run < runs; run++) best = Math.min(best, time(fn))
+    return best
   }
 
   // Warm the JIT so the first timed case is not penalised.
   parseWhatsAppFormat(' *a'.repeat(1000), { maxFormattedLineLength: Infinity })
 
-  for (const [name, text] of Object.entries(adversarial)) {
-    it(`parses a 64 KB adversarial line (${name}) in under 50 ms, even with no line cap`, () => {
-      expect(text.length).toBeGreaterThanOrEqual(65_000)
-      expect(time(() => parseWhatsAppFormat(text, { maxFormattedLineLength: Infinity }))).toBeLessThan(50)
-      expect(time(() => parseWhatsAppFormat(text))).toBeLessThan(50)
+  for (const [name, make] of Object.entries(adversarial)) {
+    it(`parses adversarial input (${name}) in linear time, even with no line cap`, () => {
+      const big = make(BIG)
+      const small = make(SMALL)
+      const uncapped = { maxFormattedLineLength: Infinity }
+      const bigMs = bestOf(3, () => parseWhatsAppFormat(big, uncapped))
+      const smallMs = bestOf(3, () => {
+        for (let k = 0; k < BIG / SMALL; k++) parseWhatsAppFormat(small, uncapped)
+      })
+      // Floor the denominator so timer granularity cannot fake a large ratio.
+      expect(bigMs / Math.max(smallMs, 0.5)).toBeLessThan(SCALING_LIMIT)
+      expect(bigMs).toBeLessThan(CEILING_MS)
+      expect(bestOf(3, () => parseWhatsAppFormat(big))).toBeLessThan(CEILING_MS)
     })
   }
 
-  it('renders a 65,536-character adversarial line in under 50 ms', () => {
+  it('renders a 65,536-character adversarial line quickly', () => {
     mount(WhatsAppText, { props: { text: '*warm* up' } }).unmount()
-    const text = adversarial['space-star-a']
+    const text = adversarial['space-star-a'](BIG)
     let wrapper: ReturnType<typeof mount> | undefined
     const elapsed = time(() => {
       wrapper = mount(WhatsAppText, { props: { text } })
     })
-    expect(elapsed).toBeLessThan(50)
+    expect(elapsed).toBeLessThan(CEILING_MS)
     expect(wrapper!.element.textContent).toBe(text)
     wrapper!.unmount()
   })
 
-  it('renders 64 KB of short adversarial lines in under 50 ms', () => {
+  it('parses 64 KB of short adversarial lines quickly', () => {
     const text = Array.from({ length: 512 }, () => ' *a _b'.repeat(21)).join('\n')
     expect(text.length).toBeGreaterThan(64_000)
-    expect(time(() => parseWhatsAppFormat(text))).toBeLessThan(50)
+    expect(bestOf(3, () => parseWhatsAppFormat(text))).toBeLessThan(CEILING_MS)
   })
 })
 

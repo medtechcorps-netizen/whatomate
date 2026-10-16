@@ -475,6 +475,8 @@
       "batchReport": "{name}: {sent} sent, {failed} failed, {notSent} not sent",
       "batchReportFiles": "Not sent: {files}",
       "batchReportDetached": "Not sent: {files}. Open the chat and attach them again.",
+      "batchReportUnconfirmed": "Check the chat for {files}: they may have been sent.",
+      "unconfirmed": "May have been sent. Check the chat before sending it again.",
       "busySending": "Still sending files to {name}. Try again when they have finished.",
       "stopSending": "Stop sending",
       "stopping": "Stopping..."

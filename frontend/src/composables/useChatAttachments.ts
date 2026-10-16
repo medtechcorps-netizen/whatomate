@@ -1,4 +1,4 @@
-import { computed, getCurrentScope, markRaw, onScopeDispose, ref } from 'vue'
+import { computed, effectScope, getCurrentScope, markRaw, onScopeDispose, ref, watch } from 'vue'
 import { messagesService } from '@/services/api'
 import { getErrorMessage } from '@/lib/api-utils'
 import { convertImageToJpeg } from '@/lib/chatImageConversion'
@@ -12,7 +12,19 @@ import {
   type ChatMediaKind,
 } from '@/lib/chatAttachments'
 
-export type StagedAttachmentStatus = 'ready' | 'invalid' | 'converting' | 'sending' | 'sent' | 'failed'
+/**
+ * 'unconfirmed': the request was cut off (Stop, or no answer before the
+ * deadline) after the server may already have received the file. It is
+ * never resent automatically; the agent checks the chat.
+ */
+export type StagedAttachmentStatus =
+  | 'ready'
+  | 'invalid'
+  | 'converting'
+  | 'sending'
+  | 'sent'
+  | 'failed'
+  | 'unconfirmed'
 
 export interface StagedAttachment {
   id: string
@@ -72,8 +84,11 @@ export interface BatchSummary {
   failed: number
   /** Files the batch never sent (stopped before they started). */
   notSent: number
+  /** Files that may or may not have reached the server. */
+  unconfirmed: number
   failedNames: string[]
   notSentNames: string[]
+  unconfirmedNames: string[]
   /** The patient the batch went to. */
   recipient: string
   /** The agent pressed Stop. */
@@ -114,7 +129,23 @@ export interface UseChatAttachmentsOptions {
   subscribeRealtime?: (listener: (event: RealtimeActivity) => void) => () => void
   /** Longest wait for a message to leave 'pending'. */
   settleTimeoutMs?: number
+  /** Once a file has fully uploaded, how long to wait for the server's answer. */
+  responseDeadlineMs?: number
+  /**
+   * The signed-in session. A batch only ever runs for the user who confirmed
+   * it: sign-out, expiry or a different user ends it at once, silently.
+   */
+  session?: {
+    userId: () => string | number | null | undefined
+    isAuthenticated: () => boolean
+  }
 }
+
+/**
+ * Dispatched on window by the auth layer, synchronously, before it clears
+ * the session and navigates (sign-out, signed out elsewhere, expiry).
+ */
+export const SESSION_ENDING_EVENT = 'rereply:session-ending'
 
 /**
  * Pacing bound. The server holds the contact row lock across Meta's media
@@ -122,6 +153,8 @@ export interface UseChatAttachmentsOptions {
  * upload before that finishes pins a second pool connection behind it.
  */
 export const MEDIA_SETTLE_TIMEOUT_MS = 10_000
+/** No answer this long after the body uploaded: give up and mark the file unconfirmed. */
+export const MEDIA_RESPONSE_DEADLINE_MS = 120_000
 const STATUS_LOG_LIMIT = 500
 
 const defaultSend: SendChatMedia = async (request, options) => {
@@ -174,14 +207,12 @@ function revokePreviewUrl(url: string | null) {
   }
 }
 
-function warnBeforeUnload(event: BeforeUnloadEvent) {
-  // Closing or reloading the tab would cut off the files still queued.
-  event.preventDefault()
-  event.returnValue = ''
-}
-
 interface ActiveBatch {
   target: ChatAttachmentTarget
+  /** The user who confirmed the batch. */
+  userId: string | null
+  /** The session ended or changed: abort everything and report nothing. */
+  terminated: boolean
   controller: AbortController | null
   /** The in-flight file's body has been fully uploaded. */
   uploadComplete: boolean
@@ -204,6 +235,19 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   const send = options.send ?? defaultSend
   const convertImage = options.convertImage ?? ((file: File) => convertImageToJpeg(file))
   const settleTimeoutMs = options.settleTimeoutMs ?? MEDIA_SETTLE_TIMEOUT_MS
+  const responseDeadlineMs = options.responseDeadlineMs ?? MEDIA_RESPONSE_DEADLINE_MS
+  const session = options.session
+
+  function currentUserId(): string | null {
+    const id = session?.userId()
+    return id === null || id === undefined || id === '' ? null : String(id)
+  }
+
+  /** True while the user who confirmed the batch is still the one signed in. */
+  function sessionIsCurrent(batch: ActiveBatch): boolean {
+    if (!session) return true
+    return session.isAuthenticated() && currentUserId() === batch.userId
+  }
   const items = ref<StagedAttachment[]>([])
   const isOpen = ref(false)
   /** A batch is in flight; stays true until its last request settles. */
@@ -355,8 +399,11 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     const queue = items.value.filter(item => statuses.includes(item.status))
     if (queue.length === 0) return null
 
+    if (session && !session.isAuthenticated()) return null
     const batch: ActiveBatch = {
       target,
+      userId: currentUserId(),
+      terminated: false,
       controller: null,
       uploadComplete: false,
       stopRequested: false,
@@ -406,16 +453,56 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     }
 
     const hasWindow = typeof window !== 'undefined'
-    if (hasWindow) window.addEventListener('beforeunload', warnBeforeUnload)
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      // Closing or reloading the tab would cut off the files still queued.
+      // Never prompt once the session is over: an idle or remote sign-out
+      // must be able to leave the page without a dialog over patient data.
+      if (batch.terminated || !sessionIsCurrent(batch)) return
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    const removeUnloadPrompt = () => {
+      if (hasWindow) window.removeEventListener('beforeunload', onBeforeUnload)
+    }
+    const terminate = () => {
+      if (batch.terminated) return
+      batch.terminated = true
+      batch.stopRequested = true
+      removeUnloadPrompt()
+      batch.controller?.abort()
+      batch.wake?.()
+    }
+    const onSessionEnding = () => {
+      terminate()
+      reset()
+    }
+    if (hasWindow) {
+      window.addEventListener('beforeunload', onBeforeUnload)
+      window.addEventListener(SESSION_ENDING_EVENT, onSessionEnding)
+    }
+    // Also follow the auth state directly, independent of the event's timing.
+    // A detached scope: the batch may outlive the component that started it.
+    const sessionWatch = session ? effectScope(true) : null
+    sessionWatch?.run(() => {
+      watch(
+        () => sessionIsCurrent(batch),
+        current => {
+          if (!current) onSessionEnding()
+        },
+      )
+    })
 
     try {
-      for (const item of queue) {
+      for (const [index, item] of queue.entries()) {
+        if (!sessionIsCurrent(batch)) terminate()
         if (batch.stopRequested) break
         if (!item.validation.ok) continue
+        const isLast = index === queue.length - 1
 
         const kind = item.validation.kind
         const caption = kindSupportsCaption(kind) ? item.caption.trim() : ''
         const controller = new AbortController()
+        let responseDeadline: ReturnType<typeof setTimeout> | null = null
         batch.controller = controller
         batch.uploadComplete = false
         item.status = 'sending'
@@ -436,13 +523,19 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
               onUploadProgress: (loaded, total) => {
                 if (!total) return
                 item.progress = Math.min(100, Math.round((loaded / total) * 100))
-                if (loaded >= total) batch.uploadComplete = true
+                if (loaded >= total && !batch.uploadComplete) {
+                  batch.uploadComplete = true
+                  // The body is on the server; never wait forever for its answer.
+                  responseDeadline = setTimeout(() => controller.abort(), responseDeadlineMs)
+                }
               },
             },
           )
           item.progress = 100
           replyTo = undefined
-          if (message && batch.target.isActive()) options.onSent?.(message)
+          if (message && !batch.terminated && sessionIsCurrent(batch) && batch.target.isActive()) {
+            options.onSent?.(message)
+          }
 
           const created = (message && typeof message === 'object' ? message : {}) as {
             id?: unknown
@@ -456,10 +549,15 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
               status: 'failed',
               ...(typeof created.error_message === 'string' ? { errorMessage: created.error_message } : {}),
             }
-          } else if (canPace && created.status === 'pending' && typeof created.id === 'string' && created.id) {
-            // Pace the batch: the next upload starts once this message leaves
-            // 'pending' at the provider, or after the bounded wait.
-            outcome = await waitForSettle(created.id)
+          } else if (created.status === 'pending' && typeof created.id === 'string' && created.id) {
+            if (canPace && !isLast && !batch.stopRequested) {
+              // Pace the batch: the next upload starts once this message
+              // leaves 'pending' at the provider, or after the bounded wait.
+              outcome = await waitForSettle(created.id)
+            } else {
+              // Last file: nothing to pace, use a status that already arrived.
+              outcome = statusLog.get(created.id) ?? null
+            }
           }
           if (outcome?.status === 'failed') {
             item.status = 'failed'
@@ -469,41 +567,52 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
           }
         } catch (error) {
           if (controller.signal.aborted) {
-            // Stopped before the body finished uploading: the server never
-            // received this file, so it is simply not sent.
-            item.status = 'ready'
-            item.progress = 0
+            // Cut off by Stop, the response deadline or the end of the
+            // session. Upload progress lags the network, so the server may
+            // already have the file: never claim it was not sent.
+            item.status = 'unconfirmed'
           } else {
             item.status = 'failed'
             item.errorMessage = getErrorMessage(error, '') || null
           }
         } finally {
+          if (responseDeadline) clearTimeout(responseDeadline)
           batch.controller = null
         }
       }
     } finally {
       unsubscribe?.()
-      if (hasWindow) window.removeEventListener('beforeunload', warnBeforeUnload)
+      sessionWatch?.stop()
+      removeUnloadPrompt()
+      if (hasWindow) window.removeEventListener(SESSION_ENDING_EVENT, onSessionEnding)
       activeBatch = null
       isSending.value = false
       isStopping.value = false
       sendingTo.value = ''
     }
 
+    const named = (status: StagedAttachmentStatus) =>
+      queue.filter(item => item.status === status).map(item => item.file.name)
     const summary: BatchSummary = {
-      sent: queue.filter(item => item.status === 'sent').length,
-      failed: queue.filter(item => item.status === 'failed').length,
-      notSent: queue.filter(item => item.status === 'ready').length,
-      failedNames: queue.filter(item => item.status === 'failed').map(item => item.file.name),
-      notSentNames: queue.filter(item => item.status === 'ready').map(item => item.file.name),
+      sent: named('sent').length,
+      failed: named('failed').length,
+      notSent: named('ready').length,
+      unconfirmed: named('unconfirmed').length,
+      failedNames: named('failed'),
+      notSentNames: named('ready'),
+      unconfirmedNames: named('unconfirmed'),
       recipient: batch.target.label ?? '',
       stopped: batch.stopRequested,
       detached: batch.detached,
     }
+    // After the session ended, report nothing: the patient's name must not
+    // appear on the login page or in someone else's session.
+    if (batch.terminated || !sessionIsCurrent(batch)) return null
     options.onBatchFinished?.(summary)
-    // Done when nothing is left to send, retry or convert; invalid files were
-    // shown as skipped. A detached batch leaves the (new) staging alone.
-    if (!batch.detached && !items.value.some(item => ['ready', 'failed', 'converting'].includes(item.status))) {
+    // Done when nothing is left to send, retry, convert or check; invalid
+    // files were shown as skipped. A detached batch leaves the (new) staging alone.
+    const open: StagedAttachmentStatus[] = ['ready', 'failed', 'converting', 'unconfirmed']
+    if (!batch.detached && !items.value.some(item => open.includes(item.status))) {
       reset()
     }
     return summary
@@ -520,9 +629,10 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   }
 
   /**
-   * Stops the running batch after the current file. A file still uploading
-   * is aborted (the server never got all of it); one already uploaded is
-   * left to finish, so nothing is reported as unsent that was actually sent.
+   * Stops the running batch: files not started stay 'ready'. A file still
+   * uploading is aborted and marked 'unconfirmed' (progress events lag, so
+   * the server may have it); one already uploaded is left to finish, bounded
+   * by the response deadline.
    */
   function stop() {
     const batch = activeBatch
@@ -539,7 +649,15 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     reset()
   }
 
-  if (getCurrentScope()) onScopeDispose(reset)
+  if (getCurrentScope()) {
+    onScopeDispose(reset)
+    // Clear staged patient files when the session ends, even with no batch running.
+    if (typeof window !== 'undefined') {
+      const onSessionEnding = () => reset()
+      window.addEventListener(SESSION_ENDING_EVENT, onSessionEnding)
+      onScopeDispose(() => window.removeEventListener(SESSION_ENDING_EVENT, onSessionEnding))
+    }
+  }
 
   return {
     items,

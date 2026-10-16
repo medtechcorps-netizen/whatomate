@@ -582,7 +582,24 @@ describe('ChatView composer', () => {
     expect(calls).toHaveLength(1)
     const dialog = wrapper.findComponent(MediaSendDialog)
     expect(dialog.props('sending')).toBe(false)
-    expect(dialog.props('items').map((item: { status: string }) => item.status)).toEqual(['ready', 'ready'])
-    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.batchReport', { description: 'chat.composer.batchReportFiles' })
+    expect(dialog.props('items').map((item: { status: string }) => item.status)).toEqual(['unconfirmed', 'ready'])
+    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.batchReport', {
+      description: 'chat.composer.batchReportFiles chat.composer.batchReportUnconfirmed',
+    })
+  })
+
+  it('ends a batch silently when the session ends', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['lab-1.png', 'lab-2.png'])
+    window.dispatchEvent(new CustomEvent('rereply:session-ending'))
+    expect(calls[0].signal.aborted).toBe(true)
+    await flushPromises()
+    expect(calls).toHaveLength(1)
+    expect(wrapper.findComponent(MediaSendDialog).props('open')).toBe(false)
+    expect(mocks.toastWarning).not.toHaveBeenCalled()
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
   })
 })
