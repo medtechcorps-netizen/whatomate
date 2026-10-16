@@ -107,14 +107,14 @@ func h1DeliverStatusReceipt(env *h1HandoverEnv, receipts *App, wamid string, lim
 // h1RunWithWatchdog runs one real ProcessMessage. A run that is still blocked after
 // limit is a permanent wedge: the test pool's backends are terminated so the test can
 // finish, and the test fails with the blocking report.
-func h1RunWithWatchdog(t *testing.T, env *h1HandoverEnv, now time.Time, limit time.Duration) (error, time.Duration) {
+func h1RunWithWatchdog(t *testing.T, env *h1HandoverEnv, now time.Time, limit time.Duration) (time.Duration, error) {
 	t.Helper()
 	started := time.Now()
 	runDone := make(chan error, 1)
 	go func() { runDone <- env.run(t, now) }()
 	select {
 	case err := <-runDone:
-		return err, time.Since(started)
+		return time.Since(started), err
 	case <-time.After(limit):
 		report := h1PoolSessionReport(env.shared)
 		_ = env.shared.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'h1_pool_bound_test'`).Error
@@ -123,7 +123,7 @@ func h1RunWithWatchdog(t *testing.T, env *h1HandoverEnv, now time.Time, limit ti
 		case <-time.After(30 * time.Second):
 		}
 		t.Fatalf("PERMANENT WEDGE: the continuation did not return within %s\n%s", limit, report)
-		return nil, 0
+		return 0, nil
 	}
 }
 
@@ -186,7 +186,7 @@ func TestH1GraphTransferStatusReceiptDuringHandover(t *testing.T) {
 				receipt = h1DeliverStatusReceipt(env, receipts, body.WhatsAppMessageID, 10*time.Second)
 			})
 
-			runErr, elapsed := h1RunWithWatchdog(t, env, env.baseTime, 60*time.Second)
+			elapsed, runErr := h1RunWithWatchdog(t, env, env.baseTime, 60*time.Second)
 			if receipt.pending != nil {
 				select {
 				case receipt.err = <-receipt.pending:
@@ -271,7 +271,7 @@ func TestH1GraphStatusReceiptBetweenTwoSends(t *testing.T) {
 	}))
 	t.Cleanup(func() { _ = env.pool.Callback().Row().Remove(name) })
 
-	runErr, elapsed := h1RunWithWatchdog(t, env, env.baseTime, 60*time.Second)
+	elapsed, runErr := h1RunWithWatchdog(t, env, env.baseTime, 60*time.Second)
 	if receipt.pending != nil {
 		select {
 		case receipt.err = <-receipt.pending:
@@ -517,7 +517,7 @@ func TestH1GraphTransferHandoverLockWaitIsBounded(t *testing.T) {
 		holderErr = <-ready // the handover starts only once the row is held
 	})
 
-	firstErr, elapsed := h1RunWithWatchdog(t, env, env.baseTime, 90*time.Second)
+	elapsed, firstErr := h1RunWithWatchdog(t, env, env.baseTime, 90*time.Second)
 	require.True(t, ran.Load())
 	select {
 	case <-holderDone:
