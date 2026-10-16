@@ -3,6 +3,7 @@ package whatsapp_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -78,4 +79,53 @@ func TestLaneEMediaMessagesCarryOptionalReplyContext(t *testing.T) {
 		}
 		assert.NotContains(t, payload, "context", "payload %d", i)
 	}
+}
+
+// A quote or line break in a file name or MIME type must not end the part
+// header early, and Graph always gets a file name.
+func TestLaneEUploadMediaSanitizesPartHeaders(t *testing.T) {
+	t.Parallel()
+	type seen struct{ name, contentType, injected string }
+	var mu sync.Mutex
+	var parts []seen
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reader, err := r.MultipartReader()
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if part.FormName() == "file" {
+				mu.Lock()
+				parts = append(parts, seen{part.FileName(), part.Header.Get("Content-Type"), part.Header.Get("X-Injected")})
+				mu.Unlock()
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "media-ok"})
+	}))
+	t.Cleanup(server.Close)
+	client := whatsapp.NewWithTimeout(testutil.NopLogger(), 5*time.Second)
+	client.HTTPClient = &http.Client{Transport: &testServerTransport{serverURL: server.URL}}
+	ctx := testutil.TestContext(t)
+
+	_, err := client.UploadMedia(ctx, testAccount(server.URL), []byte("x"), "image/png\r\nX-Injected: 1", "scan \"a\".png\r\nX-Injected: 2")
+	require.NoError(t, err)
+	_, err = client.UploadMedia(ctx, testAccount(server.URL), []byte("x"), "audio/ogg", "  ")
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, parts, 2)
+	assert.Equal(t, `scan "a".pngX-Injected: 2`, parts[0].name)
+	assert.Empty(t, parts[0].injected)
+	assert.Equal(t, "image/pngX-Injected: 1", parts[0].contentType)
+	assert.Equal(t, "upload", parts[1].name)
 }

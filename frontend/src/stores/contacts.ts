@@ -633,10 +633,24 @@ export const useContactsStore = defineStore('contacts', () => {
     }
 
     // Check if message already exists
-    const exists = messages.value.some(m => m.id === message.id)
-    if (!exists) {
+    const index = messages.value.findIndex(m => m.id === message.id)
+    if (index === -1) {
       messages.value.push(message)
       messages.value.sort(compareMessageIngestionOrder)
+      return
+    }
+    // The socket copy can arrive before the send response. Keep its fields
+    // (a newer status included) and only fill what it lacks, such as the
+    // CRM-only is_forwarded flag the socket payload does not carry.
+    const current = messages.value[index] as unknown as Record<string, unknown>
+    const late = message as unknown as Record<string, unknown>
+    const missing = Object.keys(late).filter(key =>
+      (current[key] === undefined || current[key] === null) && late[key] !== undefined && late[key] !== null,
+    )
+    if (missing.length > 0) {
+      const merged = { ...current }
+      for (const key of missing) merged[key] = late[key]
+      messages.value[index] = merged as unknown as Message
     }
   }
 

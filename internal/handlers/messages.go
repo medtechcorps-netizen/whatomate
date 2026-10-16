@@ -314,6 +314,14 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			}
 		}
 
+		if req.forwardedFrom != nil {
+			// The request checked the path contact; this is the canonical one,
+			// locked, on this transaction's own connection.
+			if refusal := a.checkForwardTargetTx(tx, organizationID, contact, time.Now()); refusal != nil {
+				return &forwardTargetRefusedError{refusal: refusal}
+			}
+		}
+
 		if req.legacyWhatsAppReply != nil {
 			existing, claimErr := claimLegacyReplyIdempotency(
 				tx,
@@ -388,6 +396,12 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		}
 		if createErr := tx.Create(candidate).Error; createErr != nil {
 			return fmt.Errorf("failed to create message: %w", createErr)
+		}
+		if req.forwardedFrom != nil {
+			// PDPA: no audit entry, no forward. Same transaction as the insert.
+			if auditErr := recordForwardAudit(tx, organizationID, opts.SentByUserID, candidate, req.forwardedFrom); auditErr != nil {
+				return auditErr
+			}
 		}
 		if req.legacyWhatsAppReply != nil {
 			if mirrorErr := persistStrictLegacyReplyMirror(tx, &req, candidate); mirrorErr != nil {
@@ -2576,6 +2590,15 @@ const (
 	// mediaReplyPreviewTimeout bounds the reply-preview reload of a media send.
 	mediaReplyPreviewTimeout = 5 * time.Second
 
+	// forwardAccountCheckTimeout bounds the account read before a forwarded
+	// attachment's upload; forwardRateLimitTimeout bounds the Redis counter.
+	forwardAccountCheckTimeout = 5 * time.Second
+	forwardRateLimitTimeout    = 2 * time.Second
+
+	// forwardRateLimitPerMinute caps forwards per user. The UI sends at most
+	// five per action, one request each.
+	forwardRateLimitPerMinute = 30
+
 	forwardErrorInvalid            fastglue.ErrorType = "forward_invalid"
 	forwardErrorSourceNotFound     fastglue.ErrorType = "forward_source_not_found"
 	forwardErrorUnsupportedType    fastglue.ErrorType = "forward_unsupported_type"
@@ -2584,6 +2607,8 @@ const (
 	forwardErrorIdentityReview     fastglue.ErrorType = "forward_identity_review"
 	forwardErrorTargetNotFound     fastglue.ErrorType = "forward_target_not_found"
 	forwardErrorAccountUnavailable fastglue.ErrorType = "forward_account_unavailable"
+	forwardErrorSourceDeleted      fastglue.ErrorType = "forward_source_deleted"
+	forwardErrorRateLimited        fastglue.ErrorType = "forward_rate_limited"
 )
 
 // messageForwardSource is the server-derived provenance of a forwarded message.
@@ -2687,6 +2712,13 @@ func (a *App) loadForwardSource(
 		return nil, notFound, nil
 	}
 
+	if revoked, _ := source.Metadata[coexistenceMediaRevokedMetadataKey].(bool); revoked {
+		return nil, &messageForwardRefusal{
+			Status:    fasthttp.StatusGone,
+			ErrorType: forwardErrorSourceDeleted,
+			Message:   "This message was deleted and cannot be forwarded",
+		}, nil
+	}
 	if !forwardableMessageType(source.MessageType) {
 		return nil, &messageForwardRefusal{
 			Status:    fasthttp.StatusUnprocessableEntity,
@@ -2721,7 +2753,13 @@ func (a *App) loadForwardSource(
 // asynchronously, after the message was accepted, so the window is checked
 // before anything is persisted.
 func (a *App) checkForwardTarget(orgID uuid.UUID, contact *models.Contact, now time.Time) *messageForwardRefusal {
-	state, err := a.GetWhatsAppIdentityReviewEffectiveState(a.DB, orgID, contact.ID)
+	return a.checkForwardTargetTx(a.DB, orgID, contact, now)
+}
+
+// checkForwardTargetTx is checkForwardTarget on an explicit session, so the
+// send path can repeat it on the canonical contact under its row lock.
+func (a *App) checkForwardTargetTx(db *gorm.DB, orgID uuid.UUID, contact *models.Contact, now time.Time) *messageForwardRefusal {
+	state, err := a.GetWhatsAppIdentityReviewEffectiveState(db, orgID, contact.ID)
 	if err != nil || state.Blocked {
 		if err != nil {
 			a.Log.Error("Failed to read identity-review state for forward target",
@@ -2836,9 +2874,18 @@ func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
 		return errors.New("forwarded attachment was stored under an unexpected key")
 	}
 
+	if err := a.requireForwardAccountActive(plan.OrganizationID, req.Account.ID); err != nil {
+		return err
+	}
+	// Patient photos, videos and voice notes carry no file name; Graph needs
+	// one. The document name shown to the customer stays MediaFilename.
+	uploadName := strings.TrimSpace(req.MediaFilename)
+	if uploadName == "" {
+		uploadName = plan.ObjectName
+	}
 	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), forwardMediaUploadTimeout)
 	defer cancelUpload()
-	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, plan.MimeType, req.MediaFilename)
+	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, plan.MimeType, uploadName)
 	if err != nil {
 		return fmt.Errorf("failed to upload media: %w", err)
 	}
@@ -2886,6 +2933,10 @@ func (a *App) forwardMessage(
 
 	if !session.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
 		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
+	}
+	if !a.allowForward(orgID, userID) {
+		return r.SendErrorEnvelope(fasthttp.StatusTooManyRequests,
+			"Too many forwards in the last minute. Wait a moment and try again.", nil, forwardErrorRateLimited)
 	}
 	sourceID, err := uuid.Parse(strings.TrimSpace(req.ForwardOfMessageID))
 	if err != nil || sourceID == uuid.Nil {
@@ -2956,6 +3007,10 @@ func (a *App) forwardMessage(
 
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
+		var refused *forwardTargetRefusedError
+		if errors.As(err, &refused) {
+			return refused.refusal.send(r)
+		}
 		a.Log.Error("Failed to forward message", "error", err, "organization_id", orgID, "source_message_id", source.ID)
 		if errors.Is(err, errOutgoingContactNotFound) ||
 			errors.Is(err, errOutgoingContactAccessRevoked) {
@@ -2963,16 +3018,6 @@ func (a *App) forwardMessage(
 		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to forward message", nil, "")
 	}
-
-	// One entry per target, written on the request's own session: inside the
-	// RLS request transaction, or as one bounded statement without RLS.
-	session.logAudit(orgID, userID, "message", message.ID, models.AuditActionCreated, nil, messageForwardAudit{
-		Operation:              "forwarded",
-		ForwardedFromMessageID: source.ID.String(),
-		ForwardedFromContactID: source.ContactID.String(),
-		TargetContactID:        message.ContactID.String(),
-		MessageType:            string(message.MessageType),
-	})
 
 	return r.SendEnvelope(MessageResponse{
 		ID:              message.ID,
@@ -3020,4 +3065,83 @@ func (a *App) attachMediaReplyPreview(orgID uuid.UUID, message *models.Message, 
 		MessageType: reply.MessageType,
 		Direction:   reply.Direction,
 	}
+}
+
+// forwardTargetRefusedError carries a target refusal found under the
+// canonical-contact lock back to the forward handler.
+type forwardTargetRefusedError struct {
+	refusal *messageForwardRefusal
+}
+
+func (e *forwardTargetRefusedError) Error() string {
+	if e == nil || e.refusal == nil {
+		return "forward target refused"
+	}
+	return e.refusal.Message
+}
+
+// recordForwardAudit writes the per-target forward audit entry on the
+// pending-message transaction: provenance ids only, never content.
+func recordForwardAudit(
+	tx *gorm.DB,
+	orgID uuid.UUID,
+	userID *uuid.UUID,
+	message *models.Message,
+	source *messageForwardSource,
+) error {
+	if userID == nil || *userID == uuid.Nil || message == nil || source == nil {
+		return errors.New("forward audit requires the forwarding user and message")
+	}
+	if err := logAuditStrict(tx, orgID, *userID, "message", message.ID, models.AuditActionCreated, nil, messageForwardAudit{
+		Operation:              "forwarded",
+		ForwardedFromMessageID: source.MessageID.String(),
+		ForwardedFromContactID: source.ContactID.String(),
+		TargetContactID:        message.ContactID.String(),
+		MessageType:            string(message.MessageType),
+	}); err != nil {
+		return fmt.Errorf("record forward audit: %w", err)
+	}
+	return nil
+}
+
+// requireForwardAccountActive re-reads the sending account in one short
+// committed transaction before a forwarded attachment's upload, so a
+// disconnected account is not used; no transaction is held during the upload.
+// The provider transaction re-checks under its account lock before the send.
+func (a *App) requireForwardAccountActive(orgID, accountID uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(context.Background(), forwardAccountCheckTimeout)
+	defer cancel()
+	var account models.WhatsAppAccount
+	err := a.rootApp().WithCommittedTenantApp(orgID, func(scoped *App) error {
+		return scoped.DB.WithContext(ctx).
+			Select("id", "status").
+			Where("id = ? AND organization_id = ?", accountID, orgID).
+			First(&account).Error
+	})
+	if err != nil {
+		return fmt.Errorf("check WhatsApp account before upload: %w", err)
+	}
+	return whatsappaccount.RequireActiveForOutbound(&account)
+}
+
+// allowForward counts a user's forwards per minute in Redis. Without Redis,
+// or if Redis fails, it allows the forward: the limit is a brake on misuse,
+// and every forward is still individually checked and audited.
+func (a *App) allowForward(orgID, userID uuid.UUID) bool {
+	root := a.rootApp()
+	if root == nil || root.Redis == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), forwardRateLimitTimeout)
+	defer cancel()
+	key := fmt.Sprintf("rereply:forward_rate:%s:%s:%d", orgID, userID, time.Now().Unix()/60)
+	count, err := root.Redis.Incr(ctx, key).Result()
+	if err != nil {
+		a.Log.Warn("Forward rate limit unavailable", "error", err, "organization_id", orgID)
+		return true
+	}
+	if count == 1 {
+		_ = root.Redis.Expire(ctx, key, 2*time.Minute).Err()
+	}
+	return count <= forwardRateLimitPerMinute
 }

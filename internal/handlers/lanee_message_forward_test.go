@@ -4,15 +4,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -423,4 +427,104 @@ func TestLaneEForwardMediaMissingFromStorageFailsBeforeMeta(t *testing.T) {
 	assert.Contains(t, messages[0].ErrorMessage, "no longer available")
 	assert.Empty(t, f.mock.uploadedMedia)
 	assert.Zero(t, f.mock.sentMessageCount())
+}
+
+// laneEStrictGraph behaves like Graph for uploads: a file part without a
+// file name is rejected, as Graph treats it as no file at all.
+type laneEStrictGraph struct {
+	mu      sync.Mutex
+	uploads []string
+	sends   int
+}
+
+func (g *laneEStrictGraph) snapshot() ([]string, int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.uploads...), g.sends
+}
+
+func laneEUseStrictGraph(t *testing.T, f *laneEForwardFixture) *laneEStrictGraph {
+	t.Helper()
+	graph := &laneEStrictGraph{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/media"):
+			reader, err := r.MultipartReader()
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			for {
+				part, err := reader.NextPart()
+				if err != nil {
+					break
+				}
+				if part.FormName() != "file" {
+					continue
+				}
+				graph.mu.Lock()
+				graph.uploads = append(graph.uploads, part.FileName())
+				graph.mu.Unlock()
+				if part.FileName() == "" {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "file is required", "code": 100}})
+					return
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "media-strict"})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages"):
+			graph.mu.Lock()
+			graph.sends++
+			graph.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"messages": []map[string]string{{"id": "wamid.strict"}}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	client := whatsapp.NewWithTimeout(testutil.NopLogger(), 5*time.Second)
+	client.HTTPClient = &http.Client{Transport: &testServerTransport{serverURL: server.URL}}
+	f.app.WhatsApp = client
+	return graph
+}
+
+// Patient photos, videos and voice notes are stored without a file name.
+func TestLaneEForwardUploadsUnnamedMediaWithAFileName(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	graph := laneEUseStrictGraph(t, f)
+	require.NoError(t, os.MkdirAll(filepath.Join(f.media, "audio"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(f.media, "audio", "voice.ogg"), []byte("ogg-bytes"), 0o600))
+	voice := f.storedMessage(t, f.source, models.MessageTypeAudio, "", "audio/voice.ogg")
+	require.NoError(t, f.app.DB.Model(&models.Message{}).Where("id = ?", voice.ID).
+		Updates(map[string]any{"media_filename": "", "media_mime_type": "audio/ogg"}).Error)
+
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": voice.ID.String()})
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+
+	uploads, sends := graph.snapshot()
+	require.Len(t, uploads, 1)
+	assert.NotEmpty(t, uploads[0])
+	assert.True(t, strings.HasSuffix(uploads[0], ".ogg"), uploads[0])
+	assert.Equal(t, 1, sends)
+	messages := f.messagesFor(t, f.target.ID)
+	require.Len(t, messages, 1)
+	assert.Equal(t, models.MessageStatusSent, messages[0].Status, messages[0].ErrorMessage)
+	assert.Empty(t, messages[0].MediaFilename, "the forwarded row keeps the source's (empty) display name")
+}
+
+func TestLaneEForwardRefusesDeletedSource(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	tombstone := f.storedMessage(t, f.source, models.MessageTypeText, "[Message deleted from WhatsApp Business App]", "")
+	require.NoError(t, f.app.DB.Model(&models.Message{}).Where("id = ?", tombstone.ID).
+		Update("metadata", models.JSONB{"coexistence_revoked": true}).Error)
+	softDeleted := f.storedMessage(t, f.source, models.MessageTypeText, "removed", "")
+	require.NoError(t, f.app.DB.Delete(&models.Message{}, "id = ?", softDeleted.ID).Error)
+
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": tombstone.ID.String()})
+	assert.Equal(t, fasthttp.StatusGone, testutil.GetResponseStatusCode(req))
+	assert.Equal(t, "forward_source_deleted", laneERefusal(t, req).ErrorType)
+
+	req = f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": softDeleted.ID.String()})
+	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))
+	assert.Empty(t, f.messagesFor(t, f.target.ID))
 }

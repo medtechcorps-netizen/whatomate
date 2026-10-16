@@ -465,9 +465,16 @@ func (c *Client) UploadMedia(ctx context.Context, account *Account, data []byte,
 	body.WriteString("Content-Disposition: form-data; name=\"messaging_product\"\r\n\r\n")
 	body.WriteString("whatsapp\r\n")
 
+	// A quote or line break in a stored or client-supplied value would end the
+	// part header early; Graph also needs a non-empty file name.
+	headerValue := strings.NewReplacer("\r", "", "\n", "")
+	safeName := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(headerValue.Replace(filename))
+	if strings.TrimSpace(safeName) == "" {
+		safeName = "upload"
+	}
 	fmt.Fprintf(body, "--%s\r\n", boundary)
-	fmt.Fprintf(body, "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", filename)
-	fmt.Fprintf(body, "Content-Type: %s\r\n\r\n", mimeType)
+	fmt.Fprintf(body, "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", safeName)
+	fmt.Fprintf(body, "Content-Type: %s\r\n\r\n", headerValue.Replace(mimeType))
 	body.Write(data)
 	body.WriteString("\r\n")
 

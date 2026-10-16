@@ -15,6 +15,7 @@ import {
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   sendMessage: vi.fn(),
+  activity: [] as Array<(event: { type: string; payload: any }) => void>,
 }))
 
 vi.mock('vue-i18n', () => ({
@@ -24,6 +25,21 @@ vi.mock('vue-i18n', () => ({
 }))
 vi.mock('@/services/api', () => ({ contactsService: { list: mocks.list } }))
 vi.mock('@/stores/contacts', () => ({ useContactsStore: () => ({ sendMessage: mocks.sendMessage }) }))
+vi.mock('@/services/websocket', () => ({
+  wsService: {
+    onInboxActivity: (callback: (event: { type: string; payload: any }) => void) => {
+      mocks.activity.push(callback)
+      return () => {
+        const index = mocks.activity.indexOf(callback)
+        if (index > -1) mocks.activity.splice(index, 1)
+      }
+    },
+  },
+}))
+
+function emitActivity(type: string, payload: Record<string, unknown>) {
+  for (const callback of [...mocks.activity]) callback({ type, payload })
+}
 
 const OPEN_REVIEW = { known: true, ai_allowed: true, blocked: false, open_hold_count: 0, reason: 'no_open_identity_review' }
 
@@ -110,7 +126,8 @@ beforeEach(() => {
       },
     },
   })
-  mocks.sendMessage.mockResolvedValue({ id: 'new' })
+  mocks.sendMessage.mockResolvedValue({ id: 'new', status: 'pending' })
+  mocks.activity.length = 0
 })
 
 afterEach(async () => {
@@ -140,9 +157,14 @@ describe('messageForward helpers', () => {
     expect(forwardTargetBlock(contact('1', { identity_review_ai_state: { ...OPEN_REVIEW, blocked: true } }))).toBe('identity_review')
   })
 
-  it('reads the CRM-only forwarded flag', () => {
+  it('reads the CRM-only forwarded flag, also from stored metadata', () => {
     expect(isForwardedMessage(message())).toBe(false)
     expect(isForwardedMessage({ ...message(), is_forwarded: true } as Message)).toBe(true)
+    expect(isForwardedMessage({ ...message(), metadata: { forwarded_from: { message_id: 'x' } } } as Message)).toBe(true)
+  })
+
+  it('does not offer a deleted-message tombstone for forwarding', () => {
+    expect(forwardSourceBlock(message({ content: { body: '[Message deleted from WhatsApp Business App]' } }))).toBe('unsupported')
   })
 })
 
@@ -169,7 +191,7 @@ describe('ForwardMessageDialog', () => {
 
   it('confirms recipients by name, then forwards one request per target with per-target results', async () => {
     mocks.sendMessage
-      .mockResolvedValueOnce({ id: 'a' })
+      .mockResolvedValueOnce({ id: 'a', status: 'pending' })
       .mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 409'), {
         isAxiosError: true,
         response: { status: 409, data: { message: 'The 24-hour service window for this contact is closed.' } },
@@ -191,10 +213,75 @@ describe('ForwardMessageDialog', () => {
     expect(mocks.sendMessage).toHaveBeenNthCalledWith(1, '1', 'text', {}, undefined, undefined, { forwardOfMessageId: 'src-1' })
     expect(mocks.sendMessage).toHaveBeenNthCalledWith(2, '2', 'text', {}, undefined, undefined, { forwardOfMessageId: 'src-1' })
 
-    const rows = Array.from(document.body.querySelectorAll('[data-testid="chat-forward-results"] li'))
-    expect(rows.map(row => row.getAttribute('data-state'))).toEqual(['sent', 'failed'])
-    expect(rows[1].textContent).toContain('The 24-hour service window for this contact is closed.')
+    const rows = () => Array.from(document.body.querySelectorAll('[data-testid="chat-forward-results"] li'))
+    // Accepted is not delivered: the first target is only queued.
+    expect(rows().map(row => row.getAttribute('data-state'))).toEqual(['queued', 'failed'])
+    expect(rows()[0].textContent).toContain('chat.forward.queued')
+    expect(rows()[1].textContent).toContain('The 24-hour service window for this contact is closed.')
+
+    emitActivity('status_update', { message_id: 'a', status: 'sent' })
+    await flushPromises()
+    expect(rows().map(row => row.getAttribute('data-state'))).toEqual(['sent', 'failed'])
     expect(q('[data-testid="chat-forward-dialog"]')!.textContent).toContain('chat.forward.summary:{"sent":1,"total":2}')
+    expect(mocks.activity).toHaveLength(0)
+  })
+
+  it('flips queued targets from live status events, including early and relayed ones', async () => {
+    mocks.sendMessage.mockImplementation(async (contactId: string) => {
+      // Target 2's failure is broadcast before its POST response arrives.
+      if (contactId === '2') emitActivity('status_update', { message_id: 'm-2', status: 'failed', error_message: 'upload failed' })
+      return { id: `m-${contactId}`, status: 'pending' }
+    })
+    await openDialog()
+    await pick('1', '2', '5')
+    await click('chat-forward-next')
+    await click('chat-forward-confirm')
+    await flushPromises()
+    const states = () => Array.from(document.body.querySelectorAll('[data-testid="chat-forward-results"] li'))
+      .map(row => row.getAttribute('data-state'))
+    expect(states()).toEqual(['queued', 'failed', 'queued'])
+    expect(q('[data-testid="chat-forward-results"]')!.textContent).toContain('upload failed')
+
+    // Another replica relays only an identifier-level status change.
+    emitActivity('realtime_sync', { kind: 'message_status_changed', message_id: 'm-5', status: 'delivered' })
+    emitActivity('status_update', { message_id: 'unrelated', status: 'failed' })
+    await flushPromises()
+    expect(states()).toEqual(['queued', 'failed', 'sent'])
+  })
+
+  it('says delivery is not confirmed when no status arrives in time', async () => {
+    vi.useFakeTimers()
+    try {
+      await openDialog()
+      await pick('1')
+      await click('chat-forward-next')
+      await click('chat-forward-confirm')
+      await vi.advanceTimersByTimeAsync(0)
+      await flushPromises()
+      expect(q('[data-testid="chat-forward-unconfirmed"]')).toBeNull()
+      await vi.advanceTimersByTimeAsync(60_000)
+      await flushPromises()
+      expect(q('[data-testid="chat-forward-results"] li')!.getAttribute('data-state')).toBe('unconfirmed')
+      expect(q('[data-testid="chat-forward-unconfirmed"]')!.textContent).toContain('chat.forward.unconfirmedNote')
+      // A late status still lands.
+      emitActivity('status_update', { message_id: 'new', status: 'read' })
+      await flushPromises()
+      expect(q('[data-testid="chat-forward-results"] li')!.getAttribute('data-state')).toBe('sent')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops listening for status events when closed', async () => {
+    const wrapper = await openDialog()
+    await pick('1')
+    await click('chat-forward-next')
+    await click('chat-forward-confirm')
+    await flushPromises()
+    expect(mocks.activity).toHaveLength(1)
+    await wrapper.setProps({ open: false })
+    await flushPromises()
+    expect(mocks.activity).toHaveLength(0)
   })
 
   it('does not offer targets for an unsupported message and explains pending media', async () => {
