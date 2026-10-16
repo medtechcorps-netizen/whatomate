@@ -1393,12 +1393,18 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 // conversation of the contact that userID may see, not only the newest one:
 // a patient who wrote to two clinic numbers has one conversation per account.
 //   - The reader's own inbox cursor advances to the newest visible incoming
-//     message of each conversation and account, so the navbar badge clears.
+//     message of each linked conversation, so the navbar badge clears.
 //   - With chat:write, every visible unread incoming message is marked read in
 //     one call to the shared read path. It locks those conversations in id
 //     order and then the contact, the same order as the visible-cursor read,
 //     and clears the manual unread mark in the same statement. Nobody opened
 //     these messages, so no WhatsApp read receipts are sent.
+//
+// It never repairs the legacy inbox mirror. That repair locks a conversation
+// and then the contact per message, so in one request transaction it would
+// put a contact lock before later conversation locks and deadlock against a
+// concurrent read. Unlinked messages are still marked read below; the
+// after-commit mirror and the backfill link them later.
 //
 // It reports whether at least one inbox cursor was proven and advanced.
 func (a *App) markContactReadByHand(
@@ -1416,24 +1422,24 @@ func (a *App) markContactReadByHand(
 	db, cancel := contactStateDB(a.DB)
 	defer cancel()
 
-	newestSQL := `SELECT DISTINCT ON (COALESCE(CAST(inbox_conversation_id AS text), ''), whats_app_account) *
+	newestSQL := `SELECT DISTINCT ON (inbox_conversation_id) *
 		FROM messages
-		WHERE organization_id = ? AND contact_id = ? AND direction = ? AND deleted_at IS NULL`
+		WHERE organization_id = ? AND contact_id = ? AND direction = ? AND deleted_at IS NULL
+		  AND inbox_conversation_id IS NOT NULL`
 	args := []any{orgID, contactID, models.DirectionIncoming}
 	if cutoff != nil {
 		newestSQL += " AND created_at >= ?"
 		args = append(args, cutoff.UTC())
 	}
 	newestSQL += `
-		ORDER BY COALESCE(CAST(inbox_conversation_id AS text), ''), whats_app_account,
-			COALESCE(ingested_at, created_at) DESC, id DESC`
+		ORDER BY inbox_conversation_id, COALESCE(ingested_at, created_at) DESC, id DESC`
 	var newest []models.Message
 	if err := db.Raw(newestSQL, args...).Scan(&newest).Error; err != nil {
 		return false, err
 	}
 	cursorSynced := false
 	if len(newest) > 0 {
-		syncResult, err := a.syncLegacyVisibleMessagesRead(orgID, userID, contactID, newest, sharedWrite)
+		syncResult, err := a.syncLegacyVisibleMessagesRead(orgID, userID, contactID, newest, false)
 		if err != nil {
 			return false, err
 		}
