@@ -418,10 +418,11 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 	}
 
 	// Mint and register the successor before the old token is consumed. It
-	// starts with a short lifetime that the rotation script extends: if the
-	// rotation never runs, or its outcome is unknown, the unissued successor
-	// expires on its own while the old token stays valid for the client's
-	// retry. A token the server never registered is never handed out.
+	// starts with a short lifetime that a successful rotation replaces with
+	// the full one: if the rotation never runs, or its outcome is unknown, the
+	// unissued successor expires on its own while the old token stays valid
+	// for the client's retry. A token the server never registered is never
+	// handed out.
 	now := time.Now()
 	successorJTI := uuid.New().String()
 	successorExpiry := now.Add(time.Duration(a.Config.JWT.RefreshExpiryDays) * 24 * time.Hour)
@@ -452,11 +453,12 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		})
 	}
 
-	// Atomically consume the old token, give the successor its full lifetime
-	// and record the grace entry; if the old token is already gone, read the
-	// grace entry instead. The script is idempotent: when a lost reply makes
-	// the client library send it again, the second run finds this request's
-	// own grace entry and reports the same win.
+	// Atomically consume the old token, register the successor for its full
+	// lifetime (again, so a winner never reports a token whose short-lived
+	// key was lost meanwhile) and record the grace entry; if the old token is
+	// already gone, read the grace entry instead. The script is idempotent:
+	// when a lost reply makes the client library send it again, the second
+	// run finds this request's own grace entry and reports the same win.
 	rotation, err := a.Redis.Eval(ctx, `
 if redis.call('DEL', KEYS[1]) == 1 then
   local previous = redis.call('GET', KEYS[3])
@@ -464,7 +466,7 @@ if redis.call('DEL', KEYS[1]) == 1 then
   redis.call('DEL', KEYS[3])
   redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
   redis.call('SET', KEYS[4], ARGV[3], 'EX', ARGV[2])
-  redis.call('EXPIRE', KEYS[5], ARGV[5])
+  redis.call('SET', KEYS[5], ARGV[6], 'EX', ARGV[5])
   return 'W'
 end
 local grace = redis.call('GET', KEYS[2])
@@ -479,6 +481,7 @@ return 'N'`,
 		claims.ID,
 		successorJTI,
 		int(successorExpiry.Sub(now).Seconds()),
+		user.ID.String(),
 	).Text()
 	if err != nil {
 		// The outcome is unknown: the script may have run. Keep the

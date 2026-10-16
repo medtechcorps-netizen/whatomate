@@ -308,6 +308,7 @@ func TestLaneA_RefreshToken_RotationFailureKeepsOldTokenAndLetsSuccessorExpire(t
 // timeout), anything else surfaces an i/o error to the handler.
 type laneAEvalHook struct {
 	mode  string
+	admin *redis.Client // for "drop-successor"
 	fired atomic.Bool
 }
 
@@ -324,6 +325,15 @@ func (h *laneAEvalHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 			strings.EqualFold(fmt.Sprint(args[0]), "eval") &&
 			strings.Contains(fmt.Sprint(args[1]), "redis.call('DEL', KEYS[1]) == 1")
 		if !isRotation || !h.fired.CompareAndSwap(false, true) {
+			return next(ctx, cmd)
+		}
+		if h.mode == "drop-successor" {
+			// The short-lived successor key is lost (a long stall, a
+			// failover or an eviction) before the rotation runs.
+			// Args: eval, script, numkeys, KEYS[1..5], ...
+			if err := h.admin.Del(ctx, fmt.Sprint(args[7])).Err(); err != nil {
+				return err
+			}
 			return next(ctx, cmd)
 		}
 		if err := next(ctx, cmd); err != nil {
@@ -360,6 +370,31 @@ func TestLaneA_RefreshToken_RotationIsIdempotentWhenTheClientResendsIt(t *testin
 	assert.Greater(t, ttl, 24*time.Hour, "the rotation gave the successor its full lifetime")
 	assert.False(t, laneAJTIExists(t, admin, f.jti))
 	assert.Equal(t, 1, laneALiveRefreshKeysFor(t, admin, f.user.ID))
+}
+
+func TestLaneA_RefreshToken_WinnerAlwaysRegistersTheSuccessor(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	admin := f.app.Redis
+	f.app.Redis = laneAHookedRedis(t, admin, &laneAEvalHook{mode: "drop-successor", admin: admin})
+
+	req := laneARefresh(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	issued := testutil.GetResponseCookie(req, "whm_refresh")
+	successor := laneAJTIOf(t, issued)
+	assert.True(t, laneAJTIExists(t, admin, successor), "the rotation re-registers what it issues")
+	ttl, err := admin.TTL(context.Background(), "refresh:"+successor).Result()
+	require.NoError(t, err)
+	assert.Greater(t, ttl, 24*time.Hour)
+
+	// The issued token works for the next rotation.
+	next := laneARefresh(t, laneAUseRedis(f.app, admin), issued)
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(next), string(testutil.GetResponseBody(next)))
+}
+
+// laneAUseRedis points app at the given (unhooked) Redis client.
+func laneAUseRedis(app *handlers.App, client *redis.Client) *handlers.App {
+	app.Redis = client
+	return app
 }
 
 func TestLaneA_RefreshToken_LostRotationReplyStaysRetryable(t *testing.T) {
