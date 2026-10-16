@@ -1406,6 +1406,14 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 // concurrent read. Unlinked messages are still marked read below; the
 // after-commit mirror and the backfill link them later.
 //
+// With chat:write it first locks every conversation it will touch in one
+// statement ordered by id: the newest rows' conversations and those with an
+// unread row. The cursor phase locks only conversations whose binding it can
+// verify (not, say, one on a deleted WhatsApp number), and the shared read
+// then locks the rest; without the up-front lock a lower-id conversation
+// could be locked after a higher-id one and deadlock against a concurrent
+// whole-contact read. Every later conversation lock re-takes a held row.
+//
 // It reports whether at least one inbox cursor was proven and advanced.
 func (a *App) markContactReadByHand(
 	orgID, userID, contactID uuid.UUID,
@@ -1437,6 +1445,46 @@ func (a *App) markContactReadByHand(
 	if err := db.Raw(newestSQL, args...).Scan(&newest).Error; err != nil {
 		return false, err
 	}
+
+	var unread []models.Message
+	if sharedWrite {
+		unreadQuery := db.Where(
+			"organization_id = ? AND contact_id = ? AND direction = ? AND status <> ?",
+			orgID,
+			contactID,
+			models.DirectionIncoming,
+			models.MessageStatusRead,
+		)
+		if cutoff != nil {
+			unreadQuery = unreadQuery.Where("created_at >= ?", cutoff.UTC())
+		}
+		if err := unreadQuery.Find(&unread).Error; err != nil {
+			return false, err
+		}
+		conversationSet := make(map[uuid.UUID]struct{})
+		for _, messages := range [][]models.Message{newest, unread} {
+			for i := range messages {
+				if id := messages[i].InboxConversationID; id != nil && *id != uuid.Nil {
+					conversationSet[*id] = struct{}{}
+				}
+			}
+		}
+		if len(conversationSet) > 0 {
+			conversationIDs := make([]uuid.UUID, 0, len(conversationSet))
+			for id := range conversationSet {
+				conversationIDs = append(conversationIDs, id)
+			}
+			var locked []models.InboxConversation
+			if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id").
+				Where("organization_id = ? AND contact_id = ? AND id IN ?", orgID, contactID, conversationIDs).
+				Order("id").
+				Find(&locked).Error; err != nil {
+				return false, err
+			}
+		}
+	}
+
 	cursorSynced := false
 	if len(newest) > 0 {
 		syncResult, err := a.syncLegacyVisibleMessagesRead(orgID, userID, contactID, newest, false)
@@ -1447,21 +1495,6 @@ func (a *App) markContactReadByHand(
 	}
 	if !sharedWrite {
 		return cursorSynced, nil
-	}
-
-	unreadQuery := db.Where(
-		"organization_id = ? AND contact_id = ? AND direction = ? AND status <> ?",
-		orgID,
-		contactID,
-		models.DirectionIncoming,
-		models.MessageStatusRead,
-	)
-	if cutoff != nil {
-		unreadQuery = unreadQuery.Where("created_at >= ?", cutoff.UTC())
-	}
-	var unread []models.Message
-	if err := unreadQuery.Find(&unread).Error; err != nil {
-		return cursorSynced, err
 	}
 	return cursorSynced, a.markSelectedMessagesAsReadWithReceipts(orgID, contactID, contact, unread, false, false)
 }

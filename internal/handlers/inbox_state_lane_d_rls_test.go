@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,6 +122,20 @@ func TestLaneDManualReadLockOrderWithRuntimeRoleRLS(t *testing.T) {
 	secondUnlinked := laneDCreateUnlinkedMessage(t, adminDB, organization.ID, secondAccount.Name, contact.ID, base.Add(3*time.Second))
 	laneDSetManualUnread(t, adminDB, contact, nil)
 
+	// The lower-id conversation's WhatsApp number is soft-deleted, as
+	// DeleteAccount does. The cursor phase cannot verify that conversation's
+	// binding, but it still has an unread message, so the shared read must
+	// lock it, and lock it first.
+	lowerConversation, lowerAccount, higherConversation := firstConversation, firstAccount, secondConversation
+	if secondConversation.ID.String() < firstConversation.ID.String() {
+		lowerConversation, lowerAccount, higherConversation = secondConversation, secondAccount, firstConversation
+	}
+	linkedByConversation := map[uuid.UUID]uuid.UUID{
+		firstConversation.ID:  firstLinked.ID,
+		secondConversation.ID: secondLinked.ID,
+	}
+	require.NoError(t, adminDB.Delete(&models.WhatsAppAccount{BaseModel: models.BaseModel{ID: lowerAccount.ID}}).Error)
+
 	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
 	runtimeDB := openRuntimeRoleTestDB(t, runtimeRole, runtimePassword)
 	require.NoError(t, database.VerifyTenantRLS(runtimeDB, runtimeRole))
@@ -146,12 +161,11 @@ func TestLaneDManualReadLockOrderWithRuntimeRoleRLS(t *testing.T) {
 		require.NoError(t, adminDB.First(&message, "id = ?", id).Error)
 		assert.Equal(t, models.MessageStatusRead, message.Status, "message %s", id)
 	}
-	firstCursor := loadConversationReadCursor(t, adminDB, organization.ID, reader.ID, firstConversation.ID)
-	require.NotNil(t, firstCursor.LastReadMessageID)
-	assert.Equal(t, firstLinked.ID, *firstCursor.LastReadMessageID)
-	secondCursor := loadConversationReadCursor(t, adminDB, organization.ID, reader.ID, secondConversation.ID)
-	require.NotNil(t, secondCursor.LastReadMessageID)
-	assert.Equal(t, secondLinked.ID, *secondCursor.LastReadMessageID)
+	higherCursor := loadConversationReadCursor(t, adminDB, organization.ID, reader.ID, higherConversation.ID)
+	require.NotNil(t, higherCursor.LastReadMessageID)
+	assert.Equal(t, linkedByConversation[higherConversation.ID], *higherCursor.LastReadMessageID)
+	// No cursor on the deleted number's conversation: its binding is unproven.
+	assertConversationReadCursorMissing(t, adminDB, organization.ID, reader.ID, lowerConversation.ID)
 	assert.False(t, laneDManualUnreadStored(t, adminDB, contact.ID))
 
 	recorder.mu.Lock()
@@ -196,6 +210,42 @@ func TestLaneDManualReadLockOrderWithRuntimeRoleRLS(t *testing.T) {
 	require.NotEmpty(t, contactLock, "the shared read locks the contact")
 	require.Positive(t, conversationLocks)
 	assert.Equal(t, conversationIDs, firstLocked, "conversations must be first locked in id order")
+
+	// No deadlock against a concurrent whole-contact read: the chatbot path,
+	// which locks every conversation of the contact in id order and then the
+	// contact. Each round starts both from unread messages.
+	handler := app.Tenant((*App).MarkContactRead)
+	for round := 0; round < 12; round++ {
+		require.NoError(t, adminDB.Model(&models.Message{}).
+			Where("organization_id = ? AND contact_id = ?", organization.ID, contact.ID).
+			Update("status", models.MessageStatusDelivered).Error)
+		manualRequest := testutil.NewJSONRequest(t, map[string]any{"mark": "read"})
+		testutil.SetAuthContext(manualRequest, organization.ID, reader.ID)
+		testutil.SetPathParam(manualRequest, "id", contact.ID.String())
+		wholeContact := *contact
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var manualErr, wholeErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			manualErr = handler(manualRequest)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			wholeErr = app.WithTenantApp(organization.ID, func(scoped *App) error {
+				return scoped.markMessagesAsReadInCurrentScope(organization.ID, contact.ID, &wholeContact)
+			})
+		}()
+		close(start)
+		wg.Wait()
+		require.NoError(t, manualErr, "round %d", round)
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(manualRequest),
+			"round %d: %s", round, string(testutil.GetResponseBody(manualRequest)))
+		require.NoError(t, wholeErr, "round %d: whole-contact read", round)
+	}
 }
 
 // A legacy mirror that cannot complete (here, a shadow inbox account bound to
