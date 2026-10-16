@@ -300,6 +300,55 @@ func TestH1GraphStatusReceiptBetweenTwoSends(t *testing.T) {
 	h1RequireLiveAfterRun(t, env)
 }
 
+// The send marker never runs on the continuation's own transaction: it commits
+// independently (visible before tx A ends), tx A keeps no lock on the response row,
+// and inside the AI-attempt fence its connection wait is the 2s best-effort budget.
+func TestH1SendMarkerCommitsOutsideContinuationTransaction(t *testing.T) {
+	app := newProcessorTestApp(t)
+	shared := app.DB
+	organization, account := createProcessorTestOrg(t, app)
+	contact := testutil.CreateTestContactWith(t, shared, organization.ID, testutil.WithContactAccount(account.Name))
+	response := models.Message{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: organization.ID,
+		WhatsAppAccount: account.Name, ContactID: contact.ID,
+		WhatsAppMessageID: "wamid.h1-marker-" + uuid.NewString(), Direction: models.DirectionOutgoing,
+		MessageType: models.MessageTypeText, Content: "durable reply", Status: models.MessageStatusSent,
+		Metadata: models.JSONB{},
+	}
+	require.NoError(t, shared.Create(&response).Error)
+
+	pool, sqlDB := h1OpenPool(t, 3)
+	root := h1RootApp(pool, true)
+	txA := pool.Begin()
+	require.NoError(t, txA.Error)
+	t.Cleanup(func() { txA.Rollback() })
+	nested := h1NestedApp(root, organization.ID)
+	nested.DB = txA // the continuation transaction
+	nested.inboundContinuation.ContactID = contact.ID
+	nested.inboundContinuation.MessageID = uuid.New()
+	nested.inboundContinuation.WAMID = "wamid.h1-marker-inbound"
+	nested.inboundContinuation.attemptGuarded = true
+
+	require.NoError(t, nested.markInboundContinuationAction(response.ID, "inbound-action:h1-marker"))
+	// Committed and unlocked while tx A is still open.
+	var stored models.Message
+	require.NoError(t, shared.Transaction(func(tx *gorm.DB) error {
+		return tx.Raw("SELECT * FROM messages WHERE id = ? FOR UPDATE NOWAIT", response.ID).Scan(&stored).Error
+	}), "the continuation transaction must hold no lock on the response row")
+	assert.Equal(t, "inbound-action:h1-marker", stored.Metadata["inbound_continuation_action_key"])
+	assert.Equal(t, "wamid.h1-marker-inbound", stored.Metadata["inbound_continuation_wamid"])
+
+	// Pool exhausted (tx A plus two held): the best-effort marker yields after ~2s.
+	release := h1HoldConnections(t, sqlDB, 2)
+	started := time.Now()
+	err := nested.markInboundContinuationAction(response.ID, "inbound-action:h1-marker-2")
+	elapsed := time.Since(started)
+	release()
+	h1RequireWedgeGuard(t, err)
+	assert.GreaterOrEqual(t, elapsed, 1900*time.Millisecond)
+	assert.Less(t, elapsed, 5*time.Second, "the marker must not keep the AI-attempt fence for the 45s in-fence budget")
+}
+
 // h1FailTransferInsertsWithLockTimeout makes the next `times` agent_transfers inserts
 // fail exactly as an expired lock_timeout does (SQLSTATE 55P03), and records the
 // lock_timeout in effect on the handover's own transaction.
