@@ -384,6 +384,7 @@ describe('MediaPreviewDialog', () => {
 
   it.each([
     [new PdfPreviewError('password'), 'chat.mediaPreview.passwordProtected'],
+    [new PdfPreviewError('too-large'), 'chat.mediaPreview.tooLarge'],
     [new PdfPreviewError('invalid'), 'chat.mediaPreview.previewFailed'],
     [new PdfPreviewError('unavailable'), 'chat.mediaPreview.previewFailed'],
     [new Error('worker crashed'), 'chat.mediaPreview.previewFailed'],

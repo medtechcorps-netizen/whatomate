@@ -3,12 +3,12 @@ import { createRequire } from 'node:module'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   documentPreviewType,
-  hasOversizedImage,
   isPdfPreviewAbort,
   openPdfPreview,
   PDF_PREVIEW_MAX_IMAGE_PIXELS,
   PDF_PREVIEW_PAGE_LIMIT,
   PdfPreviewError,
+  scanPdfImages,
 } from './pdfPreview'
 
 const mocks = vi.hoisted(() => ({
@@ -66,17 +66,18 @@ function fakeDocument(numPages: number, page = fakePage()) {
 
 const canvas = () => ({ width: 0, height: 0 }) as HTMLCanvasElement
 
-// A PDF body holding one image XObject with the given dictionary entries.
-const imageObject = (entries: string) =>
-  `4 0 obj\n<< /Type /XObject /Subtype /Image ${entries} /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 3 >>\nstream\nabc\nendstream\nendobj\n`
+// A PDF image XObject with the given dictionary entries.
+const imageObject = (entries: string, number = 4) =>
+  `${number} 0 obj\n<< /Type /XObject /Subtype /Image ${entries} /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 3 >>\nstream\nabc\nendstream\nendobj\n`
 const pdfWith = (...objects: string[]) => encoder.encode(`%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n${objects.join('')}%%EOF\n`)
+const scan = (...objects: string[]) => scanPdfImages(pdfWith(...objects))
 
-describe('hasOversizedImage', () => {
+describe('scanPdfImages', () => {
   it('limits images to 4096 x 4096 pixels', () => {
     expect(PDF_PREVIEW_MAX_IMAGE_PIXELS).toBe(16_777_216)
-    expect(hasOversizedImage(pdfWith(imageObject('/Width 4096 /Height 4096')))).toBe(false)
-    expect(hasOversizedImage(pdfWith(imageObject('/Width 4097 /Height 4096')))).toBe(true)
-    expect(hasOversizedImage(pdfWith(imageObject('/Width 30000 /Height 30000')))).toBe(true)
+    expect(scan(imageObject('/Width 4096 /Height 4096')).oversized).toBe(false)
+    expect(scan(imageObject('/Width 4097 /Height 4096')).oversized).toBe(true)
+    expect(scan(imageObject('/Width 30000 /Height 30000')).oversized).toBe(true)
   })
 
   it.each([
@@ -84,20 +85,83 @@ describe('hasOversizedImage', () => {
     ['height before width', imageObject('/Height 5000 /Width 5000')],
     ['a nested parameters dictionary', imageObject('/DecodeParms << /Columns 5000 /K -1 >> /Width 5000 /Height 5000')],
   ])('reads the size of an image in %s', (_, object) => {
-    expect(hasOversizedImage(pdfWith(object))).toBe(true)
+    expect(scan(object).oversized).toBe(true)
   })
 
   it('ignores files without a large image', () => {
-    expect(hasOversizedImage(pdfWith())).toBe(false)
-    expect(hasOversizedImage(pdfWith(imageObject('/Width 2480 /Height 3508')))).toBe(false)
+    expect(scan()).toEqual({ oversized: false, oversizedMask: false })
+    expect(scan(imageObject('/Width 2480 /Height 3508'))).toEqual({ oversized: false, oversizedMask: false })
     // A form XObject is not an image, whatever its bounding box.
-    expect(hasOversizedImage(pdfWith('5 0 obj\n<< /Subtype /Form /Width 9000 /Height 9000 >>\nstream\nq Q\nendstream\nendobj\n'))).toBe(false)
+    expect(scan('5 0 obj\n<< /Subtype /Form /Width 9000 /Height 9000 >>\nstream\nq Q\nendstream\nendobj\n').oversized).toBe(false)
   })
 
   it('finds an image whose dictionary straddles the boundary between two reading windows', () => {
     const before = '%PDF-1.7\n' + ' '.repeat((1 << 20) - 40)
-    const bytes = encoder.encode(before + imageObject('/Width 6000 /Height 6000'))
-    expect(hasOversizedImage(bytes)).toBe(true)
+    expect(scanPdfImages(encoder.encode(before + imageObject('/Width 6000 /Height 6000'))).oversized).toBe(true)
+  })
+
+  it.each([
+    ['an A3 page scanned at 300 dpi', '/Width 3508 /Height 4960'],
+    ['a 24-megapixel phone photo', '/Width 6000 /Height 4000'],
+  ])('still previews %s, leaving the image out', (_, size) => {
+    expect(scan(imageObject(size))).toEqual({ oversized: true, oversizedMask: false })
+  })
+
+  it.each([
+    ['/SMask', '/SMask 9 0 R'],
+    ['/Mask', '/Mask 9 0 R'],
+  ])('refuses a drawn image whose %s is an oversized image', (_, reference) => {
+    const mask = imageObject('/Width 12000 /Height 12000 /ColorSpace /DeviceGray', 9)
+    expect(scan(imageObject(`/Width 1 /Height 1 ${reference}`), mask)).toEqual({ oversized: true, oversizedMask: true })
+    // The mask may come first in the file.
+    expect(scan(mask, imageObject(`/Width 1 /Height 1 ${reference}`)).oversizedMask).toBe(true)
+  })
+
+  it('finds an oversized mask defined in a later reading window', () => {
+    const padding = ' '.repeat(3 << 20)
+    const bytes = encoder.encode(
+      '%PDF-1.7\n' + imageObject('/Width 1 /Height 1 /SMask 9 0 R') + padding + imageObject('/Width 12000 /Height 12000', 9),
+    )
+    expect(scanPdfImages(bytes).oversizedMask).toBe(true)
+  })
+
+  it('allows masks within the limit, colour-key masks, and the masks of images pdf.js leaves out', () => {
+    expect(scan(imageObject('/Width 800 /Height 600 /SMask 9 0 R'), imageObject('/Width 800 /Height 600', 9)).oversizedMask).toBe(false)
+    expect(scan(imageObject('/Width 800 /Height 600 /Mask [0 10 0 10 0 10]')).oversizedMask).toBe(false)
+    // A large transparent photo: pdf.js drops the photo before reading its mask.
+    expect(scan(imageObject('/Width 6000 /Height 4000 /SMask 9 0 R'), imageObject('/Width 6000 /Height 4000', 9))).toEqual({
+      oversized: true,
+      oversizedMask: false,
+    })
+  })
+})
+
+describe('scanPdfImages on hostile input', () => {
+  const sixteenMegabytes = (unit: string) => encoder.encode('%PDF-1.7\n' + unit.repeat(Math.ceil((16 << 20) / unit.length)))
+  const timed = (bytes: Uint8Array) => {
+    const started = performance.now()
+    scanPdfImages(bytes)
+    return performance.now() - started
+  }
+
+  // A scan that searched back and forth from every image marker took tens of
+  // seconds per megabyte of these; a linear one takes milliseconds.
+  it.each([
+    ['repeated image markers', '/Subtype/Image s'],
+    ['image markers after headers, never followed by a stream', '1 0 obj /Subtype/Image '],
+    ['tiny image objects referencing masks', '7 0 obj<</Subtype/Image/Width 9/Height 9/SMask 7 0 R>>stream\n'],
+    ['long digit runs', `8 0 obj /Subtype/Image /Width ${'9'.repeat(60)} /SMask ${'9'.repeat(60)} 0 R stream `],
+  ])('scans 16 MB of %s within a generous bound', (_, unit) => {
+    expect(timed(sixteenMegabytes(unit))).toBeLessThan(2000)
+  })
+
+  it('takes time proportional to the file size within a reading window', () => {
+    const sized = (length: number) => encoder.encode('%PDF-1.7\n' + '/Subtype/Image s'.repeat(length / 16))
+    const best = (bytes: Uint8Array) => Math.min(...Array.from({ length: 5 }, () => timed(bytes)))
+    const small = best(sized(128 << 10))
+    const large = best(sized(1 << 20))
+    // 8 times the bytes: about 8 times the time; a quadratic scan takes 64.
+    expect(large / Math.max(small, 0.05)).toBeLessThan(32)
   })
 })
 
@@ -171,6 +235,14 @@ describe('openPdfPreview', () => {
     expect(preview.hasOversizedImages).toBe(true)
     // The same file still goes to pdf.js, which skips the image itself.
     expect(mocks.getDocument.mock.calls[0][0].maxImageSize).toBe(PDF_PREVIEW_MAX_IMAGE_PIXELS)
+  })
+
+  it('refuses a file whose drawn image has an oversized mask before pdf.js sees it', async () => {
+    const bytes = pdfWith(imageObject('/Width 1 /Height 1 /SMask 9 0 R'), imageObject('/Width 12000 /Height 12000', 9))
+    const error = await openPdfPreview(new Blob([bytes])).catch(caught => caught)
+    expect(error).toBeInstanceOf(PdfPreviewError)
+    expect(error.reason).toBe('too-large')
+    expect(mocks.getDocument).not.toHaveBeenCalled()
   })
 
   it('points pdf.js at same-origin CMaps, fonts and JavaScript image decoders, never WebAssembly', async () => {

@@ -111,11 +111,12 @@ const status = computed(() => {
 
 const canZoom = computed(() => status.value === 'ready')
 
-const failureMessage = computed(() =>
-  props.source.type === 'pdf' && pdfFailure.value === 'password'
-    ? t('chat.mediaPreview.passwordProtected')
-    : t('chat.mediaPreview.previewFailed'),
-)
+const failureMessage = computed(() => {
+  if (props.source.type !== 'pdf') return t('chat.mediaPreview.previewFailed')
+  if (pdfFailure.value === 'password') return t('chat.mediaPreview.passwordProtected')
+  if (pdfFailure.value === 'too-large') return t('chat.mediaPreview.tooLarge')
+  return t('chat.mediaPreview.previewFailed')
+})
 
 function setPageElement(page: PreviewPage, element: Element | ComponentPublicInstance | null) {
   if (element instanceof HTMLElement) pageElements.set(page.number, element)

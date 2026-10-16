@@ -49,38 +49,93 @@ const MAX_OUTPUT_SCALE = 2
 // still covers an A4 page scanned at 400 dpi.
 export const PDF_PREVIEW_MAX_IMAGE_PIXELS = 4096 * 4096
 
-// pdf.js says nothing when it leaves an image out, and a scanned page that is
-// one large image would then look blank. Image XObjects are streams, which
-// never sit inside compressed object streams, so their dictionaries are plain
-// text in the file (encryption covers only strings and stream data). Reading
-// their sizes here lets the preview say so and offer the download instead.
-export function hasOversizedImage(bytes: Uint8Array, maxPixels = PDF_PREVIEW_MAX_IMAGE_PIXELS): boolean {
-  // Read in windows so a large file is never one huge string; latin1 keeps
-  // one character per byte, and each window overlaps its neighbours by the
-  // longest dictionary looked at.
-  const decoder = new TextDecoder('latin1')
-  const windowSize = 1 << 20
-  const reach = 4096
-  for (let offset = 0; offset < bytes.length; offset += windowSize) {
-    const from = Math.max(0, offset - reach)
-    const text = decoder.decode(bytes.subarray(from, Math.min(bytes.length, offset + windowSize + reach)))
-    const image = /\/Subtype\s*\/Image\b/g
-    image.lastIndex = offset - from
-    for (let match = image.exec(text); match && match.index < offset - from + windowSize; match = image.exec(text)) {
-      // The dictionary runs from its object header to the stream keyword.
-      const start = text.lastIndexOf('obj', match.index)
-      const end = text.indexOf('stream', match.index)
-      if (start < 0 || end < 0 || end - start > reach) continue
-      const dictionary = text.slice(start, end)
-      const width = /\/Width\s+(\d+)/.exec(dictionary)
-      const height = /\/Height\s+(\d+)/.exec(dictionary)
-      if (width && height && Number(width[1]) * Number(height[1]) > maxPixels) return true
-    }
-  }
-  return false
+export interface PdfImageScan {
+  // Some image is over the limit; pdf.js leaves it out of the page.
+  oversized: boolean
+  // An image pdf.js will draw uses an image over the limit as its /SMask or
+  // /Mask. pdf.js checks only the drawn image's own size but decodes into a
+  // buffer as large as the image and its masks together, so a 1x1 image with
+  // a 12000x12000 soft mask would allocate over half a gigabyte. Such a file
+  // is not previewed at all.
+  oversizedMask: boolean
 }
 
-export type PdfPreviewFailure = 'password' | 'invalid' | 'unavailable'
+// Each window is decoded on its own so a large file is never one huge
+// string; latin1 keeps one character per byte. A dictionary is followed at
+// most REACH characters, and windows overlap by that much on each side.
+const SCAN_WINDOW = 1 << 20
+const SCAN_REACH = 4096
+// Bounded repeats keep every pattern linear, whatever the file contains.
+const SCAN_TOKENS = /\bobj\b|\bstream\b|\/Subtype\s*\/Image\b/g
+const OBJECT_NUMBER = /(\d{1,10})\s{1,8}\d{1,5}\s{1,8}$/
+const IMAGE_WIDTH = /\/Width\s{1,8}(\d{1,10})/
+const IMAGE_HEIGHT = /\/Height\s{1,8}(\d{1,10})/
+const MASK_REFERENCE = /\/S?Mask\s{1,8}(\d{1,10})\s{1,8}\d{1,5}\s{1,8}R\b/g
+
+// pdf.js says nothing when it leaves an image out, and a scanned page that is
+// one large image would then look blank, so the sizes are read here first.
+// Image XObjects are streams, which never sit inside compressed object
+// streams, so their dictionaries are plain text in the file; encryption
+// covers only strings and stream data. One pass over each window finds every
+// object header, image subtype and stream keyword; only a dictionary of at
+// most SCAN_REACH characters is ever examined, so hostile input costs linear
+// time (16 MB of repeated image markers scans in well under a second).
+//
+// What this cannot see, and pdf.js still decodes: sizes given indirectly
+// (/Width 12 0 R) or with escaped names (/Wid#74h); inline images in content
+// streams; a JPEG whose own frame size differs from its dictionary; and
+// compression bombs, since pdf.js puts no limit on how far a stream inflates.
+export function scanPdfImages(bytes: Uint8Array, maxPixels = PDF_PREVIEW_MAX_IMAGE_PIXELS): PdfImageScan {
+  const decoder = new TextDecoder('latin1')
+  const oversizedObjects = new Set<number>()
+  const drawnMasks = new Set<number>()
+  let oversized = false
+
+  for (let offset = 0; offset < bytes.length; offset += SCAN_WINDOW) {
+    const from = Math.max(0, offset - SCAN_REACH)
+    const text = decoder.decode(bytes.subarray(from, Math.min(bytes.length, offset + SCAN_WINDOW + SCAN_REACH)))
+    // Images whose subtype lies in this window's own range are this window's;
+    // the overlaps only supply their headers and stream keywords.
+    const ownStart = offset - from
+    const ownEnd = ownStart + SCAN_WINDOW
+    let header = -1
+    let image = false
+    const tokens = new RegExp(SCAN_TOKENS)
+    for (let match = tokens.exec(text); match; match = tokens.exec(text)) {
+      const at = match.index
+      if (match[0] === 'obj') {
+        header = at
+        image = false
+      } else if (match[0] === 'stream') {
+        if (image && at - header <= SCAN_REACH) {
+          const dictionary = text.slice(header, at)
+          const width = IMAGE_WIDTH.exec(dictionary)
+          const height = IMAGE_HEIGHT.exec(dictionary)
+          const tooLarge = !!width && !!height && Number(width[1]) * Number(height[1]) > maxPixels
+          if (tooLarge) {
+            oversized = true
+            const number = OBJECT_NUMBER.exec(text.slice(Math.max(0, header - 32), header))
+            if (number) oversizedObjects.add(Number(number[1]))
+          } else {
+            // pdf.js drops an oversized image before reading its masks, so
+            // only the masks of images it will draw matter.
+            for (const reference of dictionary.matchAll(MASK_REFERENCE)) drawnMasks.add(Number(reference[1]))
+          }
+        }
+        header = -1
+        image = false
+      } else if (header >= 0 && at - header <= SCAN_REACH && at >= ownStart && at < ownEnd) {
+        image = true
+      }
+    }
+  }
+
+  let oversizedMask = false
+  for (const mask of drawnMasks) oversizedMask ||= oversizedObjects.has(mask)
+  return { oversized, oversizedMask }
+}
+
+export type PdfPreviewFailure = 'password' | 'invalid' | 'too-large' | 'unavailable'
 
 export class PdfPreviewError extends Error {
   constructor(readonly reason: PdfPreviewFailure) {
@@ -171,7 +226,9 @@ export async function openPdfPreview(blob: Blob, options: { signal?: AbortSignal
   if (signal?.aborted) throw abortError()
 
   // Read before getDocument, which hands the bytes to the worker.
-  const hasOversizedImages = hasOversizedImage(data)
+  const images = scanPdfImages(data)
+  if (images.oversizedMask) throw new PdfPreviewError('too-large')
+  const hasOversizedImages = images.oversized
   const files = runtimeFilesURL(pdfjs.version)
   const params = {
     // Transferred to the worker; this copy is not used again.

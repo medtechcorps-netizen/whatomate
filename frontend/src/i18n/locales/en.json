@@ -538,6 +538,7 @@
       "pageLimit": "Showing the first {shown} of {total} pages. Download the file to see every page.",
       "imageLimit": "Some images in this file are too large to preview and are left out. Download the file to see them.",
       "passwordProtected": "This PDF is password-protected. Download it and open it with its password.",
+      "tooLarge": "This file has images too large to preview. Download it to open it in another app.",
       "previewFailed": "This file could not be previewed. Download it to open it in another app."
     },
     "internalNotes": "Notes",
