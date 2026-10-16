@@ -2994,6 +2994,17 @@ func (a *App) persistIncomingMessageForAccount(
 	)
 }
 
+// lockIncomingOrganizationPolicyScope bounds only ingress's fence statements.
+// A physical AI attempt can hold the organization row while its completed result
+// needs another root connection; waiting ingress must release capacity before
+// the existing 45s action-ledger deadline. Keep the owning transaction's context
+// unchanged so an early successful lock does not cancel later admission work.
+func lockIncomingOrganizationPolicyScope(tx *gorm.DB, organizationID uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(tx.Statement.Context, 20*time.Second)
+	defer cancel()
+	return database.LockOrganizationPolicyScope(tx.WithContext(ctx), organizationID)
+}
+
 func (a *App) persistIncomingMessageForAccountWithAdmission(
 	phoneNumberID string,
 	msg IncomingTextMessage,
@@ -3044,7 +3055,7 @@ func (a *App) persistIncomingMessageForAccountWithAdmission(
 	if err := database.LockWhatsAppWAMIDScopes(a.DB, account.OrganizationID, msg.ID); err != nil {
 		return nil, false, fmt.Errorf("lock incoming WhatsApp message admission: %w", err)
 	}
-	if err := database.LockOrganizationPolicyScope(
+	if err := lockIncomingOrganizationPolicyScope(
 		a.DB,
 		account.OrganizationID,
 	); err != nil {

@@ -1168,7 +1168,7 @@ func (a *App) persistAuthenticatedIncomingMessageBeforeAck(
 			return persistErr
 		}
 
-		if lockErr := database.LockOrganizationPolicyScope(scoped.DB, organizationID); lockErr != nil {
+		if lockErr := lockIncomingOrganizationPolicyScope(scoped.DB, organizationID); lockErr != nil {
 			return fmt.Errorf("lock authenticated incoming admission: %w", lockErr)
 		}
 		channelAccount, shadowErr := channelapi.EnsureLegacyMetaWhatsAppAccount(
