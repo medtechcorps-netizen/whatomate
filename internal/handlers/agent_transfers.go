@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -1357,29 +1358,64 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	var savedTransfer models.AgentTransfer
 	var canonicalContact models.Contact
 	existingProven := false
+	// H1, nested handover only: one wall-clock budget for the organization fence, shared
+	// by every canonical-write attempt; it starts once the handover's own connection is held.
+	var fenceDeadline time.Time
 
 	write := func(tx *gorm.DB) error {
 		existingProven = false
-		if a.inboundContinuation != nil {
-			// H1 defence in depth: this handover holds the organization fence while it waits
-			// for contact/transfer/session locks, and its continuation waits for it in Go
-			// while holding its own transaction. A holder of one of those locks that waits
-			// (directly or through another session) on that continuation closes a cycle
-			// PostgreSQL cannot detect, and every later inbound message of the organization
-			// then queues behind the fence. Bound each lock wait of this attempt (the fence
-			// included); canonicalContactWriteTransaction retries 55P03, so all attempts
-			// stay within about 20s, and the caller turns a final 55P03 into a refunded
-			// wedge-guard deferral. Nothing commits on expiry. SET LOCAL ends with this
-			// handover's own transaction and is undone when the attempt's savepoint rolls back.
-			if err := tx.Exec("SET LOCAL lock_timeout = '3s'").Error; err != nil {
+		nested := a.inboundContinuation != nil
+		if nested {
+			// Bound each fence statement as well as their combined wall-clock time.
+			// PostgreSQL restarts statement_timeout for the advisory and row queries;
+			// the child context below keeps both inside the same 40s deadline across
+			// canonical-write retries. It never owns this transaction or its COMMIT.
+			budget := time.Until(fenceDeadline)
+			if budget < time.Millisecond {
+				budget = time.Millisecond
+			}
+			if err := tx.Exec(
+				"SELECT pg_catalog.set_config('statement_timeout', ?, true)",
+				strconv.FormatInt(budget.Milliseconds(), 10),
+			).Error; err != nil {
 				return err
 			}
 		}
-		if lockErr := database.LockOrganizationPolicyScope(
-			tx,
-			baseTransfer.OrganizationID,
-		); lockErr != nil {
+		fenceDB := tx
+		cancelFence := func() {}
+		if nested {
+			parent := tx.Statement.Context
+			if parent == nil {
+				parent = context.Background()
+			}
+			fenceCtx, cancel := context.WithDeadline(parent, fenceDeadline)
+			fenceDB, cancelFence = tx.WithContext(fenceCtx), cancel
+		}
+		lockErr := database.LockOrganizationPolicyScope(fenceDB, baseTransfer.OrganizationID)
+		fenceExpired := nested && errors.Is(fenceDB.Statement.Context.Err(), context.DeadlineExceeded)
+		cancelFence()
+		if lockErr != nil {
+			if nested && (fenceExpired || postgresErrorCode(lockErr) == "57014") {
+				// Classify only cancellation at this bounded fence. Keep the original
+				// SQL cause when supplied; a client deadline can have no SQLSTATE.
+				return errors.Join(errors.New("wedge guard: nested handover organization fence exceeded its 40s budget"), context.DeadlineExceeded, lockErr)
+			}
 			return lockErr
+		}
+		if nested {
+			// H1 defence in depth, after the fence is held: a holder of a contact/transfer/
+			// session row lock this attempt needs that waits (directly or through another
+			// session) on this continuation closes a cycle PostgreSQL cannot detect. Bound
+			// each post-fence lock wait at 3s; canonicalContactWriteTransaction retries
+			// 55P03 (six attempts, re-entering the fence on the shared budget), and the
+			// caller turns a final 55P03 into a refunded wedge-guard deferral. The fence's
+			// statement_timeout must not outlive the fence (the COMMIT included).
+			if err := tx.Exec("SET LOCAL statement_timeout TO DEFAULT").Error; err != nil {
+				return err
+			}
+			if err := tx.Exec("SET LOCAL lock_timeout = '3s'").Error; err != nil {
+				return err
+			}
 		}
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(
 			tx,
@@ -1472,6 +1508,7 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		err = a.WithCommittedTenantApp(
 			baseTransfer.OrganizationID,
 			func(scoped *App) error {
+				fenceDeadline = time.Now().Add(40 * time.Second)
 				return canonicalContactWriteTransaction(scoped.DB, write)
 			},
 		)
@@ -1705,7 +1742,44 @@ func (a *App) createTransferToTeam(account *models.WhatsAppAccount, contact *mod
 
 	var agentID *uuid.UUID
 	if !existing && a.Assigner != nil {
-		agentID = a.Assigner.AssignToTeam(teamID, account.OrganizationID, nil, assignment.ChatLoadCounter)
+		if a.inboundContinuation == nil {
+			agentID = a.Assigner.AssignToTeam(teamID, account.OrganizationID, nil, assignment.ChatLoadCounter)
+		} else {
+			// H1: never select on the continuation transaction. Round-robin UPDATEs the
+			// chosen team_members row; on that transaction the row lock would be held across
+			// the handover's own (bounded) connection wait below, and concurrent same-team
+			// handovers, each pinning its own continuation connection, would pick the same
+			// member and queue behind it in PostgreSQL: a pool+lock convoy. Select in a short
+			// transaction of its own that commits at once (as on the continuation transaction,
+			// the round-robin timestamp stays committed even if the handover then fails).
+			organizationID := account.OrganizationID
+			root := a.rootApp()
+			if root == nil || root.DB == nil || root.DB.Statement == nil {
+				return false, errors.New("team transfer agent selection requires the root database")
+			}
+			// The root pool's own context, as in WithTenantApp.
+			assignErr := a.withBoundedRootConnection(root.DB.Statement.Context, 0, func(db *gorm.DB) error {
+				assign := func(tx *gorm.DB) error {
+					if err := tx.Exec("SET LOCAL lock_timeout = '3s'").Error; err != nil {
+						return err
+					}
+					var selectionErr error
+					agentID, selectionErr = a.Assigner.WithDB(tx).AssignChatToTeamChecked(teamID, organizationID, nil)
+					return selectionErr
+				}
+				if a.rlsEnabled() {
+					return database.WithTenant(db, organizationID, assign)
+				}
+				return db.Transaction(assign)
+			})
+			if assignErr != nil {
+				// Every failed selection, including a round-robin timestamp write,
+				// retries with its real cause. An aborted transaction is not proof
+				// of congestion or of a valid selected agent.
+				a.Log.Error("Failed to select a team agent for the transfer", "error", assignErr, "contact_id", contact.ID, "team_id", teamID)
+				return false, assignErr
+			}
+		}
 	}
 
 	transfer := models.AgentTransfer{

@@ -683,8 +683,9 @@ func TestH1GraphTransferHandoverWedgeRetriesWithoutLoss(t *testing.T) {
 }
 
 // The team route's selected agent, SLA pickup and AssignToSameAgent are applied once,
-// on the committed transfer. AssignToTeam itself runs on tx A, which commits its
-// last_assigned_at even when the handover fails: the replay selects again (recorded
+// on the committed transfer. AssignToTeam itself commits in a short transaction of its
+// own (never on tx A; see h1_handover_fence_test.go), so its last_assigned_at stays
+// committed even when the handover fails: the replay selects again (recorded
 // round-robin drift, a documented residual).
 func TestH1GraphTransferTeamSelectedAgentAppliedOnce(t *testing.T) {
 	env := h1HandoverFixture(t, h1HandoverOptions{
@@ -718,7 +719,7 @@ func TestH1GraphTransferTeamSelectedAgentAppliedOnce(t *testing.T) {
 	assert.Zero(t, first.ActiveTransfers)
 	assert.Nil(t, first.ContactAssignee, "no assignment without the committed handover")
 	firstAssigned := lastAssigned()
-	require.NotNil(t, firstAssigned, "AssignToTeam ran on tx A, which committed on the error path")
+	require.NotNil(t, firstAssigned, "AssignToTeam committed its own selection on the error path")
 	h1RequireEnvelopes(t, env.envelopes, 0)
 
 	time.Sleep(5 * time.Millisecond) // a distinct round-robin timestamp on replay

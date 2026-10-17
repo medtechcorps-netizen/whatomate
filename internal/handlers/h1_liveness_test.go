@@ -12,8 +12,10 @@ package handlers
 // now commits in its own short transaction; these tests drive the real receipt into
 // that exact window and require it to complete while tx A is still open.
 //
-// (2) Defence in depth: a nested handover's lock waits are bounded (lock_timeout) and
-// a final 55P03 is a refunded wedge-guard deferral with nothing committed.
+// (2) Defence in depth: a nested handover's post-fence lock waits are bounded
+// (lock_timeout, set once the organization fence is held) and a final 55P03 is a
+// refunded wedge-guard deferral with nothing committed. The fence itself has a
+// wall-clock budget (statement_timeout); see h1_handover_fence_test.go.
 //
 // Every case drives real ProcessMessage settlement on a dedicated pool (h1OpenPool);
 // callbacks are registered only on that pool. None of these tests calls t.Parallel.
@@ -381,9 +383,10 @@ func h1RequireLockTimeoutDeferral(t *testing.T, err error) {
 	assert.False(t, inboundContinuationStoppedByPolicy(err))
 }
 
-// A nested handover runs with a bounded lock wait, and when every canonical-write
-// attempt ends in 55P03 the continuation is a refunded wedge-guard deferral with
-// nothing committed; the replay hands over exactly once without resending the body.
+// A nested handover runs with bounded post-fence lock waits, and when every
+// canonical-write attempt ends in 55P03 the continuation is a refunded wedge-guard
+// deferral with nothing committed; the replay hands over exactly once without
+// resending the body.
 func TestH1HandoverLockTimeoutIsRefundedDeferral(t *testing.T) {
 	for _, route := range []string{"queue", "team"} {
 		t.Run("graph_"+route, func(t *testing.T) {
@@ -478,10 +481,10 @@ func (p *h1LockTimeoutLogProbe) Write(data []byte) (int, error) {
 }
 
 // The real bound: an outside session holds the contact row while the graph handover
-// asks for it (after the body, on the pre-handover boundary). Without the bound this
-// handover would wait as long as the holder, pinning the organization fence; with it
-// every canonical-write attempt expires (55P03) after a few seconds, nothing commits,
-// and the replay hands over once.
+// asks for it (after the body, on the pre-handover boundary, after the organization
+// fence). Without the bound this handover would wait as long as the holder, pinning
+// the organization fence; with it every canonical-write attempt expires (55P03) after
+// a few seconds, nothing commits, and the replay hands over once.
 func TestH1GraphTransferHandoverLockWaitIsBounded(t *testing.T) {
 	h1RequireSlow(t)
 	env := h1HandoverFixture(t, h1HandoverOptions{flowCfg: map[string]any{"body": "Connecting you to a human."}})
