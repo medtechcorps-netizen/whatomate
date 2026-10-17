@@ -403,18 +403,31 @@ class H1BootstrapClosureCISourceTests(unittest.TestCase):
                         self.refused(head)
 
     def test_shared_artifact_budget_cannot_be_reset_by_new_admission(self):
+        intermediate = self.repo.commit({"README.md": "old metadata predecessor\n"})
         head = self.paired()
         real_helper = sc._ci_h1_bootstrap_closure
-        observed = []
+        observed, attempted = [], []
+        uncached = (intermediate, sc.CATALOG)
         def wrapper(reader, base, candidate, old, new):
-            self.assertNotIn((candidate, ADDITIONS[0]), reader.cache)
+            # This fixture has no pending plan or tenant-profile declaration.
+            # Legacy scans cache intermediate registry/manifest documents, but
+            # the new helper first reads its intermediate active catalog.
+            self.assertNotIn(uncached, reader.cache)
             observed.append(reader)
             reader.total = 64 * 1024 * 1024
-            return real_helper(reader, base, candidate, old, new)
+            real_blob = reader.blob
+            def record_blob(revision, path):
+                if (revision, path) == uncached:
+                    self.assertNotIn(uncached, reader.cache)
+                    attempted.append(uncached)
+                return real_blob(revision, path)
+            with mock.patch.object(reader, "blob", side_effect=record_blob):
+                return real_helper(reader, base, candidate, old, new)
         with mock.patch.object(sc, "_ci_h1_bootstrap_closure", side_effect=wrapper):
             self.refused(head)
         self.assertEqual(len(observed), 1)
-        self.assertGreater(observed[0].total, 64 * 1024 * 1024)
+        self.assertEqual(attempted, [uncached])
+        self.assertEqual(observed[0].total, 64 * 1024 * 1024 + len(self.active[sc.CATALOG].encode()))
 
     def test_history_commit_cap_and_nonancestor_base_remain_refusals(self):
         self.repo.commit({"README.md": "one\n"})
