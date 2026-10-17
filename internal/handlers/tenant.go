@@ -211,16 +211,20 @@ func (a *App) WithTenantApp(organizationID uuid.UUID, fn func(*App) error) error
 		return nil
 	}
 	var afterCommit []func()
-	err := database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
-		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
-			return err
-		}
-		scoped := root.scopedApp(tx, organizationID)
-		if err := fn(scoped); err != nil {
-			return err
-		}
-		afterCommit = scoped.takeAfterCommit()
-		return nil
+	// The root pool's own context: the tenant transaction keeps today's context;
+	// only a nested receiver's wait for the connection is bounded.
+	err := a.withBoundedRootConnection(root.DB.Statement.Context, 0, func(db *gorm.DB) error {
+		return database.WithTenant(db, organizationID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+				return err
+			}
+			scoped := root.scopedApp(tx, organizationID)
+			if err := fn(scoped); err != nil {
+				return err
+			}
+			afterCommit = scoped.takeAfterCommit()
+			return nil
+		})
 	})
 	if err != nil {
 		return err
@@ -244,27 +248,8 @@ func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) err
 	if root == nil || root.DB == nil {
 		return errors.New("database connection is required")
 	}
-	if a.rlsEnabled() {
-		var afterCommit []func()
-		err := database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
-			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
-				return err
-			}
-			scoped := root.scopedApp(tx, organizationID)
-			if err := fn(scoped); err != nil {
-				return err
-			}
-			afterCommit = scoped.takeAfterCommit()
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		a.runAfterCommit(afterCommit)
-		return nil
-	}
 	var afterCommit []func()
-	err := root.DB.Transaction(func(tx *gorm.DB) error {
+	phase := func(tx *gorm.DB) error {
 		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
 			return err
 		}
@@ -274,6 +259,13 @@ func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) err
 		}
 		afterCommit = scoped.takeAfterCommit()
 		return nil
+	}
+	// The root pool's own context, as in WithTenantApp.
+	err := a.withBoundedRootConnection(root.DB.Statement.Context, 0, func(db *gorm.DB) error {
+		if a.rlsEnabled() {
+			return database.WithTenant(db, organizationID, phase)
+		}
+		return db.Transaction(phase)
 	})
 	if err != nil {
 		return err

@@ -3,10 +3,13 @@ package assignment
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/models"
+	"gorm.io/gorm"
 )
 
 const (
@@ -23,6 +26,13 @@ type TeamConfig struct {
 
 // GetTeamConfig returns the team's assignment config, reading from cache first.
 func (a *Assigner) GetTeamConfig(teamID uuid.UUID) *TeamConfig {
+	cfg, _ := a.getTeamConfig(teamID, false)
+	return cfg
+}
+
+// checkMemberError keeps the legacy accessor's best-effort member loading while
+// checked chat selection refuses a failed read before publishing a cache entry.
+func (a *Assigner) getTeamConfig(teamID uuid.UUID, checkMemberError bool) (*TeamConfig, error) {
 	ctx := context.Background()
 	key := teamCachePrefix + teamID.String()
 
@@ -31,7 +41,7 @@ func (a *Assigner) GetTeamConfig(teamID uuid.UUID) *TeamConfig {
 	if err == nil && cached != "" {
 		var cfg TeamConfig
 		if err := json.Unmarshal([]byte(cached), &cfg); err == nil {
-			return &cfg
+			return &cfg, nil
 		}
 	}
 
@@ -39,15 +49,21 @@ func (a *Assigner) GetTeamConfig(teamID uuid.UUID) *TeamConfig {
 	var team models.Team
 	if err := a.db.Where("id = ? AND is_active = ?", teamID, true).First(&team).Error; err != nil {
 		a.log.Error("Failed to get team for assignment", "error", err, "team_id", teamID)
-		return nil
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read assignment team: %w", err)
 	}
 
 	// Get agent-role member IDs
 	var memberIDs []uuid.UUID
-	a.db.Table("team_members").
+	err = a.db.Table("team_members").
 		Select("user_id").
 		Where("team_id = ? AND role = ? AND deleted_at IS NULL", teamID, models.TeamRoleAgent).
-		Pluck("user_id", &memberIDs)
+		Pluck("user_id", &memberIDs).Error
+	if err != nil && checkMemberError {
+		return nil, fmt.Errorf("read assignment team members: %w", err)
+	}
 
 	cfg := &TeamConfig{
 		Strategy:            team.AssignmentStrategy,
@@ -61,5 +77,5 @@ func (a *Assigner) GetTeamConfig(teamID uuid.UUID) *TeamConfig {
 		a.redis.Set(ctx, key, string(data), teamCacheTTL)
 	}
 
-	return cfg
+	return cfg, nil
 }

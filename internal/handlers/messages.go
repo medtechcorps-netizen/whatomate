@@ -1010,6 +1010,12 @@ func (a *App) deliverAutomaticAIOutgoingMessage(
 			if err := a.prepareWhatsAppAccountForRuntime(account); err != nil {
 				return err
 			}
+			// The provider transaction may have waited after the outer guard and
+			// independent dispatch claim. Recheck the worker on this same fresh
+			// transaction before starting I/O; settlement remains independent.
+			if err := a.requireInboundContinuationOwnershipTx(tx); err != nil {
+				return err
+			}
 			*providerAttempted = true
 			result.providerAttempted = true
 			result.whatsAppMessageID, result.sendErr = normalizeOutgoingProviderResult(
@@ -1478,11 +1484,12 @@ func (a *App) outgoingTenantTransaction(
 	write func(tx *gorm.DB) error,
 ) error {
 	root := a.rootApp()
-	db := root.DB.WithContext(ctx)
-	if root.rlsEnabled() {
-		return database.WithTenant(db, organizationID, write)
-	}
-	return db.Transaction(write)
+	return a.withBoundedRootConnection(ctx, 0, func(db *gorm.DB) error {
+		if root.rlsEnabled() {
+			return database.WithTenant(db, organizationID, write)
+		}
+		return db.Transaction(write)
+	})
 }
 
 // lockOutgoingContactVisibility rechecks an agent's live claim after the
@@ -1793,7 +1800,52 @@ func (a *App) finalizeMessageSend(
 	// gone out. Keeps the agent's contact-list unread count clean for
 	// conversations the bot is auto-handling. See issue #280.
 	if opts.MarkIncomingRead {
-		a.markMessagesAsRead(req.Account.OrganizationID, req.Contact.ID, req.Contact)
+		if a.inboundContinuation != nil {
+			// H1: markMessagesAsRead's continuation branch (contacts.go:1078-1085), entered
+			// through this nested App so its pool wait is bounded. Inside the AI-attempt
+			// fence this goroutine holds the organization KEY SHARE that policy writers
+			// queue behind while they pin pooled connections, so this best-effort write
+			// waits at most 2s there (the unread badge then stays) instead of 45s.
+			orgID := req.Account.OrganizationID
+			root := a.rootApp()
+			readWait := time.Duration(0) // derived: 15s nested
+			if a.inboundContinuation.attemptGuarded {
+				readWait = 2 * time.Second
+			}
+			var afterCommit []func()
+			// The root pool's own context, as in WithTenantApp (never a nil Context).
+			rootCtx := context.Background()
+			if root.DB != nil && root.DB.Statement != nil && root.DB.Statement.Context != nil {
+				rootCtx = root.DB.Statement.Context
+			}
+			err := a.withBoundedRootConnection(rootCtx, readWait, func(db *gorm.DB) error {
+				if orgID == uuid.Nil {
+					return database.ErrMissingTenant
+				}
+				phase := func(tx *gorm.DB) error {
+					if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+						return err
+					}
+					scoped := root.scopedApp(tx, orgID)
+					if err := scoped.markMessagesAsReadInCurrentScope(orgID, req.Contact.ID, req.Contact); err != nil {
+						return err
+					}
+					afterCommit = scoped.takeAfterCommit()
+					return nil
+				}
+				if a.rlsEnabled() {
+					return database.WithTenant(db, orgID, phase)
+				}
+				return db.Transaction(phase)
+			})
+			if err != nil {
+				a.Log.Error("Failed to mark independently committed inbound messages as read", "error", err, "organization_id", orgID)
+			} else {
+				a.runAfterCommit(afterCommit)
+			}
+		} else {
+			a.markMessagesAsRead(req.Account.OrganizationID, req.Contact.ID, req.Contact)
+		}
 	}
 }
 

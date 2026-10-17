@@ -72,6 +72,7 @@ func TestSaveAndFinalizeTransfer_ConcurrentAliasCreatorsUseOneCanonicalTransfer(
 				&staleContact,
 				nil,
 				false,
+				nil,
 			)
 			results <- transferResult{transfer: transfer, err: err}
 		}()
@@ -157,6 +158,7 @@ func TestSaveAndFinalizeTransfer_WaitsForMergeThenUsesCanonicalContact(t *testin
 			&staleContact,
 			nil,
 			false,
+			nil,
 		)
 	}()
 

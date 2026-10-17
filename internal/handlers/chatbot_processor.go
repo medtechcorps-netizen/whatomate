@@ -224,6 +224,9 @@ type whatsAppMessageLookup struct {
 	Direction        models.Direction // Empty allows either proven reply-target direction.
 	Lock             bool
 	RepairProjection bool
+	// Only the committed continuation-validation phase sets this. It may repair
+	// an already proven display name, but must not learn a contact selector.
+	continuationValidation bool
 }
 
 type whatsAppMessageResolution struct {
@@ -516,7 +519,7 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		// authority and the SAME canonical contact/message have been locked and
 		// fully rechecked. A failed optional write must not make the unchanged
 		// enqueue/worker resolver reject an otherwise proven phone-only winner.
-		if !reviewRouted {
+		if !reviewRouted && !lookup.continuationValidation {
 			a.enrichProvenWhatsAppMessageBSUID(account, &result.Contact, lookup)
 		}
 	}
@@ -875,6 +878,12 @@ func (a *App) continuePersistedIncomingMessage(
 		return nil
 	}
 
+	if prepared := a.preparedIncoming; prepared != nil {
+		if prepared.done {
+			return nil
+		}
+		return a.continueIncomingWithContact(ctx, work, prepared.contact)
+	}
 	account := &work.Account
 	contact, err := contactutil.ResolveCanonicalContact(
 		a.DB,
@@ -901,21 +910,19 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 	// Broadcast only after optional hydration so a media message reaches the UI
 	// once, with its durable object-store URL when download succeeded.
-	// The inbound fact and optional media hydration are already durable. Publish
-	// through the root app so realtime delivery completes before the first
+	// The inbound fact and optional media hydration are already durable.
+	// H1: read the mask flag and reply preview through this continuation's own tenant
+	// transaction (plain SELECTs, no row locks) instead of a second pooled connection,
+	// then deliver the publication at once so it still precedes the first
 	// automatic-action boundary instead of waiting for the continuation's
 	// bookkeeping transaction to finish after provider I/O.
-	a.rootApp().broadcastNewMessage(work.OrganizationID, &work.Persisted, contact)
+	publisher := a.rootApp().scopedApp(a.DB, work.OrganizationID)
+	publisher.broadcastNewMessage(work.OrganizationID, &work.Persisted, contact)
+	a.rootApp().runAfterCommit(publisher.takeAfterCommit())
 	if incomingMessageAutomaticAISuppressed(&work.Persisted) {
 		reason, _ := work.Persisted.Metadata[incomingAutomaticAISuppressionReasonKey].(string)
 		return &inboundContinuationPolicyStop{Reason: reason}
 	}
-
-	msg := work.Message
-	extracted := work.Extracted
-	messageText := extracted.Text
-	buttonID := extracted.ButtonID
-	flowResponseData := extracted.FlowResponseData
 
 	// Clear chatbot tracking since this client message is newer than the bot
 	// message it acknowledges. An older continuation replay must not erase a
@@ -932,23 +939,62 @@ func (a *App) continuePersistedIncomingMessage(
 		return nil
 	}
 
+	return a.continueIncomingWithContact(ctx, work, contact)
+}
+
+// continueIncomingWithContact consumes one invocation's selected inputs. The
+// phased RLS path supplies them after short preparation; ordinary callers keep
+// their existing transactional reads and writes.
+func (a *App) continueIncomingWithContact(ctx context.Context, work *persistedIncomingMessage, contact *models.Contact) error {
+	account := &work.Account
+	msg := work.Message
+	messageText := work.Extracted.Text
+	buttonID := work.Extracted.ButtonID
+	flowResponseData := work.Extracted.FlowResponseData
 	// Check if chatbot is enabled for this account (use cache)
-	settings, err := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	var settings *models.ChatbotSettings
+	var err error
+	if a.preparedIncoming != nil {
+		settings = a.preparedIncoming.settings
+	} else {
+		settings, err = a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	}
 	if err != nil {
 		a.Log.Error("Failed to load chatbot settings", "error", err, "account", account.Name, "org_id", account.OrganizationID)
 		return fmt.Errorf("load inbound continuation chatbot settings: %w", err)
 	}
 	if !settings.IsEnabled {
 		a.Log.Debug("Chatbot not enabled for this account, creating transfer for agent queue", "account", account.Name, "settings_id", settings.ID)
-		// Create transfer to agent queue when chatbot is disabled
-		a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled)
+		// H1: decide and send the out-of-hours reply here, before the handover, so a
+		// failed reply is retried; hand over only within hours.
+		if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 &&
+			!a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
+			a.Log.Info("Outside business hours, sending out-of-hours message instead of queue transfer", "contact_id", contact.ID, "source", models.TransferSourceChatbotDisabled)
+			if settings.BusinessHours.OutOfHoursMessage != "" {
+				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
+					return fmt.Errorf("send chatbot-disabled out-of-hours response: %w", err)
+				}
+			}
+			return nil
+		}
+		// Create transfer to agent queue when chatbot is disabled.
+		// H1: consume the handover's actual error: a bounded pool wait is still a refunded
+		// "wedge guard" deferral in p.fail; any other failure retries as an ordinary attempt.
+		if _, err := a.createTransferToQueue(account, contact, models.TransferSourceChatbotDisabled, nil); err != nil {
+			if postgresErrorCode(err) == "55P03" {
+				// H1: the nested handover's bounded fence or lock waits expired (see
+				// saveAndFinalizeTransfer); refunded like a bounded pool wait.
+				return fmt.Errorf("create chatbot-disabled queue transfer: wedge guard: handover locks not acquired within the nested handover budget while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
+			}
+			return fmt.Errorf("create chatbot-disabled queue transfer: %w", err)
+		}
 		return nil
 	}
 	a.Log.Info("Chatbot settings loaded", "settings_id", settings.ID, "is_enabled", settings.IsEnabled, "ai_enabled", settings.AI.Enabled, "ai_provider", settings.AI.Provider, "default_response", settings.DefaultResponse)
 
 	// Check business hours if enabled
 	if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
-		if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
+		if !a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
 			// If automated responses are not allowed outside hours, send out-of-hours message and stop
 			if !settings.BusinessHours.AllowAutomatedOutside {
 				a.Log.Info("Outside business hours, sending out of hours message")
@@ -974,13 +1020,13 @@ func (a *App) continuePersistedIncomingMessage(
 	a.Log.Info("Processing message", "text", messageText, "buttonID", buttonID, "from", msg.From)
 
 	// Get or create active session for this contact
-	session, isNewSession, err := a.getOrCreateSession(
-		account.OrganizationID,
-		contact.ID,
-		account.Name,
-		msg.From,
-		settings.SessionTimeoutMins,
-	)
+	var session *models.ChatbotSession
+	var isNewSession bool
+	if a.preparedIncoming != nil {
+		session, isNewSession = a.preparedIncoming.session, a.preparedIncoming.isNewSession
+	} else {
+		session, isNewSession, err = a.getOrCreateSession(account.OrganizationID, contact.ID, account.Name, msg.From, settings.SessionTimeoutMins)
+	}
 	if err != nil || session == nil {
 		a.Log.Error(
 			"Failed to get or create chatbot session",
@@ -995,7 +1041,11 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 
 	// Log incoming message to session
-	a.logSessionMessage(session.ID, models.DirectionIncoming, messageText, "keyword_check")
+	if a.preparedIncoming != nil {
+		a.logPreparedIncomingHistory(a.preparedIncoming)
+	} else {
+		a.logSessionMessage(session.ID, models.DirectionIncoming, messageText, "keyword_check")
+	}
 
 	// An exact server token is never a keyword, greeting or model instruction.
 	// Consume it once against the durable offer before any ordinary response.
@@ -1005,12 +1055,18 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 
 	// Check for transfer keyword BEFORE sending greeting (transfer takes priority)
-	keywordResponse, keywordMatched := a.matchKeywordRules(account.OrganizationID, account.Name, messageText)
+	var keywordResponse *KeywordResponse
+	var keywordMatched bool
+	if a.preparedIncoming != nil {
+		keywordResponse, keywordMatched = a.preparedIncoming.keywordResponse, a.preparedIncoming.keywordMatched
+	} else {
+		keywordResponse, keywordMatched = a.matchKeywordRules(account.OrganizationID, account.Name, messageText)
+	}
 	if keywordMatched && keywordResponse.ResponseType == models.ResponseTypeTransfer {
 		a.Log.Info("Transfer keyword matched", "response", keywordResponse.Body)
 		// Check business hours - if outside hours, send out of hours message instead
 		if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
-			if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
+			if !a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
 				a.Log.Info("Outside business hours, sending out of hours message instead of transfer")
 				if settings.BusinessHours.OutOfHoursMessage != "" {
 					if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
@@ -1031,7 +1087,11 @@ func (a *App) continuePersistedIncomingMessage(
 				return fmt.Errorf("send transfer response: %w", err)
 			}
 		}
-		a.createTransferFromKeyword(account, contact)
+		// Existing handover and intentional business-hours decline both consume this
+		// inbound. Preserve real failures; the ledger replays the accepted body on retry.
+		if _, err := a.createTransferFromKeyword(account, contact); err != nil {
+			return fmt.Errorf("create keyword transfer: %w", err)
+		}
 		return nil
 	}
 
@@ -1039,7 +1099,13 @@ func (a *App) continuePersistedIncomingMessage(
 	// a v2 Graph populated; any flow without one is a misconfiguration
 	// (manual DB edit or failed backfill) — log and exit cleanly.
 	if session.CurrentFlowID != nil {
-		flow, err := a.getChatbotFlowByIDCached(account.OrganizationID, *session.CurrentFlowID)
+		var flow *models.ChatbotFlow
+		var err error
+		if a.preparedIncoming != nil {
+			flow, err = a.preparedIncoming.activeFlow, a.preparedIncoming.activeFlowErr
+		} else {
+			flow, err = a.getChatbotFlowByIDCached(account.OrganizationID, *session.CurrentFlowID)
+		}
 		if err != nil || flow == nil {
 			a.Log.Error("Active chatbot flow not loadable", "error", err, "session", session.ID, "flow", session.CurrentFlowID)
 			a.exitFlow(session)
@@ -1061,7 +1127,13 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 
 	// Try to match flow trigger keywords first (before greeting to avoid duplicate messages)
-	if flow := a.matchFlowTrigger(account.OrganizationID, messageText); flow != nil {
+	var triggeredFlow *models.ChatbotFlow
+	if a.preparedIncoming != nil {
+		triggeredFlow = a.preparedIncoming.triggeredFlow
+	} else {
+		triggeredFlow = a.matchFlowTrigger(account.OrganizationID, messageText)
+	}
+	if flow := triggeredFlow; flow != nil {
 		if flow.Graph == nil {
 			a.Log.Error("Triggered chatbot flow has no v2 graph; ignoring", "flow", flow.ID)
 			return nil
@@ -1082,7 +1154,11 @@ func (a *App) continuePersistedIncomingMessage(
 
 	// An opted-in native fallback uses the same constrained booking lane as a
 	// graph AI node, including the first message of a newly acquired session.
-	if handled, _, bookingErr := a.processNativeAIBooking(account, contact, session, settings, messageText); handled {
+	var nativeSelection *nativeBookingSelection
+	if a.preparedIncoming != nil {
+		nativeSelection = a.preparedIncoming.nativeSelection
+	}
+	if handled, _, bookingErr := a.processNativeAIBookingSelected(account, contact, session, settings, messageText, nativeSelection); handled {
 		return bookingErr
 	} else if bookingErr != nil {
 		return bookingErr
@@ -1140,31 +1216,20 @@ func (a *App) continuePersistedIncomingMessage(
 		return nil
 	}
 
+	return a.continueLegacyAIResponse(account, contact, session, settings, messageText, isNewSession, nil)
+}
+
+func (a *App) continueLegacyAIResponse(account *models.WhatsAppAccount, contact *models.Contact, session *models.ChatbotSession, settings *models.ChatbotSettings, messageText string, isNewSession bool, captured *capturedLegacyAI) error {
 	// If no keyword matched, try AI response if enabled
 	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
 		a.Log.Info("Attempting AI response", "provider", settings.AI.Provider, "model", settings.AI.Model)
-		aiResult, actionErr := a.runInboundContinuationCapturedAction(
-			"legacy_ai_generate",
-			func() models.JSONB {
-				aiResponse, generationErr := a.generateAIResponse(
-					settings,
-					session,
-					messageText,
-				)
-				result := models.JSONB{"outcome": "empty"}
-				switch {
-				case generationErr != nil:
-					result["outcome"] = "error"
-					a.Log.Error("AI response failed", "error", generationErr, "provider", settings.AI.Provider, "model", settings.AI.Model)
-				case aiResponse != "":
-					result["outcome"] = "generated"
-					// Store only the user-facing answer needed for recovery;
-					// prompts, API keys, and request payloads are excluded.
-					result["answer"] = aiResponse
-				}
-				return result
-			},
-		)
+		var aiResult models.JSONB
+		var actionErr error
+		if captured != nil {
+			aiResult, actionErr = captured.result, captured.err
+		} else {
+			aiResult, actionErr = a.captureLegacyAIResult(settings, session, messageText)
+		}
 		if actionErr != nil {
 			return fmt.Errorf("generate durable AI response: %w", actionErr)
 		}
@@ -1225,6 +1290,41 @@ func (a *App) continuePersistedIncomingMessage(
 		a.Log.Info("No fallback message configured for existing session")
 	}
 	return nil
+}
+
+func (a *App) captureLegacyAIResult(settings *models.ChatbotSettings, session *models.ChatbotSession, messageText string) (models.JSONB, error) {
+	return a.runInboundContinuationCapturedAction(
+		"legacy_ai_generate",
+		func() models.JSONB {
+			aiResponse, generationErr := a.generateAIResponse(
+				settings,
+				session,
+				messageText,
+			)
+			result := models.JSONB{"outcome": "empty"}
+			switch {
+			case generationErr != nil:
+				result["outcome"] = "error"
+				a.Log.Error("AI response failed", "error", generationErr, "provider", settings.AI.Provider, "model", settings.AI.Model)
+			case aiResponse != "":
+				result["outcome"] = "generated"
+				// Store only the user-facing answer needed for recovery;
+				// prompts, API keys, and request payloads are excluded.
+				result["answer"] = aiResponse
+			}
+			return result
+		},
+	)
+}
+
+// keywordTransferHandoverError is called only for saveAndFinalizeTransfer failure.
+// Lookup/settings/reply errors never pass here. Only a nested handover installs
+// the bounded lock timeout; preserve the actual SQL cause alongside its refund.
+func keywordTransferHandoverError(err error, nested bool) error {
+	if nested && postgresErrorCode(err) == "55P03" {
+		return fmt.Errorf("wedge guard: keyword handover locks not acquired within the nested lock timeout while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
+	}
+	return err
 }
 
 func incomingMessageAutomaticAISuppressed(message *models.Message) bool {
@@ -1540,7 +1640,42 @@ func (a *App) getOrCreateSession(
 	var result models.ChatbotSession
 	isNew := false
 
+	// H1: the session commits independently of the continuation transaction, so a
+	// bounded-wait retry of the SAME inbound message must still see the session it
+	// created as new, or the greeting is silently skipped. Record the creating inbound
+	// message under a reserved ("__") key; replays of the greeting are made safe by the
+	// action ledger's deterministic key, never by this marker.
+	const sessionOriginKey = "__inbound_session_origin"
+	creatingInbound := ""
+	if a.inboundContinuation != nil && a.inboundContinuation.MessageID != uuid.Nil {
+		creatingInbound = a.inboundContinuation.MessageID.String()
+	}
+
+	sessionLocksExpired := false
 	write := func(tx *gorm.DB) error {
+		if a.inboundContinuation != nil {
+			// H1: this nested transaction runs while the caller holds its continuation
+			// transaction. (1) It must not hold the organization fence indefinitely while
+			// waiting on a contact/session row held by another continuation's open
+			// transaction (e.g. the session-log FK share lock): that wait closes a lock
+			// cycle through Go. (2) Its wait FOR the fence queues behind every in-flight
+			// AI-attempt guard's KEY SHARE while pinning two pooled connections; a guard
+			// holder waiting for a pooled connection then closes a pool+lock cycle. Bound
+			// the fence and every lock wait after it (20s in total, before any post-claim
+			// wait inside the fence, 45s); the COMMIT keeps the transaction context.
+			lockParent := tx.Statement.Context
+			if lockParent == nil {
+				lockParent = context.Background()
+			}
+			lockCtx, cancelLocks := context.WithTimeout(lockParent, 20*time.Second)
+			defer func() {
+				if errors.Is(lockCtx.Err(), context.DeadlineExceeded) {
+					sessionLocksExpired = true
+				}
+				cancelLocks()
+			}()
+			tx = tx.WithContext(lockCtx)
+		}
 		// Admission and every policy writer take the organization fence before
 		// contact/session locks. Recheck after that fence: the earlier transfer
 		// lookup is only an optimization, not permission to start another session.
@@ -1623,13 +1758,18 @@ func (a *App) getOrCreateSession(
 				return err
 			}
 			result.LastActivityAt = now
-			isNew = false
+			origin, _ := result.SessionData[sessionOriginKey].(string)
+			isNew = creatingInbound != "" && origin == creatingInbound
 			return nil
 		}
 
 		canonicalPhone := canonical.PhoneNumber
 		if canonicalPhone == "" {
 			canonicalPhone = phoneNumber
+		}
+		sessionData := models.JSONB{}
+		if creatingInbound != "" {
+			sessionData[sessionOriginKey] = creatingInbound
 		}
 		result = models.ChatbotSession{
 			BaseModel:       models.BaseModel{ID: uuid.New()},
@@ -1638,7 +1778,7 @@ func (a *App) getOrCreateSession(
 			WhatsAppAccount: accountName,
 			PhoneNumber:     canonicalPhone,
 			Status:          models.SessionStatusActive,
-			SessionData:     models.JSONB{},
+			SessionData:     sessionData,
 			StartedAt:       now,
 			LastActivityAt:  now,
 		}
@@ -1659,12 +1799,19 @@ func (a *App) getOrCreateSession(
 	for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
 		// The policy query after a contended organization lock must see the
 		// writer's commit even if the pool defaults to REPEATABLE READ.
-		err = database.WithTenantReadCommitted(db, orgID, func(tx *gorm.DB) error {
-			if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
-				return err
-			}
-			return write(tx)
-		})
+		runAttempt := func(attemptDB *gorm.DB) error {
+			return database.WithTenantReadCommitted(attemptDB, orgID, func(tx *gorm.DB) error {
+				if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+					return err
+				}
+				return write(tx)
+			})
+		}
+		if a.inboundContinuation != nil {
+			err = a.withBoundedRootConnection(context.Background(), 0, runAttempt) // released before the backoff
+		} else {
+			err = runAttempt(db)
+		}
 		if !isRetryableCanonicalContactWrite(err) {
 			break
 		}
@@ -1674,6 +1821,9 @@ func (a *App) getOrCreateSession(
 				break
 			}
 		}
+	}
+	if err != nil && sessionLocksExpired {
+		err = fmt.Errorf("wedge guard: chatbot session fence and locks not acquired within 20s while holding the continuation transaction: %w: %w", context.DeadlineExceeded, err)
 	}
 	if err != nil {
 		return nil, false, err
@@ -1875,7 +2025,13 @@ func (a *App) buildAIContext(orgID uuid.UUID, session *models.ChatbotSession, us
 	}
 
 	// Use cached AI contexts
-	contexts, err := a.getAIContextsCached(orgID, whatsAppAccount)
+	var contexts []models.AIContext
+	var err error
+	if a.legacyAIInput != nil {
+		contexts = a.legacyAIInput.contexts
+	} else {
+		contexts, err = a.getAIContextsCached(orgID, whatsAppAccount)
+	}
 	if err != nil || len(contexts) == 0 {
 		return ""
 	}
@@ -2352,6 +2508,9 @@ func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *
 
 // getSessionHistory retrieves recent messages from the session
 func (a *App) getSessionHistory(sessionID uuid.UUID, limit int) []models.ChatbotSessionMessage {
+	if a.legacyAIInput != nil && a.legacyAIInput.sessionID == sessionID {
+		return append([]models.ChatbotSessionMessage(nil), a.legacyAIInput.history...)
+	}
 	var messages []models.ChatbotSessionMessage
 	a.DB.Where("session_id = ?", sessionID).
 		Order("created_at DESC").
@@ -2844,6 +3003,14 @@ func (a *App) persistIncomingMessageBeforeAck(
 	}
 
 	if a.rlsEnabled() && !a.hasTenantScope() {
+		release, admissionErr := a.acquireIncomingMessageCapacity()
+		if admissionErr != nil {
+			return nil, false, admissionErr
+		}
+		defer release()
+	}
+
+	if a.rlsEnabled() && !a.hasTenantScope() {
 		err = a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
 			var scopedErr error
 			work, duplicate, scopedErr = scoped.persistIncomingMessageForAccount(
@@ -2905,6 +3072,17 @@ func (a *App) persistIncomingMessageForAccount(
 	)
 }
 
+// lockIncomingOrganizationPolicyScope bounds only ingress's fence statements.
+// A physical AI attempt can hold the organization row while its completed result
+// needs another root connection; waiting ingress must release capacity before
+// the existing 45s action-ledger deadline. Keep the owning transaction's context
+// unchanged so an early successful lock does not cancel later admission work.
+func lockIncomingOrganizationPolicyScope(tx *gorm.DB, organizationID uuid.UUID) error {
+	ctx, cancel := context.WithTimeout(tx.Statement.Context, 20*time.Second)
+	defer cancel()
+	return database.LockOrganizationPolicyScope(tx.WithContext(ctx), organizationID)
+}
+
 func (a *App) persistIncomingMessageForAccountWithAdmission(
 	phoneNumberID string,
 	msg IncomingTextMessage,
@@ -2955,7 +3133,7 @@ func (a *App) persistIncomingMessageForAccountWithAdmission(
 	if err := database.LockWhatsAppWAMIDScopes(a.DB, account.OrganizationID, msg.ID); err != nil {
 		return nil, false, fmt.Errorf("lock incoming WhatsApp message admission: %w", err)
 	}
-	if err := database.LockOrganizationPolicyScope(
+	if err := lockIncomingOrganizationPolicyScope(
 		a.DB,
 		account.OrganizationID,
 	); err != nil {
@@ -3908,8 +4086,10 @@ func (a *App) persistIncomingMessageWithFlow(account *models.WhatsAppAccount, co
 				preview, eventContent = "[deleted]", ""
 			} else if msgType != "text" && msgType != "button_reply" && msgType != "nfm_reply" {
 				preview = "[" + msgType + "]"
-			} else if len(preview) > 100 {
-				preview = preview[:97] + "..."
+			} else {
+				// Rune-safe: a byte cut inside an emoji is invalid UTF-8 and fails the
+				// whole inbound persist, which Meta then redelivers indefinitely.
+				preview = truncateString(preview, 100)
 			}
 			if err := tx.Model(&canonicalContact).Updates(map[string]any{
 				"last_message_at": now, "last_message_preview": preview, "is_read": false,
