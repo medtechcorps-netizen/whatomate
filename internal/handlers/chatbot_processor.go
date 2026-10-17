@@ -224,6 +224,9 @@ type whatsAppMessageLookup struct {
 	Direction        models.Direction // Empty allows either proven reply-target direction.
 	Lock             bool
 	RepairProjection bool
+	// Only the committed continuation-validation phase sets this. It may repair
+	// an already proven display name, but must not learn a contact selector.
+	continuationValidation bool
 }
 
 type whatsAppMessageResolution struct {
@@ -516,7 +519,7 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		// authority and the SAME canonical contact/message have been locked and
 		// fully rechecked. A failed optional write must not make the unchanged
 		// enqueue/worker resolver reject an otherwise proven phone-only winner.
-		if !reviewRouted {
+		if !reviewRouted && !lookup.continuationValidation {
 			a.enrichProvenWhatsAppMessageBSUID(account, &result.Contact, lookup)
 		}
 	}
@@ -875,6 +878,12 @@ func (a *App) continuePersistedIncomingMessage(
 		return nil
 	}
 
+	if prepared := a.preparedIncoming; prepared != nil {
+		if prepared.done {
+			return nil
+		}
+		return a.continueIncomingWithContact(ctx, work, prepared.contact)
+	}
 	account := &work.Account
 	contact, err := contactutil.ResolveCanonicalContact(
 		a.DB,
@@ -915,12 +924,6 @@ func (a *App) continuePersistedIncomingMessage(
 		return &inboundContinuationPolicyStop{Reason: reason}
 	}
 
-	msg := work.Message
-	extracted := work.Extracted
-	messageText := extracted.Text
-	buttonID := extracted.ButtonID
-	flowResponseData := extracted.FlowResponseData
-
 	// Clear chatbot tracking since this client message is newer than the bot
 	// message it acknowledges. An older continuation replay must not erase a
 	// newer bot reply from another committed continuation.
@@ -936,8 +939,26 @@ func (a *App) continuePersistedIncomingMessage(
 		return nil
 	}
 
+	return a.continueIncomingWithContact(ctx, work, contact)
+}
+
+// continueIncomingWithContact consumes one invocation's selected inputs. The
+// phased RLS path supplies them after short preparation; ordinary callers keep
+// their existing transactional reads and writes.
+func (a *App) continueIncomingWithContact(ctx context.Context, work *persistedIncomingMessage, contact *models.Contact) error {
+	account := &work.Account
+	msg := work.Message
+	messageText := work.Extracted.Text
+	buttonID := work.Extracted.ButtonID
+	flowResponseData := work.Extracted.FlowResponseData
 	// Check if chatbot is enabled for this account (use cache)
-	settings, err := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	var settings *models.ChatbotSettings
+	var err error
+	if a.preparedIncoming != nil {
+		settings = a.preparedIncoming.settings
+	} else {
+		settings, err = a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	}
 	if err != nil {
 		a.Log.Error("Failed to load chatbot settings", "error", err, "account", account.Name, "org_id", account.OrganizationID)
 		return fmt.Errorf("load inbound continuation chatbot settings: %w", err)
@@ -947,7 +968,7 @@ func (a *App) continuePersistedIncomingMessage(
 		// H1: decide and send the out-of-hours reply here, before the handover, so a
 		// failed reply is retried; hand over only within hours.
 		if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 &&
-			!a.isWithinBusinessHours(settings.BusinessHours.Hours) {
+			!a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
 			a.Log.Info("Outside business hours, sending out-of-hours message instead of queue transfer", "contact_id", contact.ID, "source", models.TransferSourceChatbotDisabled)
 			if settings.BusinessHours.OutOfHoursMessage != "" {
 				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
@@ -973,7 +994,7 @@ func (a *App) continuePersistedIncomingMessage(
 
 	// Check business hours if enabled
 	if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
-		if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
+		if !a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
 			// If automated responses are not allowed outside hours, send out-of-hours message and stop
 			if !settings.BusinessHours.AllowAutomatedOutside {
 				a.Log.Info("Outside business hours, sending out of hours message")
@@ -999,13 +1020,13 @@ func (a *App) continuePersistedIncomingMessage(
 	a.Log.Info("Processing message", "text", messageText, "buttonID", buttonID, "from", msg.From)
 
 	// Get or create active session for this contact
-	session, isNewSession, err := a.getOrCreateSession(
-		account.OrganizationID,
-		contact.ID,
-		account.Name,
-		msg.From,
-		settings.SessionTimeoutMins,
-	)
+	var session *models.ChatbotSession
+	var isNewSession bool
+	if a.preparedIncoming != nil {
+		session, isNewSession = a.preparedIncoming.session, a.preparedIncoming.isNewSession
+	} else {
+		session, isNewSession, err = a.getOrCreateSession(account.OrganizationID, contact.ID, account.Name, msg.From, settings.SessionTimeoutMins)
+	}
 	if err != nil || session == nil {
 		a.Log.Error(
 			"Failed to get or create chatbot session",
@@ -1020,7 +1041,11 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 
 	// Log incoming message to session
-	a.logSessionMessage(session.ID, models.DirectionIncoming, messageText, "keyword_check")
+	if a.preparedIncoming != nil {
+		a.logPreparedIncomingHistory(a.preparedIncoming)
+	} else {
+		a.logSessionMessage(session.ID, models.DirectionIncoming, messageText, "keyword_check")
+	}
 
 	// An exact server token is never a keyword, greeting or model instruction.
 	// Consume it once against the durable offer before any ordinary response.
@@ -1030,12 +1055,18 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 
 	// Check for transfer keyword BEFORE sending greeting (transfer takes priority)
-	keywordResponse, keywordMatched := a.matchKeywordRules(account.OrganizationID, account.Name, messageText)
+	var keywordResponse *KeywordResponse
+	var keywordMatched bool
+	if a.preparedIncoming != nil {
+		keywordResponse, keywordMatched = a.preparedIncoming.keywordResponse, a.preparedIncoming.keywordMatched
+	} else {
+		keywordResponse, keywordMatched = a.matchKeywordRules(account.OrganizationID, account.Name, messageText)
+	}
 	if keywordMatched && keywordResponse.ResponseType == models.ResponseTypeTransfer {
 		a.Log.Info("Transfer keyword matched", "response", keywordResponse.Body)
 		// Check business hours - if outside hours, send out of hours message instead
 		if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
-			if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
+			if !a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
 				a.Log.Info("Outside business hours, sending out of hours message instead of transfer")
 				if settings.BusinessHours.OutOfHoursMessage != "" {
 					if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
@@ -1068,7 +1099,13 @@ func (a *App) continuePersistedIncomingMessage(
 	// a v2 Graph populated; any flow without one is a misconfiguration
 	// (manual DB edit or failed backfill) — log and exit cleanly.
 	if session.CurrentFlowID != nil {
-		flow, err := a.getChatbotFlowByIDCached(account.OrganizationID, *session.CurrentFlowID)
+		var flow *models.ChatbotFlow
+		var err error
+		if a.preparedIncoming != nil {
+			flow, err = a.preparedIncoming.activeFlow, a.preparedIncoming.activeFlowErr
+		} else {
+			flow, err = a.getChatbotFlowByIDCached(account.OrganizationID, *session.CurrentFlowID)
+		}
 		if err != nil || flow == nil {
 			a.Log.Error("Active chatbot flow not loadable", "error", err, "session", session.ID, "flow", session.CurrentFlowID)
 			a.exitFlow(session)
@@ -1090,7 +1127,13 @@ func (a *App) continuePersistedIncomingMessage(
 	}
 
 	// Try to match flow trigger keywords first (before greeting to avoid duplicate messages)
-	if flow := a.matchFlowTrigger(account.OrganizationID, messageText); flow != nil {
+	var triggeredFlow *models.ChatbotFlow
+	if a.preparedIncoming != nil {
+		triggeredFlow = a.preparedIncoming.triggeredFlow
+	} else {
+		triggeredFlow = a.matchFlowTrigger(account.OrganizationID, messageText)
+	}
+	if flow := triggeredFlow; flow != nil {
 		if flow.Graph == nil {
 			a.Log.Error("Triggered chatbot flow has no v2 graph; ignoring", "flow", flow.ID)
 			return nil
@@ -1111,7 +1154,11 @@ func (a *App) continuePersistedIncomingMessage(
 
 	// An opted-in native fallback uses the same constrained booking lane as a
 	// graph AI node, including the first message of a newly acquired session.
-	if handled, _, bookingErr := a.processNativeAIBooking(account, contact, session, settings, messageText); handled {
+	var nativeSelection *nativeBookingSelection
+	if a.preparedIncoming != nil {
+		nativeSelection = a.preparedIncoming.nativeSelection
+	}
+	if handled, _, bookingErr := a.processNativeAIBookingSelected(account, contact, session, settings, messageText, nativeSelection); handled {
 		return bookingErr
 	} else if bookingErr != nil {
 		return bookingErr
@@ -1169,31 +1216,20 @@ func (a *App) continuePersistedIncomingMessage(
 		return nil
 	}
 
+	return a.continueLegacyAIResponse(account, contact, session, settings, messageText, isNewSession, nil)
+}
+
+func (a *App) continueLegacyAIResponse(account *models.WhatsAppAccount, contact *models.Contact, session *models.ChatbotSession, settings *models.ChatbotSettings, messageText string, isNewSession bool, captured *capturedLegacyAI) error {
 	// If no keyword matched, try AI response if enabled
 	if settings.AI.Enabled && settings.AI.Provider != "" && settings.AI.APIKey != "" {
 		a.Log.Info("Attempting AI response", "provider", settings.AI.Provider, "model", settings.AI.Model)
-		aiResult, actionErr := a.runInboundContinuationCapturedAction(
-			"legacy_ai_generate",
-			func() models.JSONB {
-				aiResponse, generationErr := a.generateAIResponse(
-					settings,
-					session,
-					messageText,
-				)
-				result := models.JSONB{"outcome": "empty"}
-				switch {
-				case generationErr != nil:
-					result["outcome"] = "error"
-					a.Log.Error("AI response failed", "error", generationErr, "provider", settings.AI.Provider, "model", settings.AI.Model)
-				case aiResponse != "":
-					result["outcome"] = "generated"
-					// Store only the user-facing answer needed for recovery;
-					// prompts, API keys, and request payloads are excluded.
-					result["answer"] = aiResponse
-				}
-				return result
-			},
-		)
+		var aiResult models.JSONB
+		var actionErr error
+		if captured != nil {
+			aiResult, actionErr = captured.result, captured.err
+		} else {
+			aiResult, actionErr = a.captureLegacyAIResult(settings, session, messageText)
+		}
 		if actionErr != nil {
 			return fmt.Errorf("generate durable AI response: %w", actionErr)
 		}
@@ -1254,6 +1290,31 @@ func (a *App) continuePersistedIncomingMessage(
 		a.Log.Info("No fallback message configured for existing session")
 	}
 	return nil
+}
+
+func (a *App) captureLegacyAIResult(settings *models.ChatbotSettings, session *models.ChatbotSession, messageText string) (models.JSONB, error) {
+	return a.runInboundContinuationCapturedAction(
+		"legacy_ai_generate",
+		func() models.JSONB {
+			aiResponse, generationErr := a.generateAIResponse(
+				settings,
+				session,
+				messageText,
+			)
+			result := models.JSONB{"outcome": "empty"}
+			switch {
+			case generationErr != nil:
+				result["outcome"] = "error"
+				a.Log.Error("AI response failed", "error", generationErr, "provider", settings.AI.Provider, "model", settings.AI.Model)
+			case aiResponse != "":
+				result["outcome"] = "generated"
+				// Store only the user-facing answer needed for recovery;
+				// prompts, API keys, and request payloads are excluded.
+				result["answer"] = aiResponse
+			}
+			return result
+		},
+	)
 }
 
 // keywordTransferHandoverError is called only for saveAndFinalizeTransfer failure.
@@ -1964,7 +2025,13 @@ func (a *App) buildAIContext(orgID uuid.UUID, session *models.ChatbotSession, us
 	}
 
 	// Use cached AI contexts
-	contexts, err := a.getAIContextsCached(orgID, whatsAppAccount)
+	var contexts []models.AIContext
+	var err error
+	if a.legacyAIInput != nil {
+		contexts = a.legacyAIInput.contexts
+	} else {
+		contexts, err = a.getAIContextsCached(orgID, whatsAppAccount)
+	}
 	if err != nil || len(contexts) == 0 {
 		return ""
 	}
@@ -2441,6 +2508,9 @@ func (a *App) generateGoogleResponse(settings *models.ChatbotSettings, session *
 
 // getSessionHistory retrieves recent messages from the session
 func (a *App) getSessionHistory(sessionID uuid.UUID, limit int) []models.ChatbotSessionMessage {
+	if a.legacyAIInput != nil && a.legacyAIInput.sessionID == sessionID {
+		return append([]models.ChatbotSessionMessage(nil), a.legacyAIInput.history...)
+	}
 	var messages []models.ChatbotSessionMessage
 	a.DB.Where("session_id = ?", sessionID).
 		Order("created_at DESC").
@@ -2930,6 +3000,14 @@ func (a *App) persistIncomingMessageBeforeAck(
 	}
 	if msg.Type == "reaction" {
 		return nil, false, errors.New("reaction messages use the specialized inbound path")
+	}
+
+	if a.rlsEnabled() && !a.hasTenantScope() {
+		release, admissionErr := a.acquireIncomingMessageCapacity()
+		if admissionErr != nil {
+			return nil, false, admissionErr
+		}
+		defer release()
 	}
 
 	if a.rlsEnabled() && !a.hasTenantScope() {

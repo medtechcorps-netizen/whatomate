@@ -1010,6 +1010,12 @@ func (a *App) deliverAutomaticAIOutgoingMessage(
 			if err := a.prepareWhatsAppAccountForRuntime(account); err != nil {
 				return err
 			}
+			// The provider transaction may have waited after the outer guard and
+			// independent dispatch claim. Recheck the worker on this same fresh
+			// transaction before starting I/O; settlement remains independent.
+			if err := a.requireInboundContinuationOwnershipTx(tx); err != nil {
+				return err
+			}
 			*providerAttempted = true
 			result.providerAttempted = true
 			result.whatsAppMessageID, result.sendErr = normalizeOutgoingProviderResult(

@@ -63,6 +63,11 @@ type App struct {
 	// chatbot sends a stable WAMID-derived action key without sharing mutable
 	// execution state across concurrent webhook jobs.
 	inboundContinuation *inboundContinuationExecution
+	// continuationAdmission belongs only to the root. Prepared invocation data is
+	// per-job and never shares mutable session/action state with another job.
+	continuationAdmission inboundContinuationAdmission
+	preparedIncoming      *preparedIncomingContinuation
+	legacyAIInput         *legacyAIInput
 	// channelAdapterFactory is an internal deterministic test seam for provider
 	// calls that must race a committed control-plane mutation. Production leaves
 	// it nil and always uses the concrete adapters below.

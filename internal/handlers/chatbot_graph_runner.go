@@ -352,6 +352,10 @@ func (a *App) executeChatbotCompletionWebhookGuarded(
 	if !claim.Execute {
 		return nil
 	}
+	if err := a.requireInboundContinuationAttemptOwnership(); err != nil {
+		return errors.Join(err, a.resolveInboundContinuationAction(context.Background(), claim,
+			inboundActionStateFailedBeforeDispatch, nil))
+	}
 
 	if session.SessionData == nil {
 		session.SessionData = models.JSONB{}
@@ -1230,6 +1234,10 @@ func (a *App) execChatWebhookEffectGuarded(
 	}
 	if !claim.Execute {
 		return nil
+	}
+	if err := a.requireInboundContinuationAttemptOwnership(); err != nil {
+		return errors.Join(err, a.resolveInboundContinuationAction(context.Background(), claim,
+			inboundActionStateFailedBeforeDispatch, nil))
 	}
 
 	replaceVar := func(value string) string {

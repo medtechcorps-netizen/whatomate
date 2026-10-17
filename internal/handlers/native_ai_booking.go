@@ -52,6 +52,29 @@ type nativeBookingPrepared struct {
 	Proof   nativeBookingProof
 }
 
+type nativeBookingSelection struct {
+	key          string
+	existing     *nativeBookingPrepared
+	loadErr      error
+	binding      booking.Binding
+	authorityErr error
+}
+
+func (a *App) selectNativeBooking(account *models.WhatsAppAccount, session *models.ChatbotSession, identity inboundContinuationActionIdentity) *nativeBookingSelection {
+	selection := &nativeBookingSelection{key: identity.Key}
+	selection.loadErr = a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, account.OrganizationID, func(tx *gorm.DB) error {
+			var err error
+			selection.existing, err = a.loadNativeBookingPreparedTx(tx, identity)
+			return err
+		})
+	})
+	if selection.loadErr == nil && selection.existing == nil {
+		selection.binding, selection.authorityErr = a.readNativeBookingAuthority(account, session)
+	}
+	return selection
+}
+
 func isNativeBookingConfirmation(input string) bool {
 	_, ok := booking.ConfirmationToken(input)
 	return ok
@@ -208,6 +231,11 @@ func (a *App) readNativeBookingAuthority(account *models.WhatsAppAccount, sessio
 // can select only a bounded intent; exact customer tokens bypass it entirely.
 func (a *App) processNativeAIBooking(account *models.WhatsAppAccount, contact *models.Contact, session *models.ChatbotSession,
 	settings *models.ChatbotSettings, input string) (handled, awaiting bool, resultErr error) {
+	return a.processNativeAIBookingSelected(account, contact, session, settings, input, nil)
+}
+
+func (a *App) processNativeAIBookingSelected(account *models.WhatsAppAccount, contact *models.Contact, session *models.ChatbotSession,
+	settings *models.ChatbotSettings, input string, selection *nativeBookingSelection) (handled, awaiting bool, resultErr error) {
 	if a == nil || a.inboundContinuation == nil || account == nil || contact == nil || session == nil {
 		return false, false, nil
 	}
@@ -219,22 +247,20 @@ func (a *App) processNativeAIBooking(account *models.WhatsAppAccount, contact *m
 	}
 	// Recovery is keyed before generation. A prepared response is immutable;
 	// neither a second model answer nor a newly randomized offer replaces it.
-	var existing *nativeBookingPrepared
-	err = a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
-		return database.WithTenantReadCommitted(db, account.OrganizationID, func(tx *gorm.DB) error {
-			var loadErr error
-			existing, loadErr = a.loadNativeBookingPreparedTx(tx, identity)
-			return loadErr
-		})
-	})
-	if err != nil {
-		return true, false, err
+	if selection == nil {
+		selection = a.selectNativeBooking(account, session, identity)
 	}
-	if existing != nil {
+	if selection.key != "" && selection.key != identity.Key {
+		return true, false, errors.New("prepared native booking action identity changed")
+	}
+	if selection.loadErr != nil {
+		return true, false, selection.loadErr
+	}
+	if selection.existing != nil {
 		a.inboundContinuation.nativeBookingCheckpoint = true
-		return true, existing.Proof.Kind == "offer" || (existing.Proof.Kind == "reply" && nativeBookingProposalPending(session.SessionData)), a.dispatchNativeBookingPrepared(existing, account, contact)
+		return true, selection.existing.Proof.Kind == "offer" || (selection.existing.Proof.Kind == "reply" && nativeBookingProposalPending(session.SessionData)), a.dispatchNativeBookingPrepared(selection.existing, account, contact)
 	}
-	binding, err := a.readNativeBookingAuthority(account, session)
+	binding, err := selection.binding, selection.authorityErr
 	token, confirmation := booking.ConfirmationToken(input)
 	if err != nil {
 		if !confirmation && inboundContinuationStoppedByPolicy(err) {
