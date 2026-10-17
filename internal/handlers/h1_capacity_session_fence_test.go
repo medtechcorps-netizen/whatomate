@@ -64,9 +64,9 @@ func TestH1CapacitySession_NewReaderRowWaitExpiresAsRefundedRetry(t *testing.T) 
 	// the reader must bound contact/session waits after it owns its reader fence.
 	holder = f.shared.Begin()
 	require.NoError(t, holder.Error)
-	var contactID uuid.UUID
-	require.NoError(t, holder.Raw("SELECT id FROM contacts WHERE id = ? AND organization_id = ? FOR UPDATE", work.Contact.ID, work.OrganizationID).Scan(&contactID).Error)
-	require.Equal(t, work.Contact.ID, contactID)
+	var lockedContact struct{ ID uuid.UUID }
+	require.NoError(t, holder.Raw("SELECT id FROM contacts WHERE id = ? AND organization_id = ? FOR UPDATE", work.Contact.ID, work.OrganizationID).Scan(&lockedContact).Error)
+	require.Equal(t, work.Contact.ID, lockedContact.ID)
 	releaseRead()
 	h1IngressWaiters(t, f.shared, 1)
 	select {

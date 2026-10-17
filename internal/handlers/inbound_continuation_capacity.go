@@ -312,23 +312,42 @@ func (a *App) incomingWithinBusinessHours(hours models.JSONBArray) bool {
 	return a.isWithinBusinessHours(hours)
 }
 
-// processPreparedIncoming releases preparation ownership before a larger apply
-// reservation. A captured computation is never discarded or recomputed merely
-// because its caller's deadline expired while waiting to apply its durable result.
+// processPreparedIncoming releases preparation ownership before separately
+// admitting physical model work or apply. A captured computation is never
+// discarded or recomputed merely because its caller's deadline expired while
+// waiting to apply its durable result.
 func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx context.Context, execution *App, work *persistedIncomingMessage, job *models.ScheduledJob, releasePreparation func()) error {
 	prepared, prepareErr := execution.prepareIncomingContinuation(ctx, work)
 	if prepareErr != nil {
 		releasePreparation()
 		return prepareErr
 	}
+	releasePreparation()
 	var captured *capturedLegacyAI
 	if prepared.legacyAI {
-		execution.legacyAIInput = prepared.aiInput
-		result, err := execution.captureLegacyAIResult(prepared.settings, prepared.session, work.Extracted.Text)
-		execution.legacyAIInput = nil
-		captured = &capturedLegacyAI{result: result, err: err}
+		// Preparation has released every DB scope. Re-admit the physical phase
+		// before any model action claim; a one-connection suppression/broadcast
+		// may finish on a tiny pool, but physical model work must fail closed.
+		performCtx := execution.markInboundContinuationContext(ctx)
+		phaseErr := func() error {
+			releasePerform, err := execution.acquireInboundContinuationCapacity(performCtx, p.stopCh, 1)
+			if err != nil {
+				return err
+			}
+			defer releasePerform()
+			if err := inboundContinuationAdmissionWaitError(performCtx, p.stopCh); err != nil {
+				return err
+			}
+			execution.legacyAIInput = prepared.aiInput
+			defer func() { execution.legacyAIInput = nil }()
+			result, err := execution.captureLegacyAIResult(prepared.settings, prepared.session, work.Extracted.Text)
+			captured = &capturedLegacyAI{result: result, err: err}
+			return nil
+		}()
+		if phaseErr != nil {
+			return phaseErr
+		}
 	}
-	releasePreparation()
 	applyCtx, stop := ctx, (<-chan struct{})(p.stopCh)
 	if captured != nil {
 		applyCtx, stop = ownershipCtx, nil

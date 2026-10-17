@@ -161,7 +161,7 @@ func (g *inboundContinuationAdmission) acquire(ctx context.Context, stop <-chan 
 			return nil, err
 		}
 		maximum := maxOpen()
-		if maximum < 0 || (maximum > 0 && maximum < 3) {
+		if maximum < 0 || (maximum > 0 && maximum < 3 && (weight != 1 || priority != inboundContinuationFreshPriority)) {
 			g.removeLocked(waiter)
 			g.notifyLocked()
 			g.mu.Unlock()
@@ -169,9 +169,10 @@ func (g *inboundContinuationAdmission) acquire(ctx context.Context, stop <-chan 
 		}
 		budget := maximum - inboundContinuationProgressAllowance
 		fits := maximum == 0 || g.used <= budget-weight
-		if maximum == 3 || maximum == 4 {
-			// A supported small pool admits exactly one phase at a time. Keep its
-			// real weight accounted so a subsequent pool increase cannot over-admit.
+		if maximum > 0 && maximum <= 4 {
+			// Tiny pools admit only fresh one-connection preparation; perform and
+			// apply are refused above. All small pools serialize the admitted phase.
+			// Keep its real weight so a later pool increase cannot over-admit.
 			fits = g.used == 0
 		}
 		head := g.waiters[0]

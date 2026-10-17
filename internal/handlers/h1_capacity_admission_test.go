@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/stretchr/testify/require"
 )
 
@@ -347,13 +348,40 @@ func TestH1CapacityAdmission_SmallPoolSerializesAndResizeKeepsActualWeight(t *te
 		h1CapacityWaitQueue(t, &g, 0, 0)
 	})
 	t.Run("unsupported-and-unlimited", func(t *testing.T) {
-		for _, size := range []int{-1, 1, 2} {
+		for _, size := range []int{1, 2} {
 			var g inboundContinuationAdmission
-			release, err := g.acquire(context.Background(), nil, 3, inboundContinuationApplyPriority, func() int { return size })
-			require.Error(t, err)
-			require.Nil(t, release)
-			h1CapacityWaitQueue(t, &g, 0, 0)
+			limit := func() int { return size }
+			first, err := g.acquire(context.Background(), nil, 1, inboundContinuationFreshPriority, limit)
+			require.NoError(t, err)
+			t.Cleanup(first)
+			second := h1CapacityAcquireAsync(t, &g, context.Background(), nil, 1, inboundContinuationFreshPriority, limit)
+			h1CapacityWaitQueue(t, &g, 1, 1)
+			select {
+			case <-second:
+				t.Fatal("a tiny pool admitted two preparation phases concurrently")
+			default:
+			}
+			first()
+			got := h1CapacityReceiveAdmission(t, second)
+			require.NoError(t, got.err)
+			got.release()
+			// These phases need independent action/heartbeat progress. The small
+			// broadcast-only preparation exception cannot authorize either one.
+			for _, phase := range []struct{ weight, priority int }{
+				{1, inboundContinuationPerformPriority},
+				{3, inboundContinuationApplyPriority},
+			} {
+				release, err := g.acquire(context.Background(), nil, phase.weight, phase.priority, limit)
+				require.Error(t, err)
+				require.Nil(t, release)
+				h1CapacityWaitQueue(t, &g, 0, 0)
+			}
 		}
+		var invalid inboundContinuationAdmission
+		release, err := invalid.acquire(context.Background(), nil, 1, inboundContinuationFreshPriority, func() int { return -1 })
+		require.Error(t, err)
+		require.Nil(t, release)
+		h1CapacityWaitQueue(t, &invalid, 0, 0)
 		var g inboundContinuationAdmission
 		one, err := g.acquire(context.Background(), nil, 3, inboundContinuationApplyPriority, func() int { return 0 })
 		require.NoError(t, err)
@@ -363,4 +391,47 @@ func TestH1CapacityAdmission_SmallPoolSerializesAndResizeKeepsActualWeight(t *te
 		two()
 		h1CapacityWaitQueue(t, &g, 0, 0)
 	})
+}
+
+// The original pool-one broadcast regression remains unchanged. This paired
+// oracle proves that admitting one-connection preparation does not authorize a
+// physical model attempt whose action/lease transactions cannot make progress.
+func TestH1CapacityAdmission_TinyPoolsRefuseModelBeforeActionClaim(t *testing.T) {
+	for _, size := range []int{1, 2} {
+		t.Run(fmt.Sprintf("pool-%d", size), func(t *testing.T) {
+			f := h1CapacityLegacy(t, 1)
+			f.pool.SetMaxOpenConns(size)
+			f.pool.SetMaxIdleConns(size)
+			f.model.unblock()
+			work := f.works[0]
+			processor := NewInboundContinuationProcessor(f.app, time.Second)
+			require.Nil(t, processor.process, "exercise the production prepared path")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := processor.ProcessMessage(ctx, work.OrganizationID, work.Persisted.ID)
+			require.ErrorContains(t, err, fmt.Sprintf("pool limit %d cannot admit weight 1", size))
+			require.False(t, inboundContinuationStoppedByPolicy(err))
+			require.False(t, inboundContinuationRequiresManualReview(err))
+			require.NoError(t, ctx.Err(), "the perform boundary must reject promptly")
+			require.Zero(t, f.model.calls.Load())
+			require.Zero(t, f.model.errors.Load())
+			require.Zero(t, f.providerErrors.Load())
+			f.mu.Lock()
+			sends := len(f.sent)
+			f.mu.Unlock()
+			require.Zero(t, sends)
+			job := loadInboundContinuationJob(t, &App{DB: f.shared}, work.OrganizationID, work.Persisted.ID)
+			require.Equal(t, models.ScheduledJobStatusPending, job.Status)
+			require.Equal(t, 1, job.Attempts, "the parent was claimed before preparation")
+			require.NotEqual(t, true, job.Payload["manual_review_required"])
+			var actions, outgoing, history int64
+			require.NoError(t, f.shared.Model(&models.ScheduledJob{}).Where("organization_id = ? AND kind = ? AND aggregate_id = ?", work.OrganizationID, inboundContinuationActionJobKind, work.Persisted.ID).Count(&actions).Error)
+			require.NoError(t, f.shared.Model(&models.Message{}).Where("organization_id = ? AND contact_id = ? AND direction = ?", work.OrganizationID, work.Contact.ID, models.DirectionOutgoing).Count(&outgoing).Error)
+			require.NoError(t, f.shared.Model(&models.ChatbotSessionMessage{}).Where("session_id = ?", f.sessions[0].ID).Count(&history).Error)
+			require.Zero(t, actions, "no model or text action may be claimed before perform admission")
+			require.Zero(t, outgoing)
+			require.Zero(t, history, "prepared history remains virtual")
+			h1CapacityWaitQueue(t, &f.app.continuationAdmission, 0, 0)
+		})
+	}
 }
