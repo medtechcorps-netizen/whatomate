@@ -98,10 +98,9 @@ func h1KeywordOutcomeFixture(t *testing.T) *h1KeywordOutcomeEnv {
 	t.Cleanup(provider.Close)
 	app.WhatsApp = whatsapp.NewWithBaseURL(app.Log, provider.URL)
 	env.processor = NewInboundContinuationProcessor(app, time.Second)
-	process := env.processor.process
 	env.processor.process = func(ctx context.Context, scoped *App, work *persistedIncomingMessage) error {
 		env.execution.Store(scoped)
-		return process(ctx, scoped, work)
+		return scoped.continuePersistedIncomingMessage(ctx, work)
 	}
 	return env
 }

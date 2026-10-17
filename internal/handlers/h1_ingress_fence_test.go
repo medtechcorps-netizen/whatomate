@@ -7,6 +7,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -77,7 +78,7 @@ type h1IngressHTTPResult struct {
 	err    error
 }
 
-func h1IngressSignedAsync(t *testing.T, app *App, body []byte) <-chan h1IngressHTTPResult {
+func h1IngressSignedAsync(t *testing.T, app *App, body []byte, beforeJoin ...func()) <-chan h1IngressHTTPResult {
 	t.Helper()
 	req := testutil.NewRequest(t)
 	req.RequestCtx.Request.Header.SetMethod("POST")
@@ -85,10 +86,23 @@ func h1IngressSignedAsync(t *testing.T, app *App, body []byte) <-chan h1IngressH
 	req.RequestCtx.Request.Header.Set("X-Hub-Signature-256", webhookTestSignature(body))
 	req.RequestCtx.Request.SetBody(body)
 	done := make(chan h1IngressHTTPResult, 1)
+	joined := make(chan struct{})
 	go func() {
+		defer close(joined)
 		err := app.WebhookHandler(req)
 		done <- h1IngressHTTPResult{req.RequestCtx.Response.StatusCode(), err}
 	}()
+	t.Cleanup(func() {
+		for _, release := range beforeJoin {
+			release()
+		}
+		select {
+		case <-joined:
+			h1IngressJoin(t, app)
+		case <-time.After(35 * time.Second):
+			t.Error("signed webhook worker did not join during cleanup")
+		}
+	})
 	return done
 }
 
@@ -128,7 +142,7 @@ func TestH1IngressFence_AuthenticatedTimeoutRollsBackAndReplays(t *testing.T) {
 			before := h1IngressCounts(t, shared, account.OrganizationID)
 			release := h1IngressHoldAIGuard(t, shared, account.OrganizationID)
 			started := time.Now()
-			done := h1IngressSignedAsync(t, app, body)
+			done := h1IngressSignedAsync(t, app, body, release)
 			h1IngressWaiters(t, shared, 1)
 			var result h1IngressHTTPResult
 			select {
@@ -183,7 +197,7 @@ func TestH1IngressFence_EarlyReleaseDoesNotCancelOwningTransaction(t *testing.T)
 	release := h1IngressHoldAIGuard(t, shared, account.OrganizationID)
 	body := coexistenceAdmissionInboundBody(account, "wamid.h1-early-"+uuid.NewString(),
 		coexistenceAdmissionTestPhone(), "US."+testutil.NewTestGraphObjectID()[:20], "Synthetic early release")
-	done := h1IngressSignedAsync(t, app, body)
+	done := h1IngressSignedAsync(t, app, body, release)
 	h1IngressWaiters(t, shared, 1)
 	release()
 	select {
@@ -223,12 +237,30 @@ func TestH1IngressFence_CapturedAIResultSurvivesPoolPressure(t *testing.T) {
 		return execution.sendAndSaveTextMessage(&work.Account, &work.Contact, result["answer"].(string))
 	}
 	aiDone := make(chan error, 1)
-	go func() { aiDone <- env.run(t, env.baseTime) }()
+	var running sync.WaitGroup
+	t.Cleanup(func() {
+		finishAI()
+		joined := make(chan struct{})
+		go func() { running.Wait(); close(joined) }()
+		select {
+		case <-joined:
+			h1IngressJoin(t, env.app)
+		case <-time.After(65 * time.Second):
+			t.Error("AI and ingress workers did not join during cleanup")
+		}
+	})
+	running.Add(1)
+	go func() { defer running.Done(); aiDone <- env.run(t, env.baseTime) }()
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):
 		t.Fatal("real durable AI guard and claim were not established")
 	}
+	gate := &env.app.rootApp().continuationAdmission
+	gate.mu.Lock()
+	continuationWeight := gate.used
+	gate.mu.Unlock()
+	require.Equal(t, 3, continuationWeight, "the custom callback reserves its actual outer/guard/provider demand")
 	type admissionResult struct {
 		index     int
 		work      *persistedIncomingMessage
@@ -242,14 +274,31 @@ func TestH1IngressFence_CapturedAIResultSurvivesPoolPressure(t *testing.T) {
 			coexistenceAdmissionTestPhone(), "Synthetic concurrent ingress")
 		message := messages[i]
 		index := i
+		running.Add(1)
 		go func() {
+			defer running.Done()
 			work, duplicate, err := env.app.persistAuthenticatedIncomingMessageBeforeAck(
 				env.account.PhoneID, message, "Synthetic ingress", strings.Repeat("a", 64))
 			results <- admissionResult{index, work, duplicate, err}
 		}()
 	}
-	h1IngressWaiters(t, env.shared, 8)
-	require.Equal(t, 10, env.sqlPool.Stats().InUse, "eight admissions plus outer continuation and physical AI guard exhaust the actual pool")
+	// The corrected admission gate queues excess ingress BEFORE it can own SQL.
+	// Keep all eight competing deliveries, but distinguish granted real fence
+	// waiters from queued callers instead of demanding an obsolete full-pool
+	// barrier. The custom callback retains its ordinary outer+guard shape.
+	budget := env.sqlPool.Stats().MaxOpenConnections - inboundContinuationProgressAllowance
+	granted := budget - continuationWeight
+	require.Greater(t, granted, 0)
+	require.Less(t, granted, len(messages), "the fixture must exercise both admitted and queued ingress")
+	queued := len(messages) - granted
+	h1IngressWaiters(t, env.shared, granted)
+	require.Eventually(t, func() bool {
+		gate.mu.Lock()
+		defer gate.mu.Unlock()
+		return gate.used == budget && len(gate.waiters) == queued
+	}, 3*time.Second, 10*time.Millisecond, "all eight ingresses must reach either the real DB fence or the pre-DB admission queue")
+	require.Equal(t, granted+2, env.sqlPool.Stats().InUse, "queued ingress cannot retain a SQL connection; outer continuation and physical guard account for the other two")
+	require.LessOrEqual(t, env.sqlPool.Stats().InUse, env.sqlPool.Stats().MaxOpenConnections-inboundContinuationProgressAllowance, "independent result persistence retains real pool headroom")
 	finishedAt := time.Now()
 	finishAI()
 	var aiErr error
@@ -266,7 +315,7 @@ func TestH1IngressFence_CapturedAIResultSurvivesPoolPressure(t *testing.T) {
 			if result.err != nil {
 				refused++
 				assert.Nil(t, result.work, "failed ingress exposes no uncommitted work")
-				assert.Contains(t, result.err.Error(), "lock incoming organization admission")
+				assert.True(t, errors.Is(result.err, context.DeadlineExceeded) || strings.Contains(result.err.Error(), "lock incoming organization admission"), "only a known bounded pre-ACK admission refusal is expected")
 			} else {
 				// Once the AI guard releases, remaining in-budget admissions
 				// may legitimately win the lock instead of timing out.
@@ -280,7 +329,10 @@ func TestH1IngressFence_CapturedAIResultSurvivesPoolPressure(t *testing.T) {
 	}
 	require.NoError(t, aiErr, "durable continuation settlement must succeed")
 	require.NoError(t, <-dispatchErrors, "CAPTURED_RESULT_STARVED: a computed AI result must not become manual review behind ingress fences")
-	assert.Positive(t, refused, "at least one real ingress deadline must release capacity")
+	// Admission headroom can now persist the captured result without waiting for
+	// an ingress timeout. The separate authenticated-timeout regression still
+	// proves rollback and redelivery for a real 20s fence expiry.
+	t.Logf("eight ingress outcomes: admitted=%d refused=%d", len(messages)-refused, refused)
 	assert.Less(t, time.Since(finishedAt), 40*time.Second, "ingress releases capacity before the existing 45s ledger bound")
 	assert.EqualValues(t, 1, computations.Load())
 	assert.EqualValues(t, 1, env.calls.Load())
