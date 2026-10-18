@@ -60,18 +60,6 @@ const (
 	inboundContinuationWriter
 )
 
-// Bound ingress admission before it owns a tenant transaction. Cancelling this
-// child after the grant affects neither the later fence statements nor COMMIT.
-func (a *App) acquireIncomingMessageCapacity() (func(), error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	release, err := a.acquireInboundContinuationCapacity(ctx, nil, 1)
-	if err != nil {
-		return nil, fmt.Errorf("incoming message capacity admission: %w", err)
-	}
-	return release, nil
-}
-
 // checkInboundContinuationEntry must run before RunOnce takes runMu and before
 // either public entry point claims a job. Internal phase transitions do not call
 // this guard: they retain the marked context but release all DB/permit ownership
