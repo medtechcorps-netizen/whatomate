@@ -1851,6 +1851,34 @@ func (a *App) finalizeMessageSend(
 
 // broadcastNewMessage broadcasts a new message via WebSocket
 func (a *App) broadcastNewMessage(orgID uuid.UUID, msg *models.Message, contact *models.Contact) {
+	if a != nil && a.inboundContinuation != nil && a.inboundContinuation.detachedGeneratedApply {
+		if orgID != a.inboundContinuation.OrganizationID {
+			a.Log.Error("Detached generated message event has a different organization", "organization_id", orgID)
+			return
+		}
+		// Payload construction reads the organization's masking setting. Enter
+		// a bounded tenant scope without retaining a third connection across
+		// provider I/O. The history finalizer still owns event publication.
+		var afterCommit []func()
+		err := a.withInboundContinuationDetachedApplyRead(func(db *gorm.DB) error {
+			scoped := a.scopedApp(db, orgID)
+			scoped.broadcastNewMessageInCurrentScope(orgID, msg, contact)
+			afterCommit = scoped.takeAfterCommit()
+			return nil
+		})
+		if err != nil {
+			a.Log.Error("Failed to prepare detached generated message event", "error", err, "organization_id", orgID)
+			return
+		}
+		for _, callback := range afterCommit {
+			a.afterTenantCommit(callback)
+		}
+		return
+	}
+	a.broadcastNewMessageInCurrentScope(orgID, msg, contact)
+}
+
+func (a *App) broadcastNewMessageInCurrentScope(orgID uuid.UUID, msg *models.Message, contact *models.Contact) {
 	if a == nil || msg == nil || contact == nil {
 		return
 	}

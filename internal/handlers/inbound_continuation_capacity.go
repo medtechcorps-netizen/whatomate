@@ -395,6 +395,9 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 		return err
 	}
 	defer releaseApply()
+	if applyMode == inboundContinuationReader {
+		return p.processGeneratedIncomingApply(ownershipCtx, execution, work, job, prepared, captured)
+	}
 	var continuationErr error
 	err = execution.WithTenantApp(work.OrganizationID, func(scoped *App) error {
 		scoped.inboundContinuation = execution.inboundContinuation
@@ -428,6 +431,90 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 			}
 			execution.inboundContinuation.preparedSession = prepared.session
 			continuationErr = scoped.continuePersistedIncomingMessage(ctx, work)
+		}
+		if inboundContinuationStoppedByPolicy(continuationErr) {
+			continuationErr = nil
+		}
+		if continuationErr == nil {
+			continuationErr = scoped.markInboundContinuationCompleted(work.Persisted.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return continuationErr
+}
+
+// processGeneratedIncomingApply keeps the existing physical send guard and all
+// independently durable send/ledger phases. Only invocation-local history and
+// completion wait until that guard has returned; their final transaction keeps
+// its ordinary uncancelled context and owns the deferred realtime callbacks.
+// This deliberately changes the local-history failure boundary: a failed
+// history insert cannot poison verification of an already accepted send.
+// Session deletion between send and finalization can fail the history write;
+// replay must use the durable action result, never repeat the physical effect.
+func (p *InboundContinuationProcessor) processGeneratedIncomingApply(
+	ownershipCtx context.Context,
+	execution *App,
+	work *persistedIncomingMessage,
+	job *models.ScheduledJob,
+	prepared *preparedIncomingContinuation,
+	captured *capturedLegacyAI,
+) error {
+	if preparedIncomingApplyMode(prepared, captured) != inboundContinuationReader ||
+		execution.inboundContinuation == nil || execution.inboundContinuation.detachedGeneratedApply {
+		return errors.New("detached apply requires one captured generated-text continuation")
+	}
+	// Preserve the original pre-send ordinary-tenant and parent-lease check.
+	// Fully release this read before acquiring the unchanged physical guard.
+	var ownershipErr error
+	err := execution.WithTenantApp(work.OrganizationID, func(scoped *App) error {
+		if err := ownershipCtx.Err(); err != nil {
+			ownershipErr = err
+			return nil
+		}
+		var owners int64
+		if err := scoped.DB.WithContext(ownershipCtx).Model(&models.ScheduledJob{}).
+			Where("id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+				job.ID, work.OrganizationID, inboundContinuationJobKind, models.ScheduledJobStatusProcessing, p.workerID).
+			Count(&owners).Error; err != nil {
+			ownershipErr = err
+			return nil
+		}
+		if owners != 1 {
+			ownershipErr = errors.New("inbound continuation apply lost its lease")
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if ownershipErr != nil {
+		return ownershipErr
+	}
+	answer := captured.result["answer"].(string) // validated by the exact route classifier
+	execution.Log.Info("Attempting AI response", "provider", prepared.settings.AI.Provider, "model", prepared.settings.AI.Model)
+	execution.Log.Info("AI response generated successfully", "response_length", len(answer))
+	continuationErr := func() error {
+		execution.inboundContinuation.detachedGeneratedApply = true
+		defer func() { execution.inboundContinuation.detachedGeneratedApply = false }()
+		if err := execution.sendAndSaveTextMessage(&work.Account, prepared.contact, answer); err != nil {
+			execution.Log.Error("Failed to send AI response", "error", err, "contact", prepared.contact.PhoneNumber)
+			return fmt.Errorf("send AI response: %w", err)
+		}
+		return nil
+	}()
+	sent := continuationErr == nil
+	err = execution.WithTenantApp(work.OrganizationID, func(scoped *App) error {
+		scoped.inboundContinuation = execution.inboundContinuation
+		scoped.preparedIncoming = prepared
+		// Capture callbacks on success AND guard error. They may run only when
+		// this original history/completion owner successfully commits.
+		scoped.adoptAfterCommit(execution)
+		scoped.logPreparedIncomingHistory(prepared)
+		if sent {
+			scoped.logSessionMessage(prepared.session.ID, models.DirectionOutgoing, answer, "ai_response")
 		}
 		if inboundContinuationStoppedByPolicy(continuationErr) {
 			continuationErr = nil

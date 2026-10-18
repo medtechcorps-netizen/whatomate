@@ -57,6 +57,9 @@ type inboundContinuationExecution struct {
 	actionScope    string
 	actionIndex    int
 	attemptGuarded bool
+	// Only the audited captured generated-text route sends without an outer
+	// history transaction. Its verification and event reads still enter tenant scope.
+	detachedGeneratedApply bool
 	// Booking commits session proposals independently before provider I/O.
 	// Its graph checkpoint must therefore not reuse an older outer snapshot.
 	nativeBookingCheckpoint bool
@@ -1788,6 +1791,35 @@ func (a *App) runInboundContinuationCapturedActionGuarded(
 	return result, nil
 }
 
+// withInboundContinuationDetachedApplyRead is limited to send verification,
+// resolved-send lookup and realtime payload reads. Close this short read scope
+// before recovery opens its independent SLA restoration transaction. Ordinary
+// callers retain their existing transaction and snapshot.
+func (a *App) withInboundContinuationDetachedApplyRead(read func(*gorm.DB) error) error {
+	if a == nil || a.DB == nil || read == nil {
+		return errors.New("inbound send verification requires an app database and callback")
+	}
+	execution := a.inboundContinuation
+	if execution == nil || !execution.detachedGeneratedApply {
+		return read(a.DB)
+	}
+	root := a.rootApp()
+	if !execution.attemptGuarded || execution.OrganizationID == uuid.Nil ||
+		a.tenantOrgID != uuid.Nil || root == nil || root.DB == nil ||
+		a.DB.Statement == nil || root.DB.Statement == nil ||
+		a.DB.Statement.ConnPool != root.DB.Statement.ConnPool {
+		return errors.New("detached generated send verification requires its guarded root pool")
+	}
+	if err := a.requireInboundContinuationPoolEntry(); err != nil {
+		return err
+	}
+	// Keep the root's uncancelled context, independently of the physical
+	// guard deadline, just as the former outer verification transaction did.
+	return a.WithTenantApp(execution.OrganizationID, func(scoped *App) error {
+		return read(scoped.DB)
+	})
+}
+
 func (a *App) recoverResolvedInboundContinuationSend(
 	claim *inboundContinuationActionClaim,
 ) error {
@@ -1804,15 +1836,17 @@ func (a *App) recoverResolvedInboundContinuationSend(
 	}
 
 	var message models.Message
-	err = a.DB.Unscoped().
-		Select("id", "organization_id", "contact_id", "created_at", "status", "error_message", "metadata").
-		Where(
-			"id = ? AND organization_id = ? AND direction = ?",
-			messageID,
-			a.inboundContinuationOrganizationID(),
-			models.DirectionOutgoing,
-		).
-		First(&message).Error
+	err = a.withInboundContinuationDetachedApplyRead(func(db *gorm.DB) error {
+		return db.Unscoped().
+			Select("id", "organization_id", "contact_id", "created_at", "status", "error_message", "metadata").
+			Where(
+				"id = ? AND organization_id = ? AND direction = ?",
+				messageID,
+				a.inboundContinuationOrganizationID(),
+				models.DirectionOutgoing,
+			).
+			First(&message).Error
+	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return &inboundContinuationManualReviewError{
 			ActionKey: claim.Key,
@@ -1979,9 +2013,11 @@ func (a *App) markInboundContinuationAction(
 
 func (a *App) verifySynchronousChatbotSend(messageID uuid.UUID) error {
 	var message models.Message
-	if err := a.DB.Select("id", "status", "error_message").
-		Where("id = ?", messageID).
-		First(&message).Error; err != nil {
+	if err := a.withInboundContinuationDetachedApplyRead(func(db *gorm.DB) error {
+		return db.Select("id", "status", "error_message").
+			Where("id = ?", messageID).
+			First(&message).Error
+	}); err != nil {
 		return fmt.Errorf("verify synchronous chatbot send: %w", err)
 	}
 	switch message.Status {
