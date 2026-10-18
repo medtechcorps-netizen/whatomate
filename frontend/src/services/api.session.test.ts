@@ -331,6 +331,67 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(options.withCredentials).toBe(true)
   })
 
+  it('stamps the logout with the CSRF cookie as it is after the revoke', async () => {
+    const seen: Array<string | undefined> = []
+    const { api } = await loadTab(async (config) => {
+      seen.push(config.headers.get('X-CSRF-Token') as string | undefined)
+      return ok(config)
+    })
+
+    // The revoke rotates the cookie (another tab refreshed meanwhile)...
+    postSpy.mockImplementationOnce(async () => {
+      setCookie('whm_csrf=csrf-token-2; path=/')
+      return { data: { data: {} }, status: 200 }
+    })
+    await api.post('/auth/logout', {})
+    // ...or clears it, as a successful revoke does.
+    postSpy.mockImplementationOnce(async () => {
+      setCookie('whm_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/')
+      return { data: { data: {} }, status: 200 }
+    })
+    setCookie('whm_csrf=csrf-token-3; path=/')
+    await api.post('/auth/logout', {})
+
+    expect(seen).toEqual(['csrf-token-2', undefined])
+  })
+
+  it('retries a revoke rejected for a CSRF cookie rotated mid-flight', async () => {
+    const { api } = await loadTab(async (config) => ok(config))
+    const sent: string[] = []
+    postSpy.mockImplementation(async (_url: string, _body: unknown, options: any) => {
+      sent.push(options.headers['X-CSRF-Token'])
+      if (sent.length === 1) {
+        setCookie('whm_csrf=csrf-token-2; path=/')
+        throw httpError(403)
+      }
+      return { data: { data: {} }, status: 200 }
+    })
+
+    await api.post('/auth/logout', {})
+
+    expect(sent).toEqual(['csrf-token-1', 'csrf-token-2'])
+  })
+
+  it('stops revoking when someone else signs in during the backoff', async () => {
+    vi.useFakeTimers()
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+    const { api } = await loadTab(adapter)
+    postSpy.mockImplementation(async () => {
+      // While this logout waits out a 429, another tab signs a different
+      // user in (new cookies, new stored identity).
+      localStorage.setItem('user', JSON.stringify({ id: 'user-2', email: 'b@example.com' }))
+      setCookie('whm_csrf=csrf-of-user-2; path=/')
+      throw httpError(429)
+    })
+
+    const logout = api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(3_000)
+    await logout
+
+    expect(postSpy).toHaveBeenCalledTimes(1)
+    expect(adapter).toHaveBeenCalledTimes(1)
+  })
+
   it('re-reads the CSRF cookie for each revoke attempt', async () => {
     vi.useFakeTimers()
     const { api } = await loadTab(async (config) => ok(config))

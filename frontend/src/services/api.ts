@@ -263,7 +263,11 @@ function postRefresh() {
  * first. Failures never block the logout.
  */
 export async function revokeRefreshToken(): Promise<void> {
-  for (let attempt = 0; ; attempt++) {
+  const identity = storedIdentity();
+  for (let attempt = 0; attempt <= REVOKE_RETRY_DELAYS_MS.length; attempt++) {
+    // A different session signed in from another tab while this one waited:
+    // its token is not this logout's to revoke.
+    if (attempt > 0 && storedIdentity() !== identity) return;
     // Read the token on every attempt: a refresh in another tab rotates it.
     const csrfToken = getCookie("whm_csrf");
     if (!csrfToken) return;
@@ -279,13 +283,26 @@ export async function revokeRefreshToken(): Promise<void> {
       );
       return;
     } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      // The CSRF cookie was rotated mid-flight: try again with the new one.
+      if (status === 403 && getCookie("whm_csrf") !== csrfToken) continue;
       // The revoke shares the per-IP refresh rate limit, which a busy
       // clinic behind one NAT address can exhaust: wait and retry a 429.
       // Anything else, or a last failure, still lets the logout go ahead.
-      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
       if (status !== 429 || attempt >= REVOKE_RETRY_DELAYS_MS.length) return;
       await delay(REVOKE_RETRY_DELAYS_MS[attempt]);
     }
+  }
+}
+
+// storedIdentity identifies the signed-in user and organization of this
+// browser, so a logout can tell when another tab signed someone else in.
+function storedIdentity(): string {
+  try {
+    const user = JSON.parse(localStorage.getItem("user") || "null");
+    return user?.id ? `${user.id}|${user.organization_id ?? ""}` : "";
+  } catch {
+    return "";
   }
 }
 
@@ -483,8 +500,17 @@ api.interceptors.request.use(
       config.headers.set("X-Organization-ID", organizationId);
     }
     if (isLogout) {
-      // Revoke the refresh token first, then log out as before.
-      return revokeRefreshToken().then(() => config);
+      // Revoke the refresh token first, then log out as before, with the
+      // CSRF token as it stands then: the revoke clears or may rotate it.
+      return revokeRefreshToken().then(() => {
+        const csrfToken = getCookie("whm_csrf");
+        if (csrfToken) {
+          config.headers.set("X-CSRF-Token", csrfToken);
+        } else {
+          config.headers.delete("X-CSRF-Token");
+        }
+        return config;
+      });
     }
     return config;
   },
