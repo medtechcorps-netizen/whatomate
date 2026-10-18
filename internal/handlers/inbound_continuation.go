@@ -246,7 +246,7 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 			if remaining <= 0 || ctx.Err() != nil {
 				break
 			}
-			release, admitErr := p.acquirePreparationCapacity(ctx, organizationID)
+			release, preparationMode, admitErr := p.acquirePreparationCapacity(ctx, organizationID, inboundContinuationWriter)
 			if admitErr != nil {
 				runErrors = append(runErrors, admitErr)
 				remaining = 0
@@ -266,7 +266,7 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 			madeProgress = true
 			remaining--
 			if p.process != nil || !p.app.rlsEnabled() {
-				if err := worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release); err != nil {
+				if err := worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode); err != nil {
 					runErrors = append(runErrors, err)
 				}
 				continue
@@ -274,7 +274,7 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 			running.Add(1)
 			go func() {
 				defer running.Done()
-				if err := worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release); err != nil {
+				if err := worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode); err != nil {
 					errorsCh <- err
 				}
 			}()
@@ -318,7 +318,7 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 	if err := p.app.checkInboundContinuationEntry(ctx); err != nil {
 		return err
 	}
-	release, err := p.acquirePreparationCapacity(ctx, organizationID)
+	release, preparationMode, err := p.acquirePreparationCapacity(ctx, organizationID, inboundContinuationReader)
 	if err != nil {
 		return err
 	}
@@ -328,19 +328,21 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 		release()
 		return err
 	}
-	return worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release)
+	return worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode)
 }
 
-// Ordinary RLS preparation starts with the audited reader-compatible claim and
-// validation path. Media and existing-session transitions explicitly release
-// this ownership before entering their writer phase. Admission still precedes
-// the durable claim; custom callbacks retain their generic contract. RunOnce
-// enqueues organizations serially, without claiming fairness for unqueued work.
-func (p *InboundContinuationProcessor) acquirePreparationCapacity(ctx context.Context, organizationID uuid.UUID) (func(), error) {
+// Recovery preparation owns Writer1 from before the claim through preparation;
+// the fast path starts with Reader1 and explicitly yields for writer fallback.
+// Both release preparation before ordinary model admission unless the fast path
+// can safely retain its reader. Custom callbacks retain generic admission.
+// RunOnce still enqueues tenants serially and claims at most one bounded batch.
+func (p *InboundContinuationProcessor) acquirePreparationCapacity(ctx context.Context, organizationID uuid.UUID, mode int) (func(), int, error) {
 	if p.process != nil || !p.app.rlsEnabled() {
-		return p.app.acquireInboundContinuationCapacity(ctx, p.stopCh, 1)
+		release, err := p.app.acquireInboundContinuationCapacity(ctx, p.stopCh, 1)
+		return release, inboundContinuationUnscoped, err
 	}
-	return p.app.acquireInboundContinuationPhase(ctx, p.stopCh, 1, organizationID.String(), inboundContinuationReader)
+	release, err := p.app.acquireInboundContinuationPhase(ctx, p.stopCh, 1, organizationID.String(), mode)
+	return release, mode, err
 }
 
 func (p *InboundContinuationProcessor) listOrganizations(
@@ -477,6 +479,7 @@ func (p *InboundContinuationProcessor) processClaimed(
 	organizationID uuid.UUID,
 	job *models.ScheduledJob,
 	releasePreparation func(),
+	preparationMode int,
 ) (resultErr error) {
 	defer releasePreparation()
 	if job == nil {
@@ -573,7 +576,7 @@ func (p *InboundContinuationProcessor) processClaimed(
 			return err
 		})
 		if scopeErr == nil && !alreadyCompleted {
-			continuationErr = p.processPreparedIncoming(processCtx, ownershipCtx, executionApp, work, job, releasePreparation)
+			continuationErr = p.processPreparedIncoming(processCtx, ownershipCtx, executionApp, work, job, releasePreparation, preparationMode)
 			if inboundContinuationStoppedByPolicy(continuationErr) {
 				continuationErr = executionApp.WithTenantApp(organizationID, func(scoped *App) error {
 					return scoped.markInboundContinuationCompleted(work.Persisted.ID)

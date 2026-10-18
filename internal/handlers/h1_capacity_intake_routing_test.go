@@ -55,7 +55,7 @@ func TestH1IntakeCohort_RealIngressUsesIntakeAfterDiscoveryAndKeepsPreparationOr
 			})
 			go func() {
 				defer close(preparationJoined)
-				release, err := processor.acquirePreparationCapacity(ctx, account.OrganizationID)
+				release, _, err := processor.acquirePreparationCapacity(ctx, account.OrganizationID, inboundContinuationReader)
 				preparation <- h1CapacityAdmissionResult{release: release, err: err}
 			}()
 			h1CapacityWaitQueue(t, g, 1, 1)

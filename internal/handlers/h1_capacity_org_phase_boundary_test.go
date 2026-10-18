@@ -83,7 +83,12 @@ func TestH1OrgPhase_ProcessorModeWaitPrecedesClaimAndSQL(t *testing.T) {
 			queuedOrg, queuedMode := g.waiters[0].organization, g.waiters[0].mode
 			g.mu.Unlock()
 			require.Equal(t, org.String(), queuedOrg)
-			require.Equal(t, inboundContinuationReader, queuedMode)
+			wantMode := inboundContinuationReader
+			if entry == "RunOnce" {
+				// Recovery owns writer preparation before claim; the fast path stays reader.
+				wantMode = inboundContinuationWriter
+			}
+			require.Equal(t, wantMode, queuedMode)
 			require.Zero(t, f.pool.Stats().InUse, "an incompatible mode wait owns no application SQL connection")
 			require.Zero(t, jobStatements.Load(), "even the first claim statement must wait for organization admission")
 			require.Zero(t, f.model.calls.Load())

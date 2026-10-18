@@ -424,7 +424,8 @@ func (a *App) incomingWithinBusinessHours(hours models.JSONBArray) bool {
 // the operation yield and re-enter the ordinary perform queue. Writer fallbacks
 // always release reader ownership first; every route releases before apply.
 // Captured computations are never discarded merely because the caller expires.
-func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx context.Context, execution *App, work *persistedIncomingMessage, job *models.ScheduledJob, releasePreparation func()) error {
+func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx context.Context, execution *App, work *persistedIncomingMessage, job *models.ScheduledJob, releasePreparation func(), preparationMode int) error {
+	initialWriter := preparationMode == inboundContinuationWriter
 	var releaseWriter func()
 	releaseAllPreparation := func() {
 		releasePreparation()
@@ -432,11 +433,11 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 			releaseWriter()
 		}
 	}
-	// processClaimed owns only the original reader release. Replacement writer
-	// ownership must also unwind on errors and panics in later preparation.
+	// processClaimed owns the original preparation release in either mode.
+	// Replacement writer ownership also unwinds on preparation errors and panics.
 	defer releaseAllPreparation()
 	acquireWriter := func() error {
-		if releaseWriter != nil {
+		if initialWriter || releaseWriter != nil {
 			return nil
 		}
 		releasePreparation()
@@ -450,7 +451,7 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 	if prepareErr != nil {
 		return prepareErr
 	}
-	retainReader := prepared.legacyAI && releaseWriter == nil && execution.canRetainInboundPreparationForPerform()
+	retainReader := preparationMode == inboundContinuationReader && prepared.legacyAI && releaseWriter == nil && execution.canRetainInboundPreparationForPerform()
 	if !retainReader {
 		releaseAllPreparation()
 	}
