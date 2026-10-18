@@ -811,6 +811,28 @@ describe('ProtectedMessageMedia', () => {
       expect(view.find('[role="alert"]').exists()).toBe(false)
     })
 
+    it('does not pull focus to the image when the agent left Retry before the swap', async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
+      const view = mount(ProtectedMessageMedia, {
+        props: { organizationId: 'workspace-b', message: pendingImage },
+        attachTo: document.body,
+      })
+      wrappers.push(view)
+      await flushPromises()
+      ;(view.get('[data-testid="chat-message-media-error"] button').element as HTMLButtonElement).focus()
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+
+      // Focus leaves Retry while the try runs, so nothing in the bubble has it at the swap.
+      ;(document.activeElement as HTMLElement | null)?.blur()
+      quietTry.resolve(mediaResponse())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(document.activeElement).toBe(document.body)
+    })
+
     it('moves focus to the image when the agent reached Retry only while the try was running', async () => {
       const quietTry = deferred<ReturnType<typeof mediaResponse>>()
       mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
