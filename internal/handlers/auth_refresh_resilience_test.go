@@ -473,3 +473,51 @@ func TestLaneA_RefreshToken_RevokeOfARotatedTokenRevokesItsSuccessor(t *testing.
 	assert.False(t, laneAKeyExists(t, f.app.Redis, "refresh_grace:"+f.jti))
 	testutil.AssertErrorResponse(t, laneARefresh(t, f.app, testutil.GetResponseCookie(first, "whm_refresh")), fasthttp.StatusUnauthorized, "revoked")
 }
+
+// laneALogoutWithBody calls App.Logout the direct-API way: refresh token in
+// the JSON body, no cookie.
+func laneALogoutWithBody(t *testing.T, app *handlers.App, token string) *fastglue.Request {
+	t.Helper()
+	req := testutil.NewJSONRequest(t, map[string]string{"refresh_token": token})
+	require.NoError(t, app.Logout(req))
+	return req
+}
+
+func TestLaneA_Logout_StalePredecessorRevokesTheWholeChain(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	// T0 rotated into T1, but the response was lost: the client still holds T0.
+	rotated := laneARefresh(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(rotated))
+	t1 := testutil.GetResponseCookie(rotated, "whm_refresh")
+
+	logout := laneALogoutWithBody(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(logout))
+	assert.Contains(t, string(testutil.GetResponseBody(logout)), "logged_out")
+
+	testutil.AssertErrorResponse(t, laneARefresh(t, f.app, f.token), fasthttp.StatusUnauthorized, "revoked")
+	testutil.AssertErrorResponse(t, laneARefresh(t, f.app, t1), fasthttp.StatusUnauthorized, "revoked")
+}
+
+func TestLaneA_Logout_CurrentSuccessorRevokesTheChain(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	rotated := laneARefresh(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(rotated))
+	t1 := testutil.GetResponseCookie(rotated, "whm_refresh")
+
+	logout := laneALogoutWithBody(t, f.app, t1)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(logout))
+
+	testutil.AssertErrorResponse(t, laneARefresh(t, f.app, t1), fasthttp.StatusUnauthorized, "revoked")
+	testutil.AssertErrorResponse(t, laneARefresh(t, f.app, f.token), fasthttp.StatusUnauthorized, "revoked")
+}
+
+func TestLaneA_Logout_UnvalidatedTokenRevokesNothing(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	// Same JTI, wrong signing key: logout succeeds but revokes nothing.
+	forged := generateRefreshTokenWithJTI(t, "another-secret-key-that-is-at-least-32-chars", f.user, f.jti, time.Hour)
+
+	logout := laneALogoutWithBody(t, f.app, forged)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(logout))
+	assert.True(t, laneAJTIExists(t, f.app.Redis, f.jti))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(laneARefresh(t, f.app, f.token)))
+}

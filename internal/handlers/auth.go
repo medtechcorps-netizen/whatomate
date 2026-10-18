@@ -408,7 +408,13 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 			}
 			err = a.applyOrganizationMembership(&user, claims.OrganizationID, false)
 		}
-		if err != nil && err != gorm.ErrRecordNotFound && err != database.ErrPlatformComplianceTenant {
+		// Permanent organization states end the session like a removed
+		// membership; only other (database) errors are worth retrying.
+		permanent := err == gorm.ErrRecordNotFound ||
+			err == database.ErrPlatformComplianceTenant ||
+			err == database.ErrPlatformComplianceMarkerInvalid ||
+			err == database.ErrMissingTenant
+		if err != nil && !permanent {
 			return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
 		}
 		if err != nil {
@@ -832,15 +838,26 @@ func (a *App) Logout(r *fastglue.Request) error {
 	}
 
 	if refreshTokenStr != "" {
-		// Parse the token to extract JTI (don't need to fully validate — just extract claims)
-		token, _ := jwt.ParseWithClaims(refreshTokenStr, &middleware.JWTClaims{}, func(token *jwt.Token) (any, error) {
-			return []byte(a.Config.JWT.Secret), nil
-		})
-		if token != nil {
-			if claims, ok := token.Claims.(*middleware.JWTClaims); ok && claims.ID != "" {
+		// Only a genuine refresh token is revoked, and with it everything it
+		// was already rotated into: after a lost rotation response the
+		// client may still present the predecessor, whose grace entry would
+		// otherwise keep handing out the successor. An absent, forged or
+		// expired token still logs out; it just revokes nothing.
+		token, err := jwt.ParseWithClaims(
+			refreshTokenStr,
+			&middleware.JWTClaims{},
+			func(token *jwt.Token) (any, error) {
+				return []byte(a.Config.JWT.Secret), nil
+			},
+			jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		)
+		if err == nil && token.Valid {
+			if claims, ok := token.Claims.(*middleware.JWTClaims); ok && claims.ID != "" && middleware.IsRefreshJWTClaims(claims) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				a.Redis.Del(ctx, refreshTokenKey(claims.ID))
+				if err := a.revokeRefreshChain(ctx, claims.ID); err != nil {
+					a.Log.Error("Logout could not revoke the refresh token", "reason", "revoke_store_unavailable", "user_id", claims.UserID)
+				}
 			}
 		}
 	}
