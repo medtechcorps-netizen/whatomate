@@ -263,25 +263,31 @@ async function forwardAll() {
   step.value = 'results'
   watchStatus()
   // Sequential on purpose: one short request at a time keeps the server's
-  // connection use flat, and each result can be shown as it lands.
-  const started = session
+  // connection use flat, and each result can be shown as it lands. The run
+  // belongs to the session it started in: once the dialog closes, reopens or
+  // unmounts, no further target of this run is sent.
+  const run = session
   for (const result of results.value) {
-    await sendTo(result, message.id)
+    if (run !== session) return
+    await sendTo(result, message.id, run)
   }
-  if (started === session) settleWatching()
+  if (run === session) settleWatching()
 }
 
-/** One forward request for one target. Exactly one request per call. */
-async function sendTo(result: TargetResult, sourceId: string) {
-  const started = session
+/**
+ * One forward request for one target, for the session `run`. Exactly one
+ * request per call, and none at all if that session has ended.
+ */
+async function sendTo(result: TargetResult, sourceId: string, run: number) {
+  if (run !== session) return
   result.state = 'sending'
   result.error = undefined
   try {
     const created = await contactsStore.sendMessage(result.contact.id, 'text', {}, undefined, undefined, {
       forwardOfMessageId: sourceId,
     })
-    // Closed (or reopened) meanwhile: nothing watches this result any more.
-    if (started !== session) return
+    // Closed, reopened or unmounted meanwhile: nothing watches this result.
+    if (run !== session) return
     result.messageId = created?.id ? String(created.id) : undefined
     result.state = 'queued'
     startConfirmTimer(result)
@@ -291,7 +297,7 @@ async function sendTo(result: TargetResult, sourceId: string) {
       applyStatus(result.messageId, early?.status ?? String(created?.status ?? ''), early?.error ?? created?.error_message)
     }
   } catch (error) {
-    if (started !== session) return
+    if (run !== session) return
     const failure = classifyForwardError(error)
     result.state = failure
     result.error = failure === 'uncertain' ? undefined : getErrorMessage(error, t('chat.forward.failed'))
@@ -307,10 +313,10 @@ function settleWatching() {
 async function retryTarget(result: TargetResult) {
   const message = props.message
   if (!message || result.state !== 'retryable' || isSending.value) return
-  const started = session
+  const run = session
   watchStatus()
-  await sendTo(result, message.id)
-  if (started === session) settleWatching()
+  await sendTo(result, message.id, run)
+  if (run === session) settleWatching()
 }
 
 function resultLabel(state: ResultState): string {

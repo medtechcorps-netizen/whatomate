@@ -3213,7 +3213,7 @@ func recordForwardAudit(
 		TargetContactID:        message.ContactID.String(),
 		MessageType:            string(message.MessageType),
 	}); err != nil {
-		if forwardAuditFailureRepeats(err) {
+		if forwardFailureRepeats(err) {
 			return &forwardAuditError{err: err}
 		}
 		// Transient (deadline, cancellation, dropped connection, retryable
@@ -3223,12 +3223,13 @@ func recordForwardAudit(
 	return nil
 }
 
-// forwardAuditFailureRepeats reports whether a failed audit write would fail
-// the same way on a retry: a data (22), integrity (23), schema or privilege
-// (42) or raised (P0, e.g. a trigger or policy) error. Anything else, such as
-// a deadline, a cancellation (57014), a dropped connection, or a deadlock or
-// lock timeout left after retries (40P01, 55P03), is transient.
-func forwardAuditFailureRepeats(err error) bool {
+// forwardFailureRepeats reports whether PostgreSQL rejected a forward's write
+// in a way that would repeat on a retry: a data error (22), an integrity
+// constraint (23), a syntax, privilege or row-level-security policy error
+// (42), or an exception raised by a trigger or guard function (P0). Anything
+// else, such as a deadline, a cancellation (57014), a dropped connection, or a
+// deadlock or lock timeout left after retries (40P01, 55P03), is transient.
+func forwardFailureRepeats(err error) bool {
 	code := postgresErrorCode(err)
 	if len(code) != 5 {
 		return false
@@ -3391,7 +3392,7 @@ type forwardSendOutcome struct {
 
 // forwardAuditError is a per-target forward audit failure that would repeat
 // (a missing actor or message, or a permanent SQLSTATE class; see
-// forwardAuditFailureRepeats). Transient audit failures are not wrapped.
+// forwardFailureRepeats). Transient audit failures are not wrapped.
 type forwardAuditError struct {
 	err error
 }
@@ -3411,7 +3412,8 @@ func (e *forwardAuditError) Unwrap() error {
 }
 
 // forwardSendFailedRefusal is a definite failure that would repeat (the
-// audit cannot be written, an up-front check, a tenant-scope mismatch). It is
+// audit cannot be written, an up-front check, a tenant-scope mismatch, a
+// permanent database rejection before COMMIT). It is
 // the response an ordinary send gives for a failed send; it never says "try
 // again", and the client never retries a 500 by itself.
 func forwardSendFailedRefusal() *messageForwardRefusal {
@@ -3461,11 +3463,13 @@ func forwardAccountUnavailableRefusal() *messageForwardRefusal {
 //   - inside an RLS Tenant request, the pending row is a savepoint of the
 //     request transaction, and Tenant rolls an error response back.
 //
-// Failures that would repeat (inactive account, audit write, an up-front
-// invariant) are definite and non-retryable, with the codes an ordinary send
-// returns. Other definite failures are 503 "try again". Outside a request
-// transaction, an error once the write reached COMMIT (from COMMIT itself, or
-// after COMMIT was sent) is ambiguous: 500 forward_outcome_unknown.
+// Failures that would repeat are definite and non-retryable, with the codes
+// an ordinary send returns: an inactive account, the audit write, an up-front
+// invariant, or a statement PostgreSQL rejected permanently before COMMIT (a
+// constraint, a policy, a guard trigger; see forwardFailureRepeats). Other
+// definite failures are 503 "try again". Outside a request transaction, any
+// error once the write reached COMMIT (from COMMIT itself, or after COMMIT was
+// sent) is ambiguous, whatever its SQLSTATE: 500 forward_outcome_unknown.
 func forwardSendFailureRefusal(err error, async bool, outcome forwardSendOutcome) *messageForwardRefusal {
 	var auditErr *forwardAuditError
 	switch {
@@ -3478,6 +3482,9 @@ func forwardSendFailureRefusal(err error, async bool, outcome forwardSendOutcome
 	case !async:
 		return forwardOutcomeUnknownRefusal()
 	case outcome.requestTransaction, !outcome.writeStarted, !outcome.reachedCommit:
+		if forwardFailureRepeats(err) {
+			return forwardSendFailedRefusal()
+		}
 		return forwardNotAcceptedRefusal()
 	default:
 		return forwardOutcomeUnknownRefusal()

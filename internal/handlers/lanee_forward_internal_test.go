@@ -220,6 +220,13 @@ func TestLaneEForwardSendFailureClassification(t *testing.T) {
 		{"request transaction: even after its write completed", timeout, true, inRequest, 503, string(forwardErrorTemporarilyUnavailable)},
 		{"own transaction: no write began (no connection, BEGIN or tenant binding)", timeout, true, requested, 503, string(forwardErrorTemporarilyUnavailable)},
 		{"own transaction: a statement in the write failed, so COMMIT was never sent", errors.New("insert failed"), true, rolledBack, 503, string(forwardErrorTemporarilyUnavailable)},
+		// Discriminating controls for a statement rejected before COMMIT.
+		{"before COMMIT, transient (deadlock left after retries): try again", fmt.Errorf("failed to create message: %w", laneESQLStateError("40P01")), true, rolledBack, 503, string(forwardErrorTemporarilyUnavailable)},
+		{"before COMMIT, INSERT rejected by a constraint: definite, would repeat", fmt.Errorf("failed to create message: %w", laneESQLStateError("23514")), true, rolledBack, 500, sendFailed},
+		{"before COMMIT, row-level-security policy rejection: definite, would repeat", fmt.Errorf("failed to create message: %w", laneESQLStateError("42501")), true, rolledBack, 500, sendFailed},
+		{"before COMMIT, guard trigger raised: definite, would repeat", laneESQLStateError("P0001"), true, rolledBack, 500, sendFailed},
+		{"request transaction, constraint rejection: definite, would repeat", laneESQLStateError("23505"), true, forwardSendOutcome{writeRequested: true, requestTransaction: true, writeStarted: true}, 500, sendFailed},
+		{"at COMMIT, even a permanent SQLSTATE stays ambiguous", fmt.Errorf("commit: %w", laneESQLStateError("23514")), true, atCommit, 500, string(forwardErrorOutcomeUnknown)},
 		{"own transaction: COMMIT itself returned an error", errors.New("commit: deferred constraint failed"), true, atCommit, 500, string(forwardErrorOutcomeUnknown)},
 		{"own transaction: connection dropped after COMMIT was sent", errors.New("commit: connection reset"), true, atCommit, 500, string(forwardErrorOutcomeUnknown)},
 		{"own transaction: context cancelled during COMMIT", fmt.Errorf("commit: %w", context.Canceled), true, atCommit, 500, string(forwardErrorOutcomeUnknown)},
@@ -246,19 +253,20 @@ type laneESQLStateError string
 func (e laneESQLStateError) Error() string    { return "synthetic SQLSTATE " + string(e) }
 func (e laneESQLStateError) SQLState() string { return string(e) }
 
-// E2R3-4: only audit failures that would repeat are non-retryable; transient
-// ones are classified by phase (a rolled-back write is a 503).
-func TestLaneEForwardAuditFailureRepeatsOnlyForPermanentClasses(t *testing.T) {
+// E2R3-4 and Q5: only database rejections that would repeat are
+// non-retryable; transient ones are classified by phase (a rolled-back write
+// is a 503).
+func TestLaneEForwardFailureRepeatsOnlyForPermanentClasses(t *testing.T) {
 	cases := map[string]bool{
 		"22001": true, "23505": true, "42501": true, "P0001": true,
 		"40P01": false, "40001": false, "55P03": false, "57014": false, "08006": false, "25P02": false,
 	}
 	for code, repeats := range cases {
-		assert.Equal(t, repeats, forwardAuditFailureRepeats(fmt.Errorf("insert audit_logs: %w", laneESQLStateError(code))), code)
+		assert.Equal(t, repeats, forwardFailureRepeats(fmt.Errorf("insert audit_logs: %w", laneESQLStateError(code))), code)
 	}
-	assert.False(t, forwardAuditFailureRepeats(context.DeadlineExceeded))
-	assert.False(t, forwardAuditFailureRepeats(context.Canceled))
-	assert.False(t, forwardAuditFailureRepeats(errors.New("connection reset by peer")))
+	assert.False(t, forwardFailureRepeats(context.DeadlineExceeded))
+	assert.False(t, forwardFailureRepeats(context.Canceled))
+	assert.False(t, forwardFailureRepeats(errors.New("connection reset by peer")))
 }
 
 // The phase record is filled by SendOutgoingMessage itself: a rejection before
@@ -490,17 +498,24 @@ func laneEArgsInclude(args []any, want string) bool {
 // (a sequence, so it survives the rollbacks).
 func laneEFailInserts(t *testing.T, db *gorm.DB, table, column string, value uuid.UUID) func() int64 {
 	t.Helper()
-	return laneEInstallRefusal(t, db, table, column, value, false)
+	return laneEInstallRefusal(t, db, table, column, value, false, "P0001")
+}
+
+// laneERejectInserts is laneEFailInserts with a chosen SQLSTATE, e.g. 23514
+// (a check constraint) or 40P01 (a deadlock, which the write retries).
+func laneERejectInserts(t *testing.T, db *gorm.DB, table, column string, value uuid.UUID, sqlstate string) func() int64 {
+	t.Helper()
+	return laneEInstallRefusal(t, db, table, column, value, false, sqlstate)
 }
 
 // laneEFailAtCommit is laneEFailInserts as a deferred constraint trigger: the
 // INSERT succeeds and the transaction's COMMIT itself returns the error.
 func laneEFailAtCommit(t *testing.T, db *gorm.DB, table, column string, value uuid.UUID) func() int64 {
 	t.Helper()
-	return laneEInstallRefusal(t, db, table, column, value, true)
+	return laneEInstallRefusal(t, db, table, column, value, true, "P0001")
 }
 
-func laneEInstallRefusal(t *testing.T, db *gorm.DB, table, column string, value uuid.UUID, atCommit bool) func() int64 {
+func laneEInstallRefusal(t *testing.T, db *gorm.DB, table, column string, value uuid.UUID, atCommit bool, sqlstate string) func() int64 {
 	t.Helper()
 	name := "lane_e_refuse_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
 	require.NoError(t, db.Exec("CREATE SEQUENCE "+name+"_count").Error)
@@ -508,11 +523,11 @@ func laneEInstallRefusal(t *testing.T, db *gorm.DB, table, column string, value 
 BEGIN
 	IF NEW.%[2]s = '%[3]s'::uuid THEN
 		PERFORM nextval('%[1]s_count');
-		RAISE EXCEPTION 'lane-e synthetic insert failure';
+		RAISE EXCEPTION 'lane-e synthetic insert failure' USING ERRCODE = '%[4]s';
 	END IF;
 	RETURN NEW;
 END
-$fn$`, name, column, value)).Error)
+$fn$`, name, column, value, sqlstate)).Error)
 	trigger := "CREATE TRIGGER %[1]s BEFORE INSERT ON %[2]s FOR EACH ROW EXECUTE FUNCTION %[1]s()"
 	if atCommit {
 		trigger = "CREATE CONSTRAINT TRIGGER %[1]s AFTER INSERT ON %[2]s DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION %[1]s()"
@@ -626,22 +641,71 @@ func (tx *laneELostCommitTx) Commit() error {
 	}
 }
 
-// Q5 under RLS, with a database-raised failure. The BEFORE INSERT trigger
-// aborts the whole request transaction, so "no row" would hold whatever the
-// savepoint or Tenant code did: this test shows the 503 contract, one attempt
-// and no provider call, not the rollback path. The rollback path is
-// TestLaneEForwardRLSGoLevelFailureRollsBack.
-func TestLaneEForwardRLSTriggerFailureIsDefinite(t *testing.T) {
-	w := laneENewForwardWorld(t)
-	w.app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
-	refused := laneEFailInserts(t, w.app.DB, "messages", "contact_id", w.target.ID)
+// laneEInsertRejections are the discriminating controls for a pending-row
+// INSERT that PostgreSQL rejects (before COMMIT): permanent rejections are
+// definite and non-retryable (500 "Failed to send message", one attempt);
+// a transient one is retried by the write and then answered 503.
+type laneEInsertRejection struct {
+	name     string
+	sqlstate string
+	status   int
+	attempts int64
+}
 
-	status, body := w.post(t, w.app, true, nil)
-	assert.Equal(t, 503, status, body)
-	assert.Contains(t, body, string(forwardErrorTemporarilyUnavailable))
-	assert.Equal(t, int64(1), refused(), "one insert attempt, never retried")
-	assert.Zero(t, laneECountMessages(t, w.app, w.target), "no durable pending row")
-	assert.Empty(t, w.capture.snapshot(), "no provider attempt")
+func laneEInsertRejections() []laneEInsertRejection {
+	return []laneEInsertRejection{
+		{"check constraint (23514): would repeat", "23514", 500, 1},
+		{"guard or policy trigger (P0001): would repeat", "P0001", 500, 1},
+		{"deadlock (40P01): transient, retried, then try again", "40P01", 503, canonicalContactWriteAttempts},
+	}
+}
+
+func laneEAssertInsertRejection(t *testing.T, status int, body string, wantStatus int) {
+	t.Helper()
+	assert.Equal(t, wantStatus, status, body)
+	if wantStatus == 503 {
+		assert.Contains(t, body, string(forwardErrorTemporarilyUnavailable))
+		return
+	}
+	assert.Contains(t, body, "Failed to send message")
+	assert.NotContains(t, body, string(forwardErrorTemporarilyUnavailable))
+	assert.NotContains(t, body, string(forwardErrorOutcomeUnknown))
+}
+
+// Q5, own transaction: a rejected INSERT never reaches COMMIT, so it is
+// definite; whether it is retryable depends on whether it would repeat.
+func TestLaneEForwardInsertRejectionsAreClassified(t *testing.T) {
+	for _, tc := range laneEInsertRejections() {
+		t.Run(tc.name, func(t *testing.T) {
+			w := laneENewForwardWorld(t)
+			refused := laneERejectInserts(t, w.app.DB, "messages", "contact_id", w.target.ID, tc.sqlstate)
+			status, body := w.post(t, w.app, false, nil)
+			laneEAssertInsertRejection(t, status, body, tc.status)
+			assert.Equal(t, tc.attempts, refused())
+			assert.Zero(t, laneECountMessages(t, w.app, w.target))
+			assert.Empty(t, w.capture.snapshot(), "no provider attempt")
+		})
+	}
+}
+
+// Q5 under RLS, with database-raised failures. A trigger error aborts the
+// savepoint, so "no row" would hold whatever the savepoint or Tenant code
+// did: these show the classification, the attempts and that nothing reached
+// the provider, not the rollback path. The rollback path is
+// TestLaneEForwardRLSGoLevelFailureRollsBack.
+func TestLaneEForwardRLSTriggerRejectionsAreClassified(t *testing.T) {
+	for _, tc := range laneEInsertRejections() {
+		t.Run(tc.name, func(t *testing.T) {
+			w := laneENewForwardWorld(t)
+			w.app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+			refused := laneERejectInserts(t, w.app.DB, "messages", "contact_id", w.target.ID, tc.sqlstate)
+			status, body := w.post(t, w.app, true, nil)
+			laneEAssertInsertRejection(t, status, body, tc.status)
+			assert.Equal(t, tc.attempts, refused())
+			assert.Zero(t, laneECountMessages(t, w.app, w.target), "no durable pending row")
+			assert.Empty(t, w.capture.snapshot(), "no provider attempt")
+		})
+	}
 }
 
 // Q5 under RLS, with a Go-level failure after the INSERT: the message and its
@@ -1306,13 +1370,21 @@ func TestLaneEForwardProcessExitAfterProviderAccepted(t *testing.T) {
 func TestLaneEForwardProcessPausedWorkerResumes(t *testing.T) {
 	x := laneENewExitWorld(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	paused := x.child(ctx, "pause-before-worker")
 	resume, err := paused.StdinPipe()
 	require.NoError(t, err)
 	var pausedOut strings.Builder
 	paused.Stdout, paused.Stderr = &pausedOut, &pausedOut
 	require.NoError(t, paused.Start())
+	// Unconditional, so a failed assertion below never leaks the child: the
+	// cancel kills it if it is still running, and Wait reaps it.
+	waited := false
+	t.Cleanup(func() {
+		cancel()
+		if !waited {
+			_ = paused.Wait()
+		}
+	})
 
 	var row models.Message
 	require.Eventually(t, func() bool {
@@ -1328,6 +1400,7 @@ func TestLaneEForwardProcessPausedWorkerResumes(t *testing.T) {
 	_, err = fmt.Fprintln(resume, "resume")
 	require.NoError(t, err)
 	waitErr := paused.Wait()
+	waited = true
 	require.Zero(t, laneEExitCode(t, waitErr, pausedOut.String()), pausedOut.String())
 	stored := x.targetForward(t)
 	assert.Equal(t, models.MessageStatusSent, stored.Status, stored.ErrorMessage)

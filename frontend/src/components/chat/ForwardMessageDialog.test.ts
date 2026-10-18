@@ -420,6 +420,48 @@ describe('forward capacity contract (client)', () => {
     expect(mocks.sendMessage).toHaveBeenCalledTimes(1)
   })
 
+  it.each(['close', 'reopen', 'unmount'] as const)(
+    'stops an old batch when the parent does a %s mid-run: no later target is sent, no timer is armed',
+    async (action) => {
+      vi.useFakeTimers()
+      try {
+        let releaseFirst!: (value: unknown) => void
+        mocks.sendMessage.mockImplementation((contactId: string) => {
+          if (contactId === '1') return new Promise(resolve => { releaseFirst = resolve })
+          return Promise.resolve({ id: `m-${contactId}`, status: 'pending' })
+        })
+        await openDialog()
+        await pick('1', '2')
+        await click('chat-forward-next')
+        await click('chat-forward-confirm')
+        expect(mocks.sendMessage.mock.calls.map(call => call[0])).toEqual(['1'])
+
+        const wrapper = mounted[mounted.length - 1]
+        if (action === 'unmount') {
+          wrapper.unmount()
+          mounted.pop()
+        } else {
+          await wrapper.setProps({ open: false })
+          if (action === 'reopen') await wrapper.setProps({ open: true })
+        }
+        await vi.advanceTimersByTimeAsync(0)
+
+        const timersBefore = vi.getTimerCount()
+        releaseFirst({ id: 'm-1', status: 'pending' })
+        await vi.advanceTimersByTimeAsync(0)
+        await vi.advanceTimersByTimeAsync(0)
+        expect(mocks.sendMessage.mock.calls.map(call => call[0])).toEqual(['1'])
+        expect(vi.getTimerCount()).toBe(timersBefore)
+        if (action === 'reopen') {
+          // The reopened dialog starts clean; the old run touched nothing in it.
+          expect(document.body.querySelector('[data-testid="chat-forward-results"]')).toBeNull()
+        }
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
   it('arms no timer for a retry that resolves after the dialog was closed', async () => {
     vi.useFakeTimers()
     try {
