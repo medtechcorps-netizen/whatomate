@@ -618,7 +618,9 @@ describe('ProtectedMessageMedia', () => {
 
   describe('a forwarded image whose media is still being copied', () => {
     const notFound = () => Object.assign(new Error('Request failed with status code 404'), { response: { status: 404 } })
-    const pendingImage = { ...imageMessage, status: 'pending' }
+    // As the live socket delivers a forward: outgoing and pending, with no
+    // forward marker (the socket payload carries none).
+    const pendingImage = { ...imageMessage, direction: 'outgoing' as const, status: 'pending' }
 
     beforeEach(() => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
@@ -634,7 +636,7 @@ describe('ProtectedMessageMedia', () => {
       await flushPromises()
     }
 
-    it('loads again by itself once the message moves on from pending, and shows the image', async () => {
+    it('loads again by itself once the message leaves pending, and shows the image', async () => {
       mocks.getMedia.mockRejectedValueOnce(notFound()).mockResolvedValueOnce(mediaResponse())
       const view = await mountLoaded({ message: pendingImage })
       expect(view.attributes('data-media-status')).toBe('error')
@@ -687,7 +689,59 @@ describe('ProtectedMessageMedia', () => {
       expect(view.attributes('data-media-status')).toBe('ready')
     })
 
-    it('notices a status change that lands while the first load is still failing', async () => {
+    it("keeps the failure, its alert and Retry's focus in place while it tries again", async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia
+        .mockRejectedValueOnce(notFound())
+        .mockReturnValueOnce(quietTry.promise)
+        .mockResolvedValueOnce(mediaResponse())
+      const view = mount(ProtectedMessageMedia, {
+        props: { organizationId: 'workspace-b', message: pendingImage },
+        attachTo: document.body,
+      })
+      wrappers.push(view)
+      await flushPromises()
+      const alert = view.get('[role="alert"]').element
+      const retryButton = view.get('[role="alert"] button').element as HTMLButtonElement
+      retryButton.focus()
+      expect(document.activeElement).toBe(retryButton)
+
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      // The try is running, yet the bubble shows no loading box: the alert is
+      // the same element (announced once) and Retry still has focus.
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(view.attributes('data-media-status')).toBe('error')
+      expect(view.attributes('aria-busy')).toBeUndefined()
+      expect(view.get('[role="alert"]').element).toBe(alert)
+      expect(document.activeElement).toBe(retryButton)
+
+      quietTry.reject(notFound())
+      await flushPromises()
+      expect(view.get('[role="alert"]').element).toBe(alert)
+      expect(document.activeElement).toBe(retryButton)
+
+      // The next try succeeds; focus moves from Retry to the image that replaced it.
+      await wait(5_000)
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(document.activeElement).toBe(view.get('button').element)
+    })
+
+    it('does not try again after a later decode error once the media has loaded', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockResolvedValueOnce(mediaResponse())
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(view.attributes('data-media-status')).toBe('ready')
+
+      await view.get('img').trigger('error')
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await wait(60_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(view.attributes('data-media-status')).toBe('error')
+    })
+
+    it('notices the message leaving pending while the first load is still failing', async () => {
       const first = deferred<ReturnType<typeof mediaResponse>>()
       mocks.getMedia.mockReturnValueOnce(first.promise).mockResolvedValueOnce(mediaResponse())
       const view = mountMedia({ message: pendingImage })
@@ -732,24 +786,37 @@ describe('ProtectedMessageMedia', () => {
       await wait(21_000)
       expect(mocks.getMedia).toHaveBeenCalledTimes(4)
 
-      // The server points the message at new media: one fresh load, then a
-      // fresh set of tries after the next status change.
-      await view.setProps({ message: { ...pendingImage, status: 'sent', media_url: 'organizations/workspace-b/messages/images/copy.jpg' } })
+      const copy = { ...pendingImage, media_url: 'organizations/workspace-b/messages/images/copy.jpg' }
+      await view.setProps({ message: copy })
       await flushPromises()
       expect(mocks.getMedia).toHaveBeenCalledTimes(5)
-      await view.setProps({
-        message: { ...pendingImage, status: 'delivered', media_url: 'organizations/workspace-b/messages/images/copy.jpg' },
-      })
+      await view.setProps({ message: { ...copy, status: 'sent' } })
       await wait(21_000)
       expect(mocks.getMedia).toHaveBeenCalledTimes(8)
+    })
+
+    it.each([
+      ['an incoming image', { ...imageMessage, direction: 'incoming' as const, status: 'received' }, 'read'],
+      ['an outgoing image that was already sent', { ...pendingImage, status: 'sent' }, 'delivered'],
+      ['a template header image', { ...pendingImage, message_type: 'template' }, 'sent'],
+    ])('leaves %s to Retry', async (_, message, nextStatus) => {
+      mocks.getMedia.mockRejectedValue(notFound())
+      const view = await mountLoaded({ message })
+      expect(view.attributes('data-media-status')).toBe('error')
+      await view.setProps({ message: { ...message, status: nextStatus } })
+      await wait(60_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(1)
     })
 
     it('leaves documents, video and audio to Retry, since they load only when asked', async () => {
       mocks.getMedia.mockRejectedValue(notFound())
       vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
-      const pendingDocument = { ...pendingImage, message_type: 'document', media_mime_type: 'application/pdf', media_filename: 'lab.pdf' }
-      const pendingVideo = { ...pendingImage, message_type: 'video', media_mime_type: 'video/mp4' }
-      for (const message of [pendingDocument, pendingVideo]) {
+      const kinds = [
+        { ...pendingImage, message_type: 'document', media_mime_type: 'application/pdf', media_filename: 'lab.pdf' },
+        { ...pendingImage, message_type: 'video', media_mime_type: 'video/mp4' },
+        { ...pendingImage, message_type: 'audio', media_mime_type: 'audio/ogg' },
+      ]
+      for (const message of kinds) {
         const view = mountMedia({ message })
         await view.get('button').trigger('click')
         await flushPromises()
@@ -758,7 +825,7 @@ describe('ProtectedMessageMedia', () => {
         await wait(30_000)
         expect(view.attributes('data-media-status')).toBe('error')
       }
-      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(3)
     })
 
     it('does not reload an image that failed to decode, whatever the status does', async () => {

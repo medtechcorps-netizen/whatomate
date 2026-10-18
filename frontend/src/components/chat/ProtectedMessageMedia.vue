@@ -23,7 +23,7 @@ const props = defineProps<{
   // Workspace the transcript was requested from; every request is pinned to it.
   organizationId: string
   message: Pick<Message, 'id' | 'message_type' | 'media_url' | 'media_mime_type' | 'media_filename' | 'content'> &
-    Partial<Pick<Message, 'status'>>
+    Partial<Pick<Message, 'status' | 'direction'>>
 }>()
 
 const { t } = useI18n()
@@ -46,18 +46,26 @@ let requestController: AbortController | null = null
 let releaseSlot: (() => void) | null = null
 let generation = 0
 
-// A forwarded message appears before the server has copied its media, so an
-// image in it can first answer 404. Once the message's status moves on (the
-// copy runs before the send), an image whose load failed loads again by
-// itself: at most once per wait below, then only by Retry. Each new media
-// gets a fresh budget. Only the media is fetched again; nothing here sends a
-// message. Other kinds load only when the agent asks, so they keep Retry.
+// A forwarded image is listed while its message is still pending, before the
+// server has copied the media (the copy runs before the send), so its first
+// load can answer 404. When that message leaves pending, the image loads
+// again by itself: at most once per wait below, then only by Retry, and each
+// new media gets a fresh budget. Only the media is fetched again; nothing
+// here sends a message. The tries keep the failure on screen until one
+// succeeds, so Retry keeps its focus and the alert is announced once.
+//
+// This applies only to an outgoing image whose load failed while pending.
+// Other media is stored before its message exists, and incoming messages are
+// never pending. The forward marker itself is not checked: the live socket
+// copy of a new message carries no metadata or is_forwarded, so other agents'
+// screens could not see it.
 const AUTO_RELOAD_WAITS = [1_000, 5_000, 15_000]
 let autoReloadTimer: ReturnType<typeof setTimeout> | null = null
 let autoReloadsUsed = 0
 let autoReloadEpoch = 0
-// The message status when the last failed load started, if one failed.
-let failedAtStatus: string | undefined
+// The last load failed while the message was pending; cleared by any success.
+let failedWhilePending = false
+const root = ref<HTMLElement | null>(null)
 
 const kind = computed<ChatMediaKind>(() => {
   const { message_type: type, media_mime_type: mimeType } = props.message
@@ -127,7 +135,8 @@ function releaseMedia() {
   documentPreview.value = null
 }
 
-async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<string> {
+// A quiet load leaves the failure on screen until it succeeds.
+async function loadMedia(options: { userInitiated?: boolean; quiet?: boolean } = {}): Promise<string> {
   releaseMedia()
   const requestGeneration = generation
   const organizationId = props.organizationId.trim()
@@ -139,8 +148,8 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
     return ''
   }
 
-  status.value = 'loading'
-  const startedAtStatus = props.message.status
+  if (!options.quiet) status.value = 'loading'
+  const startedPending = props.message.status === 'pending'
   const controller = new AbortController()
   requestController = controller
   let slot: (() => void) | null = null
@@ -171,11 +180,12 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
     if (previewType === 'image/jpeg' || previewType === 'image/png') {
       previewImageURL.value = URL.createObjectURL(new Blob([blob], { type: previewType }))
     }
+    failedWhilePending = false
     status.value = 'ready'
     return mediaURL.value
   } catch {
     if (requestGeneration === generation) {
-      failedAtStatus = startedAtStatus
+      failedWhilePending = startedPending
       status.value = 'error'
     }
     return ''
@@ -222,21 +232,34 @@ function cancelAutoReload() {
 }
 
 function scheduleAutoReload() {
-  if (autoReloadTimer || autoReloadsUsed >= AUTO_RELOAD_WAITS.length) return
-  if (!loadsAutomatically.value || status.value !== 'error') return
+  if (autoReloadTimer || autoReloadsUsed >= AUTO_RELOAD_WAITS.length || status.value !== 'error') return
   const epoch = autoReloadEpoch
   autoReloadTimer = setTimeout(async () => {
     autoReloadTimer = null
-    const url = await loadMedia()
-    // Media still missing waits longer before the next try.
-    if (!url && epoch === autoReloadEpoch) scheduleAutoReload()
+    const focused = !!root.value?.contains(document.activeElement)
+    const url = await loadMedia({ quiet: true })
+    if (epoch !== autoReloadEpoch) return
+    if (!url) {
+      // Media still missing waits longer before the next try.
+      scheduleAutoReload()
+      return
+    }
+    // Focus that was on Retry moves to the image that replaced it.
+    if (focused) {
+      await nextTick()
+      root.value?.querySelector<HTMLElement>('button')?.focus()
+    }
   }, AUTO_RELOAD_WAITS[autoReloadsUsed++])
 }
 
-// A status that differs from the one a failed load started at, including a
-// change that landed while that load was still running.
+const reloadsWhenSent = computed(() => props.message.message_type === 'image' && props.message.direction === 'outgoing')
+
+// The message has left pending, including a change that landed while the
+// failing load was still running.
 watch([() => props.message.status, status], ([messageStatus, mediaStatus]) => {
-  if (mediaStatus === 'error' && failedAtStatus !== undefined && messageStatus !== failedAtStatus) scheduleAutoReload()
+  if (mediaStatus === 'error' && failedWhilePending && reloadsWhenSent.value && messageStatus !== 'pending') {
+    scheduleAutoReload()
+  }
 })
 
 function retry() {
@@ -273,7 +296,7 @@ watch(
   () => {
     cancelAutoReload()
     autoReloadsUsed = 0
-    failedAtStatus = undefined
+    failedWhilePending = false
     releaseMedia()
     status.value = 'idle'
     if (loadsAutomatically.value) void loadMedia()
@@ -291,6 +314,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div
+    ref="root"
     class="mb-2"
     data-testid="chat-message-media"
     :data-media-kind="kind"
