@@ -138,6 +138,33 @@ export interface UseChatAttachmentsOptions {
   session?: {
     userId: () => string | number | null | undefined
     isAuthenticated: () => boolean
+    /**
+     * The workspace requests go to (selected organization / token
+     * organization). A batch never continues into a different workspace.
+     */
+    workspace?: () => string | null | undefined
+    /** A marker that changes on every login/logout (see LOGICAL_SESSION_STORAGE_KEY). */
+    logicalSession?: () => string | null | undefined
+  }
+  /**
+   * Holds workspace switching while a batch is sending (the coordinated
+   * boundary); returns the release function.
+   */
+  holdWorkspace?: (recipient: string) => () => void
+}
+
+/**
+ * Logical session marker kept by the auth layer (lane A); it changes only on
+ * login, registration, logout or expiry. Absent on builds without it: the
+ * batch then relies on the user/workspace checks and fails closed on change.
+ */
+export const LOGICAL_SESSION_STORAGE_KEY = 'whm_session_id'
+
+export function readLogicalSessionMarker(): string | null {
+  try {
+    return localStorage.getItem(LOGICAL_SESSION_STORAGE_KEY)
+  } catch {
+    return null
   }
 }
 
@@ -155,6 +182,23 @@ export const SESSION_ENDING_EVENT = 'rereply:session-ending'
 export const MEDIA_SETTLE_TIMEOUT_MS = 10_000
 /** No answer this long after the body uploaded: give up and mark the file unconfirmed. */
 export const MEDIA_RESPONSE_DEADLINE_MS = 120_000
+
+/** Gateway answers that say nothing about whether the app processed the request. */
+const AMBIGUOUS_GATEWAY_STATUSES = new Set([502, 503, 504, 524])
+
+/**
+ * After the whole body reached the server, a missing answer (network error)
+ * or a gateway 502/503/504/524 without the app's own error envelope does not
+ * tell whether the file was sent. Retrying could send it to the patient twice.
+ */
+export function isAmbiguousAfterUpload(error: unknown): boolean {
+  const response = (error as { response?: { status?: number; data?: unknown } } | null)?.response
+  if (!response) return true
+  if (!AMBIGUOUS_GATEWAY_STATUSES.has(response.status ?? 0)) return false
+  const data = response.data as { status?: unknown; message?: unknown } | null | undefined
+  const appRefusal = !!data && typeof data === 'object' && data.status === 'error' && typeof data.message === 'string'
+  return !appRefusal
+}
 const STATUS_LOG_LIMIT = 500
 
 const defaultSend: SendChatMedia = async (request, options) => {
@@ -211,6 +255,9 @@ interface ActiveBatch {
   target: ChatAttachmentTarget
   /** The user who confirmed the batch. */
   userId: string | null
+  /** The workspace and logical session the batch was confirmed in. */
+  workspace: string | null
+  logicalSession: string | null
   /** The session ended or changed: abort everything and report nothing. */
   terminated: boolean
   controller: AbortController | null
@@ -238,15 +285,35 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   const responseDeadlineMs = options.responseDeadlineMs ?? MEDIA_RESPONSE_DEADLINE_MS
   const session = options.session
 
-  function currentUserId(): string | null {
-    const id = session?.userId()
-    return id === null || id === undefined || id === '' ? null : String(id)
+  function normalizeIdentity(value: string | number | null | undefined): string | null {
+    return value === null || value === undefined || value === '' ? null : String(value)
   }
 
-  /** True while the user who confirmed the batch is still the one signed in. */
+  function currentUserId(): string | null {
+    return normalizeIdentity(session?.userId())
+  }
+
+  function currentWorkspace(): string | null {
+    return normalizeIdentity(session?.workspace?.())
+  }
+
+  function currentLogicalSession(): string | null {
+    return normalizeIdentity(session?.logicalSession?.())
+  }
+
+  /**
+   * True while the batch's user, workspace and logical session are all still
+   * the current ones. Any change (sign-out, another user, a workspace switch
+   * in this or another tab, a new login) ends the batch: fail closed.
+   */
   function sessionIsCurrent(batch: ActiveBatch): boolean {
     if (!session) return true
-    return session.isAuthenticated() && currentUserId() === batch.userId
+    return (
+      session.isAuthenticated() &&
+      currentUserId() === batch.userId &&
+      currentWorkspace() === batch.workspace &&
+      currentLogicalSession() === batch.logicalSession
+    )
   }
   const items = ref<StagedAttachment[]>([])
   const isOpen = ref(false)
@@ -403,6 +470,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     const batch: ActiveBatch = {
       target,
       userId: currentUserId(),
+      workspace: currentWorkspace(),
+      logicalSession: currentLogicalSession(),
       terminated: false,
       controller: null,
       uploadComplete: false,
@@ -455,9 +524,14 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     const hasWindow = typeof window !== 'undefined'
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
       // Closing or reloading the tab would cut off the files still queued.
-      // Never prompt once the session is over: an idle or remote sign-out
-      // must be able to leave the page without a dialog over patient data.
-      if (batch.terminated || !sessionIsCurrent(batch)) return
+      // Never prompt once the session or workspace changed: an idle/remote
+      // sign-out or a workspace switch must reload without a dialog, and a
+      // cancelled reload must not leave the batch running in the new identity.
+      if (batch.terminated) return
+      if (!sessionIsCurrent(batch)) {
+        onSessionEnding()
+        return
+      }
       event.preventDefault()
       event.returnValue = ''
     }
@@ -476,9 +550,21 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
       terminate()
       reset()
     }
+    // Another tab switched workspace or signed in/out: localStorage changed.
+    const onStorage = () => {
+      if (!batch.terminated && !sessionIsCurrent(batch)) onSessionEnding()
+    }
     if (hasWindow) {
       window.addEventListener('beforeunload', onBeforeUnload)
       window.addEventListener(SESSION_ENDING_EVENT, onSessionEnding)
+      window.addEventListener('storage', onStorage)
+    }
+    let releaseWorkspace: (() => void) | null = null
+    try {
+      releaseWorkspace = options.holdWorkspace?.(batch.target.label ?? '') ?? null
+    } catch {
+      // The fail-closed identity checks still guard the batch.
+      releaseWorkspace = null
     }
     // Also follow the auth state directly, independent of the event's timing.
     // A detached scope: the batch may outlive the component that started it.
@@ -494,7 +580,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
 
     try {
       for (const [index, item] of queue.entries()) {
-        if (!sessionIsCurrent(batch)) terminate()
+        if (!batch.terminated && !sessionIsCurrent(batch)) onSessionEnding()
         if (batch.stopRequested) break
         if (!item.validation.ok) continue
         const isLast = index === queue.length - 1
@@ -571,6 +657,11 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
             // session. Upload progress lags the network, so the server may
             // already have the file: never claim it was not sent.
             item.status = 'unconfirmed'
+          } else if (batch.uploadComplete && isAmbiguousAfterUpload(error)) {
+            // The whole file reached the server and the answer was lost
+            // (network error, gateway 502/503/504/524): it may have been
+            // sent, so it is not offered for an automatic retry.
+            item.status = 'unconfirmed'
           } else {
             item.status = 'failed'
             item.errorMessage = getErrorMessage(error, '') || null
@@ -584,7 +675,15 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
       unsubscribe?.()
       sessionWatch?.stop()
       removeUnloadPrompt()
-      if (hasWindow) window.removeEventListener(SESSION_ENDING_EVENT, onSessionEnding)
+      if (hasWindow) {
+        window.removeEventListener(SESSION_ENDING_EVENT, onSessionEnding)
+        window.removeEventListener('storage', onStorage)
+      }
+      try {
+        releaseWorkspace?.()
+      } catch {
+        // Nothing to release.
+      }
       activeBatch = null
       isSending.value = false
       isStopping.value = false

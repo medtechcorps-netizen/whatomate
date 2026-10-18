@@ -4,6 +4,7 @@ import { effectScope, nextTick, reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   SESSION_ENDING_EVENT,
+  isAmbiguousAfterUpload,
   messageStatusFromRealtimeEvent,
   useChatAttachments,
   type RealtimeActivity,
@@ -824,5 +825,268 @@ describe('useChatAttachments deadlines and the last file', () => {
     calls[0].result.resolve({ id: 'm1', status: 'pending' })
     await done
     expect(attachments.items.value[0]).toMatchObject({ status: 'failed', errorMessage: 'Rejected' })
+  })
+})
+
+describe('useChatAttachments workspace and session binding', () => {
+  // Reactive identity: a same-tab change through the stores.
+  function reactiveIdentity(marker: string | null = 'session-1') {
+    const ws = reactive({ workspace: 'org-1', marker })
+    return {
+      ws,
+      session: {
+        userId: () => 'agent-1',
+        isAuthenticated: () => true,
+        workspace: () => ws.workspace,
+        logicalSession: () => ws.marker,
+      },
+    }
+  }
+
+  // Plain identity: localStorage written without any reactive store.
+  function plainIdentity() {
+    const ws = { workspace: 'org-1', marker: 'session-1' as string | null }
+    return {
+      ws,
+      session: {
+        userId: () => 'agent-1',
+        isAuthenticated: () => true,
+        workspace: () => ws.workspace,
+        logicalSession: () => ws.marker,
+      },
+    }
+  }
+
+  function expectStopped(
+    attachments: ReturnType<typeof setup>['attachments'],
+    onBatchFinished: ReturnType<typeof vi.fn>,
+  ) {
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.isSending.value).toBe(false)
+    expect(attachments.items.value).toHaveLength(0)
+    expect(attachments.isOpen.value).toBe(false)
+  }
+
+  it('stops queued work when the workspace changes during pacing', async () => {
+    const live = realtime()
+    const { ws, session } = reactiveIdentity()
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session, subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    expect(onSent).toHaveBeenCalledTimes(1)
+    // Same user switches workspace while file 1 is still pending at the provider.
+    ws.workspace = 'org-2'
+    await nextTick()
+    await done
+    expect(calls).toHaveLength(1)
+    expectStopped(attachments, onBatchFinished)
+  })
+
+  it('aborts an upload in flight when the workspace changes, and never resends it', async () => {
+    const { ws, session } = reactiveIdentity()
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(40, 100)
+    ws.workspace = 'org-2'
+    await nextTick()
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expectStopped(attachments, onBatchFinished)
+  })
+
+  it('lets a workspace-switch reload go through: no prompt, and nothing continues if it is cancelled', async () => {
+    const { ws, session } = plainIdentity()
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    // The switcher writes the new organization, then reloads.
+    ws.workspace = 'org-2'
+    const unload = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(unload)
+    expect(unload.defaultPrevented).toBe(false)
+    expect(calls[0].signal.aborted).toBe(true)
+    // Had the reload been cancelled, the batch is already over.
+    await done
+    expect(calls).toHaveLength(1)
+    expectStopped(attachments, onBatchFinished)
+    const again = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(again)
+    expect(again.defaultPrevented).toBe(false)
+  })
+
+  it('stops when another tab selects a different organization', async () => {
+    const { ws, session } = plainIdentity()
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    ws.workspace = 'org-2'
+    window.dispatchEvent(new Event('storage'))
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expectStopped(attachments, onBatchFinished)
+  })
+
+  it('stops when the same user signs in again (new logical session)', async () => {
+    const { ws, session } = plainIdentity()
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    ws.marker = 'session-2'
+    window.dispatchEvent(new Event('storage'))
+    await done
+    expect(calls).toHaveLength(1)
+    expectStopped(attachments, onBatchFinished)
+  })
+
+  it('checks identity before each dispatch even without any event', async () => {
+    const { ws, session } = plainIdentity()
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    ws.workspace = 'org-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    // File 1 was accepted (in the old workspace) but nothing is added to the
+    // new one, file 2 is never dispatched and no summary appears.
+    expect(onSent).not.toHaveBeenCalled()
+    expect(calls).toHaveLength(1)
+    expectStopped(attachments, onBatchFinished)
+  })
+
+  it('keeps sending across ordinary chat navigation in the same workspace', async () => {
+    const { session } = reactiveIdentity()
+    const { attachments, calls, state, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    state.contactId = 'contact-b'
+    attachments.reset()
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(calls).toHaveLength(2)
+    expect(calls[1].request.contact_id).toBe('contact-a')
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 2, detached: true }))
+  })
+
+  it('works without the logical-session marker and fails closed when it appears', async () => {
+    const { ws, session } = reactiveIdentity(null)
+    const first = setup({ session })
+    first.attachments.stage([file('a.png', 'image/png')])
+    const done = first.attachments.sendAll()
+    await settle()
+    first.calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(first.onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 1 }))
+
+    first.attachments.stage([file('b.png', 'image/png'), file('c.png', 'image/png')])
+    const second = first.attachments.sendAll()
+    await settle()
+    ws.marker = 'session-9'
+    await nextTick()
+    await second
+    expect(first.calls).toHaveLength(2)
+  })
+
+  it('holds workspace switching for the whole batch and releases it at the end', async () => {
+    const release = vi.fn()
+    const holdWorkspace = vi.fn(() => release)
+    const { attachments, calls } = setup({ holdWorkspace })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(holdWorkspace).toHaveBeenCalledWith('Patient contact-a')
+    expect(release).not.toHaveBeenCalled()
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(release).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases the workspace hold when the session ends', async () => {
+    const release = vi.fn()
+    const { attachments } = setup({ holdWorkspace: () => release })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    window.dispatchEvent(new CustomEvent(SESSION_ENDING_EVENT))
+    await done
+    expect(release).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('useChatAttachments ambiguous failure after upload (FU-12)', () => {
+  function httpError(status: number, data?: unknown) {
+    return Object.assign(new Error(`Request failed with status code ${status}`), { response: { status, data } })
+  }
+
+  it('marks a 504 after the full upload unconfirmed and does not offer a retry', async () => {
+    const { attachments, calls, onBatchFinished } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(100, 100)
+    calls[0].result.reject(httpError(504, '<html>Gateway Timeout</html>'))
+    await done
+    expect(attachments.items.value[0].status).toBe('unconfirmed')
+    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ failed: 0, unconfirmed: 1 }))
+    expect(await attachments.retryFailed()).toBeNull()
+    expect(calls).toHaveLength(1)
+  })
+
+  it('treats a lost connection after the full upload as unconfirmed', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(100, 100)
+    calls[0].result.reject(Object.assign(new Error('Network Error'), { code: 'ERR_NETWORK' }))
+    await done
+    expect(attachments.items.value[0].status).toBe('unconfirmed')
+  })
+
+  it('keeps definite refusals as failed: 4xx, and a 5xx carrying the app error envelope', async () => {
+    for (const error of [httpError(400, { status: 'error', message: 'Invalid multipart form' }), httpError(503, { status: 'error', message: 'Failed to send message' })]) {
+      const { attachments, calls } = setup()
+      attachments.stage([file('a.png', 'image/png')])
+      const done = attachments.sendAll()
+      await settle()
+      calls[0].progress(100, 100)
+      calls[0].result.reject(error)
+      await done
+      expect(attachments.items.value[0].status).toBe('failed')
+    }
+  })
+
+  it('keeps a 5xx before the upload completed as failed', async () => {
+    const { attachments, calls } = setup()
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(50, 100)
+    calls[0].result.reject(httpError(503))
+    await done
+    expect(attachments.items.value[0].status).toBe('failed')
+  })
+
+  it('classifies errors with isAmbiguousAfterUpload', () => {
+    expect(isAmbiguousAfterUpload(httpError(502))).toBe(true)
+    expect(isAmbiguousAfterUpload(httpError(524, 'origin timeout'))).toBe(true)
+    expect(isAmbiguousAfterUpload(new Error('Network Error'))).toBe(true)
+    expect(isAmbiguousAfterUpload(httpError(500))).toBe(false)
+    expect(isAmbiguousAfterUpload(httpError(404))).toBe(false)
+    expect(isAmbiguousAfterUpload(httpError(503, { status: 'error', message: 'Failed' }))).toBe(false)
   })
 })

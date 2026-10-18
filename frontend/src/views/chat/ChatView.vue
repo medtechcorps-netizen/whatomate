@@ -120,7 +120,8 @@ import MediaSendDialog from '@/components/chat/MediaSendDialog.vue'
 import ComposerFormatToolbar from '@/components/chat/ComposerFormatToolbar.vue'
 import WhatsAppText from '@/components/chat/WhatsAppText.vue'
 import ChatDropZoneOverlay from '@/components/chat/ChatDropZoneOverlay.vue'
-import { useChatAttachments } from '@/composables/useChatAttachments'
+import { readLogicalSessionMarker, useChatAttachments } from '@/composables/useChatAttachments'
+import { readSelectedOrganizationId } from '@/lib/browserIdentity'
 import { useComposerFormatting } from '@/composables/useComposerFormatting'
 import { CHAT_ATTACHMENT_ACCEPT, filesFromClipboard, summarizeFileNames } from '@/lib/chatAttachments'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
@@ -266,6 +267,20 @@ const chatAttachments = useChatAttachments({
   session: {
     userId: () => authStore.user?.id ?? null,
     isAuthenticated: () => authStore.isAuthenticated,
+    // Requests carry the selected organization, or the token's: any change,
+    // in this tab or another, ends the batch instead of re-scoping it.
+    workspace: () => [
+      readSelectedOrganizationId() ?? '',
+      organizationsStore.selectedOrgId ?? '',
+      authStore.user?.organization_id ?? '',
+    ].join('|'),
+    logicalSession: readLogicalSessionMarker,
+  },
+  // Coordinated boundary: the workspace switcher refuses while files are sending.
+  holdWorkspace: recipient => {
+    const owner = 'chat-media-batch'
+    organizationsStore.blockOrganizationSwitch(owner, t('chat.composer.workspaceSwitchBlocked', { name: recipient }))
+    return () => organizationsStore.unblockOrganizationSwitch(owner)
   },
   onSent: message => {
     // addMessage dedupes against the WebSocket echo.

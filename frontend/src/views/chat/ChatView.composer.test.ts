@@ -26,6 +26,8 @@ const mocks = vi.hoisted(() => ({
   toastError: vi.fn(),
   convertImageToJpeg: vi.fn(),
   t: vi.fn((key: string) => key),
+  blockOrganizationSwitch: vi.fn(),
+  unblockOrganizationSwitch: vi.fn(),
   realtimeListeners: new Set<(event: { type?: string; payload?: any }) => void>(),
 }))
 
@@ -126,7 +128,13 @@ vi.mock('@/stores/auth', () => ({
   }),
 }))
 vi.mock('@/stores/omnichannelUnread', () => ({ useOmnichannelUnreadStore: () => ({ refresh: vi.fn() }) }))
-vi.mock('@/stores/organizations', () => ({ useOrganizationsStore: () => ({ selectedOrgId: null }) }))
+vi.mock('@/stores/organizations', () => ({
+  useOrganizationsStore: () => ({
+    selectedOrgId: null,
+    blockOrganizationSwitch: mocks.blockOrganizationSwitch,
+    unblockOrganizationSwitch: mocks.unblockOrganizationSwitch,
+  }),
+}))
 vi.mock('@/stores/users', () => ({ useUsersStore: () => ({ users: [], fetchUsers: vi.fn(async () => undefined) }) }))
 vi.mock('@/stores/transfers', () => ({
   useTransfersStore: () => ({
@@ -677,6 +685,52 @@ describe('ChatView composer', () => {
     await flushPromises()
     expect(mocks.t).toHaveBeenCalledWith('chat.composer.batchReportUnconfirmedMany', { files: 'a.png, b.png' })
     expect(mocks.toastWarning).toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+  })
+
+  it('blocks workspace switching while files are sending', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png'])
+    expect(mocks.blockOrganizationSwitch).toHaveBeenCalledWith('chat-media-batch', 'chat.composer.workspaceSwitchBlocked')
+    expect(mocks.t).toHaveBeenCalledWith('chat.composer.workspaceSwitchBlocked', { name: 'Patient first' })
+    expect(mocks.unblockOrganizationSwitch).not.toHaveBeenCalled()
+    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.unblockOrganizationSwitch).toHaveBeenCalledWith('chat-media-batch')
+  })
+
+  it('stops the batch and shows nothing when another tab switches organization', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png', 'b.png'])
+    localStorage.setItem('selected_organization_id', 'org-elsewhere')
+    window.dispatchEvent(new Event('storage'))
+    expect(calls[0].signal.aborted).toBe(true)
+    await flushPromises()
+    expect(calls).toHaveLength(1)
+    expect(wrapper.findComponent(MediaSendDialog).props('open')).toBe(false)
+    expect(mocks.toastWarning).not.toHaveBeenCalled()
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    expect(mocks.unblockOrganizationSwitch).toHaveBeenCalledWith('chat-media-batch')
+    localStorage.removeItem('selected_organization_id')
+  })
+
+  it('reports a gateway timeout after the full upload as may-have-been-sent, in a warning', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['scan.png'])
+    calls[0].progress(10, 10)
+    calls[0].reject(Object.assign(new Error('Request failed with status code 504'), { response: { status: 504, data: '' } }))
+    await flushPromises()
+    expect(wrapper.findComponent(MediaSendDialog).props('items')[0].status).toBe('unconfirmed')
+    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.batchReportWithUnconfirmed', {
+      description: 'chat.composer.batchReportUnconfirmedOne',
+    })
     expect(mocks.toastError).not.toHaveBeenCalled()
   })
 })
