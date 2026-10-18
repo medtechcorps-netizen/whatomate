@@ -194,8 +194,8 @@ func (g *inboundContinuationAdmission) acquireIntake(ctx context.Context, stop <
 }
 
 func (g *inboundContinuationAdmission) acquireScopedClass(ctx context.Context, stop <-chan struct{}, weight, priority int, maxOpen func() int, organization string, mode int, intake bool) (func(), error) {
-	if weight != 1 && weight != 3 && !(weight == 2 && organization != "" &&
-		mode == inboundContinuationReader && priority == inboundContinuationApplyPriority && !intake) {
+	if weight != 1 && weight != 3 && (weight != 2 || organization == "" ||
+		mode != inboundContinuationReader || priority != inboundContinuationApplyPriority || intake) {
 		return nil, errors.New("inbound continuation admission weight is invalid for its phase")
 	}
 	if priority < inboundContinuationApplyPriority || priority > inboundContinuationFreshPriority || maxOpen == nil {
