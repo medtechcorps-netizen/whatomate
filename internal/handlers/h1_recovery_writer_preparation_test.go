@@ -55,8 +55,12 @@ func TestH1RecoveryPreparation_InitialWriterYieldsBeforeModelAndRenewsClaim(t *t
 		t.Run(route, func(t *testing.T) {
 			f := h1CapacityLegacy(t, 1)
 			h1RecoveryOnlyFixtureOrganization(t, f)
+			var hintFailures *atomic.Int32
 			if route == "new-session" {
 				h1ReaderPreparationRemoveSeed(t, f)
+				// Keep this original Writer ownership/heartbeat witness on the
+				// conservative route by failing only its optional recovery query.
+				hintFailures = h1RecoveryHintFailSQL(t, f.app)
 			}
 			work := f.works[0]
 			g := &f.app.continuationAdmission
@@ -120,6 +124,9 @@ func TestH1RecoveryPreparation_InitialWriterYieldsBeforeModelAndRenewsClaim(t *t
 					"both session routes must use the writer already acquired before the durable claim")
 			case <-time.After(5 * time.Second):
 				t.Fatal("recovery did not reach session preparation without reacquiring its own writer")
+			}
+			if hintFailures != nil {
+				require.EqualValues(t, 1, hintFailures.Load(), "the optional recovery SQL failure must actually select original Writer preparation")
 			}
 			apply := h1OrgAcquireAsync(t, g, context.Background(), nil, 2, inboundContinuationApplyPriority,
 				func() int { return 10 }, work.OrganizationID.String(), inboundContinuationReader)

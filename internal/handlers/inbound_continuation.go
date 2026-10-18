@@ -246,7 +246,13 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 			if remaining <= 0 || ctx.Err() != nil {
 				break
 			}
-			release, preparationMode, admitErr := p.acquirePreparationCapacity(ctx, organizationID, inboundContinuationWriter)
+			mode, hintErr := p.hintInboundRecoveryPreparationMode(ctx, organizationID)
+			if hintErr != nil {
+				runErrors = append(runErrors, hintErr)
+				remaining = 0
+				break
+			}
+			release, preparationMode, admitErr := p.acquirePreparationCapacity(ctx, organizationID, mode)
 			if admitErr != nil {
 				runErrors = append(runErrors, admitErr)
 				remaining = 0
@@ -341,10 +347,10 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 	return worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode)
 }
 
-// Recovery preparation owns Writer1 from before the claim through preparation;
-// the fast path uses an advisory hint, with Reader1 and writer fallback otherwise.
-// Both release preparation before ordinary model admission unless the fast path
-// can safely retain its reader. Custom callbacks retain generic admission.
+// Recovery preparation defaults to Writer1; an advisory negative session hint
+// can request Reader1. The fast path retains its separate advisory mode choice.
+// Both release preparation before ordinary model admission unless the actual
+// reader can safely be retained. Custom callbacks retain generic admission.
 // RunOnce still enqueues tenants serially and claims at most one bounded batch.
 func (p *InboundContinuationProcessor) acquirePreparationCapacity(ctx context.Context, organizationID uuid.UUID, mode int) (func(), int, error) {
 	if p.process != nil || !p.app.rlsEnabled() {

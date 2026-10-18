@@ -167,6 +167,84 @@ func (p *InboundContinuationProcessor) hintInboundContinuationPreparationMode(ct
 	return inboundContinuationWriter, nil
 }
 
+// hintInboundRecoveryPreparationMode observes only a scheduling opportunity.
+// It checks the first eligible job before message/session qualification, without
+// reserving it. Unknown observations retain recovery's original Writer1 route;
+// claim and preparation remain authoritative even when Reader1 is requested.
+func (p *InboundContinuationProcessor) hintInboundRecoveryPreparationMode(ctx context.Context, organizationID uuid.UUID) (int, error) {
+	if p.process != nil || !p.app.rlsEnabled() {
+		return inboundContinuationWriter, nil
+	}
+	root := p.app.rootApp()
+	pool, err := root.DB.DB()
+	if err != nil || pool == nil {
+		return inboundContinuationWriter, nil
+	}
+	maximum := pool.Stats().MaxOpenConnections
+	if maximum < 0 || (maximum > 0 && maximum < 3) {
+		return inboundContinuationWriter, nil
+	}
+	hintCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	release, err := p.app.acquireInboundContinuationCapacity(hintCtx, p.stopCh, 1)
+	if err != nil {
+		if waitErr := inboundContinuationAdmissionWaitError(ctx, p.stopCh); waitErr != nil {
+			return inboundContinuationWriter, waitErr
+		}
+		return inboundContinuationWriter, nil
+	}
+	var readerCompatible bool
+	hintErr := func() error {
+		defer release()
+		return database.WithTenantReadCommitted(root.DB.WithContext(hintCtx), organizationID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+				return err
+			}
+			now := p.now().UTC()
+			staleBefore := now.Add(-p.lease)
+			return tx.Raw(`SELECT EXISTS (
+				SELECT 1 FROM (
+					SELECT j.organization_id, j.aggregate_id
+					FROM scheduled_jobs AS j
+					WHERE j.organization_id = ? AND j.kind = ? AND j.run_at <= ?
+					  AND j.attempts < j.max_attempts
+					  AND (j.status = ? OR (j.status = ? AND (j.locked_at IS NULL OR j.locked_at < ?)))
+					  AND j.deleted_at IS NULL
+					ORDER BY j.run_at, j.created_at, j.id
+					LIMIT 1
+				) AS candidate
+				JOIN messages AS m
+				  ON m.organization_id = candidate.organization_id AND m.id = candidate.aggregate_id
+				JOIN contacts AS c
+				  ON c.id = m.contact_id AND c.organization_id = m.organization_id
+				WHERE m.organization_id = ? AND m.direction = ? AND m.deleted_at IS NULL
+				  AND m.contact_id IS NOT NULL AND m.contact_id <> ?
+				  AND c.deleted_at IS NULL AND c.merged_into_id IS NULL
+				  AND BTRIM(m.whats_app_account) <> ''
+				  AND NOT EXISTS (
+					SELECT 1 FROM chatbot_sessions AS s
+					WHERE s.organization_id = ? AND s.organization_id = m.organization_id
+					  AND s.contact_id = m.contact_id AND s.whats_app_account = m.whats_app_account
+					  AND s.status = ? AND s.deleted_at IS NULL
+				  )
+			)`, organizationID, inboundContinuationJobKind, now, models.ScheduledJobStatusPending,
+				models.ScheduledJobStatusProcessing, staleBefore, organizationID, models.DirectionIncoming,
+				uuid.Nil, organizationID, models.SessionStatusActive).Scan(&readerCompatible).Error
+		})
+	}()
+	if err := inboundContinuationAdmissionWaitError(ctx, p.stopCh); err != nil {
+		return inboundContinuationWriter, err
+	}
+	if hintErr != nil || !readerCompatible {
+		return inboundContinuationWriter, nil
+	}
+	maximum = pool.Stats().MaxOpenConnections
+	if maximum < 0 || (maximum > 0 && maximum < 3) {
+		return inboundContinuationWriter, nil
+	}
+	return inboundContinuationReader, nil
+}
+
 // Discovery and the scoped writer wait share the original ingress admission
 // deadline. Discovery owns one globally accounted credit, releases it and its
 // query fully, then queues for the atomic organization+credit grant. The caller
