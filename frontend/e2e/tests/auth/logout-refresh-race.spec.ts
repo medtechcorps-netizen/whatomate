@@ -14,8 +14,11 @@ import { loginAsAdmin, logout, TEST_USERS, type TestUser } from '../../helpers'
 // Negative controls: against 3d086ef5 (before R1-AUTH-1) the ordering
 // assertions here fail (the revoke and logout go out before the refresh
 // lands, and the late Set-Cookie signs the browser back in). Against 04344c17
-// the 7 s case fails: the revoke was only raced, not aborted, so its late
-// answer cleared the next session's cookies.
+// the 7 s case fails: that build only raced the revoke against the budget, so
+// the pending attempt was never aborted; its held answer (which revokes and
+// clears the cookies) lands after B has signed in and clears B's cookies, and
+// the jar and /me checks fail. A build without the budget abort never fails
+// the attempt at all (it gets its answer at ~7.5 s).
 
 type Held = {
   started: Promise<void>
@@ -299,6 +302,7 @@ test.describe('Logout during a token refresh', () => {
     const isRevoke = (request: { url(): string; postData(): string | null }) =>
       request.url().endsWith('/api/auth/refresh') && (request.postData() ?? '').includes('"revoke"')
     let attempts = 0
+    let firstAttemptAt = 0
     let lastAttempt: unknown = null
     let lastAttemptFailedAt = 0
     let loginSentAt = 0
@@ -308,10 +312,10 @@ test.describe('Logout during a token refresh', () => {
     page.on('request', (request) => {
       if (request.url().endsWith('/api/auth/login') && !loginSentAt) loginSentAt = Date.now()
     })
-    // Attempts 1 and 2 are rate-limited, each answer arriving after 1 s, so
-    // attempt 3 goes out at ~5 s (its own 5 s timeout would fire at ~10 s).
-    // It reaches the real server (which revokes and clears the cookies in its
-    // answer), but that answer is held for 9 s: only the 7 s budget can end it.
+    // Attempts 1 and 2 are rate-limited, so attempt 3 goes out at ~3 s (from
+    // attempt 1). It reaches the real server, which revokes and clears the
+    // cookies in its answer; that answer is held for 4.5 s, to land at ~7.5 s:
+    // after the 7 s budget, before the attempt's own 5 s timeout (~8 s).
     await page.route('**/api/auth/refresh', async (route) => {
       const request = route.request()
       if (!isRevoke(request)) {
@@ -319,8 +323,8 @@ test.describe('Logout during a token refresh', () => {
         return
       }
       attempts++
+      if (attempts === 1) firstAttemptAt = Date.now()
       if (attempts <= 2) {
-        await new Promise((resolve) => setTimeout(resolve, 1_000))
         await route.fulfill({ status: 429, json: { status: 'error', message: 'Too many requests' } })
         return
       }
@@ -334,28 +338,27 @@ test.describe('Logout during a token refresh', () => {
         headers,
         data: request.postDataBuffer() ?? undefined,
       })
-      await new Promise((resolve) => setTimeout(resolve, 9_000))
+      await new Promise((resolve) => setTimeout(resolve, 4_500))
       await route.fulfill({ response }).catch(() => undefined)
       await upstream.dispose()
     })
 
-    const clickedAt = Date.now()
     await logout(page)
     await expect(page).toHaveURL(/\/login/)
     // B signs in at once; the sign-in waits for the logout to let go.
     await signInHere(page, TEST_USERS.manager)
 
-    // The pending attempt was aborted at the budget (~7 s; not by its own
-    // timeout, ~10 s), before the sign-in request went out.
+    // The pending attempt was aborted at the budget (~7 s after attempt 1),
+    // before its answer could land and before the sign-in request went out.
     expect(attempts).toBe(3)
     expect(lastAttemptFailedAt).toBeGreaterThan(0)
-    expect(lastAttemptFailedAt - clickedAt).toBeGreaterThanOrEqual(6_500)
-    expect(lastAttemptFailedAt - clickedAt).toBeLessThanOrEqual(7_800)
+    expect(lastAttemptFailedAt - firstAttemptAt).toBeGreaterThanOrEqual(6_800)
+    expect(lastAttemptFailedAt - firstAttemptAt).toBeLessThan(7_450)
     expect(lastAttemptFailedAt).toBeLessThanOrEqual(loginSentAt)
 
     // After the moment the held answer would have landed, B's session is the
     // one in the jar and it works.
-    await page.waitForTimeout(Math.max(0, clickedAt + 16_000 - Date.now()))
+    await page.waitForTimeout(Math.max(0, firstAttemptAt + 12_000 - Date.now()))
     const refreshB = await cookieValue(context, 'whm_refresh')
     expect(refreshB).toBeTruthy()
     expect(refreshB).not.toBe(originalRefresh)

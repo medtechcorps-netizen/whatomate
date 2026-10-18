@@ -1215,6 +1215,37 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order).toEqual(['revoke csrf-token-1'])
   })
 
+  it('without Web Locks a sign-in arriving after a waiter timed out still waits for the real holder', async () => {
+    vi.useFakeTimers()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const sent: Array<[string, number]> = []
+    const start = Date.now()
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      sent.push([config.url!, Date.now() - start])
+      if (config.url === '/auth/switch-org') {
+        await new Promise((resolve) => setTimeout(resolve, 25_000))
+      }
+      return ok(config, { data: { expires_in: 900, user: {} } })
+    })
+    recordPosts([])
+
+    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    await vi.advanceTimersByTimeAsync(100)
+    await api.post('/auth/logout', {})
+    // The logout's wait runs out at ~20 s; the sign-in arrives after that.
+    await vi.advanceTimersByTimeAsync(20_400)
+    const login = api.post('/auth/login', { email: 'b@example.com', password: 'x' }).catch((e) => e.code)
+    await vi.advanceTimersByTimeAsync(4_000)
+    expect(sent.map(([url]) => url)).toEqual(['/auth/switch-org'])
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    await switched
+    await login
+    await whenLogoutSettled()
+    const loginAt = sent.find(([url]) => url === '/auth/login')
+    expect(loginAt === undefined || loginAt[1] >= 25_000).toBe(true)
+  })
+
   it('without Web Locks a sign-in still waits for the real holder after a logout before it timed out', async () => {
     vi.useFakeTimers()
     localStorage.setItem('whm_session_id', 'session-a')
@@ -1246,14 +1277,15 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     await whenLogoutSettled()
   })
 
-  it('an SSO start drops the organization a previous session selected', async () => {
+  it('an SSO start keeps the organization selection a live tab may still use', async () => {
     installWebLocks()
     localStorage.setItem('selected_organization_id', 'org-a')
     const { beginSsoSignIn } = await loadTab(async (config) => ok(config))
 
     await beginSsoSignIn()
 
-    expect(localStorage.getItem('selected_organization_id')).toBeNull()
+    // Only the callback, once the new session's cookies are in, drops it.
+    expect(localStorage.getItem('selected_organization_id')).toBe('org-a')
   })
 
   it("the SSO callback's /me carries no organization a previous session selected", async () => {
@@ -1335,9 +1367,11 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     installWebLocks()
     const order: string[] = []
     const { api } = await loadTab(async (config) => {
-      // Meanwhile an IdP-initiated SSO callback (no lock) set B's cookies.
+      // Meanwhile an IdP-initiated SSO callback (no lock) set B's cookies and
+      // began B's session, as its page load does.
       setCookie('whm_csrf=csrf-of-b; path=/')
       localStorage.setItem('whm_session_id', 'session-b')
+      localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-b', csrf: 'csrf-of-b' }))
       order.push('login (no answer)')
       throw new AxiosError('timeout of 15000ms exceeded', AxiosError.ECONNABORTED, config)
     })
@@ -1347,6 +1381,204 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     expect(order).toEqual(['login (no answer)'])
     expect(localStorage.getItem('whm_session_id')).toBe('session-b')
+  })
+
+  it('a no-answer sign-in whose late cookies replaced a newer session undoes them', async () => {
+    installWebLocks()
+    const order: string[] = []
+    const { api } = await loadTab(async (config) => {
+      // B began elsewhere meanwhile...
+      localStorage.setItem('whm_session_id', 'session-b')
+      localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-b', csrf: 'csrf-of-b' }))
+      // ...and then this request's own cookies landed over B's.
+      setCookie('whm_csrf=csrf-of-this-sign-in; path=/')
+      order.push('login (no answer)')
+      throw new AxiosError('timeout of 15000ms exceeded', AxiosError.ECONNABORTED, config)
+    })
+    recordPosts(order)
+
+    await api.post('/auth/login', { email: 'a@example.com', password: 'x' }).catch(() => undefined)
+
+    expect(order).toEqual(['login (no answer)', 'revoke csrf-of-this-sign-in', 'logout csrf-of-this-sign-in'])
+  })
+
+  it('a switch-org without an answer and with the CSRF cookie unchanged undoes nothing', async () => {
+    installWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const order: string[] = []
+    const { api } = await loadTab(async (config) => {
+      order.push('switch-org (no answer)')
+      throw new AxiosError('Network Error', AxiosError.ERR_NETWORK, config)
+    })
+    recordPosts(order)
+
+    await api.post('/auth/switch-org', { organization_id: 'org-2' }).catch(() => undefined)
+
+    expect(order).toEqual(['switch-org (no answer)'])
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+    expect(document.cookie).toContain('whm_csrf=csrf-token-1')
+  })
+
+  it('a switch-org is refused, sending nothing, once another tab began a new session', async () => {
+    installWebLocks()
+    const releaseHolder = holdLockElsewhere()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
+    const { api } = await loadTab(adapter)
+    const order: string[] = []
+    recordPosts(order)
+
+    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    await tick()
+    localStorage.setItem('whm_session_id', 'session-b')
+    localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-b', csrf: 'csrf-token-1' }))
+    releaseHolder()
+
+    expect(await switched).toBe('ERR_CANCELED')
+    expect(adapter).not.toHaveBeenCalled()
+    expect(order).toEqual([])
+  })
+
+  it('a no-answer sign-in is undone before the lock is let go', async () => {
+    installWebLocks()
+    const order: string[] = []
+    const signIn = await loadTab(async (config) => {
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      order.push('login (no answer)')
+      throw new AxiosError('timeout of 15000ms exceeded', AxiosError.ECONNABORTED, config)
+    })
+    const other = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    let releaseRevoke!: () => void
+    const revokeGate = new Promise<void>((resolve) => {
+      releaseRevoke = resolve
+    })
+    recordPosts(order, async (label) => {
+      if (label === 'refresh') return refreshOk()
+      if (label.startsWith('revoke')) await revokeGate
+      return undefined
+    })
+
+    const login = signIn.api.post('/auth/login', { email: 'b@example.com', password: 'x' }).catch(() => undefined)
+    await vi.waitFor(() => expect(order).toEqual(['login (no answer)', 'revoke csrf-of-b']))
+    // Another tab's refresh queues on the lock while the undo runs.
+    const request = other.api.get('/contacts').catch(() => undefined)
+    await tick()
+    releaseRevoke()
+    await login
+    await request
+
+    expect(order.slice(0, 4)).toEqual(['login (no answer)', 'revoke csrf-of-b', 'logout csrf-of-b', 'refresh'])
+  })
+
+  it('a retried switch refused after another tab began B leaves B alone', async () => {
+    installWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    let releaseRefresh!: () => void
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve
+    })
+    const order: string[] = []
+    let switchCalls = 0
+    const switching = await loadTab(async (config) => {
+      switchCalls++
+      // The first attempt hits an expired access token.
+      throw httpError(401, config)
+    })
+    const signingIn = await loadTab(async (config) => {
+      order.push('login B')
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      return ok(config, { data: { expires_in: 900, user: {} } })
+    })
+    recordPosts(order, async (label) => {
+      if (label === 'refresh') {
+        await refreshGate
+        // The refresh rotates the session's CSRF value.
+        setCookie('whm_csrf=csrf-token-2; path=/')
+        return refreshOk()
+      }
+    })
+
+    const switched = switching.api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    await vi.waitFor(() => expect(order).toEqual(['refresh']))
+    // B's sign-in queues on the lock during the refresh.
+    const login = signingIn.api.post('/auth/login', { email: 'b@example.com', password: 'x' })
+    await tick()
+    releaseRefresh()
+    await login
+    const sessionB = localStorage.getItem('whm_session_id')
+
+    expect(await switched).toBe('ERR_CANCELED')
+    expect(switchCalls).toBe(1)
+    expect(order).toEqual(['refresh', 'login B'])
+    expect(localStorage.getItem('whm_session_id')).toBe(sessionB)
+    expect(document.cookie).toContain('whm_csrf=csrf-of-b')
+  })
+
+  it("without Web Locks a no-answer switch adopts another tab's rotation of the same session", async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const order: string[] = []
+    const { api } = await loadTab(async (config) => {
+      // Another tab's refresh of this same session lands meanwhile.
+      setCookie('whm_csrf=csrf-token-2; path=/')
+      localStorage.setItem('whm_auth_epoch', String(Date.now() + 1_000))
+      order.push('switch-org (no answer)')
+      throw new AxiosError('Network Error', AxiosError.ERR_NETWORK, config)
+    })
+    recordPosts(order)
+
+    await api.post('/auth/switch-org', { organization_id: 'org-2' }).catch(() => undefined)
+
+    expect(order).toEqual(['switch-org (no answer)'])
+  })
+
+  it('without Web Locks a no-answer sign-in after a rotation is undone only for the account it asked for', async () => {
+    const getSpy = vi.spyOn(axios, 'get')
+    for (const [jarEmail, expected] of [
+      ['other@example.com', ['login (no answer)']],
+      ['b@example.com', ['login (no answer)', 'revoke csrf-token-2', 'logout csrf-token-2']],
+    ] as const) {
+      setCookie('whm_csrf=csrf-token-1; path=/')
+      localStorage.setItem('whm_session_id', 'ended:')
+      getSpy.mockResolvedValue({ data: { data: { email: jarEmail } }, status: 200 })
+      const order: string[] = []
+      const { api } = await loadTab(async (config) => {
+        setCookie('whm_csrf=csrf-token-2; path=/')
+        localStorage.setItem('whm_auth_epoch', String(Date.now() + 1_000))
+        order.push('login (no answer)')
+        throw new AxiosError('timeout of 15000ms exceeded', AxiosError.ECONNABORTED, config)
+      })
+      recordPosts(order)
+
+      await api.post('/auth/login', { email: 'B@example.com', password: 'x' }).catch(() => undefined)
+
+      expect(order).toEqual(expected)
+    }
+  })
+
+  it("the begun session's CSRF record follows its refreshes", async () => {
+    installWebLocks()
+    let rotated = false
+    const { api } = await loadTab(async (config) => {
+      if (config.url === '/auth/login') return ok(config, { data: { expires_in: 900, user: {} } })
+      if (!rotated) throw httpError(401, config)
+      return ok(config)
+    })
+    recordPosts([], (label) => {
+      if (label === 'refresh') {
+        rotated = true
+        setCookie('whm_csrf=csrf-token-2; path=/')
+        return refreshOk()
+      }
+    })
+    await api.post('/auth/login', { email: 'a@example.com', password: 'x' })
+    const marker = localStorage.getItem('whm_session_id')
+    expect(JSON.parse(localStorage.getItem('whm_session_begun')!)).toEqual({ marker, csrf: 'csrf-token-1' })
+
+    await api.get('/contacts')
+
+    expect(JSON.parse(localStorage.getItem('whm_session_begun')!)).toEqual({ marker, csrf: 'csrf-token-2' })
   })
 
   it('a replayed callback page sends nothing with the ended session\'s cookies', async () => {

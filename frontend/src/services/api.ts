@@ -112,6 +112,10 @@ const SESSION_LOCK_BACKSTOP_MS = 60_000;
 // Without Web Locks each tab announces a refresh it has in flight (a lease,
 // for at most the refresh timeout); session changes in other tabs wait for it.
 const REFRESH_LEASE_PREFIX = "whm_refresh_lease:";
+// The marker and CSRF value of the session that began last (kept current
+// across its refreshes): tells whether the jar still holds that session's
+// cookies.
+const SESSION_BEGUN_KEY = "whm_session_begun";
 // Written when an SSO sign-in starts: other tabs abort logout requests still
 // in flight, whose cookie-clearing answers must not land on the new session.
 const SSO_STARTED_KEY = "whm_sso_started";
@@ -148,10 +152,11 @@ type AuthAwareRequestConfig = InternalAxiosRequestConfig & {
   _sessionMarker?: string | null;
   // A sign-in or org switch holds the refresh lock until its response.
   _releaseSessionLock?: () => void;
-  // The marker and CSRF cookie when a sign-in or org switch was sent, with the
-  // lock held.
+  // The marker, CSRF cookie and auth epoch when a sign-in or org switch was
+  // sent, with the lock held.
   _issueMarker?: string | null;
   _issueCsrf?: string | null;
+  _issueEpoch?: number;
 };
 
 // Login/refresh responses whose Set-Cookie starts a new auth epoch.
@@ -242,9 +247,28 @@ export function readSessionId(): string {
 // not got through is moot: the jar now holds the new session's cookies.
 function beginSessionMarker(): string {
   writeStoredValue(LOGOUT_PENDING_KEY, null);
-  return writeSessionMarker(
+  const marker = writeSessionMarker(
     Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
   );
+  writeStoredValue(SESSION_BEGUN_KEY, JSON.stringify({ marker, csrf: getCookie("whm_csrf") }));
+  return marker;
+}
+
+function readBegunSession(): { marker: string; csrf: string | null } | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SESSION_BEGUN_KEY) || "null");
+    return parsed && typeof parsed.marker === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// A refresh rotated the current session's cookies: note its new CSRF value.
+function noteBegunCsrf(marker: string | null) {
+  const begun = readBegunSession();
+  if (begun && begun.marker === marker) {
+    writeStoredValue(SESSION_BEGUN_KEY, JSON.stringify({ marker, csrf: getCookie("whm_csrf") }));
+  }
 }
 
 function endSessionMarker(): string {
@@ -610,6 +634,7 @@ async function refreshWithRetry(
       throw sessionChangedError();
     }
     onSessionIssued(response?.data?.data?.expires_in);
+    noteBegunCsrf(marker);
     if (attempt > 0) showReconnectToast("dismiss");
     emitAuthSessionState(attempt > 0 ? "reconnected" : "refreshed");
     return;
@@ -709,13 +734,16 @@ function holdRefreshLock(forSignIn = false): Promise<(() => void) | null> {
     const mine = before.then(() => held);
     fallbackHold = mine;
     return waited.then((acquired) => {
-      const done = () => {
+      if (!acquired) {
+        // Only this waiter gives up: its place (behind the real holder) stays
+        // in the queue, so a later arrival still waits for that holder.
+        release();
+        return null;
+      }
+      return () => {
         release();
         if (fallbackHold === mine) fallbackHold = null;
       };
-      if (acquired) return done;
-      done();
-      return null;
     });
   }
   return new Promise((resolveHold) => {
@@ -869,6 +897,40 @@ async function endIssuedSession(): Promise<void> {
   }
 }
 
+// leftCookiesWithoutAnswer tells whether a sign-in or org switch that got no
+// answer left cookies of its own in the jar (to be undone under its lock).
+async function leftCookiesWithoutAnswer(config: AuthAwareRequestConfig): Promise<boolean> {
+  const marker = readSessionMarker();
+  const csrf = getCookie("whm_csrf");
+  if (marker !== config._issueMarker) {
+    // Another session began meanwhile (an SSO callback needs no lock). Its
+    // cookies are intact while the jar holds the CSRF value it began with;
+    // otherwise this request's late cookies replaced them.
+    const begun = readBegunSession();
+    return !(begun && begun.marker === marker && begun.csrf === csrf);
+  }
+  if (csrf === config._issueCsrf) return false;
+  // With Web Locks nothing else could change the cookies under this lock.
+  if (readAuthEpoch() === config._issueEpoch) return true;
+  // Without them another tab's refresh may have rotated this same session
+  // meanwhile, so the changed CSRF value proves nothing. An org switch keeps
+  // the session (same user): adopt rather than revoke. A sign-in is undone
+  // only if the jar holds the account it asked for.
+  if (requestPath(config.url) === "/auth/switch-org") return false;
+  try {
+    const me = await axios.get(`${API_BASE_URL}/me`, {
+      withCredentials: true,
+      timeout: LOGOUT_REQUEST_TIMEOUT_MS,
+    });
+    const email = String(me?.data?.data?.email ?? "").toLowerCase();
+    const body = typeof config.data === "string" ? JSON.parse(config.data) : config.data;
+    const asked = String(body?.email ?? "").toLowerCase();
+    return !!email && email === asked;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Orders an SSO sign-in like a password sign-in before the browser leaves for
  * the identity provider: it waits (bounded) for refresh work and an earlier
@@ -890,11 +952,10 @@ export async function beginSsoSignIn(): Promise<void> {
     release();
     throw sessionBusyError();
   }
-  // Other tabs abort logout requests still in flight (fence).
+  // Other tabs abort logout requests still in flight (fence). The previous
+  // organization selection stays until the callback confirms the new session
+  // (a live tab may still use it if this SSO fails).
   writeStoredValue(SSO_STARTED_KEY, String(Date.now()));
-  // Like a password sign-in: the SSO account's organization is not the one a
-  // previous session selected.
-  clearBrowserOrganizationIdentity();
 }
 
 /** Resolves once a logout started in this tab has finished in the background. */
@@ -1234,6 +1295,10 @@ api.interceptors.request.use(
       // session; an org switch keeps it (the auth epoch already retires
       // refreshes issued before the switch).
       const held = config as AuthAwareRequestConfig;
+      // A retried request (401, refresh, replay) starts afresh.
+      held._issueMarker = undefined;
+      held._issueCsrf = undefined;
+      held._issueEpoch = undefined;
       const startMarker = readSessionMarker();
       return holdRefreshLock(true).then(async (release) => {
         // The lock stayed busy: refuse ("please try again"), never send unlocked.
@@ -1248,6 +1313,7 @@ api.interceptors.request.use(
           // that session ended or another began.
           const marker = readSessionMarker();
           if (marker !== startMarker || isEndedMarker(marker)) {
+            releaseSessionLock(held);
             throw sessionChangedError(config);
           }
         } else {
@@ -1262,6 +1328,7 @@ api.interceptors.request.use(
         }
         held._issueMarker = readSessionMarker();
         held._issueCsrf = getCookie("whm_csrf");
+        held._issueEpoch = readAuthEpoch();
         if (!config.timeout || config.timeout > SESSION_ISSUING_TIMEOUT_MS) {
           config.timeout = SESSION_ISSUING_TIMEOUT_MS;
         }
@@ -1312,11 +1379,8 @@ api.interceptors.response.use(
     if (
       issuing?._releaseSessionLock &&
       issuing._issueMarker !== undefined &&
-      // Not if another session began meanwhile (an SSO callback needs no
-      // lock): the changed cookies may be that session's.
-      readSessionMarker() === issuing._issueMarker &&
       !error.response &&
-      getCookie("whm_csrf") !== issuing._issueCsrf
+      (await leftCookiesWithoutAnswer(issuing))
     ) {
       await endIssuedSession();
     }
