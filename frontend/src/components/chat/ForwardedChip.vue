@@ -1,13 +1,19 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { Forward } from 'lucide-vue-next'
-import type { ForwardDeliveryState } from './messageForward'
+import type { Message } from '@/stores/contacts'
+import { forwardDeliveryState, useForwardClock } from './messageForward'
 
 // Internal CRM marker. WhatsApp offers no settable "Forwarded" label, so the
 // customer receives an ordinary message; only agents see this chip. A stalled
-// forward also says that its status is unknown and it won't be resent.
-defineProps<{
-  state?: ForwardDeliveryState
+// forward also says that its status is unknown and it won't be resent. The
+// state is re-applied on a clock, so an open chat shows it without a reload.
+const props = defineProps<{
+  message: Message
 }>()
+
+const clock = useForwardClock()
+const state = computed(() => (props.message.status === 'pending' ? forwardDeliveryState(props.message, clock.value) : null))
 </script>
 
 <template>

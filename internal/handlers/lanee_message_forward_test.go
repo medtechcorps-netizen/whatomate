@@ -588,6 +588,32 @@ func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
 	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
 	assert.Len(t, f.messagesFor(t, f.target.ID), 1, "only the warm-up forward exists")
 	assert.Equal(t, sentBefore, f.mock.sentMessageCount())
+
+	// E2-R1: the account lookup itself hits a database deadline. Nothing has
+	// been saved yet, so this is also a definite 503 (not the 400 a missing or
+	// unusable account gets).
+	org, accountName := f.org.ID, f.account.Name
+	name := "laneE:account_lookup_" + uuid.NewString()
+	require.NoError(t, f.app.DB.Callback().Query().After("gorm:query").Register(name, func(db *gorm.DB) {
+		if db.Statement.Table != "whatsapp_accounts" {
+			return
+		}
+		hasOrg, hasName := false, false
+		for _, v := range db.Statement.Vars {
+			hasOrg = hasOrg || v == any(org)
+			hasName = hasName || v == any(accountName)
+		}
+		if hasOrg && hasName {
+			_ = db.AddError(context.DeadlineExceeded)
+		}
+	}))
+	t.Cleanup(func() { _ = f.app.DB.Callback().Query().Remove(name) })
+
+	req = f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
+	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
+	assert.Len(t, f.messagesFor(t, f.target.ID), 1)
+	assert.Equal(t, sentBefore, f.mock.sentMessageCount())
 }
 
 // Q5: the pending-row INSERT fails inside its own transaction, which rolls
@@ -616,35 +642,6 @@ func TestLaneEForwardFailedInsertIsDefiniteAndNotRetried(t *testing.T) {
 	assert.Zero(t, f.mock.sentMessageCount())
 }
 
-// Item 8: a failed account lookup (database or deadline) happens before
-// anything is saved, so it is a definite 503, not a 400.
-func TestLaneEForwardAccountLookupFailureIsRetryable(t *testing.T) {
-	f := laneENewForwardFixture(t)
-	text := f.storedMessage(t, f.source, models.MessageTypeText, "lookup", "")
-	org, accountName := f.org.ID, f.account.Name
-	name := "laneE:account_lookup_" + uuid.NewString()
-	require.NoError(t, f.app.DB.Callback().Query().After("gorm:query").Register(name, func(db *gorm.DB) {
-		if db.Statement.Table != "whatsapp_accounts" {
-			return
-		}
-		hasOrg, hasName := false, false
-		for _, v := range db.Statement.Vars {
-			hasOrg = hasOrg || v == any(org)
-			hasName = hasName || v == any(accountName)
-		}
-		if hasOrg && hasName {
-			_ = db.AddError(errors.New("synthetic: connection reset during account lookup"))
-		}
-	}))
-	t.Cleanup(func() { _ = f.app.DB.Callback().Query().Remove(name) })
-
-	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
-	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
-	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
-	assert.Empty(t, f.messagesFor(t, f.target.ID))
-	assert.Zero(t, f.mock.sentMessageCount())
-}
-
 // Item 8: a missing account is a definite refusal that would repeat: 400.
 func TestLaneEForwardUnknownAccountIsNotRetryable(t *testing.T) {
 	f := laneENewForwardFixture(t)
@@ -654,7 +651,9 @@ func TestLaneEForwardUnknownAccountIsNotRetryable(t *testing.T) {
 		"whatsapp_account":      "no-such-account",
 	})
 	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
-	assert.Equal(t, "forward_account_unavailable", laneERefusal(t, req).ErrorType)
+	envelope := laneERefusal(t, req)
+	assert.Equal(t, "forward_account_unavailable", envelope.ErrorType)
+	assert.Equal(t, "Failed to resolve WhatsApp account", envelope.Message, "the message an ordinary send returns")
 	assert.Empty(t, f.messagesFor(t, f.target.ID))
 }
 
@@ -711,11 +710,17 @@ func TestLaneEForwardStalledStatesProjection(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(list), &listed))
 	states := map[uuid.UUID]string{}
+	dispatch := map[uuid.UUID]handlers.MessageResponse{}
 	for _, message := range listed.Data.Messages {
 		states[message.ID] = message.ForwardDeliveryState
+		dispatch[message.ID] = message
 	}
 	assert.Equal(t, "delayed", states[delayed])
 	assert.Equal(t, "uncertain", states[uncertain])
+	// The marker comes with the message, so an open chat can apply the rule.
+	assert.Equal(t, "queued", dispatch[delayed].ForwardDispatch)
+	assert.Equal(t, "provider", dispatch[uncertain].ForwardDispatch)
+	assert.NotEmpty(t, dispatch[uncertain].ForwardDispatchAt)
 	assert.Equal(t, "", states[delivered[0].ID])
 	// Neither stalled row is resent by anything on the read path.
 	assert.Equal(t, 1, f.mock.sentMessageCount())

@@ -85,6 +85,10 @@ type MessageResponse struct {
 	// or "uncertain" (may have been sent) for a stalled forward. Neither
 	// means "not sent"; neither is resent automatically.
 	ForwardDeliveryState string `json:"forward_delivery_state,omitempty"`
+	// ForwardDispatch and ForwardDispatchAt expose a forward's dispatch
+	// marker so an open chat can apply the same rule as it ages.
+	ForwardDispatch   string `json:"forward_dispatch,omitempty"`
+	ForwardDispatchAt string `json:"forward_dispatch_at,omitempty"`
 }
 
 // ReplyPreview contains a preview of the replied-to message
@@ -1187,6 +1191,10 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 			IsForwarded:         messageIsForwarded(m.Metadata),
 		}
 		msgResp.ForwardDeliveryState = forwardDeliveryState(&m, time.Now())
+		if msgResp.IsForwarded {
+			msgResp.ForwardDispatch, _ = m.Metadata[forwardDispatchMetadataKey].(string)
+			msgResp.ForwardDispatchAt, _ = m.Metadata[forwardDispatchAtMetadataKey].(string)
+		}
 
 		if m.IsReply && m.ReplyToMessageID != nil {
 			replyToID := m.ReplyToMessageID.String()

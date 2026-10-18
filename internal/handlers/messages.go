@@ -269,7 +269,7 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	err := a.outgoingPreProviderTransaction(ctx, organizationID, opts.Async, func(tx *gorm.DB) error {
 		if req.forwardOutcome != nil {
 			req.forwardOutcome.writeStarted = true
-			req.forwardOutcome.writeCompleted = false
+			req.forwardOutcome.reachedCommit = false
 		}
 		if req.legacyWhatsAppReply != nil {
 			// The pending Message insert below locks the organization row (write
@@ -447,7 +447,9 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		msg = candidate
 		canonicalContact = *contact
 		if req.forwardOutcome != nil {
-			req.forwardOutcome.writeCompleted = true
+			// Returning nil hands the transaction to COMMIT. From here on an
+			// error (from COMMIT itself or after it was sent) is ambiguous.
+			req.forwardOutcome.reachedCommit = true
 		}
 		return nil
 	})
@@ -613,11 +615,26 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 					// longer pending and queued, it stops without touching it.
 					claimed, markErr := root.claimForwardProviderPhase(organizationID, msg.ID)
 					if markErr != nil {
+						// Either way the provider is never called. Before COMMIT
+						// (e.g. no pool connection within the deadline) the marker
+						// certainly did not commit; after it, it may have. The row
+						// is settled "not sent" with user-safe text, which is true:
+						// a settled row can never be claimed or delivered. If this
+						// settlement fails too, the row stays pending and later
+						// reads as delayed (queued) or uncertain (provider).
+						var claimErr *forwardClaimError
+						root.Log.Error(
+							"Forward provider-phase claim failed; not dispatching",
+							"error", markErr,
+							"marker_may_have_committed", errors.As(markErr, &claimErr) && claimErr.reachedCommit,
+							"organization_id", organizationID,
+							"message_id", msg.ID,
+						)
 						if settlementErr := root.settleOutgoingFailureBeforeProvider(
 							msg,
 							req,
 							opts,
-							fmt.Errorf("forward not sent: %w", markErr),
+							forwardServerBusyError(),
 						); settlementErr != nil {
 							root.Log.Error(
 								"Failed to settle forwarded message after its dispatch marker failed",
@@ -2675,9 +2692,6 @@ const (
 	// client shows "may have been forwarded" and never retries by itself.
 	forwardErrorTemporarilyUnavailable fastglue.ErrorType = "forward_temporarily_unavailable"
 	forwardErrorOutcomeUnknown         fastglue.ErrorType = "forward_outcome_unknown"
-	// forwardErrorBlocked: definitely not sent, and retrying will not help
-	// (the forward audit cannot be written, or a tenant-scope invariant broke).
-	forwardErrorBlocked fastglue.ErrorType = "forward_blocked"
 )
 
 // messageForwardSource is the server-derived provenance of a forwarded message.
@@ -2919,7 +2933,8 @@ func forwardMediaExtension(name string) string {
 func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
 	plan := req.forwardMedia
 	if plan == nil || req.Account == nil {
-		return errors.New("forwarded attachment plan is incomplete")
+		a.Log.Error("Forwarded attachment plan is incomplete")
+		return forwardAttachmentCopyError()
 	}
 	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
 	defer cancelStorage()
@@ -2945,11 +2960,10 @@ func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
 		data,
 		plan.MimeType,
 	)
-	if err != nil {
-		return fmt.Errorf("store forwarded attachment: %w", err)
-	}
-	if key != plan.DestinationKey {
-		return errors.New("forwarded attachment was stored under an unexpected key")
+	if err != nil || key != plan.DestinationKey {
+		a.Log.Error("Failed to store forwarded attachment",
+			"error", err, "organization_id", plan.OrganizationID, "key_matches_plan", key == plan.DestinationKey)
+		return forwardAttachmentCopyError()
 	}
 
 	if err := a.requireForwardAccountActive(plan.OrganizationID, req.Account.ID); err != nil {
@@ -3071,7 +3085,7 @@ func (a *App) forwardMessage(
 	}
 	if a.rlsEnabled() && a.hasTenantScope() && !a.usesCurrentTenantPreProvider(account.OrganizationID) {
 		// Would fail the same way every time: not a "try again" condition.
-		return forwardBlockedRefusal().send(r)
+		return forwardSendFailedRefusal().send(r)
 	}
 
 	msgReq := OutgoingMessageRequest{
@@ -3133,6 +3147,7 @@ func (a *App) forwardMessage(
 		CreatedAt:       message.CreatedAt,
 		UpdatedAt:       message.UpdatedAt,
 		IsForwarded:     true,
+		ForwardDispatch: forwardDispatchQueued,
 	})
 }
 
@@ -3215,7 +3230,9 @@ func (a *App) requireForwardAccountActive(orgID, accountID uuid.UUID) error {
 			First(&account).Error
 	})
 	if err != nil {
-		return fmt.Errorf("check WhatsApp account before upload: %w", err)
+		a.Log.Error("Failed to check WhatsApp account before a forwarded upload",
+			"error", err, "organization_id", orgID)
+		return forwardServerBusyError()
 	}
 	return whatsappaccount.RequireActiveForOutbound(&account)
 }
@@ -3340,9 +3357,13 @@ type forwardSendOutcome struct {
 	requestTransaction bool
 	// writeStarted: the pre-provider write began on an acquired connection.
 	writeStarted bool
-	// writeCompleted: the last write attempt returned without error, so only
-	// its COMMIT (if any) could still have failed.
-	writeCompleted bool
+	// reachedCommit: the last write attempt returned nil, so its transaction
+	// went on to COMMIT. Before that, an error comes from a statement inside
+	// the write; GORM then rolls the transaction back and never sends COMMIT,
+	// so nothing was committed. After it, an error comes from COMMIT itself or
+	// from anything after COMMIT was sent (a dropped connection, a context
+	// cancelled during COMMIT): the row may have committed. Reset per retry.
+	reachedCommit bool
 }
 
 // forwardAuditError is a failure to write the per-target forward audit entry.
@@ -3365,12 +3386,28 @@ func (e *forwardAuditError) Unwrap() error {
 	return e.err
 }
 
-func forwardBlockedRefusal() *messageForwardRefusal {
+// forwardSendFailedRefusal is a definite failure that would repeat (the
+// audit cannot be written, an up-front check, a tenant-scope mismatch). It is
+// the response an ordinary send gives for a failed send; it never says "try
+// again", and the client never retries a 500 by itself.
+func forwardSendFailedRefusal() *messageForwardRefusal {
 	return &messageForwardRefusal{
-		Status:    fasthttp.StatusInternalServerError,
-		ErrorType: forwardErrorBlocked,
-		Message:   "This forward was blocked by a server-side check and was not sent. Trying again won't help; contact support.",
+		Status:  fasthttp.StatusInternalServerError,
+		Message: "Failed to send message",
 	}
+}
+
+// forwardServerBusyError is the stored, user-facing reason for a forward the
+// delivery worker gave up before the provider because the server was busy
+// (raw database errors are logged, never stored).
+func forwardServerBusyError() error {
+	return errors.New("Not sent: the server was too busy to send this forward. Forward it again from the original message.")
+}
+
+// forwardAttachmentCopyError is the stored, user-facing reason for a
+// forwarded attachment that could not be copied before the upload.
+func forwardAttachmentCopyError() error {
+	return errors.New("Not sent: the attachment could not be copied for this forward. Forward it again from the original message.")
 }
 
 func forwardOutcomeUnknownRefusal() *messageForwardRefusal {
@@ -3382,12 +3419,13 @@ func forwardOutcomeUnknownRefusal() *messageForwardRefusal {
 }
 
 // forwardAccountUnavailableRefusal: no usable WhatsApp account (missing,
-// inactive or without valid credentials). Definite and non-retryable.
+// inactive or without valid credentials). Definite and non-retryable; the
+// same status and message an ordinary send returns.
 func forwardAccountUnavailableRefusal() *messageForwardRefusal {
 	return &messageForwardRefusal{
 		Status:    fasthttp.StatusBadRequest,
 		ErrorType: forwardErrorAccountUnavailable,
-		Message:   "This WhatsApp account can't send messages right now. Check the account settings.",
+		Message:   "Failed to resolve WhatsApp account",
 	}
 }
 
@@ -3400,9 +3438,10 @@ func forwardAccountUnavailableRefusal() *messageForwardRefusal {
 //     request transaction, and Tenant rolls an error response back.
 //
 // Failures that would repeat (inactive account, audit write, an up-front
-// invariant) are definite and non-retryable. Other definite failures are 503
-// "try again". A failure after the write completed outside a request
-// transaction may follow a successful COMMIT, so it stays ambiguous.
+// invariant) are definite and non-retryable, with the codes an ordinary send
+// returns. Other definite failures are 503 "try again". Outside a request
+// transaction, an error once the write reached COMMIT (from COMMIT itself, or
+// after COMMIT was sent) is ambiguous: 500 forward_outcome_unknown.
 func forwardSendFailureRefusal(err error, async bool, outcome forwardSendOutcome) *messageForwardRefusal {
 	var auditErr *forwardAuditError
 	switch {
@@ -3411,10 +3450,10 @@ func forwardSendFailureRefusal(err error, async bool, outcome forwardSendOutcome
 	case errors.Is(err, whatsappaccount.ErrOutboundInactive):
 		return forwardAccountUnavailableRefusal()
 	case errors.As(err, &auditErr), !outcome.writeRequested:
-		return forwardBlockedRefusal()
+		return forwardSendFailedRefusal()
 	case !async:
 		return forwardOutcomeUnknownRefusal()
-	case outcome.requestTransaction, !outcome.writeStarted, !outcome.writeCompleted:
+	case outcome.requestTransaction, !outcome.writeStarted, !outcome.reachedCommit:
 		return forwardNotAcceptedRefusal()
 	default:
 		return forwardOutcomeUnknownRefusal()
@@ -3427,11 +3466,11 @@ func forwardSendFailureRefusal(err error, async bool, outcome forwardSendOutcome
 // was still pending and still queued.
 //
 // Re-entry policy: a second claim, a settled row or a missing row moves
-// nothing, and the caller must not call the provider or touch the row. An
-// error means the marker commit is ambiguous; the caller stops before the
-// provider.
+// nothing, and the caller must not call the provider or touch the row. Any
+// error (a *forwardClaimError) stops the caller before the provider.
 func (a *App) claimForwardProviderPhase(orgID, messageID uuid.UUID) (bool, error) {
 	var moved int64
+	reachedCommit := false
 	err := a.withForwardTenantTx(orgID, func(tx *gorm.DB) error {
 		result := tx.Model(&models.Message{}).
 			Where(
@@ -3451,12 +3490,36 @@ func (a *App) claimForwardProviderPhase(orgID, messageID uuid.UUID) (bool, error
 			return fmt.Errorf("forward dispatch claim moved %d rows", result.RowsAffected)
 		}
 		moved = result.RowsAffected
+		reachedCommit = true
 		return nil
 	})
 	if err != nil {
-		return false, err
+		return false, &forwardClaimError{reachedCommit: reachedCommit, err: err}
 	}
 	return moved == 1, nil
+}
+
+// forwardClaimError is a failed provider-phase claim. Without reachedCommit it
+// failed before or inside its UPDATE (pool acquisition, BEGIN, tenant binding,
+// the statement), so the marker certainly did not commit. With it, COMMIT
+// failed or its answer was lost, so the marker may have committed.
+type forwardClaimError struct {
+	reachedCommit bool
+	err           error
+}
+
+func (e *forwardClaimError) Error() string {
+	if e == nil || e.err == nil {
+		return "claim forward provider phase"
+	}
+	return "claim forward provider phase: " + e.err.Error()
+}
+
+func (e *forwardClaimError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 // forwardDeliveryState derives, read-only, what a stalled forward means for the
@@ -3516,7 +3579,7 @@ func (a *App) resolveForwardAccount(orgID uuid.UUID, accountName string) (*model
 		return nil, forwardNotAcceptedRefusal()
 	}
 	if account.OrganizationID != orgID {
-		return nil, forwardBlockedRefusal()
+		return nil, forwardSendFailedRefusal()
 	}
 	if err := a.prepareWhatsAppAccountForOutbound(&account); err != nil {
 		a.Log.Warn("WhatsApp account cannot send a forward", "error", err, "organization_id", orgID, "account", account.Name)

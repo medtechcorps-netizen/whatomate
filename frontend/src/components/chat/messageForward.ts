@@ -1,3 +1,4 @@
+import { onScopeDispose, ref, type Ref } from 'vue'
 import type { Contact, Message } from '@/stores/contacts'
 
 /** One forward request carries one target; the dialog sends at most this many. */
@@ -58,32 +59,82 @@ export type ForwardFailure = 'retryable' | 'uncertain' | 'failed'
  * The server's forward contract for a request that did not return 2xx:
  * - 503 forward_temporarily_unavailable: definitely not accepted (nothing was
  *   saved or sent), so a manual retry is safe;
- * - forward_blocked: definitely not sent, and retrying will not help;
- * - any other 5xx, or no response at all: it may have been accepted, so the
- *   agent must check the chat; never retried automatically;
- * - 4xx: a refusal (window closed, identity review, ...), not sent.
+ * - any other 5xx, or no response at all: it may have been accepted (or the
+ *   server cannot say), so the agent must check the chat; never retried
+ *   automatically;
+ * - 4xx: a refusal (window closed, identity review, account, ...), not sent.
  */
 export function classifyForwardError(error: unknown): ForwardFailure {
   const response = (error as { response?: { status?: number; data?: { error_type?: string } } } | null)?.response
   const status = response?.status
-  const errorType = response?.data?.error_type
   if (!status) return 'uncertain'
-  if (status === 503 && errorType === 'forward_temporarily_unavailable') return 'retryable'
-  if (errorType === 'forward_blocked') return 'failed'
+  if (status === 503 && response?.data?.error_type === 'forward_temporarily_unavailable') return 'retryable'
   if (status >= 500) return 'uncertain'
   return 'failed'
 }
 
 export type ForwardDeliveryState = 'delayed' | 'uncertain' | null
 
+/** The server's stall age (forwardDeliveryStalledAfter in messages.go). */
+export const FORWARD_STALLED_AFTER_MS = 3 * 60_000
+
 /**
- * Server-derived state of a stalled forward. Neither means "not sent", and
- * ReReply never resends either one automatically:
- * - "delayed": no send attempt recorded yet; it may still be sent;
- * - "uncertain": a send attempt began but its result was not recorded; it may
- *   have been sent.
+ * The state of a stalled forward, by the server's rule. Neither state means
+ * "not sent", and ReReply never resends either one automatically:
+ * - "delayed": still queued (no send attempt recorded) past the stall age; it
+ *   may still be sent;
+ * - "uncertain": a send attempt began (provider phase) but its result was not
+ *   recorded past the stall age; it may have been sent.
+ * The dispatch marker comes with the message (GET and the forward response),
+ * so an open chat applies the rule as the message ages; without it, the
+ * server's state at fetch time is used. Only a pending forward has a state.
  */
-export function forwardDeliveryState(message: Message): ForwardDeliveryState {
-  const state = (message as Message & { forward_delivery_state?: string }).forward_delivery_state
-  return state === 'delayed' || state === 'uncertain' ? state : null
+export function forwardDeliveryState(message: Message, now: number = Date.now()): ForwardDeliveryState {
+  if (message.status !== 'pending' || !isForwardedMessage(message)) return null
+  const extended = message as Message & {
+    forward_delivery_state?: string
+    forward_dispatch?: string
+    forward_dispatch_at?: string
+  }
+  const stalledSince = (since?: string) => {
+    const at = since ? Date.parse(since) : Number.NaN
+    return Number.isFinite(at) && now - at > FORWARD_STALLED_AFTER_MS
+  }
+  if (extended.forward_dispatch === 'queued') {
+    return stalledSince(message.created_at) ? 'delayed' : null
+  }
+  if (extended.forward_dispatch === 'provider') {
+    return stalledSince(extended.forward_dispatch_at || message.updated_at) ? 'uncertain' : null
+  }
+  const server = extended.forward_delivery_state
+  return server === 'delayed' || server === 'uncertain' ? server : null
+}
+
+/** How often an open chat re-applies the stall rule. */
+export const FORWARD_CLOCK_TICK_MS = 30_000
+
+const forwardClock = ref(Date.now())
+let forwardClockUsers = 0
+let forwardClockTimer: ReturnType<typeof setInterval> | undefined
+
+/**
+ * A shared clock for the stall rule: one interval for every component that
+ * uses it, running only while at least one is mounted.
+ */
+export function useForwardClock(): Readonly<Ref<number>> {
+  forwardClockUsers += 1
+  if (!forwardClockTimer) {
+    forwardClock.value = Date.now()
+    forwardClockTimer = setInterval(() => {
+      forwardClock.value = Date.now()
+    }, FORWARD_CLOCK_TICK_MS)
+  }
+  onScopeDispose(() => {
+    forwardClockUsers -= 1
+    if (forwardClockUsers === 0 && forwardClockTimer) {
+      clearInterval(forwardClockTimer)
+      forwardClockTimer = undefined
+    }
+  })
+  return forwardClock
 }

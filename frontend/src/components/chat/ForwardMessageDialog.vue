@@ -74,6 +74,9 @@ const isLoading = ref(false)
 const loadFailed = ref(false)
 const selected = ref<Contact[]>([])
 const results = ref<TargetResult[]>([])
+// Bumped when the dialog opens, closes or unmounts. A request that resolves in
+// a later session must not arm a timer nothing watches or touch new results.
+let session = 0
 
 const sourceBlock = computed(() => (props.message ? forwardSourceBlock(props.message) : 'unsupported'))
 const isSending = computed(() => results.value.some(r => r.state === 'pending' || r.state === 'sending'))
@@ -145,6 +148,7 @@ async function loadCandidates() {
 }
 
 function reset() {
+  session += 1
   step.value = 'pick'
   search.value = ''
   selected.value = []
@@ -177,7 +181,7 @@ watch(search, () => {
 
 let stopStatusWatch: (() => void) | null = null
 // One confirmation window per target attempt, so a manual retry gets a fresh one.
-const confirmTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const confirmTimers = new Map<TargetResult, ReturnType<typeof setTimeout>>()
 // Status events can arrive before the POST response that names the message.
 const earlyStatuses = new Map<string, { status: string; error?: string }>()
 
@@ -217,17 +221,16 @@ function watchStatus() {
 
 function startConfirmTimer(result: TargetResult) {
   clearConfirmTimer(result)
-  const key = result.contact.id
-  confirmTimers.set(key, setTimeout(() => {
-    confirmTimers.delete(key)
+  confirmTimers.set(result, setTimeout(() => {
+    confirmTimers.delete(result)
     if (result.state === 'queued') result.state = 'unconfirmed'
   }, DELIVERY_CONFIRM_TIMEOUT_MS))
 }
 
 function clearConfirmTimer(result: TargetResult) {
-  const timer = confirmTimers.get(result.contact.id)
+  const timer = confirmTimers.get(result)
   if (timer) clearTimeout(timer)
-  confirmTimers.delete(result.contact.id)
+  confirmTimers.delete(result)
 }
 
 function stopWatchingStatus() {
@@ -239,10 +242,13 @@ function stopWatchingStatus() {
 }
 
 watch(() => props.open, open => {
-  if (!open) stopWatchingStatus()
+  if (open) return
+  session += 1
+  stopWatchingStatus()
 })
 
 onBeforeUnmount(() => {
+  session += 1
   if (searchTimer) clearTimeout(searchTimer)
   searchController?.abort()
   stopWatchingStatus()
@@ -258,20 +264,24 @@ async function forwardAll() {
   watchStatus()
   // Sequential on purpose: one short request at a time keeps the server's
   // connection use flat, and each result can be shown as it lands.
+  const started = session
   for (const result of results.value) {
     await sendTo(result, message.id)
   }
-  settleWatching()
+  if (started === session) settleWatching()
 }
 
 /** One forward request for one target. Exactly one request per call. */
 async function sendTo(result: TargetResult, sourceId: string) {
+  const started = session
   result.state = 'sending'
   result.error = undefined
   try {
     const created = await contactsStore.sendMessage(result.contact.id, 'text', {}, undefined, undefined, {
       forwardOfMessageId: sourceId,
     })
+    // Closed (or reopened) meanwhile: nothing watches this result any more.
+    if (started !== session) return
     result.messageId = created?.id ? String(created.id) : undefined
     result.state = 'queued'
     startConfirmTimer(result)
@@ -281,6 +291,7 @@ async function sendTo(result: TargetResult, sourceId: string) {
       applyStatus(result.messageId, early?.status ?? String(created?.status ?? ''), early?.error ?? created?.error_message)
     }
   } catch (error) {
+    if (started !== session) return
     const failure = classifyForwardError(error)
     result.state = failure
     result.error = failure === 'uncertain' ? undefined : getErrorMessage(error, t('chat.forward.failed'))
@@ -296,9 +307,10 @@ function settleWatching() {
 async function retryTarget(result: TargetResult) {
   const message = props.message
   if (!message || result.state !== 'retryable' || isSending.value) return
+  const started = session
   watchStatus()
   await sendTo(result, message.id)
-  settleWatching()
+  if (started === session) settleWatching()
 }
 
 function resultLabel(state: ResultState): string {
