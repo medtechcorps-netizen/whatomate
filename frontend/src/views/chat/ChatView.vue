@@ -276,6 +276,12 @@ const chatAttachments = useChatAttachments({
   onReplySent: (replyToMessageId, target) => {
     if (target.isActive() && contactsStore.replyingTo?.id === replyToMessageId) contactsStore.clearReplyingTo()
   },
+  // The server cannot quote that message for this patient: drop the stale
+  // reply bar (a text reply would fail the same way). The dialog offers to
+  // send the file without the quote.
+  onReplyRejected: (replyToMessageId, target) => {
+    if (target.isActive() && contactsStore.replyingTo?.id === replyToMessageId) contactsStore.clearReplyingTo()
+  },
   // Paces uploads on each message leaving 'pending' (status_update /
   // realtime_sync), which keeps a batch from pinning DB pool connections.
   subscribeRealtime: listener => wsService.onInboxActivity(listener),
@@ -3452,6 +3458,7 @@ watch(contactId, () => chatAttachments.reset())
       @convert-all="chatAttachments.convertAllToJpeg"
       @send="chatAttachments.sendAll"
       @retry-failed="chatAttachments.retryFailed"
+      @send-without-quote="chatAttachments.sendWithoutQuote"
       @stop="chatAttachments.stop"
       @add-more="openFilePicker"
     />

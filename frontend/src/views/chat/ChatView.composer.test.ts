@@ -866,4 +866,28 @@ describe('ChatView composer', () => {
     await flushPromises()
     expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
   })
+
+  it('clears a refused reply and sends the file without the quote on request', async () => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('incoming-stale', 'first', 'Old message')
+    await nextTick()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png'])
+    expect(calls[0].request).toMatchObject({ reply_to_message_id: 'incoming-stale' })
+    calls[0].reject(Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { message: 'Reply message not found for this contact' } },
+    }))
+    await flushPromises()
+    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
+    const dialog = wrapper.findComponent(MediaSendDialog)
+    const [refused] = dialog.props('items')
+    expect(refused).toMatchObject({ status: 'failed', replyRejected: true })
+
+    dialog.vm.$emit('send-without-quote', refused.id)
+    await flushPromises()
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+  })
 })

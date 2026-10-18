@@ -492,6 +492,9 @@
       "recipientLabel": "To:",
       "recipientCheck": "Check the recipient before sending. Sent files cannot be recalled.",
       "replyQuote": "The first file will quote:",
+      "quotesReply": "Quotes the message you are replying to",
+      "replyRejected": "The message you are replying to cannot be quoted in this conversation, so this file was not sent.",
+      "sendWithoutQuote": "Send without quote",
       "removeFile": "Remove {name}",
       "captionFor": "Caption for {name}",
       "kind": {
