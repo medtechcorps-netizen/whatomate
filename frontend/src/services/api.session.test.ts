@@ -962,6 +962,8 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const heard: Array<{ type: string }> = []
     peer.onmessage = (event) => heard.push(event.data)
     peer.postMessage({ type: 'hello', id: 'peer-tab' })
+    // The other tab is alive: its liveness stamp is fresh.
+    localStorage.setItem('whm_tab_alive:peer-tab', String(Date.now()))
 
     await api.post('/auth/logout', {})
     window.dispatchEvent(new Event('pagehide'))
@@ -969,6 +971,31 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     // No unordered keepalive: the open tab is told to take over instead.
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(heard.map((message) => message.type)).toEqual(['here', 'bye'])
+    releaseHolder()
+    FakeBroadcastChannel.channels.clear()
+  })
+
+  it('a closing tab still sends its logout when the other tab is frozen or gone', async () => {
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    FakeBroadcastChannel.channels.clear()
+    installWebLocks()
+    const releaseHolder = holdLockElsewhere()
+    const fetchSpy = vi.fn(async () => new Response('{}'))
+    vi.stubGlobal('fetch', fetchSpy)
+    localStorage.setItem('whm_session_id', 'session-closing-2')
+    const { api } = await loadTab(async (config) => ok(config))
+    recordPosts([])
+    const peer = new FakeBroadcastChannel('whm-tabs')
+    peer.postMessage({ type: 'hello', id: 'frozen-tab' })
+    // The other tab's liveness stamp is stale (frozen, discarded or crashed).
+    localStorage.setItem('whm_tab_alive:frozen-tab', String(Date.now() - 60_000))
+
+    await api.post('/auth/logout', {})
+    window.dispatchEvent(new Event('pagehide'))
+
+    const calls = fetchSpy.mock.calls as unknown as [string, RequestInit][]
+    expect(calls.map(([url]) => url)).toEqual(['/api/auth/refresh', '/api/auth/logout'])
+    expect(Number(localStorage.getItem('whm_logout_keepalive_at'))).toBeGreaterThan(0)
     releaseHolder()
     FakeBroadcastChannel.channels.clear()
   })
@@ -1016,6 +1043,245 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(JSON.parse(localStorage.getItem('whm_logout_pending')!)).toMatchObject({ marker: 'ended:session-last' })
     releaseHolder()
     FakeBroadcastChannel.channels.clear()
+  })
+
+  it('an SSO start or sign-in is refused while an earlier logout still fails, and that logout stays pending', async () => {
+    installWebLocks()
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
+    const { api, beginSsoSignIn, SESSION_BUSY_CODE } = await loadTab(adapter)
+    // An outage: the logout of session A never got through.
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    localStorage.setItem('whm_logout_pending', JSON.stringify({ marker: 'ended:session-a', csrf: 'csrf-token-1' }))
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke')) throw httpError(504)
+      if (label.startsWith('logout')) throw networkError()
+    })
+
+    await expect(beginSsoSignIn()).rejects.toMatchObject({ code: SESSION_BUSY_CODE })
+    await expect(api.post('/auth/login', { email: 'b@example.com', password: 'x' })).rejects.toMatchObject({ code: SESSION_BUSY_CODE })
+
+    expect(adapter).not.toHaveBeenCalled()
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+    expect(JSON.parse(localStorage.getItem('whm_logout_pending')!)).toMatchObject({ marker: 'ended:session-a' })
+
+    // Once the server is back, the next load finishes it.
+    order.length = 0
+    recordPosts(order)
+    const later = await loadTab(adapter)
+    await later.whenLogoutSettled()
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+    expect(localStorage.getItem('whm_logout_pending')).toBeNull()
+  })
+
+  it('an org switch is refused after the session ended, even with its logout still pending', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
+    const other = await loadTab(adapter)
+    const ending = await loadTab(adapter)
+    recordPosts([], (label) => {
+      if (label.startsWith('logout')) throw networkError()
+    })
+    await ending.api.post('/auth/logout', {})
+    await ending.whenLogoutSettled()
+    expect(localStorage.getItem('whm_logout_pending')).not.toBeNull()
+    const user = localStorage.getItem('user')
+
+    await expect(other.api.post('/auth/switch-org', { organization_id: 'org-2' }))
+      .rejects.toMatchObject({ code: 'ERR_CANCELED' })
+    expect(adapter).not.toHaveBeenCalled()
+    expect(localStorage.getItem('user')).toBe(user)
+  })
+
+  it("without Web Locks another tab's late refresh after a logout is revoked by that tab", async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    let releaseRefresh!: () => void
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve
+    })
+    const order: string[] = []
+    recordPosts(order, async (label) => {
+      if (label === 'refresh') {
+        await refreshGate
+        order.push('refresh landed')
+        return refreshOk()
+      }
+    })
+    const refreshing = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const request = refreshing.api.get('/contacts').then(() => 'resolved', () => 'rejected')
+    await vi.waitFor(() => expect(order).toEqual(['refresh']))
+
+    const ending = await loadTab(async (config) => ok(config))
+    await ending.api.post('/auth/logout', {})
+    await ending.whenLogoutSettled()
+    releaseRefresh()
+
+    expect(await request).toBe('rejected')
+    expect(order).toEqual([
+      'refresh', 'revoke csrf-token-1', 'logout csrf-token-1',
+      'refresh landed', 'revoke csrf-token-1', 'logout csrf-token-1',
+    ])
+  })
+
+  it('a sign-in queued before a takeover still finishes the taken-over logout first', async () => {
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    FakeBroadcastChannel.channels.clear()
+    installWebLocks()
+    const releaseHolder = holdLockElsewhere()
+    const order: string[] = []
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      order.push(config.url!)
+      return ok(config, { data: { expires_in: 900, user: {} } })
+    })
+    recordPosts(order)
+    const login = api.post('/auth/login', { email: 'b@example.com', password: 'x' })
+    await tick()
+    // A closing tab hands over its pending logout.
+    localStorage.setItem('whm_session_id', 'ended:session-closing')
+    localStorage.setItem('whm_logout_pending', JSON.stringify({ marker: 'ended:session-closing', csrf: 'csrf-token-1' }))
+    new FakeBroadcastChannel('whm-tabs').postMessage({ type: 'bye', id: 'closing-tab' })
+
+    releaseHolder()
+    await login
+    await whenLogoutSettled()
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1', '/auth/login'])
+    FakeBroadcastChannel.channels.clear()
+  })
+
+  it("a sign-in in a later page waits out a closed page's keepalive logout", async () => {
+    vi.useFakeTimers()
+    installWebLocks()
+    localStorage.setItem('whm_logout_keepalive_at', String(Date.now()))
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
+    const { api } = await loadTab(adapter)
+
+    const login = api.post('/auth/login', { email: 'b@example.com', password: 'x' })
+    await vi.advanceTimersByTimeAsync(14_000)
+    expect(adapter).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(2_000)
+    await login
+    expect(adapter).toHaveBeenCalledTimes(1)
+    expect(localStorage.getItem('whm_logout_keepalive_at')).toBeNull()
+  })
+
+  it('a sign-in that times out after its cookies were set undoes them before letting go', async () => {
+    installWebLocks()
+    const order: string[] = []
+    const { api, SESSION_BUSY_CODE } = await loadTab(async (config) => {
+      // The answer's cookies were stored, then the request timed out.
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      order.push('login (no answer)')
+      throw new AxiosError('timeout of 15000ms exceeded', AxiosError.ECONNABORTED, config)
+    })
+    recordPosts(order)
+    const marker = localStorage.getItem('whm_session_id')
+
+    const error = await api.post('/auth/login', { email: 'b@example.com', password: 'x' }).catch((e) => e)
+
+    expect(error.code).toBe(AxiosError.ECONNABORTED)
+    expect(error.code).not.toBe(SESSION_BUSY_CODE)
+    expect(order).toEqual(['login (no answer)', 'revoke csrf-of-b', 'logout csrf-of-b'])
+    // No session began.
+    expect(localStorage.getItem('whm_session_id')).toBe(marker)
+  })
+
+  it("without Web Locks a newer session in another tab aborts this tab's undo of a late switch", async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    let answer!: () => void
+    const gate = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    const signals: AbortSignal[] = []
+    const order: string[] = []
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      if (config.url === '/auth/switch-org') {
+        await gate
+        return ok(config, { data: { expires_in: 900, user: {} } })
+      }
+      return ok(config)
+    })
+    recordPosts(order, (label, options) => {
+      if (label.startsWith('revoke') && signals.length === 0 && order.length === 1) {
+        signals.push(options.signal)
+        return new Promise((_, reject) => {
+          options.signal.addEventListener('abort', () => reject(new AxiosError('canceled', AxiosError.ERR_CANCELED)))
+        })
+      }
+      return undefined
+    })
+    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    await tick()
+    // The session ends (another tab), so the late switch answer must be undone...
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    answer()
+    await vi.waitFor(() => expect(signals).toHaveLength(1))
+    // ...but meanwhile B signs in elsewhere: the undo stops at once.
+    localStorage.setItem('whm_session_id', 'session-b')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'whm_session_id', newValue: 'session-b' }))
+
+    expect(await switched).toBe('ERR_CANCELED')
+    await whenLogoutSettled()
+    expect(signals[0].aborted).toBe(true)
+    expect(order).toEqual(['revoke csrf-token-1'])
+  })
+
+  it('without Web Locks a sign-in still waits for the real holder after a logout before it timed out', async () => {
+    vi.useFakeTimers()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const sent: Array<[string, number]> = []
+    const start = Date.now()
+    const { api, whenLogoutSettled, SESSION_BUSY_CODE } = await loadTab(async (config) => {
+      sent.push([config.url!, Date.now() - start])
+      if (config.url === '/auth/switch-org') {
+        // A stalled server answers after 25 s.
+        await new Promise((resolve) => setTimeout(resolve, 25_000))
+      }
+      return ok(config, { data: { expires_in: 900, user: {} } })
+    })
+    recordPosts([])
+
+    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    await vi.advanceTimersByTimeAsync(100)
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(900)
+    const login = api.post('/auth/login', { email: 'b@example.com', password: 'x' }).catch((e) => e.code)
+    await vi.advanceTimersByTimeAsync(24_500)
+
+    // The logout's wait ran out at 20 s, but the sign-in still waited for the
+    // switch (the real holder), and was refused when its own wait ran out.
+    expect(await login).toBe(SESSION_BUSY_CODE)
+    expect(sent.map(([url]) => url)).toEqual(['/auth/switch-org'])
+    await vi.advanceTimersByTimeAsync(2_000)
+    await switched
+    await whenLogoutSettled()
+  })
+
+  it('an SSO start drops the organization a previous session selected', async () => {
+    installWebLocks()
+    localStorage.setItem('selected_organization_id', 'org-a')
+    const { beginSsoSignIn } = await loadTab(async (config) => ok(config))
+
+    await beginSsoSignIn()
+
+    expect(localStorage.getItem('selected_organization_id')).toBeNull()
+  })
+
+  it("the SSO callback's /me carries no organization a previous session selected", async () => {
+    localStorage.setItem('selected_organization_id', 'org-a')
+    stubLocation('/auth/sso/callback')
+    setCookie('whm_csrf=csrf-of-b; path=/')
+    const seen: Array<string | undefined> = []
+    const { api } = await loadTab(async (config) => {
+      seen.push(config.headers.get('X-Organization-ID') as string | undefined)
+      return ok(config, { data: { id: 'user-b' } })
+    })
+
+    await api.get('/me')
+
+    expect(seen).toEqual([undefined])
+    expect(localStorage.getItem('selected_organization_id')).toBeNull()
   })
 
   it('an SSO callback that completes while a logout is queued is never revoked', async () => {
@@ -1269,7 +1535,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     void signIn.api.post('/auth/login', { email: 'a@example.com', password: 'x' })
     await vi.advanceTimersByTimeAsync(10)
     void other.api.get('/contacts').catch(() => undefined)
-    await vi.advanceTimersByTimeAsync(30_000)
+    await vi.advanceTimersByTimeAsync(55_000)
     expect(order).toEqual([])
 
     await vi.advanceTimersByTimeAsync(6_000)

@@ -115,10 +115,21 @@ const handleLogin = async () => {
     router.push(redirect || '/')
   } catch (error: any) {
     // A sign-in that could not be ordered after an earlier logout in time is
-    // refused, not sent: the user just tries again.
-    const message = error?.code === SESSION_BUSY_CODE
-      ? t('errors.timeout')
-      : error.response?.data?.message || t('auth.invalidCredentials')
+    // refused, not sent; a timeout or a lost answer is not a wrong password
+    // either. In both cases the user just tries again.
+    let message: string
+    if (
+      error?.code === SESSION_BUSY_CODE ||
+      error?.code === 'ERR_CANCELED' ||
+      error?.code === 'ECONNABORTED' ||
+      error?.code === 'ETIMEDOUT'
+    ) {
+      message = t('errors.timeout')
+    } else if (!error?.response) {
+      message = t('errors.network')
+    } else {
+      message = error.response.data?.message || t('auth.invalidCredentials')
+    }
     toast.error(message)
   } finally {
     isLoading.value = false

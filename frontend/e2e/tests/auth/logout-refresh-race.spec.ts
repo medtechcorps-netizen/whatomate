@@ -11,9 +11,11 @@ import { loginAsAdmin, logout, TEST_USERS, type TestUser } from '../../helpers'
 // a separate request context (its own cookie jar), so the browser's jar only
 // changes when route.fulfill delivers it. Each test first proves that.
 //
-// Negative control: against 3d086ef5 (before R1-AUTH-1) the ordering
+// Negative controls: against 3d086ef5 (before R1-AUTH-1) the ordering
 // assertions here fail (the revoke and logout go out before the refresh
-// lands, and the late Set-Cookie signs the browser back in).
+// lands, and the late Set-Cookie signs the browser back in). Against 04344c17
+// the 7 s case fails: the revoke was only raced, not aborted, so its late
+// answer cleared the next session's cookies.
 
 type Held = {
   started: Promise<void>
@@ -273,7 +275,7 @@ test.describe('Logout during a token refresh', () => {
     await idp.dispose()
   })
 
-  test('a revoke still pending at the 7 s budget is aborted, so its late answer cannot clear the next session', async ({
+  test('a revoke still pending at the 7 s budget is aborted before the next sign-in goes out', async ({
     page,
     context,
     playwright,
@@ -282,23 +284,34 @@ test.describe('Logout during a token refresh', () => {
     const newContext = () => playwright.request.newContext({ baseURL })
     await loginAsAdmin(page)
     const originalRefresh = await cookieValue(context, 'whm_refresh')
-    const order: string[] = []
-    recordSessionRequests(context, order)
-    let revokeAborted = false
+    const isRevoke = (request: { url(): string; postData(): string | null }) =>
+      request.url().endsWith('/api/auth/refresh') && (request.postData() ?? '').includes('"revoke"')
+    let attempts = 0
+    let lastAttempt: unknown = null
+    let lastAttemptFailedAt = 0
+    let loginSentAt = 0
     page.on('requestfailed', (request) => {
-      if (request.url().endsWith('/api/auth/refresh') && (request.postData() ?? '').includes('"revoke"')) {
-        revokeAborted = true
-      }
+      if (request === lastAttempt) lastAttemptFailedAt = Date.now()
     })
-    // The real revoke runs upstream (it clears cookies in its answer), but
-    // the answer reaches the browser only after 9 s.
-    let lateAnswerDelivered = false
+    page.on('request', (request) => {
+      if (request.url().endsWith('/api/auth/login') && !loginSentAt) loginSentAt = Date.now()
+    })
+    // Attempts 1 and 2 are rate-limited, so attempt 3 goes out at ~3 s. It
+    // reaches the real server (which revokes and clears the cookies in its
+    // answer), but the answer is held for 9 s: past the 7 s budget and before
+    // the attempt's own 5 s timeout would fire.
     await page.route('**/api/auth/refresh', async (route) => {
       const request = route.request()
-      if (!(request.postData() ?? '').includes('"revoke"')) {
+      if (!isRevoke(request)) {
         await route.continue()
         return
       }
+      attempts++
+      if (attempts <= 2) {
+        await route.fulfill({ status: 429, json: { status: 'error', message: 'Too many requests' } })
+        return
+      }
+      lastAttempt = request
       const upstream = await newContext()
       const headers = await request.allHeaders()
       delete headers['content-length']
@@ -309,25 +322,30 @@ test.describe('Logout during a token refresh', () => {
         data: request.postDataBuffer() ?? undefined,
       })
       await new Promise((resolve) => setTimeout(resolve, 9_000))
-      try {
-        await route.fulfill({ response })
-        lateAnswerDelivered = true
-      } catch {
-        // The browser already gave up on it.
-      }
+      await route.fulfill({ response }).catch(() => undefined)
       await upstream.dispose()
     })
 
+    const clickedAt = Date.now()
     await logout(page)
     await expect(page).toHaveURL(/\/login/)
-    // B signs in as soon as the logout lets go of the lock (after ~7 s).
+    // B signs in at once; the sign-in waits for the logout to let go.
     await signInHere(page, TEST_USERS.manager)
-    await page.waitForTimeout(4_000)
 
-    expect(revokeAborted).toBe(true)
-    expect(lateAnswerDelivered).toBe(false)
-    expect(order.slice(0, 2)).toEqual(['revoke', 'logout'])
-    // B's session survived the late answer.
+    // The pending attempt was aborted at the budget (~7 s), before the
+    // sign-in request went out.
+    expect(attempts).toBe(3)
+    expect(lastAttemptFailedAt).toBeGreaterThan(0)
+    expect(lastAttemptFailedAt - clickedAt).toBeGreaterThan(6_000)
+    expect(lastAttemptFailedAt - clickedAt).toBeLessThan(8_500)
+    expect(lastAttemptFailedAt).toBeLessThanOrEqual(loginSentAt)
+
+    // After the moment the held answer would have landed, B's session is the
+    // one in the jar and it works.
+    await page.waitForTimeout(Math.max(0, clickedAt + 14_000 - Date.now()))
+    const refreshB = await cookieValue(context, 'whm_refresh')
+    expect(refreshB).toBeTruthy()
+    expect(refreshB).not.toBe(originalRefresh)
     const me = await page.request.get('/api/me')
     expect(me.status()).toBe(200)
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
