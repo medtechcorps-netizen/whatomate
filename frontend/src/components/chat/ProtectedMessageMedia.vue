@@ -22,7 +22,8 @@ import MediaPreviewDialog, { type MediaPreviewSource } from './MediaPreviewDialo
 const props = defineProps<{
   // Workspace the transcript was requested from; every request is pinned to it.
   organizationId: string
-  message: Pick<Message, 'id' | 'message_type' | 'media_url' | 'media_mime_type' | 'media_filename' | 'content'>
+  message: Pick<Message, 'id' | 'message_type' | 'media_url' | 'media_mime_type' | 'media_filename' | 'content'> &
+    Partial<Pick<Message, 'status'>>
 }>()
 
 const { t } = useI18n()
@@ -44,6 +45,19 @@ const progress = ref<number | null>(null)
 let requestController: AbortController | null = null
 let releaseSlot: (() => void) | null = null
 let generation = 0
+
+// A forwarded message appears before the server has copied its media, so an
+// image in it can first answer 404. Once the message's status moves on (the
+// copy runs before the send), an image whose load failed loads again by
+// itself: at most once per wait below, then only by Retry. Each new media
+// gets a fresh budget. Only the media is fetched again; nothing here sends a
+// message. Other kinds load only when the agent asks, so they keep Retry.
+const AUTO_RELOAD_WAITS = [1_000, 5_000, 15_000]
+let autoReloadTimer: ReturnType<typeof setTimeout> | null = null
+let autoReloadsUsed = 0
+let autoReloadEpoch = 0
+// The message status when the last failed load started, if one failed.
+let failedAtStatus: string | undefined
 
 const kind = computed<ChatMediaKind>(() => {
   const { message_type: type, media_mime_type: mimeType } = props.message
@@ -126,6 +140,7 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
   }
 
   status.value = 'loading'
+  const startedAtStatus = props.message.status
   const controller = new AbortController()
   requestController = controller
   let slot: (() => void) | null = null
@@ -159,7 +174,10 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
     status.value = 'ready'
     return mediaURL.value
   } catch {
-    if (requestGeneration === generation) status.value = 'error'
+    if (requestGeneration === generation) {
+      failedAtStatus = startedAtStatus
+      status.value = 'error'
+    }
     return ''
   } finally {
     slot?.()
@@ -197,7 +215,32 @@ async function playMedia() {
   }
 }
 
+function cancelAutoReload() {
+  autoReloadEpoch++
+  if (autoReloadTimer) clearTimeout(autoReloadTimer)
+  autoReloadTimer = null
+}
+
+function scheduleAutoReload() {
+  if (autoReloadTimer || autoReloadsUsed >= AUTO_RELOAD_WAITS.length) return
+  if (!loadsAutomatically.value || status.value !== 'error') return
+  const epoch = autoReloadEpoch
+  autoReloadTimer = setTimeout(async () => {
+    autoReloadTimer = null
+    const url = await loadMedia()
+    // Media still missing waits longer before the next try.
+    if (!url && epoch === autoReloadEpoch) scheduleAutoReload()
+  }, AUTO_RELOAD_WAITS[autoReloadsUsed++])
+}
+
+// A status that differs from the one a failed load started at, including a
+// change that landed while that load was still running.
+watch([() => props.message.status, status], ([messageStatus, mediaStatus]) => {
+  if (mediaStatus === 'error' && failedAtStatus !== undefined && messageStatus !== failedAtStatus) scheduleAutoReload()
+})
+
 function retry() {
+  cancelAutoReload()
   if (kind.value === 'document') void openDocument()
   else if (kind.value === 'video' || kind.value === 'audio') void playMedia()
   else void loadMedia({ userInitiated: true })
@@ -228,6 +271,9 @@ watch(
     () => props.message.message_type,
   ],
   () => {
+    cancelAutoReload()
+    autoReloadsUsed = 0
+    failedAtStatus = undefined
     releaseMedia()
     status.value = 'idle'
     if (loadsAutomatically.value) void loadMedia()
@@ -237,7 +283,10 @@ watch(
   { immediate: true, flush: 'sync' },
 )
 
-onBeforeUnmount(releaseMedia)
+onBeforeUnmount(() => {
+  cancelAutoReload()
+  releaseMedia()
+})
 </script>
 
 <template>
