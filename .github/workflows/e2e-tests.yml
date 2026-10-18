@@ -20,7 +20,7 @@ concurrency:
 jobs:
   e2e-shard:
     name: e2e-shard-${{ matrix.shard }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -267,7 +267,7 @@ jobs:
     name: e2e
     if: always()
     needs: [e2e-shard, canary-local]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Verify all E2E shards passed
         env:
