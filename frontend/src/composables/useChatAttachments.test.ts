@@ -1201,7 +1201,7 @@ describe('useChatAttachments round 4: workspace identity, holds and teardown', (
     expect(holds.size).toBe(0)
   })
 
-  it('B-FU12-1: any bare 5xx after the full upload is unconfirmed; an enveloped 5xx stays failed', async () => {
+  it('B-FU12-1: any 5xx after the full upload is unconfirmed, bare or enveloped; a 4xx stays failed', async () => {
     const cases: Array<[unknown, string]> = [
       [Object.assign(new Error('520'), { response: { status: 520, data: '<html>Web server is returning an unknown error</html>' } }), 'unconfirmed'],
       [Object.assign(new Error('500'), { response: { status: 500, data: '' } }), 'unconfirmed'],
@@ -1285,5 +1285,69 @@ describe('useChatAttachments round 5: enveloped 5xx and stale persisted user', (
     expect(calls[0].signal.aborted).toBe(true)
     await done
     expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+})
+
+describe('useChatAttachments round 6: account in the identity', () => {
+  afterEach(() => {
+    setSelectedOrganizationId('cleanup')
+    localStorage.clear()
+  })
+
+  it('R5-B-1: another account signing in through SSO in another tab ends the batch, even with a stored key', async () => {
+    setSelectedOrganizationId('org-A')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-A', 'agent-1'),
+    }
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // SSO in another tab writes 'user' for a different account; the key is untouched.
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-2', organization_id: 'org-B' }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+
+  it('R5-B-I3: in a suppressed tab, the other tab\'s user write alone (before its key write) already stops the batch', async () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    clearBrowserOrganizationIdentity()
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-A', 'agent-1'),
+    }
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // switch-org in the other tab: applyAuth writes 'user' first...
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+    expect(calls[0].signal.aborted).toBe(true)
+    // ...and the selection key afterwards: nothing more happens.
+    localStorage.setItem('selected_organization_id', 'org-B')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'selected_organization_id' }))
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+
+  it('a same-agent stale rewrite still does not cancel (no false cancel from the account part)', () => {
+    setSelectedOrganizationId('org-B')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    const before = readWorkspaceIdentity('org-B', 'agent-1')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A', is_available: false }))
+    expect(readWorkspaceIdentity('org-B', 'agent-1')).toBe(before)
   })
 })

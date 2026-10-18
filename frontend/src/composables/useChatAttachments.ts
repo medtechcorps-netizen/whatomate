@@ -177,14 +177,18 @@ function readStorage(key: string): string | null {
   }
 }
 
-function persistedUserOrganizationId(): string | null {
+function persistedUser(): { id: string | null; organizationId: string | null } {
   const raw = readStorage(PERSISTED_USER_STORAGE_KEY)
-  if (!raw) return null
+  if (!raw) return { id: null, organizationId: null }
   try {
-    const user = JSON.parse(raw) as { organization_id?: unknown } | null
-    return user && typeof user.organization_id === 'string' ? user.organization_id : null
+    const user = JSON.parse(raw) as { id?: unknown; organization_id?: unknown } | null
+    const id = user?.id
+    return {
+      id: typeof id === 'string' || typeof id === 'number' ? String(id) : null,
+      organizationId: user && typeof user.organization_id === 'string' ? user.organization_id : null,
+    }
   } catch {
-    return null
+    return { id: null, organizationId: null }
   }
 }
 
@@ -196,8 +200,12 @@ function persistedUserOrganizationId(): string | null {
  *   for life, see clearBrowserOrganizationIdentity, but still sees another
  *   tab's write); while none is stored, the token organization from the
  *   persisted user (the cookie/JWT org), else the in-memory user's;
- * - the in-memory user's organization (reactive, same tab).
- * Once a selected organization is stored, the persisted user is ignored:
+ * - the in-memory user's organization (reactive, same tab);
+ * - the persisted user's id (else the in-memory one), never gated by the
+ *   stored selection: a sign-in by another account in another tab (SSO
+ *   writes 'user' but not the selection key) ends the batch.
+ * Once a selected organization is stored, the persisted user's organization
+ * is ignored:
  * switch-org and selectOrganization always write that key, while any stale
  * tab can rewrite 'user' with its old organization (e.g. an availability
  * toggle), which must not cancel a batch going to the right workspace.
@@ -205,10 +213,15 @@ function persistedUserOrganizationId(): string | null {
  * its own organization after page load is not a switch, and store fields
  * that initialise late are not part of it.
  */
-export function readWorkspaceIdentity(inMemoryOrganizationId?: string | null): string {
+export function readWorkspaceIdentity(
+  inMemoryOrganizationId?: string | null,
+  inMemoryUserId?: string | number | null,
+): string {
   const storedSelection = readStorage(SELECTED_ORGANIZATION_STORAGE_KEY)
-  const workspace = storedSelection || persistedUserOrganizationId() || inMemoryOrganizationId || ''
-  return JSON.stringify([workspace, inMemoryOrganizationId ?? ''])
+  const persisted = persistedUser()
+  const workspace = storedSelection || persisted.organizationId || inMemoryOrganizationId || ''
+  const account = persisted.id || (inMemoryUserId === null || inMemoryUserId === undefined ? '' : String(inMemoryUserId))
+  return JSON.stringify([workspace, inMemoryOrganizationId ?? '', account])
 }
 
 let batchSequence = 0

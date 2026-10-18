@@ -269,7 +269,7 @@ const chatAttachments = useChatAttachments({
     // The workspace requests go to (override or token organization, in this
     // tab or written by another): any change ends the batch instead of
     // re-scoping it.
-    workspace: () => readWorkspaceIdentity(authStore.user?.organization_id ?? null),
+    workspace: () => readWorkspaceIdentity(authStore.user?.organization_id ?? null, authStore.user?.id ?? null),
     logicalSession: readLogicalSessionMarker,
   },
   // Coordinated boundary: the workspace switcher refuses while files are sending.
