@@ -548,7 +548,7 @@ func TestH1GeneratedApply_GuardFailurePreservesIncomingHistory(t *testing.T) {
 		f.model.unblock()
 		err := h1GeneratedResult(t, h1GeneratedStart(t, f, nil))
 		require.True(t, injected.Load())
-		require.ErrorContains(t, err, sentinel)
+		require.ErrorContains(t, err, "provider attempt did not reach a confirmed sent state")
 		require.True(t, inboundContinuationRequiresManualReview(err))
 		require.EqualValues(t, 1, f.model.calls.Load())
 		require.Equal(t, 1, h1GeneratedSentCount(f))
