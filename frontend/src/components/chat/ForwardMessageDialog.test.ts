@@ -8,6 +8,8 @@ import {
   MAX_FORWARD_TARGETS,
   canOfferForward,
   forwardSourceBlock,
+  classifyForwardError,
+  forwardDeliveryState,
   forwardTargetBlock,
   isForwardedMessage,
 } from './messageForward'
@@ -322,3 +324,76 @@ describe('ForwardMessageDialog', () => {
     }
   })
 })
+
+function httpError(status: number, data: Record<string, unknown> = {}) {
+  return Object.assign(new Error(`Request failed with status code ${status}`), {
+    isAxiosError: true,
+    response: { status, data },
+  })
+}
+
+describe('forward capacity contract (client)', () => {
+  it('classifies a failed request by the server contract', () => {
+    expect(classifyForwardError(httpError(503, { error_type: 'forward_temporarily_unavailable' }))).toBe('retryable')
+    expect(classifyForwardError(httpError(503, {}))).toBe('uncertain')
+    expect(classifyForwardError(httpError(500, { error_type: 'forward_outcome_unknown' }))).toBe('uncertain')
+    expect(classifyForwardError(httpError(502))).toBe('uncertain')
+    expect(classifyForwardError(Object.assign(new Error('timeout of 0ms exceeded'), { isAxiosError: true }))).toBe('uncertain')
+    expect(classifyForwardError(httpError(409, { error_type: 'forward_window_closed' }))).toBe('failed')
+    expect(classifyForwardError(httpError(429, { error_type: 'forward_rate_limited' }))).toBe('failed')
+  })
+
+  it('reads the server-derived delivery state of a stalled forward', () => {
+    expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'interrupted' } as Message)).toBe('interrupted')
+    expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'uncertain' } as Message)).toBe('uncertain')
+    expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'other' } as Message)).toBeNull()
+    expect(forwardDeliveryState(message())).toBeNull()
+  })
+
+  async function confirmTargets(...ids: string[]) {
+    await openDialog()
+    await pick(...ids)
+    await click('chat-forward-next')
+    await click('chat-forward-confirm')
+    await flushPromises()
+  }
+
+  const row = (id: string) => document.body.querySelector(`[data-testid="chat-forward-results"] li:nth-child(${id})`)!
+
+  it('offers a manual retry, for that target only, when nothing was sent (503)', async () => {
+    mocks.sendMessage.mockImplementation(async (contactId: string) => {
+      if (contactId === '2') throw httpError(503, { error_type: 'forward_temporarily_unavailable', message: 'The server is busy, so this forward was not sent.' })
+      return { id: `m-${contactId}`, status: 'pending' }
+    })
+    await confirmTargets('1', '2')
+    expect(row('2').getAttribute('data-state')).toBe('retryable')
+    expect(row('2').textContent).toContain('chat.forward.retryable')
+    const calls = () => mocks.sendMessage.mock.calls.filter(call => call[0] === '2').length
+    expect(calls()).toBe(1)
+    await flushPromises()
+    expect(calls()).toBe(1) // never retried by itself
+
+    mocks.sendMessage.mockResolvedValue({ id: 'm-2b', status: 'pending' })
+    await click('chat-forward-retry-2')
+    await flushPromises()
+    expect(calls()).toBe(2)
+    expect(mocks.sendMessage.mock.calls.filter(call => call[0] === '1')).toHaveLength(1)
+    expect(row('2').getAttribute('data-state')).toBe('queued')
+    expect(document.body.querySelector('[data-testid="chat-forward-retry-2"]')).toBeNull()
+  })
+
+  it('says a forward may have been sent, and never retries, when the outcome is unknown', async () => {
+    mocks.sendMessage.mockImplementation(async (contactId: string) => {
+      if (contactId === '1') throw httpError(500, { error_type: 'forward_outcome_unknown' })
+      throw Object.assign(new Error('Network Error'), { isAxiosError: true })
+    })
+    await confirmTargets('1', '2')
+    expect(row('1').getAttribute('data-state')).toBe('uncertain')
+    expect(row('2').getAttribute('data-state')).toBe('uncertain')
+    expect(row('1').textContent).toContain('chat.forward.uncertain')
+    expect(document.body.querySelector('[data-testid="chat-forward-uncertain"]')!.textContent).toContain('chat.forward.uncertainNote')
+    expect(document.body.querySelector('[data-testid^="chat-forward-retry-"]')).toBeNull()
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(2)
+  })
+})
+

@@ -398,6 +398,12 @@
       "failed": "Could not forward",
       "unconfirmed": "Not confirmed yet",
       "unconfirmedNote": "Delivery isn't confirmed yet. Open the chat to check whether the message was sent.",
+      "retryable": "Not sent: server busy",
+      "retry": "Try again",
+      "uncertain": "May have been forwarded",
+      "uncertainNote": "The server could not confirm a forward. Open that chat to check before forwarding again.",
+      "interruptedNote": "Not sent: a server restart interrupted this forward. Forward it again from the original message.",
+      "uncertainDeliveryNote": "May have been sent before a server restart. Check with the customer before forwarding again.",
       "done": "Done",
       "chip": "Forwarded",
       "chipHint": "Forwarded by your team. The customer sees an ordinary message."

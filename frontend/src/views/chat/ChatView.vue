@@ -122,7 +122,7 @@ import MessageActions from '@/components/chat/MessageActions.vue'
 import MessageContextMenu from '@/components/chat/MessageContextMenu.vue'
 import ForwardMessageDialog from '@/components/chat/ForwardMessageDialog.vue'
 import ForwardedChip from '@/components/chat/ForwardedChip.vue'
-import { isForwardedMessage } from '@/components/chat/messageForward'
+import { forwardDeliveryState, isForwardedMessage } from '@/components/chat/messageForward'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
 import MediaSendDialog from '@/components/chat/MediaSendDialog.vue'
@@ -2864,7 +2864,7 @@ watch(contactId, () => chatAttachments.reset())
                   message.direction === 'outgoing' ? 'chat-bubble-outgoing' : 'chat-bubble-incoming'
                 ]"
               >
-                <ForwardedChip v-if="isForwardedMessage(message)" />
+                <ForwardedChip v-if="isForwardedMessage(message)" :state="forwardDeliveryState(message)" />
                 <!-- Reply preview (if this message is replying to another) -->
                 <div
                   v-if="message.is_reply && message.reply_to_message"

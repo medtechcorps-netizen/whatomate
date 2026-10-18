@@ -2,7 +2,9 @@ package handlers_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -563,4 +565,115 @@ func TestLaneEForwardRefusesDeletedSource(t *testing.T) {
 	req = f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": softDeleted.ID.String()})
 	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))
 	assert.Empty(t, f.messagesFor(t, f.target.ID))
+}
+
+// Q5 (definite rejection): a failure before anything is persisted answers 503
+// forward_temporarily_unavailable; nothing is saved and nothing reaches Meta.
+func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	text := f.storedMessage(t, f.source, models.MessageTypeText, "first", "")
+	// Warm the permission cache with one ordinary forward.
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	sentBefore := f.mock.sentMessageCount()
+
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	healthy := f.app.DB
+	f.app.DB = f.app.DB.WithContext(expired)
+	req = f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
+	f.app.DB = healthy
+
+	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
+	assert.Len(t, f.messagesFor(t, f.target.ID), 1, "only the warm-up forward exists")
+	assert.Equal(t, sentBefore, f.mock.sentMessageCount())
+}
+
+// Q5 (ambiguous acceptance): outside a request transaction the pending
+// message has its own COMMIT, so a send-phase failure is reported as
+// forward_outcome_unknown, and the server makes exactly one attempt.
+func TestLaneEForwardAmbiguousFailureIsNeverRetried(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	text := f.storedMessage(t, f.source, models.MessageTypeText, "ambiguous", "")
+	f.app.WaitForBackgroundTasks()
+	attempts := 0
+	target := f.target.ID
+	name := "laneE:ambiguous_forward_" + uuid.NewString()
+	require.NoError(t, f.app.DB.Callback().Create().Before("gorm:create").Register(name, func(db *gorm.DB) {
+		if message, ok := db.Statement.Dest.(*models.Message); ok && message.ContactID == target {
+			attempts++
+			_ = db.AddError(errors.New("synthetic: commit outcome unknown"))
+		}
+	}))
+	t.Cleanup(func() { _ = f.app.DB.Callback().Create().Remove(name) })
+
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
+	assert.Equal(t, fasthttp.StatusInternalServerError, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	envelope := laneERefusal(t, req)
+	assert.Equal(t, "forward_outcome_unknown", envelope.ErrorType)
+	assert.Contains(t, envelope.Message, "may have been sent")
+	assert.Equal(t, 1, attempts, "never a second automatic attempt")
+	assert.Zero(t, f.mock.sentMessageCount())
+}
+
+// Q6: each persisted forward left behind by a process exit shows a visible
+// state, and the delivered one records the provider phase before sending.
+func TestLaneEForwardProcessExitStatesAreVisible(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	text := f.storedMessage(t, f.source, models.MessageTypeText, "delivered normally", "")
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	delivered := f.messagesFor(t, f.target.ID)
+	require.Len(t, delivered, 1)
+	assert.Equal(t, models.MessageStatusSent, delivered[0].Status)
+	assert.Equal(t, "provider", delivered[0].Metadata["forward_dispatch"], "the provider phase is recorded before the send")
+
+	longAgo := time.Now().Add(-10 * time.Minute)
+	seed := func(dispatch models.JSONB) uuid.UUID {
+		metadata := models.JSONB{"forwarded_from": map[string]any{"message_id": text.ID.String(), "contact_id": f.source.ID.String()}}
+		for key, value := range dispatch {
+			metadata[key] = value
+		}
+		row := &models.Message{
+			BaseModel:       models.BaseModel{ID: uuid.New(), CreatedAt: longAgo, UpdatedAt: longAgo},
+			OrganizationID:  f.org.ID,
+			WhatsAppAccount: f.account.Name,
+			ContactID:       f.target.ID,
+			Direction:       models.DirectionOutgoing,
+			MessageType:     models.MessageTypeText,
+			Content:         "stalled",
+			Status:          models.MessageStatusPending,
+			SentByUserID:    &f.user.ID,
+			Metadata:        metadata,
+		}
+		require.NoError(t, f.app.DB.Create(row).Error)
+		require.NoError(t, f.app.DB.Model(&models.Message{}).Where("id = ?", row.ID).
+			UpdateColumns(map[string]any{"created_at": longAgo, "updated_at": longAgo}).Error)
+		return row.ID
+	}
+	// (a) the process exited before the provider phase was recorded.
+	interrupted := seed(models.JSONB{"forward_dispatch": "queued"})
+	// (b) the process exited after it: the send may have happened.
+	uncertain := seed(models.JSONB{"forward_dispatch": "provider", "forward_dispatch_at": longAgo.UTC().Format(time.RFC3339Nano)})
+
+	list := testutil.NewGETRequest(t)
+	testutil.SetAuthContext(list, f.org.ID, f.user.ID)
+	testutil.SetPathParam(list, "id", f.target.ID.String())
+	require.NoError(t, f.app.GetMessages(list))
+	var listed struct {
+		Data struct {
+			Messages []handlers.MessageResponse `json:"messages"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(list), &listed))
+	states := map[uuid.UUID]string{}
+	for _, message := range listed.Data.Messages {
+		states[message.ID] = message.ForwardDeliveryState
+	}
+	assert.Equal(t, "interrupted", states[interrupted])
+	assert.Equal(t, "uncertain", states[uncertain])
+	assert.Equal(t, "", states[delivered[0].ID])
+	// Neither stalled row is resent by anything on the read path.
+	assert.Equal(t, 1, f.mock.sentMessageCount())
 }

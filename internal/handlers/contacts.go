@@ -81,6 +81,9 @@ type MessageResponse struct {
 	// IsForwarded marks an agent forward for the CRM only; the customer
 	// receives an ordinary message.
 	IsForwarded bool `json:"is_forwarded,omitempty"`
+	// ForwardDeliveryState is "interrupted" (not sent) or "uncertain" (may
+	// have been sent) for a forward stalled by a process exit.
+	ForwardDeliveryState string `json:"forward_delivery_state,omitempty"`
 }
 
 // ReplyPreview contains a preview of the replied-to message
@@ -1182,6 +1185,7 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 			UpdatedAt:           m.UpdatedAt,
 			IsForwarded:         messageIsForwarded(m.Metadata),
 		}
+		msgResp.ForwardDeliveryState = forwardDeliveryState(&m, time.Now())
 
 		if m.IsReply && m.ReplyToMessageID != nil {
 			replyToID := m.ReplyToMessageID.String()

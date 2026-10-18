@@ -147,4 +147,10 @@ describe('MessageActions', () => {
     await forward.trigger('click')
     expect(wrapper.findComponent(MessageActions).emitted('forward')?.[0]?.[0]).toMatchObject({ id: 'm-1' })
   })
+
+  it('never offers Retry on a failed forwarded bubble (it is forwarded again instead)', () => {
+    const failedForward = { ...message({ direction: 'outgoing', status: 'failed' }), is_forwarded: true } as Message
+    expect(mountActions({ message: failedForward }).findAll('[class*="lucide-rotate-cw"]')).toHaveLength(0)
+  })
 })
+

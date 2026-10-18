@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { Message } from '@/stores/contacts'
-import { canOfferForward } from './messageForward'
+import { canOfferForward, isForwardedMessage } from './messageForward'
 
 /**
  * Per-bubble action strip (react, reply, forward, retry). It keeps the
@@ -43,10 +43,13 @@ const forwardLabel = computed(() => t('chat.forward.action'))
 
 const showForward = computed(() => props.canForward === true && canOfferForward(props.message))
 
+// A forwarded bubble is never re-sent from here: its content lives on the
+// original message, so a failed or interrupted forward is forwarded again.
 const canRetry = computed(() =>
   props.message.direction === 'outgoing' &&
   props.message.status === 'failed' &&
-  props.message.message_type !== 'template',
+  props.message.message_type !== 'template' &&
+  !isForwardedMessage(props.message),
 )
 </script>
 

@@ -51,3 +51,34 @@ export function forwardTargetBlock(contact: Pick<Contact, 'service_window_open' 
   if (contact.service_window_open !== true) return 'window_closed'
   return null
 }
+
+export type ForwardFailure = 'retryable' | 'uncertain' | 'failed'
+
+/**
+ * The server's forward contract for a request that did not return 2xx:
+ * - 503 forward_temporarily_unavailable: definitely not accepted (nothing was
+ *   saved or sent), so a manual retry is safe;
+ * - any other 5xx, or no response at all: it may have been accepted, so the
+ *   agent must check the chat; never retried automatically;
+ * - 4xx: a refusal (window closed, identity review, ...), not sent.
+ */
+export function classifyForwardError(error: unknown): ForwardFailure {
+  const response = (error as { response?: { status?: number; data?: { error_type?: string } } } | null)?.response
+  const status = response?.status
+  if (!status) return 'uncertain'
+  if (status === 503 && response?.data?.error_type === 'forward_temporarily_unavailable') return 'retryable'
+  if (status >= 500) return 'uncertain'
+  return 'failed'
+}
+
+export type ForwardDeliveryState = 'interrupted' | 'uncertain' | null
+
+/**
+ * Server-derived state of a forward stalled by a process exit:
+ * "interrupted" was never sent; "uncertain" may have been sent.
+ */
+export function forwardDeliveryState(message: Message): ForwardDeliveryState {
+  const state = (message as Message & { forward_delivery_state?: string }).forward_delivery_state
+  return state === 'interrupted' || state === 'uncertain' ? state : null
+}
+

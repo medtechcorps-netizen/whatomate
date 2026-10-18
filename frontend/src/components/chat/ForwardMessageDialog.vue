@@ -18,6 +18,7 @@ import { getErrorMessage } from '@/lib/api-utils'
 import { useContactsStore, type Contact, type Message } from '@/stores/contacts'
 import {
   MAX_FORWARD_TARGETS,
+  classifyForwardError,
   forwardSourceBlock,
   forwardTargetBlock,
   type ForwardTargetBlock,
@@ -32,6 +33,10 @@ import {
  * A 200 only means the message was queued: delivery runs after commit. Each
  * target therefore shows Queued, then Sent or Failed from the live status
  * events for its message id, or a "not confirmed" note after a timeout.
+ *
+ * A failed request follows the server's contract (classifyForwardError): a
+ * definite "not sent" (503) offers a manual Try again for that target only; an
+ * ambiguous failure says it may have been forwarded and is never retried.
  */
 const props = defineProps<{
   open: boolean
@@ -48,7 +53,7 @@ const { t } = useI18n()
 const contactsStore = useContactsStore()
 
 type Step = 'pick' | 'confirm' | 'results'
-type ResultState = 'pending' | 'sending' | 'queued' | 'sent' | 'failed' | 'unconfirmed'
+type ResultState = 'pending' | 'sending' | 'queued' | 'sent' | 'failed' | 'unconfirmed' | 'retryable' | 'uncertain'
 interface TargetResult {
   contact: Contact
   state: ResultState
@@ -73,6 +78,7 @@ const results = ref<TargetResult[]>([])
 const sourceBlock = computed(() => (props.message ? forwardSourceBlock(props.message) : 'unsupported'))
 const isSending = computed(() => results.value.some(r => r.state === 'pending' || r.state === 'sending'))
 const hasUnconfirmed = computed(() => results.value.some(r => r.state === 'unconfirmed'))
+const hasUncertain = computed(() => results.value.some(r => r.state === 'uncertain'))
 const sentCount = computed(() => results.value.filter(r => r.state === 'sent').length)
 const limitReached = computed(() => selected.value.length >= MAX_FORWARD_TARGETS)
 
@@ -235,32 +241,55 @@ async function forwardAll() {
   // Sequential on purpose: one short request at a time keeps the server's
   // connection use flat, and each result can be shown as it lands.
   for (const result of results.value) {
-    result.state = 'sending'
-    try {
-      const created = await contactsStore.sendMessage(result.contact.id, 'text', {}, undefined, undefined, {
-        forwardOfMessageId: message.id,
-      })
-      result.messageId = created?.id ? String(created.id) : undefined
-      result.state = 'queued'
-      if (result.messageId) {
-        const early = earlyStatuses.get(result.messageId)
-        earlyStatuses.delete(result.messageId)
-        applyStatus(result.messageId, early?.status ?? String(created?.status ?? ''), early?.error ?? created?.error_message)
-      }
-    } catch (error) {
-      result.state = 'failed'
-      result.error = getErrorMessage(error, t('chat.forward.failed'))
-    }
+    await sendTo(result, message.id)
   }
+  settleWatching()
+}
+
+/** One forward request for one target. Exactly one request per call. */
+async function sendTo(result: TargetResult, sourceId: string) {
+  result.state = 'sending'
+  result.error = undefined
+  try {
+    const created = await contactsStore.sendMessage(result.contact.id, 'text', {}, undefined, undefined, {
+      forwardOfMessageId: sourceId,
+    })
+    result.messageId = created?.id ? String(created.id) : undefined
+    result.state = 'queued'
+    if (result.messageId) {
+      const early = earlyStatuses.get(result.messageId)
+      earlyStatuses.delete(result.messageId)
+      applyStatus(result.messageId, early?.status ?? String(created?.status ?? ''), early?.error ?? created?.error_message)
+    }
+  } catch (error) {
+    const failure = classifyForwardError(error)
+    result.state = failure
+    result.error = failure === 'uncertain' ? undefined : getErrorMessage(error, t('chat.forward.failed'))
+  }
+}
+
+/** Keep listening only while a target waits for its delivery status. */
+function settleWatching() {
   if (!results.value.some(r => r.state === 'queued')) {
-    stopWatchingStatus()
+    if (!results.value.some(r => r.state === 'unconfirmed')) stopWatchingStatus()
     return
   }
+  if (confirmTimer) return
   confirmTimer = setTimeout(() => {
+    confirmTimer = undefined
     for (const result of results.value) {
       if (result.state === 'queued') result.state = 'unconfirmed'
     }
   }, DELIVERY_CONFIRM_TIMEOUT_MS)
+}
+
+/** Manual retry, offered only when the server proved nothing was sent. */
+async function retryTarget(result: TargetResult) {
+  const message = props.message
+  if (!message || result.state !== 'retryable' || isSending.value) return
+  watchStatus()
+  await sendTo(result, message.id)
+  settleWatching()
 }
 
 function resultLabel(state: ResultState): string {
@@ -273,6 +302,10 @@ function resultLabel(state: ResultState): string {
       return t('chat.forward.failed')
     case 'unconfirmed':
       return t('chat.forward.unconfirmed')
+    case 'retryable':
+      return t('chat.forward.retryable')
+    case 'uncertain':
+      return t('chat.forward.uncertain')
     default:
       return t('chat.forward.sending')
   }
@@ -395,7 +428,7 @@ function requestClose(open: boolean) {
             :data-state="result.state"
           >
             <Loader2 v-if="result.state === 'pending' || result.state === 'sending'" class="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground" aria-hidden="true" />
-            <Clock v-else-if="result.state === 'queued' || result.state === 'unconfirmed'" class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <Clock v-else-if="result.state === 'queued' || result.state === 'unconfirmed' || result.state === 'uncertain'" class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
             <CheckCheck v-else-if="result.state === 'sent'" class="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" aria-hidden="true" />
             <AlertCircle v-else class="mt-0.5 h-4 w-4 shrink-0 text-destructive" aria-hidden="true" />
             <span class="min-w-0 flex-1">
@@ -403,8 +436,22 @@ function requestClose(open: boolean) {
               <span class="text-muted-foreground"> · {{ resultLabel(result.state) }}</span>
               <span v-if="result.error" class="block text-xs text-destructive">{{ result.error }}</span>
             </span>
+            <Button
+              v-if="result.state === 'retryable'"
+              variant="outline"
+              size="sm"
+              class="h-7 shrink-0 px-2 text-xs"
+              :disabled="isSending"
+              :data-testid="`chat-forward-retry-${result.contact.id}`"
+              @click="retryTarget(result)"
+            >
+              {{ t('chat.forward.retry') }}
+            </Button>
           </li>
         </ul>
+        <p v-if="hasUncertain" class="text-xs text-muted-foreground" data-testid="chat-forward-uncertain">
+          {{ t('chat.forward.uncertainNote') }}
+        </p>
         <p v-if="hasUnconfirmed" class="text-xs text-muted-foreground" data-testid="chat-forward-unconfirmed">
           {{ t('chat.forward.unconfirmedNote') }}
         </p>

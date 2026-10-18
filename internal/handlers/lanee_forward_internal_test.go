@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,4 +181,90 @@ func TestLaneEForwardChecksObjectSizeBeforeDownloading(t *testing.T) {
 	assert.False(t, known, "another tenant's key is never listed")
 	assert.Equal(t, int64(5<<20), forwardMediaSizeLimit(models.MessageTypeImage))
 	assert.Equal(t, int64(16<<20), forwardMediaSizeLimit(models.MessageTypeAudio))
+}
+
+// Q5: a failure proves "not accepted" by its phase, never by a timeout alone.
+func TestLaneEForwardSendFailureClassification(t *testing.T) {
+	// The exact shape H1's withBoundedRootConnection returns when no pooled
+	// connection was ever acquired (nothing ran).
+	wedge := fmt.Errorf("wedge guard: no pooled database connection within 15s while this goroutine may hold another: %w", context.DeadlineExceeded)
+	cases := []struct {
+		name string
+		err  error
+		inTx bool
+		want bool
+	}{
+		{"request transaction: any error is rolled back with the response", errors.New("insert failed"), true, true},
+		{"request transaction: a timeout too", fmt.Errorf("persist: %w", context.DeadlineExceeded), true, true},
+		{"own transaction: a plain error may follow a successful COMMIT", errors.New("commit: connection reset"), false, false},
+		{"own transaction: a bare timeout proves nothing", fmt.Errorf("persist: %w", context.DeadlineExceeded), false, false},
+		{"own transaction: a wedge-guard rejection never acquired a connection", fmt.Errorf("persist pending message: %w", wedge), false, true},
+		{"own transaction: wedge text without a deadline is not trusted", errors.New("wedge guard: no pooled database connection"), false, false},
+		{"own transaction: a later wedge guard (locks inside a tx) is not definite", fmt.Errorf("wedge guard: chatbot session fence and locks not acquired: %w", context.DeadlineExceeded), false, false},
+		{"no error", nil, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, forwardSendFailureIsDefinite(tc.err, tc.inTx))
+		})
+	}
+	refusal := forwardNotAcceptedRefusal()
+	assert.Equal(t, 503, refusal.Status)
+	assert.Equal(t, forwardErrorTemporarilyUnavailable, refusal.ErrorType)
+}
+
+// Q6: what a reader sees for a forward stalled by a process exit.
+func TestLaneEForwardDeliveryStateAfterProcessExit(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-10 * time.Minute)
+	fresh := now.Add(-30 * time.Second)
+	forwarded := func(status models.MessageStatus, created, updated time.Time, extra models.JSONB) *models.Message {
+		metadata := models.JSONB{forwardedFromMetadataKey: map[string]any{"message_id": "m", "contact_id": "c"}}
+		for key, value := range extra {
+			metadata[key] = value
+		}
+		return &models.Message{
+			BaseModel: models.BaseModel{ID: uuid.New(), CreatedAt: created, UpdatedAt: updated},
+			Status:    status,
+			Metadata:  metadata,
+		}
+	}
+	queued := models.JSONB{forwardDispatchMetadataKey: forwardDispatchQueued}
+	provider := func(at time.Time) models.JSONB {
+		return models.JSONB{forwardDispatchMetadataKey: forwardDispatchProvider, forwardDispatchAtMetadataKey: at.Format(time.RFC3339Nano)}
+	}
+	cases := []struct {
+		name string
+		msg  *models.Message
+		want string
+	}{
+		{"(a) exit before the provider call: not sent", forwarded(models.MessageStatusPending, old, old, queued), forwardDeliveryInterrupted},
+		{"(b) exit after the provider phase began: may have been sent", forwarded(models.MessageStatusPending, old, old, provider(old)), forwardDeliveryUncertain},
+		{"still within the bounded phases: no state yet", forwarded(models.MessageStatusPending, fresh, fresh, queued), ""},
+		{"provider phase just recorded on an old row: not yet uncertain", forwarded(models.MessageStatusPending, old, old, provider(fresh)), ""},
+		{"provider phase without a timestamp falls back to updated_at", forwarded(models.MessageStatusPending, old, old, models.JSONB{forwardDispatchMetadataKey: forwardDispatchProvider}), forwardDeliveryUncertain},
+		{"settled sent", forwarded(models.MessageStatusSent, old, old, provider(old)), ""},
+		{"settled failed", forwarded(models.MessageStatusFailed, old, old, queued), ""},
+		{"a forward from before markers existed", forwarded(models.MessageStatusPending, old, old, nil), ""},
+		{"not a forward", &models.Message{BaseModel: models.BaseModel{CreatedAt: old, UpdatedAt: old}, Status: models.MessageStatusPending, Metadata: queued}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, forwardDeliveryState(tc.msg, now))
+		})
+	}
+}
+
+// Every forward row is created with the "queued" marker in its own insert.
+func TestLaneEForwardRowStartsQueued(t *testing.T) {
+	app := &App{Log: testutil.NopLogger()}
+	msg := app.createOutgoingMessage(OutgoingMessageRequest{
+		Account:       &models.WhatsAppAccount{OrganizationID: uuid.New(), Name: "acct"},
+		Contact:       &models.Contact{BaseModel: models.BaseModel{ID: uuid.New()}},
+		Type:          models.MessageTypeText,
+		Content:       "hi",
+		forwardedFrom: &messageForwardSource{MessageID: uuid.New(), ContactID: uuid.New()},
+	}, DefaultSendOptions())
+	assert.Equal(t, forwardDispatchQueued, msg.Metadata[forwardDispatchMetadataKey])
+	assert.True(t, messageIsForwarded(msg.Metadata))
 }
