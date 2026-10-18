@@ -114,8 +114,8 @@ func (a *App) requireInboundContinuationPoolEntry() error {
 // The caller must not hold a previous phase's permit or any DB connection when
 // calling it, and must retain the returned permit until that phase has unwound.
 // The receiver check cannot detect an unrelated connection held by its caller.
-// Current proposed internal weights are 1 (perform) and 3 (apply); fresh entry
-// may request either supported weight as the preparation design is finalized.
+// Generic weights remain 1 (perform) and 3 (mixed apply). Only the dedicated
+// captured generated-text helper may request the two-connection apply charge.
 func (a *App) acquireInboundContinuationCapacity(ctx context.Context, stop <-chan struct{}, weight int) (func(), error) {
 	return a.acquireInboundContinuationPhase(ctx, stop, weight, "", inboundContinuationUnscoped)
 }
@@ -124,17 +124,28 @@ func (a *App) acquireInboundContinuationCapacity(ctx context.Context, stop <-cha
 // release the previous phase completely before entering; database policy and
 // account fences remain authoritative, including against other processes.
 func (a *App) acquireInboundContinuationPhase(ctx context.Context, stop <-chan struct{}, weight int, organization string, mode int) (func(), error) {
-	return a.acquireInboundContinuationPhaseClass(ctx, stop, weight, organization, mode, false)
+	return a.acquireInboundContinuationPhaseClass(ctx, stop, weight, a.inboundContinuationPhasePriority(ctx, weight), organization, mode, false)
 }
 
 // Only authenticated pre-ACK ingress uses this class, after bounded tenant
 // discovery has released its generic permit and database connection. Ordinary
 // fresh preparation remains on acquireInboundContinuationPhase.
 func (a *App) acquireIncomingMessageIntake(ctx context.Context, organization string) (func(), error) {
-	return a.acquireInboundContinuationPhaseClass(ctx, nil, 1, organization, inboundContinuationWriter, true)
+	return a.acquireInboundContinuationPhaseClass(ctx, nil, 1, a.inboundContinuationPhasePriority(ctx, 1), organization, inboundContinuationWriter, true)
 }
 
-func (a *App) acquireInboundContinuationPhaseClass(ctx context.Context, stop <-chan struct{}, weight int, organization string, mode int, intake bool) (func(), error) {
+func (a *App) inboundContinuationPhasePriority(ctx context.Context, weight int) int {
+	root := a.rootApp()
+	if root != nil && ctx != nil && ctx.Value(inboundContinuationAdmissionContextKey{}) == root {
+		if weight == 3 {
+			return inboundContinuationApplyPriority
+		}
+		return inboundContinuationPerformPriority
+	}
+	return inboundContinuationFreshPriority
+}
+
+func (a *App) acquireInboundContinuationPhaseClass(ctx context.Context, stop <-chan struct{}, weight, priority int, organization string, mode int, intake bool) (func(), error) {
 	root := a.rootApp()
 	if root == nil || root.DB == nil {
 		return nil, errors.New("inbound continuation admission requires an app database")
@@ -151,14 +162,6 @@ func (a *App) acquireInboundContinuationPhaseClass(ctx context.Context, stop <-c
 	}
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	priority := inboundContinuationFreshPriority
-	if ctx.Value(inboundContinuationAdmissionContextKey{}) == root {
-		if weight == 3 {
-			priority = inboundContinuationApplyPriority
-		} else {
-			priority = inboundContinuationPerformPriority
-		}
 	}
 	if intake {
 		if priority != inboundContinuationFreshPriority {
@@ -191,8 +194,9 @@ func (g *inboundContinuationAdmission) acquireIntake(ctx context.Context, stop <
 }
 
 func (g *inboundContinuationAdmission) acquireScopedClass(ctx context.Context, stop <-chan struct{}, weight, priority int, maxOpen func() int, organization string, mode int, intake bool) (func(), error) {
-	if weight != 1 && weight != 3 {
-		return nil, errors.New("inbound continuation admission weight must be 1 or 3")
+	if weight != 1 && weight != 3 && !(weight == 2 && organization != "" &&
+		mode == inboundContinuationReader && priority == inboundContinuationApplyPriority && !intake) {
+		return nil, errors.New("inbound continuation admission weight is invalid for its phase")
 	}
 	if priority < inboundContinuationApplyPriority || priority > inboundContinuationFreshPriority || maxOpen == nil {
 		return nil, errors.New("inbound continuation admission parameters are invalid")

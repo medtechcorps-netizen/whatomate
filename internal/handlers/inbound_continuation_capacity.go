@@ -390,14 +390,19 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 	// acquire or upgrade local phase ownership while holding a transaction.
 	applyMode := preparedIncomingApplyMode(prepared, captured)
 	applyCtx = execution.markInboundContinuationContext(applyCtx)
+	if applyMode == inboundContinuationReader {
+		releaseApply, err := execution.acquireInboundContinuationGeneratedApply(applyCtx, stop, work, prepared, captured)
+		if err != nil {
+			return err
+		}
+		defer releaseApply()
+		return p.processGeneratedIncomingApply(ownershipCtx, execution, work, job, prepared, captured)
+	}
 	releaseApply, err := execution.acquireInboundContinuationPhase(applyCtx, stop, 3, work.OrganizationID.String(), applyMode)
 	if err != nil {
 		return err
 	}
 	defer releaseApply()
-	if applyMode == inboundContinuationReader {
-		return p.processGeneratedIncomingApply(ownershipCtx, execution, work, job, prepared, captured)
-	}
 	var continuationErr error
 	err = execution.WithTenantApp(work.OrganizationID, func(scoped *App) error {
 		scoped.inboundContinuation = execution.inboundContinuation
@@ -545,6 +550,43 @@ func preparedIncomingApplyMode(prepared *preparedIncomingContinuation, captured 
 		return inboundContinuationReader
 	}
 	return inboundContinuationWriter
+}
+
+// The generated-text path releases each independent send/read scope before its
+// final history transaction, so its physical guard plus one independent scope
+// require two connections. Keep this admission seam tied to that exact route;
+// mixed routes retain three and admission never borrows a SQL connection.
+func (a *App) acquireInboundContinuationGeneratedApply(ctx context.Context, stop <-chan struct{}, work *persistedIncomingMessage, prepared *preparedIncomingContinuation, captured *capturedLegacyAI) (func(), error) {
+	if a == nil || a.inboundContinuation == nil || work == nil || prepared == nil ||
+		prepared.contact == nil || prepared.session == nil || prepared.settings == nil ||
+		preparedIncomingApplyMode(prepared, captured) != inboundContinuationReader {
+		return nil, errors.New("generated apply admission requires a captured generated-text continuation")
+	}
+	organizationID := a.inboundContinuation.OrganizationID
+	if organizationID == uuid.Nil || work.OrganizationID != organizationID ||
+		prepared.contact.OrganizationID != organizationID || prepared.session.OrganizationID != organizationID ||
+		prepared.settings.OrganizationID != organizationID {
+		return nil, errors.New("generated apply admission requires matching continuation organizations")
+	}
+	root := a.rootApp()
+	if a.tenantOrgID != uuid.Nil || root == nil || root.tenantOrgID != uuid.Nil {
+		return nil, errors.New("generated apply admission requires its root connection pool")
+	}
+	if err := a.requireInboundContinuationPoolEntry(); err != nil {
+		return nil, err
+	}
+	pool, err := root.DB.DB()
+	if err != nil || pool == nil || root.DB.Statement.ConnPool != pool || a.DB.Statement.ConnPool != pool {
+		return nil, errors.New("generated apply admission requires its exact root SQL pool")
+	}
+	if !root.rlsEnabled() {
+		return func() {}, nil
+	}
+	if ctx == nil || ctx.Value(inboundContinuationAdmissionContextKey{}) != root {
+		return nil, errors.New("generated apply admission requires its marked continuation context")
+	}
+	return a.acquireInboundContinuationPhaseClass(ctx, stop, 2, inboundContinuationApplyPriority,
+		organizationID.String(), inboundContinuationReader, false)
 }
 
 // This check takes no session lock across provider I/O. At the physical attempt

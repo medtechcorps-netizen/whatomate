@@ -1,8 +1,8 @@
 package handlers
 
 // Generated-text transaction-boundary regressions. All providers, accounts and
-// SQL actors belong to each fixture. Admission remains weight three; the held
-// SQL connections witness the physical footprint independently of that charge.
+// SQL actors belong to each fixture. Held SQL connections witness physical
+// ownership independently of the admission accounting charge.
 import (
 	"context"
 	"encoding/json"
@@ -414,8 +414,8 @@ func TestH1GeneratedApply_PhysicalSendAndResolvedReplayUseTwoConnections(t *test
 			t.Cleanup(provider.Close)
 			f.app.WhatsApp = whatsapp.NewWithBaseURL(f.app.Log, provider.URL)
 			var creditReleases []func()
-			for range 2 {
-				release, err := f.app.acquireInboundContinuationCapacity(context.Background(), nil, 3)
+			for _, weight := range []int{3, 3, 1} {
+				release, err := f.app.acquireInboundContinuationCapacity(context.Background(), nil, weight)
 				require.NoError(t, err)
 				creditReleases = append(creditReleases, release)
 				t.Cleanup(release)
@@ -431,7 +431,7 @@ func TestH1GeneratedApply_PhysicalSendAndResolvedReplayUseTwoConnections(t *test
 				}
 			})
 			f.model.unblock()
-			h1CapacityWaitQueue(t, &f.app.continuationAdmission, 6, 1)
+			h1CapacityWaitQueue(t, &f.app.continuationAdmission, 7, 1)
 			require.Zero(t, f.pool.Stats().InUse, "captured apply is queued without SQL ownership")
 			releaseSQL = h1HoldConnections(t, f.pool, 8)
 			for _, release := range creditReleases {
@@ -494,8 +494,8 @@ func TestH1GeneratedApply_GuardFailurePreservesIncomingHistory(t *testing.T) {
 	t.Run("fresh-policy-denial", func(t *testing.T) {
 		f := h1CapacityLegacy(t, 1)
 		var releases []func()
-		for range 2 {
-			release, err := f.app.acquireInboundContinuationCapacity(context.Background(), nil, 3)
+		for _, weight := range []int{3, 3, 1} {
+			release, err := f.app.acquireInboundContinuationCapacity(context.Background(), nil, weight)
 			require.NoError(t, err)
 			releases = append(releases, release)
 			t.Cleanup(release)
@@ -506,7 +506,7 @@ func TestH1GeneratedApply_GuardFailurePreservesIncomingHistory(t *testing.T) {
 			}
 		})
 		f.model.unblock()
-		h1CapacityWaitQueue(t, &f.app.continuationAdmission, 6, 1)
+		h1CapacityWaitQueue(t, &f.app.continuationAdmission, 7, 1)
 		work := f.works[0]
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

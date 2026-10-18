@@ -38,8 +38,8 @@ func TestH1OrgPhase_GeneratedApplyCompletesUnderOtherContactPhysicalGuard(t *tes
 	processor := NewInboundContinuationProcessor(f.app, time.Second)
 	require.Nil(t, processor.process, "use ordinary preparation, model capture and apply")
 	var fillers []func()
-	for range 2 {
-		release, err := f.app.acquireInboundContinuationCapacity(ctx, nil, 3)
+	for _, weight := range []int{3, 3, 1} {
+		release, err := f.app.acquireInboundContinuationCapacity(ctx, nil, weight)
 		require.NoError(t, err)
 		fillers = append(fillers, release)
 		t.Cleanup(release)
@@ -76,7 +76,7 @@ func TestH1OrgPhase_GeneratedApplyCompletesUnderOtherContactPhysicalGuard(t *tes
 		defer close(processJoined)
 		processDone <- processor.ProcessMessage(ctx, work.OrganizationID, work.Persisted.ID)
 	}()
-	h1CapacityWaitQueue(t, &f.app.continuationAdmission, 6, 1)
+	h1CapacityWaitQueue(t, &f.app.continuationAdmission, 7, 1)
 	f.app.continuationAdmission.mu.Lock()
 	queued := f.app.continuationAdmission.waiters[0]
 	queuedOrganization, queuedMode, queuedPriority := queued.organization, queued.mode, queued.priority

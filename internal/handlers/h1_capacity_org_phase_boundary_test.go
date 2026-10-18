@@ -280,12 +280,14 @@ func TestH1OrgPhase_RealGeneratedGraphAndNativeDispatchKeepSingleApplyMode(t *te
 			var shared *gorm.DB
 			var work *persistedIncomingMessage
 			wantMode := inboundContinuationWriter
+			wantWeight := 3
 			var verify func()
 			switch route {
 			case "generated-legacy":
 				f := h1CapacityLegacy(t, 1)
 				app, shared, work = f.app, f.shared, f.works[0]
 				wantMode = inboundContinuationReader
+				wantWeight = 2
 				f.model.unblock()
 				verify = func() { f.assertGenerated(t, 0) }
 			case "graph":
@@ -365,16 +367,16 @@ func TestH1OrgPhase_RealGeneratedGraphAndNativeDispatchKeepSingleApplyMode(t *te
 			case <-time.After(15 * time.Second):
 				t.Fatal("actual prepared route did not reach its independently committed provider boundary")
 			}
-			h1OrgAssertActive(t, app, work.OrganizationID, wantMode, 1, 3)
+			h1OrgAssertActive(t, app, work.OrganizationID, wantMode, 1, wantWeight)
 			opposite := inboundContinuationReader
 			if wantMode == inboundContinuationReader {
 				compatible := h1OrgHold(t, &app.continuationAdmission, 1, inboundContinuationPerformPriority, func() int { return 10 }, work.OrganizationID.String(), inboundContinuationReader)
-				h1OrgAssertActive(t, app, work.OrganizationID, wantMode, 2, 4)
+				h1OrgAssertActive(t, app, work.OrganizationID, wantMode, 2, wantWeight+1)
 				compatible()
 				opposite = inboundContinuationWriter
 			}
 			waiting := h1OrgAcquireAsync(t, &app.continuationAdmission, context.Background(), nil, 1, inboundContinuationFreshPriority, func() int { return 10 }, work.OrganizationID.String(), opposite)
-			h1CapacityWaitQueue(t, &app.continuationAdmission, 3, 1)
+			h1CapacityWaitQueue(t, &app.continuationAdmission, wantWeight, 1)
 			h1OrgBlocked(t, waiting)
 			releaseProvider()
 			h1CapacityJoin(t, done, 1)
