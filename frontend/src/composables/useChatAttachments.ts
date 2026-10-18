@@ -310,7 +310,7 @@ function createPreviewUrl(file: File, validation: AttachmentValidation): string 
 }
 
 /** 400 "Reply message not found for this contact" / "Invalid reply message ID" from the media handler. */
-function isReplyRejection(error: unknown): boolean {
+export function isReplyRejection(error: unknown): boolean {
   const response = (error as { response?: { status?: number; data?: { message?: unknown } } } | null)?.response
   if (response?.status !== 400) return false
   return typeof response.data?.message === 'string' && /reply message/i.test(response.data.message)
@@ -536,7 +536,18 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     for (const id of ids) await convertToJpeg(id)
   }
 
-  async function runBatch(statuses: StagedAttachmentStatus[], onlyIds?: string[]): Promise<BatchSummary | null> {
+  interface RunOptions {
+    /** Only these staged files. */
+    onlyIds?: string[]
+    /**
+     * Send without any quote: no reply is read or bound, and the files' own
+     * quotes are dropped at their attempt ("Send without quote").
+     */
+    plain?: boolean
+  }
+
+  async function runBatch(statuses: StagedAttachmentStatus[], run: RunOptions = {}): Promise<BatchSummary | null> {
+    const { onlyIds, plain = false } = run
     if (activeBatch || !target || convertingCount.value > 0) return null
     if (!target.isActive()) {
       reset()
@@ -568,8 +579,10 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     sendingTo.value = batch.target.label ?? ''
     const whatsappAccount = options.getWhatsAppAccount?.() || undefined
     // The reply selected right now, for this batch's patient. Its quote is
-    // bound to the first file of the first batch that sees it.
-    const replyTo = options.replyTo?.(batch.target) || undefined
+    // bound to the first file of the first batch that sees it. A plain run
+    // neither reads nor binds it, so a newly selected reply stays unclaimed
+    // for a later, intentional send.
+    const replyTo = plain ? undefined : options.replyTo?.(batch.target) || undefined
     if (replyTo && !claimedReplies.has(replyTo)) {
       claimedReplies.add(replyTo)
       queue[0].quotesReply = replyTo
@@ -683,9 +696,11 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         let responseDeadline: ReturnType<typeof setTimeout> | null = null
         batch.controller = controller
         batch.uploadComplete = false
+        if (plain) item.quotesReply = null
         item.status = 'sending'
         item.progress = 0
         item.errorMessage = null
+        item.replyRejected = false
         try {
           const message = await send(
             {
@@ -827,16 +842,15 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   }
 
   /**
-   * The server refused to quote the reply for this file: drop its quote and
-   * send just that file again, as a plain attachment. The reply stays claimed,
-   * so no other file picks it up.
+   * The server refused to quote the reply for this file: send just that file
+   * again, as a plain attachment. Nothing is changed unless the run actually
+   * starts; the refused reply stays claimed, so no other file picks it up, and
+   * a reply selected since then is left for a later send.
    */
   function sendWithoutQuote(id: string) {
     const item = find(id)
     if (!item || item.status !== 'failed' || !item.replyRejected) return Promise.resolve(null)
-    item.quotesReply = null
-    item.replyRejected = false
-    return runBatch(['failed'], [id])
+    return runBatch(['failed'], { onlyIds: [id], plain: true })
   }
 
   /**

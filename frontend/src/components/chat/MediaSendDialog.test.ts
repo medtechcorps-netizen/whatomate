@@ -294,4 +294,10 @@ describe('MediaSendDialog', () => {
     await wrapper.get('[data-testid="composer-media-send-without-quote"]').trigger('click')
     expect(wrapper.emitted('send-without-quote')).toEqual([[refused.id]])
   })
+
+  it('disables Send without quote while a conversion is running', () => {
+    const refused = item('a.png', 'image/png', { status: 'failed', quotesReply: 'Q1', replyRejected: true })
+    const wrapper = mountDialog({ items: [refused, item('c.webp', 'image/webp', { status: 'converting' })] })
+    expect(wrapper.get('[data-testid="composer-media-send-without-quote"]').attributes('disabled')).toBeDefined()
+  })
 })

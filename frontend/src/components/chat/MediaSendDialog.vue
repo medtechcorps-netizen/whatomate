@@ -353,7 +353,7 @@ function onOpenChange(open: boolean) {
                 variant="outline"
                 size="xs"
                 class="text-xs"
-                :disabled="sending"
+                :disabled="busy"
                 data-testid="composer-media-send-without-quote"
                 @click="emit('send-without-quote', item.id)"
               >
