@@ -143,7 +143,8 @@ async function loadMedia(options: { userInitiated?: boolean; quiet?: boolean } =
   const messageId = props.message.id
   if (!organizationId || !messageId || !props.message.media_url) {
     // Fail closed: without a workspace the request would silently fall back
-    // to the login workspace.
+    // to the login workspace. Only a prop change or Retry loads again.
+    failedWhilePending = false
     status.value = 'error'
     return ''
   }
@@ -279,6 +280,9 @@ function handleImageError(event: Event) {
   // An image removed by a reload can still report an error for its old URL.
   const target = event.target as HTMLElement | null
   if (!mediaURL.value || target?.getAttribute('src') !== mediaURL.value) return
+  // Bytes that arrived but do not decode are left to Retry.
+  cancelAutoReload()
+  failedWhilePending = false
   releaseMedia()
   status.value = 'error'
 }
