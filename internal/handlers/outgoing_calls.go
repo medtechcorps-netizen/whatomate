@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	appcrypto "github.com/shridarpatil/whatomate/internal/crypto"
@@ -207,37 +206,37 @@ func (a *App) sendCallPermissionRequestGuarded(
 // GetICEServers handles GET /api/calls/ice-servers
 // Returns the configured ICE (STUN/TURN) servers for the frontend to use in WebRTC peer connections.
 func (a *App) GetICEServers(r *fastglue.Request) error {
-	orgID, _, err := a.requireAuth(r, models.ResourceOutgoingCalls, models.ActionRead)
+	r.RequestCtx.Response.Header.Set("Cache-Control", "no-store")
+	r.RequestCtx.Response.Header.Set("Pragma", "no-cache")
+	orgID, userID, err := a.getOrgAndUserID(r)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	// Both outgoing callers and incoming-only agents need temporary browser
+	// relay credentials. Use the selected resource's normal authorization and
+	// entitlement path instead of requiring unrelated outgoing permissions.
+	resource, action := models.ResourceOutgoingCalls, models.ActionRead
+	if !a.HasPermission(userID, resource, action, orgID) {
+		resource, action = models.ResourceCallTransfers, models.ActionWrite
+	}
+	_, _, err = a.requireAuth(r, resource, action)
 	if err != nil {
 		return nil
 	}
-	if err := a.requireCallingEnabled(r, orgID); err != nil {
-		return nil
+	if !a.IsCallingEnabledForOrg(orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Calling is not enabled for this organization", nil, "")
 	}
-	if a.Config == nil {
+	if a.Config == nil || a.CallManager == nil {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Calling is not configured", nil, "")
 	}
 
-	type iceServer struct {
-		URLs       []string `json:"urls"`
-		Username   string   `json:"username,omitempty"`
-		Credential string   `json:"credential,omitempty"`
+	// fasthttp's context tracks server shutdown, not individual client request
+	// cancellation. Credential refresh has its own bounded five-second deadline.
+	resolved, err := a.CallManager.ResolveICEConfiguration(context.Background())
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Calling relay credentials are temporarily unavailable", nil, "")
 	}
-
-	now := time.Now()
-	servers := make([]iceServer, 0, len(a.Config.Calling.ICEServers))
-	for _, s := range a.Config.Calling.ICEServers {
-		username, credential := s.ResolveCredentials(now)
-		servers = append(servers, iceServer{
-			URLs:       s.URLs,
-			Username:   username,
-			Credential: credential,
-		})
-	}
-
-	return r.SendEnvelope(map[string]any{
-		"ice_servers": servers,
-	})
+	return r.SendEnvelope(resolved)
 }
 
 // GetCallPermission handles GET /api/calls/permission/{contactId}?whatsapp_account=X
