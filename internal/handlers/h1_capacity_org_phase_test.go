@@ -226,6 +226,9 @@ func TestH1OrgPhase_AcceptedApplyDrainsClosedReaderPhaseWithoutReopeningIt(t *te
 		r()
 	}
 	writer := h1OrgAcquireAsync(t, &g, context.Background(), nil, 1, inboundContinuationFreshPriority, maximum, "tenant-a", inboundContinuationWriter)
+	// Saturated quota blocks a reader only once the opposite writer is queued.
+	// Goroutine creation order alone does not establish that precondition.
+	h1CapacityWaitQueue(t, &g, 1, 1)
 	reader := h1OrgAcquireAsync(t, &g, context.Background(), nil, 1, inboundContinuationPerformPriority, maximum, "tenant-a", inboundContinuationReader)
 	h1CapacityWaitQueue(t, &g, 1, 2)
 	// This finite backlog represents results from work admitted before phase
@@ -295,6 +298,9 @@ func TestH1OrgPhase_CancelOppositeTurnAndIdempotentReleasePermitCurrentMode(t *t
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	writer := h1OrgAcquireAsync(t, &g, ctx, nil, 1, inboundContinuationFreshPriority, maximum, "tenant", inboundContinuationWriter)
+	// Saturated quota blocks a reader only once the opposite writer is queued.
+	// Goroutine creation order alone does not establish that precondition.
+	h1CapacityWaitQueue(t, &g, 1, 1)
 	reader := h1OrgAcquireAsync(t, &g, context.Background(), nil, 1, inboundContinuationPerformPriority, maximum, "tenant", inboundContinuationReader)
 	h1CapacityWaitQueue(t, &g, 1, 2)
 	cancel()
