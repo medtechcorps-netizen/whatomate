@@ -3,7 +3,7 @@ import { ref, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
-import { api } from '@/services/api'
+import { api, beginSsoSignIn, SESSION_BUSY_CODE } from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -114,17 +114,34 @@ const handleLogin = async () => {
     const redirect = route.query.redirect as string
     router.push(redirect || '/')
   } catch (error: any) {
-    const message = error.response?.data?.message || t('auth.invalidCredentials')
+    // A sign-in that could not be ordered after an earlier logout in time is
+    // refused, not sent: the user just tries again.
+    const message = error?.code === SESSION_BUSY_CODE
+      ? t('errors.timeout')
+      : error.response?.data?.message || t('auth.invalidCredentials')
     toast.error(message)
   } finally {
     isLoading.value = false
   }
 }
 
-const initiateSSO = (provider: string) => {
+const isSSOStarting = ref(false)
+
+const initiateSSO = async (provider: string) => {
   const selector = organization.value.trim().toLowerCase()
   if (!selector) {
     toast.error(t('auth.workspaceCodeRequired'))
+    return
+  }
+  if (isSSOStarting.value) return
+  isSSOStarting.value = true
+  // Ordered like a password sign-in: an earlier logout finishes first, then a
+  // new session begins. The page stays busy until it leaves for the provider.
+  try {
+    await beginSsoSignIn()
+  } catch {
+    isSSOStarting.value = false
+    toast.error(t('errors.timeout'))
     return
   }
   const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
@@ -270,9 +287,11 @@ const initiateSSO = (provider: string) => {
                 :class="providerColors[provider.provider] || providerColors.custom"
                 type="button"
                 :data-testid="`sso-provider-${provider.provider}`"
+                :disabled="isSSOStarting"
                 @click="initiateSSO(provider.provider)"
               >
-                <svg class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+                <Loader2 v-if="isSSOStarting" class="h-5 w-5 animate-spin" />
+                <svg v-else class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
                   <path :d="providerIcons[provider.provider] || providerIcons.custom" />
                 </svg>
                 {{ provider.name }}

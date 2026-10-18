@@ -860,6 +860,11 @@ func (a *App) Logout(r *fastglue.Request) error {
 				defer cancel()
 				if err := a.revokeRefreshChain(ctx, claims.ID); err != nil {
 					a.Log.Error("Logout could not revoke the refresh token", "reason", "revoke_store_unavailable", "user_id", claims.UserID)
+					// The token is still live: say so, so the client retries
+					// rather than trusting a logout that left it usable. This
+					// browser's own cookies are cleared either way.
+					a.clearAuthCookies(r)
+					return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Logout could not revoke the session, please retry", nil, "")
 				}
 			}
 		}

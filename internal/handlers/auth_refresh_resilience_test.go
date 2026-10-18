@@ -521,3 +521,26 @@ func TestLaneA_Logout_UnvalidatedTokenRevokesNothing(t *testing.T) {
 	assert.True(t, laneAJTIExists(t, f.app.Redis, f.jti))
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(laneARefresh(t, f.app, f.token)))
 }
+
+func TestLaneA_Logout_RevokeStoreFailureIsNotReportedAsLoggedOut(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	healthy := f.app.Redis
+	unreachable := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 200 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	t.Cleanup(func() { _ = unreachable.Close() })
+	f.app.Redis = unreachable
+
+	logout := laneALogoutWithBody(t, f.app, f.token)
+	testutil.AssertErrorResponse(t, logout, fasthttp.StatusServiceUnavailable, "retry")
+	assert.NotContains(t, string(testutil.GetResponseBody(logout)), "logged_out")
+
+	// Nothing was revoked; a retry once the store is back ends the chain.
+	f.app.Redis = healthy
+	assert.True(t, laneAJTIExists(t, healthy, f.jti))
+	retry := laneALogoutWithBody(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(retry))
+	assert.False(t, laneAJTIExists(t, healthy, f.jti))
+}
