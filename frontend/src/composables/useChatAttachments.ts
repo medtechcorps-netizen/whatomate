@@ -2,7 +2,7 @@ import { computed, effectScope, getCurrentScope, markRaw, onScopeDispose, ref, w
 import { messagesService } from '@/services/api'
 import { getErrorMessage } from '@/lib/api-utils'
 import { convertImageToJpeg } from '@/lib/chatImageConversion'
-import { SELECTED_ORGANIZATION_STORAGE_KEY, readSelectedOrganizationId } from '@/lib/browserIdentity'
+import { SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
 import {
   MAX_CAPTION_LENGTH,
   MAX_CHAT_ATTACHMENTS,
@@ -189,30 +189,26 @@ function persistedUserOrganizationId(): string | null {
 }
 
 /**
- * The workspace this tab's requests go to, plus the shared storage that can
- * change it from another tab. A tab that signed in without reloading has its
- * selected-organization override suppressed for its whole life
- * (clearBrowserOrganizationIdentity), so the override alone would miss a
- * switch made in another tab. Parts:
- * - the effective organization of this tab's requests: the override api.ts
- *   sends (readSelectedOrganizationId), else the token organization;
- * - the same, read from the raw shared selected organization whatever the
- *   suppression says (a switch written by another tab);
- * - the token organization: the persisted user's (the cookie/JWT org,
- *   rewritten by switch-org in any tab), else the in-memory user's;
+ * The workspace this tab's requests go to, as seen through storage shared
+ * by every tab, so a switch made in another tab is noticed. Two parts:
+ * - the shared workspace signal: the stored selected organization, read raw
+ *   (a tab that signed in without reloading has its own override suppressed
+ *   for life, see clearBrowserOrganizationIdentity, but still sees another
+ *   tab's write); while none is stored, the token organization from the
+ *   persisted user (the cookie/JWT org), else the in-memory user's;
  * - the in-memory user's organization (reactive, same tab).
+ * Once a selected organization is stored, the persisted user is ignored:
+ * switch-org and selectOrganization always write that key, while any stale
+ * tab can rewrite 'user' with its old organization (e.g. an availability
+ * toggle), which must not cancel a batch going to the right workspace.
  * Effective values, not raw store fields: a super-admin's switcher selecting
- * its own organization after page load is not a switch. Store fields that
- * initialise late are deliberately not part of it.
+ * its own organization after page load is not a switch, and store fields
+ * that initialise late are not part of it.
  */
 export function readWorkspaceIdentity(inMemoryOrganizationId?: string | null): string {
-  const tokenOrganization = persistedUserOrganizationId() || inMemoryOrganizationId || ''
-  return JSON.stringify([
-    readSelectedOrganizationId() || tokenOrganization,
-    readStorage(SELECTED_ORGANIZATION_STORAGE_KEY) || tokenOrganization,
-    tokenOrganization,
-    inMemoryOrganizationId ?? '',
-  ])
+  const storedSelection = readStorage(SELECTED_ORGANIZATION_STORAGE_KEY)
+  const workspace = storedSelection || persistedUserOrganizationId() || inMemoryOrganizationId || ''
+  return JSON.stringify([workspace, inMemoryOrganizationId ?? ''])
 }
 
 let batchSequence = 0
@@ -234,19 +230,19 @@ export const MEDIA_RESPONSE_DEADLINE_MS = 120_000
 
 /**
  * After the whole body reached the server, a missing answer (network error)
- * or any 5xx without the app's own error envelope {status:'error', message}
- * does not tell whether the file was sent: the media route never emits a
- * bare 5xx itself, so those come from gateways (502/503/504, Cloudflare
- * 520-524, an empty 500). Retrying could send it to the patient twice.
- * A 4xx or an enveloped 5xx is the app's definite answer.
+ * or any 5xx does not tell whether the file was sent, so it is unconfirmed
+ * (never retried automatically: the patient could get it twice).
+ * The app's error envelope is no proof either: the media handler can persist
+ * the message and register its delivery, then fail the commit with an
+ * unknown outcome and return an enveloped 500 while the message still goes
+ * out. Only an explicit, authoritative pre-dispatch failure could be safely
+ * retryable; that would need a server-side marker (a possible later
+ * refinement, outside this frontend change). A 4xx is a definite refusal.
  */
 export function isAmbiguousAfterUpload(error: unknown): boolean {
-  const response = (error as { response?: { status?: number; data?: unknown } } | null)?.response
+  const response = (error as { response?: { status?: number } } | null)?.response
   if (!response) return true
-  if ((response.status ?? 0) < 500) return false
-  const data = response.data as { status?: unknown; message?: unknown } | null | undefined
-  const appRefusal = !!data && typeof data === 'object' && data.status === 'error' && typeof data.message === 'string'
-  return !appRefusal
+  return (response.status ?? 0) >= 500
 }
 const STATUS_LOG_LIMIT = 500
 

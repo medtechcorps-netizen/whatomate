@@ -1059,8 +1059,8 @@ describe('useChatAttachments ambiguous failure after upload (FU-12)', () => {
     expect(attachments.items.value[0].status).toBe('unconfirmed')
   })
 
-  it('keeps definite refusals as failed: 4xx, and a 5xx carrying the app error envelope', async () => {
-    for (const error of [httpError(400, { status: 'error', message: 'Invalid multipart form' }), httpError(503, { status: 'error', message: 'Failed to send message' })]) {
+  it('keeps a 4xx after the full upload as failed: a definite refusal', async () => {
+    for (const error of [httpError(400, { status: 'error', message: 'Invalid multipart form' }), httpError(404, '<html>Not Found</html>')]) {
       const { attachments, calls } = setup()
       attachments.stage([file('a.png', 'image/png')])
       const done = attachments.sendAll()
@@ -1090,9 +1090,11 @@ describe('useChatAttachments ambiguous failure after upload (FU-12)', () => {
     // The media route never emits a bare 5xx: those are gateway artifacts.
     expect(isAmbiguousAfterUpload(httpError(500))).toBe(true)
     expect(isAmbiguousAfterUpload(httpError(520, '<html>unknown error</html>'))).toBe(true)
-    expect(isAmbiguousAfterUpload(httpError(500, { status: 'error', message: 'Failed to send message' }))).toBe(false)
+    // An enveloped 5xx proves nothing about dispatch either.
+    expect(isAmbiguousAfterUpload(httpError(500, { status: 'error', message: 'Failed to send message' }))).toBe(true)
     expect(isAmbiguousAfterUpload(httpError(404))).toBe(false)
-    expect(isAmbiguousAfterUpload(httpError(503, { status: 'error', message: 'Failed' }))).toBe(false)
+    expect(isAmbiguousAfterUpload(httpError(503, { status: 'error', message: 'Failed' }))).toBe(true)
+    expect(isAmbiguousAfterUpload(httpError(400, { status: 'error', message: 'Invalid multipart form' }))).toBe(false)
   })
 })
 
@@ -1138,10 +1140,18 @@ describe('useChatAttachments round 4: workspace identity, holds and teardown', (
     // Selecting another organization is.
     setSelectedOrganizationId('org-X')
     expect(readWorkspaceIdentity('org-H')).not.toBe(atLoad)
-    // A switch-org in any tab rewrites the persisted user.
+    // With a selected organization stored, a persisted-user rewrite alone
+    // (a stale tab) is ignored: switch-org always writes the key as well.
     setSelectedOrganizationId('org-H')
     localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
-    expect(readWorkspaceIdentity('org-H')).not.toBe(atLoad)
+    expect(readWorkspaceIdentity('org-H')).toBe(atLoad)
+    // Without one (e.g. a tab that signed in without reloading), the persisted
+    // user's organization is the cross-tab signal.
+    localStorage.removeItem('selected_organization_id')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-H' }))
+    const withoutSelection = readWorkspaceIdentity('org-H')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    expect(readWorkspaceIdentity('org-H')).not.toBe(withoutSelection)
   })
 
   it('readWorkspaceIdentity sees raw shared writes while this tab\'s override is suppressed', () => {
@@ -1195,7 +1205,8 @@ describe('useChatAttachments round 4: workspace identity, holds and teardown', (
     const cases: Array<[unknown, string]> = [
       [Object.assign(new Error('520'), { response: { status: 520, data: '<html>Web server is returning an unknown error</html>' } }), 'unconfirmed'],
       [Object.assign(new Error('500'), { response: { status: 500, data: '' } }), 'unconfirmed'],
-      [Object.assign(new Error('500'), { response: { status: 500, data: { status: 'error', message: 'Failed to send message' } } }), 'failed'],
+      [Object.assign(new Error('500'), { response: { status: 500, data: { status: 'error', message: 'Failed to send message' } } }), 'unconfirmed'],
+      [Object.assign(new Error('400'), { response: { status: 400, data: { status: 'error', message: 'Invalid multipart form' } } }), 'failed'],
     ]
     for (const [error, expected] of cases) {
       const { attachments, calls } = setup()
@@ -1207,5 +1218,72 @@ describe('useChatAttachments round 4: workspace identity, holds and teardown', (
       await done
       expect(attachments.items.value[0].status).toBe(expected)
     }
+  })
+})
+
+describe('useChatAttachments round 5: enveloped 5xx and stale persisted user', () => {
+  afterEach(() => {
+    setSelectedOrganizationId('cleanup')
+    localStorage.clear()
+  })
+
+  it('keeps an enveloped 5xx after the full upload unconfirmed: the envelope proves nothing about dispatch', async () => {
+    for (const status of [500, 503]) {
+      const { attachments, calls, onBatchFinished } = setup()
+      attachments.stage([file('a.png', 'image/png')])
+      const done = attachments.sendAll()
+      await settle()
+      calls[0].progress(100, 100)
+      calls[0].result.reject(
+        Object.assign(new Error(`Request failed with status code ${status}`), {
+          response: { status, data: { status: 'error', message: 'Failed to send message' } },
+        }),
+      )
+      await done
+      expect(attachments.items.value[0].status).toBe('unconfirmed')
+      expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ failed: 0, unconfirmed: 1 }))
+      expect(await attachments.retryFailed()).toBeNull()
+    }
+  })
+
+  it('B4-WS-1: a stale tab rewriting the persisted user with its old organization does not cancel the batch', async () => {
+    // This tab switched to org B: the selected organization is stored.
+    setSelectedOrganizationId('org-B')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-B'),
+    }
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // A stale tab still on org A toggles availability and rewrites 'user'.
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A', is_available: false }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+
+    expect(calls[0].signal.aborted).toBe(false)
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(calls).toHaveLength(2)
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 2 }))
+  })
+
+  it('still stops when the stored selected organization itself changes', async () => {
+    setSelectedOrganizationId('org-B')
+    const session = { userId: () => 'agent-1', isAuthenticated: () => true, workspace: () => readWorkspaceIdentity('org-B') }
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    localStorage.setItem('selected_organization_id', 'org-C')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'selected_organization_id' }))
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(onBatchFinished).not.toHaveBeenCalled()
   })
 })
