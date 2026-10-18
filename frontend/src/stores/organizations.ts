@@ -20,10 +20,12 @@ export const useOrganizationsStore = defineStore('organizations', () => {
   const selectedOrgId = ref<string | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
-  const organizationSwitchBlocker = ref<{
-    owner: string
-    message: string
-  } | null>(null)
+  // Holds on workspace switching, one per owner, so a holder that finishes
+  // only ever releases its own hold (overlapping chat batches, embedded
+  // signup). Switching is blocked while any hold exists; the switcher shows
+  // the oldest hold's message.
+  const organizationSwitchHolds = ref<Array<{ owner: string; message: string }>>([])
+  const organizationSwitchBlocker = computed(() => organizationSwitchHolds.value[0] ?? null)
   let identityGeneration = 0
   let organizationsLoadGeneration = 0
   let myOrganizationsLoadGeneration = 0
@@ -127,18 +129,18 @@ export const useOrganizationsStore = defineStore('organizations', () => {
     selectedOrgId.value = null
     loading.value = false
     error.value = null
-    organizationSwitchBlocker.value = null
+    organizationSwitchHolds.value = []
     clearBrowserOrganizationIdentity()
   }
 
   function blockOrganizationSwitch(owner: string, message: string) {
-    organizationSwitchBlocker.value = { owner, message }
+    const index = organizationSwitchHolds.value.findIndex(hold => hold.owner === owner)
+    if (index >= 0) organizationSwitchHolds.value[index] = { owner, message }
+    else organizationSwitchHolds.value.push({ owner, message })
   }
 
   function unblockOrganizationSwitch(owner: string) {
-    if (organizationSwitchBlocker.value?.owner === owner) {
-      organizationSwitchBlocker.value = null
-    }
+    organizationSwitchHolds.value = organizationSwitchHolds.value.filter(hold => hold.owner !== owner)
   }
 
   async function addMember(data: { email: string; role_id?: string }): Promise<void> {

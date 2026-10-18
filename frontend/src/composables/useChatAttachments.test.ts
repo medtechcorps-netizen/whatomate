@@ -1,11 +1,13 @@
 /** @vitest-environment happy-dom */
 
 import { effectScope, nextTick, reactive } from 'vue'
+import { clearBrowserOrganizationIdentity, setSelectedOrganizationId } from '@/lib/browserIdentity'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   SESSION_ENDING_EVENT,
   isAmbiguousAfterUpload,
   messageStatusFromRealtimeEvent,
+  readWorkspaceIdentity,
   useChatAttachments,
   type RealtimeActivity,
   type SendChatMedia,
@@ -1008,7 +1010,7 @@ describe('useChatAttachments workspace and session binding', () => {
     attachments.stage([file('a.png', 'image/png')])
     const done = attachments.sendAll()
     await settle()
-    expect(holdWorkspace).toHaveBeenCalledWith('Patient contact-a')
+    expect(holdWorkspace).toHaveBeenCalledWith('Patient contact-a', expect.stringMatching(/^chat-media-batch:\d+$/))
     expect(release).not.toHaveBeenCalled()
     calls[0].result.resolve({ id: 'm1' })
     await done
@@ -1085,8 +1087,125 @@ describe('useChatAttachments ambiguous failure after upload (FU-12)', () => {
     expect(isAmbiguousAfterUpload(httpError(502))).toBe(true)
     expect(isAmbiguousAfterUpload(httpError(524, 'origin timeout'))).toBe(true)
     expect(isAmbiguousAfterUpload(new Error('Network Error'))).toBe(true)
-    expect(isAmbiguousAfterUpload(httpError(500))).toBe(false)
+    // The media route never emits a bare 5xx: those are gateway artifacts.
+    expect(isAmbiguousAfterUpload(httpError(500))).toBe(true)
+    expect(isAmbiguousAfterUpload(httpError(520, '<html>unknown error</html>'))).toBe(true)
+    expect(isAmbiguousAfterUpload(httpError(500, { status: 'error', message: 'Failed to send message' }))).toBe(false)
     expect(isAmbiguousAfterUpload(httpError(404))).toBe(false)
     expect(isAmbiguousAfterUpload(httpError(503, { status: 'error', message: 'Failed' }))).toBe(false)
+  })
+})
+
+describe('useChatAttachments round 4: workspace identity, holds and teardown', () => {
+  afterEach(() => {
+    // Lift the module-level override suppression set by an SPA login.
+    setSelectedOrganizationId('cleanup')
+    localStorage.clear()
+  })
+
+  it('B-WS-1: sees another tab switching organization after an SPA login (override suppressed)', async () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    clearBrowserOrganizationIdentity()
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-A'),
+    }
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // The same agent switches to org B in another tab.
+    localStorage.setItem('selected_organization_id', 'org-B')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+  })
+
+  it('readWorkspaceIdentity follows the effective request organization', () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-H' }))
+    const atLoad = readWorkspaceIdentity('org-H')
+    // A super-admin switcher selecting its own organization after load is not a switch.
+    setSelectedOrganizationId('org-H')
+    expect(readWorkspaceIdentity('org-H')).toBe(atLoad)
+    // Selecting another organization is.
+    setSelectedOrganizationId('org-X')
+    expect(readWorkspaceIdentity('org-H')).not.toBe(atLoad)
+    // A switch-org in any tab rewrites the persisted user.
+    setSelectedOrganizationId('org-H')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    expect(readWorkspaceIdentity('org-H')).not.toBe(atLoad)
+  })
+
+  it('readWorkspaceIdentity sees raw shared writes while this tab\'s override is suppressed', () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    clearBrowserOrganizationIdentity()
+    const before = readWorkspaceIdentity('org-A')
+    localStorage.setItem('selected_organization_id', 'org-B')
+    expect(readWorkspaceIdentity('org-A')).not.toBe(before)
+  })
+
+  it('B-T1: a silent change during the only file tears down without reporting', async () => {
+    const ws = { workspace: 'org-1' }
+    const session = { userId: () => 'agent-1', isAuthenticated: () => true, workspace: () => ws.workspace }
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    ws.workspace = 'org-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+    expect(attachments.isOpen.value).toBe(false)
+  })
+
+  it('B-WS-2: overlapping batches from two instances each release only their own hold', async () => {
+    const holds = new Map<string, string>()
+    const holdWorkspace = (recipient: string, holdId: string) => {
+      holds.set(holdId, recipient)
+      return () => holds.delete(holdId)
+    }
+    const first = setup({ holdWorkspace })
+    const second = setup({ holdWorkspace })
+    first.attachments.stage([file('a.png', 'image/png')])
+    second.attachments.stage([file('b.png', 'image/png')])
+    const firstDone = first.attachments.sendAll()
+    const secondDone = second.attachments.sendAll()
+    await settle()
+    expect(holds.size).toBe(2)
+    first.calls[0].result.resolve({ id: 'm1' })
+    await firstDone
+    // The finished batch released its own hold; the other one still blocks switching.
+    expect(holds.size).toBe(1)
+    second.calls[0].result.resolve({ id: 'm2' })
+    await secondDone
+    expect(holds.size).toBe(0)
+  })
+
+  it('B-FU12-1: any bare 5xx after the full upload is unconfirmed; an enveloped 5xx stays failed', async () => {
+    const cases: Array<[unknown, string]> = [
+      [Object.assign(new Error('520'), { response: { status: 520, data: '<html>Web server is returning an unknown error</html>' } }), 'unconfirmed'],
+      [Object.assign(new Error('500'), { response: { status: 500, data: '' } }), 'unconfirmed'],
+      [Object.assign(new Error('500'), { response: { status: 500, data: { status: 'error', message: 'Failed to send message' } } }), 'failed'],
+    ]
+    for (const [error, expected] of cases) {
+      const { attachments, calls } = setup()
+      attachments.stage([file('a.png', 'image/png')])
+      const done = attachments.sendAll()
+      await settle()
+      calls[0].progress(100, 100)
+      calls[0].result.reject(error)
+      await done
+      expect(attachments.items.value[0].status).toBe(expected)
+    }
   })
 })

@@ -2,6 +2,7 @@ import { computed, effectScope, getCurrentScope, markRaw, onScopeDispose, ref, w
 import { messagesService } from '@/services/api'
 import { getErrorMessage } from '@/lib/api-utils'
 import { convertImageToJpeg } from '@/lib/chatImageConversion'
+import { SELECTED_ORGANIZATION_STORAGE_KEY, readSelectedOrganizationId } from '@/lib/browserIdentity'
 import {
   MAX_CAPTION_LENGTH,
   MAX_CHAT_ATTACHMENTS,
@@ -148,9 +149,10 @@ export interface UseChatAttachmentsOptions {
   }
   /**
    * Holds workspace switching while a batch is sending (the coordinated
-   * boundary); returns the release function.
+   * boundary). holdId is unique per batch, so a finishing batch only ever
+   * releases its own hold. Returns the release function.
    */
-  holdWorkspace?: (recipient: string) => () => void
+  holdWorkspace?: (recipient: string, holdId: string) => () => void
 }
 
 /**
@@ -161,12 +163,59 @@ export interface UseChatAttachmentsOptions {
 export const LOGICAL_SESSION_STORAGE_KEY = 'whm_session_id'
 
 export function readLogicalSessionMarker(): string | null {
+  return readStorage(LOGICAL_SESSION_STORAGE_KEY)
+}
+
+/** Where the auth store persists the signed-in user (on every login and switch-org). */
+const PERSISTED_USER_STORAGE_KEY = 'user'
+
+function readStorage(key: string): string | null {
   try {
-    return localStorage.getItem(LOGICAL_SESSION_STORAGE_KEY)
+    return localStorage.getItem(key)
   } catch {
     return null
   }
 }
+
+function persistedUserOrganizationId(): string | null {
+  const raw = readStorage(PERSISTED_USER_STORAGE_KEY)
+  if (!raw) return null
+  try {
+    const user = JSON.parse(raw) as { organization_id?: unknown } | null
+    return user && typeof user.organization_id === 'string' ? user.organization_id : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The workspace this tab's requests go to, plus the shared storage that can
+ * change it from another tab. A tab that signed in without reloading has its
+ * selected-organization override suppressed for its whole life
+ * (clearBrowserOrganizationIdentity), so the override alone would miss a
+ * switch made in another tab. Parts:
+ * - the effective organization of this tab's requests: the override api.ts
+ *   sends (readSelectedOrganizationId), else the token organization;
+ * - the same, read from the raw shared selected organization whatever the
+ *   suppression says (a switch written by another tab);
+ * - the token organization: the persisted user's (the cookie/JWT org,
+ *   rewritten by switch-org in any tab), else the in-memory user's;
+ * - the in-memory user's organization (reactive, same tab).
+ * Effective values, not raw store fields: a super-admin's switcher selecting
+ * its own organization after page load is not a switch. Store fields that
+ * initialise late are deliberately not part of it.
+ */
+export function readWorkspaceIdentity(inMemoryOrganizationId?: string | null): string {
+  const tokenOrganization = persistedUserOrganizationId() || inMemoryOrganizationId || ''
+  return JSON.stringify([
+    readSelectedOrganizationId() || tokenOrganization,
+    readStorage(SELECTED_ORGANIZATION_STORAGE_KEY) || tokenOrganization,
+    tokenOrganization,
+    inMemoryOrganizationId ?? '',
+  ])
+}
+
+let batchSequence = 0
 
 /**
  * Dispatched on window by the auth layer, synchronously, before it clears
@@ -183,18 +232,18 @@ export const MEDIA_SETTLE_TIMEOUT_MS = 10_000
 /** No answer this long after the body uploaded: give up and mark the file unconfirmed. */
 export const MEDIA_RESPONSE_DEADLINE_MS = 120_000
 
-/** Gateway answers that say nothing about whether the app processed the request. */
-const AMBIGUOUS_GATEWAY_STATUSES = new Set([502, 503, 504, 524])
-
 /**
  * After the whole body reached the server, a missing answer (network error)
- * or a gateway 502/503/504/524 without the app's own error envelope does not
- * tell whether the file was sent. Retrying could send it to the patient twice.
+ * or any 5xx without the app's own error envelope {status:'error', message}
+ * does not tell whether the file was sent: the media route never emits a
+ * bare 5xx itself, so those come from gateways (502/503/504, Cloudflare
+ * 520-524, an empty 500). Retrying could send it to the patient twice.
+ * A 4xx or an enveloped 5xx is the app's definite answer.
  */
 export function isAmbiguousAfterUpload(error: unknown): boolean {
   const response = (error as { response?: { status?: number; data?: unknown } } | null)?.response
   if (!response) return true
-  if (!AMBIGUOUS_GATEWAY_STATUSES.has(response.status ?? 0)) return false
+  if ((response.status ?? 0) < 500) return false
   const data = response.data as { status?: unknown; message?: unknown } | null | undefined
   const appRefusal = !!data && typeof data === 'object' && data.status === 'error' && typeof data.message === 'string'
   return !appRefusal
@@ -561,7 +610,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     }
     let releaseWorkspace: (() => void) | null = null
     try {
-      releaseWorkspace = options.holdWorkspace?.(batch.target.label ?? '') ?? null
+      releaseWorkspace = options.holdWorkspace?.(batch.target.label ?? '', `chat-media-batch:${++batchSequence}`) ?? null
     } catch {
       // The fail-closed identity checks still guard the batch.
       releaseWorkspace = null
@@ -704,9 +753,12 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
       stopped: batch.stopRequested,
       detached: batch.detached,
     }
-    // After the session ended, report nothing: the patient's name must not
-    // appear on the login page or in someone else's session.
-    if (batch.terminated || !sessionIsCurrent(batch)) return null
+    // After the session or workspace changed, report nothing: the patient's
+    // name must not appear on the login page or in another workspace. A
+    // silent change (no event) during the last file still tears down the
+    // staging here, so nothing stays live in the new identity.
+    if (!batch.terminated && !sessionIsCurrent(batch)) onSessionEnding()
+    if (batch.terminated) return null
     options.onBatchFinished?.(summary)
     // Done when nothing is left to send, retry, convert or check; invalid
     // files were shown as skipped. A detached batch leaves the (new) staging alone.

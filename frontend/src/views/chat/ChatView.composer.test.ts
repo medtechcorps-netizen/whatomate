@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => ({
   t: vi.fn((key: string) => key),
   blockOrganizationSwitch: vi.fn(),
   unblockOrganizationSwitch: vi.fn(),
+  organizationsStore: null as any,
   realtimeListeners: new Set<(event: { type?: string; payload?: any }) => void>(),
 }))
 
@@ -128,13 +129,16 @@ vi.mock('@/stores/auth', () => ({
   }),
 }))
 vi.mock('@/stores/omnichannelUnread', () => ({ useOmnichannelUnreadStore: () => ({ refresh: vi.fn() }) }))
-vi.mock('@/stores/organizations', () => ({
-  useOrganizationsStore: () => ({
-    selectedOrgId: null,
+vi.mock('@/stores/organizations', async () => {
+  const { reactive } = await import('vue')
+  const store = reactive({
+    selectedOrgId: null as string | null,
     blockOrganizationSwitch: mocks.blockOrganizationSwitch,
     unblockOrganizationSwitch: mocks.unblockOrganizationSwitch,
-  }),
-}))
+  })
+  mocks.organizationsStore = store
+  return { useOrganizationsStore: () => store }
+})
 vi.mock('@/stores/users', () => ({ useUsersStore: () => ({ users: [], fetchUsers: vi.fn(async () => undefined) }) }))
 vi.mock('@/stores/transfers', () => ({
   useTransfersStore: () => ({
@@ -279,6 +283,8 @@ describe('ChatView composer', () => {
   afterEach(() => {
     wrapper?.unmount()
     wrapper = null
+    for (const key of ['whm_session_id', 'selected_organization_id', 'user']) localStorage.removeItem(key)
+    if (mocks.organizationsStore) mocks.organizationsStore.selectedOrgId = null
     vi.runOnlyPendingTimers()
     vi.useRealTimers()
     vi.unstubAllGlobals()
@@ -693,12 +699,13 @@ describe('ChatView composer', () => {
     await settle()
     const calls = sendMediaDeferred()
     await stageAndSend(['a.png'])
-    expect(mocks.blockOrganizationSwitch).toHaveBeenCalledWith('chat-media-batch', 'chat.composer.workspaceSwitchBlocked')
+    expect(mocks.blockOrganizationSwitch).toHaveBeenCalledWith(expect.stringMatching(/^chat-media-batch:\d+$/), 'chat.composer.workspaceSwitchBlocked')
+    const holdId = mocks.blockOrganizationSwitch.mock.calls[0][0]
     expect(mocks.t).toHaveBeenCalledWith('chat.composer.workspaceSwitchBlocked', { name: 'Patient first' })
     expect(mocks.unblockOrganizationSwitch).not.toHaveBeenCalled()
     calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
     await flushPromises()
-    expect(mocks.unblockOrganizationSwitch).toHaveBeenCalledWith('chat-media-batch')
+    expect(mocks.unblockOrganizationSwitch).toHaveBeenCalledWith(holdId)
   })
 
   it('stops the batch and shows nothing when another tab switches organization', async () => {
@@ -715,7 +722,7 @@ describe('ChatView composer', () => {
     expect(mocks.toastWarning).not.toHaveBeenCalled()
     expect(mocks.toastSuccess).not.toHaveBeenCalled()
     expect(mocks.toastError).not.toHaveBeenCalled()
-    expect(mocks.unblockOrganizationSwitch).toHaveBeenCalledWith('chat-media-batch')
+    expect(mocks.unblockOrganizationSwitch).toHaveBeenCalledWith(expect.stringMatching(/^chat-media-batch:/))
     localStorage.removeItem('selected_organization_id')
   })
 
@@ -732,5 +739,40 @@ describe('ChatView composer', () => {
       description: 'chat.composer.batchReportUnconfirmedOne',
     })
     expect(mocks.toastError).not.toHaveBeenCalled()
+  })
+
+  it('B-T2: ends the batch when the logical session changes (same user signs in again)', async () => {
+    localStorage.setItem('whm_session_id', 's1')
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png', 'b.png'])
+    localStorage.setItem('whm_session_id', 's2')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'whm_session_id' }))
+    expect(calls[0].signal.aborted).toBe(true)
+    await flushPromises()
+    expect(calls).toHaveLength(1)
+    expect(wrapper.findComponent(MediaSendDialog).props('open')).toBe(false)
+    expect(mocks.contactsStore!.addMessage).not.toHaveBeenCalled()
+    expect(mocks.toastWarning).not.toHaveBeenCalled()
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    expect(mocks.unblockOrganizationSwitch).toHaveBeenCalledWith(expect.stringMatching(/^chat-media-batch:/))
+  })
+
+  it('B-WS-3: the switcher initialising its own organization mid-batch does not cancel it', async () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-H' }))
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png'])
+    // OrganizationSwitcher's onMounted: selectOrganization(own org) after a slow load.
+    mocks.organizationsStore.selectedOrgId = 'org-H'
+    localStorage.setItem('selected_organization_id', 'org-H')
+    await nextTick()
+    expect(calls[0].signal.aborted).toBe(false)
+    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.toastSuccess).toHaveBeenCalledWith('chat.composer.batchSentOne')
   })
 })
