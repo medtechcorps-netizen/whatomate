@@ -621,15 +621,15 @@ func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
 // lost-COMMIT case (ambiguous) is in lanee_forward_internal_test.go.
 func TestLaneEForwardFailedInsertIsDefiniteAndNotRetried(t *testing.T) {
 	f := laneENewForwardFixture(t)
-	text := f.storedMessage(t, f.source, models.MessageTypeText, "ambiguous", "")
+	text := f.storedMessage(t, f.source, models.MessageTypeText, "insert fails", "")
 	f.app.WaitForBackgroundTasks()
 	attempts := 0
 	target := f.target.ID
-	name := "laneE:ambiguous_forward_" + uuid.NewString()
+	name := "laneE:failed_forward_insert_" + uuid.NewString()
 	require.NoError(t, f.app.DB.Callback().Create().Before("gorm:create").Register(name, func(db *gorm.DB) {
 		if message, ok := db.Statement.Dest.(*models.Message); ok && message.ContactID == target {
 			attempts++
-			_ = db.AddError(errors.New("synthetic: commit outcome unknown"))
+			_ = db.AddError(errors.New("synthetic: the pending-message INSERT failed before COMMIT"))
 		}
 	}))
 	t.Cleanup(func() { _ = f.app.DB.Callback().Create().Remove(name) })

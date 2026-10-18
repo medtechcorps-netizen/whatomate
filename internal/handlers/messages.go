@@ -3213,9 +3213,32 @@ func recordForwardAudit(
 		TargetContactID:        message.ContactID.String(),
 		MessageType:            string(message.MessageType),
 	}); err != nil {
-		return &forwardAuditError{err: err}
+		if forwardAuditFailureRepeats(err) {
+			return &forwardAuditError{err: err}
+		}
+		// Transient (deadline, cancellation, dropped connection, retryable
+		// SQLSTATE): classified by phase, so the client may try again.
+		return fmt.Errorf("record forward audit: %w", err)
 	}
 	return nil
+}
+
+// forwardAuditFailureRepeats reports whether a failed audit write would fail
+// the same way on a retry: a data (22), integrity (23), schema or privilege
+// (42) or raised (P0, e.g. a trigger or policy) error. Anything else, such as
+// a deadline, a cancellation (57014), a dropped connection, or a deadlock or
+// lock timeout left after retries (40P01, 55P03), is transient.
+func forwardAuditFailureRepeats(err error) bool {
+	code := postgresErrorCode(err)
+	if len(code) != 5 {
+		return false
+	}
+	switch code[:2] {
+	case "22", "23", "42", "P0":
+		return true
+	default:
+		return false
+	}
 }
 
 // requireForwardAccountActive re-reads the sending account in one short
@@ -3366,8 +3389,9 @@ type forwardSendOutcome struct {
 	reachedCommit bool
 }
 
-// forwardAuditError is a failure to write the per-target forward audit entry.
-// The forward is refused; it would fail the same way on a retry.
+// forwardAuditError is a per-target forward audit failure that would repeat
+// (a missing actor or message, or a permanent SQLSTATE class; see
+// forwardAuditFailureRepeats). Transient audit failures are not wrapped.
 type forwardAuditError struct {
 	err error
 }

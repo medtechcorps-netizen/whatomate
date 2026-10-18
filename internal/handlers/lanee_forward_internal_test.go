@@ -5,10 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +22,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
+	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -208,6 +213,8 @@ func TestLaneEForwardSendFailureClassification(t *testing.T) {
 		{"inactive account: would repeat", fmt.Errorf("send: %w", whatsappaccount.ErrOutboundInactive), true, requested, 400, string(forwardErrorAccountUnavailable)},
 		{"audit write failure: would repeat", fmt.Errorf("persist: %w", &forwardAuditError{err: errors.New("insert audit_logs")}), true, rolledBack, 500, sendFailed},
 		{"audit write failure inside a request transaction: would repeat", &forwardAuditError{}, true, inRequest, 500, sendFailed},
+		{"audit write hit a deadline: transient, rolled back", fmt.Errorf("record forward audit: %w", context.DeadlineExceeded), true, rolledBack, 503, string(forwardErrorTemporarilyUnavailable)},
+		{"audit write deadlocked after retries (40P01): transient", fmt.Errorf("record forward audit: %w", laneESQLStateError("40P01")), true, rolledBack, 503, string(forwardErrorTemporarilyUnavailable)},
 		{"rejected before any write: would repeat", errors.New("WhatsApp account is required"), true, forwardSendOutcome{}, 500, sendFailed},
 		{"request transaction: rolled back with the error response", errors.New("savepoint failed"), true, forwardSendOutcome{writeRequested: true, requestTransaction: true, writeStarted: true}, 503, string(forwardErrorTemporarilyUnavailable)},
 		{"request transaction: even after its write completed", timeout, true, inRequest, 503, string(forwardErrorTemporarilyUnavailable)},
@@ -231,6 +238,27 @@ func TestLaneEForwardSendFailureClassification(t *testing.T) {
 	assert.Equal(t, "Failed to send message", forwardSendFailedRefusal().Message)
 	assert.Equal(t, "Failed to resolve WhatsApp account", forwardAccountUnavailableRefusal().Message)
 	assert.Equal(t, 503, forwardNotAcceptedRefusal().Status)
+}
+
+// laneESQLStateError is an error carrying a PostgreSQL SQLSTATE, as pgx's are.
+type laneESQLStateError string
+
+func (e laneESQLStateError) Error() string    { return "synthetic SQLSTATE " + string(e) }
+func (e laneESQLStateError) SQLState() string { return string(e) }
+
+// E2R3-4: only audit failures that would repeat are non-retryable; transient
+// ones are classified by phase (a rolled-back write is a 503).
+func TestLaneEForwardAuditFailureRepeatsOnlyForPermanentClasses(t *testing.T) {
+	cases := map[string]bool{
+		"22001": true, "23505": true, "42501": true, "P0001": true,
+		"40P01": false, "40001": false, "55P03": false, "57014": false, "08006": false, "25P02": false,
+	}
+	for code, repeats := range cases {
+		assert.Equal(t, repeats, forwardAuditFailureRepeats(fmt.Errorf("insert audit_logs: %w", laneESQLStateError(code))), code)
+	}
+	assert.False(t, forwardAuditFailureRepeats(context.DeadlineExceeded))
+	assert.False(t, forwardAuditFailureRepeats(context.Canceled))
+	assert.False(t, forwardAuditFailureRepeats(errors.New("connection reset by peer")))
 }
 
 // The phase record is filled by SendOutgoingMessage itself: a rejection before
@@ -326,14 +354,17 @@ func TestLaneEForwardRowStartsQueued(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DB and process-boundary tests (run at the R3 gates; they need
-// TEST_DATABASE_URL). A process boundary is emulated without a second OS
-// process: a forward's pending row commits in its own transaction and its
-// delivery worker is queued as an after-commit callback. Dropping that
-// callback is an exit before the worker ran; running it later is a worker
-// that resumes; runtime.Goexit inside the provider call is an exit at that
-// point (only deferred calls run, so the open provider transaction rolls
-// back). A "restarted" App shares only the database with the old one.
+// DB tests (run at the R3 gates; they need TEST_DATABASE_URL).
+//
+// Two kinds of process-boundary test follow. The "InProcess" ones are
+// emulations inside this test process: the delivery worker is a queued
+// after-commit callback (dropped = it never ran, run twice = a duplicate
+// worker), and runtime.Goexit inside the provider call stops that goroutine
+// while still running its deferred calls (so GORM rolls the provider
+// transaction back). They prove the claim fence and the stored states, not
+// what a real exit or restart does. The "ProcessExit" tests at the end re-run
+// this test binary as a child process that calls os.Exit at the boundary and
+// restart through a second child that builds App like cmd/whatomate/main.go.
 // ---------------------------------------------------------------------------
 
 // laneEForwardWorld is one organization with a sendable account, a source
@@ -419,8 +450,8 @@ func (w *laneEForwardWorld) commitForward(
 	return msg, callbacks
 }
 
-// restarted is a new process on the same database: no goroutine, callback or
-// in-memory state survives from the one that exited.
+// restarted is a fresh App value on the same database (in-process: it runs no
+// startup path). The real restart is laneEChildApp in a child process.
 func (w *laneEForwardWorld) restarted() *App {
 	return &App{DB: w.app.DB, Log: testutil.NopLogger(), Config: w.app.Config, WhatsApp: w.app.WhatsApp}
 }
@@ -504,8 +535,24 @@ $fn$`, name, column, value)).Error)
 // after COMMIT was sent would.
 type laneELostCommitPool struct {
 	gorm.ConnPool
-	matches func(query string, args []any) bool
-	lost    chan struct{} // one token: one lost confirmation
+	matches    func(query string, args []any) bool
+	lost       chan struct{} // one token: one lost confirmation
+	beginFails chan struct{} // one token: one failed BEGIN
+}
+
+// laneEFailNextBegin makes the next BEGIN on db fail, as when no pooled
+// connection (or tenant binding) is available: nothing is written.
+func laneEFailNextBegin(db *gorm.DB) *gorm.DB {
+	pool := &laneELostCommitPool{
+		ConnPool:   db.Statement.ConnPool,
+		matches:    func(string, []any) bool { return false },
+		lost:       make(chan struct{}, 1),
+		beginFails: make(chan struct{}, 1),
+	}
+	pool.beginFails <- struct{}{}
+	failing := db.Session(&gorm.Session{NewDB: true, Context: context.Background()})
+	failing.Statement.ConnPool = pool
+	return failing
 }
 
 func laneELoseCommitConfirmation(db *gorm.DB, matches func(query string, args []any) bool) *gorm.DB {
@@ -517,6 +564,11 @@ func laneELoseCommitConfirmation(db *gorm.DB, matches func(query string, args []
 }
 
 func (p *laneELostCommitPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	select {
+	case <-p.beginFails:
+		return nil, errors.New("synthetic: no pooled database connection for BEGIN")
+	default:
+	}
 	beginner, ok := p.ConnPool.(gorm.TxBeginner)
 	if !ok {
 		return nil, gorm.ErrInvalidTransaction
@@ -574,10 +626,12 @@ func (tx *laneELostCommitTx) Commit() error {
 	}
 }
 
-// Q5: under RLS the pending row is a savepoint of the request transaction. A
-// real failure inside that savepoint, then Tenant's rollback of the error
-// response, leaves no row and no provider attempt: a definite 503.
-func TestLaneEForwardRLSSavepointFailureRollsBackDefinitely(t *testing.T) {
+// Q5 under RLS, with a database-raised failure. The BEFORE INSERT trigger
+// aborts the whole request transaction, so "no row" would hold whatever the
+// savepoint or Tenant code did: this test shows the 503 contract, one attempt
+// and no provider call, not the rollback path. The rollback path is
+// TestLaneEForwardRLSGoLevelFailureRollsBack.
+func TestLaneEForwardRLSTriggerFailureIsDefinite(t *testing.T) {
 	w := laneENewForwardWorld(t)
 	w.app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
 	refused := laneEFailInserts(t, w.app.DB, "messages", "contact_id", w.target.ID)
@@ -588,6 +642,67 @@ func TestLaneEForwardRLSSavepointFailureRollsBackDefinitely(t *testing.T) {
 	assert.Equal(t, int64(1), refused(), "one insert attempt, never retried")
 	assert.Zero(t, laneECountMessages(t, w.app, w.target), "no durable pending row")
 	assert.Empty(t, w.capture.snapshot(), "no provider attempt")
+}
+
+// Q5 under RLS, with a Go-level failure after the INSERT: the message and its
+// audit row were written and the request transaction is still healthy (no
+// SQL error aborted it). Only the savepoint rollback and Tenant's rollback of
+// the error response keep the rows out; if neither ran, they would be there.
+func TestLaneEForwardRLSGoLevelFailureRollsBack(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	w.app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+	preview := "lane-e savepoint " + uuid.NewString()
+	require.NoError(t, w.app.DB.Model(&models.Message{}).Where("id = ?", w.source.ID).Update("content", preview).Error)
+	var before models.Contact
+	require.NoError(t, w.app.DB.First(&before, "id = ?", w.target.ID).Error)
+
+	target := w.target.ID
+	inserted := 0
+	insertHook := "laneE:count_forward_insert_" + uuid.NewString()
+	require.NoError(t, w.app.DB.Callback().Create().After("gorm:create").Register(insertHook, func(db *gorm.DB) {
+		if message, ok := db.Statement.Dest.(*models.Message); ok && message.ContactID == target && db.Error == nil {
+			inserted++
+		}
+	}))
+	t.Cleanup(func() { _ = w.app.DB.Callback().Create().Remove(insertHook) })
+	failHook := "laneE:fail_contact_preview_" + uuid.NewString()
+	require.NoError(t, w.app.DB.Callback().Update().Before("gorm:update").Register(failHook, func(db *gorm.DB) {
+		dest, ok := db.Statement.Dest.(map[string]any)
+		if ok && db.Statement.Table == "contacts" && fmt.Sprint(dest["last_message_preview"]) == preview {
+			_ = db.AddError(errors.New("synthetic: contact preview update refused (no SQL ran)"))
+		}
+	}))
+	t.Cleanup(func() { _ = w.app.DB.Callback().Update().Remove(failHook) })
+
+	status, body := w.post(t, w.app, true, nil)
+	assert.Equal(t, 503, status, body)
+	assert.Contains(t, body, string(forwardErrorTemporarilyUnavailable))
+	assert.Equal(t, 1, inserted, "the INSERT succeeded before the failure")
+	assert.Zero(t, laneECountMessages(t, w.app, w.target), "no message row")
+	var audits int64
+	require.NoError(t, w.app.DB.Model(&models.AuditLog{}).
+		Where("organization_id = ? AND user_id = ? AND resource_type = ?", w.org.ID, w.user.ID, "message").
+		Count(&audits).Error)
+	assert.Zero(t, audits, "no forward audit row")
+	var after models.Contact
+	require.NoError(t, w.app.DB.First(&after, "id = ?", w.target.ID).Error)
+	assert.Equal(t, before.LastMessagePreview, after.LastMessagePreview, "contact preview unchanged")
+	assert.Empty(t, w.capture.snapshot(), "no provider call")
+}
+
+// Q5 phase "no write began" on the real path: BEGIN itself fails, so nothing
+// was written. A definite 503.
+func TestLaneEForwardBeginFailureIsDefinite(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	healthy := w.app.DB
+	w.app.DB = laneEFailNextBegin(healthy)
+	status, body := w.post(t, w.app, false, nil)
+	w.app.DB = healthy
+
+	assert.Equal(t, 503, status, body)
+	assert.Contains(t, body, string(forwardErrorTemporarilyUnavailable))
+	assert.Zero(t, laneECountMessages(t, w.app, w.target))
+	assert.Empty(t, w.capture.snapshot())
 }
 
 // Q5: the pending row commits but the COMMIT confirmation is lost. The handler
@@ -798,17 +913,18 @@ func TestLaneEForwardClaimErrorReportsCommitBoundary(t *testing.T) {
 	assert.True(t, claimErr.reachedCommit)
 }
 
-// Q6 boundary 1: the process exits after the request committed, before the
-// worker claimed the provider phase. After a restart the forward reads as
-// delayed (status unknown) and nothing sends it.
-func TestLaneEForwardExitBeforeMarkerIsDelayedAndNotResent(t *testing.T) {
+// Q6 boundary 1, in-process emulation: the worker callback is dropped. This
+// shows the stored state (queued, read as delayed) and that no in-process
+// path resends a queued forward. It cannot show what a real restart does:
+// that is TestLaneEForwardProcessExitBeforeMarker.
+func TestLaneEForwardInProcessExitBeforeMarkerHasNoResendPath(t *testing.T) {
 	w := laneENewForwardWorld(t)
 	calls := 0
 	msg, _ := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
 		calls++
 		return "wamid.lane-e-b1", nil
 	})
-	// Exit: the queued worker never runs.
+	// The queued worker never runs.
 	restarted := w.restarted()
 	stored := laneELoadMessage(t, restarted, msg.ID)
 	assert.Equal(t, models.MessageStatusPending, stored.Status)
@@ -819,10 +935,11 @@ func TestLaneEForwardExitBeforeMarkerIsDelayedAndNotResent(t *testing.T) {
 	assert.Empty(t, w.capture.snapshot())
 }
 
-// Q6 boundary 2: the worker committed the provider-phase marker and the
-// process exited before the provider was called. The forward reads as
-// uncertain after a restart, and no later worker reaches the provider.
-func TestLaneEForwardExitAfterMarkerBeforeProviderIsUncertain(t *testing.T) {
+// Q6 boundary 2, in-process emulation (Goexit runs the deferred rollback): the
+// marker committed, so the row reads uncertain, and the claim fence stops any
+// later worker before the provider. Real exit:
+// TestLaneEForwardProcessExitAfterMarkerBeforeProvider.
+func TestLaneEForwardInProcessClaimFenceAfterMarker(t *testing.T) {
 	w := laneENewForwardWorld(t)
 	entered := 0
 	msg, pending := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
@@ -847,10 +964,11 @@ func TestLaneEForwardExitAfterMarkerBeforeProviderIsUncertain(t *testing.T) {
 	assert.Equal(t, models.MessageStatusPending, laneELoadMessage(t, restarted, msg.ID).Status)
 }
 
-// Q6 boundary 3: the provider accepted the message and the process exited
-// before its result was recorded. The forward stays uncertain across a
-// restart and there is never a second provider effect.
-func TestLaneEForwardExitAfterProviderAcceptedIsUncertainAndNotDuplicated(t *testing.T) {
+// Q6 boundary 3, in-process emulation: the provider accepted and the worker
+// stopped before recording the result. The row stays uncertain and the claim
+// fence prevents a second provider effect. Real exit:
+// TestLaneEForwardProcessExitAfterProviderAccepted.
+func TestLaneEForwardInProcessClaimFenceAfterProviderAccepted(t *testing.T) {
 	w := laneENewForwardWorld(t)
 	accepted := 0
 	msg, pending := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
@@ -875,9 +993,10 @@ func TestLaneEForwardExitAfterProviderAcceptedIsUncertainAndNotDuplicated(t *tes
 		forwardDeliveryState(laneELoadMessage(t, restarted, msg.ID), time.Now().Add(10*time.Minute)))
 }
 
-// Q6: "delayed" is not "not sent". A worker paused past the stall age still
-// owns its queued row: when it resumes it sends, exactly once.
-func TestLaneEForwardPausedWorkerResumesAndSendsOnce(t *testing.T) {
+// Q6, in-process: "delayed" is not "not sent". A worker paused past the stall
+// age still owns its queued row: when it resumes it sends, exactly once. Real
+// processes: TestLaneEForwardProcessPausedWorkerResumes.
+func TestLaneEForwardInProcessPausedWorkerResumesAndSendsOnce(t *testing.T) {
 	w := laneENewForwardWorld(t)
 	calls := 0
 	wamid := "wamid.lane-e-paused-" + uuid.NewString()[:8]
@@ -896,4 +1015,321 @@ func TestLaneEForwardPausedWorkerResumesAndSendsOnce(t *testing.T) {
 	assert.Equal(t, wamid, stored.WhatsAppMessageID)
 	assert.Equal(t, 1, calls)
 	assert.Empty(t, forwardDeliveryState(stored, time.Now()))
+}
+
+// ---------------------------------------------------------------------------
+// Real process-exit tests (R3 gate). The parent re-runs this test binary as a
+// child process (LANE_E_EXIT_CHILD) that commits a forward and calls os.Exit
+// at one boundary: no deferred call runs, PostgreSQL sees the connection drop
+// and aborts any open transaction. A second child then plays the restarted
+// server: it builds App as cmd/whatomate/main.go does (database.NewPostgres,
+// then the App fields a forward uses) and serves the row on the read path,
+// which is all a server does with a stalled forward (no startup step resends
+// or settles one). Provider calls go to a Graph stub in the parent, so a
+// provider effect survives the child's exit.
+// ---------------------------------------------------------------------------
+
+// laneEExitAtHook is the exit code a child uses at its boundary, so the parent
+// can tell that exit from a failure.
+const laneEExitAtHook = 3
+
+type laneEExitWorld struct {
+	*laneEForwardWorld
+	graph   *httptest.Server
+	effects *atomic.Int64 // provider sends the Graph stub accepted
+}
+
+func laneENewExitWorld(t *testing.T) *laneEExitWorld {
+	t.Helper()
+	w := laneENewForwardWorld(t)
+	effects := &atomic.Int64{}
+	graph := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/messages") {
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n := effects.Add(1)
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(rw, `{"messages":[{"id":"wamid.lane-e-exit-%d-%s"}]}`, n, uuid.NewString()[:8])
+	}))
+	t.Cleanup(graph.Close)
+	return &laneEExitWorld{laneEForwardWorld: w, graph: graph, effects: effects}
+}
+
+func (x *laneEExitWorld) child(ctx context.Context, mode string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLaneEForwardExitChild$", "-test.count=1", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"LANE_E_EXIT_CHILD="+mode,
+		"LANE_E_EXIT_GRAPH="+x.graph.URL,
+		"LANE_E_EXIT_ORG="+x.org.ID.String(),
+		"LANE_E_EXIT_USER="+x.user.ID.String(),
+		"LANE_E_EXIT_ACCOUNT="+x.account.ID.String(),
+		"LANE_E_EXIT_TARGET="+x.target.ID.String(),
+		"LANE_E_EXIT_SOURCE="+x.source.ID.String(),
+	)
+	return cmd
+}
+
+// run starts a child, waits for it and returns its exit code and output.
+func (x *laneEExitWorld) run(t *testing.T, mode string) (int, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	out, err := x.child(ctx, mode).CombinedOutput()
+	return laneEExitCode(t, err, string(out)), string(out)
+}
+
+func laneEExitCode(t *testing.T, err error, out string) int {
+	t.Helper()
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	require.True(t, errors.As(err, &exitErr), "child did not run: %v\n%s", err, out)
+	return exitErr.ExitCode()
+}
+
+// laneEChildValue reads a "LANE_E_<key>=value" line a child printed.
+func laneEChildValue(out, key string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "LANE_E_"+key+"="); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+// targetForward is the one forward a child committed for this world's target.
+func (x *laneEExitWorld) targetForward(t *testing.T) *models.Message {
+	t.Helper()
+	var rows []models.Message
+	require.NoError(t, x.app.DB.Where("organization_id = ? AND contact_id = ?", x.org.ID, x.target.ID).Find(&rows).Error)
+	require.Len(t, rows, 1)
+	return &rows[0]
+}
+
+// age moves a stalled forward's clocks past the stall age.
+func (x *laneEExitWorld) age(t *testing.T, id uuid.UUID) {
+	t.Helper()
+	past := time.Now().Add(-10 * time.Minute).UTC()
+	require.NoError(t, x.app.DB.Exec(`UPDATE messages
+		SET created_at = ?, updated_at = ?,
+		    metadata = CASE WHEN metadata ->> 'forward_dispatch_at' IS NOT NULL
+		      THEN jsonb_set(metadata, '{forward_dispatch_at}', to_jsonb(?::text)) ELSE metadata END
+		WHERE id = ?`, past, past, past.Format(time.RFC3339Nano), id).Error)
+}
+
+// laneEChildApp builds App as cmd/whatomate/main.go does, for what a forward
+// needs: database.NewPostgres from the database configuration, then the App
+// fields. Redis, the websocket hub and the job queue are left out; a forward's
+// delivery runs without them.
+func laneEChildApp(t *testing.T) *App {
+	t.Helper()
+	cfg := &config.Config{Database: config.DatabaseConfig{
+		URL:             os.Getenv("TEST_DATABASE_URL"),
+		MaxOpenConns:    5,
+		MaxIdleConns:    2,
+		ConnMaxLifetime: 60,
+	}}
+	db, err := database.NewPostgres(&cfg.Database, false)
+	require.NoError(t, err)
+	log := testutil.NopLogger()
+	return &App{
+		Config:     cfg,
+		DB:         db,
+		Log:        log,
+		WhatsApp:   whatsapp.NewWithBaseURL(log, os.Getenv("LANE_E_EXIT_GRAPH")),
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+// TestLaneEForwardExitChild is the child half of the process-exit tests. It
+// does nothing unless the parent set LANE_E_EXIT_CHILD.
+func TestLaneEForwardExitChild(t *testing.T) {
+	mode := os.Getenv("LANE_E_EXIT_CHILD")
+	if mode == "" {
+		t.Skip("child process for the TestLaneEForwardProcess* tests")
+	}
+	id := func(key string) uuid.UUID {
+		value, err := uuid.Parse(os.Getenv("LANE_E_EXIT_" + key))
+		require.NoError(t, err, key)
+		return value
+	}
+	app := laneEChildApp(t)
+	orgID, targetID := id("ORG"), id("TARGET")
+	if mode == "restart" || mode == "restart-claim" {
+		laneEChildRestart(t, app, orgID, targetID, mode == "restart-claim")
+		return
+	}
+
+	var account models.WhatsAppAccount
+	require.NoError(t, app.DB.First(&account, "id = ? AND organization_id = ?", id("ACCOUNT"), orgID).Error)
+	require.NoError(t, app.prepareWhatsAppAccountForOutbound(&account))
+	var target models.Contact
+	require.NoError(t, app.DB.First(&target, "id = ? AND organization_id = ?", targetID, orgID).Error)
+	var source models.Message
+	require.NoError(t, app.DB.First(&source, "id = ? AND organization_id = ?", id("SOURCE"), orgID).Error)
+
+	var deliver func(context.Context, *models.Contact) (string, error)
+	switch mode {
+	case "exit-after-marker":
+		deliver = func(context.Context, *models.Contact) (string, error) {
+			// Inside the provider transaction, before any provider effect.
+			os.Exit(laneEExitAtHook)
+			return "", nil
+		}
+	case "exit-after-provider":
+		deliver = func(ctx context.Context, contact *models.Contact) (string, error) {
+			wamid, err := app.WhatsApp.SendTextMessage(ctx, app.toWhatsAppAccount(&account),
+				whatsapp.Recipient{Phone: contact.PhoneNumber, BSUID: contact.BSUID}, source.Content, "")
+			if err == nil {
+				// The provider accepted; its result is never recorded.
+				os.Exit(laneEExitAtHook)
+			}
+			return wamid, err
+		}
+	}
+
+	userID := id("USER")
+	opts := DefaultSendOptions()
+	opts.SentByUserID = &userID
+	scoped := app.scopedApp(app.DB, orgID)
+	msg, err := scoped.SendOutgoingMessage(context.Background(), OutgoingMessageRequest{
+		Account:          &account,
+		Contact:          &target,
+		Type:             models.MessageTypeText,
+		Content:          source.Content,
+		forwardedFrom:    &messageForwardSource{MessageID: source.ID, ContactID: source.ContactID},
+		deliveryOverride: deliver,
+	}, opts)
+	require.NoError(t, err)
+	worker := scoped.takeAfterCommit()
+	fmt.Printf("LANE_E_MESSAGE=%s\n", msg.ID)
+
+	switch mode {
+	case "exit-before-marker":
+		// Committed; the delivery worker never starts.
+		os.Exit(laneEExitAtHook)
+	case "pause-before-worker":
+		// A live process whose worker has not run yet, until the parent says so.
+		var line string
+		_, _ = fmt.Fscanln(os.Stdin, &line)
+	}
+	for _, callback := range worker {
+		callback()
+	}
+	app.WaitForBackgroundTasks()
+}
+
+// laneEChildRestart is the restarted server: it serves the target's forward
+// on the read path and, if asked, tries to claim it again.
+func laneEChildRestart(t *testing.T, app *App, orgID, targetID uuid.UUID, tryClaim bool) {
+	t.Helper()
+	var messages []models.Message
+	require.NoError(t, app.DB.Where("organization_id = ? AND contact_id = ?", orgID, targetID).Find(&messages).Error)
+	require.Len(t, messages, 1)
+	response := app.buildMessagesResponse(messages)[0]
+	fmt.Printf("LANE_E_STATUS=%s\nLANE_E_STATE=%s\nLANE_E_DISPATCH=%s\n",
+		response.Status, response.ForwardDeliveryState, response.ForwardDispatch)
+	if tryClaim {
+		claimed, err := app.claimForwardProviderPhase(orgID, messages[0].ID)
+		require.NoError(t, err)
+		fmt.Printf("LANE_E_CLAIM=%t\n", claimed)
+	}
+	app.WaitForBackgroundTasks()
+}
+
+// Q6 boundary 1, real exit: the request committed and the process exited
+// before its worker started. A restarted server reads the forward as delayed
+// and nothing sends it.
+func TestLaneEForwardProcessExitBeforeMarker(t *testing.T) {
+	x := laneENewExitWorld(t)
+	code, out := x.run(t, "exit-before-marker")
+	require.Equal(t, laneEExitAtHook, code, out)
+	row := x.targetForward(t)
+	assert.Equal(t, row.ID.String(), laneEChildValue(out, "MESSAGE"))
+	assert.Equal(t, models.MessageStatusPending, row.Status)
+	assert.Equal(t, forwardDispatchQueued, row.Metadata[forwardDispatchMetadataKey])
+
+	x.age(t, row.ID)
+	code, out = x.run(t, "restart")
+	require.Zero(t, code, out)
+	assert.Equal(t, string(models.MessageStatusPending), laneEChildValue(out, "STATUS"), out)
+	assert.Equal(t, forwardDeliveryDelayed, laneEChildValue(out, "STATE"), out)
+	assert.Equal(t, forwardDispatchQueued, laneEChildValue(out, "DISPATCH"), out)
+	assert.Zero(t, x.effects.Load(), "no provider call, before or after the restart")
+}
+
+// Q6 boundary 2, real exit: the worker committed the marker, then the process
+// died inside the provider transaction before any provider effect. PostgreSQL
+// aborts that transaction; the row reads uncertain after a restart and can
+// never be claimed again.
+func TestLaneEForwardProcessExitAfterMarkerBeforeProvider(t *testing.T) {
+	x := laneENewExitWorld(t)
+	code, out := x.run(t, "exit-after-marker")
+	require.Equal(t, laneEExitAtHook, code, out)
+	row := x.targetForward(t)
+	assert.Equal(t, models.MessageStatusPending, row.Status)
+	assert.Equal(t, forwardDispatchProvider, row.Metadata[forwardDispatchMetadataKey], "the marker committed before the provider transaction")
+
+	x.age(t, row.ID)
+	code, out = x.run(t, "restart-claim")
+	require.Zero(t, code, out)
+	assert.Equal(t, forwardDeliveryUncertain, laneEChildValue(out, "STATE"), out)
+	assert.Equal(t, "false", laneEChildValue(out, "CLAIM"), "the restarted server cannot claim it again")
+	assert.Zero(t, x.effects.Load())
+}
+
+// Q6 boundary 3, real exit: the provider accepted the message and the process
+// died before recording the result. It stays uncertain across a restart and
+// there is never a second provider effect.
+func TestLaneEForwardProcessExitAfterProviderAccepted(t *testing.T) {
+	x := laneENewExitWorld(t)
+	code, out := x.run(t, "exit-after-provider")
+	require.Equal(t, laneEExitAtHook, code, out)
+	require.Equal(t, int64(1), x.effects.Load(), "the provider accepted the message")
+	row := x.targetForward(t)
+	assert.Equal(t, models.MessageStatusPending, row.Status, "its result was never recorded")
+	assert.Equal(t, forwardDispatchProvider, row.Metadata[forwardDispatchMetadataKey])
+
+	x.age(t, row.ID)
+	code, out = x.run(t, "restart-claim")
+	require.Zero(t, code, out)
+	assert.Equal(t, forwardDeliveryUncertain, laneEChildValue(out, "STATE"), out)
+	assert.Equal(t, "false", laneEChildValue(out, "CLAIM"))
+	assert.Equal(t, int64(1), x.effects.Load(), "no second provider effect")
+}
+
+// Q6 paused worker, real processes: a live process whose worker has not run
+// yet. While it is paused, a second process reads the forward as delayed
+// (never "not sent"); when the first resumes, it sends exactly once.
+func TestLaneEForwardProcessPausedWorkerResumes(t *testing.T) {
+	x := laneENewExitWorld(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	paused := x.child(ctx, "pause-before-worker")
+	resume, err := paused.StdinPipe()
+	require.NoError(t, err)
+	var pausedOut strings.Builder
+	paused.Stdout, paused.Stderr = &pausedOut, &pausedOut
+	require.NoError(t, paused.Start())
+
+	var row models.Message
+	require.Eventually(t, func() bool {
+		return x.app.DB.Where("organization_id = ? AND contact_id = ?", x.org.ID, x.target.ID).
+			Limit(1).Find(&row).Error == nil && row.ID != uuid.Nil
+	}, time.Minute, 100*time.Millisecond, "the paused process committed its forward")
+	x.age(t, row.ID)
+	code, out := x.run(t, "restart")
+	require.Zero(t, code, out)
+	assert.Equal(t, forwardDeliveryDelayed, laneEChildValue(out, "STATE"), out)
+	assert.Zero(t, x.effects.Load())
+
+	_, err = fmt.Fprintln(resume, "resume")
+	require.NoError(t, err)
+	waitErr := paused.Wait()
+	require.Zero(t, laneEExitCode(t, waitErr, pausedOut.String()), pausedOut.String())
+	stored := x.targetForward(t)
+	assert.Equal(t, models.MessageStatusSent, stored.Status, stored.ErrorMessage)
+	assert.Equal(t, int64(1), x.effects.Load(), "sent exactly once")
 }
