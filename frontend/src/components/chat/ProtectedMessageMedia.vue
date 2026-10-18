@@ -63,6 +63,10 @@ const AUTO_RELOAD_WAITS = [1_000, 5_000, 15_000]
 let autoReloadTimer: ReturnType<typeof setTimeout> | null = null
 let autoReloadsUsed = 0
 let autoReloadEpoch = 0
+// The epoch of the automatic load still running, if any. Only one runs at a
+// time: a quiet load leaves the failure on screen, so a status change while
+// it runs must not arm another.
+let autoReloadRunning: number | null = null
 // The last load failed while the message was pending; cleared by any success.
 let failedWhilePending = false
 const root = ref<HTMLElement | null>(null)
@@ -181,12 +185,15 @@ async function loadMedia(options: { userInitiated?: boolean; quiet?: boolean } =
     if (previewType === 'image/jpeg' || previewType === 'image/png') {
       previewImageURL.value = URL.createObjectURL(new Blob([blob], { type: previewType }))
     }
+    // Any load that succeeds ends the automatic tries for this media.
+    cancelAutoReload()
     failedWhilePending = false
     status.value = 'ready'
     return mediaURL.value
   } catch {
     if (requestGeneration === generation) {
-      failedWhilePending = startedPending
+      // An automatic try that fails keeps the remaining tries.
+      if (!options.quiet) failedWhilePending = startedPending
       status.value = 'error'
     }
     return ''
@@ -233,22 +240,34 @@ function cancelAutoReload() {
 }
 
 function scheduleAutoReload() {
-  if (autoReloadTimer || autoReloadsUsed >= AUTO_RELOAD_WAITS.length || status.value !== 'error') return
+  if (autoReloadTimer || autoReloadRunning === autoReloadEpoch) return
+  if (autoReloadsUsed >= AUTO_RELOAD_WAITS.length || status.value !== 'error') return
   const epoch = autoReloadEpoch
   autoReloadTimer = setTimeout(async () => {
     autoReloadTimer = null
-    const focused = !!root.value?.contains(document.activeElement)
-    const url = await loadMedia({ quiet: true })
-    if (epoch !== autoReloadEpoch) return
+    // Anything may have happened during the wait: a Retry, new media, a load
+    // that already succeeded.
+    if (epoch !== autoReloadEpoch || status.value !== 'error' || !failedWhilePending) return
+    const retryFocused = !!root.value?.contains(document.activeElement)
+    autoReloadRunning = epoch
+    let url = ''
+    try {
+      url = await loadMedia({ quiet: true })
+    } finally {
+      if (autoReloadRunning === epoch) autoReloadRunning = null
+    }
     if (!url) {
       // Media still missing waits longer before the next try.
-      scheduleAutoReload()
+      if (epoch === autoReloadEpoch) scheduleAutoReload()
       return
     }
-    // Focus that was on Retry moves to the image that replaced it.
-    if (focused) {
-      await nextTick()
-      root.value?.querySelector<HTMLElement>('button')?.focus()
+    // Focus that was on Retry moves to the image that replaced it, unless
+    // the agent has since moved it elsewhere.
+    await nextTick()
+    const active = document.activeElement
+    const focusLeftBubble = !!active && active !== document.body && !root.value?.contains(active)
+    if (retryFocused && !focusLeftBubble && mediaURL.value === url) {
+      root.value?.querySelector<HTMLElement>('button')?.focus({ preventScroll: true })
     }
   }, AUTO_RELOAD_WAITS[autoReloadsUsed++])
 }
@@ -363,9 +382,12 @@ onBeforeUnmount(() => {
       <Play class="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
       <span class="text-sm">{{ kind === 'video' ? t('chat.playVideo') : t('chat.playAudio') }}</span>
     </button>
+    <!-- Polite, not assertive: a failed attachment should not interrupt
+         what the agent is reading or typing. -->
     <div
       v-else-if="status === 'error'"
       role="alert"
+      aria-live="polite"
       class="flex max-w-[280px] items-center gap-2 px-3 py-3 bg-background/50 rounded-lg text-sm"
     >
       <AlertCircle class="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />

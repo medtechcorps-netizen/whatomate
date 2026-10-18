@@ -727,6 +727,89 @@ describe('ProtectedMessageMedia', () => {
       expect(document.activeElement).toBe(view.get('button').element)
     })
 
+    it('arms no second try while one runs: later statuses during a slow quiet load change nothing', async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      const { signal } = requestOptions(1)
+
+      // Delivery and read receipts arrive while the try is still running.
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await view.setProps({ message: { ...pendingImage, status: 'read' } })
+      await flushPromises()
+      expect(vi.getTimerCount()).toBe(0)
+
+      quietTry.resolve(mediaResponse())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('ready')
+      await vi.runAllTimersAsync()
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(signal.aborted).toBe(false)
+      expect(revokeURL).not.toHaveBeenCalled()
+      expect(view.get('img').attributes('src')).toBe('blob:protected-photo')
+    })
+
+    it('reloads once when a slow first request fails while statuses keep arriving', async () => {
+      const first = deferred<ReturnType<typeof mediaResponse>>()
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockReturnValueOnce(first.promise).mockReturnValueOnce(quietTry.promise)
+      const view = mountMedia({ message: pendingImage })
+      await flushPromises()
+      for (const status of ['sent', 'delivered', 'read']) {
+        await view.setProps({ message: { ...pendingImage, status } })
+      }
+      first.reject(notFound())
+      await flushPromises()
+      expect(vi.getTimerCount()).toBe(1)
+
+      // More events while the try waits and while it runs.
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await wait(1_000)
+      await view.setProps({ message: { ...pendingImage, status: 'read' } })
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(vi.getTimerCount()).toBe(0)
+
+      quietTry.resolve(mediaResponse())
+      await vi.runAllTimersAsync()
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(revokeURL).not.toHaveBeenCalled()
+      expect(view.attributes('data-media-status')).toBe('ready')
+    })
+
+    it('leaves focus where the agent moved it while the try was running', async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
+      const composer = document.createElement('input')
+      document.body.appendChild(composer)
+      const view = mount(ProtectedMessageMedia, {
+        props: { organizationId: 'workspace-b', message: pendingImage },
+        attachTo: document.body,
+      })
+      wrappers.push(view)
+      await flushPromises()
+      ;(view.get('[role="alert"] button').element as HTMLButtonElement).focus()
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+
+      composer.focus()
+      quietTry.resolve(mediaResponse())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(document.activeElement).toBe(composer)
+    })
+
+    it('announces the failure politely', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound())
+      const view = await mountLoaded({ message: pendingImage })
+      expect(view.get('[role="alert"]').attributes('aria-live')).toBe('polite')
+    })
+
     it('pending 404, then sent, then a successful reload, then a decode error: only Retry is left', async () => {
       mocks.getMedia.mockRejectedValueOnce(notFound()).mockResolvedValueOnce(mediaResponse())
       const view = await mountLoaded({ message: pendingImage })
