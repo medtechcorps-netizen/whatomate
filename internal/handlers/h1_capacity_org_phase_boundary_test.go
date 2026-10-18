@@ -42,7 +42,7 @@ func TestH1OrgPhase_ProcessorModeWaitPrecedesClaimAndSQL(t *testing.T) {
 				require.NotEmpty(t, organizations)
 				org = organizations[0]
 			}
-			hold := h1OrgHold(t, &f.app.continuationAdmission, 1, inboundContinuationPerformPriority, func() int { return 10 }, org.String(), inboundContinuationReader)
+			hold := h1OrgHold(t, &f.app.continuationAdmission, 1, inboundContinuationPerformPriority, func() int { return 10 }, org.String(), inboundContinuationWriter)
 			before := loadInboundContinuationJob(t, &App{DB: f.shared}, work.OrganizationID, work.Persisted.ID)
 			var jobStatements atomic.Int32
 			callback := "h1:org-preclaim:" + uuid.NewString()
@@ -83,7 +83,7 @@ func TestH1OrgPhase_ProcessorModeWaitPrecedesClaimAndSQL(t *testing.T) {
 			queuedOrg, queuedMode := g.waiters[0].organization, g.waiters[0].mode
 			g.mu.Unlock()
 			require.Equal(t, org.String(), queuedOrg)
-			require.Equal(t, inboundContinuationWriter, queuedMode)
+			require.Equal(t, inboundContinuationReader, queuedMode)
 			require.Zero(t, f.pool.Stats().InUse, "an incompatible mode wait owns no application SQL connection")
 			require.Zero(t, jobStatements.Load(), "even the first claim statement must wait for organization admission")
 			require.Zero(t, f.model.calls.Load())

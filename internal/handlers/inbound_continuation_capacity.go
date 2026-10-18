@@ -89,7 +89,13 @@ func (a *App) acquireIncomingMessageOrganization(phoneID string) (uuid.UUID, fun
 // prepareIncomingContinuation owns at most one connection at a time. Each read
 // callback finishes before any independent tracking/session/media transaction.
 // Its receiver is a per-job root-pool App, never a discarded tenant transaction.
-func (a *App) prepareIncomingContinuation(ctx context.Context, work *persistedIncomingMessage) (*preparedIncomingContinuation, error) {
+// acquireWriter is called only between completed DB scopes, before either
+// operation that needs an organization UPDATE fence. It must release the reader
+// permit before waiting and retain writer ownership for the remaining preparation.
+func (a *App) prepareIncomingContinuation(ctx context.Context, work *persistedIncomingMessage, acquireWriter func() error) (*preparedIncomingContinuation, error) {
+	if acquireWriter == nil {
+		return nil, errors.New("inbound preparation requires an explicit writer transition")
+	}
 	prepared := &preparedIncomingContinuation{}
 	read := func(fn func(*App) error) error { return a.WithTenantApp(work.OrganizationID, fn) }
 	if err := read(func(scoped *App) error {
@@ -100,6 +106,11 @@ func (a *App) prepareIncomingContinuation(ctx context.Context, work *persistedIn
 		return nil, fmt.Errorf("resolve inbound continuation contact: %w", err)
 	}
 	account := &work.Account
+	if work.Extracted.Media != nil {
+		if err := acquireWriter(); err != nil {
+			return nil, err
+		}
+	}
 	if err := a.hydratePersistedIncomingMedia(ctx, work, account); err != nil {
 		return nil, err
 	}
@@ -142,8 +153,8 @@ func (a *App) prepareIncomingContinuation(ctx context.Context, work *persistedIn
 		return prepared, nil
 	}
 	var err error
-	prepared.session, prepared.isNewSession, err = a.getOrCreatePreparedIncomingSession(account.OrganizationID,
-		prepared.contact.ID, account.Name, work.Message.From, settings.SessionTimeoutMins)
+	prepared.session, prepared.isNewSession, err = a.getOrCreatePreparedIncomingSessionWithWriter(account.OrganizationID,
+		prepared.contact.ID, account.Name, work.Message.From, settings.SessionTimeoutMins, acquireWriter)
 	if err != nil || prepared.session == nil {
 		if err == nil {
 			err = errors.New("chatbot session was not returned")
@@ -265,6 +276,12 @@ func (a *App) withContinuationReaderApp(organizationID uuid.UUID, fn func(*App) 
 // expired, or duplicate active row makes it release every reader/contact lock
 // and restart the original UPDATE-fenced acquisition. It never upgrades locks.
 func (a *App) getOrCreatePreparedIncomingSession(orgID, contactID uuid.UUID, accountName, phoneNumber string, timeoutMins int) (*models.ChatbotSession, bool, error) {
+	return a.getOrCreatePreparedIncomingSessionWithWriter(orgID, contactID, accountName, phoneNumber, timeoutMins, nil)
+}
+
+// The explicit transition is used by reader-admitted production preparation.
+// The compatibility wrapper above retains its caller-owned admission boundary.
+func (a *App) getOrCreatePreparedIncomingSessionWithWriter(orgID, contactID uuid.UUID, accountName, phoneNumber string, timeoutMins int, acquireWriter func() error) (*models.ChatbotSession, bool, error) {
 	var created *models.ChatbotSession
 	err := a.withContinuationReaderApp(orgID, func(scoped *App) error {
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(scoped.DB, orgID, contactID)
@@ -311,6 +328,14 @@ func (a *App) getOrCreatePreparedIncomingSession(orgID, contactID uuid.UUID, acc
 	if created != nil {
 		return created, true, nil
 	}
+	// withContinuationReaderApp has committed and released every selector,
+	// organization and contact lock. Never upgrade while retaining those locks
+	// or a reader permit. The original writer revalidates current session state.
+	if acquireWriter != nil {
+		if err := acquireWriter(); err != nil {
+			return nil, false, err
+		}
+	}
 	return a.getOrCreateSession(orgID, contactID, accountName, phoneNumber, timeoutMins)
 }
 
@@ -345,30 +370,61 @@ func (a *App) incomingWithinBusinessHours(hours models.JSONBArray) bool {
 	return a.isWithinBusinessHours(hours)
 }
 
-// processPreparedIncoming releases preparation ownership before separately
-// admitting physical model work or apply. A captured computation is never
-// discarded or recomputed merely because its caller's deadline expired while
-// waiting to apply its durable result.
+// Reader-compatible preparation and its legacy model may share one admitted
+// Reader1 operation, with no DB scope spanning the transition. This consumes one
+// finite reader grant, rather than two. Queued apply work or a reduced pool makes
+// the operation yield and re-enter the ordinary perform queue. Writer fallbacks
+// always release reader ownership first; every route releases before apply.
+// Captured computations are never discarded merely because the caller expires.
 func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx context.Context, execution *App, work *persistedIncomingMessage, job *models.ScheduledJob, releasePreparation func()) error {
-	prepared, prepareErr := execution.prepareIncomingContinuation(ctx, work)
-	if prepareErr != nil {
+	var releaseWriter func()
+	releaseAllPreparation := func() {
 		releasePreparation()
+		if releaseWriter != nil {
+			releaseWriter()
+		}
+	}
+	// processClaimed owns only the original reader release. Replacement writer
+	// ownership must also unwind on errors and panics in later preparation.
+	defer releaseAllPreparation()
+	acquireWriter := func() error {
+		if releaseWriter != nil {
+			return nil
+		}
+		releasePreparation()
+		var err error
+		releaseWriter, err = execution.acquireInboundContinuationPhase(
+			execution.markInboundContinuationContext(ctx), p.stopCh, 1,
+			work.OrganizationID.String(), inboundContinuationWriter)
+		return err
+	}
+	prepared, prepareErr := execution.prepareIncomingContinuation(ctx, work, acquireWriter)
+	if prepareErr != nil {
 		return prepareErr
 	}
-	releasePreparation()
+	retainReader := prepared.legacyAI && releaseWriter == nil && execution.canRetainInboundPreparationForPerform()
+	if !retainReader {
+		releaseAllPreparation()
+	}
 	var captured *capturedLegacyAI
 	if prepared.legacyAI {
-		// Preparation has released every DB scope. Re-admit the physical phase
-		// before any model action claim; a one-connection suppression/broadcast
-		// may finish on a tiny pool, but physical model work must fail closed.
+		// Tiny pools and queued applications use the original perform admission
+		// path. Retention is possible only for this still-owned reader permit.
 		performCtx := execution.markInboundContinuationContext(ctx)
 		phaseErr := func() error {
-			releasePerform, err := execution.acquireInboundContinuationPhase(performCtx, p.stopCh, 1, work.OrganizationID.String(), inboundContinuationReader)
-			if err != nil {
-				return err
+			releasePerform := releasePreparation
+			if !retainReader {
+				var err error
+				releasePerform, err = execution.acquireInboundContinuationPhase(performCtx, p.stopCh, 1, work.OrganizationID.String(), inboundContinuationReader)
+				if err != nil {
+					return err
+				}
 			}
 			defer releasePerform()
 			if err := inboundContinuationAdmissionWaitError(performCtx, p.stopCh); err != nil {
+				return err
+			}
+			if err := ownershipCtx.Err(); err != nil {
 				return err
 			}
 			execution.legacyAIInput = prepared.aiInput
@@ -381,6 +437,7 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 			return phaseErr
 		}
 	}
+	releaseAllPreparation()
 	applyCtx, stop := ctx, (<-chan struct{})(p.stopCh)
 	if captured != nil {
 		applyCtx, stop = ownershipCtx, nil

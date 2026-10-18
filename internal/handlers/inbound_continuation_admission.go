@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -132,6 +133,54 @@ func (a *App) acquireInboundContinuationPhase(ctx context.Context, stop <-chan s
 // fresh preparation remains on acquireInboundContinuationPhase.
 func (a *App) acquireIncomingMessageIntake(ctx context.Context, organization string) (func(), error) {
 	return a.acquireInboundContinuationPhaseClass(ctx, nil, 1, a.inboundContinuationPhasePriority(ctx, 1), organization, inboundContinuationWriter, true)
+}
+
+// This is a continuation decision for an already owned Reader1 permit, never
+// an admission or ownership proof by itself. Its sole production caller has
+// completed every preparation DB scope, has not entered a writer fallback, and
+// still owns that exact root/organization reader. It neither adds a grant nor
+// changes a cohort. Preparation plus model is one nonpreemptive operation;
+// ordinary waiters retain FIFO for new grants, not a new queue turn here.
+func (a *App) canRetainInboundPreparationForPerform() bool {
+	if a == nil || a.inboundContinuation == nil || a.requireInboundContinuationPoolEntry() != nil {
+		return false
+	}
+	organizationID := a.inboundContinuation.OrganizationID
+	root := a.rootApp()
+	if organizationID == uuid.Nil || a.tenantOrgID != uuid.Nil ||
+		root == nil || root.tenantOrgID != uuid.Nil || !root.rlsEnabled() {
+		return false
+	}
+	pool, err := root.DB.DB()
+	if err != nil || pool == nil || root.DB.Statement.ConnPool != pool || a.DB.Statement.ConnPool != pool {
+		return false
+	}
+	g := &root.continuationAdmission
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	phase := g.phases[organizationID.String()]
+	if g.used < 1 || phase == nil || phase.active == 0 || phase.activeMode != inboundContinuationReader {
+		return false
+	}
+	maximum := pool.Stats().MaxOpenConnections
+	if maximum < 0 || (maximum > 0 && maximum < 3) {
+		return false
+	}
+	if maximum > 0 && maximum <= 4 {
+		if g.used != 1 {
+			return false
+		}
+	} else if maximum > 0 && g.used > maximum-inboundContinuationProgressAllowance {
+		return false
+	}
+	for _, queued := range g.waiters {
+		if queued.priority == inboundContinuationApplyPriority {
+			// Yield even to an incompatible application's drain request. A later
+			// enqueue occurs after this already admitted operation's boundary.
+			return false
+		}
+	}
+	return true
 }
 
 func (a *App) inboundContinuationPhasePriority(ctx context.Context, weight int) int {

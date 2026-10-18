@@ -16,7 +16,7 @@ func TestH1IntakeCohort_RealIngressUsesIntakeAfterDiscoveryAndKeepsPreparationOr
 			app, shared, pool, account := h1IngressFixture(t, route == "coexistence")
 			g := &app.continuationAdmission
 			before := h1IngressCounts(t, shared, account.OrganizationID)
-			hold := h1OrgHold(t, g, 1, inboundContinuationPerformPriority, func() int { return 10 }, account.OrganizationID.String(), inboundContinuationReader)
+			hold := h1OrgHold(t, g, 1, inboundContinuationPerformPriority, func() int { return 10 }, account.OrganizationID.String(), inboundContinuationWriter)
 			processor := NewInboundContinuationProcessor(app, time.Second)
 			ctx, cancelPreparation := context.WithCancel(context.Background())
 			preparation, preparationJoined := make(chan h1CapacityAdmissionResult, 1), make(chan struct{})
@@ -36,7 +36,7 @@ func TestH1IntakeCohort_RealIngressUsesIntakeAfterDiscoveryAndKeepsPreparationOr
 					t.Error("ordinary preparation admission did not join")
 				}
 				// Release a granted but unconsumed preparation before joining the
-				// ingress worker; failure-path cleanup must not retain its writer.
+				// ingress worker; failure-path cleanup must not retain its permit.
 				select {
 				case pending := <-preparation:
 					if pending.release != nil {
@@ -80,7 +80,7 @@ func TestH1IntakeCohort_RealIngressUsesIntakeAfterDiscoveryAndKeepsPreparationOr
 				ordinary, intake := g.waiters[0], g.waiters[1]
 				return !ordinary.intake && intake.intake &&
 					ordinary.organization == account.OrganizationID.String() && intake.organization == account.OrganizationID.String() &&
-					ordinary.mode == inboundContinuationWriter && intake.mode == inboundContinuationWriter &&
+					ordinary.mode == inboundContinuationReader && intake.mode == inboundContinuationWriter &&
 					ordinary.priority == inboundContinuationFreshPriority && intake.priority == inboundContinuationFreshPriority
 			}, 5*time.Second, time.Millisecond, "actual discovery must release SQL/credit, then queue only ingress as intake")
 			require.Equal(t, before, h1IngressCounts(t, shared, account.OrganizationID))

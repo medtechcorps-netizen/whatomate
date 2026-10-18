@@ -331,16 +331,16 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 	return worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release)
 }
 
-// The ordinary RLS path may write session/selector state during preparation.
-// Admit it before claiming the job, without holding either a DB connection or
-// another phase's credits. Custom callback compatibility stays on its original
-// generic contract. RunOnce still enqueues organizations serially; this helper
-// does not claim dispatcher fairness for organizations not yet enqueued.
+// Ordinary RLS preparation starts with the audited reader-compatible claim and
+// validation path. Media and existing-session transitions explicitly release
+// this ownership before entering their writer phase. Admission still precedes
+// the durable claim; custom callbacks retain their generic contract. RunOnce
+// enqueues organizations serially, without claiming fairness for unqueued work.
 func (p *InboundContinuationProcessor) acquirePreparationCapacity(ctx context.Context, organizationID uuid.UUID) (func(), error) {
 	if p.process != nil || !p.app.rlsEnabled() {
 		return p.app.acquireInboundContinuationCapacity(ctx, p.stopCh, 1)
 	}
-	return p.app.acquireInboundContinuationPhase(ctx, p.stopCh, 1, organizationID.String(), inboundContinuationWriter)
+	return p.app.acquireInboundContinuationPhase(ctx, p.stopCh, 1, organizationID.String(), inboundContinuationReader)
 }
 
 func (p *InboundContinuationProcessor) listOrganizations(
