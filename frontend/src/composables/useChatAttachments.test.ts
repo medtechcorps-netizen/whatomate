@@ -1750,3 +1750,72 @@ describe('isReplyRejection', () => {
     expect(attachments.items.value[0]).toMatchObject({ status: 'unconfirmed', replyRejected: false })
   })
 })
+
+describe('useChatAttachments INT2-R4: quote callbacks after a silent identity change', () => {
+  function refused() {
+    return Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { status: 'error', message: 'Reply message not found for this contact' } },
+    })
+  }
+
+  // No event, no reactivity: the change is only seen by the checks themselves.
+  function plainIdentity() {
+    const ws = { workspace: 'org-1', marker: 'session-1' }
+    return {
+      ws,
+      session: {
+        userId: () => 'agent-1',
+        isAuthenticated: () => true,
+        workspace: () => ws.workspace,
+        logicalSession: () => ws.marker,
+      },
+    }
+  }
+
+  it('(a) workspace changed while the quoting upload is pending, then 200: no onReplySent', async () => {
+    const { ws, session } = plainIdentity()
+    const onReplySent = vi.fn()
+    const { attachments, calls, onBatchFinished } = setup({ replyTo: () => 'Q1', onReplySent, session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.reply_to_message_id).toBe('Q1')
+    ws.workspace = 'org-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+  })
+
+  it('(b) workspace changed, then the 400 refusal: no onReplyRejected, and send-without-quote sends nothing', async () => {
+    const { ws, session } = plainIdentity()
+    const onReplyRejected = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'Q1', onReplyRejected, session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    const id = attachments.items.value[0].id
+    ws.workspace = 'org-2'
+    calls[0].result.reject(refused())
+    await done
+    expect(onReplyRejected).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+    expect(await attachments.sendWithoutQuote(id)).toBeNull()
+    expect(calls).toHaveLength(1)
+  })
+
+  it('(c) the same user signed in again while the quoting upload is pending, then 200: no onReplySent', async () => {
+    const { ws, session } = plainIdentity()
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'Q1', onReplySent, session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    ws.marker = 'session-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+  })
+})
