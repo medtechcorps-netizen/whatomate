@@ -101,6 +101,72 @@ func (a *App) canRetainInboundPreparationForPerform() bool {
 	return true
 }
 
+// hintInboundContinuationPreparationMode chooses only a local scheduling mode.
+// The caller has passed the public entry checks; claim and preparation remain
+// authoritative. A failed or stale read falls back to the original reader path.
+func (p *InboundContinuationProcessor) hintInboundContinuationPreparationMode(ctx context.Context, organizationID, messageID uuid.UUID) (int, error) {
+	if p.process != nil || !p.app.rlsEnabled() {
+		return inboundContinuationReader, nil
+	}
+	root := p.app.rootApp()
+	pool, err := root.DB.DB()
+	if err != nil || pool == nil {
+		return inboundContinuationReader, nil
+	}
+	maximum := pool.Stats().MaxOpenConnections
+	if maximum < 0 || (maximum > 0 && maximum < 3) {
+		return inboundContinuationReader, nil
+	}
+	hintCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	release, err := p.app.acquireInboundContinuationCapacity(hintCtx, p.stopCh, 1)
+	if err != nil {
+		if waitErr := inboundContinuationAdmissionWaitError(ctx, p.stopCh); waitErr != nil {
+			return inboundContinuationReader, waitErr
+		}
+		return inboundContinuationReader, nil
+	}
+	var existing bool
+	hintErr := func() error {
+		defer release()
+		return database.WithTenantReadCommitted(root.DB.WithContext(hintCtx), organizationID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+				return err
+			}
+			now := p.now().UTC()
+			staleBefore := now.Add(-p.lease)
+			return tx.Raw(`SELECT EXISTS (
+				SELECT 1 FROM messages AS m
+				JOIN scheduled_jobs AS j
+				  ON j.organization_id = m.organization_id AND j.aggregate_id = m.id
+				JOIN chatbot_sessions AS s
+				  ON s.organization_id = m.organization_id
+				 AND s.contact_id = m.contact_id
+				 AND s.whats_app_account = m.whats_app_account
+				WHERE m.id = ? AND m.organization_id = ? AND m.direction = ?
+				  AND s.organization_id = ? AND s.status = ?
+				  AND j.organization_id = ? AND j.kind = ? AND j.run_at <= ?
+				  AND j.attempts < j.max_attempts
+				  AND (j.status = ? OR (j.status = ? AND (j.locked_at IS NULL OR j.locked_at < ?)))
+				  AND m.deleted_at IS NULL AND s.deleted_at IS NULL AND j.deleted_at IS NULL
+			)`, messageID, organizationID, models.DirectionIncoming, organizationID, models.SessionStatusActive,
+				organizationID, inboundContinuationJobKind, now, models.ScheduledJobStatusPending,
+				models.ScheduledJobStatusProcessing, staleBefore).Scan(&existing).Error
+		})
+	}()
+	if err := inboundContinuationAdmissionWaitError(ctx, p.stopCh); err != nil {
+		return inboundContinuationReader, err
+	}
+	if hintErr != nil || !existing {
+		return inboundContinuationReader, nil
+	}
+	maximum = pool.Stats().MaxOpenConnections
+	if maximum < 0 || (maximum > 0 && maximum < 3) {
+		return inboundContinuationReader, nil
+	}
+	return inboundContinuationWriter, nil
+}
+
 // Discovery and the scoped writer wait share the original ingress admission
 // deadline. Discovery owns one globally accounted credit, releases it and its
 // query fully, then queues for the atomic organization+credit grant. The caller

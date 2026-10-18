@@ -318,7 +318,17 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 	if err := p.app.checkInboundContinuationEntry(ctx); err != nil {
 		return err
 	}
-	release, preparationMode, err := p.acquirePreparationCapacity(ctx, organizationID, inboundContinuationReader)
+	preparationMode, err := p.hintInboundContinuationPreparationMode(ctx, organizationID, messageID)
+	if err != nil {
+		return err
+	}
+	preparationCtx := ctx
+	if preparationMode == inboundContinuationWriter {
+		// A hinted writer retains the existing replacement-writer eligibility,
+		// including dynamic tiny-pool refusal, without marking the claim context.
+		preparationCtx = p.app.markInboundContinuationContext(ctx)
+	}
+	release, preparationMode, err := p.acquirePreparationCapacity(preparationCtx, organizationID, preparationMode)
 	if err != nil {
 		return err
 	}
@@ -332,7 +342,7 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 }
 
 // Recovery preparation owns Writer1 from before the claim through preparation;
-// the fast path starts with Reader1 and explicitly yields for writer fallback.
+// the fast path uses an advisory hint, with Reader1 and writer fallback otherwise.
 // Both release preparation before ordinary model admission unless the fast path
 // can safely retain its reader. Custom callbacks retain generic admission.
 // RunOnce still enqueues tenants serially and claims at most one bounded batch.

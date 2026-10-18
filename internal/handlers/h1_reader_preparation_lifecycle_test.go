@@ -55,6 +55,7 @@ func TestH1ReaderPreparation_WriterFallbackBeginsAfterReaderSQLAndBeforeMedia(t 
 
 func TestH1ReaderPreparation_ReplacementWriterIsReleasedAfterPanic(t *testing.T) {
 	f := h1CapacityLegacy(t, 1)
+	negativeHint := h1FastHintNegative(t, f.app) // Panic must still exercise a replacement Writer.
 	var injected atomic.Bool
 	callback := "h1:reader-writer-panic:" + uuid.NewString()
 	require.NoError(t, f.app.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
@@ -76,6 +77,7 @@ func TestH1ReaderPreparation_ReplacementWriterIsReleasedAfterPanic(t *testing.T)
 	defer cancel()
 	err := p.ProcessMessage(ctx, f.works[0].OrganizationID, f.works[0].Persisted.ID)
 	require.True(t, injected.Load(), "panic must occur with the replacement writer actually owned")
+	require.EqualValues(t, 1, negativeHint.Load(), "exercise the explicit advisory-negative panic fixture")
 	require.ErrorContains(t, err, "synthetic replacement-writer panic")
 	require.Zero(t, f.model.calls.Load())
 	h1OrgEmpty(t, &f.app.continuationAdmission)
@@ -203,6 +205,7 @@ func TestH1ReaderPreparation_NewSessionAcceptedResultsSurviveCompletionRetry(t *
 	}
 	p := NewInboundContinuationProcessor(f.app, time.Second)
 	p.now = func() time.Time { return job.RunAt.Add(time.Second) }
+	negativeHint := h1FastHintNegative(t, f.app) // Retain the retry oracle across actual writer fallback.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	require.NoError(t, p.ProcessMessage(ctx, work.OrganizationID, work.Persisted.ID))
@@ -213,5 +216,6 @@ func TestH1ReaderPreparation_NewSessionAcceptedResultsSurviveCompletionRetry(t *
 	sends := len(f.sent)
 	f.mu.Unlock()
 	require.Equal(t, 1, sends, "retry reuses the independently accepted result across writer fallback")
+	require.EqualValues(t, 1, negativeHint.Load(), "exercise the explicit advisory-negative retry fixture")
 	h1OrgEmpty(t, &f.app.continuationAdmission)
 }

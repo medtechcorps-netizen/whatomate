@@ -129,6 +129,7 @@ func TestH1ReaderPreparation_NewSessionCompletesUnderSameRootPhysicalReader(t *t
 
 func TestH1ReaderPreparation_ExistingSessionFallbackReleasesReaderAndRenewsClaim(t *testing.T) {
 	f := h1CapacityLegacy(t, 1)
+	negativeHint := h1FastHintNegative(t, f.app) // Preserve the actual post-claim fallback and heartbeat route.
 	stopGuard := h1ReaderPreparationHoldGuard(t, f)
 	p := NewInboundContinuationProcessor(f.app, time.Second)
 	p.lease = 600 * time.Millisecond
@@ -154,6 +155,7 @@ func TestH1ReaderPreparation_ExistingSessionFallbackReleasesReaderAndRenewsClaim
 	require.Equal(t, inboundContinuationWriter, mode)
 	before := loadInboundContinuationJob(t, &App{DB: f.shared}, work.OrganizationID, work.Persisted.ID)
 	require.Equal(t, models.ScheduledJobStatusProcessing, before.Status, "fallback follows an actual claim")
+	require.EqualValues(t, 1, negativeHint.Load(), "exercise the explicit advisory-negative fallback fixture")
 	require.NotNil(t, before.LockedAt)
 	require.NotEmpty(t, before.LockedBy)
 	require.Eventually(t, func() bool {

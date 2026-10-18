@@ -33,6 +33,10 @@ func TestH1OrgPhase_ProcessorModeWaitPrecedesClaimAndSQL(t *testing.T) {
 			f := h1CapacityLegacy(t, 1)
 			work := f.works[0]
 			processor := NewInboundContinuationProcessor(f.app, time.Second)
+			var negativeHint *atomic.Int32
+			if entry == "ProcessMessage" {
+				negativeHint = h1FastHintNegative(t, f.app)
+			}
 			org := work.OrganizationID
 			if entry == "RunOnce" {
 				// RunOnce enqueues tenants serially. Block its actual first tenant;
@@ -85,10 +89,13 @@ func TestH1OrgPhase_ProcessorModeWaitPrecedesClaimAndSQL(t *testing.T) {
 			require.Equal(t, org.String(), queuedOrg)
 			wantMode := inboundContinuationReader
 			if entry == "RunOnce" {
-				// Recovery owns writer preparation before claim; the fast path stays reader.
+				// Recovery owns Writer; this explicit advisory-negative fast path keeps Reader.
 				wantMode = inboundContinuationWriter
 			}
 			require.Equal(t, wantMode, queuedMode)
+			if negativeHint != nil {
+				require.EqualValues(t, 1, negativeHint.Load(), "exercise the explicit advisory-negative Reader boundary")
+			}
 			require.Zero(t, f.pool.Stats().InUse, "an incompatible mode wait owns no application SQL connection")
 			require.Zero(t, jobStatements.Load(), "even the first claim statement must wait for organization admission")
 			require.Zero(t, f.model.calls.Load())
