@@ -50,17 +50,13 @@ func h1RecoveryOnlyFixtureOrganization(t *testing.T, f *h1CapacityLegacyFixture)
 	require.EqualValues(t, 1, constrained.Load(), "the actual organization-ID query must be constrained")
 }
 
-func TestH1RecoveryPreparation_InitialWriterYieldsBeforeModelAndRenewsClaim(t *testing.T) {
+func TestH1RecoveryPreparation_PreparationYieldsBeforeModelAndRenewsClaim(t *testing.T) {
 	for _, route := range []string{"new-session", "existing-session"} {
 		t.Run(route, func(t *testing.T) {
 			f := h1CapacityLegacy(t, 1)
 			h1RecoveryOnlyFixtureOrganization(t, f)
-			var hintFailures *atomic.Int32
 			if route == "new-session" {
 				h1ReaderPreparationRemoveSeed(t, f)
-				// Keep this original Writer ownership/heartbeat witness on the
-				// conservative route by failing only its optional recovery query.
-				hintFailures = h1RecoveryHintFailSQL(t, f.app)
 			}
 			work := f.works[0]
 			g := &f.app.continuationAdmission
@@ -120,13 +116,14 @@ func TestH1RecoveryPreparation_InitialWriterYieldsBeforeModelAndRenewsClaim(t *t
 			go func() { defer close(joined); done <- p.RunOnce(ctx) }()
 			select {
 			case state := <-entered:
-				require.Equal(t, ownership{mode: inboundContinuationWriter, active: 1, used: 7}, state,
-					"both session routes must use the writer already acquired before the durable claim")
+				wantMode := inboundContinuationReader
+				if route == "existing-session" {
+					wantMode = inboundContinuationWriter
+				}
+				require.Equal(t, ownership{mode: wantMode, active: 1, used: 7}, state,
+					"new insert owns Reader; existing generation update owns actual replacement Writer")
 			case <-time.After(5 * time.Second):
-				t.Fatal("recovery did not reach session preparation without reacquiring its own writer")
-			}
-			if hintFailures != nil {
-				require.EqualValues(t, 1, hintFailures.Load(), "the optional recovery SQL failure must actually select original Writer preparation")
+				t.Fatal("recovery did not reach its authoritative session preparation")
 			}
 			apply := h1OrgAcquireAsync(t, g, context.Background(), nil, 2, inboundContinuationApplyPriority,
 				func() int { return 10 }, work.OrganizationID.String(), inboundContinuationReader)
@@ -140,9 +137,9 @@ func TestH1RecoveryPreparation_InitialWriterYieldsBeforeModelAndRenewsClaim(t *t
 			require.Equal(t, work.OrganizationID.String(), queuedOrg)
 			require.Equal(t, inboundContinuationReader, queuedMode)
 			require.Equal(t, inboundContinuationPerformPriority, queuedPriority)
-			require.Zero(t, f.model.calls.Load(), "accepted apply takes the released writer credit before model admission")
+			require.Zero(t, f.model.calls.Load(), "accepted apply takes the released preparation credit before model admission")
 			require.Eventually(t, func() bool { return f.pool.Stats().InUse == 0 }, time.Second, time.Millisecond,
-				"writer SQL must be fully released before the ordinary perform wait")
+				"preparation SQL must be fully released before the ordinary perform wait")
 			before := loadInboundContinuationJob(t, &App{DB: f.shared}, work.OrganizationID, work.Persisted.ID)
 			require.Equal(t, models.ScheduledJobStatusProcessing, before.Status)
 			require.NotNil(t, before.LockedAt)
@@ -186,7 +183,7 @@ func TestH1RecoveryPreparation_InitialWriterYieldsBeforeModelAndRenewsClaim(t *t
 	}
 }
 
-func TestH1RecoveryPreparation_InitialWriterUnwindsOnPreparationFailure(t *testing.T) {
+func TestH1RecoveryPreparation_ReplacementWriterUnwindsOnPreparationFailure(t *testing.T) {
 	for _, fault := range []string{"error", "panic", "stop", "cancel"} {
 		t.Run(fault, func(t *testing.T) {
 			f := h1CapacityLegacy(t, 1)
@@ -195,9 +192,10 @@ func TestH1RecoveryPreparation_InitialWriterUnwindsOnPreparationFailure(t *testi
 			p.batchSize = 1
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			t.Cleanup(cancel)
+			initialMode := h1RecoveryHintInitialSessionMode(t, f)
 			var injected atomic.Bool
 			callback := "h1:recovery-writer-unwind:" + uuid.NewString()
-			const sentinel = "synthetic initial recovery writer failure"
+			const sentinel = "synthetic replacement recovery writer failure"
 			require.NoError(t, f.app.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
 				if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "chatbot_sessions" {
 					return
@@ -223,7 +221,13 @@ func TestH1RecoveryPreparation_InitialWriterUnwindsOnPreparationFailure(t *testi
 			}))
 			t.Cleanup(func() { _ = f.app.DB.Callback().Update().Remove(callback) })
 			err := p.RunOnce(ctx)
-			require.True(t, injected.Load(), "the fault must occur while the actual initial writer is owned")
+			require.True(t, injected.Load(), "the fault must occur while the actual replacement writer is owned")
+			select {
+			case mode := <-initialMode:
+				require.Equal(t, inboundContinuationReader, mode)
+			default:
+				t.Fatal("missing actual initial Reader lookup before replacement Writer fault")
+			}
 			switch fault {
 			case "error", "panic":
 				require.ErrorContains(t, err, sentinel)

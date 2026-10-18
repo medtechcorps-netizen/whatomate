@@ -39,8 +39,8 @@ func TestH1OrgPhase_ProcessorModeWaitPrecedesClaimAndSQL(t *testing.T) {
 			}
 			org := work.OrganizationID
 			if entry == "RunOnce" {
-				// Use the fixture tenant's real organization query and seeded active session
-				// to exercise conservative Writer admission before claim SQL.
+				// Use the fixture tenant's real organization query; even an existing
+				// session must wait for initial Reader admission before claim SQL.
 				h1RecoveryOnlyFixtureOrganization(t, f)
 				organizations, err := processor.listOrganizations(context.Background())
 				require.NoError(t, err)
@@ -90,11 +90,6 @@ func TestH1OrgPhase_ProcessorModeWaitPrecedesClaimAndSQL(t *testing.T) {
 			g.mu.Unlock()
 			require.Equal(t, org.String(), queuedOrg)
 			wantMode := inboundContinuationReader
-			if entry == "RunOnce" {
-				// The seeded existing session keeps recovery on Writer; the explicit
-				// advisory-negative fast path above keeps ProcessMessage on Reader.
-				wantMode = inboundContinuationWriter
-			}
 			require.Equal(t, wantMode, queuedMode)
 			if negativeHint != nil {
 				require.EqualValues(t, 1, negativeHint.Load(), "exercise the explicit advisory-negative Reader boundary")

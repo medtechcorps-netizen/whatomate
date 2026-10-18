@@ -2,9 +2,7 @@ package handlers
 
 import (
 	"context"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,76 +12,6 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
-
-func h1RecoveryHintSQL(tx *gorm.DB) bool {
-	return tx.Statement != nil && strings.Contains(tx.Statement.SQL.String(), "FROM scheduled_jobs AS j") &&
-		strings.Contains(tx.Statement.SQL.String(), "ORDER BY j.run_at, j.created_at, j.id")
-}
-
-func h1RecoveryHintObserve(t *testing.T, app *App, fn func(*gorm.DB)) {
-	t.Helper()
-	name := "h1:recovery-hint:" + uuid.NewString()
-	require.NoError(t, app.DB.Callback().Row().Before("gorm:row").Register(name, func(tx *gorm.DB) {
-		if h1RecoveryHintSQL(tx) {
-			fn(tx)
-		}
-	}))
-	t.Cleanup(func() { _ = app.DB.Callback().Row().Remove(name) })
-}
-
-// Only the optional recovery statement fails. The transaction really aborts;
-// the subsequent authoritative claim and session statements remain untouched.
-func h1RecoveryHintFailSQL(t *testing.T, app *App) *atomic.Int32 {
-	t.Helper()
-	hits := &atomic.Int32{}
-	h1RecoveryHintObserve(t, app, func(tx *gorm.DB) {
-		hits.Add(1)
-		tx.Statement.SQL.Reset()
-		tx.Statement.SQL.WriteString("SELECT 1 / 0")
-		tx.Statement.Vars = nil
-	})
-	return hits
-}
-
-func h1RecoveryHintPair(t *testing.T) (*h1CapacityLegacyFixture, []models.ScheduledJob) {
-	t.Helper()
-	f := h1CapacityLegacy(t, 1)
-	text := "Synthetic capacity recovery second " + uuid.NewString()
-	message := inboundContinuationTextMessage(t, "wamid.recovery-hint-"+uuid.NewString(), "601799009902", text)
-	work, duplicate, err := h1RootApp(f.shared, false).persistIncomingMessageBeforeAck(
-		f.works[0].Account.PhoneID, message, "Synthetic recovery hint fixture")
-	require.NoError(t, err)
-	require.False(t, duplicate)
-	require.Equal(t, f.works[0].OrganizationID, work.OrganizationID)
-	require.NotEqual(t, f.works[0].Contact.ID, work.Contact.ID)
-	session := &models.ChatbotSession{
-		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: work.OrganizationID,
-		ContactID: work.Contact.ID, WhatsAppAccount: work.Account.Name, PhoneNumber: work.Contact.PhoneNumber,
-		Status: models.SessionStatusActive, SessionData: models.JSONB{}, StartedAt: time.Now(), LastActivityAt: time.Now(),
-	}
-	require.NoError(t, f.shared.Create(session).Error)
-	f.works = append(f.works, work)
-	f.sessions = append(f.sessions, session)
-	f.texts = append(f.texts, text)
-	h1RecoveryOnlyFixtureOrganization(t, f)
-	jobs := make([]models.ScheduledJob, 2)
-	for i := range jobs {
-		jobs[i] = loadInboundContinuationJob(t, &App{DB: f.shared}, work.OrganizationID, f.works[i].Persisted.ID)
-		require.NoError(t, f.shared.Model(&models.ScheduledJob{}).Where("id = ?", jobs[i].ID).
-			Update("run_at", time.Now().UTC().Add(time.Duration(i-2)*time.Minute)).Error)
-		jobs[i] = loadInboundContinuationJob(t, &App{DB: f.shared}, work.OrganizationID, f.works[i].Persisted.ID)
-	}
-	return f, jobs
-}
-
-func h1RecoveryHintLoadSession(t *testing.T, f *h1CapacityLegacyFixture, index int) {
-	t.Helper()
-	var session models.ChatbotSession
-	work := f.works[index]
-	require.NoError(t, f.shared.Where("organization_id = ? AND contact_id = ? AND whats_app_account = ? AND status = ?",
-		work.OrganizationID, work.Contact.ID, work.Account.Name, models.SessionStatusActive).First(&session).Error)
-	f.sessions[index] = &session
-}
 
 func h1RecoveryHintLockJob(t *testing.T, f *h1CapacityLegacyFixture, job models.ScheduledJob) func() {
 	t.Helper()
@@ -143,80 +71,13 @@ func h1RecoveryHintQueued(t *testing.T, f *h1CapacityLegacyFixture, used, mode, 
 	}, 5*time.Second, time.Millisecond)
 }
 
-func TestH1RecoveryPreparationHint_FirstCandidatePrecedesIdentityQualification(t *testing.T) {
-	for _, first := range []string{"existing", "new", "expired-active", "duplicate-active", "missing-message", "foreign-message", "deleted-message", "outgoing-message", "empty-account", "space-account", "deleted-contact", "merged-contact"} {
-		t.Run(first, func(t *testing.T) {
-			f, jobs := h1RecoveryHintPair(t)
-			// The second candidate always qualifies as new. It must not replace
-			// an earlier existing or unusable candidate in the advisory query.
-			require.NoError(t, f.shared.Delete(f.sessions[1]).Error)
-			want := inboundContinuationWriter
-			if first != "existing" && first != "expired-active" && first != "duplicate-active" {
-				h1ReaderPreparationRemoveSeed(t, f)
-			}
-			switch first {
-			case "new":
-				want = inboundContinuationReader
-			case "expired-active":
-				require.NoError(t, f.shared.Model(&models.ChatbotSession{}).Where("id = ?", f.sessions[0].ID).
-					Update("last_activity_at", time.Now().Add(-24*time.Hour)).Error)
-			case "duplicate-active":
-				duplicate := *f.sessions[0]
-				duplicate.ID = uuid.New()
-				require.NoError(t, f.shared.Create(&duplicate).Error)
-			case "missing-message":
-				require.NoError(t, f.shared.Model(&models.ScheduledJob{}).Where("id = ?", jobs[0].ID).
-					Update("aggregate_id", uuid.New()).Error)
-			case "foreign-message":
-				foreign := h1CapacityLegacy(t, 1)
-				require.NoError(t, f.shared.Model(&models.ScheduledJob{}).Where("id = ?", jobs[0].ID).
-					Update("aggregate_id", foreign.works[0].Persisted.ID).Error)
-			case "deleted-message":
-				require.NoError(t, f.shared.Delete(&f.works[0].Persisted).Error)
-			case "outgoing-message":
-				require.NoError(t, f.shared.Model(&models.Message{}).Where("id = ?", f.works[0].Persisted.ID).
-					Update("direction", models.DirectionOutgoing).Error)
-			case "empty-account", "space-account":
-				account := ""
-				if first == "space-account" {
-					account = "   "
-				}
-				require.NoError(t, f.shared.Model(&models.Message{}).Where("id = ?", f.works[0].Persisted.ID).
-					Update("whats_app_account", account).Error)
-			case "deleted-contact":
-				require.NoError(t, f.shared.Delete(&f.works[0].Contact).Error)
-			case "merged-contact":
-				require.NoError(t, f.shared.Model(&models.Contact{}).Where("id = ?", f.works[0].Contact.ID).
-					Update("merged_into_id", f.works[1].Contact.ID).Error)
-			}
-			var before []models.ScheduledJob
-			require.NoError(t, f.shared.Where("id IN ?", []uuid.UUID{jobs[0].ID, jobs[1].ID}).Order("id").Find(&before).Error)
-			var queries atomic.Int32
-			h1RecoveryHintObserve(t, f.app, func(*gorm.DB) { queries.Add(1) })
-			p := NewInboundContinuationProcessor(f.app, time.Second)
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			defer cancel()
-			mode, err := p.hintInboundRecoveryPreparationMode(ctx, f.works[0].OrganizationID)
-			require.NoError(t, err)
-			require.Equal(t, want, mode)
-			require.EqualValues(t, 1, queries.Load())
-			var after []models.ScheduledJob
-			require.NoError(t, f.shared.Where("id IN ?", []uuid.UUID{jobs[0].ID, jobs[1].ID}).Order("id").Find(&after).Error)
-			require.Equal(t, before, after, "discovery neither reserves the first job nor skips it by claiming the second")
-			h1OrgEmpty(t, &f.app.continuationAdmission)
-			require.Zero(t, f.pool.Stats().InUse)
-		})
-	}
-}
-
-func TestH1RecoveryPreparationHint_LockedCandidateDoesNotConstrainActualClaim(t *testing.T) {
+func TestH1RecoveryReader_LockedCandidateDoesNotConstrainActualClaim(t *testing.T) {
 	for _, direction := range []string{"new-A-existing-B", "existing-A-new-B"} {
 		t.Run(direction, func(t *testing.T) {
-			f, jobs := h1RecoveryHintPair(t)
-			wantMode := inboundContinuationWriter
+			f, jobs := h1RecoveryReaderPair(t)
+			wantMode := inboundContinuationReader
 			if direction == "new-A-existing-B" {
 				h1ReaderPreparationRemoveSeed(t, f)
-				wantMode = inboundContinuationReader
 			} else {
 				require.NoError(t, f.shared.Delete(f.sessions[1]).Error)
 			}
@@ -225,11 +86,11 @@ func TestH1RecoveryPreparationHint_LockedCandidateDoesNotConstrainActualClaim(t 
 			p := NewInboundContinuationProcessor(f.app, time.Second)
 			p.batchSize = 1
 			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-			done := h1RecoveryHintRun(t, f, p, ctx, cancel)
+			done := h1RecoveryReaderRun(t, f, p, ctx, cancel)
 			t.Cleanup(func() { cancel(); unlock() })
 			select {
 			case mode := <-initialMode:
-				require.Equal(t, wantMode, mode, "the real first snapshot routes admission; it does not select the claim")
+				require.Equal(t, wantMode, mode, "ordinary recovery validates under Reader; real SKIP LOCKED selects B")
 			case <-time.After(5 * time.Second):
 				t.Fatal("SKIP LOCKED did not proceed to B while A remained locked")
 			}
@@ -244,11 +105,11 @@ func TestH1RecoveryPreparationHint_LockedCandidateDoesNotConstrainActualClaim(t 
 			require.Equal(t, 1, f.pool.Stats().InUse, "only B's physical model guard remains on the private pool")
 			f.model.unblock()
 			h1CapacityJoin(t, done, 1)
-			h1RecoveryHintLoadSession(t, f, 1)
+			h1RecoveryReaderLoadSession(t, f, 1)
 			f.assertGenerated(t, 1)
 			unlock()
 			require.NoError(t, p.RunOnce(ctx))
-			h1RecoveryHintLoadSession(t, f, 0)
+			h1RecoveryReaderLoadSession(t, f, 0)
 			f.assertGenerated(t, 0)
 			require.NoError(t, p.RunOnce(ctx))
 			require.EqualValues(t, 2, f.model.calls.Load(), "both actual claims resolve once; replay does not recompute")
@@ -257,8 +118,8 @@ func TestH1RecoveryPreparationHint_LockedCandidateDoesNotConstrainActualClaim(t 
 	}
 }
 
-func TestH1RecoveryPreparationHint_NegativeReaderShrinkRefusesReplacementBeforeMutation(t *testing.T) {
-	f, jobs := h1RecoveryHintPair(t)
+func TestH1RecoveryReader_QueuedShrinkRefusesReplacementBeforeMutation(t *testing.T) {
+	f, jobs := h1RecoveryReaderPair(t)
 	h1ReaderPreparationRemoveSeed(t, f)
 	unlock := h1RecoveryHintLockJob(t, f, jobs[0])
 	var before models.ChatbotSession
@@ -266,17 +127,14 @@ func TestH1RecoveryPreparationHint_NegativeReaderShrinkRefusesReplacementBeforeM
 	g := &f.app.continuationAdmission
 	release := h1OrgHold(t, g, 1, inboundContinuationFreshPriority,
 		func() int { return f.pool.Stats().MaxOpenConnections }, f.works[0].OrganizationID.String(), inboundContinuationWriter)
-	var queries atomic.Int32
-	h1RecoveryHintObserve(t, f.app, func(*gorm.DB) { queries.Add(1) })
 	initialMode := h1RecoveryHintInitialSessionMode(t, f)
 	p := NewInboundContinuationProcessor(f.app, time.Second)
 	p.batchSize = 1
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	done := h1RecoveryHintRun(t, f, p, ctx, cancel)
+	done := h1RecoveryReaderRun(t, f, p, ctx, cancel)
 	t.Cleanup(func() { cancel(); release(); unlock(); f.pool.SetMaxOpenConns(10) })
 	h1RecoveryHintQueued(t, f, 1, inboundContinuationReader, inboundContinuationFreshPriority)
-	require.EqualValues(t, 1, queries.Load())
-	require.Zero(t, f.pool.Stats().InUse, "discovery is fully closed before actual Reader admission")
+	require.Zero(t, f.pool.Stats().InUse, "initial Reader admission owns no SQL before its actual grant")
 	f.pool.SetMaxOpenConns(2)
 	release()
 	select {

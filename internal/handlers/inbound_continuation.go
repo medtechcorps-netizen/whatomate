@@ -246,12 +246,7 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 			if remaining <= 0 || ctx.Err() != nil {
 				break
 			}
-			mode, hintErr := p.hintInboundRecoveryPreparationMode(ctx, organizationID)
-			if hintErr != nil {
-				runErrors = append(runErrors, hintErr)
-				remaining = 0
-				break
-			}
+			mode := p.inboundRecoveryPreparationMode()
 			release, preparationMode, admitErr := p.acquirePreparationCapacity(ctx, organizationID, mode)
 			if admitErr != nil {
 				runErrors = append(runErrors, admitErr)
@@ -347,8 +342,9 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 	return worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode)
 }
 
-// Recovery preparation defaults to Writer1; an advisory negative session hint
-// can request Reader1. The fast path retains its separate advisory mode choice.
+// Ordinary recovery claims and validates under Reader1 when the pool supports
+// Perform; tiny pools retain Fresh Writer1. Actual existing-session/media mutation
+// still acquires Writer1. The fast path keeps its separate advisory mode choice.
 // Both release preparation before ordinary model admission unless the actual
 // reader can safely be retained. Custom callbacks retain generic admission.
 // RunOnce still enqueues tenants serially and claims at most one bounded batch.
