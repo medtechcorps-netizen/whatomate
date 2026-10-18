@@ -52,7 +52,8 @@ function refreshOk(expiresIn = 900) {
 // A FIFO Web Locks stand-in shared by every "tab" in a test.
 function installWebLocks() {
   const tails = new Map<string, Promise<void>>()
-  const request = vi.fn(async (name: string, callback: () => Promise<unknown>) => {
+  const request = vi.fn(async (name: string, ...rest: unknown[]) => {
+    const callback = rest[rest.length - 1] as () => Promise<unknown>
     const previous = tails.get(name) ?? Promise.resolve()
     let release!: () => void
     const held = new Promise<void>((resolve) => {
@@ -312,158 +313,319 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(assignedHref).toBeNull()
   })
 
-  it('revokes the refresh token before logging out', async () => {
+  // Labels the bare-axios POSTs: revoke, logout or refresh.
+  function postLabel(url: string, body: unknown, options: any) {
+    if ((body as { revoke?: boolean })?.revoke) return `revoke ${options?.headers?.['X-CSRF-Token']}`
+    if (url.endsWith('/auth/logout')) return `logout ${options?.headers?.['X-CSRF-Token'] ?? '-'}`
+    return 'refresh'
+  }
+
+  function recordPosts(order: string[], onPost?: (label: string) => Promise<unknown> | unknown) {
+    postSpy.mockImplementation(async (url: string, body: unknown, options: any) => {
+      const label = postLabel(url, body, options)
+      order.push(label)
+      const custom = onPost ? await onPost(label) : undefined
+      return custom ?? { data: { data: {} }, status: 200 }
+    })
+  }
+
+  it('logs out at once, then revokes and logs out in the background', async () => {
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+    const { api, whenLogoutSettled } = await loadTab(adapter)
     const order: string[] = []
-    const { api } = await loadTab(async (config) => {
-      order.push(`adapter ${config.url}`)
-      return ok(config)
-    })
-    postSpy.mockImplementation(async (_url: string, body: unknown, options: any) => {
-      order.push(`revoke ${JSON.stringify(body)} ${options.headers['X-CSRF-Token']}`)
-      return { data: { data: { status: 'revoked' } }, status: 200 }
-    })
+    recordPosts(order)
 
-    await api.post('/auth/logout', {})
+    const response = await api.post('/auth/logout', {})
 
-    expect(order).toEqual(['revoke {"revoke":true} csrf-token-1', 'adapter /auth/logout'])
+    expect(response.status).toBe(200)
+    expect(adapter).not.toHaveBeenCalled()
+    await whenLogoutSettled()
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
     const [url, , options] = postSpy.mock.calls[0] as [string, unknown, { withCredentials: boolean }]
     expect(url).toMatch(/\/api\/auth\/refresh$/)
     expect(options.withCredentials).toBe(true)
   })
 
-  it('stamps the logout with the CSRF cookie as it is after the revoke', async () => {
-    const seen: Array<string | undefined> = []
-    const { api } = await loadTab(async (config) => {
-      seen.push(config.headers.get('X-CSRF-Token') as string | undefined)
-      return ok(config)
-    })
-
+  it('logs out with the CSRF cookie as it is after the revoke', async () => {
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
     // The revoke rotates the cookie (another tab refreshed meanwhile)...
-    postSpy.mockImplementationOnce(async () => {
-      setCookie('whm_csrf=csrf-token-2; path=/')
-      return { data: { data: {} }, status: 200 }
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke')) setCookie('whm_csrf=csrf-token-2; path=/')
     })
     await api.post('/auth/logout', {})
+    await whenLogoutSettled()
     // ...or clears it, as a successful revoke does.
-    postSpy.mockImplementationOnce(async () => {
-      setCookie('whm_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/')
-      return { data: { data: {} }, status: 200 }
-    })
     setCookie('whm_csrf=csrf-token-3; path=/')
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke')) setCookie('whm_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/')
+    })
     await api.post('/auth/logout', {})
+    await whenLogoutSettled()
 
-    expect(seen).toEqual(['csrf-token-2', undefined])
+    expect(order).toEqual([
+      'revoke csrf-token-1', 'logout csrf-token-2',
+      'revoke csrf-token-3', 'logout -',
+    ])
   })
 
   it('retries a revoke rejected for a CSRF cookie rotated mid-flight', async () => {
-    const { api } = await loadTab(async (config) => ok(config))
-    const sent: string[] = []
-    postSpy.mockImplementation(async (_url: string, _body: unknown, options: any) => {
-      sent.push(options.headers['X-CSRF-Token'])
-      if (sent.length === 1) {
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    let first = true
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke') && first) {
+        first = false
         setCookie('whm_csrf=csrf-token-2; path=/')
         throw httpError(403)
       }
-      return { data: { data: {} }, status: 200 }
     })
 
     await api.post('/auth/logout', {})
+    await whenLogoutSettled()
 
-    expect(sent).toEqual(['csrf-token-1', 'csrf-token-2'])
+    expect(order).toEqual(['revoke csrf-token-1', 'revoke csrf-token-2', 'logout csrf-token-2'])
   })
 
-  it('stops revoking when someone else signs in during the backoff', async () => {
+  it('stops when someone else signs in during the revoke backoff', async () => {
     vi.useFakeTimers()
-    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
-    const { api } = await loadTab(adapter)
-    postSpy.mockImplementation(async () => {
-      // While this logout waits out a 429, another tab signs a different
-      // user in (new cookies, new stored identity).
-      localStorage.setItem('user', JSON.stringify({ id: 'user-2', email: 'b@example.com' }))
-      setCookie('whm_csrf=csrf-of-user-2; path=/')
-      throw httpError(429)
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke')) {
+        // While this logout waits out a 429, another tab signs a different
+        // user in: new identity, new logical session, new cookies.
+        localStorage.setItem('user', JSON.stringify({ id: 'user-2', email: 'b@example.com' }))
+        localStorage.setItem('whm_session_id', 'session-of-user-2')
+        setCookie('whm_csrf=csrf-of-user-2; path=/')
+        throw httpError(429)
+      }
     })
 
-    const logout = api.post('/auth/logout', {})
-    await vi.advanceTimersByTimeAsync(3_000)
-    await logout
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(10_000)
+    await whenLogoutSettled()
 
-    expect(postSpy).toHaveBeenCalledTimes(1)
-    expect(adapter).toHaveBeenCalledTimes(1)
+    // Neither a second revoke nor a logout touches the new session.
+    expect(order).toEqual(['revoke csrf-token-1'])
   })
 
   it('re-reads the CSRF cookie for each revoke attempt', async () => {
     vi.useFakeTimers()
-    const { api } = await loadTab(async (config) => ok(config))
-    const sent: string[] = []
-    postSpy.mockImplementation(async (_url: string, _body: unknown, options: any) => {
-      sent.push(options.headers['X-CSRF-Token'])
-      if (sent.length === 1) {
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    let first = true
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke') && first) {
+        first = false
         // Another tab refreshes meanwhile and rotates the CSRF cookie.
         setCookie('whm_csrf=csrf-token-2; path=/')
         throw httpError(429)
       }
-      return { data: { data: {} }, status: 200 }
     })
 
-    const logout = api.post('/auth/logout', {})
+    await api.post('/auth/logout', {})
     await vi.advanceTimersByTimeAsync(1_000)
-    await logout
+    await whenLogoutSettled()
 
-    expect(sent).toEqual(['csrf-token-1', 'csrf-token-2'])
+    expect(order).toEqual(['revoke csrf-token-1', 'revoke csrf-token-2', 'logout csrf-token-2'])
   })
 
   it('retries a rate-limited revoke before logging out', async () => {
     vi.useFakeTimers()
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
     const order: string[] = []
+    let revokes = 0
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke') && ++revokes < 3) throw httpError(429)
+    })
+
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(3_000)
+    await whenLogoutSettled()
+
+    expect(order).toEqual([
+      'revoke csrf-token-1', 'revoke csrf-token-1', 'revoke csrf-token-1', 'logout csrf-token-1',
+    ])
+  })
+
+  it('logs out after the revoke stays rate-limited or fails', async () => {
+    vi.useFakeTimers()
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke')) throw httpError(429)
+    })
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(10_000)
+    await whenLogoutSettled()
+    expect(order.filter((label) => label.startsWith('revoke'))).toHaveLength(3)
+    expect(order[order.length - 1]).toBe('logout csrf-token-1')
+
+    order.length = 0
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke')) throw networkError()
+    })
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(10_000)
+    await whenLogoutSettled()
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+  })
+
+  for (const locking of ['Web Locks', 'no Web Locks (fallback)']) {
+    it(`a logout waits for a refresh in flight, which then leaves no trace (${locking})`, async () => {
+      if (locking === 'Web Locks') installWebLocks()
+      let releaseRefresh!: () => void
+      const refreshGate = new Promise<void>((resolve) => {
+        releaseRefresh = resolve
+      })
+      const { api, whenLogoutSettled } = await loadTab(async (config) => {
+        throw httpError(401, config)
+      })
+      const order: string[] = []
+      recordPosts(order, async (label) => {
+        if (label === 'refresh') {
+          await refreshGate
+          order.push('refresh done')
+          return refreshOk()
+        }
+      })
+
+      const request = api.get('/contacts').then(
+        () => 'resolved',
+        (error: AxiosError) => error.code ?? error.response?.status,
+      )
+      await vi.waitFor(() => expect(order).toEqual(['refresh']))
+      await api.post('/auth/logout', {})
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      // The revoke waits: the refresh response must land first.
+      expect(order).toEqual(['refresh'])
+
+      releaseRefresh()
+      await whenLogoutSettled()
+      expect(order).toEqual(['refresh', 'refresh done', 'revoke csrf-token-1', 'logout csrf-token-1'])
+      // The late refresh left no session bookkeeping behind.
+      expect(localStorage.getItem('whm_auth_expires_at')).toBeNull()
+      expect(await request).not.toBe('resolved')
+    })
+  }
+
+  it('a logout stops a refresh that is backing off', async () => {
+    vi.useFakeTimers()
+    installWebLocks()
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label === 'refresh') throw httpError(503)
+    })
+
+    const request = api.get('/contacts').then(() => 'resolved', () => 'rejected')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(order).toEqual(['refresh'])
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(10_000)
+    await whenLogoutSettled()
+
+    expect(order).toEqual(['refresh', 'revoke csrf-token-1', 'logout csrf-token-1'])
+    expect(await request).toBe('rejected')
+  })
+
+  it('a refresh queued on the lock never sends once its session ended', async () => {
+    const locks = installWebLocks()
+    let releaseHolder!: () => void
+    const held = new Promise<void>((resolve) => {
+      releaseHolder = resolve
+    })
+    // Another tab holds the refresh lock.
+    void (navigator as unknown as { locks: { request: (name: string, cb: () => Promise<void>) => Promise<void> } })
+      .locks.request('whm-token-refresh', () => held)
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const order: string[] = []
+    recordPosts(order)
+
+    const request = api.get('/contacts').then(() => 'resolved', () => 'rejected')
+    await vi.waitFor(() => expect(locks).toHaveBeenCalledTimes(2))
+    await api.post('/auth/logout', {})
+    await vi.waitFor(() => expect(locks).toHaveBeenCalledTimes(3))
+    releaseHolder()
+    await whenLogoutSettled()
+
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+    expect(await request).toBe('rejected')
+  })
+
+  for (const locking of ['Web Locks', 'no Web Locks (fallback)']) {
+    it(`a new sign-in waits for an earlier logout to finish (${locking})`, async () => {
+      if (locking === 'Web Locks') installWebLocks()
+      let releaseRevoke!: () => void
+      const revokeGate = new Promise<void>((resolve) => {
+        releaseRevoke = resolve
+      })
+      const order: string[] = []
+      const { api } = await loadTab(async (config) => {
+        order.push(`sign-in ${config.url}`)
+        return ok(config, { data: { expires_in: 900, user: {} } })
+      })
+      recordPosts(order, async (label) => {
+        if (label.startsWith('revoke')) await revokeGate
+      })
+
+      await api.post('/auth/logout', {})
+      const login = api.post('/auth/login', { email: 'a@example.com', password: 'x' })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(order).toEqual(['revoke csrf-token-1'])
+
+      releaseRevoke()
+      await login
+      expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1', 'sign-in /auth/login'])
+      // The new session is live: its own bookkeeping applies.
+      expect(Number(localStorage.getItem('whm_auth_expires_at'))).toBeGreaterThan(Date.now())
+      expect(localStorage.getItem('whm_session_id')).toMatch(/^(?!ended:)./)
+    })
+  }
+
+  it('an org switch is ordered after a refresh already in flight', async () => {
+    installWebLocks()
+    let releaseRefresh!: () => void
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve
+    })
+    const order: string[] = []
+    let rotated = false
     const { api } = await loadTab(async (config) => {
-      order.push('logout')
+      if (config.url === '/auth/switch-org') {
+        order.push('switch-org')
+        return ok(config, { data: { expires_in: 900, user: {} } })
+      }
+      if (!rotated) throw httpError(401, config)
       return ok(config)
     })
-    postSpy
-      .mockImplementationOnce(async () => {
-        order.push('revoke 429')
-        throw httpError(429)
-      })
-      .mockImplementationOnce(async () => {
-        order.push('revoke 429')
-        throw httpError(429)
-      })
-      .mockImplementationOnce(async () => {
-        order.push('revoke ok')
-        return { data: { data: {} }, status: 200 }
-      })
+    recordPosts(order, async (label) => {
+      if (label === 'refresh') {
+        await refreshGate
+        rotated = true
+        order.push('refresh done')
+        return refreshOk()
+      }
+    })
 
-    const logout = api.post('/auth/logout', {})
-    await vi.advanceTimersByTimeAsync(3_000)
-    await logout
+    localStorage.setItem('whm_session_id', 'session-a')
+    const request = api.get('/contacts')
+    await vi.waitFor(() => expect(order).toEqual(['refresh']))
+    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(order).toEqual(['refresh'])
 
-    expect(order).toEqual(['revoke 429', 'revoke 429', 'revoke ok', 'logout'])
-  })
-
-  it('logs out after the revoke stays rate-limited', async () => {
-    vi.useFakeTimers()
-    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
-    const { api } = await loadTab(adapter)
-    postSpy.mockRejectedValue(httpError(429))
-
-    const logout = api.post('/auth/logout', {})
-    await vi.advanceTimersByTimeAsync(3_000)
-
-    expect((await logout).status).toBe(200)
-    expect(postSpy).toHaveBeenCalledTimes(3)
-    expect(adapter).toHaveBeenCalledTimes(1)
-  })
-
-  it('still logs out when the revoke fails', async () => {
-    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
-    const { api } = await loadTab(adapter)
-    postSpy.mockRejectedValue(networkError())
-
-    const response = await api.post('/auth/logout', {})
-
-    expect(response.status).toBe(200)
-    expect(adapter).toHaveBeenCalledTimes(1)
+    releaseRefresh()
+    await switched
+    await request
+    expect(order.slice(0, 3)).toEqual(['refresh', 'refresh done', 'switch-org'])
+    // An org switch is not a new login: the logical session carries on.
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
   })
 
   it('logs out on a definitive 403 from /auth/refresh', async () => {
@@ -494,17 +656,11 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     rotated = false
     postSpy.mockClear()
-    postSpy.mockImplementation(async (_url: string, body: unknown) => {
-      // Logout's revoke call; it rotates nothing.
-      if ((body as { revoke?: boolean })?.revoke) return { data: { data: {} }, status: 200 }
-      rotated = true
-      return refreshOk()
-    })
-    for (const url of ['/auth/login', '/auth/register', '/auth/logout', '/auth/sso/google/init']) {
+    for (const url of ['/auth/login', '/auth/register', '/auth/sso/google/init']) {
       await expect(api.post(url, {})).rejects.toMatchObject({ response: { status: 401 } })
     }
-    // No refresh was attempted; the only /auth/refresh call is logout's revoke.
-    expect(postSpy.mock.calls.map((call: unknown[]) => call[1])).toEqual([{ revoke: true }])
+    // No refresh was attempted. (Logout never reaches the adapter at all.)
+    expect(postSpy).not.toHaveBeenCalled()
   })
 
   it('refreshes proactively before expiry while visible, not while hidden', async () => {

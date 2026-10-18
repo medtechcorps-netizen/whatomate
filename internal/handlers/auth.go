@@ -410,6 +410,9 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		}
 		// Permanent organization states end the session like a removed
 		// membership; only other (database) errors are worth retrying.
+		// The compliance-marker cases have no refresh unit test: their
+		// fixture is internal to package handlers, while the refresh tests
+		// are in handlers_test. They are checked at the gate.
 		permanent := err == gorm.ErrRecordNotFound ||
 			err == database.ErrPlatformComplianceTenant ||
 			err == database.ErrPlatformComplianceMarkerInvalid ||
