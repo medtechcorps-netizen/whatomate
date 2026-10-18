@@ -162,6 +162,7 @@ func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 		HTTPClient:            root.HTTPClient,
 		CallManager:           root.CallManager,
 		TTS:                   root.TTS,
+		AudioStore:            root.AudioStore,
 		S3Client:              root.S3Client,
 		ObjectStore:           root.ObjectStore,
 		root:                  root,

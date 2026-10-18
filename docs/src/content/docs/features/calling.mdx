@@ -262,7 +262,7 @@ Add to your `config.toml`:
 
 ```toml
 [calling]
-audio_dir = "./audio"                  # Directory for IVR audio files
+audio_dir = "./audio"                  # Local audio storage / object-storage cache
 hold_music_file = "hold-music.ogg"     # Hold music file (relative to audio_dir)
 ringback_file = "ringback.ogg"         # Ringback tone for outgoing calls
 max_call_duration = 3600               # Max call duration in seconds
@@ -294,6 +294,16 @@ credential = "pass"
 ### Enabling Calling per Organization
 
 Calling is enabled per-organization in the database. Set `calling_enabled = true` on the organization record to allow calls for that org.
+
+### Persisting IVR Recordings
+
+When `storage.type = "s3"`, uploaded prompts, generated speech, and organization hold/ringback recordings use the existing S3-compatible object store. An upload succeeds only after its recording is stored. Each organization has a separate audio namespace. Playback downloads recordings into a local cache, so a new replica or a deployment can recover them without another upload.
+
+For `storage.type = "local"`, recordings stay under `calling.audio_dir` in organization-specific directories. Mount this directory on persistent storage if recordings must survive replacement of the server. Server-configured default hold and ringback files still use their configured paths relative to `audio_dir`.
+
+<Aside type="caution" title="Upgrading existing recordings">
+  Earlier versions saved uploads directly in the shared `audio_dir`. After upgrading, re-upload each organization's original recordings and save the updated IVR flow or calling settings before accepting calls. Old shared files are not automatically assigned to an organization: their filenames do not prove ownership. If the files have already disappeared, restore the original audio from your backup. The flow's stored filename alone cannot recover the recording.
+</Aside>
 
 ## Text-to-Speech (IVR Greetings)
 
@@ -361,7 +371,7 @@ opusenc --bitrate 24 test.wav test.ogg
 ```
 
 <Aside type="tip">
-  Generated audio files are cached in the `audio_dir` (default: `./audio`) using a SHA256 hash of the text. The same text always reuses the existing file, so regeneration is instant after the first run.
+  Piper caches synthesis results in `audio_dir` (default: `./audio`). Before returning a filename to the flow editor, the application also saves the audio in the organization's configured audio store, including when Piper reuses a cached result. Saved recordings use immutable filenames derived from their audio content.
 </Aside>
 
 ## Firewall & Network
