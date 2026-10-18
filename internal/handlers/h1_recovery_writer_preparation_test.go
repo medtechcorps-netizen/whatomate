@@ -12,12 +12,49 @@ import (
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// The package shares one fixture database. Restrict only this private pool's
+// real organization-ID enumeration, so batchSize=1 cannot select an older test's
+// pending job. Claims, session SQL and public RunOnce still execute normally.
+func h1RecoveryOnlyFixtureOrganization(t *testing.T, f *h1CapacityLegacyFixture) {
+	t.Helper()
+	organizationID := f.works[0].OrganizationID
+	callback := "h1:recovery-fixture-organizations:" + uuid.NewString()
+	var constrained atomic.Int32
+	require.NoError(t, f.app.DB.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		statement := tx.Statement
+		if statement == nil || statement.Schema == nil || statement.Schema.Table != "organizations" {
+			return
+		}
+		ids, ok := statement.Dest.(*[]uuid.UUID)
+		if !ok || ids == nil {
+			return
+		}
+		selection, ok := statement.Clauses["SELECT"].Expression.(clause.Select)
+		if !ok || len(selection.Columns) != 1 || selection.Columns[0].Name != "id" || selection.Columns[0].Raw {
+			return
+		}
+		statement.AddClause(clause.Where{Exprs: []clause.Expression{clause.Eq{
+			Column: clause.Column{Table: clause.CurrentTable, Name: "id"}, Value: organizationID,
+		}}})
+		constrained.Add(1)
+	}))
+	t.Cleanup(func() { _ = f.app.DB.Callback().Query().Remove(callback) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	organizations, err := NewInboundContinuationProcessor(f.app, time.Second).listOrganizations(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []uuid.UUID{organizationID}, organizations)
+	require.EqualValues(t, 1, constrained.Load(), "the actual organization-ID query must be constrained")
+}
 
 func TestH1RecoveryPreparation_InitialWriterYieldsBeforeModelAndRenewsClaim(t *testing.T) {
 	for _, route := range []string{"new-session", "existing-session"} {
 		t.Run(route, func(t *testing.T) {
 			f := h1CapacityLegacy(t, 1)
+			h1RecoveryOnlyFixtureOrganization(t, f)
 			if route == "new-session" {
 				h1ReaderPreparationRemoveSeed(t, f)
 			}
@@ -146,6 +183,7 @@ func TestH1RecoveryPreparation_InitialWriterUnwindsOnPreparationFailure(t *testi
 	for _, fault := range []string{"error", "panic", "stop", "cancel"} {
 		t.Run(fault, func(t *testing.T) {
 			f := h1CapacityLegacy(t, 1)
+			h1RecoveryOnlyFixtureOrganization(t, f)
 			p := NewInboundContinuationProcessor(f.app, time.Second)
 			p.batchSize = 1
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
