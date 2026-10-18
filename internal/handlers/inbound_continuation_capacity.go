@@ -79,7 +79,7 @@ func (a *App) acquireIncomingMessageOrganization(phoneID string) (uuid.UUID, fun
 	if err != nil {
 		return uuid.Nil, nil, err
 	}
-	release, err := a.acquireInboundContinuationPhase(ctx, nil, 1, organizationID.String(), inboundContinuationWriter)
+	release, err := a.acquireIncomingMessageIntake(ctx, organizationID.String())
 	if err != nil {
 		return uuid.Nil, nil, fmt.Errorf("incoming message capacity admission: %w", err)
 	}

@@ -26,6 +26,7 @@ type inboundContinuationAdmissionWaiter struct {
 	priority     int
 	organization string
 	mode         int
+	intake       bool
 }
 
 type inboundContinuationOrganizationPhase struct {
@@ -38,6 +39,9 @@ type inboundContinuationOrganizationPhase struct {
 	normalQueued [3]int
 	applyQueued  [3]int
 	firstNormal  int
+	intakeQueued int
+	// nil is unsealed; an empty nonnil map is an exhausted intake snapshot.
+	intakeCohort map[*inboundContinuationAdmissionWaiter]struct{}
 }
 
 type inboundContinuationAdmissionContextKey struct{}
@@ -120,6 +124,17 @@ func (a *App) acquireInboundContinuationCapacity(ctx context.Context, stop <-cha
 // release the previous phase completely before entering; database policy and
 // account fences remain authoritative, including against other processes.
 func (a *App) acquireInboundContinuationPhase(ctx context.Context, stop <-chan struct{}, weight int, organization string, mode int) (func(), error) {
+	return a.acquireInboundContinuationPhaseClass(ctx, stop, weight, organization, mode, false)
+}
+
+// Only authenticated pre-ACK ingress uses this class, after bounded tenant
+// discovery has released its generic permit and database connection. Ordinary
+// fresh preparation remains on acquireInboundContinuationPhase.
+func (a *App) acquireIncomingMessageIntake(ctx context.Context, organization string) (func(), error) {
+	return a.acquireInboundContinuationPhaseClass(ctx, nil, 1, organization, inboundContinuationWriter, true)
+}
+
+func (a *App) acquireInboundContinuationPhaseClass(ctx context.Context, stop <-chan struct{}, weight int, organization string, mode int, intake bool) (func(), error) {
 	root := a.rootApp()
 	if root == nil || root.DB == nil {
 		return nil, errors.New("inbound continuation admission requires an app database")
@@ -145,6 +160,14 @@ func (a *App) acquireInboundContinuationPhase(ctx context.Context, stop <-chan s
 			priority = inboundContinuationPerformPriority
 		}
 	}
+	if intake {
+		if priority != inboundContinuationFreshPriority {
+			return nil, errors.New("inbound continuation intake cannot enter a continuation phase")
+		}
+		return root.continuationAdmission.acquireIntake(ctx, stop, func() int {
+			return pool.Stats().MaxOpenConnections
+		}, organization)
+	}
 	return root.continuationAdmission.acquireScoped(ctx, stop, weight, priority, func() int {
 		return pool.Stats().MaxOpenConnections
 	}, organization, mode)
@@ -160,6 +183,14 @@ func (g *inboundContinuationAdmission) acquire(ctx context.Context, stop <-chan 
 }
 
 func (g *inboundContinuationAdmission) acquireScoped(ctx context.Context, stop <-chan struct{}, weight, priority int, maxOpen func() int, organization string, mode int) (func(), error) {
+	return g.acquireScopedClass(ctx, stop, weight, priority, maxOpen, organization, mode, false)
+}
+
+func (g *inboundContinuationAdmission) acquireIntake(ctx context.Context, stop <-chan struct{}, maxOpen func() int, organization string) (func(), error) {
+	return g.acquireScopedClass(ctx, stop, 1, inboundContinuationFreshPriority, maxOpen, organization, inboundContinuationWriter, true)
+}
+
+func (g *inboundContinuationAdmission) acquireScopedClass(ctx context.Context, stop <-chan struct{}, weight, priority int, maxOpen func() int, organization string, mode int, intake bool) (func(), error) {
 	if weight != 1 && weight != 3 {
 		return nil, errors.New("inbound continuation admission weight must be 1 or 3")
 	}
@@ -170,10 +201,13 @@ func (g *inboundContinuationAdmission) acquireScoped(ctx context.Context, stop <
 		(organization != "" && mode != inboundContinuationReader && mode != inboundContinuationWriter) {
 		return nil, errors.New("inbound continuation organization phase is invalid")
 	}
+	if intake && (weight != 1 || priority != inboundContinuationFreshPriority || organization == "" || mode != inboundContinuationWriter) {
+		return nil, errors.New("inbound continuation intake phase is invalid")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	waiter := &inboundContinuationAdmissionWaiter{priority: priority, organization: organization, mode: mode}
+	waiter := &inboundContinuationAdmissionWaiter{priority: priority, organization: organization, mode: mode, intake: intake}
 	g.mu.Lock()
 	g.waiters = append(g.waiters, waiter)
 	g.notifyLocked()
@@ -203,6 +237,24 @@ func (g *inboundContinuationAdmission) acquireScoped(ctx context.Context, stop <
 		}
 		head := g.headLocked()
 		if head == waiter && fits {
+			if intake {
+				phase := g.phases[organization]
+				if len(phase.intakeCohort) == 0 {
+					// Seal only on actual intake service. An empty writer turn may
+					// first run discovery/preparation before scoped intake appears.
+					// A sealed, exhausted snapshot can renew only after the normal
+					// turn is complete and no reader is waiting (eligibleLocked).
+					if phase.intakeCohort != nil {
+						phase.normalGrants = 0
+					}
+					phase.intakeCohort = make(map[*inboundContinuationAdmissionWaiter]struct{})
+					for _, queued := range g.waiters {
+						if queued.organization == organization && queued.intake {
+							phase.intakeCohort[queued] = struct{}{}
+						}
+					}
+				}
+			}
 			g.removeLocked(waiter)
 			g.used += weight
 			if organization != "" {
@@ -211,7 +263,7 @@ func (g *inboundContinuationAdmission) acquireScoped(ctx context.Context, stop <
 				phase.active++
 				if priority != inboundContinuationApplyPriority {
 					phase.fixed = true
-					if phase.normalGrants < phase.limit {
+					if !intake && phase.normalGrants < phase.limit {
 						phase.normalGrants++
 					}
 				}
@@ -280,15 +332,17 @@ func (g *inboundContinuationAdmission) phaseWaitersLocked(organization string, m
 	return
 }
 
-// Each phase permits at most one existing bounded recovery batch of normal
-// grants once the opposite mode is waiting. This is an unmeasured scheduling
-// policy, not a throughput or successful-admission deadline guarantee. Apply
-// grants finish finite previously admitted work without reopening the quota.
+// Reader/preparation phases retain the existing bounded recovery batch once
+// the opposite mode is waiting. Writers additionally service one finite intake
+// snapshot, sealed on its first grant. This is an unmeasured scheduling policy,
+// not a throughput or successful-admission deadline guarantee. Apply grants
+// finish finite admitted work without reopening either normal service cohort.
 func (g *inboundContinuationAdmission) refreshPhasesLocked() {
 	for _, phase := range g.phases {
 		phase.normalQueued = [3]int{}
 		phase.applyQueued = [3]int{}
 		phase.firstNormal = inboundContinuationUnscoped
+		phase.intakeQueued = 0
 	}
 	for _, queued := range g.waiters {
 		if queued.organization == "" {
@@ -307,6 +361,9 @@ func (g *inboundContinuationAdmission) refreshPhasesLocked() {
 			phase.applyQueued[queued.mode]++
 		} else {
 			phase.normalQueued[queued.mode]++
+			if queued.intake {
+				phase.intakeQueued++
+			}
 			if phase.firstNormal == inboundContinuationUnscoped {
 				phase.firstNormal = queued.mode
 			}
@@ -327,13 +384,22 @@ func (g *inboundContinuationAdmission) refreshPhasesLocked() {
 			delete(g.phases, organization)
 			continue
 		}
-		if opposite && (!same || phase.normalGrants >= phase.limit) {
+		turnComplete := !same || phase.normalGrants >= phase.limit
+		if phase.mode == inboundContinuationWriter {
+			// Intake has its own finite snapshot, independent of the durable
+			// preparation quota. A first or unfinished snapshot must not be
+			// skipped merely because preparation already used its 50 grants.
+			preparationQueued := phase.normalQueued[inboundContinuationWriter] - phase.intakeQueued
+			turnComplete = !g.intakeReadyLocked(phase) && (preparationQueued == 0 || phase.normalGrants >= phase.limit)
+		}
+		if opposite && turnComplete {
 			if phase.mode == inboundContinuationReader {
 				phase.mode = inboundContinuationWriter
 			} else {
 				phase.mode = inboundContinuationReader
 			}
 			phase.normalGrants = 0
+			phase.intakeCohort = nil
 			phase.limit = defaultInboundContinuationBatch
 			phase.fixed = true
 		}
@@ -363,8 +429,41 @@ func (g *inboundContinuationAdmission) eligibleLocked(waiter *inboundContinuatio
 			return false
 		}
 	}
+	if waiter.mode == inboundContinuationWriter {
+		intakeReady := g.intakeReadyLocked(phase)
+		if waiter.intake {
+			if !intakeReady {
+				return false
+			}
+			if len(phase.intakeCohort) != 0 {
+				_, captured := phase.intakeCohort[waiter]
+				return captured
+			}
+			return true
+		}
+		if intakeReady {
+			// Only same-organization preparation yields to this finite intake
+			// set. Other eligible tenants and generic discovery retain FIFO.
+			return false
+		}
+	}
 	_, opposite, _ := g.phaseWaitersLocked(waiter.organization, phase.mode)
 	return !opposite || phase.normalGrants < phase.limit
+}
+
+func (g *inboundContinuationAdmission) intakeReadyLocked(phase *inboundContinuationOrganizationPhase) bool {
+	if phase.intakeQueued == 0 {
+		return false
+	}
+	if phase.intakeCohort == nil || len(phase.intakeCohort) != 0 {
+		return true
+	}
+	// Renew an exhausted snapshot only when this normal writer turn is done
+	// and no opposite normal reader is waiting. This keeps ingress-only routes
+	// work-conserving without refilling ahead of queued readers/preparations.
+	preparationQueued := phase.normalQueued[inboundContinuationWriter] - phase.intakeQueued
+	return phase.normalQueued[inboundContinuationReader] == 0 &&
+		(preparationQueued == 0 || phase.normalGrants >= phase.limit)
 }
 
 func inboundContinuationAdmissionWaitError(ctx context.Context, stop <-chan struct{}) error {
@@ -380,6 +479,9 @@ func inboundContinuationAdmissionWaitError(ctx context.Context, stop <-chan stru
 }
 
 func (g *inboundContinuationAdmission) removeLocked(waiter *inboundContinuationAdmissionWaiter) {
+	if waiter.organization != "" && g.phases[waiter.organization] != nil {
+		delete(g.phases[waiter.organization].intakeCohort, waiter)
+	}
 	for i, queued := range g.waiters {
 		if queued == waiter {
 			copy(g.waiters[i:], g.waiters[i+1:])
