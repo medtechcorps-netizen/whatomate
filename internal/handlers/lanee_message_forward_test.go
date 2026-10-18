@@ -590,10 +590,10 @@ func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
 	assert.Equal(t, sentBefore, f.mock.sentMessageCount())
 }
 
-// Q5 (ambiguous acceptance): outside a request transaction the pending
-// message has its own COMMIT, so a send-phase failure is reported as
-// forward_outcome_unknown, and the server makes exactly one attempt.
-func TestLaneEForwardAmbiguousFailureIsNeverRetried(t *testing.T) {
+// Q5: the pending-row INSERT fails inside its own transaction, which rolls
+// back before COMMIT: definitely not accepted (503), one attempt only. The
+// lost-COMMIT case (ambiguous) is in lanee_forward_internal_test.go.
+func TestLaneEForwardFailedInsertIsDefiniteAndNotRetried(t *testing.T) {
 	f := laneENewForwardFixture(t)
 	text := f.storedMessage(t, f.source, models.MessageTypeText, "ambiguous", "")
 	f.app.WaitForBackgroundTasks()
@@ -609,17 +609,60 @@ func TestLaneEForwardAmbiguousFailureIsNeverRetried(t *testing.T) {
 	t.Cleanup(func() { _ = f.app.DB.Callback().Create().Remove(name) })
 
 	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
-	assert.Equal(t, fasthttp.StatusInternalServerError, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
-	envelope := laneERefusal(t, req)
-	assert.Equal(t, "forward_outcome_unknown", envelope.ErrorType)
-	assert.Contains(t, envelope.Message, "may have been sent")
+	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
 	assert.Equal(t, 1, attempts, "never a second automatic attempt")
+	assert.Empty(t, f.messagesFor(t, f.target.ID))
 	assert.Zero(t, f.mock.sentMessageCount())
 }
 
-// Q6: each persisted forward left behind by a process exit shows a visible
-// state, and the delivered one records the provider phase before sending.
-func TestLaneEForwardProcessExitStatesAreVisible(t *testing.T) {
+// Item 8: a failed account lookup (database or deadline) happens before
+// anything is saved, so it is a definite 503, not a 400.
+func TestLaneEForwardAccountLookupFailureIsRetryable(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	text := f.storedMessage(t, f.source, models.MessageTypeText, "lookup", "")
+	org, accountName := f.org.ID, f.account.Name
+	name := "laneE:account_lookup_" + uuid.NewString()
+	require.NoError(t, f.app.DB.Callback().Query().After("gorm:query").Register(name, func(db *gorm.DB) {
+		if db.Statement.Table != "whatsapp_accounts" {
+			return
+		}
+		hasOrg, hasName := false, false
+		for _, v := range db.Statement.Vars {
+			hasOrg = hasOrg || v == any(org)
+			hasName = hasName || v == any(accountName)
+		}
+		if hasOrg && hasName {
+			_ = db.AddError(errors.New("synthetic: connection reset during account lookup"))
+		}
+	}))
+	t.Cleanup(func() { _ = f.app.DB.Callback().Query().Remove(name) })
+
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
+	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
+	assert.Empty(t, f.messagesFor(t, f.target.ID))
+	assert.Zero(t, f.mock.sentMessageCount())
+}
+
+// Item 8: a missing account is a definite refusal that would repeat: 400.
+func TestLaneEForwardUnknownAccountIsNotRetryable(t *testing.T) {
+	f := laneENewForwardFixture(t)
+	text := f.storedMessage(t, f.source, models.MessageTypeText, "unknown account", "")
+	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{
+		"forward_of_message_id": text.ID.String(),
+		"whatsapp_account":      "no-such-account",
+	})
+	assert.Equal(t, fasthttp.StatusBadRequest, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+	assert.Equal(t, "forward_account_unavailable", laneERefusal(t, req).ErrorType)
+	assert.Empty(t, f.messagesFor(t, f.target.ID))
+}
+
+// Q6, projection only: GetMessages exposes the derived state of stalled
+// forwards. The rows are seeded to look like what an exit leaves behind; the
+// real exit boundaries are exercised in lanee_forward_internal_test.go. Also
+// checks that a delivered forward recorded the provider phase.
+func TestLaneEForwardStalledStatesProjection(t *testing.T) {
 	f := laneENewForwardFixture(t)
 	text := f.storedMessage(t, f.source, models.MessageTypeText, "delivered normally", "")
 	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
@@ -652,9 +695,9 @@ func TestLaneEForwardProcessExitStatesAreVisible(t *testing.T) {
 			UpdateColumns(map[string]any{"created_at": longAgo, "updated_at": longAgo}).Error)
 		return row.ID
 	}
-	// (a) the process exited before the provider phase was recorded.
-	interrupted := seed(models.JSONB{"forward_dispatch": "queued"})
-	// (b) the process exited after it: the send may have happened.
+	// Still queued: delayed, status unknown.
+	delayed := seed(models.JSONB{"forward_dispatch": "queued"})
+	// Provider phase recorded without a result: may have been sent.
 	uncertain := seed(models.JSONB{"forward_dispatch": "provider", "forward_dispatch_at": longAgo.UTC().Format(time.RFC3339Nano)})
 
 	list := testutil.NewGETRequest(t)
@@ -671,7 +714,7 @@ func TestLaneEForwardProcessExitStatesAreVisible(t *testing.T) {
 	for _, message := range listed.Data.Messages {
 		states[message.ID] = message.ForwardDeliveryState
 	}
-	assert.Equal(t, "interrupted", states[interrupted])
+	assert.Equal(t, "delayed", states[delayed])
 	assert.Equal(t, "uncertain", states[uncertain])
 	assert.Equal(t, "", states[delivered[0].ID])
 	// Neither stalled row is resent by anything on the read path.

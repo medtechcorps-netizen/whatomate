@@ -44,7 +44,7 @@ const forwardLabel = computed(() => t('chat.forward.action'))
 const showForward = computed(() => props.canForward === true && canOfferForward(props.message))
 
 // A forwarded bubble is never re-sent from here: its content lives on the
-// original message, so a failed or interrupted forward is forwarded again.
+// original message, so a failed forward is forwarded again from there.
 const canRetry = computed(() =>
   props.message.direction === 'outgoing' &&
   props.message.status === 'failed' &&

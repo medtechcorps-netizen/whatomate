@@ -3,8 +3,8 @@ import { Forward } from 'lucide-vue-next'
 import type { ForwardDeliveryState } from './messageForward'
 
 // Internal CRM marker. WhatsApp offers no settable "Forwarded" label, so the
-// customer receives an ordinary message; only agents see this chip. A forward
-// stalled by a process exit also says whether it was sent.
+// customer receives an ordinary message; only agents see this chip. A stalled
+// forward also says that its status is unknown and it won't be resent.
 defineProps<{
   state?: ForwardDeliveryState
 }>()
@@ -21,7 +21,7 @@ defineProps<{
       class="mt-0.5 text-[11px] text-amber-600 light:text-amber-700"
       :data-forward-delivery-state="state"
     >
-      {{ state === 'interrupted' ? $t('chat.forward.interruptedNote') : $t('chat.forward.uncertainDeliveryNote') }}
+      {{ state === 'delayed' ? $t('chat.forward.delayedNote') : $t('chat.forward.uncertainDeliveryNote') }}
     </p>
   </div>
 </template>

@@ -176,7 +176,8 @@ watch(search, () => {
 // ---- Delivery status ------------------------------------------------------
 
 let stopStatusWatch: (() => void) | null = null
-let confirmTimer: ReturnType<typeof setTimeout> | undefined
+// One confirmation window per target attempt, so a manual retry gets a fresh one.
+const confirmTimers = new Map<string, ReturnType<typeof setTimeout>>()
 // Status events can arrive before the POST response that names the message.
 const earlyStatuses = new Map<string, { status: string; error?: string }>()
 
@@ -190,8 +191,10 @@ function applyStatus(messageId: string, status: string, error?: string) {
   if (status === 'failed') {
     result.state = 'failed'
     result.error = error || t('chat.forward.failed')
+    clearConfirmTimer(result)
   } else if (DELIVERED_STATUSES.has(status)) {
     result.state = 'sent'
+    clearConfirmTimer(result)
   }
   if (!results.value.some(r => r.state === 'queued' || r.state === 'unconfirmed' || r.state === 'pending' || r.state === 'sending')) {
     stopWatchingStatus()
@@ -212,11 +215,26 @@ function watchStatus() {
   })
 }
 
+function startConfirmTimer(result: TargetResult) {
+  clearConfirmTimer(result)
+  const key = result.contact.id
+  confirmTimers.set(key, setTimeout(() => {
+    confirmTimers.delete(key)
+    if (result.state === 'queued') result.state = 'unconfirmed'
+  }, DELIVERY_CONFIRM_TIMEOUT_MS))
+}
+
+function clearConfirmTimer(result: TargetResult) {
+  const timer = confirmTimers.get(result.contact.id)
+  if (timer) clearTimeout(timer)
+  confirmTimers.delete(result.contact.id)
+}
+
 function stopWatchingStatus() {
   stopStatusWatch?.()
   stopStatusWatch = null
-  if (confirmTimer) clearTimeout(confirmTimer)
-  confirmTimer = undefined
+  for (const timer of confirmTimers.values()) clearTimeout(timer)
+  confirmTimers.clear()
   earlyStatuses.clear()
 }
 
@@ -256,6 +274,7 @@ async function sendTo(result: TargetResult, sourceId: string) {
     })
     result.messageId = created?.id ? String(created.id) : undefined
     result.state = 'queued'
+    startConfirmTimer(result)
     if (result.messageId) {
       const early = earlyStatuses.get(result.messageId)
       earlyStatuses.delete(result.messageId)
@@ -270,17 +289,7 @@ async function sendTo(result: TargetResult, sourceId: string) {
 
 /** Keep listening only while a target waits for its delivery status. */
 function settleWatching() {
-  if (!results.value.some(r => r.state === 'queued')) {
-    if (!results.value.some(r => r.state === 'unconfirmed')) stopWatchingStatus()
-    return
-  }
-  if (confirmTimer) return
-  confirmTimer = setTimeout(() => {
-    confirmTimer = undefined
-    for (const result of results.value) {
-      if (result.state === 'queued') result.state = 'unconfirmed'
-    }
-  }, DELIVERY_CONFIRM_TIMEOUT_MS)
+  if (!results.value.some(r => r.state === 'queued' || r.state === 'unconfirmed')) stopWatchingStatus()
 }
 
 /** Manual retry, offered only when the server proved nothing was sent. */

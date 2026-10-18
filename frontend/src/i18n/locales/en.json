@@ -402,8 +402,8 @@
       "retry": "Try again",
       "uncertain": "May have been forwarded",
       "uncertainNote": "The server could not confirm a forward. Open that chat to check before forwarding again.",
-      "interruptedNote": "Not sent: a server restart interrupted this forward. Forward it again from the original message.",
-      "uncertainDeliveryNote": "May have been sent before a server restart. Check with the customer before forwarding again.",
+      "delayedNote": "Delayed, status unknown: this forward may still be sent. ReReply won't resend it automatically. Check this chat before forwarding again.",
+      "uncertainDeliveryNote": "May have been sent, but the result wasn't recorded. ReReply won't resend it automatically. Check with the customer before forwarding again.",
       "done": "Done",
       "chip": "Forwarded",
       "chipHint": "Forwarded by your team. The customer sees an ordinary message."

@@ -4,7 +4,7 @@ import { mount } from '@vue/test-utils'
 import { describe, expect, it } from 'vitest'
 import ForwardedChip from './ForwardedChip.vue'
 
-function mountChip(state?: 'interrupted' | 'uncertain' | null) {
+function mountChip(state?: 'delayed' | 'uncertain' | null) {
   return mount(ForwardedChip, {
     props: { state },
     global: { mocks: { $t: (key: string) => key } },
@@ -18,13 +18,13 @@ describe('ForwardedChip', () => {
     expect(wrapper.find('[data-forward-delivery-state]').exists()).toBe(false)
   })
 
-  it('says a forward interrupted before sending was not sent', () => {
-    const note = mountChip('interrupted').get('[data-forward-delivery-state]')
-    expect(note.attributes('data-forward-delivery-state')).toBe('interrupted')
-    expect(note.text()).toBe('chat.forward.interruptedNote')
+  it('says a delayed forward has an unknown status (never "not sent")', () => {
+    const note = mountChip('delayed').get('[data-forward-delivery-state]')
+    expect(note.attributes('data-forward-delivery-state')).toBe('delayed')
+    expect(note.text()).toBe('chat.forward.delayedNote')
   })
 
-  it('says a forward interrupted after the provider phase may have been sent', () => {
+  it('says a forward whose send attempt has no recorded result may have been sent', () => {
     const note = mountChip('uncertain').get('[data-forward-delivery-state]')
     expect(note.text()).toBe('chat.forward.uncertainDeliveryNote')
   })

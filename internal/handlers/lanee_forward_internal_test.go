@@ -2,22 +2,26 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // The planned key is stored as media_url before the copy runs, so it must be
@@ -107,8 +111,8 @@ func TestLaneEForwardAuditFailsClosed(t *testing.T) {
 	app, account, contact := laneEInternalForwardFixture(t, &recent)
 	opts := DefaultSendOptions() // no SentByUserID: the audit cannot name an actor
 	_, err := app.SendOutgoingMessage(context.Background(), laneEForwardRequest(account, contact), opts)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "forward audit")
+	var auditErr *forwardAuditError
+	require.True(t, errors.As(err, &auditErr), "got %v", err)
 	assert.Zero(t, laneECountMessages(t, app, contact))
 }
 
@@ -183,38 +187,83 @@ func TestLaneEForwardChecksObjectSizeBeforeDownloading(t *testing.T) {
 	assert.Equal(t, int64(16<<20), forwardMediaSizeLimit(models.MessageTypeAudio))
 }
 
-// Q5: a failure proves "not accepted" by its phase, never by a timeout alone.
+// Q5: a failure is classified by the typed phase record of this forward's own
+// SendOutgoingMessage call (asynchronous), never by error text.
 func TestLaneEForwardSendFailureClassification(t *testing.T) {
-	// The exact shape H1's withBoundedRootConnection returns when no pooled
-	// connection was ever acquired (nothing ran).
-	wedge := fmt.Errorf("wedge guard: no pooled database connection within 15s while this goroutine may hold another: %w", context.DeadlineExceeded)
+	timeout := fmt.Errorf("persist: %w", context.DeadlineExceeded)
+	wedgeText := fmt.Errorf("wedge guard: no pooled database connection within 15s: %w", context.DeadlineExceeded)
+	requested := forwardSendOutcome{writeRequested: true}
+	rolledBack := forwardSendOutcome{writeRequested: true, writeStarted: true}
+	written := forwardSendOutcome{writeRequested: true, writeStarted: true, writeCompleted: true}
+	inRequest := forwardSendOutcome{writeRequested: true, requestTransaction: true, writeStarted: true, writeCompleted: true}
 	cases := []struct {
-		name string
-		err  error
-		inTx bool
-		want bool
+		name    string
+		err     error
+		async   bool
+		outcome forwardSendOutcome
+		status  int
+		want    string
 	}{
-		{"request transaction: any error is rolled back with the response", errors.New("insert failed"), true, true},
-		{"request transaction: a timeout too", fmt.Errorf("persist: %w", context.DeadlineExceeded), true, true},
-		{"own transaction: a plain error may follow a successful COMMIT", errors.New("commit: connection reset"), false, false},
-		{"own transaction: a bare timeout proves nothing", fmt.Errorf("persist: %w", context.DeadlineExceeded), false, false},
-		{"own transaction: a wedge-guard rejection never acquired a connection", fmt.Errorf("persist pending message: %w", wedge), false, true},
-		{"own transaction: wedge text without a deadline is not trusted", errors.New("wedge guard: no pooled database connection"), false, false},
-		{"own transaction: a later wedge guard (locks inside a tx) is not definite", fmt.Errorf("wedge guard: chatbot session fence and locks not acquired: %w", context.DeadlineExceeded), false, false},
-		{"no error", nil, true, false},
+		{"inactive account: would repeat", fmt.Errorf("send: %w", whatsappaccount.ErrOutboundInactive), true, requested, 400, string(forwardErrorAccountUnavailable)},
+		{"audit write failure: would repeat", fmt.Errorf("persist: %w", &forwardAuditError{err: errors.New("insert audit_logs")}), true, rolledBack, 500, string(forwardErrorBlocked)},
+		{"audit write failure inside a request transaction: would repeat", &forwardAuditError{}, true, inRequest, 500, string(forwardErrorBlocked)},
+		{"rejected before any write: would repeat", errors.New("WhatsApp account is required"), true, forwardSendOutcome{}, 500, string(forwardErrorBlocked)},
+		{"request transaction: rolled back with the error response", errors.New("savepoint failed"), true, forwardSendOutcome{writeRequested: true, requestTransaction: true, writeStarted: true}, 503, string(forwardErrorTemporarilyUnavailable)},
+		{"request transaction: even after its write completed", timeout, true, inRequest, 503, string(forwardErrorTemporarilyUnavailable)},
+		{"own transaction: no write began (no connection, BEGIN or tenant binding)", timeout, true, requested, 503, string(forwardErrorTemporarilyUnavailable)},
+		{"own transaction: the write failed and rolled back", errors.New("insert failed"), true, rolledBack, 503, string(forwardErrorTemporarilyUnavailable)},
+		{"own transaction: COMMIT failed or its answer was lost", errors.New("commit: connection reset"), true, written, 500, string(forwardErrorOutcomeUnknown)},
+		{"own transaction: error text is never trusted", wedgeText, true, written, 500, string(forwardErrorOutcomeUnknown)},
+		{"not the asynchronous forward call", errors.New("send failed"), false, requested, 500, string(forwardErrorOutcomeUnknown)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, forwardSendFailureIsDefinite(tc.err, tc.inTx))
+			refusal := forwardSendFailureRefusal(tc.err, tc.async, tc.outcome)
+			require.NotNil(t, refusal)
+			assert.Equal(t, tc.status, refusal.Status)
+			assert.Equal(t, tc.want, string(refusal.ErrorType))
 		})
 	}
-	refusal := forwardNotAcceptedRefusal()
-	assert.Equal(t, 503, refusal.Status)
-	assert.Equal(t, forwardErrorTemporarilyUnavailable, refusal.ErrorType)
+	assert.Nil(t, forwardSendFailureRefusal(nil, true, written))
+	assert.Equal(t, 503, forwardNotAcceptedRefusal().Status)
 }
 
-// Q6: what a reader sees for a forward stalled by a process exit.
-func TestLaneEForwardDeliveryStateAfterProcessExit(t *testing.T) {
+// The phase record is filled by SendOutgoingMessage itself: a rejection before
+// any write is marked as such, so it is never answered with "try again".
+func TestLaneEForwardUpFrontRejectionIsNotRetryable(t *testing.T) {
+	app := &App{Log: testutil.NopLogger()}
+	contact := &models.Contact{BaseModel: models.BaseModel{ID: uuid.New()}}
+	account := &models.WhatsAppAccount{OrganizationID: uuid.New(), Status: whatsappaccount.StatusActive}
+
+	outcome := &forwardSendOutcome{}
+	opts := ChatbotSendOptions() // synchronous: the media guard refuses before any write
+	_, err := app.SendOutgoingMessage(context.Background(), OutgoingMessageRequest{
+		Account:        account,
+		Contact:        contact,
+		Type:           models.MessageTypeImage,
+		forwardMedia:   &forwardMediaCopy{OrganizationID: account.OrganizationID},
+		forwardOutcome: outcome,
+	}, opts)
+	require.Error(t, err)
+	assert.False(t, outcome.writeRequested)
+	assert.Equal(t, forwardErrorBlocked, forwardSendFailureRefusal(err, opts.Async, *outcome).ErrorType)
+
+	outcome = &forwardSendOutcome{}
+	inactive := &models.WhatsAppAccount{OrganizationID: uuid.New(), Status: "disconnected"}
+	_, err = app.SendOutgoingMessage(context.Background(), OutgoingMessageRequest{
+		Account:        inactive,
+		Contact:        contact,
+		Type:           models.MessageTypeText,
+		forwardOutcome: outcome,
+	}, DefaultSendOptions())
+	require.ErrorIs(t, err, whatsappaccount.ErrOutboundInactive)
+	refusal := forwardSendFailureRefusal(err, true, *outcome)
+	assert.Equal(t, 400, refusal.Status)
+	assert.Equal(t, forwardErrorAccountUnavailable, refusal.ErrorType)
+}
+
+// Q6: the read-time state of a stalled forward. Neither state says "not sent".
+func TestLaneEForwardDerivedDeliveryState(t *testing.T) {
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-10 * time.Minute)
 	fresh := now.Add(-30 * time.Second)
@@ -238,9 +287,9 @@ func TestLaneEForwardDeliveryStateAfterProcessExit(t *testing.T) {
 		msg  *models.Message
 		want string
 	}{
-		{"(a) exit before the provider call: not sent", forwarded(models.MessageStatusPending, old, old, queued), forwardDeliveryInterrupted},
-		{"(b) exit after the provider phase began: may have been sent", forwarded(models.MessageStatusPending, old, old, provider(old)), forwardDeliveryUncertain},
-		{"still within the bounded phases: no state yet", forwarded(models.MessageStatusPending, fresh, fresh, queued), ""},
+		{"queued past the stall age: delayed, status unknown (a paused worker may still send it)", forwarded(models.MessageStatusPending, old, old, queued), forwardDeliveryDelayed},
+		{"provider phase recorded, no result: may have been sent", forwarded(models.MessageStatusPending, old, old, provider(old)), forwardDeliveryUncertain},
+		{"recent: no state yet", forwarded(models.MessageStatusPending, fresh, fresh, queued), ""},
 		{"provider phase just recorded on an old row: not yet uncertain", forwarded(models.MessageStatusPending, old, old, provider(fresh)), ""},
 		{"provider phase without a timestamp falls back to updated_at", forwarded(models.MessageStatusPending, old, old, models.JSONB{forwardDispatchMetadataKey: forwardDispatchProvider}), forwardDeliveryUncertain},
 		{"settled sent", forwarded(models.MessageStatusSent, old, old, provider(old)), ""},
@@ -267,4 +316,493 @@ func TestLaneEForwardRowStartsQueued(t *testing.T) {
 	}, DefaultSendOptions())
 	assert.Equal(t, forwardDispatchQueued, msg.Metadata[forwardDispatchMetadataKey])
 	assert.True(t, messageIsForwarded(msg.Metadata))
+}
+
+// ---------------------------------------------------------------------------
+// DB and process-boundary tests (run at the R3 gates; they need
+// TEST_DATABASE_URL). A process boundary is emulated without a second OS
+// process: a forward's pending row commits in its own transaction and its
+// delivery worker is queued as an after-commit callback. Dropping that
+// callback is an exit before the worker ran; running it later is a worker
+// that resumes; runtime.Goexit inside the provider call is an exit at that
+// point (only deferred calls run, so the open provider transaction rolls
+// back). A "restarted" App shares only the database with the old one.
+// ---------------------------------------------------------------------------
+
+// laneEForwardWorld is one organization with a sendable account, a source
+// message, and a target inside its 24-hour window.
+type laneEForwardWorld struct {
+	app     *App
+	capture *canonicalMessageCapture
+	org     *models.Organization
+	user    *models.User
+	account *models.WhatsAppAccount
+	target  *models.Contact
+	source  *models.Message
+}
+
+func laneENewForwardWorld(t *testing.T) *laneEForwardWorld {
+	t.Helper()
+	app, capture := newCanonicalMessageTestApp(t)
+	app.Config = &config.Config{}
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	sourceContact := testutil.CreateTestContactWith(t, app.DB, org.ID, testutil.WithContactAccount(account.Name))
+	target := testutil.CreateTestContactWith(t, app.DB, org.ID, testutil.WithContactAccount(account.Name))
+	require.NoError(t, app.DB.Model(&models.Contact{}).Where("id = ?", target.ID).
+		Update("last_inbound_at", time.Now().Add(-time.Hour)).Error)
+	source := createCanonicalReplyMessage(t, app, org.ID, sourceContact.ID, account.Name)
+	return &laneEForwardWorld{app, capture, org, user, account, target, source}
+}
+
+// post forwards the source to the target through the HTTP handler, optionally
+// inside the RLS Tenant wrapper, and waits for any delivery it started.
+func (w *laneEForwardWorld) post(t *testing.T, app *App, viaTenant bool, body map[string]any) (int, string) {
+	t.Helper()
+	if body == nil {
+		body = map[string]any{"forward_of_message_id": w.source.ID.String()}
+	}
+	req := testutil.NewJSONRequest(t, body)
+	testutil.SetAuthContext(req, w.org.ID, w.user.ID)
+	testutil.SetPathParam(req, "id", w.target.ID.String())
+	done := make(chan error, 1)
+	go func() {
+		if viaTenant {
+			done <- app.Tenant((*App).SendMessage)(req)
+			return
+		}
+		done <- app.SendMessage(req)
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("forward handler did not return")
+	}
+	app.WaitForBackgroundTasks()
+	return testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req))
+}
+
+// commitForward commits a forward's pending row as the request path does and
+// returns, unrun, the callbacks it registered for after commit (the delivery
+// worker is one of them).
+func (w *laneEForwardWorld) commitForward(
+	t *testing.T,
+	deliver func(context.Context, *models.Contact) (string, error),
+) (*models.Message, []func()) {
+	t.Helper()
+	account := *w.account
+	account.Status = whatsappaccount.StatusActive
+	opts := DefaultSendOptions()
+	opts.SentByUserID = &w.user.ID
+	scoped := w.app.scopedApp(w.app.DB, w.org.ID)
+	msg, err := scoped.SendOutgoingMessage(context.Background(), OutgoingMessageRequest{
+		Account:          &account,
+		Contact:          w.target,
+		Type:             models.MessageTypeText,
+		Content:          w.source.Content,
+		forwardedFrom:    &messageForwardSource{MessageID: w.source.ID, ContactID: w.source.ContactID},
+		deliveryOverride: deliver,
+	}, opts)
+	require.NoError(t, err)
+	callbacks := scoped.takeAfterCommit()
+	require.NotEmpty(t, callbacks, "delivery starts only after commit")
+	return msg, callbacks
+}
+
+// restarted is a new process on the same database: no goroutine, callback or
+// in-memory state survives from the one that exited.
+func (w *laneEForwardWorld) restarted() *App {
+	return &App{DB: w.app.DB, Log: testutil.NopLogger(), Config: w.app.Config, WhatsApp: w.app.WhatsApp}
+}
+
+func laneELoadMessage(t *testing.T, app *App, id uuid.UUID) *models.Message {
+	t.Helper()
+	var stored models.Message
+	require.NoError(t, app.DB.First(&stored, "id = ?", id).Error)
+	return &stored
+}
+
+func laneERun(app *App, callbacks []func()) {
+	for _, callback := range callbacks {
+		callback()
+	}
+	app.WaitForBackgroundTasks()
+}
+
+// laneEExitHere ends the delivery goroutine on the spot, as a process exit
+// would: only deferred calls run, so the provider transaction rolls back.
+func laneEExitHere() {
+	runtime.Goexit()
+}
+
+func laneEArgsInclude(args []any, want string) bool {
+	for _, arg := range args {
+		if fmt.Sprint(arg) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// laneEFailInserts installs a BEFORE INSERT trigger that raises for rows of
+// table whose column equals value, and returns a counter of refused inserts
+// (a sequence, so it survives the rollbacks).
+func laneEFailInserts(t *testing.T, db *gorm.DB, table, column string, value uuid.UUID) func() int64 {
+	t.Helper()
+	name := "lane_e_refuse_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	require.NoError(t, db.Exec("CREATE SEQUENCE "+name+"_count").Error)
+	require.NoError(t, db.Exec(fmt.Sprintf(`CREATE FUNCTION %[1]s() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+	IF NEW.%[2]s = '%[3]s'::uuid THEN
+		PERFORM nextval('%[1]s_count');
+		RAISE EXCEPTION 'lane-e synthetic insert failure';
+	END IF;
+	RETURN NEW;
+END
+$fn$`, name, column, value)).Error)
+	require.NoError(t, db.Exec(fmt.Sprintf("CREATE TRIGGER %[1]s BEFORE INSERT ON %[2]s FOR EACH ROW EXECUTE FUNCTION %[1]s()", name, table)).Error)
+	t.Cleanup(func() {
+		_ = db.Exec(fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s", name, table)).Error
+		_ = db.Exec("DROP FUNCTION IF EXISTS " + name + "()").Error
+		_ = db.Exec("DROP SEQUENCE IF EXISTS " + name + "_count").Error
+	})
+	return func() int64 {
+		var refused int64
+		require.NoError(t, db.Raw("SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM "+name+"_count").Scan(&refused).Error)
+		return refused
+	}
+}
+
+// laneELostCommitPool makes the first transaction that runs a matching
+// statement COMMIT for real and then report an error, as a connection lost
+// after COMMIT was sent would.
+type laneELostCommitPool struct {
+	gorm.ConnPool
+	matches func(query string, args []any) bool
+	lost    chan struct{} // one token: one lost confirmation
+}
+
+func laneELoseCommitConfirmation(db *gorm.DB, matches func(query string, args []any) bool) *gorm.DB {
+	pool := &laneELostCommitPool{ConnPool: db.Statement.ConnPool, matches: matches, lost: make(chan struct{}, 1)}
+	pool.lost <- struct{}{}
+	lossy := db.Session(&gorm.Session{NewDB: true, Context: context.Background()})
+	lossy.Statement.ConnPool = pool
+	return lossy
+}
+
+func (p *laneELostCommitPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	beginner, ok := p.ConnPool.(gorm.TxBeginner)
+	if !ok {
+		return nil, gorm.ErrInvalidTransaction
+	}
+	tx, err := beginner.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &laneELostCommitTx{Tx: tx, pool: p}, nil
+}
+
+func (p *laneELostCommitPool) GetDBConn() (*sql.DB, error) {
+	if db, ok := p.ConnPool.(*sql.DB); ok {
+		return db, nil
+	}
+	return nil, gorm.ErrInvalidDB
+}
+
+type laneELostCommitTx struct {
+	*sql.Tx
+	pool    *laneELostCommitPool
+	matched bool
+}
+
+func (tx *laneELostCommitTx) note(query string, args []any) {
+	if tx.pool.matches(query, args) {
+		tx.matched = true
+	}
+}
+
+func (tx *laneELostCommitTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	tx.note(query, args)
+	return tx.Tx.ExecContext(ctx, query, args...)
+}
+
+func (tx *laneELostCommitTx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	tx.note(query, args)
+	return tx.Tx.QueryContext(ctx, query, args...)
+}
+
+func (tx *laneELostCommitTx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	tx.note(query, args)
+	return tx.Tx.QueryRowContext(ctx, query, args...)
+}
+
+func (tx *laneELostCommitTx) Commit() error {
+	if err := tx.Tx.Commit(); err != nil || !tx.matched {
+		return err
+	}
+	select {
+	case <-tx.pool.lost:
+		return errors.New("synthetic: connection lost after COMMIT was sent")
+	default:
+		return nil
+	}
+}
+
+// Q5: under RLS the pending row is a savepoint of the request transaction. A
+// real failure inside that savepoint, then Tenant's rollback of the error
+// response, leaves no row and no provider attempt: a definite 503.
+func TestLaneEForwardRLSSavepointFailureRollsBackDefinitely(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	w.app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+	refused := laneEFailInserts(t, w.app.DB, "messages", "contact_id", w.target.ID)
+
+	status, body := w.post(t, w.app, true, nil)
+	assert.Equal(t, 503, status, body)
+	assert.Contains(t, body, string(forwardErrorTemporarilyUnavailable))
+	assert.Equal(t, int64(1), refused(), "one insert attempt, never retried")
+	assert.Zero(t, laneECountMessages(t, w.app, w.target), "no durable pending row")
+	assert.Empty(t, w.capture.snapshot(), "no provider attempt")
+}
+
+// Q5: the pending row commits but the COMMIT confirmation is lost. The handler
+// cannot tell this from a failed COMMIT, so it answers "outcome unknown" and
+// makes no second attempt. The row is real; nothing sends it by itself.
+func TestLaneEForwardLostCommitConfirmationStaysAmbiguous(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	healthy := w.app.DB
+	target := w.target.ID.String()
+	w.app.DB = laneELoseCommitConfirmation(healthy, func(query string, args []any) bool {
+		return strings.HasPrefix(strings.TrimSpace(query), `INSERT INTO "messages"`) && laneEArgsInclude(args, target)
+	})
+	status, body := w.post(t, w.app, false, nil)
+	w.app.DB = healthy
+
+	assert.Equal(t, 500, status, body)
+	assert.Contains(t, body, string(forwardErrorOutcomeUnknown))
+	var rows []models.Message
+	require.NoError(t, healthy.Where("organization_id = ? AND contact_id = ?", w.org.ID, w.target.ID).Find(&rows).Error)
+	require.Len(t, rows, 1, "committed once, never retried")
+	assert.Equal(t, models.MessageStatusPending, rows[0].Status)
+	assert.Equal(t, forwardDispatchQueued, rows[0].Metadata[forwardDispatchMetadataKey])
+	assert.Empty(t, w.capture.snapshot(), "no delivery was started")
+	// After a restart it reads as delayed (status unknown), never as not sent.
+	assert.Equal(t, forwardDeliveryDelayed, forwardDeliveryState(&rows[0], time.Now().Add(10*time.Minute)))
+	w.restarted().WaitForBackgroundTasks()
+	assert.Empty(t, w.capture.snapshot())
+}
+
+// Q5 (item 7): under RLS, failures that would repeat are never "try again".
+func TestLaneEForwardRLSPermanentFailuresAreNotRetryable(t *testing.T) {
+	rls := &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+
+	t.Run("inactive account", func(t *testing.T) {
+		w := laneENewForwardWorld(t)
+		w.app.Config = rls
+		require.NoError(t, w.app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", w.account.ID).
+			Update("status", "disconnected").Error)
+		status, body := w.post(t, w.app, true, nil)
+		assert.Equal(t, 400, status, body)
+		assert.Contains(t, body, string(forwardErrorAccountUnavailable))
+		assert.Zero(t, laneECountMessages(t, w.app, w.target))
+		assert.Empty(t, w.capture.snapshot())
+	})
+
+	t.Run("strict audit insert failure", func(t *testing.T) {
+		w := laneENewForwardWorld(t)
+		w.app.Config = rls
+		refused := laneEFailInserts(t, w.app.DB, "audit_logs", "user_id", w.user.ID)
+		status, body := w.post(t, w.app, true, nil)
+		assert.Equal(t, 500, status, body)
+		assert.Contains(t, body, string(forwardErrorBlocked))
+		assert.Equal(t, int64(1), refused())
+		assert.Zero(t, laneECountMessages(t, w.app, w.target), "the savepoint and the request rolled back")
+		assert.Empty(t, w.capture.snapshot())
+	})
+
+	t.Run("tenant scope mismatch", func(t *testing.T) {
+		w := laneENewForwardWorld(t)
+		w.app.Config = rls
+		other := testutil.CreateTestOrganization(t, w.app.DB)
+		outer := w.app.DB.Begin()
+		require.NoError(t, outer.Error)
+		t.Cleanup(func() { _ = outer.Rollback().Error })
+		require.NoError(t, database.SetTenantContext(outer, w.org.ID))
+		status, body := w.post(t, w.app.scopedApp(outer, other.ID), false, nil)
+		assert.Equal(t, 500, status, body)
+		assert.Contains(t, body, string(forwardErrorBlocked))
+		require.NoError(t, outer.Rollback().Error)
+		assert.Zero(t, laneECountMessages(t, w.app, w.target))
+		assert.Empty(t, w.capture.snapshot())
+	})
+}
+
+// Q6 claim policy: queued -> provider moves exactly one row, once.
+func TestLaneEForwardProviderClaimIsSingleUse(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	msg, _ := w.commitForward(t, nil)
+
+	claimed, err := w.app.claimForwardProviderPhase(w.org.ID, msg.ID)
+	require.NoError(t, err)
+	assert.True(t, claimed)
+	stored := laneELoadMessage(t, w.app, msg.ID)
+	assert.Equal(t, forwardDispatchProvider, stored.Metadata[forwardDispatchMetadataKey])
+	assert.NotEmpty(t, stored.Metadata[forwardDispatchAtMetadataKey])
+
+	claimed, err = w.app.claimForwardProviderPhase(w.org.ID, msg.ID)
+	require.NoError(t, err)
+	assert.False(t, claimed, "a second claim moves nothing")
+	claimed, err = w.app.claimForwardProviderPhase(w.org.ID, uuid.New())
+	require.NoError(t, err)
+	assert.False(t, claimed, "a missing row moves nothing")
+}
+
+// Q6 re-entry policy: a worker whose row is no longer pending and queued stops
+// without calling the provider or touching the row.
+func TestLaneEForwardWorkerStopsWhenItsClaimMovesNothing(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	calls := 0
+	msg, pending := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
+		calls++
+		return "wamid.lane-e-mismatch", nil
+	})
+	require.NoError(t, w.app.DB.Model(&models.Message{}).Where("id = ?", msg.ID).
+		UpdateColumns(map[string]any{"status": models.MessageStatusFailed, "error_message": "settled elsewhere"}).Error)
+	before := laneELoadMessage(t, w.app, msg.ID)
+
+	laneERun(w.app, pending)
+	after := laneELoadMessage(t, w.app, msg.ID)
+	assert.Zero(t, calls)
+	assert.Equal(t, before.Status, after.Status)
+	assert.Equal(t, before.ErrorMessage, after.ErrorMessage)
+	assert.Equal(t, forwardDispatchQueued, after.Metadata[forwardDispatchMetadataKey])
+	assert.True(t, before.UpdatedAt.Equal(after.UpdatedAt), "the row is untouched")
+}
+
+// Q6: the marker's COMMIT is ambiguous (here it committed and the answer was
+// lost). The worker fails closed: it stops before the provider and records
+// "not sent", which is true because it never called the provider.
+func TestLaneEForwardAmbiguousMarkerStopsBeforeProvider(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	calls := 0
+	msg, pending := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
+		calls++
+		return "wamid.lane-e-marker", nil
+	})
+	healthy := w.app.DB
+	id := msg.ID.String()
+	w.app.DB = laneELoseCommitConfirmation(healthy, func(query string, args []any) bool {
+		return strings.HasPrefix(strings.TrimSpace(query), `UPDATE "messages"`) &&
+			strings.Contains(query, "jsonb_build_object") && laneEArgsInclude(args, id)
+	})
+	laneERun(w.app, pending)
+	w.app.DB = healthy
+
+	stored := laneELoadMessage(t, w.app, msg.ID)
+	assert.Zero(t, calls, "no provider call")
+	assert.Equal(t, forwardDispatchProvider, stored.Metadata[forwardDispatchMetadataKey], "the marker did commit")
+	assert.Equal(t, models.MessageStatusFailed, stored.Status)
+	assert.NotEmpty(t, stored.ErrorMessage)
+}
+
+// Q6 boundary 1: the process exits after the request committed, before the
+// worker claimed the provider phase. After a restart the forward reads as
+// delayed (status unknown) and nothing sends it.
+func TestLaneEForwardExitBeforeMarkerIsDelayedAndNotResent(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	calls := 0
+	msg, _ := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
+		calls++
+		return "wamid.lane-e-b1", nil
+	})
+	// Exit: the queued worker never runs.
+	restarted := w.restarted()
+	stored := laneELoadMessage(t, restarted, msg.ID)
+	assert.Equal(t, models.MessageStatusPending, stored.Status)
+	assert.Equal(t, forwardDispatchQueued, stored.Metadata[forwardDispatchMetadataKey])
+	assert.Equal(t, forwardDeliveryDelayed, forwardDeliveryState(stored, time.Now().Add(10*time.Minute)))
+	restarted.WaitForBackgroundTasks()
+	assert.Zero(t, calls)
+	assert.Empty(t, w.capture.snapshot())
+}
+
+// Q6 boundary 2: the worker committed the provider-phase marker and the
+// process exited before the provider was called. The forward reads as
+// uncertain after a restart, and no later worker reaches the provider.
+func TestLaneEForwardExitAfterMarkerBeforeProviderIsUncertain(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	entered := 0
+	msg, pending := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
+		entered++
+		laneEExitHere() // inside the provider transaction, before any provider effect
+		return "", nil
+	})
+	laneERun(w.app, pending)
+	require.Equal(t, 1, entered)
+
+	restarted := w.restarted()
+	stored := laneELoadMessage(t, restarted, msg.ID)
+	assert.Equal(t, models.MessageStatusPending, stored.Status)
+	assert.Equal(t, forwardDispatchProvider, stored.Metadata[forwardDispatchMetadataKey])
+	assert.Equal(t, forwardDeliveryUncertain, forwardDeliveryState(stored, time.Now().Add(10*time.Minute)))
+	claimed, err := restarted.claimForwardProviderPhase(w.org.ID, msg.ID)
+	require.NoError(t, err)
+	assert.False(t, claimed, "a recorded provider phase is never claimed again")
+
+	laneERun(w.app, pending) // a duplicate worker for the same row
+	assert.Equal(t, 1, entered, "the duplicate stopped at its claim")
+	assert.Equal(t, models.MessageStatusPending, laneELoadMessage(t, restarted, msg.ID).Status)
+}
+
+// Q6 boundary 3: the provider accepted the message and the process exited
+// before its result was recorded. The forward stays uncertain across a
+// restart and there is never a second provider effect.
+func TestLaneEForwardExitAfterProviderAcceptedIsUncertainAndNotDuplicated(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	accepted := 0
+	msg, pending := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
+		accepted++ // the provider effect happened
+		laneEExitHere()
+		return "wamid.lane-e-b3", nil
+	})
+	laneERun(w.app, pending)
+	require.Equal(t, 1, accepted)
+
+	restarted := w.restarted()
+	stored := laneELoadMessage(t, restarted, msg.ID)
+	assert.Equal(t, models.MessageStatusPending, stored.Status, "the result was never recorded")
+	assert.Equal(t, forwardDeliveryUncertain, forwardDeliveryState(stored, time.Now().Add(10*time.Minute)))
+	claimed, err := restarted.claimForwardProviderPhase(w.org.ID, msg.ID)
+	require.NoError(t, err)
+	assert.False(t, claimed)
+
+	laneERun(w.app, pending) // a duplicate worker for the same row
+	assert.Equal(t, 1, accepted, "no second provider effect")
+	assert.Equal(t, forwardDeliveryUncertain,
+		forwardDeliveryState(laneELoadMessage(t, restarted, msg.ID), time.Now().Add(10*time.Minute)))
+}
+
+// Q6: "delayed" is not "not sent". A worker paused past the stall age still
+// owns its queued row: when it resumes it sends, exactly once.
+func TestLaneEForwardPausedWorkerResumesAndSendsOnce(t *testing.T) {
+	w := laneENewForwardWorld(t)
+	calls := 0
+	wamid := "wamid.lane-e-paused-" + uuid.NewString()[:8]
+	msg, pending := w.commitForward(t, func(context.Context, *models.Contact) (string, error) {
+		calls++
+		return wamid, nil
+	})
+	require.NoError(t, w.app.DB.Model(&models.Message{}).Where("id = ?", msg.ID).
+		UpdateColumn("created_at", time.Now().Add(-10*time.Minute)).Error)
+	assert.Equal(t, forwardDeliveryDelayed,
+		forwardDeliveryState(laneELoadMessage(t, w.restarted(), msg.ID), time.Now()), "shown as delayed while paused")
+
+	laneERun(w.app, pending) // the worker resumes
+	stored := laneELoadMessage(t, w.app, msg.ID)
+	assert.Equal(t, models.MessageStatusSent, stored.Status, stored.ErrorMessage)
+	assert.Equal(t, wamid, stored.WhatsAppMessageID)
+	assert.Equal(t, 1, calls)
+	assert.Empty(t, forwardDeliveryState(stored, time.Now()))
 }

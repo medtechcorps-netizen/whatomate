@@ -153,4 +153,3 @@ describe('MessageActions', () => {
     expect(mountActions({ message: failedForward }).findAll('[class*="lucide-rotate-cw"]')).toHaveLength(0)
   })
 })
-

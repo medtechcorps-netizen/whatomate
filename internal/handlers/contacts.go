@@ -81,8 +81,9 @@ type MessageResponse struct {
 	// IsForwarded marks an agent forward for the CRM only; the customer
 	// receives an ordinary message.
 	IsForwarded bool `json:"is_forwarded,omitempty"`
-	// ForwardDeliveryState is "interrupted" (not sent) or "uncertain" (may
-	// have been sent) for a forward stalled by a process exit.
+	// ForwardDeliveryState is "delayed" (status unknown, may still be sent)
+	// or "uncertain" (may have been sent) for a stalled forward. Neither
+	// means "not sent"; neither is resent automatically.
 	ForwardDeliveryState string `json:"forward_delivery_state,omitempty"`
 }
 

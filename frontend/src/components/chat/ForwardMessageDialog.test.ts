@@ -341,11 +341,15 @@ describe('forward capacity contract (client)', () => {
     expect(classifyForwardError(Object.assign(new Error('timeout of 0ms exceeded'), { isAxiosError: true }))).toBe('uncertain')
     expect(classifyForwardError(httpError(409, { error_type: 'forward_window_closed' }))).toBe('failed')
     expect(classifyForwardError(httpError(429, { error_type: 'forward_rate_limited' }))).toBe('failed')
+    // Definitely not sent, and retrying won't help: no Try again, no "may have been sent".
+    expect(classifyForwardError(httpError(500, { error_type: 'forward_blocked' }))).toBe('failed')
+    expect(classifyForwardError(httpError(400, { error_type: 'forward_account_unavailable' }))).toBe('failed')
   })
 
   it('reads the server-derived delivery state of a stalled forward', () => {
-    expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'interrupted' } as Message)).toBe('interrupted')
+    expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'delayed' } as Message)).toBe('delayed')
     expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'uncertain' } as Message)).toBe('uncertain')
+    expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'interrupted' } as Message)).toBeNull()
     expect(forwardDeliveryState({ ...message(), forward_delivery_state: 'other' } as Message)).toBeNull()
     expect(forwardDeliveryState(message())).toBeNull()
   })
@@ -395,5 +399,44 @@ describe('forward capacity contract (client)', () => {
     expect(document.body.querySelector('[data-testid^="chat-forward-retry-"]')).toBeNull()
     expect(mocks.sendMessage).toHaveBeenCalledTimes(2)
   })
-})
 
+  it('shows a blocked forward as failed, with no Try again', async () => {
+    mocks.sendMessage.mockRejectedValue(httpError(500, {
+      error_type: 'forward_blocked',
+      message: 'This forward was blocked by a server-side check and was not sent.',
+    }))
+    await confirmTargets('1')
+    expect(row('1').getAttribute('data-state')).toBe('failed')
+    expect(row('1').textContent).toContain('blocked by a server-side check')
+    expect(document.body.querySelector('[data-testid^="chat-forward-retry-"]')).toBeNull()
+    expect(document.body.querySelector('[data-testid="chat-forward-uncertain"]')).toBeNull()
+  })
+
+  it('gives each attempt its own confirmation window (a retry gets a fresh one)', async () => {
+    vi.useFakeTimers()
+    try {
+      mocks.sendMessage.mockImplementation(async (contactId: string) => {
+        if (contactId === '2') throw httpError(503, { error_type: 'forward_temporarily_unavailable' })
+        return { id: `m-${contactId}`, status: 'pending' }
+      })
+      await confirmTargets('1', '2')
+      await vi.advanceTimersByTimeAsync(40_000)
+      mocks.sendMessage.mockResolvedValue({ id: 'm-2b', status: 'pending' })
+      await click('chat-forward-retry-2')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(row('2').getAttribute('data-state')).toBe('queued')
+
+      await vi.advanceTimersByTimeAsync(25_000) // 65 s after the batch, 25 s after the retry
+      expect(row('1').getAttribute('data-state')).toBe('unconfirmed')
+      expect(row('2').getAttribute('data-state')).toBe('queued')
+
+      await vi.advanceTimersByTimeAsync(40_000)
+      expect(row('2').getAttribute('data-state')).toBe('unconfirmed')
+      emitActivity('status_update', { message_id: 'm-2b', status: 'sent' })
+      await flushPromises()
+      expect(row('2').getAttribute('data-state')).toBe('sent')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

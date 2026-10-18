@@ -58,6 +58,7 @@ export type ForwardFailure = 'retryable' | 'uncertain' | 'failed'
  * The server's forward contract for a request that did not return 2xx:
  * - 503 forward_temporarily_unavailable: definitely not accepted (nothing was
  *   saved or sent), so a manual retry is safe;
+ * - forward_blocked: definitely not sent, and retrying will not help;
  * - any other 5xx, or no response at all: it may have been accepted, so the
  *   agent must check the chat; never retried automatically;
  * - 4xx: a refusal (window closed, identity review, ...), not sent.
@@ -65,20 +66,24 @@ export type ForwardFailure = 'retryable' | 'uncertain' | 'failed'
 export function classifyForwardError(error: unknown): ForwardFailure {
   const response = (error as { response?: { status?: number; data?: { error_type?: string } } } | null)?.response
   const status = response?.status
+  const errorType = response?.data?.error_type
   if (!status) return 'uncertain'
-  if (status === 503 && response?.data?.error_type === 'forward_temporarily_unavailable') return 'retryable'
+  if (status === 503 && errorType === 'forward_temporarily_unavailable') return 'retryable'
+  if (errorType === 'forward_blocked') return 'failed'
   if (status >= 500) return 'uncertain'
   return 'failed'
 }
 
-export type ForwardDeliveryState = 'interrupted' | 'uncertain' | null
+export type ForwardDeliveryState = 'delayed' | 'uncertain' | null
 
 /**
- * Server-derived state of a forward stalled by a process exit:
- * "interrupted" was never sent; "uncertain" may have been sent.
+ * Server-derived state of a stalled forward. Neither means "not sent", and
+ * ReReply never resends either one automatically:
+ * - "delayed": no send attempt recorded yet; it may still be sent;
+ * - "uncertain": a send attempt began but its result was not recorded; it may
+ *   have been sent.
  */
 export function forwardDeliveryState(message: Message): ForwardDeliveryState {
   const state = (message as Message & { forward_delivery_state?: string }).forward_delivery_state
-  return state === 'interrupted' || state === 'uncertain' ? state : null
+  return state === 'delayed' || state === 'uncertain' ? state : null
 }
-

@@ -97,6 +97,10 @@ type OutgoingMessageRequest struct {
 	// committed and before any provider transaction opens.
 	forwardMedia *forwardMediaCopy
 
+	// forwardOutcome, set only by the forward handler, records which phase of
+	// the pending-message write a failure happened in (see forwardSendOutcome).
+	forwardOutcome *forwardSendOutcome
+
 	// legacyWhatsAppReply is populated only by the fail-closed, exact
 	// Omnichannel reply endpoint. Established Chat callers cannot opt into or
 	// influence this server-derived binding.
@@ -255,7 +259,18 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	// Message persistence and the contact-list preview are one fact. Resolve
 	// and lock the canonical contact in the same transaction so a concurrent
 	// merge cannot strand either write on a soft-deleted alias.
+	if req.forwardOutcome != nil {
+		// Mirrors outgoingPreProviderTransaction's branch: an asynchronous send
+		// entered through an RLS Tenant request writes its pending row as a
+		// savepoint of that request transaction.
+		req.forwardOutcome.writeRequested = true
+		req.forwardOutcome.requestTransaction = opts.Async && a.rlsEnabled() && a.hasTenantScope()
+	}
 	err := a.outgoingPreProviderTransaction(ctx, organizationID, opts.Async, func(tx *gorm.DB) error {
+		if req.forwardOutcome != nil {
+			req.forwardOutcome.writeStarted = true
+			req.forwardOutcome.writeCompleted = false
+		}
 		if req.legacyWhatsAppReply != nil {
 			// The pending Message insert below locks the organization row (write
 			// guard and foreign keys) while this transaction owns the shadow, so
@@ -431,6 +446,9 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		contact.LastMessagePreview = preview
 		msg = candidate
 		canonicalContact = *contact
+		if req.forwardOutcome != nil {
+			req.forwardOutcome.writeCompleted = true
+		}
 		return nil
 	})
 	if err != nil {
@@ -588,10 +606,13 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 					}
 				}
 				if req.forwardedFrom != nil {
-					// Committed before the provider transaction opens: after a
-					// process exit, "queued" proves nothing was sent and
-					// "provider" means the send may have happened.
-					if markErr := root.markForwardProviderPhase(organizationID, msg.ID); markErr != nil {
+					// Single-use queued -> provider transition, committed before the
+					// provider transaction opens. Fail closed: if the marker commit
+					// is ambiguous this worker stops (and records "not sent", which
+					// is true because it never calls the provider); if the row is no
+					// longer pending and queued, it stops without touching it.
+					claimed, markErr := root.claimForwardProviderPhase(organizationID, msg.ID)
+					if markErr != nil {
 						if settlementErr := root.settleOutgoingFailureBeforeProvider(
 							msg,
 							req,
@@ -606,6 +627,14 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 								"message_id", msg.ID,
 							)
 						}
+						return
+					}
+					if !claimed {
+						root.Log.Warn(
+							"Forwarded message is no longer pending and queued; not dispatching",
+							"organization_id", organizationID,
+							"message_id", msg.ID,
+						)
 						return
 					}
 				}
@@ -2646,6 +2675,9 @@ const (
 	// client shows "may have been forwarded" and never retries by itself.
 	forwardErrorTemporarilyUnavailable fastglue.ErrorType = "forward_temporarily_unavailable"
 	forwardErrorOutcomeUnknown         fastglue.ErrorType = "forward_outcome_unknown"
+	// forwardErrorBlocked: definitely not sent, and retrying will not help
+	// (the forward audit cannot be written, or a tenant-scope invariant broke).
+	forwardErrorBlocked fastglue.ErrorType = "forward_blocked"
 )
 
 // messageForwardSource is the server-derived provenance of a forwarded message.
@@ -3033,9 +3065,13 @@ func (a *App) forwardMessage(
 	if req.WhatsAppAccount != "" {
 		accountName = req.WhatsAppAccount
 	}
-	account, err := session.resolveWhatsAppAccount(orgID, accountName)
-	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Failed to resolve WhatsApp account", nil, forwardErrorAccountUnavailable)
+	account, refusal := session.resolveForwardAccount(orgID, accountName)
+	if refusal != nil {
+		return refusal.send(r)
+	}
+	if a.rlsEnabled() && a.hasTenantScope() && !a.usesCurrentTenantPreProvider(account.OrganizationID) {
+		// Would fail the same way every time: not a "try again" condition.
+		return forwardBlockedRefusal().send(r)
 	}
 
 	msgReq := OutgoingMessageRequest{
@@ -3060,8 +3096,13 @@ func (a *App) forwardMessage(
 		}
 	}
 
-	opts := DefaultSendOptions() // Async: provider delivery starts after commit.
+	// The failure contract below depends on this exact call: Async=true, so
+	// the pending row is written by outgoingPreProviderTransaction and provider
+	// delivery is only registered (startAsyncDelivery) after it returns.
+	opts := DefaultSendOptions()
 	opts.SentByUserID = &userID
+	outcome := &forwardSendOutcome{}
+	msgReq.forwardOutcome = outcome
 
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
@@ -3074,12 +3115,7 @@ func (a *App) forwardMessage(
 			errors.Is(err, errOutgoingContactAccessRevoked) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, forwardErrorTargetNotFound)
 		}
-		if forwardSendFailureIsDefinite(err, a.rlsEnabled() && a.hasTenantScope()) {
-			return forwardNotAcceptedRefusal().send(r)
-		}
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError,
-			"The server could not confirm this forward. It may have been sent: check the chat before forwarding again.",
-			nil, forwardErrorOutcomeUnknown)
+		return forwardSendFailureRefusal(err, opts.Async, *outcome).send(r)
 	}
 
 	return r.SendEnvelope(MessageResponse{
@@ -3153,7 +3189,7 @@ func recordForwardAudit(
 	source *messageForwardSource,
 ) error {
 	if userID == nil || *userID == uuid.Nil || message == nil || source == nil {
-		return errors.New("forward audit requires the forwarding user and message")
+		return &forwardAuditError{err: errors.New("forward audit requires the forwarding user and message")}
 	}
 	if err := logAuditStrict(tx, orgID, *userID, "message", message.ID, models.AuditActionCreated, nil, messageForwardAudit{
 		Operation:              "forwarded",
@@ -3162,7 +3198,7 @@ func recordForwardAudit(
 		TargetContactID:        message.ContactID.String(),
 		MessageType:            string(message.MessageType),
 	}); err != nil {
-		return fmt.Errorf("record forward audit: %w", err)
+		return &forwardAuditError{err: err}
 	}
 	return nil
 }
@@ -3272,13 +3308,13 @@ const (
 	forwardDispatchQueued        = "queued"
 	forwardDispatchProvider      = "provider"
 
-	// Every phase of a forward's delivery is bounded (storage 20 s, account
-	// check 5 s, upload 30 s, provider 30 s + 10 s recovery). A forward still
-	// pending well past that was interrupted, e.g. by a process exit.
+	// Each delivery phase has its own deadline, but nothing bounds the time
+	// before a phase starts or a paused process. Past this age a pending
+	// forward is shown as stalled, never as "not sent".
 	forwardDeliveryStalledAfter = 3 * time.Minute
 
-	forwardDeliveryInterrupted = "interrupted"
-	forwardDeliveryUncertain   = "uncertain"
+	forwardDeliveryDelayed   = "delayed"
+	forwardDeliveryUncertain = "uncertain"
 )
 
 // forwardNotAcceptedRefusal is a definite pre-acceptance failure: nothing was
@@ -3291,47 +3327,146 @@ func forwardNotAcceptedRefusal() *messageForwardRefusal {
 	}
 }
 
-// forwardSendFailureIsDefinite reports whether a SendOutgoingMessage error
-// proves the forward was not accepted. A timeout alone proves nothing; the
-// phase does:
-//   - Inside an RLS request transaction the pending message is a savepoint of
-//     that transaction, which the error response rolls back, and provider
-//     delivery is only scheduled after commit. Nothing was committed or sent.
-//   - Otherwise the pending message has its own transaction, whose COMMIT may
-//     have succeeded; only a wedge-guard rejection, raised when no connection
-//     was ever acquired, proves nothing ran.
-func forwardSendFailureIsDefinite(err error, inRequestTransaction bool) bool {
-	if err == nil {
-		return false
-	}
-	if inRequestTransaction {
-		return true
-	}
-	return errors.Is(err, context.DeadlineExceeded) &&
-		strings.Contains(err.Error(), "wedge guard: no pooled database connection")
+// forwardSendOutcome is the forward call path's typed phase record, filled by
+// SendOutgoingMessage, so a failure is classified by where it happened instead
+// of by error text.
+type forwardSendOutcome struct {
+	// writeRequested: the call passed its up-front checks and asked for the
+	// pending-row write. A failure before that is an input or invariant
+	// rejection, which would repeat.
+	writeRequested bool
+	// requestTransaction: the pending row is a savepoint of the caller's RLS
+	// Tenant request transaction (asynchronous send).
+	requestTransaction bool
+	// writeStarted: the pre-provider write began on an acquired connection.
+	writeStarted bool
+	// writeCompleted: the last write attempt returned without error, so only
+	// its COMMIT (if any) could still have failed.
+	writeCompleted bool
 }
 
-// markForwardProviderPhase durably records, in its own short transaction, that
-// this forward is about to reach the provider. It never runs while another
-// connection or transaction is held.
-func (a *App) markForwardProviderPhase(orgID, messageID uuid.UUID) error {
-	return a.withForwardTenantTx(orgID, func(tx *gorm.DB) error {
-		return tx.Model(&models.Message{}).
-			Where("organization_id = ? AND id = ? AND status = ?", orgID, messageID, models.MessageStatusPending).
+// forwardAuditError is a failure to write the per-target forward audit entry.
+// The forward is refused; it would fail the same way on a retry.
+type forwardAuditError struct {
+	err error
+}
+
+func (e *forwardAuditError) Error() string {
+	if e == nil || e.err == nil {
+		return "record forward audit"
+	}
+	return "record forward audit: " + e.err.Error()
+}
+
+func (e *forwardAuditError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func forwardBlockedRefusal() *messageForwardRefusal {
+	return &messageForwardRefusal{
+		Status:    fasthttp.StatusInternalServerError,
+		ErrorType: forwardErrorBlocked,
+		Message:   "This forward was blocked by a server-side check and was not sent. Trying again won't help; contact support.",
+	}
+}
+
+func forwardOutcomeUnknownRefusal() *messageForwardRefusal {
+	return &messageForwardRefusal{
+		Status:    fasthttp.StatusInternalServerError,
+		ErrorType: forwardErrorOutcomeUnknown,
+		Message:   "The server could not confirm this forward. It may have been sent: check the chat before forwarding again.",
+	}
+}
+
+// forwardAccountUnavailableRefusal: no usable WhatsApp account (missing,
+// inactive or without valid credentials). Definite and non-retryable.
+func forwardAccountUnavailableRefusal() *messageForwardRefusal {
+	return &messageForwardRefusal{
+		Status:    fasthttp.StatusBadRequest,
+		ErrorType: forwardErrorAccountUnavailable,
+		Message:   "This WhatsApp account can't send messages right now. Check the account settings.",
+	}
+}
+
+// forwardSendFailureRefusal maps an error from the forward handler's own
+// SendOutgoingMessage call to the client contract. It is valid only for that
+// call (asynchronous, DefaultSendOptions), whose invariants are:
+//   - provider delivery is registered (startAsyncDelivery) only after the
+//     pending-row write returns, so an error means no provider effect;
+//   - inside an RLS Tenant request, the pending row is a savepoint of the
+//     request transaction, and Tenant rolls an error response back.
+//
+// Failures that would repeat (inactive account, audit write, an up-front
+// invariant) are definite and non-retryable. Other definite failures are 503
+// "try again". A failure after the write completed outside a request
+// transaction may follow a successful COMMIT, so it stays ambiguous.
+func forwardSendFailureRefusal(err error, async bool, outcome forwardSendOutcome) *messageForwardRefusal {
+	var auditErr *forwardAuditError
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, whatsappaccount.ErrOutboundInactive):
+		return forwardAccountUnavailableRefusal()
+	case errors.As(err, &auditErr), !outcome.writeRequested:
+		return forwardBlockedRefusal()
+	case !async:
+		return forwardOutcomeUnknownRefusal()
+	case outcome.requestTransaction, !outcome.writeStarted, !outcome.writeCompleted:
+		return forwardNotAcceptedRefusal()
+	default:
+		return forwardOutcomeUnknownRefusal()
+	}
+}
+
+// claimForwardProviderPhase is the single-use queued -> provider transition,
+// committed in its own short transaction before the provider transaction
+// opens. It reports claimed only when exactly one row moved, i.e. the forward
+// was still pending and still queued.
+//
+// Re-entry policy: a second claim, a settled row or a missing row moves
+// nothing, and the caller must not call the provider or touch the row. An
+// error means the marker commit is ambiguous; the caller stops before the
+// provider.
+func (a *App) claimForwardProviderPhase(orgID, messageID uuid.UUID) (bool, error) {
+	var moved int64
+	err := a.withForwardTenantTx(orgID, func(tx *gorm.DB) error {
+		result := tx.Model(&models.Message{}).
+			Where(
+				"organization_id = ? AND id = ? AND status = ? AND metadata ->> ? = ?",
+				orgID, messageID, models.MessageStatusPending,
+				forwardDispatchMetadataKey, forwardDispatchQueued,
+			).
 			Update("metadata", gorm.Expr(
 				"COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(?::text, ?::text, ?::text, ?::text)",
 				forwardDispatchMetadataKey, forwardDispatchProvider,
 				forwardDispatchAtMetadataKey, time.Now().UTC().Format(time.RFC3339Nano),
-			)).Error
+			))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected > 1 {
+			return fmt.Errorf("forward dispatch claim moved %d rows", result.RowsAffected)
+		}
+		moved = result.RowsAffected
+		return nil
 	})
+	if err != nil {
+		return false, err
+	}
+	return moved == 1, nil
 }
 
 // forwardDeliveryState derives, read-only, what a stalled forward means for the
-// people reading the chat:
-//   - "interrupted": still "queued" long after every bounded phase would have
-//     ended. Nothing reached the provider, so it was not sent; forward it again.
+// people reading the chat. Neither state claims the message was not sent, and
+// nothing ever resends it automatically:
+//   - "delayed": still "queued" (no provider phase recorded) long after it
+//     should have been sent. Its worker may be dead or merely paused; a paused
+//     worker can still send it later. Status unknown.
 //   - "uncertain": the provider phase was recorded but no result was. It may
-//     have been sent, so it must never be resent automatically.
+//     have been sent.
 //
 // A settled (sent/failed) or recent forward has no derived state.
 func forwardDeliveryState(message *models.Message, now time.Time) string {
@@ -3342,7 +3477,7 @@ func forwardDeliveryState(message *models.Message, now time.Time) string {
 	switch phase {
 	case forwardDispatchQueued:
 		if now.Sub(message.CreatedAt) > forwardDeliveryStalledAfter {
-			return forwardDeliveryInterrupted
+			return forwardDeliveryDelayed
 		}
 	case forwardDispatchProvider:
 		since := message.UpdatedAt
@@ -3356,4 +3491,36 @@ func forwardDeliveryState(message *models.Message, now time.Time) string {
 		}
 	}
 	return ""
+}
+
+// resolveForwardAccount mirrors resolveWhatsAppAccount for the forward
+// handler, keeping the cause: a missing or unusable account is a definite,
+// non-retryable refusal; a failed lookup (database or deadline) is a definite
+// 503, because nothing has been persisted yet.
+func (a *App) resolveForwardAccount(orgID uuid.UUID, accountName string) (*models.WhatsAppAccount, *messageForwardRefusal) {
+	var account models.WhatsAppAccount
+	var err error
+	if accountName != "" {
+		err = a.DB.Where("name = ? AND organization_id = ?", accountName, orgID).First(&account).Error
+	} else {
+		err = a.DB.Where("organization_id = ? AND is_default_outgoing = ?", orgID, true).First(&account).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			err = a.DB.Where("organization_id = ?", orgID).First(&account).Error
+		}
+	}
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, forwardAccountUnavailableRefusal()
+		}
+		a.Log.Error("Failed to resolve WhatsApp account for forward", "error", err, "organization_id", orgID)
+		return nil, forwardNotAcceptedRefusal()
+	}
+	if account.OrganizationID != orgID {
+		return nil, forwardBlockedRefusal()
+	}
+	if err := a.prepareWhatsAppAccountForOutbound(&account); err != nil {
+		a.Log.Warn("WhatsApp account cannot send a forward", "error", err, "organization_id", orgID, "account", account.Name)
+		return nil, forwardAccountUnavailableRefusal()
+	}
+	return &account, nil
 }
