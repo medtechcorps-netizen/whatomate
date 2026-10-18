@@ -311,39 +311,39 @@ onMounted(async () => {
 
     <!-- Create Dialog -->
     <Dialog v-model:open="showCreateDialog">
-      <DialogContent class="max-w-md">
-        <DialogHeader>
+      <DialogContent class="grid-cols-1 w-[calc(100vw-2rem)] max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-lg">
+        <DialogHeader class="min-w-0 pr-6">
           <DialogTitle>{{ t('calling.createFlow') }}</DialogTitle>
           <DialogDescription>
             {{ t('calling.flowEditorDesc') }}
           </DialogDescription>
         </DialogHeader>
 
-        <div class="space-y-4">
+        <div class="min-w-0 space-y-4">
           <div class="space-y-2">
-            <Label>{{ t('calling.name') }}</Label>
-            <Input v-model="createForm.name" :placeholder="t('calling.flowNamePlaceholder')" />
+            <Label for="ivr-flow-name">{{ t('calling.name') }}</Label>
+            <Input id="ivr-flow-name" v-model="createForm.name" :placeholder="t('calling.flowNamePlaceholder')" />
           </div>
           <div class="space-y-2">
-            <Label>{{ t('calling.account') }}</Label>
+            <Label for="ivr-flow-account">{{ t('calling.account') }}</Label>
             <Select v-model="createForm.whatsapp_account">
-              <SelectTrigger>
-                <SelectValue :placeholder="t('calling.selectAccount')" />
+              <SelectTrigger id="ivr-flow-account" class="min-w-0 gap-2" :title="createForm.whatsapp_account">
+                <SelectValue class="min-w-0 flex-1" :placeholder="t('calling.selectAccount')" />
               </SelectTrigger>
-              <SelectContent>
-                <SelectItem v-for="acc in accounts" :key="acc.name" :value="acc.name">
+              <SelectContent class="w-[var(--reka-select-trigger-width)] max-w-[calc(100vw-2rem)]">
+                <SelectItem v-for="acc in accounts" :key="acc.name" :value="acc.name" class="whitespace-normal [overflow-wrap:anywhere]">
                   {{ acc.name }}
                 </SelectItem>
               </SelectContent>
             </Select>
           </div>
           <div class="space-y-2">
-            <Label>{{ t('calling.description') }}</Label>
-            <Textarea v-model="createForm.description" :placeholder="t('calling.descriptionPlaceholder')" :rows="2" />
+            <Label for="ivr-flow-description">{{ t('calling.description') }}</Label>
+            <Textarea id="ivr-flow-description" v-model="createForm.description" class="resize-y" :placeholder="t('calling.descriptionPlaceholder')" :rows="2" />
           </div>
         </div>
 
-        <DialogFooter>
+        <DialogFooter class="min-w-0 gap-2">
           <Button variant="outline" @click="showCreateDialog = false">{{ t('common.cancel') }}</Button>
           <Button :disabled="saving" @click="createFlow">
             <span v-if="saving" class="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2" />
