@@ -286,7 +286,10 @@ func (a *App) Register(r *fastglue.Request) error {
 //
 // A body of {"revoke": true} revokes the presented refresh token instead
 // (the logout path: the whm_refresh cookie is only sent to this route). It
-// requires the CSRF double-submit header.
+// requires the CSRF double-submit header. With "keep_cookies": true it
+// revokes without touching the cookies: a closing page sends it with
+// keepalive, and its answer may arrive after a newer session has set its own
+// cookies, which it must not clear. The next page clears the old ones.
 func (a *App) RefreshToken(r *fastglue.Request) error {
 	// Failures are logged with a reason code and the user ID only — never a
 	// token value. Definitive rejections answer 401, and the client ends the
@@ -304,6 +307,7 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 	var body struct {
 		RefreshToken string `json:"refresh_token"`
 		Revoke       bool   `json:"revoke"`
+		KeepCookies  bool   `json:"keep_cookies"`
 	}
 	_ = r.Decode(&body, "json")
 
@@ -343,12 +347,16 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		}
 		if claims, ok := parseRefresh(); ok && claims.ID != "" {
 			if err := a.revokeRefreshChain(ctx, claims.ID); err != nil {
-				a.clearAuthCookies(r)
+				if !body.KeepCookies {
+					a.clearAuthCookies(r)
+				}
 				return reject(fasthttp.StatusServiceUnavailable, "Session store unavailable", "revoke_store_unavailable", claims.UserID)
 			}
 			a.Log.Info("Refresh token revoked", "reason", "logout", "user_id", claims.UserID)
 		}
-		a.clearAuthCookies(r)
+		if !body.KeepCookies {
+			a.clearAuthCookies(r)
+		}
 		return r.SendEnvelope(map[string]string{"status": "revoked"})
 	}
 

@@ -65,7 +65,8 @@ async function holdRefreshResponse(
       .find(Boolean)
     await gate
     order.push('refresh landed')
-    await route.fulfill({ response })
+    // The browser may have aborted it meanwhile: then nothing is delivered.
+    await route.fulfill({ response }).catch(() => undefined)
     await upstream.dispose()
   })
   return { started, release: () => release(), successorRefresh: () => successor }
@@ -86,6 +87,17 @@ function recordSessionRequests(context: BrowserContext, order: string[]) {
     sent.push({ kind, cookie: headers.cookie ?? '', csrf: headers['x-csrf-token'] ?? '' })
   })
   return sent
+}
+
+// The auth cookie values a response sets.
+function setCookies(headers: Array<{ name: string; value: string }>) {
+  const values: Record<string, string> = {}
+  for (const header of headers) {
+    if (header.name.toLowerCase() !== 'set-cookie') continue
+    const match = /^(whm_[a-z]+)=([^;]*)/.exec(header.value)
+    if (match) values[match[1]] = match[2]
+  }
+  return values
 }
 
 async function cookieValue(context: BrowserContext, name: string) {
@@ -296,10 +308,10 @@ test.describe('Logout during a token refresh', () => {
     page.on('request', (request) => {
       if (request.url().endsWith('/api/auth/login') && !loginSentAt) loginSentAt = Date.now()
     })
-    // Attempts 1 and 2 are rate-limited, so attempt 3 goes out at ~3 s. It
-    // reaches the real server (which revokes and clears the cookies in its
-    // answer), but the answer is held for 9 s: past the 7 s budget and before
-    // the attempt's own 5 s timeout would fire.
+    // Attempts 1 and 2 are rate-limited, each answer arriving after 1 s, so
+    // attempt 3 goes out at ~5 s (its own 5 s timeout would fire at ~10 s).
+    // It reaches the real server (which revokes and clears the cookies in its
+    // answer), but that answer is held for 9 s: only the 7 s budget can end it.
     await page.route('**/api/auth/refresh', async (route) => {
       const request = route.request()
       if (!isRevoke(request)) {
@@ -308,6 +320,7 @@ test.describe('Logout during a token refresh', () => {
       }
       attempts++
       if (attempts <= 2) {
+        await new Promise((resolve) => setTimeout(resolve, 1_000))
         await route.fulfill({ status: 429, json: { status: 'error', message: 'Too many requests' } })
         return
       }
@@ -332,17 +345,17 @@ test.describe('Logout during a token refresh', () => {
     // B signs in at once; the sign-in waits for the logout to let go.
     await signInHere(page, TEST_USERS.manager)
 
-    // The pending attempt was aborted at the budget (~7 s), before the
-    // sign-in request went out.
+    // The pending attempt was aborted at the budget (~7 s; not by its own
+    // timeout, ~10 s), before the sign-in request went out.
     expect(attempts).toBe(3)
     expect(lastAttemptFailedAt).toBeGreaterThan(0)
-    expect(lastAttemptFailedAt - clickedAt).toBeGreaterThan(6_000)
-    expect(lastAttemptFailedAt - clickedAt).toBeLessThan(8_500)
+    expect(lastAttemptFailedAt - clickedAt).toBeGreaterThanOrEqual(6_500)
+    expect(lastAttemptFailedAt - clickedAt).toBeLessThanOrEqual(7_800)
     expect(lastAttemptFailedAt).toBeLessThanOrEqual(loginSentAt)
 
     // After the moment the held answer would have landed, B's session is the
     // one in the jar and it works.
-    await page.waitForTimeout(Math.max(0, clickedAt + 14_000 - Date.now()))
+    await page.waitForTimeout(Math.max(0, clickedAt + 16_000 - Date.now()))
     const refreshB = await cookieValue(context, 'whm_refresh')
     expect(refreshB).toBeTruthy()
     expect(refreshB).not.toBe(originalRefresh)
@@ -432,5 +445,51 @@ test.describe('Logout during a token refresh', () => {
     expect(tokenRequests.filter((at) => at > answeredAt && at < answeredAt + 500)).toEqual([])
     const me = await page.request.get('/api/me')
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+  })
+
+  test('without Web Locks in any tab, a late refresh cannot replace a fresh sign-in', async ({
+    page,
+    context,
+    playwright,
+    baseURL,
+  }) => {
+    await context.addInitScript(() => {
+      Object.defineProperty(Navigator.prototype, 'locks', { configurable: true, get: () => undefined })
+    })
+    const newContext = () => playwright.request.newContext({ baseURL })
+    await loginAsAdmin(page)
+    const originalRefresh = await cookieValue(context, 'whm_refresh')
+    const other = await context.newPage()
+    await other.goto('/', { waitUntil: 'domcontentloaded' })
+    expect(await page.evaluate(() => !!navigator.locks)).toBe(false)
+    expect(await other.evaluate(() => !!navigator.locks)).toBe(false)
+
+    const order: string[] = []
+    recordSessionRequests(context, order)
+    const held = await holdRefreshResponse(other, newContext, order)
+    await startProactiveRefresh(other)
+    await held.started
+    // The harness holds the other tab's rotated cookies back.
+    expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
+    expect(held.successorRefresh()).toBeTruthy()
+
+    await logout(page)
+    await expect(page).toHaveURL(/\/login/)
+    // The same user signs in again at once: a fresh session behind the same
+    // /me, so only the exact cookies can show which session the jar holds.
+    const signInAnswer = page.waitForResponse('**/api/auth/login')
+    await signInHere(page, TEST_USERS.admin)
+    const issued = setCookies(await (await signInAnswer).headersArray())
+    expect(issued.whm_refresh).toBeTruthy()
+
+    held.release()
+    await other.waitForTimeout(3_000)
+
+    // The jar holds exactly the fresh sign-in's cookies.
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+      expect(await cookieValue(context, name)).toBe(issued[name])
+    }
+    expect((await page.request.get('/api/me')).status()).toBe(200)
+    await expectRefreshRejected(newContext, [originalRefresh, held.successorRefresh()])
   })
 })

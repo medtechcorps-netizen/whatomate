@@ -544,3 +544,40 @@ func TestLaneA_Logout_RevokeStoreFailureIsNotReportedAsLoggedOut(t *testing.T) {
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(retry))
 	assert.False(t, laneAJTIExists(t, healthy, f.jti))
 }
+
+func TestLaneA_RefreshToken_KeepaliveRevokeSetsNoCookies(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	rotated := laneARefresh(t, f.app, f.token)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(rotated))
+	current := testutil.GetResponseCookie(rotated, "whm_refresh")
+
+	// The closing page's keepalive revoke: the chain ends, the cookies stay.
+	req := testutil.NewJSONRequest(t, map[string]any{"revoke": true, "keep_cookies": true})
+	req.RequestCtx.Request.Header.SetCookie("whm_refresh", current)
+	req.RequestCtx.Request.Header.SetCookie("whm_csrf", "csrf-1")
+	req.RequestCtx.Request.Header.Set("X-CSRF-Token", "csrf-1")
+	require.NoError(t, f.app.RefreshToken(req))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+
+	cookies := 0
+	req.RequestCtx.Response.Header.VisitAllCookie(func(_, _ []byte) { cookies++ })
+	assert.Zero(t, cookies, "a keepalive revoke must not set or clear any cookie")
+	assert.False(t, laneAJTIExists(t, f.app.Redis, laneAJTIOf(t, current)))
+	testutil.AssertErrorResponse(t, laneARefresh(t, f.app, current), fasthttp.StatusUnauthorized, "revoked")
+	testutil.AssertErrorResponse(t, laneARefresh(t, f.app, f.token), fasthttp.StatusUnauthorized, "revoked")
+
+	// Without the flag the revoke still clears them.
+	plain := laneARevoke(t, f.app, current, "csrf-1", "csrf-1")
+	cleared := 0
+	plain.RequestCtx.Response.Header.VisitAllCookie(func(_, _ []byte) { cleared++ })
+	assert.GreaterOrEqual(t, cleared, 3)
+}
+
+func TestLaneA_RefreshToken_KeepaliveRevokeStillNeedsCSRF(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	req := testutil.NewJSONRequest(t, map[string]any{"revoke": true, "keep_cookies": true})
+	req.RequestCtx.Request.Header.SetCookie("whm_refresh", f.token)
+	require.NoError(t, f.app.RefreshToken(req))
+	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
+	assert.True(t, laneAJTIExists(t, f.app.Redis, f.jti))
+}
