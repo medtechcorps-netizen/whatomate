@@ -13,9 +13,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// Both invocations have completed session acquisition before either can apply.
-// The older generation must retry before any graph effect, rather than silently
-// become a policy-terminal completed job at the graph's later progression check.
+// An independently committed session writer represents another process outside
+// this root's local phase scheduler. It advances the generation after the first
+// graph was prepared; stale apply must retry before any effect. The next inbound
+// then executes the current graph exactly once, including both replay checks.
 func TestH1CapacityGraph_CompetingPreparedSessionRetriesBeforeDuplicateEffect(t *testing.T) {
 	env := h1HandoverFixture(t, h1HandoverOptions{})
 	require.Empty(t, env.flow.TriggerKeywords, "the completed graph must not auto-trigger again on the older message retry")
@@ -53,7 +54,9 @@ func TestH1CapacityGraph_CompetingPreparedSessionRetriesBeforeDuplicateEffect(t 
 		index := int(selectionCount.Add(1)) - 1
 		if index < 2 {
 			close(selected[index])
-			<-allowRead[index]
+			if index == 0 {
+				<-allowRead[index]
+			}
 		}
 	}))
 	t.Cleanup(func() { _ = env.app.DB.Callback().Query().Remove(callback) })
@@ -88,14 +91,20 @@ func TestH1CapacityGraph_CompetingPreparedSessionRetriesBeforeDuplicateEffect(t 
 	case <-time.After(12 * time.Second):
 		t.Fatal("first invocation did not select its active graph")
 	}
-	start(1, second)
-	select {
-	case <-selected[1]:
-	case <-time.After(12 * time.Second):
-		t.Fatal("second already-admitted invocation did not select the same graph after advancing its session generation")
-	}
+	var beforeWriter models.ChatbotSession
+	require.NoError(t, env.shared.Where("id = ? AND organization_id = ?", env.session.ID, env.org.ID).First(&beforeWriter).Error)
+	writerDB, _ := h1OpenPool(t, 2)
+	writer := h1RootApp(writerDB.WithContext(ctx), true)
+	advanced, _, writerErr := writer.getOrCreateSession(env.org.ID, env.work.Contact.ID, env.account.Name, env.work.Contact.PhoneNumber, 30)
+	require.NoError(t, writerErr)
+	require.NotNil(t, advanced)
+	require.Equal(t, beforeWriter.ID, advanced.ID)
+	require.True(t, advanced.LastActivityAt.After(beforeWriter.LastActivityAt), "the existing UPDATE-fenced writer must commit a new generation")
 	releaseReads()
-	h1CapacityWaitQueue(t, &env.app.continuationAdmission, 6, 2)
+	// The first apply is still queued without SQL while the original six
+	// generic credits remain. A second same-root preparation is intentionally
+	// not demanded while writer-mode apply has priority over those credits.
+	h1CapacityWaitQueue(t, &env.app.continuationAdmission, 6, 1)
 	for _, release := range fillers {
 		release()
 	}
@@ -107,6 +116,12 @@ func TestH1CapacityGraph_CompetingPreparedSessionRetriesBeforeDuplicateEffect(t 
 		require.NotErrorAs(t, err, &policyStop, "stale preparation must retry, not be consumed as a policy stop")
 	case <-time.After(30 * time.Second):
 		t.Fatal("older prepared graph did not settle")
+	}
+	start(1, second)
+	select {
+	case <-selected[1]:
+	case <-time.After(12 * time.Second):
+		t.Fatal("second invocation did not select the current graph after stale application retried")
 	}
 	h1CapacityJoin(t, done[1], 1)
 	older := loadInboundContinuationJob(t, &App{DB: env.shared}, env.org.ID, env.work.Persisted.ID)

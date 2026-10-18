@@ -3003,15 +3003,14 @@ func (a *App) persistIncomingMessageBeforeAck(
 	}
 
 	if a.rlsEnabled() && !a.hasTenantScope() {
-		release, admissionErr := a.acquireIncomingMessageCapacity()
+		organizationID, release, admissionErr := a.acquireIncomingMessageOrganization(phoneNumberID)
 		if admissionErr != nil {
 			return nil, false, admissionErr
 		}
 		defer release()
-	}
-
-	if a.rlsEnabled() && !a.hasTenantScope() {
-		err = a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
+		// persistIncomingMessageForAccount revalidates the phone binding within
+		// this discovered tenant; it never retargets another tenant after waiting.
+		err = a.WithTenantApp(organizationID, func(scoped *App) error {
 			var scopedErr error
 			work, duplicate, scopedErr = scoped.persistIncomingMessageForAccount(
 				phoneNumberID,

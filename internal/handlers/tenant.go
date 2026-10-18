@@ -408,15 +408,24 @@ func (a *App) hasTenantScope() bool {
 }
 
 func (a *App) resolveWhatsAppOrganization(phoneID string) (uuid.UUID, error) {
+	if strings.TrimSpace(phoneID) == "" {
+		return uuid.Nil, database.ErrMissingTenant
+	}
+	return a.resolveWhatsAppOrganizationWithDB(a.rootApp().DB, phoneID)
+}
+
+// The caller may bind a deadline to the actual discovery query. Do not reset
+// this DB through rootApp: ingress must release bounded discovery before it
+// queues for organization-scoped phase admission.
+func (a *App) resolveWhatsAppOrganizationWithDB(db *gorm.DB, phoneID string) (uuid.UUID, error) {
 	phoneID = strings.TrimSpace(phoneID)
 	if phoneID == "" {
 		return uuid.Nil, database.ErrMissingTenant
 	}
-	root := a.rootApp()
 	var organizationID uuid.UUID
 	if a.rlsEnabled() {
 		var organizationIDText string
-		if err := root.DB.Raw(
+		if err := db.Raw(
 			"SELECT public.rereply_resolve_whatsapp_org(?)::text",
 			phoneID,
 		).Scan(&organizationIDText).Error; err != nil {
@@ -432,7 +441,7 @@ func (a *App) resolveWhatsAppOrganization(phoneID string) (uuid.UUID, error) {
 		}
 	} else {
 		var account models.WhatsAppAccount
-		if err := root.DB.
+		if err := db.
 			Select("organization_id").
 			Where("BTRIM(phone_id) = BTRIM(?)", phoneID).
 			First(&account).Error; err != nil {

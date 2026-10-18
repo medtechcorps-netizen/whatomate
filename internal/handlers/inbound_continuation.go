@@ -243,7 +243,7 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 			if remaining <= 0 || ctx.Err() != nil {
 				break
 			}
-			release, admitErr := p.app.acquireInboundContinuationCapacity(ctx, p.stopCh, 1)
+			release, admitErr := p.acquirePreparationCapacity(ctx, organizationID)
 			if admitErr != nil {
 				runErrors = append(runErrors, admitErr)
 				remaining = 0
@@ -315,7 +315,7 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 	if err := p.app.checkInboundContinuationEntry(ctx); err != nil {
 		return err
 	}
-	release, err := p.app.acquireInboundContinuationCapacity(ctx, p.stopCh, 1)
+	release, err := p.acquirePreparationCapacity(ctx, organizationID)
 	if err != nil {
 		return err
 	}
@@ -326,6 +326,18 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 		return err
 	}
 	return worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release)
+}
+
+// The ordinary RLS path may write session/selector state during preparation.
+// Admit it before claiming the job, without holding either a DB connection or
+// another phase's credits. Custom callback compatibility stays on its original
+// generic contract. RunOnce still enqueues organizations serially; this helper
+// does not claim dispatcher fairness for organizations not yet enqueued.
+func (p *InboundContinuationProcessor) acquirePreparationCapacity(ctx context.Context, organizationID uuid.UUID) (func(), error) {
+	if p.process != nil || !p.app.rlsEnabled() {
+		return p.app.acquireInboundContinuationCapacity(ctx, p.stopCh, 1)
+	}
+	return p.app.acquireInboundContinuationPhase(ctx, p.stopCh, 1, organizationID.String(), inboundContinuationWriter)
 }
 
 func (p *InboundContinuationProcessor) listOrganizations(

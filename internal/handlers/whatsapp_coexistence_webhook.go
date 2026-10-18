@@ -1136,19 +1136,14 @@ func (a *App) persistAuthenticatedIncomingMessageBeforeAck(
 		return nil, false, errors.New("reaction messages use the specialized inbound path")
 	}
 
-	// Enter before tenant scope or account lookup can own a pooled connection.
-	// Ingress shares the same budget as continuation preparation, leaving the
-	// independent action-result path room to persist an accepted outcome.
-	release, admissionErr := a.acquireIncomingMessageCapacity()
+	// Release bounded, globally accounted tenant discovery before waiting for
+	// the atomic writer+credit grant. Revalidate the account in the tenant below.
+	organizationID, release, admissionErr := a.acquireIncomingMessageOrganization(phoneNumberID)
 	if admissionErr != nil {
 		return nil, false, admissionErr
 	}
 	defer release()
 
-	organizationID, err := a.resolveWhatsAppOrganization(phoneNumberID)
-	if err != nil {
-		return nil, false, fmt.Errorf("resolve authenticated incoming tenant: %w", err)
-	}
 	err = a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
 		if lockErr := database.LockWhatsAppWAMIDScopes(scoped.DB, organizationID, message.ID); lockErr != nil {
 			return fmt.Errorf("lock authenticated incoming WhatsApp message admission: %w", lockErr)

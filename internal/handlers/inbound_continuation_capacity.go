@@ -53,6 +53,39 @@ type capturedLegacyAI struct {
 	err    error
 }
 
+// Discovery and the scoped writer wait share the original ingress admission
+// deadline. Discovery owns one globally accounted credit, releases it and its
+// query fully, then queues for the atomic organization+credit grant. The caller
+// must revalidate the phone/account inside its existing committed tenant scope.
+// Canceling this wait context after grant never cancels that owning transaction.
+func (a *App) acquireIncomingMessageOrganization(phoneID string) (uuid.UUID, func(), error) {
+	if !a.rlsEnabled() {
+		organizationID, err := a.resolveWhatsAppOrganization(phoneID)
+		return organizationID, func() {}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	releaseDiscovery, err := a.acquireInboundContinuationCapacity(ctx, nil, 1)
+	if err != nil {
+		return uuid.Nil, nil, fmt.Errorf("incoming message capacity admission: %w", err)
+	}
+	var organizationID uuid.UUID
+	err = func() error {
+		defer releaseDiscovery()
+		var discoverErr error
+		organizationID, discoverErr = a.resolveWhatsAppOrganizationWithDB(a.rootApp().DB.WithContext(ctx), phoneID)
+		return discoverErr
+	}()
+	if err != nil {
+		return uuid.Nil, nil, err
+	}
+	release, err := a.acquireInboundContinuationPhase(ctx, nil, 1, organizationID.String(), inboundContinuationWriter)
+	if err != nil {
+		return uuid.Nil, nil, fmt.Errorf("incoming message capacity admission: %w", err)
+	}
+	return organizationID, release, nil
+}
+
 // prepareIncomingContinuation owns at most one connection at a time. Each read
 // callback finishes before any independent tracking/session/media transaction.
 // Its receiver is a per-job root-pool App, never a discarded tenant transaction.
@@ -330,7 +363,7 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 		// may finish on a tiny pool, but physical model work must fail closed.
 		performCtx := execution.markInboundContinuationContext(ctx)
 		phaseErr := func() error {
-			releasePerform, err := execution.acquireInboundContinuationCapacity(performCtx, p.stopCh, 1)
+			releasePerform, err := execution.acquireInboundContinuationPhase(performCtx, p.stopCh, 1, work.OrganizationID.String(), inboundContinuationReader)
 			if err != nil {
 				return err
 			}
@@ -352,8 +385,12 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 	if captured != nil {
 		applyCtx, stop = ownershipCtx, nil
 	}
+	// Classification happens after perform has released every scope/credit and
+	// before apply owns anything. Nested helpers inherit this mode; they never
+	// acquire or upgrade local phase ownership while holding a transaction.
+	applyMode := preparedIncomingApplyMode(prepared, captured)
 	applyCtx = execution.markInboundContinuationContext(applyCtx)
-	releaseApply, err := execution.acquireInboundContinuationCapacity(applyCtx, stop, 3)
+	releaseApply, err := execution.acquireInboundContinuationPhase(applyCtx, stop, 3, work.OrganizationID.String(), applyMode)
 	if err != nil {
 		return err
 	}
@@ -404,6 +441,23 @@ func (p *InboundContinuationProcessor) processPreparedIncoming(ctx, ownershipCtx
 		return err
 	}
 	return continuationErr
+}
+
+// Only the audited captured generated-text route is organization-reader
+// compatible. It still writes independent history/send/receipt facts and keeps
+// every database guard. Fallback, error, graph and native routes stay mixed.
+func preparedIncomingApplyMode(prepared *preparedIncomingContinuation, captured *capturedLegacyAI) int {
+	if prepared == nil || !prepared.legacyAI || prepared.settings == nil ||
+		!prepared.settings.AI.Enabled || prepared.settings.AI.Provider == "" || prepared.settings.AI.APIKey == "" ||
+		captured == nil || captured.err != nil {
+		return inboundContinuationWriter
+	}
+	outcome, outcomeOK := captured.result["outcome"].(string)
+	answer, answerOK := captured.result["answer"].(string)
+	if outcomeOK && outcome == "generated" && answerOK && answer != "" {
+		return inboundContinuationReader
+	}
+	return inboundContinuationWriter
 }
 
 // This check takes no session lock across provider I/O. At the physical attempt

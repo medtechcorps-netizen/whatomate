@@ -282,12 +282,13 @@ func TestH1IngressFence_CapturedAIResultSurvivesPoolPressure(t *testing.T) {
 			results <- admissionResult{index, work, duplicate, err}
 		}()
 	}
-	// The corrected admission gate queues excess ingress BEFORE it can own SQL.
-	// Keep all eight competing deliveries, but distinguish granted real fence
-	// waiters from queued callers instead of demanding an obsolete full-pool
-	// barrier. The custom callback retains its ordinary outer+guard shape.
+	// All eight deliveries remain. Their discovery queries release SQL and
+	// global credits before the same-organization writer queue. One ingress
+	// can wait at the real SQL fence; the other seven own neither resource.
+	// The custom callback retains its ordinary outer+guard shape.
 	budget := env.sqlPool.Stats().MaxOpenConnections - inboundContinuationProgressAllowance
-	granted := budget - continuationWeight
+	granted := 1
+	require.Greater(t, budget-continuationWeight, granted, "organization serialization must be exercised with spare global credits")
 	require.Greater(t, granted, 0)
 	require.Less(t, granted, len(messages), "the fixture must exercise both admitted and queued ingress")
 	queued := len(messages) - granted
@@ -295,7 +296,15 @@ func TestH1IngressFence_CapturedAIResultSurvivesPoolPressure(t *testing.T) {
 	require.Eventually(t, func() bool {
 		gate.mu.Lock()
 		defer gate.mu.Unlock()
-		return gate.used == budget && len(gate.waiters) == queued
+		if gate.used != continuationWeight+granted || len(gate.waiters) != queued {
+			return false
+		}
+		for _, waiter := range gate.waiters {
+			if waiter.organization != env.org.ID.String() || waiter.mode != inboundContinuationWriter {
+				return false
+			}
+		}
+		return true
 	}, 3*time.Second, 10*time.Millisecond, "all eight ingresses must reach either the real DB fence or the pre-DB admission queue")
 	require.Equal(t, granted+2, env.sqlPool.Stats().InUse, "queued ingress cannot retain a SQL connection; outer continuation and physical guard account for the other two")
 	require.LessOrEqual(t, env.sqlPool.Stats().InUse, env.sqlPool.Stats().MaxOpenConnections-inboundContinuationProgressAllowance, "independent result persistence retains real pool headroom")
