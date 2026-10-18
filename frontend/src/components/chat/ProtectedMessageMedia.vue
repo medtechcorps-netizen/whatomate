@@ -70,6 +70,9 @@ let autoReloadRunning: number | null = null
 // The last load failed while the message was pending; cleared by any success.
 let failedWhilePending = false
 const root = ref<HTMLElement | null>(null)
+// Whether focus was inside this bubble (on Retry) when the last successful
+// load replaced what was on screen.
+let focusInBubbleAtSwap = false
 
 const kind = computed<ChatMediaKind>(() => {
   const { message_type: type, media_mime_type: mimeType } = props.message
@@ -188,6 +191,7 @@ async function loadMedia(options: { userInitiated?: boolean; quiet?: boolean } =
     // Any load that succeeds ends the automatic tries for this media.
     cancelAutoReload()
     failedWhilePending = false
+    focusInBubbleAtSwap = !!root.value?.contains(document.activeElement)
     status.value = 'ready'
     return mediaURL.value
   } catch {
@@ -248,7 +252,6 @@ function scheduleAutoReload() {
     // Anything may have happened during the wait: a Retry, new media, a load
     // that already succeeded.
     if (epoch !== autoReloadEpoch || status.value !== 'error' || !failedWhilePending) return
-    const retryFocused = !!root.value?.contains(document.activeElement)
     autoReloadRunning = epoch
     let url = ''
     try {
@@ -261,12 +264,12 @@ function scheduleAutoReload() {
       if (epoch === autoReloadEpoch) scheduleAutoReload()
       return
     }
-    // Focus that was on Retry moves to the image that replaced it, unless
-    // the agent has since moved it elsewhere.
+    // Focus that was on Retry when the image replaced it moves to the image,
+    // unless the agent has since moved it elsewhere.
     await nextTick()
     const active = document.activeElement
     const focusLeftBubble = !!active && active !== document.body && !root.value?.contains(active)
-    if (retryFocused && !focusLeftBubble && mediaURL.value === url) {
+    if (focusInBubbleAtSwap && !focusLeftBubble && mediaURL.value === url) {
       root.value?.querySelector<HTMLElement>('button')?.focus({ preventScroll: true })
     }
   }, AUTO_RELOAD_WAITS[autoReloadsUsed++])
@@ -382,12 +385,12 @@ onBeforeUnmount(() => {
       <Play class="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
       <span class="text-sm">{{ kind === 'video' ? t('chat.playVideo') : t('chat.playAudio') }}</span>
     </button>
-    <!-- Polite, not assertive: a failed attachment should not interrupt
-         what the agent is reading or typing. -->
+    <!-- A status, not an alert: a failed attachment is announced politely and
+         does not interrupt what the agent is reading or typing. -->
     <div
       v-else-if="status === 'error'"
-      role="alert"
-      aria-live="polite"
+      role="status"
+      data-testid="chat-message-media-error"
       class="flex max-w-[280px] items-center gap-2 px-3 py-3 bg-background/50 rounded-lg text-sm"
     >
       <AlertCircle class="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
