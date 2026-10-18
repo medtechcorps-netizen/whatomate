@@ -134,11 +134,11 @@ func (a *App) acquireInboundContinuationCapacity(ctx context.Context, stop <-cha
 	})
 }
 
-// acquire gives apply work priority over perform work, and both priority over
-// fresh claims; FIFO is retained within each class. A higher-priority waiter
-// that needs more capacity blocks lower-priority grants, allowing released
-// capacity to accumulate. Fresh claims can be delayed by admitted work; this
-// prioritization is not a throughput or tenant-fairness guarantee.
+// acquire gives apply work priority so released capacity can accumulate for a
+// completed result. Fresh ingress/preparation and new physical attempts share
+// one FIFO below apply: neither class can overtake an already queued waiter.
+// The phase labels still distinguish tiny-pool eligibility. This bounds queue
+// overtaking, not wall-clock latency or throughput through the database fences.
 func (g *inboundContinuationAdmission) acquire(ctx context.Context, stop <-chan struct{}, weight, priority int, maxOpen func() int) (func(), error) {
 	if weight != 1 && weight != 3 {
 		return nil, errors.New("inbound continuation admission weight must be 1 or 3")
@@ -177,7 +177,7 @@ func (g *inboundContinuationAdmission) acquire(ctx context.Context, stop <-chan 
 		}
 		head := g.waiters[0]
 		for _, queued := range g.waiters[1:] {
-			if queued.priority < head.priority {
+			if queued.priority == inboundContinuationApplyPriority && head.priority != inboundContinuationApplyPriority {
 				head = queued
 			}
 		}
