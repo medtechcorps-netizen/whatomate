@@ -9,6 +9,7 @@ import {
   Loader2,
   Music,
   Plus,
+  Quote,
   RotateCw,
   Send,
   ShieldCheck,
@@ -49,8 +50,10 @@ const props = withDefaults(
     serviceWindowExpired?: boolean
     /** Stop was pressed; the current file is finishing. */
     stopping?: boolean
+    /** The reply-bar message the first file will quote. */
+    replyPreview?: string
   }>(),
-  { recipientDetail: '', sending: false, maxFiles: 10, serviceWindowExpired: false, stopping: false },
+  { recipientDetail: '', sending: false, maxFiles: 10, serviceWindowExpired: false, stopping: false, replyPreview: '' },
 )
 
 const emit = defineEmits<{
@@ -180,6 +183,18 @@ function onOpenChange(open: boolean) {
           </p>
           <p class="text-xs text-muted-foreground">{{ t('chat.composer.recipientCheck') }}</p>
         </div>
+      </div>
+
+      <div
+        v-if="replyPreview"
+        class="flex items-start gap-2 rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-xs text-muted-foreground light:border-gray-200 light:bg-gray-50"
+        data-testid="composer-media-reply"
+      >
+        <Quote class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <p class="min-w-0">
+          {{ t('chat.composer.replyQuote') }}
+          <span class="line-clamp-2 break-words text-foreground">{{ replyPreview }}</span>
+        </p>
       </div>
 
       <div

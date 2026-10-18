@@ -110,11 +110,14 @@ export interface UseChatAttachmentsOptions {
   /** Sending WhatsApp account, read when a batch starts. */
   getWhatsAppAccount?: () => string | null | undefined
   /**
-   * Message the batch replies to, read when a batch starts. Only the first
-   * file sent in the batch carries it. Not wired yet: the media endpoint
-   * does not read reply_to_message_id today.
+   * Message the batch replies to, read when a batch starts with the batch's
+   * patient, so a reply from another conversation can be refused. Only the
+   * first file of the batch quotes it, even if that file fails; the server
+   * also checks the quoted message belongs to the same contact.
    */
-  replyTo?: () => string | null | undefined
+  replyTo?: (target: ChatAttachmentTarget) => string | null | undefined
+  /** The file quoting replyTo was accepted by the server (e.g. clear the reply bar). */
+  onReplySent?: (replyToMessageId: string, target: ChatAttachmentTarget) => void
   /** Called with each message the server created, while its conversation is still open. */
   onSent?: (message: unknown) => void
   onBatchFinished?: (summary: BatchSummary) => void
@@ -542,7 +545,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     isStopping.value = false
     sendingTo.value = batch.target.label ?? ''
     const whatsappAccount = options.getWhatsAppAccount?.() || undefined
-    let replyTo = options.replyTo?.() || undefined
+    const replyTo = options.replyTo?.(batch.target) || undefined
 
     // Status changes are logged from the start, so an update that arrives
     // before its HTTP response still counts.
@@ -642,6 +645,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         if (batch.stopRequested) break
         if (!item.validation.ok) continue
         const isLast = index === queue.length - 1
+        // Only the first file of the batch quotes the replied-to message.
+        const quotes = index === 0 ? replyTo : undefined
 
         const kind = item.validation.kind
         const caption = kindSupportsCaption(kind) ? item.caption.trim() : ''
@@ -660,7 +665,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
               type: kind,
               ...(caption ? { caption } : {}),
               ...(whatsappAccount ? { whatsapp_account: whatsappAccount } : {}),
-              ...(replyTo ? { reply_to_message_id: replyTo } : {}),
+              ...(quotes ? { reply_to_message_id: quotes } : {}),
             },
             {
               signal: controller.signal,
@@ -676,7 +681,6 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
             },
           )
           item.progress = 100
-          replyTo = undefined
           if (message && !batch.terminated && sessionIsCurrent(batch) && batch.target.isActive()) {
             options.onSent?.(message)
           }
@@ -708,6 +712,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
             item.errorMessage = outcome.errorMessage ?? null
           } else {
             item.status = 'sent'
+            if (quotes && !batch.terminated && sessionIsCurrent(batch)) options.onReplySent?.(quotes, batch.target)
           }
         } catch (error) {
           if (controller.signal.aborted) {

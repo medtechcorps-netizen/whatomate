@@ -258,4 +258,14 @@ describe('MediaSendDialog', () => {
     // It is not offered for an automatic resend.
     expect(wrapper.find('[data-testid="composer-media-retry"]').exists()).toBe(false)
   })
+
+  it('shows what the first file will quote when sending as a reply', () => {
+    const plain = mountDialog({ items: [item('a.png', 'image/png')] })
+    expect(plain.find('[data-testid="composer-media-reply"]').exists()).toBe(false)
+    const reply = mountDialog({ replyPreview: 'Can you send the <b>results</b>?', items: [item('a.png', 'image/png')] })
+    const quote = reply.get('[data-testid="composer-media-reply"]')
+    expect(quote.text()).toContain('chat.composer.replyQuote')
+    expect(quote.text()).toContain('Can you send the <b>results</b>?')
+    expect(quote.find('b').exists()).toBe(false)
+  })
 })

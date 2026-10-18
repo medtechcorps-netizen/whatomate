@@ -1351,3 +1351,77 @@ describe('useChatAttachments round 6: account in the identity', () => {
     expect(readWorkspaceIdentity('org-B', 'agent-1')).toBe(before)
   })
 })
+
+describe('useChatAttachments reply with attachment', () => {
+  it('asks for the reply with the batch patient, and only the first file quotes it', async () => {
+    const replyTo = vi.fn(() => 'incoming-1')
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo, onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png'), file('c.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(replyTo).toHaveBeenCalledTimes(1)
+    expect(replyTo).toHaveBeenCalledWith(expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+    expect(onReplySent).toHaveBeenCalledWith('incoming-1', expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await settle()
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm3' })
+    await done
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not move the quote to the next file when the first one fails', async () => {
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(new Error('Failed to send message'))
+    await settle()
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+
+    // Retrying the failed first file quotes again while the reply is still set.
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[2].request.file.name).toBe('a.png')
+    expect(calls[2].request.reply_to_message_id).toBe('incoming-1')
+    calls[2].result.resolve({ id: 'm1' })
+    await retry
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the reply when the provider rejects the quoting file', async () => {
+    const live = realtime()
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent, subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'failed', error_message: 'Reply context invalid' } })
+    await settle()
+    calls[1].result.resolve({ id: 'm2', status: 'sent' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+  })
+
+  it('sends without a quote when there is no reply', async () => {
+    const { attachments, calls } = setup({ replyTo: () => undefined })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+  })
+})

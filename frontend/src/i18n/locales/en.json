@@ -491,6 +491,7 @@
       "descriptionMany": "{count} files. Each one is sent as a separate WhatsApp message.",
       "recipientLabel": "To:",
       "recipientCheck": "Check the recipient before sending. Sent files cannot be recalled.",
+      "replyQuote": "The first file will quote:",
       "removeFile": "Remove {name}",
       "captionFor": "Caption for {name}",
       "kind": {

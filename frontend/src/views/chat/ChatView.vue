@@ -266,6 +266,16 @@ const chatAttachments = useChatAttachments({
     }
   },
   getWhatsAppAccount: () => selectedAccount.value,
+  // Reply with attachment: the first file of the batch quotes the reply-bar
+  // message, and only when that message belongs to the batch's patient.
+  replyTo: target => {
+    const reply = contactsStore.replyingTo
+    if (!reply || reply.contact_id !== target.contactId || !target.isActive()) return undefined
+    return reply.id
+  },
+  onReplySent: (replyToMessageId, target) => {
+    if (target.isActive() && contactsStore.replyingTo?.id === replyToMessageId) contactsStore.clearReplyingTo()
+  },
   // Paces uploads on each message leaving 'pending' (status_update /
   // realtime_sync), which keeps a batch from pinning DB pool connections.
   subscribeRealtime: listener => wsService.onInboxActivity(listener),
@@ -332,6 +342,13 @@ const {
   isSending: isUploadingMedia,
   isStopping: isStoppingMedia,
 } = chatAttachments
+// What the first file of a batch will quote, shown in the staging dialog.
+const mediaReplyPreview = computed(() => {
+  const reply = contactsStore.replyingTo
+  const contact = contactsStore.currentContact
+  if (!reply || !contact || reply.contact_id !== contact.id) return ''
+  return getMessageContent(reply) || '[Media]'
+})
 
 // Canned responses slash command state
 const cannedPickerOpen = ref(false)
@@ -3424,6 +3441,7 @@ watch(contactId, () => chatAttachments.reset())
       :recipient-detail="currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text"
       :sending="isUploadingMedia"
       :stopping="isStoppingMedia"
+      :reply-preview="mediaReplyPreview"
       :max-files="chatAttachments.maxFiles"
       :service-window-expired="isServiceWindowExpired"
       @update:open="onMediaDialogOpenChange"
