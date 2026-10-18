@@ -284,7 +284,10 @@ const chatAttachments = useChatAttachments({
       return
     }
     const missing = [...summary.failedNames, ...summary.notSentNames]
-    const report = t('chat.composer.batchReport', { name: recipient, sent, failed, notSent, unconfirmed })
+    // The "may have been sent" part only appears when a file is unconfirmed.
+    const report = unconfirmed > 0
+      ? t('chat.composer.batchReportWithUnconfirmed', { name: recipient, sent, failed, notSent, unconfirmed })
+      : t('chat.composer.batchReport', { name: recipient, sent, failed, notSent })
     const notes: string[] = []
     if (missing.length > 0) {
       notes.push(t(
@@ -293,10 +296,15 @@ const chatAttachments = useChatAttachments({
       ))
     }
     if (unconfirmed > 0) {
-      notes.push(t('chat.composer.batchReportUnconfirmed', { files: summarizeFileNames(summary.unconfirmedNames) }))
+      notes.push(t(
+        unconfirmed === 1 ? 'chat.composer.batchReportUnconfirmedOne' : 'chat.composer.batchReportUnconfirmedMany',
+        { files: summarizeFileNames(summary.unconfirmedNames) },
+      ))
     }
     const description = notes.join(' ')
-    if (sent === 0 && !summary.stopped) toast.error(report, { description })
+    // Red only when nothing reached the server and something definitely
+    // failed; a file that may have been sent is a warning, not an error.
+    if (failed > 0 && sent === 0 && unconfirmed === 0 && !summary.stopped) toast.error(report, { description })
     else toast.warning(report, { description })
   },
 })

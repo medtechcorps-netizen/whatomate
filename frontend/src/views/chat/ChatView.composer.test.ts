@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   toastWarning: vi.fn(),
   toastError: vi.fn(),
   convertImageToJpeg: vi.fn(),
+  t: vi.fn((key: string) => key),
   realtimeListeners: new Set<(event: { type?: string; payload?: any }) => void>(),
 }))
 
@@ -37,7 +38,7 @@ vi.mock('vue-router', async () => {
 
 vi.mock('vue-i18n', async importOriginal => ({
   ...(await importOriginal<typeof import('vue-i18n')>()),
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({ t: mocks.t }),
 }))
 
 vi.mock('@vueuse/core', async () => {
@@ -508,12 +509,19 @@ describe('ChatView composer', () => {
   })
 
   function sendMediaDeferred() {
-    const calls: Array<{ resolve: (value: unknown) => void; reject: (error: unknown) => void; signal: AbortSignal; request: any }> = []
-    mocks.sendMedia.mockImplementation((request: any, options: { signal: AbortSignal }) =>
-      new Promise((resolve, reject) => {
-        options.signal.addEventListener('abort', () => reject(new Error('canceled')))
-        calls.push({ resolve, reject, signal: options.signal, request })
-      }),
+    const calls: Array<{
+      resolve: (value: unknown) => void
+      reject: (error: unknown) => void
+      signal: AbortSignal
+      request: any
+      progress: (loaded: number, total: number | undefined) => void
+    }> = []
+    mocks.sendMedia.mockImplementation(
+      (request: any, options: { signal: AbortSignal; onUploadProgress: (loaded: number, total: number | undefined) => void }) =>
+        new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(new Error('canceled')))
+          calls.push({ resolve, reject, signal: options.signal, request, progress: options.onUploadProgress })
+        }),
     )
     return calls
   }
@@ -583,8 +591,17 @@ describe('ChatView composer', () => {
     const dialog = wrapper.findComponent(MediaSendDialog)
     expect(dialog.props('sending')).toBe(false)
     expect(dialog.props('items').map((item: { status: string }) => item.status)).toEqual(['unconfirmed', 'ready'])
-    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.batchReport', {
-      description: 'chat.composer.batchReportFiles chat.composer.batchReportUnconfirmed',
+    expect(mocks.t).toHaveBeenCalledWith('chat.composer.batchReportWithUnconfirmed', {
+      name: 'Patient first',
+      sent: 0,
+      failed: 0,
+      notSent: 1,
+      unconfirmed: 1,
+    })
+    expect(mocks.t).toHaveBeenCalledWith('chat.composer.batchReportFiles', { files: 'b.png' })
+    expect(mocks.t).toHaveBeenCalledWith('chat.composer.batchReportUnconfirmedOne', { files: 'a.png' })
+    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.batchReportWithUnconfirmed', {
+      description: 'chat.composer.batchReportFiles chat.composer.batchReportUnconfirmedOne',
     })
   })
 
@@ -600,6 +617,66 @@ describe('ChatView composer', () => {
     expect(wrapper.findComponent(MediaSendDialog).props('open')).toBe(false)
     expect(mocks.toastWarning).not.toHaveBeenCalled()
     expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+  })
+
+  it('reports a file left unconfirmed by the response deadline as a warning, not an error', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['scan.png'])
+    calls[0].progress(10, 10)
+    await vi.advanceTimersByTimeAsync(120_000)
+    await flushPromises()
+    expect(calls[0].signal.aborted).toBe(true)
+    expect(mocks.t).toHaveBeenCalledWith('chat.composer.batchReportWithUnconfirmed', {
+      name: 'Patient first',
+      sent: 0,
+      failed: 0,
+      notSent: 0,
+      unconfirmed: 1,
+    })
+    expect(mocks.toastWarning).toHaveBeenCalledWith('chat.composer.batchReportWithUnconfirmed', {
+      description: 'chat.composer.batchReportUnconfirmedOne',
+    })
+    expect(mocks.toastError).not.toHaveBeenCalled()
+  })
+
+  it('leaves the unconfirmed part out of the headline when nothing is unconfirmed', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png', 'b.png'])
+    calls[0].reject(new Error('Failed to send message'))
+    await flushPromises()
+    calls[1].reject(new Error('Failed to send message'))
+    await flushPromises()
+    expect(mocks.t).toHaveBeenCalledWith('chat.composer.batchReport', {
+      name: 'Patient first',
+      sent: 0,
+      failed: 2,
+      notSent: 0,
+    })
+    expect(mocks.t).not.toHaveBeenCalledWith('chat.composer.batchReportWithUnconfirmed', expect.anything())
+    // Nothing reached the server and both failed: a red error toast.
+    expect(mocks.toastError).toHaveBeenCalledWith('chat.composer.batchReport', {
+      description: 'chat.composer.batchReportFiles',
+    })
+  })
+
+  it('uses the plural wording for several unconfirmed files', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png', 'b.png'])
+    calls[0].progress(10, 10)
+    await vi.advanceTimersByTimeAsync(120_000)
+    await flushPromises()
+    calls[1].progress(10, 10)
+    await vi.advanceTimersByTimeAsync(120_000)
+    await flushPromises()
+    expect(mocks.t).toHaveBeenCalledWith('chat.composer.batchReportUnconfirmedMany', { files: 'a.png, b.png' })
+    expect(mocks.toastWarning).toHaveBeenCalled()
     expect(mocks.toastError).not.toHaveBeenCalled()
   })
 })
