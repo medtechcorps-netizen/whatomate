@@ -65,7 +65,7 @@ test.describe('Teams - List View', () => {
     await expect(link).toBeVisible()
     await link.click()
     await expect(page).toHaveURL(new RegExp(`/settings/teams/${team.id}$`))
-    await expect(page.getByText('Details')).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Details', exact: true })).toBeVisible()
   })
 
   test('should delete team from list', async ({ page, request }) => {
