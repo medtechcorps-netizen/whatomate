@@ -250,9 +250,6 @@ export function readSessionId(): string {
 // not got through is moot: the jar now holds the new session's cookies.
 function beginSessionMarker(): string {
   writeStoredValue(LOGOUT_PENDING_KEY, null);
-  // A session this tab begins also settles an SSO exchange it once sent and
-  // never saw answered.
-  clearSsoExchangeSent();
   const marker = writeSessionMarker(
     Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
   );
@@ -997,8 +994,8 @@ function dropSsoCode() {
 // that moment, and cleared once its outcome is seen here. A tab that finds it
 // after a reload never saw the answer: the exchange's cookies may have landed
 // unseen, so the stored identity may not be the jar's session any more. It
-// stays (every reload, Back) until a session this tab begins, or a newer
-// session consistent with the jar, settles it.
+// stays (every reload, Back) until a newer session consistent with the jar
+// settles it: one another tab began, or a sign-in in this tab.
 const SSO_SENT_KEY = "whm_sso_sent";
 
 function noteSsoExchangeSent() {
