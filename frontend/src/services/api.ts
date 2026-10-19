@@ -1364,7 +1364,12 @@ api.interceptors.response.use(
         await endIssuedSession();
         throw sessionChangedError(config);
       }
-      if (path !== "/auth/switch-org") beginSessionMarker();
+      if (path === "/auth/switch-org") {
+        // Same session, new cookies: keep its begun record current.
+        noteBegunCsrf(readSessionMarker());
+      } else {
+        beginSessionMarker();
+      }
       onSessionIssued(response.data?.data?.expires_in);
     } finally {
       releaseSessionLock(config);

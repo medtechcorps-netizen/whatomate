@@ -1472,6 +1472,70 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order.slice(0, 4)).toEqual(['login (no answer)', 'revoke csrf-of-b', 'logout csrf-of-b', 'refresh'])
   })
 
+  it("the begun session's CSRF record follows its org switches", async () => {
+    installWebLocks()
+    const { api } = await loadTab(async (config) => {
+      if (config.url === '/auth/switch-org') setCookie('whm_csrf=csrf-after-switch; path=/')
+      return ok(config, { data: { expires_in: 900, user: {} } })
+    })
+    await api.post('/auth/login', { email: 'a@example.com', password: 'x' })
+    const marker = localStorage.getItem('whm_session_id')
+
+    await api.post('/auth/switch-org', { organization_id: 'org-2' })
+
+    expect(JSON.parse(localStorage.getItem('whm_session_begun')!)).toEqual({ marker, csrf: 'csrf-after-switch' })
+  })
+
+  it('a retried switch refused after a build without the begun record signed in B leaves B alone', async () => {
+    installWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    let releaseRefresh!: () => void
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve
+    })
+    const order: string[] = []
+    let switchCalls = 0
+    const { api } = await loadTab(async (config) => {
+      switchCalls++
+      throw httpError(401, config)
+    })
+    recordPosts(order, async (label) => {
+      if (label === 'refresh') {
+        await refreshGate
+        setCookie('whm_csrf=csrf-token-2; path=/')
+        return refreshOk()
+      }
+    })
+
+    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    await vi.waitFor(() => expect(order).toEqual(['refresh']))
+    // A tab of an older build signs in as B on the lock meanwhile, and writes
+    // no begun record: only this request's own fields can tell it apart.
+    let releaseHolder!: () => void
+    const holding = new Promise<void>((acquired) => {
+      void (navigator as unknown as { locks: { request: (name: string, cb: () => Promise<void>) => Promise<void> } })
+        .locks.request('whm-token-refresh', () => {
+          acquired()
+          return new Promise<void>((resolve) => {
+            releaseHolder = resolve
+          })
+        })
+    })
+    releaseRefresh()
+    await holding
+    // The switch's retry is queued on the lock by now.
+    await tick()
+    setCookie('whm_csrf=csrf-of-b; path=/')
+    localStorage.setItem('whm_session_id', 'session-b')
+    releaseHolder()
+
+    expect(await switched).toBe('ERR_CANCELED')
+    expect(switchCalls).toBe(1)
+    expect(order).toEqual(['refresh'])
+    expect(localStorage.getItem('whm_session_begun')).toBeNull()
+    expect(document.cookie).toContain('whm_csrf=csrf-of-b')
+  })
+
   it('a retried switch refused after another tab began B leaves B alone', async () => {
     installWebLocks()
     localStorage.setItem('whm_session_id', 'session-a')
@@ -1624,6 +1688,45 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     await whenLogoutSettled()
 
     expect(order).toEqual(['refresh', 'revoke csrf-token-2', 'logout csrf-token-2'])
+    expect(JSON.parse(localStorage.getItem('whm_logout_pending')!)).toEqual({
+      marker: 'ended:session-a',
+      csrf: 'csrf-token-2',
+    })
+  })
+
+  it("a refresh that lands after its session ended updates the pending logout's CSRF value even when that logout is deferred", async () => {
+    vi.useFakeTimers()
+    installWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    let releaseRefresh!: () => void
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve
+    })
+    const order: string[] = []
+    recordPosts(order, async (label) => {
+      if (label === 'refresh') {
+        await refreshGate
+        setCookie('whm_csrf=csrf-token-2; path=/')
+        return refreshOk()
+      }
+    })
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const request = api.get('/contacts').catch(() => undefined)
+    await vi.waitFor(() => expect(order).toEqual(['refresh']))
+    // A stuck holder queues behind the refresh: this logout's lock wait runs
+    // out and it is deferred before it sends anything.
+    holdLockElsewhere()
+    await api.post('/auth/logout', {})
+    releaseRefresh()
+    await vi.advanceTimersByTimeAsync(20_500)
+    await request
+    await whenLogoutSettled()
+
+    expect(order).toEqual(['refresh'])
+    // What a later page (the replayed-callback check, the load retry) matches
+    // against is the jar's rotated value.
     expect(JSON.parse(localStorage.getItem('whm_logout_pending')!)).toEqual({
       marker: 'ended:session-a',
       csrf: 'csrf-token-2',
