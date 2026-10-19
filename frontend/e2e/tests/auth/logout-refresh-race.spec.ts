@@ -404,6 +404,7 @@ test.describe('Logout during a token refresh', () => {
       // once, and the navigation may cancel the request in flight.
       const revoked = page.waitForRequest(
         (request) => request.url().endsWith('/api/auth/refresh') && (request.postData() ?? '').includes('"revoke"'),
+        { timeout: 10_000 },
       )
       if (ending === 'a logout click') await logout(page)
       else await startProactiveRefresh(page)

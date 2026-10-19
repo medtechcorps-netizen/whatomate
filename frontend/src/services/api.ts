@@ -1173,9 +1173,10 @@ function isUnsupported(error: unknown): boolean {
 // Locks once it would need a refresh (which may not run there): logged out
 // cookie-neutral (the refresh chain revoked; the cookie clearing stays pending
 // for a page that holds the lock), and the user is sent to the login page,
-// which says why a sign-in is refused.
+// which says why a sign-in is refused. Once: a second refresh need (another
+// 401, the proactive timer) finds the session already ended and only leaves.
 function endUnsupportedSession() {
-  void api.post("/auth/logout", {}).catch(() => undefined);
+  if (!isEndedMarker(readSessionMarker())) void api.post("/auth/logout", {}).catch(() => undefined);
   expireSession();
 }
 

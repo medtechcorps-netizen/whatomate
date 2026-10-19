@@ -650,10 +650,6 @@ return 1`,
 	).Err()
 }
 
-// applyOrganizationMembership updates a user with the current organization and
-// role from user_organizations. Only initial login may fall back to a different
-// active membership; refresh and organization switching must honor the exact
-// organization already selected.
 // ssoOrganizationMember tells whether user may sign in through the SSO of
 // organization orgID. The membership table is the authority, as it is for a
 // login (applyOrganizationMembership): an active membership there (one derived
@@ -677,6 +673,10 @@ func (a *App) ssoOrganizationMember(user *models.User, orgID uuid.UUID) (bool, e
 	return user.IsSuperAdmin || access.ResellerDerivedMembershipActive(a.DB, &memberships[0]), nil
 }
 
+// applyOrganizationMembership updates a user with the current organization and
+// role from user_organizations. Only initial login may fall back to a different
+// active membership; refresh and organization switching must honor the exact
+// organization already selected.
 func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, allowFallback bool) error {
 	var membership models.UserOrganization
 	membershipErr := a.DB.Where("user_id = ? AND organization_id = ?", user.ID, orgID).First(&membership).Error

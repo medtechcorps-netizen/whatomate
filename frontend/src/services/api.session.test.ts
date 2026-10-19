@@ -2477,6 +2477,23 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(assignedHref).toBe('/login')
   })
 
+  it('without Web Locks two refresh needs end the session once: one revoke', async () => {
+    removeWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const order: string[] = []
+    recordPosts(order)
+
+    // Two API calls get a 401 together; each would need a refresh.
+    await Promise.allSettled([api.get('/contacts'), api.get('/users')])
+    await whenLogoutSettled()
+
+    expect(order).toEqual(['revoke csrf-token-1'])
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+  })
+
   it('a page that cannot hold the lock logs out cookie-neutral; a page that can then finishes the clearing', async () => {
     localStorage.setItem('whm_session_id', 'session-a')
     // This page's lock manager refuses (a sandboxed page); the browser's

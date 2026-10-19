@@ -707,10 +707,14 @@ func TestLaneA_SSOExchange_FallsBackLikeLogin(t *testing.T) {
 		p.AllowAutoCreate = false
 	})
 	user := testutil.CreateTestUser(t, app.DB, home.ID, testutil.WithEmail(testutil.UniqueEmail("fallback")))
-	roleC := laneAMembership(t, app, user.ID, orgC.ID)
-	require.NoError(t, app.DB.Model(&models.UserOrganization{}).
-		Where("user_id = ? AND organization_id = ?", user.ID, orgC.ID).Update("is_default", true).Error)
+	// B's membership first: only the default flag, not the creation order,
+	// makes C the one Login falls back to.
 	laneAMembership(t, app, user.ID, orgB.ID)
+	roleC := laneAMembership(t, app, user.ID, orgC.ID)
+	madeDefault := app.DB.Model(&models.UserOrganization{}).
+		Where("user_id = ? AND organization_id = ?", user.ID, orgC.ID).Update("is_default", true)
+	require.NoError(t, madeDefault.Error)
+	require.EqualValues(t, 1, madeDefault.RowsAffected)
 	require.NoError(t, app.DB.Where("user_id = ? AND organization_id = ?", user.ID, home.ID).
 		Delete(&models.UserOrganization{}).Error)
 
@@ -811,37 +815,44 @@ func laneAJarCookies(jar map[string]string, first ...string) [][2]string {
 }
 
 func TestLaneA_SSOExchange_TwoBindingsInOneRequest(t *testing.T) {
-	// Callbacks A then B in one browser; every exchange carries both
-	// bindings, A's first in the Cookie header. Whichever attempt exchanges
-	// first reads and spends only its own binding.
+	// Callbacks A then B in one browser. The first exchange carries both
+	// bindings, A's first in the Cookie header; it reads and spends only its
+	// own, and the other attempt's exchange (carrying its own binding) then
+	// succeeds.
 	for _, bFirst := range []bool{true, false} {
-		app := newSSOApp(t)
-		jar := map[string]string{}
-		a := laneASSOCallback(t, app)
-		laneAApplyCookies(jar, a.callback)
-		b := laneASSOCallback(t, app)
-		laneAApplyCookies(jar, b.callback)
-		require.Len(t, jar, 2)
-
-		first, second := b, a
-		if !bFirst {
-			first, second = a, b
+		name := "A first"
+		if bFirst {
+			name = "B first"
 		}
-		exchanged := laneAExchangeOrdered(t, app, first.code, laneAJarCookies(jar, a.bindName, b.bindName))
-		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exchanged), "first exchange (B first: %v)", bFirst)
-		laneAAssertBindingSpent(t, exchanged, first, "/api/auth/refresh")
-		laneAApplyCookies(jar, exchanged)
-		assert.Equal(t, second.binding, jar[second.bindName])
+		t.Run(name, func(t *testing.T) {
+			app := newSSOApp(t)
+			jar := map[string]string{}
+			a := laneASSOCallback(t, app)
+			laneAApplyCookies(jar, a.callback)
+			b := laneASSOCallback(t, app)
+			laneAApplyCookies(jar, b.callback)
+			require.Len(t, jar, 2)
 
-		// The other then succeeds, and the jar ends with its session.
-		exchanged = laneAExchangeOrdered(t, app, second.code, laneAJarCookies(jar, a.bindName, b.bindName))
-		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exchanged), "second exchange (B first: %v)", bFirst)
-		laneAAssertBindingSpent(t, exchanged, second, "/api/auth/refresh")
-		laneAApplyCookies(jar, exchanged)
-		for _, name := range []string{"whm_access", "whm_refresh", "whm_csrf"} {
-			assert.Equal(t, testutil.GetResponseCookie(exchanged, name), jar[name], name)
-		}
-		assert.Equal(t, second.user.ID, laneAAccessClaims(t, jar["whm_access"]).UserID)
+			first, second := b, a
+			if !bFirst {
+				first, second = a, b
+			}
+			exchanged := laneAExchangeOrdered(t, app, first.code, laneAJarCookies(jar, a.bindName, b.bindName))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exchanged))
+			laneAAssertBindingSpent(t, exchanged, first, "/api/auth/refresh")
+			laneAApplyCookies(jar, exchanged)
+			assert.Equal(t, second.binding, jar[second.bindName])
+
+			// The other then succeeds, and the jar ends with its session.
+			exchanged = laneAExchangeOrdered(t, app, second.code, laneAJarCookies(jar, a.bindName, b.bindName))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exchanged))
+			laneAAssertBindingSpent(t, exchanged, second, "/api/auth/refresh")
+			laneAApplyCookies(jar, exchanged)
+			for _, cookie := range []string{"whm_access", "whm_refresh", "whm_csrf"} {
+				assert.Equal(t, testutil.GetResponseCookie(exchanged, cookie), jar[cookie], cookie)
+			}
+			assert.Equal(t, second.user.ID, laneAAccessClaims(t, jar["whm_access"]).UserID)
+		})
 	}
 }
 
