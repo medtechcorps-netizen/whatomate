@@ -1420,7 +1420,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div v-else-if="activeTab === 'builder'" class="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] xl:grid-cols-[232px_minmax(0,1fr)_342px] xl:grid-rows-1">
+    <div v-else-if="activeTab === 'builder'" class="grid min-h-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] xl:grid-cols-[232px_minmax(0,1fr)_342px] xl:grid-rows-1">
       <aside data-testid="automation-palette" class="border-b border-white/[0.08] bg-[#0c0f10] p-3 light:border-gray-200 light:bg-white xl:border-b-0 xl:border-r xl:p-4" aria-label="Automation step palette">
         <div class="hidden xl:block">
           <p class="text-[9px] font-bold uppercase tracking-[0.22em] text-white/30 light:text-gray-500">Step palette</p>
