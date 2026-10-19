@@ -2082,20 +2082,47 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(reloaded.ssoExchangeInterrupted()).toBe(true)
   })
 
-  it('an SSO exchange answered 503 changes nothing: no revoke or logout, the session from before stays, its note is retired', async () => {
-    localStorage.setItem('whm_session_id', 'session-a')
-    const { exchangeSsoCode, ssoExchangeInterrupted } = await loadTab(async (config) => {
+  it('a received exchange 503 is sent once and preserves the settled session without expiry or identity writes', async () => {
+    vi.useFakeTimers()
+    const identity = {
+      user: JSON.stringify({ id: 'user-1', email: 'a@example.com', organization_id: 'org-a' }),
+      selected_organization_id: 'org-a',
+      whm_session_id: 'session-a',
+      whm_session_begun: JSON.stringify({ marker: 'session-a', csrf: 'csrf-token-1' }),
+      whm_auth_epoch: '123',
+      whm_auth_expires_at: String(Date.now() + 3_600_000),
+    }
+    for (const [key, value] of Object.entries(identity)) localStorage.setItem(key, value)
+    const csrfBefore = document.cookie
+    const exchangeAdapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
       throw httpError(503, config)
     })
+    const { exchangeSsoCode, keepSsoCode, ssoExchangeInterrupted, unsentSsoCode } = await loadTab(exchangeAdapter)
     const order: string[] = []
     recordPosts(order)
+    const writes = vi.spyOn(Storage.prototype, 'setItem')
+    const removals = vi.spyOn(Storage.prototype, 'removeItem')
+    keepSsoCode('code-b')
 
     await expect(exchangeSsoCode('code-b')).rejects.toMatchObject({ response: { status: 503 } })
+    // Include the ordinary refresh retry window; no delayed code replay may run.
+    await vi.advanceTimersByTimeAsync(10_000)
 
+    expect(exchangeAdapter).toHaveBeenCalledTimes(1)
+    const [request] = exchangeAdapter.mock.calls[0]!
+    expect(request.url).toBe('/auth/refresh')
+    expect(request.method).toBe('post')
+    expect(JSON.parse(request.data)).toEqual({ sso_exchange: 'code-b' })
     expect(order).toEqual([])
-    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
-    expect(JSON.parse(localStorage.getItem('user')!).id).toBe('user-1')
-    expect(document.cookie).toContain('whm_csrf=csrf-token-1')
+    for (const [key, value] of Object.entries(identity)) expect(localStorage.getItem(key)).toBe(value)
+    const identityKeys = Object.keys(identity)
+    expect(writes.mock.calls.filter(([key]) => identityKeys.includes(key))).toEqual([])
+    expect(removals.mock.calls.filter(([key]) => identityKeys.includes(key))).toEqual([])
+    expect(document.cookie).toBe(csrfBefore)
+    expect(localStorage.getItem('whm_logout_pending')).toBeNull()
+    expect(sessionEvents).toEqual([])
+    expect(assignedHref).toBeNull()
+    expect(unsentSsoCode()).toBeNull()
     expect(sessionStorage.getItem('whm_sso_sent')).toBeNull()
     expect(ssoExchangeInterrupted()).toBe(false)
   })

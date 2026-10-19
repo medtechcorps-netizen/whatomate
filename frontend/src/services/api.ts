@@ -943,9 +943,11 @@ export async function beginSsoSignIn(): Promise<void> {
  * request with everything a password sign-in has (the lock, an earlier logout
  * first, the new session only on success, the undo of a late or unanswered
  * answer, the timeout). The code is single-use and bound to this browser.
- * An answer of 503 means the sign-in failed temporarily: start the sign-in
- * again (the code is usually spent already); the previous session state is
- * untouched.
+ * A received application 503 requires a fresh sign-in, never a replay of this
+ * single-use code (a store error does not prove it remains unspent). This
+ * failure path neither issues a new auth identity nor expires the previously
+ * settled session. Attempt code/binding/note bookkeeping may change; an earlier
+ * pending logout still settles before the exchange, under its existing rules.
  */
 export function exchangeSsoCode(code: string) {
   return api.post("/auth/refresh", { sso_exchange: code }, {
