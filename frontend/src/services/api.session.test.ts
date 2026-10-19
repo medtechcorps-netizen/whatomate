@@ -1780,7 +1780,10 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
       expect(await request).toBe('rejected')
       await whenLogoutSettled()
-      expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+      // Without Web Locks the logout is cookie-neutral: the revoke only.
+      expect(order).toEqual(
+        locking === 'Web Locks' ? ['revoke csrf-token-1', 'logout csrf-token-1'] : ['revoke csrf-token-1'],
+      )
       expect(assignedHref).toBeNull()
     })
 
@@ -1902,7 +1905,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
   })
 
   for (const failure of ['throws', 'rejects'] as const) {
-    it(`a lock manager that ${failure} counts as none: the sign-in is refused at once, a logout still goes through`, async () => {
+    it(`a lock manager that ${failure} counts as none: the sign-in is refused at once, a logout is cookie-neutral`, async () => {
       vi.useFakeTimers()
       localStorage.setItem('whm_session_id', 'session-a')
       const request = vi.fn((..._args: unknown[]) => {
@@ -1923,11 +1926,13 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       expect(await login).toBe(SESSION_UNSUPPORTED_CODE)
       expect(adapter).not.toHaveBeenCalled()
       expect(sessionsSupported()).toBe(false)
-      // A session that already existed still logs out (within this tab).
+      // A session that already existed still logs out, cookie-neutral: the
+      // revoke only; the clearing stays pending for a page that holds the lock.
       await api.post('/auth/logout', {})
       await vi.advanceTimersByTimeAsync(10)
       await whenLogoutSettled()
-      expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+      expect(order).toEqual(['revoke csrf-token-1'])
+      expect(JSON.parse(localStorage.getItem('whm_logout_pending')!).marker).toBe('ended:session-a')
     })
   }
 
@@ -1946,7 +1951,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     await expect(api.get('/contacts')).rejects.toMatchObject({ response: { status: 401 } })
     await whenLogoutSettled()
 
-    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+    expect(order).toEqual(['revoke csrf-token-1'])
     expect(sessionsSupported()).toBe(false)
     expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
     expect(localStorage.getItem('user')).toBeNull()
@@ -2189,7 +2194,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(adapter).not.toHaveBeenCalled()
   })
 
-  it('without Web Locks a session that existed is not refreshed: it ends, with a cookie-neutral revoke, then /auth/logout', async () => {
+  it('without Web Locks a session that existed is not refreshed: it ends, with a cookie-neutral revoke and no /auth/logout', async () => {
     removeWebLocks()
     localStorage.setItem('whm_session_id', 'session-a')
     const { api, whenLogoutSettled } = await loadTab(async (config) => {
@@ -2204,13 +2209,48 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     await expect(api.get('/contacts')).rejects.toMatchObject({ response: { status: 401 } })
     await whenLogoutSettled()
 
-    expect(posts).toEqual([
-      { url: '/auth/refresh', body: { revoke: true, keep_cookies: true } },
-      { url: '/auth/logout', body: {} },
-    ])
+    expect(posts).toEqual([{ url: '/auth/refresh', body: { revoke: true, keep_cookies: true } }])
     expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+    expect(JSON.parse(localStorage.getItem('whm_logout_pending')!).marker).toBe('ended:session-a')
     expect(localStorage.getItem('user')).toBeNull()
     expect(assignedHref).toBe('/login')
+  })
+
+  it('a page that cannot hold the lock logs out cookie-neutral; a page that can then finishes the clearing', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    // This page's lock manager refuses (a sandboxed page); the browser's
+    // other pages have a working one.
+    const refuse = () => Promise.reject(new DOMException('Lock manager unavailable', 'SecurityError'))
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: { request: vi.fn(refuse), query: vi.fn(refuse) },
+    })
+    const sandboxed = await loadTab(async (config) => ok(config))
+    await tick()
+    expect(sandboxed.sessionsSupported()).toBe(false)
+    const posts: Array<{ url: string; body: unknown }> = []
+    postSpy.mockImplementation(async (url: string, body: unknown) => {
+      posts.push({ url: url.replace(/^.*\/api/, ''), body })
+      return { data: { data: {} }, status: 200 }
+    })
+
+    await sandboxed.api.post('/auth/logout', {})
+    await sandboxed.whenLogoutSettled()
+
+    // No cookie change this page cannot order against the others.
+    expect(posts).toEqual([{ url: '/auth/refresh', body: { revoke: true, keep_cookies: true } }])
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+    expect(JSON.parse(localStorage.getItem('whm_logout_pending')!).marker).toBe('ended:session-a')
+
+    // The next page that holds the lock finishes the clearing, ordered.
+    installWebLocks()
+    const other = await loadTab(async (config) => ok(config))
+    await other.whenLogoutSettled()
+    expect(posts.slice(1)).toEqual([
+      { url: '/auth/refresh', body: { revoke: true } },
+      { url: '/auth/logout', body: {} },
+    ])
+    expect(localStorage.getItem('whm_logout_pending')).toBeNull()
   })
 
   it("a refresh rejected after this tab's own logout reports no expiry", async () => {

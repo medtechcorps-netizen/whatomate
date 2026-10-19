@@ -39,7 +39,9 @@ import {
 // attempt at all (it gets its answer at ~7.5 s). Expected to fail against
 // f9f8c65d (not yet run): the no-Web-Locks case (that build signed in through
 // a best-effort fallback). The SSO exchange cases need the exchange (the
-// callback page of fdb8937b and earlier never sends one).
+// callback page of fdb8937b and earlier never sends one). The no-Web-Locks
+// logout cases need the cookie-neutral logout (3ee42429 and earlier send a
+// clearing /auth/logout).
 //
 // The identity provider is not run here: the callback page is opened with a
 // code, and its exchange is answered with a real session of the user (a
@@ -312,8 +314,48 @@ const withoutWebLocks = () => {
 test.describe('Logout during a token refresh', () => {
   test.describe.configure({ timeout: 120_000 })
 
-  for (const locking of ['Web Locks', 'no Web Locks (a session from before)']) {
-    test(`a refresh response that lands after the click cannot revive the session (${locking})`, async ({
+  test('a refresh response that lands after the click cannot revive the session', async ({
+    page,
+    context,
+    playwright,
+    baseURL,
+  }) => {
+    const newContext = () => playwright.request.newContext({ baseURL })
+    await loginAsAdmin(page)
+    expect(await page.evaluate(() => !!navigator.locks)).toBe(true)
+    const originalRefresh = await cookieValue(context, 'whm_refresh')
+    expect(originalRefresh).toBeTruthy()
+
+    const order: string[] = []
+    recordSessionRequests(context, order)
+    const held = await holdResponse(page, '/auth/refresh', newContext, order, 'refresh landed')
+    await startProactiveRefresh(page)
+    await held.ready
+    // The harness really holds the cookie write back.
+    expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
+    expect(held.cookies().whm_refresh).toBeTruthy()
+
+    // The user is out at once, refresh or not.
+    await logout(page)
+    await expect(page).toHaveURL(/\/login/)
+    // Give an unordered logout every chance to go out first.
+    await page.waitForTimeout(1_000)
+    expect(order).toEqual([])
+
+    const loggedOut = page.waitForResponse('**/api/auth/logout')
+    held.release()
+    await loggedOut
+    expect(order).toEqual(['refresh landed', 'revoke', 'logout'])
+
+    expect(await cookieValue(context, 'whm_access')).toBeUndefined()
+    expect(await cookieValue(context, 'whm_refresh')).toBeUndefined()
+    expect((await page.request.get('/api/me')).status()).toBe(401)
+    // Neither the original refresh token nor its successor mints a session.
+    await expectRefreshRejected(newContext, [originalRefresh, held.cookies().whm_refresh])
+  })
+
+  for (const ending of ['its first refresh need', 'a logout click'] as const) {
+    test(`without Web Locks a session from before ends at ${ending}: a cookie-neutral revoke, no cookie cleared`, async ({
       page,
       context,
       playwright,
@@ -321,42 +363,57 @@ test.describe('Logout during a token refresh', () => {
     }) => {
       const newContext = () => playwright.request.newContext({ baseURL })
       await loginAsAdmin(page)
-      if (locking !== 'Web Locks') {
-        // A session that already existed, in a browser without Web Locks: it
-        // still refreshes and logs out, ordered within its tab.
-        await page.addInitScript(withoutWebLocks)
-        await page.reload({ waitUntil: 'domcontentloaded' })
+      // A session that already existed, in a page without Web Locks: it can
+      // order no cookie change against other tabs, so it makes none.
+      await page.addInitScript(withoutWebLocks)
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      expect(await page.evaluate(() => !!navigator.locks)).toBe(false)
+      const before: Record<string, string | undefined> = {}
+      for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+        before[name] = await cookieValue(context, name)
+        expect(before[name]).toBeTruthy()
       }
-      expect(await page.evaluate(() => !!navigator.locks)).toBe(locking === 'Web Locks')
-      const originalRefresh = await cookieValue(context, 'whm_refresh')
-      expect(originalRefresh).toBeTruthy()
-
       const order: string[] = []
       recordSessionRequests(context, order)
-      const held = await holdResponse(page, '/auth/refresh', newContext, order, 'refresh landed')
-      await startProactiveRefresh(page)
-      await held.ready
-      // The harness really holds the cookie write back.
-      expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
-      expect(held.cookies().whm_refresh).toBeTruthy()
+      const refreshes = countRefreshes(page)
+      const revokeBodies: unknown[] = []
+      page.on('request', (request) => {
+        const body = request.postData() ?? ''
+        if (request.url().endsWith('/api/auth/refresh') && body.includes('"revoke"')) revokeBodies.push(JSON.parse(body))
+      })
 
-      // The user is out at once, refresh or not.
-      await logout(page)
+      const revoked = page.waitForResponse((response) => response.url().endsWith('/api/auth/refresh'))
+      if (ending === 'a logout click') await logout(page)
+      else await startProactiveRefresh(page)
       await expect(page).toHaveURL(/\/login/)
-      // Give an unordered logout every chance to go out first.
-      await page.waitForTimeout(1_000)
-      expect(order).toEqual([])
+      await revoked
+      // Give a clearing /auth/logout every chance to go out.
+      await page.waitForTimeout(2_000)
 
-      const loggedOut = page.waitForResponse('**/api/auth/logout')
-      held.release()
-      await loggedOut
-      expect(order).toEqual(['refresh landed', 'revoke', 'logout'])
+      // The revoke only, cookie-neutral; no refresh, no /auth/logout.
+      expect(order).toEqual(['revoke'])
+      expect(revokeBodies).toEqual([{ revoke: true, keep_cookies: true }])
+      expect(refreshes()).toBe(0)
+      for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+        expect(await cookieValue(context, name)).toBe(before[name])
+      }
+      // The refresh chain is revoked; the clearing waits for a page that
+      // holds the lock.
+      await expectRefreshRejected(newContext, [before.whm_refresh])
+      const pending = await page.evaluate(() => localStorage.getItem('whm_logout_pending'))
+      expect(JSON.parse(pending!).marker).toMatch(/^ended:/)
+      expect(await page.evaluate(() => localStorage.getItem('whm_session_id'))).toMatch(/^ended:/)
 
+      // The next page that holds the lock finishes the clearing, ordered.
+      const other = await context.newPage()
+      const cleared = other.waitForResponse('**/api/auth/logout')
+      await other.goto('/login', { waitUntil: 'domcontentloaded' })
+      expect(await other.evaluate(() => !!navigator.locks)).toBe(true)
+      await cleared
+      expect(order).toEqual(['revoke', 'revoke', 'logout'])
       expect(await cookieValue(context, 'whm_access')).toBeUndefined()
       expect(await cookieValue(context, 'whm_refresh')).toBeUndefined()
-      expect((await page.request.get('/api/me')).status()).toBe(401)
-      // Neither the original refresh token nor its successor mints a session.
-      await expectRefreshRejected(newContext, [originalRefresh, held.cookies().whm_refresh])
+      await expect.poll(() => other.evaluate(() => localStorage.getItem('whm_logout_pending'))).toBeNull()
     })
   }
 

@@ -68,10 +68,19 @@ func (a *App) Login(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid credentials", nil, "")
 	}
 
+	return a.issueLoginSession(r, &user)
+}
+
+// issueLoginSession issues the session a sign-in gives an authenticated,
+// active user: the membership, organization and role resolved now (the user's
+// organization, or another active membership), the role's permissions, the
+// session cookies and the {expires_in, user} answer. Login and the SSO code
+// exchange both end here, so they issue the same thing.
+func (a *App) issueLoginSession(r *fastglue.Request, user *models.User) error {
 	// The membership table is authoritative. If the user's legacy home
 	// organization is no longer available, login may fall back to another
 	// active membership.
-	if err := a.applyOrganizationMembership(&user, user.OrganizationID, true); err != nil {
+	if err := a.applyOrganizationMembership(user, user.OrganizationID, true); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "No active organization membership", nil, "")
 	}
 
@@ -96,13 +105,13 @@ func (a *App) Login(r *fastglue.Request) error {
 	}
 
 	// Generate tokens
-	accessToken, err := a.generateAccessToken(&user)
+	accessToken, err := a.generateAccessToken(user)
 	if err != nil {
 		a.Log.Error("Failed to generate access token", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
 	}
 
-	refreshToken, err := a.generateRefreshToken(&user)
+	refreshToken, err := a.generateRefreshToken(user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
@@ -112,7 +121,7 @@ func (a *App) Login(r *fastglue.Request) error {
 
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
-		User:      user,
+		User:      *user,
 	})
 }
 

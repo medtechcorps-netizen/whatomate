@@ -12,9 +12,11 @@ const (
 	cookieAccessName  = "whm_access"
 	cookieRefreshName = "whm_refresh"
 	cookieCSRFName    = "whm_csrf"
-	// cookieSSOBindName binds a one-time SSO exchange code to the browser
-	// whose SSO callback it was issued to. It carries no session.
-	cookieSSOBindName = "whm_sso_bind"
+	// cookieSSOBindPrefix + an attempt id names the cookie that binds one SSO
+	// exchange code to the browser whose callback it was issued to. Each
+	// attempt has its own, so one exchange never clears another's. It carries
+	// no session.
+	cookieSSOBindPrefix = "whm_sso_bind_"
 )
 
 // setAuthCookies sets httpOnly auth cookies and a JS-readable CSRF cookie.
@@ -99,12 +101,12 @@ func (a *App) clearAuthCookies(r *fastglue.Request) {
 	}
 }
 
-// setSSOBindingCookie sets (maxAge > 0) or expires (maxAge < 0) the SSO
-// binding cookie: httpOnly, sent only to the exchange on the refresh route,
-// and only for as long as the code it binds is valid.
-func (a *App) setSSOBindingCookie(r *fastglue.Request, value string, maxAge int) {
+// setSSOBindingCookie sets (maxAge > 0) or expires (maxAge < 0) the binding
+// cookie of one SSO attempt: httpOnly, sent only to the exchange on the
+// refresh route, and only for as long as the code it binds is valid.
+func (a *App) setSSOBindingCookie(r *fastglue.Request, attempt, value string, maxAge int) {
 	c := fasthttp.AcquireCookie()
-	c.SetKey(cookieSSOBindName)
+	c.SetKey(cookieSSOBindPrefix + attempt)
 	c.SetValue(value)
 	c.SetHTTPOnly(true)
 	c.SetSecure(a.Config.Cookie.Secure)

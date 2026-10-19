@@ -757,7 +757,8 @@ func TestApp_CallbackSSO_CustomProvider_ExistingUser_LoginSuccess(t *testing.T) 
 	// and its binding cookie, for the callback page to exchange.
 	assert.Empty(t, testutil.GetResponseCookie(req, "whm_access"))
 	assert.Empty(t, testutil.GetResponseCookie(req, "whm_refresh"))
-	assert.NotEmpty(t, testutil.GetResponseCookie(req, "whm_sso_bind"))
+	_, binding := laneABindingCookie(req)
+	assert.NotEmpty(t, binding)
 
 	// Token endpoint received our code.
 	assert.Equal(t, "auth-code-xyz", fake.LastTokenCode)
@@ -828,7 +829,8 @@ func TestApp_CallbackSSO_AutoCreateEnabledCreatesUserWithDefaultRole(t *testing.
 	require.NoError(t, app.CallbackSSO(req))
 	require.Equal(t, fasthttp.StatusTemporaryRedirect, testutil.GetResponseStatusCode(req))
 	assert.Empty(t, testutil.GetResponseCookie(req, "whm_access"))
-	assert.NotEmpty(t, testutil.GetResponseCookie(req, "whm_sso_bind"))
+	_, binding := laneABindingCookie(req)
+	assert.NotEmpty(t, binding)
 
 	var created models.User
 	require.NoError(t, app.DB.Where("email = ?", "auto@example.com").First(&created).Error)

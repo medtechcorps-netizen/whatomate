@@ -249,11 +249,30 @@ func (a *App) InitSSO(r *fastglue.Request) error {
 const ssoExchangeTTL = 60 * time.Second
 
 // ssoExchangeGrant is what an SSO callback stores under its one-time code:
-// whom to sign in, and the binding cookie value of the browser it was issued
-// to.
+// whom to sign in, through which organization's SSO, and the binding cookie
+// (its attempt id and value) of the browser it was issued to.
 type ssoExchangeGrant struct {
 	UserID  string `json:"user_id"`
+	OrgID   string `json:"org_id"`
+	Attempt string `json:"attempt"`
 	Binding string `json:"binding"`
+}
+
+// ssoOrganizationMember tells whether user may sign in through the SSO of
+// organization orgID: it is their organization, or they hold a membership
+// there. The callback checks it, and the exchange again (the grant waits up
+// to ssoExchangeTTL).
+func (a *App) ssoOrganizationMember(user *models.User, orgID uuid.UUID) (bool, error) {
+	if user.OrganizationID == orgID {
+		return true, nil
+	}
+	var count int64
+	if err := a.DB.Model(&models.UserOrganization{}).
+		Where("user_id = ? AND organization_id = ?", user.ID, orgID).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // CallbackSSO handles OAuth callback. It does not set the session cookies:
@@ -429,16 +448,12 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 
 		a.Log.Info("Created SSO user", "user_id", user.ID, "email", user.Email, "provider", provider)
 	} else {
-		var membershipCount int64
-		if user.OrganizationID == orgID {
-			membershipCount = 1
-		} else if err := a.DB.Model(&models.UserOrganization{}).
-			Where("user_id = ? AND organization_id = ?", user.ID, orgID).
-			Count(&membershipCount).Error; err != nil {
+		member, err := a.ssoOrganizationMember(&user, orgID)
+		if err != nil {
 			a.redirectWithError(r, "Failed to verify organization membership")
 			return nil
 		}
-		if membershipCount == 0 {
+		if !member {
 			a.redirectWithError(r, "User is not a member of this organization")
 			return nil
 		}
@@ -460,8 +475,14 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 	// in the URL (useless without the binding cookie, and single-use); the
 	// tokens are only issued by the exchange.
 	exchangeCode := generateRandomString(43)
+	attempt := generateRandomString(16)
 	binding := generateRandomString(43)
-	grant, err := json.Marshal(ssoExchangeGrant{UserID: user.ID.String(), Binding: binding})
+	grant, err := json.Marshal(ssoExchangeGrant{
+		UserID:  user.ID.String(),
+		OrgID:   orgID.String(),
+		Attempt: attempt,
+		Binding: binding,
+	})
 	if err != nil {
 		a.redirectWithError(r, "Failed to complete authentication")
 		return nil
@@ -473,7 +494,7 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 		a.redirectWithError(r, "Failed to complete authentication")
 		return nil
 	}
-	a.setSSOBindingCookie(r, binding, int(ssoExchangeTTL/time.Second))
+	a.setSSOBindingCookie(r, attempt, binding, int(ssoExchangeTTL/time.Second))
 
 	// Redirect to the frontend SSO callback page, which exchanges the code.
 	basePath := sanitizeRedirectPath(a.Config.Server.BasePath)
@@ -483,14 +504,13 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 	return nil
 }
 
-// exchangeSSOSession issues the session an SSO callback stored under `code`.
+// exchangeSSOSession issues the session an SSO callback granted under `code`.
 // The code is single-use (GETDEL, whatever the outcome) and valid only with
-// the binding cookie the callback set in the same browser. The answer is the
-// one a password login gives: the session cookies and {expires_in, user}.
+// the binding cookie of its own attempt, set by the callback in the same
+// browser (and cleared here; no other attempt's). Membership, organization
+// and role are resolved now, as a password login does (issueLoginSession),
+// and the user must still be a member of the organization whose SSO it was.
 func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
-	binding := string(r.RequestCtx.Request.Header.Cookie(cookieSSOBindName))
-	// The binding is spent with the code.
-	a.setSSOBindingCookie(r, "", -1)
 	invalid := func(reason string) error {
 		a.Log.Warn("SSO exchange rejected", "reason", reason)
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid or expired sign-in, please try again", nil, "")
@@ -505,9 +525,12 @@ func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
 		return invalid("sso_code_unknown")
 	}
 	var grant ssoExchangeGrant
-	if err := json.Unmarshal(stored, &grant); err != nil {
+	if err := json.Unmarshal(stored, &grant); err != nil || grant.Attempt == "" {
 		return invalid("sso_code_corrupt")
 	}
+	// This attempt's binding is spent with its code.
+	binding := string(r.RequestCtx.Request.Header.Cookie(cookieSSOBindPrefix + grant.Attempt))
+	a.setSSOBindingCookie(r, grant.Attempt, "", -1)
 	if binding == "" || binding != grant.Binding {
 		return invalid("sso_binding_mismatch")
 	}
@@ -515,30 +538,26 @@ func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
 	if err != nil {
 		return invalid("sso_grant_user")
 	}
+	orgID, err := uuid.Parse(grant.OrgID)
+	if err != nil {
+		return invalid("sso_grant_org")
+	}
 	var user models.User
-	if err := a.DB.Where("id = ?", userID).First(&user).Error; err != nil {
+	if err := a.DB.Preload("Role").Where("id = ?", userID).First(&user).Error; err != nil {
 		return invalid("sso_user_gone")
 	}
 	if !user.IsActive {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Account is disabled", nil, "")
 	}
-
-	accessToken, err := a.generateAccessToken(&user)
+	member, err := a.ssoOrganizationMember(&user, orgID)
 	if err != nil {
-		a.Log.Error("Failed to generate access token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Failed to verify organization membership", nil, "")
 	}
-	refreshToken, err := a.generateRefreshToken(&user)
-	if err != nil {
-		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+	if !member {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "User is not a member of this organization", nil, "")
 	}
-	a.setAuthCookies(r, accessToken, refreshToken)
 
-	return r.SendEnvelope(CookieAuthResponse{
-		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
-		User:      user,
-	})
+	return a.issueLoginSession(r, &user)
 }
 
 // GetSSOSettings returns all SSO provider configs for the organization (admin only)

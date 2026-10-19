@@ -508,7 +508,8 @@ export async function revokeRefreshToken(
     try {
       await axios.post(
         `${API_BASE_URL}/auth/refresh`,
-        // Without Web Locks: cookie-neutral (its /auth/logout clears them).
+        // Without Web Locks: cookie-neutral. This page cannot order a cookie
+        // change against other tabs, so it changes none (no /auth/logout follows).
         webLocks() ? { revoke: true } : { revoke: true, keep_cookies: true },
         {
           withCredentials: true,
@@ -764,6 +765,8 @@ async function finishLogout(
 // sendLogoutRequests revokes the refresh token (aborted after
 // LOGOUT_REVOKE_BUDGET_MS) and then calls /auth/logout, for the session that
 // `ended` ended, unless a newer session began. The caller holds the lock.
+// A page that cannot hold the shared lock only revokes, cookie-neutral: the
+// cookie clearing stays pending for a page that can order it.
 async function sendLogoutRequests(ended: string, identity?: string): Promise<void> {
   // A newer sign-in has begun: its session is not this logout's to end.
   if (readSessionMarker() !== ended) return;
@@ -778,6 +781,7 @@ async function sendLogoutRequests(ended: string, identity?: string): Promise<voi
     // Nothing of the revoke may land after this point.
     revoke.abort();
   }
+  if (!webLocks()) return;
   if (readSessionMarker() !== ended) return;
   // Someone else signed in meanwhile: the cookies are theirs now.
   const current = storedIdentity();
@@ -1040,9 +1044,9 @@ function isUnsupported(error: unknown): boolean {
 
 // endUnsupportedSession ends a session that existed in a browser without Web
 // Locks once it would need a refresh (which may not run there): logged out
-// like any other (a cookie-neutral revoke, then /auth/logout; nothing else can
-// set cookies in this mode), and the user is sent to the login page, which
-// says why a sign-in is refused.
+// cookie-neutral (the refresh chain revoked; the cookie clearing stays pending
+// for a page that holds the lock), and the user is sent to the login page,
+// which says why a sign-in is refused.
 function endUnsupportedSession() {
   void api.post("/auth/logout", {}).catch(() => undefined);
   expireSession();
