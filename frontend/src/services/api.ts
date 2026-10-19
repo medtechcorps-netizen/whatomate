@@ -525,32 +525,49 @@ export async function revokeRefreshToken(
     const pinned = !webLocks();
     const csrfToken = pinned ? recordedLogoutCsrf(endedMarker) : getCookie("whm_csrf");
     if (!csrfToken) return;
+    let status: number | undefined;
     try {
-      await axios.post(
-        `${API_BASE_URL}/auth/refresh`,
-        // Without Web Locks: cookie-neutral. This page cannot order a cookie
-        // change against other tabs, so it changes none (no /auth/logout follows).
-        webLocks() ? { revoke: true } : { revoke: true, keep_cookies: true },
-        {
-          withCredentials: true,
-          timeout: REVOKE_REQUEST_TIMEOUT_MS,
-          headers: { "X-CSRF-Token": csrfToken },
+      if (pinned) {
+        // Without Web Locks: cookie-neutral (this page cannot order a cookie
+        // change against other tabs, so it changes none; no /auth/logout
+        // follows), and with keepalive: the page may leave at once (a full
+        // navigation to the login page), and no other page finishes this
+        // revoke for it.
+        const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+          keepalive: true,
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+          body: JSON.stringify({ revoke: true, keep_cookies: true }),
           signal,
-        },
-      );
-      return;
+        });
+        if (response.ok) return;
+        status = response.status;
+      } else {
+        await axios.post(
+          `${API_BASE_URL}/auth/refresh`,
+          { revoke: true },
+          {
+            withCredentials: true,
+            timeout: REVOKE_REQUEST_TIMEOUT_MS,
+            headers: { "X-CSRF-Token": csrfToken },
+            signal,
+          },
+        );
+        return;
+      }
     } catch (error) {
       if (signal?.aborted) return;
-      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
-      // The CSRF cookie was rotated mid-flight: try again with the new one
-      // (never without Web Locks: the new one may be a newer session's).
-      if (status === 403 && !pinned && getCookie("whm_csrf") !== csrfToken) continue;
-      // The revoke shares the per-IP refresh rate limit, which a busy
-      // clinic behind one NAT address can exhaust: wait and retry a 429.
-      // Anything else, or a last failure, still lets the logout go ahead.
-      if (status !== 429 || attempt >= REVOKE_RETRY_DELAYS_MS.length) return;
-      await delay(REVOKE_RETRY_DELAYS_MS[attempt], signal);
+      status = axios.isAxiosError(error) ? error.response?.status : undefined;
     }
+    // The CSRF cookie was rotated mid-flight: try again with the new one
+    // (never without Web Locks: the new one may be a newer session's).
+    if (status === 403 && !pinned && getCookie("whm_csrf") !== csrfToken) continue;
+    // The revoke shares the per-IP refresh rate limit, which a busy clinic
+    // behind one NAT address can exhaust: wait and retry a 429. Anything else,
+    // or a last failure, still lets the logout go ahead.
+    if (status !== 429 || attempt >= REVOKE_RETRY_DELAYS_MS.length) return;
+    await delay(REVOKE_RETRY_DELAYS_MS[attempt], signal);
   }
 }
 

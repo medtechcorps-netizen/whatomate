@@ -455,6 +455,35 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       const custom = onPost ? await onPost(label, options) : undefined
       return custom ?? { data: { data: {} }, status: 200 }
     })
+    recordFetches(async (url, body, options) => {
+      const label = postLabel(url, body, options)
+      order.push(label)
+      return onPost ? await onPost(label, options) : undefined
+    })
+  }
+
+  // Routes the API client's fetch calls (the keepalive revoke of a page
+  // without Web Locks) to `onFetch`, answered like axios.post would be: a
+  // thrown httpError becomes that status. A fetch spy a test installed itself
+  // is left in place.
+  function recordFetches(onFetch: (url: string, body: unknown, options: any) => Promise<unknown> | unknown) {
+    const current = globalThis.fetch as unknown as { laneARecorder?: boolean }
+    if (vi.isMockFunction(globalThis.fetch) && !current.laneARecorder) return
+    const recorder = vi.fn(async (url: string, init: RequestInit = {}) => {
+      const body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body
+      try {
+        const custom = (await onFetch(String(url), body, { headers: init.headers })) as
+          | { data?: unknown; status?: number }
+          | undefined
+        return new Response(JSON.stringify(custom?.data ?? { data: {} }), { status: custom?.status ?? 200 })
+      } catch (error) {
+        const status = (error as { response?: { status?: number } })?.response?.status
+        if (status) return new Response(JSON.stringify({ status: 'error' }), { status })
+        throw error
+      }
+    })
+    Object.assign(recorder, { laneARecorder: true })
+    vi.stubGlobal('fetch', recorder)
   }
 
   // Another tab holds the shared refresh lock until the returned release().
@@ -1835,10 +1864,28 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     FakeBroadcastChannel.channels.clear()
   })
 
+  it('without Web Locks the revoke goes out with keepalive, cookie-neutral (the page may leave at once)', async () => {
+    removeWebLocks()
+    const fetchSpy = vi.fn(async (..._args: unknown[]) => new Response('{}'))
+    vi.stubGlobal('fetch', fetchSpy)
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    recordPosts([])
+
+    await api.post('/auth/logout', {})
+    await whenLogoutSettled()
+
+    expect(postSpy).not.toHaveBeenCalled()
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit]
+    expect(url).toMatch(/\/api\/auth\/refresh$/)
+    expect(init).toMatchObject({ method: 'POST', credentials: 'include', keepalive: true })
+    expect((init.headers as Record<string, string>)['X-CSRF-Token']).toBe('csrf-token-1')
+    expect(JSON.parse(init.body as string)).toEqual({ revoke: true, keep_cookies: true })
+  })
+
   it('a page without Web Locks that logged out sends no keepalive revoke when it closes', async () => {
     removeWebLocks()
-    const fetchSpy = vi.fn(async () => new Response('{}'))
-    vi.stubGlobal('fetch', fetchSpy)
     localStorage.setItem('whm_session_id', 'session-a')
     const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
     const order: string[] = []
@@ -1850,8 +1897,8 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(JSON.parse(localStorage.getItem('whm_logout_pending')!).marker).toBe('ended:session-a')
     window.dispatchEvent(new Event('pagehide'))
 
+    // Its one revoke (a keepalive fetch, cookie-neutral), and nothing more.
     expect(order).toEqual(['revoke csrf-token-1'])
-    expect(fetchSpy).not.toHaveBeenCalled()
   })
 
   it('without Web Locks a revoke retried after a 429 still presents the recorded CSRF value', async () => {
@@ -2416,6 +2463,9 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       posts.push({ url: url.replace(/^.*\/api/, ''), body })
       return { data: { data: {} }, status: 200 }
     })
+    recordFetches((url, body) => {
+      posts.push({ url: url.replace(/^.*\/api/, ''), body })
+    })
 
     await expect(api.get('/contacts')).rejects.toMatchObject({ response: { status: 401 } })
     await whenLogoutSettled()
@@ -2443,6 +2493,9 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     postSpy.mockImplementation(async (url: string, body: unknown) => {
       posts.push({ url: url.replace(/^.*\/api/, ''), body })
       return { data: { data: {} }, status: 200 }
+    })
+    recordFetches((url, body) => {
+      posts.push({ url: url.replace(/^.*\/api/, ''), body })
     })
 
     await sandboxed.api.post('/auth/logout', {})

@@ -286,7 +286,9 @@ async function navigateInApp(page: Page, path: string) {
 }
 
 // Answers the next GET of `page` matching `pattern` with a 401 (once).
-async function unauthorizedOnce(page: Page, pattern: RegExp) {
+// Resolves once the route is in place, with `served`, which settles when the
+// 401 has gone out (an object, so awaiting the route does not wait for it).
+async function unauthorizedOnce(page: Page, pattern: RegExp): Promise<{ served: Promise<void> }> {
   let answered = false
   let served!: () => void
   const done = new Promise<void>((resolve) => {
@@ -301,7 +303,7 @@ async function unauthorizedOnce(page: Page, pattern: RegExp) {
     await route.fulfill({ status: 401, json: { status: 'error', message: 'Unauthorized' } })
     served()
   })
-  return done
+  return { served: done }
 }
 
 const UNSUPPORTED = "This browser can't keep sessions safe across tabs."
@@ -586,7 +588,7 @@ test.describe('Logout during a token refresh', () => {
         // cookies.
         await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
         await exchange.ready
-        const unauthorized = unauthorizedOnce(other, /\/api\/users(\?.*)?$/)
+        const unauthorized = (await unauthorizedOnce(other, /\/api\/users(\?.*)?$/)).served
         await navigateInApp(other, '/settings/users')
         await unauthorized
         await expect.poll(() => pendingSessionLocks(other)).toBe(1)
@@ -775,7 +777,7 @@ test.describe('Logout during a token refresh', () => {
     // lock (the sign-in already cleared the stored identity, so no proactive
     // refresh would run): its refresh waits for the lock, and sends nothing
     // with A's cookies.
-    const unauthorized = unauthorizedOnce(other, /\/api\/users(\?.*)?$/)
+    const unauthorized = (await unauthorizedOnce(other, /\/api\/users(\?.*)?$/)).served
     await navigateInApp(other, '/settings/users')
     await unauthorized
     await expect.poll(() => pendingSessionLocks(other)).toBe(1)
@@ -834,6 +836,7 @@ test.describe('Logout during a token refresh', () => {
       const other = await context.newPage()
       await other.goto('/profile', { waitUntil: 'domcontentloaded' })
       const refreshes = countRefreshes(other)
+      const switchingTabRefreshes = countRefreshes(page)
 
       // This tab switches to the second organization; the answer is held.
       const order: string[] = []
@@ -844,19 +847,24 @@ test.describe('Logout during a token refresh', () => {
       expect(held.cookies().whm_refresh).toBeTruthy()
 
       // The other tab's refresh comes due while the switch holds the lock: it
-      // waits, and sends nothing with the pre-switch cookies.
+      // waits, and sends nothing with the pre-switch cookies. (The expiry is
+      // shared, so the switching tab's own proactive refresh may come due
+      // too, and wait the same way.)
       await startProactiveRefresh(other)
-      await expect.poll(() => pendingSessionLocks(other)).toBe(1)
+      await expect.poll(() => pendingSessionLocks(other)).toBeGreaterThanOrEqual(1)
       await other.waitForTimeout(2_000)
       expect(refreshes()).toBe(0)
+      expect(switchingTabRefreshes()).toBe(0)
 
       const reloaded = page.waitForEvent('domcontentloaded')
       held.release()
       await reloaded
       await other.waitForTimeout(3_000)
 
-      // The jar holds exactly the switch's cookies, for the second organization.
+      // The jar holds exactly the switch's cookies, for the second organization;
+      // neither tab refreshed (the switch's answer retired those refreshes).
       expect(refreshes()).toBe(0)
+      expect(switchingTabRefreshes()).toBe(0)
       for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
         expect(await cookieValue(context, name)).toBe(held.cookies()[name])
       }
