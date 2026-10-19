@@ -21,8 +21,8 @@ import {
 // - every cookie-changing request runs under one Web Lock shared by all tabs;
 // - a session change in one tab aborts another tab's refresh in flight (its
 //   late Set-Cookie is discarded);
-// - while an SSO sign-in is at the identity provider, no tab refreshes or
-//   logs out the session it started from;
+// - the SSO callback sets no cookie: the callback page exchanges a one-time
+//   code for the session, under the same lock, like a password sign-in;
 // - without Web Locks the app signs nobody in (fail closed).
 //
 // Answers are held back for real: each is fetched upstream through a separate
@@ -38,9 +38,13 @@ import {
 // and /me checks fail. A build without the budget abort never fails the
 // attempt at all (it gets its answer at ~7.5 s). Expected to fail against
 // f9f8c65d (not yet run): the no-Web-Locks case (that build signed in through
-// a best-effort fallback) and the SSO case (the open tab's refresh went out
-// while B was at the identity provider, and its held answer replaced B's
-// cookies).
+// a best-effort fallback). The SSO exchange cases need the exchange (the
+// callback page of fdb8937b and earlier never sends one).
+//
+// The identity provider is not run here: the callback page is opened with a
+// code, and its exchange is answered with a real session of the user (a
+// password sign-in upstream). The server side of the exchange (single use,
+// binding cookie, expiry, no cookie on the callback) has its own Go tests.
 
 type Held = {
   // The browser sent the request (it reached the route handler).
@@ -181,18 +185,56 @@ async function expectRefreshRejected(newContext: () => Promise<APIRequestContext
   }
 }
 
-// B's real session, as an identity provider round trip would set it.
-async function sessionOf(newContext: () => Promise<APIRequestContext>, user: TestUser) {
-  const idp = await newContext()
-  const signIn = await idp.post('/api/auth/login', { data: { email: user.email, password: user.password } })
-  expect(signIn.status()).toBe(200)
-  const cookies = (await idp.storageState()).cookies
-  await idp.dispose()
-  return {
-    cookies,
-    refresh: cookies.find((c) => c.name === 'whm_refresh')!.value,
-    csrf: cookies.find((c) => c.name === 'whm_csrf')!.value,
-  }
+function isExchange(request: { url(): string; postData(): string | null }) {
+  return request.url().endsWith('/api/auth/refresh') && (request.postData() ?? '').includes('"sso_exchange"')
+}
+
+// Answers the next SSO code exchange of `page` with a real session of `user`
+// (as the server would for a valid code), held until release(); `status`
+// answers it with a rejection instead.
+async function answerExchange(
+  page: Page,
+  newContext: () => Promise<APIRequestContext>,
+  user: TestUser,
+  order: string[],
+  options: { hold?: boolean; status?: number } = {},
+): Promise<Held> {
+  let cookies: Record<string, string> = {}
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  if (!options.hold) release()
+  let seen!: () => void
+  const started = new Promise<void>((resolve) => {
+    seen = resolve
+  })
+  let captured!: () => void
+  const ready = new Promise<void>((resolve) => {
+    captured = resolve
+  })
+  await page.route('**/api/auth/refresh', async (route) => {
+    if (!isExchange(route.request())) {
+      await route.continue()
+      return
+    }
+    order.push('exchange')
+    seen()
+    if (options.status) {
+      captured()
+      await route.fulfill({ status: options.status, json: { status: 'error', message: 'Invalid or expired sign-in, please try again' } })
+      return
+    }
+    const upstream = await newContext()
+    const response = await upstream.post('/api/auth/login', { data: { email: user.email, password: user.password } })
+    cookies = setCookies(response.headersArray())
+    captured()
+    await gate
+    order.push('exchange landed')
+    await route.fulfill({ response }).catch(() => undefined)
+    await upstream.dispose()
+  })
+  return { started, ready, release: () => release(), cookies: () => cookies }
 }
 
 // Lets `page` discover the Google SSO provider for a workspace code.
@@ -378,8 +420,6 @@ test.describe('Logout during a token refresh', () => {
     baseURL,
   }) => {
     const newContext = () => playwright.request.newContext({ baseURL })
-    const b = await sessionOf(newContext, TEST_USERS.manager)
-
     await loginAsAdmin(page)
     const originalRefresh = await cookieValue(context, 'whm_refresh')
     const other = await context.newPage()
@@ -395,89 +435,170 @@ test.describe('Logout during a token refresh', () => {
     await logout(page)
     await expect(page).toHaveURL(/\/login/)
 
+    // B's SSO: the provider sends the browser back with a one-time code; the
+    // callback page's exchange is answered with B's session.
+    const exchange = await answerExchange(page, newContext, TEST_USERS.manager, order)
     await offerGoogleSso(page)
-    await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, async (route) => {
-      order.push('sso')
-      await context.addCookies(b.cookies)
-      await route.fulfill({ status: 302, headers: { location: '/auth/sso/callback' } })
-    })
+    await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, (route) =>
+      route.fulfill({ status: 302, headers: { location: '/auth/sso/callback?code=e2e-code-b' } }),
+    )
     await startGoogleSso(page)
-    await page.waitForTimeout(1_000)
-    // The SSO start waits for the logout ahead of it.
-    expect(order).toEqual([])
+    await exchange.started
+    await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 30_000 })
 
-    await page.waitForURL(/\/auth\/sso\/callback/, { timeout: 20_000 })
-    await expect.poll(() => order.includes('sso')).toBe(true)
-    expect(order.slice(0, 3)).toEqual(['revoke', 'logout', 'sso'])
-    await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 15_000 })
-
+    // The exchange waited for the logout ahead of it.
+    expect(order.slice(0, 3)).toEqual(['revoke', 'logout', 'exchange'])
+    const issued = exchange.cookies()
     // Nothing of the old logout carried B's cookies or CSRF token...
     for (const request of sent) {
-      expect(request.cookie).not.toContain(b.refresh)
-      expect(request.csrf).not.toBe(b.csrf)
+      expect(request.cookie).not.toContain(issued.whm_refresh)
+      expect(request.csrf).not.toBe(issued.whm_csrf)
     }
-    // ...and B's session is the one in the jar, and it works.
-    expect(await cookieValue(context, 'whm_refresh')).toBe(b.refresh)
+    // ...and B's session is the one in the jar, exactly, and it works.
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+      expect(await cookieValue(context, name)).toBe(issued[name])
+    }
     const me = await page.request.get('/api/me')
     expect(me.status()).toBe(200)
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
     await expectRefreshRejected(newContext, [originalRefresh])
   })
 
-  test('an open tab refreshes nothing while an SSO sign-in in another tab is at the identity provider', async ({
+  for (const first of ['refresh', 'exchange'] as const) {
+    test(`an SSO exchange and another tab's refresh never overlap (${first} first): the exchange's cookies stay`, async ({
+      page,
+      context,
+      playwright,
+      baseURL,
+    }) => {
+      const newContext = () => playwright.request.newContext({ baseURL })
+      await loginAsAdmin(page)
+      const other = await context.newPage()
+      await other.goto('/', { waitUntil: 'domcontentloaded' })
+      const order: string[] = []
+      const exchange = await answerExchange(page, newContext, TEST_USERS.manager, order, { hold: first === 'exchange' })
+      const refreshes = countRefreshes(other)
+
+      if (first === 'refresh') {
+        // The other tab's refresh (A's cookies) is in flight; then this tab's
+        // callback page asks for B's session: the exchange waits for it.
+        const held = await holdResponse(other, '/auth/refresh', newContext, order, 'refresh landed')
+        await startProactiveRefresh(other)
+        await held.ready
+        await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
+        await expect.poll(() => pendingSessionLocks(page)).toBe(1)
+        expect(order).toEqual([])
+        held.release()
+        await exchange.started
+        expect(order.slice(0, 2)).toEqual(['refresh landed', 'exchange'])
+      } else {
+        // The exchange is in flight (its answer held); then the other tab's
+        // API call gets a 401: its refresh waits, and sends nothing with A's
+        // cookies.
+        await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
+        await exchange.ready
+        const unauthorized = unauthorizedOnce(other, /\/api\/users(\?.*)?$/)
+        await navigateInApp(other, '/settings/users')
+        await unauthorized
+        await expect.poll(() => pendingSessionLocks(other)).toBe(1)
+        await other.waitForTimeout(2_000)
+        expect(refreshes()).toBe(0)
+        exchange.release()
+      }
+      await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 30_000 })
+      await other.waitForTimeout(3_000)
+
+      // The jar holds exactly B's session (as the exchange issued it).
+      if (first === 'exchange') expect(refreshes()).toBe(0)
+      for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+        expect(await cookieValue(context, name)).toBe(exchange.cookies()[name])
+      }
+      const me = await page.request.get('/api/me')
+      expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+    })
+  }
+
+  test('an SSO return after a long stay at the identity provider: open tabs refresh meanwhile, then the exchange', async ({
     page,
     context,
     playwright,
     baseURL,
   }) => {
     const newContext = () => playwright.request.newContext({ baseURL })
-    const b = await sessionOf(newContext, TEST_USERS.manager)
-
     await loginAsAdmin(page)
     const other = await context.newPage()
     await other.goto('/', { waitUntil: 'domcontentloaded' })
     const refreshes = countRefreshes(other)
     const order: string[] = []
-    // A refresh the open tab sent now would carry A's cookies; held here, its
-    // answer would land after B's.
-    const held = await holdResponse(other, '/auth/refresh', newContext, order, 'refresh landed')
+    const exchange = await answerExchange(page, newContext, TEST_USERS.manager, order)
 
-    // This tab starts an SSO sign-in as B while A's session is live, and
-    // leaves for the identity provider (a page without the app: the lock is
-    // let go).
+    // This tab leaves for the identity provider (a page without the app).
     await page.goto('/login', { waitUntil: 'domcontentloaded' })
     await offerGoogleSso(page)
-    await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, async (route) => {
-      order.push('sso')
-      await route.fulfill({ status: 302, headers: { location: '/__mock_idp' } })
-    })
+    await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, (route) =>
+      route.fulfill({ status: 302, headers: { location: '/__mock_idp' } }),
+    )
     await page.route('**/__mock_idp', (route) =>
       route.fulfill({ contentType: 'text/html', body: '<html><body>Identity provider</body></html>' }),
     )
     await startGoogleSso(page)
     await page.waitForURL(/__mock_idp/)
-    expect(await page.evaluate(() => localStorage.getItem('whm_sso_started'))).toBeTruthy()
 
-    // While B is at the identity provider, the open tab's refresh comes due.
+    // Meanwhile the open tab's session needs a refresh: nothing holds it back.
     await startProactiveRefresh(other)
-    await other.waitForTimeout(3_000)
-    expect(refreshes()).toBe(0)
-    // It keeps A's session meanwhile (it is not sent to the login page).
-    expect(other.url()).not.toContain('/login')
+    await expect.poll(() => refreshes()).toBe(1)
+    expect((await page.request.get('/api/me')).status()).toBe(200)
 
-    // The provider redirects back: B's cookies, then the callback page.
-    await context.addCookies(b.cookies)
-    await page.goto('/auth/sso/callback', { waitUntil: 'domcontentloaded' })
-    await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 15_000 })
-    // A refresh held from the provider phase would land now.
-    held.release()
-    await other.waitForTimeout(1_000)
+    // The provider sends the browser back, minutes later, with the code.
+    await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
+    await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 30_000 })
 
-    expect(refreshes()).toBe(0)
-    expect(await cookieValue(context, 'whm_refresh')).toBe(b.refresh)
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+      expect(await cookieValue(context, name)).toBe(exchange.cookies()[name])
+    }
     const me = await page.request.get('/api/me')
-    expect(me.status()).toBe(200)
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+  })
+
+  test('a replayed or expired SSO code changes nothing', async ({ page, context, playwright, baseURL }) => {
+    const newContext = () => playwright.request.newContext({ baseURL })
+    await loginAsAdmin(page)
+    const before: Record<string, string | undefined> = {}
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) before[name] = await cookieValue(context, name)
+    const marker = await page.evaluate(() => localStorage.getItem('whm_session_id'))
+    const order: string[] = []
+    await answerExchange(page, newContext, TEST_USERS.manager, order, { status: 401 })
+
+    await page.goto('/auth/sso/callback?code=a-used-code', { waitUntil: 'domcontentloaded' })
+    await expect(page.getByText('Invalid or expired sign-in', { exact: false })).toBeVisible()
+
+    expect(order).toEqual(['exchange'])
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+      expect(await cookieValue(context, name)).toBe(before[name])
+    }
+    expect(await page.evaluate(() => localStorage.getItem('whm_session_id'))).toBe(marker)
+    expect((await (await page.request.get('/api/me')).json()).data.email).toBe(TEST_USERS.admin.email)
+  })
+
+  test('without Web Locks an SSO callback exchanges nothing and writes nothing', async ({ page, context }) => {
+    await loginAsAdmin(page)
+    const before: Record<string, string | undefined> = {}
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) before[name] = await cookieValue(context, name)
+    const other = await context.newPage()
+    await other.addInitScript(withoutWebLocks)
+    const exchanges: string[] = []
+    other.on('request', (request) => {
+      if (isExchange(request)) exchanges.push(request.url())
+    })
+
+    await other.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
+    await expect(other.getByText(UNSUPPORTED, { exact: false })).toBeVisible()
+
+    expect(exchanges).toEqual([])
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+      expect(await cookieValue(context, name)).toBe(before[name])
+    }
+    expect((await (await page.request.get('/api/me')).json()).data.email).toBe(TEST_USERS.admin.email)
   })
 
   test('an API 401 while the refresh fails (a transient server fault) keeps the session', async ({

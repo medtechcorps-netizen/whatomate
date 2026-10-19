@@ -244,7 +244,24 @@ func (a *App) InitSSO(r *fastglue.Request) error {
 	return nil
 }
 
-// CallbackSSO handles OAuth callback
+// ssoExchangeTTL is how long the code an SSO callback issues can be
+// exchanged for the session.
+const ssoExchangeTTL = 60 * time.Second
+
+// ssoExchangeGrant is what an SSO callback stores under its one-time code:
+// whom to sign in, and the binding cookie value of the browser it was issued
+// to.
+type ssoExchangeGrant struct {
+	UserID  string `json:"user_id"`
+	Binding string `json:"binding"`
+}
+
+// CallbackSSO handles OAuth callback. It does not set the session cookies:
+// they would land with the navigation, unordered against the app's other
+// tabs (their refreshes and logouts). It stores the signed-in user under a
+// one-time code, bound to this browser by an httpOnly binding cookie, and
+// redirects to the frontend callback page, which exchanges the code under
+// the app's session lock (POST /auth/refresh {"sso_exchange": code}).
 func (a *App) CallbackSSO(r *fastglue.Request) error {
 	provider := r.RequestCtx.UserValue("provider").(string)
 	code := string(r.RequestCtx.QueryArgs().Peek("code"))
@@ -439,30 +456,89 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 		}
 	}
 
-	// Generate JWT tokens
-	accessToken, err := a.generateAccessToken(&user)
+	// A one-time code for the session, bound to this browser. The code goes
+	// in the URL (useless without the binding cookie, and single-use); the
+	// tokens are only issued by the exchange.
+	exchangeCode := generateRandomString(43)
+	binding := generateRandomString(43)
+	grant, err := json.Marshal(ssoExchangeGrant{UserID: user.ID.String(), Binding: binding})
 	if err != nil {
-		a.Log.Error("Failed to generate access token", "error", err)
 		a.redirectWithError(r, "Failed to complete authentication")
 		return nil
 	}
-
-	refreshToken, err := a.generateRefreshToken(&user)
-	if err != nil {
-		a.Log.Error("Failed to generate refresh token", "error", err)
+	storeCtx, cancelStore := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStore()
+	if err := a.Redis.Set(storeCtx, "sso:exchange:"+exchangeCode, grant, ssoExchangeTTL).Err(); err != nil {
+		a.Log.Error("Failed to store SSO exchange code", "error", err)
 		a.redirectWithError(r, "Failed to complete authentication")
 		return nil
 	}
+	a.setSSOBindingCookie(r, binding, int(ssoExchangeTTL/time.Second))
 
-	// Set auth cookies (tokens no longer exposed in URL)
-	a.setAuthCookies(r, accessToken, refreshToken)
-
-	// Redirect to frontend SSO callback page (cookies already set)
+	// Redirect to the frontend SSO callback page, which exchanges the code.
 	basePath := sanitizeRedirectPath(a.Config.Server.BasePath)
-	redirectURL := fmt.Sprintf("%s/auth/sso/callback", basePath)
+	redirectURL := fmt.Sprintf("%s/auth/sso/callback?code=%s", basePath, url.QueryEscape(exchangeCode))
 
 	r.RequestCtx.Redirect(redirectURL, fasthttp.StatusTemporaryRedirect)
 	return nil
+}
+
+// exchangeSSOSession issues the session an SSO callback stored under `code`.
+// The code is single-use (GETDEL, whatever the outcome) and valid only with
+// the binding cookie the callback set in the same browser. The answer is the
+// one a password login gives: the session cookies and {expires_in, user}.
+func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
+	binding := string(r.RequestCtx.Request.Header.Cookie(cookieSSOBindName))
+	// The binding is spent with the code.
+	a.setSSOBindingCookie(r, "", -1)
+	invalid := func(reason string) error {
+		a.Log.Warn("SSO exchange rejected", "reason", reason)
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid or expired sign-in, please try again", nil, "")
+	}
+	if a.Redis == nil {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "SSO state storage is unavailable", nil, "")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stored, err := a.Redis.GetDel(ctx, "sso:exchange:"+code).Bytes()
+	if err != nil {
+		return invalid("sso_code_unknown")
+	}
+	var grant ssoExchangeGrant
+	if err := json.Unmarshal(stored, &grant); err != nil {
+		return invalid("sso_code_corrupt")
+	}
+	if binding == "" || binding != grant.Binding {
+		return invalid("sso_binding_mismatch")
+	}
+	userID, err := uuid.Parse(grant.UserID)
+	if err != nil {
+		return invalid("sso_grant_user")
+	}
+	var user models.User
+	if err := a.DB.Where("id = ?", userID).First(&user).Error; err != nil {
+		return invalid("sso_user_gone")
+	}
+	if !user.IsActive {
+		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Account is disabled", nil, "")
+	}
+
+	accessToken, err := a.generateAccessToken(&user)
+	if err != nil {
+		a.Log.Error("Failed to generate access token", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+	}
+	refreshToken, err := a.generateRefreshToken(&user)
+	if err != nil {
+		a.Log.Error("Failed to generate refresh token", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+	}
+	a.setAuthCookies(r, accessToken, refreshToken)
+
+	return r.SendEnvelope(CookieAuthResponse{
+		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
+		User:      user,
+	})
 }
 
 // GetSSOSettings returns all SSO provider configs for the organization (admin only)

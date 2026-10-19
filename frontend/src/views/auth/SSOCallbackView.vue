@@ -1,23 +1,35 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
-import { api } from '@/services/api'
+import {
+  api,
+  exchangeSsoCode,
+  SESSION_BUSY_CODE,
+  SESSION_UNSUPPORTED_CODE,
+} from '@/services/api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Loader2, AlertCircle, CheckCircle } from 'lucide-vue-next'
 import { toast } from 'vue-sonner'
 
 const { t } = useI18n()
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 
 const status = ref<'loading' | 'success' | 'error'>('loading')
 const errorMessage = ref('')
 
 onMounted(async () => {
+  // The SSO redirect set no cookie: it handed over a one-time code, bound to
+  // this browser. Take it off the URL (it is single-use), then exchange it
+  // for the session, ordered like a password sign-in.
+  const code = typeof route.query.code === 'string' ? route.query.code : ''
+  if (code) void router.replace({ query: { ...route.query, code: undefined } })
   try {
-    // Cookies were set by the SSO redirect — call /me to get the user object
+    if (!code) throw new Error('missing code')
+    await exchangeSsoCode(code)
     const response = await api.get('/me')
     const user = response.data.data
 
@@ -37,7 +49,18 @@ onMounted(async () => {
     }, 1000)
   } catch (error: any) {
     status.value = 'error'
-    errorMessage.value = error.response?.data?.message || t('auth.ssoLoginFailed')
+    if (error?.code === SESSION_UNSUPPORTED_CODE) {
+      errorMessage.value = t('errors.unsupportedBrowser')
+    } else if (
+      error?.code === SESSION_BUSY_CODE ||
+      error?.code === 'ERR_CANCELED' ||
+      error?.code === 'ECONNABORTED' ||
+      error?.code === 'ETIMEDOUT'
+    ) {
+      errorMessage.value = t('errors.timeout')
+    } else {
+      errorMessage.value = error.response?.data?.message || t('auth.ssoLoginFailed')
+    }
   }
 })
 </script>

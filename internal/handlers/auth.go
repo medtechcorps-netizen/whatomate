@@ -290,6 +290,9 @@ func (a *App) Register(r *fastglue.Request) error {
 // revokes without touching the cookies: a closing page sends it with
 // keepalive, and its answer may arrive after a newer session has set its own
 // cookies, which it must not clear. The next page clears the old ones.
+//
+// A body of {"sso_exchange": code} exchanges the one-time code of an SSO
+// callback for the session instead (see exchangeSSOSession).
 func (a *App) RefreshToken(r *fastglue.Request) error {
 	// Failures are logged with a reason code and the user ID only — never a
 	// token value. Definitive rejections answer 401, and the client ends the
@@ -308,8 +311,15 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		RefreshToken string `json:"refresh_token"`
 		Revoke       bool   `json:"revoke"`
 		KeepCookies  bool   `json:"keep_cookies"`
+		SSOExchange  string `json:"sso_exchange"`
 	}
 	_ = r.Decode(&body, "json")
+
+	// The SSO callback page exchanges its one-time code for the session; no
+	// refresh token is involved.
+	if body.SSOExchange != "" {
+		return a.exchangeSSOSession(r, body.SSOExchange)
+	}
 
 	// Read refresh token from cookie first, fall back to JSON body.
 	refreshTokenStr := string(r.RequestCtx.Request.Header.Cookie(cookieRefreshName))

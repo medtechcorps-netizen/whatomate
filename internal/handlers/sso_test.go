@@ -753,16 +753,18 @@ func TestApp_CallbackSSO_CustomProvider_ExistingUser_LoginSuccess(t *testing.T) 
 	require.NoError(t, app.CallbackSSO(req))
 	assert.Equal(t, fasthttp.StatusTemporaryRedirect, testutil.GetResponseStatusCode(req))
 
-	// Auth cookies set on the response.
-	assert.NotEmpty(t, testutil.GetResponseCookie(req, "whm_access"))
-	assert.NotEmpty(t, testutil.GetResponseCookie(req, "whm_refresh"))
+	// No session cookie on the navigation: a one-time code (in the redirect)
+	// and its binding cookie, for the callback page to exchange.
+	assert.Empty(t, testutil.GetResponseCookie(req, "whm_access"))
+	assert.Empty(t, testutil.GetResponseCookie(req, "whm_refresh"))
+	assert.NotEmpty(t, testutil.GetResponseCookie(req, "whm_sso_bind"))
 
 	// Token endpoint received our code.
 	assert.Equal(t, "auth-code-xyz", fake.LastTokenCode)
 
-	// Redirect target is the frontend SSO callback (no token in URL).
+	// Redirect target is the frontend SSO callback with the code (no token in URL).
 	loc := string(req.RequestCtx.Response.Header.Peek("Location"))
-	assert.Contains(t, loc, "/auth/sso/callback")
+	assert.Contains(t, loc, "/auth/sso/callback?code=")
 	assert.NotContains(t, loc, "access_token", "token must not be exposed in URL")
 
 	// Existing user got SSO fields populated.
@@ -825,7 +827,8 @@ func TestApp_CallbackSSO_AutoCreateEnabledCreatesUserWithDefaultRole(t *testing.
 
 	require.NoError(t, app.CallbackSSO(req))
 	require.Equal(t, fasthttp.StatusTemporaryRedirect, testutil.GetResponseStatusCode(req))
-	assert.NotEmpty(t, testutil.GetResponseCookie(req, "whm_access"))
+	assert.Empty(t, testutil.GetResponseCookie(req, "whm_access"))
+	assert.NotEmpty(t, testutil.GetResponseCookie(req, "whm_sso_bind"))
 
 	var created models.User
 	require.NoError(t, app.DB.Where("email = ?", "auto@example.com").First(&created).Error)

@@ -635,9 +635,8 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
   })
 
-  for (const locking of ['Web Locks', 'no Web Locks (a session from before)']) {
-    it(`a logout waits for a refresh in flight, which then leaves no trace (${locking})`, async () => {
-      if (locking !== 'Web Locks') removeWebLocks()
+  {
+    it('a logout waits for a refresh in flight, which then leaves no trace', async () => {
       let releaseRefresh!: () => void
       const refreshGate = new Promise<void>((resolve) => {
         releaseRefresh = resolve
@@ -965,16 +964,16 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const adapter = vi.fn(async (config: InternalAxiosRequestConfig) =>
       ok(config, { data: { expires_in: 900, user: {} } }),
     )
-    const { api, beginSsoSignIn, SESSION_BUSY_CODE } = await loadTab(adapter)
+    const { api, exchangeSsoCode, SESSION_BUSY_CODE } = await loadTab(adapter)
     const marker = localStorage.getItem('whm_session_id')
 
     const login = api.post('/auth/login', { email: 'b@example.com', password: 'x' })
       .then(() => 'signed in', (error: AxiosError) => error.code)
-    const sso = beginSsoSignIn().then(() => 'started', (error: AxiosError) => error.code)
+    const exchange = exchangeSsoCode('code-b').then(() => 'signed in', (error: AxiosError) => error.code)
     await vi.advanceTimersByTimeAsync(20_500)
 
     expect(await login).toBe(SESSION_BUSY_CODE)
-    expect(await sso).toBe(SESSION_BUSY_CODE)
+    expect(await exchange).toBe(SESSION_BUSY_CODE)
     expect(adapter).not.toHaveBeenCalled()
     expect(localStorage.getItem('whm_session_id')).toBe(marker)
     releaseHolder()
@@ -1130,10 +1129,10 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     FakeBroadcastChannel.channels.clear()
   })
 
-  it('an SSO start or sign-in is refused while an earlier logout still fails, and that logout stays pending', async () => {
+  it('an SSO exchange or sign-in is refused while an earlier logout still fails, and that logout stays pending', async () => {
     installWebLocks()
     const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
-    const { api, beginSsoSignIn, SESSION_BUSY_CODE } = await loadTab(adapter)
+    const { api, exchangeSsoCode, SESSION_BUSY_CODE } = await loadTab(adapter)
     // An outage: the logout of session A never got through.
     localStorage.setItem('whm_session_id', 'ended:session-a')
     localStorage.setItem('whm_logout_pending', JSON.stringify({ marker: 'ended:session-a', csrf: 'csrf-token-1' }))
@@ -1143,7 +1142,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       if (label.startsWith('logout')) throw networkError()
     })
 
-    await expect(beginSsoSignIn()).rejects.toMatchObject({ code: SESSION_BUSY_CODE })
+    await expect(exchangeSsoCode('code-b')).rejects.toMatchObject({ code: SESSION_BUSY_CODE })
     await expect(api.post('/auth/login', { email: 'b@example.com', password: 'x' })).rejects.toMatchObject({ code: SESSION_BUSY_CODE })
 
     expect(adapter).not.toHaveBeenCalled()
@@ -1275,20 +1274,26 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(localStorage.getItem('selected_organization_id')).toBe('org-a')
   })
 
-  it("the SSO callback's /me carries no organization a previous session selected", async () => {
+  it("the SSO exchange drops the identity and organization a previous session stored; /me then carries none", async () => {
     localStorage.setItem('selected_organization_id', 'org-a')
+    localStorage.setItem('whm_session_id', 'ended:session-a')
     stubLocation('/auth/sso/callback')
-    setCookie('whm_csrf=csrf-of-b; path=/')
     const seen: Array<string | undefined> = []
-    const { api } = await loadTab(async (config) => {
+    const { api, exchangeSsoCode } = await loadTab(async (config) => {
+      if (config.url === '/auth/refresh') {
+        setCookie('whm_csrf=csrf-of-b; path=/')
+        return ok(config, { data: { expires_in: 900, user: { id: 'user-b' } } })
+      }
       seen.push(config.headers.get('X-Organization-ID') as string | undefined)
       return ok(config, { data: { id: 'user-b' } })
     })
 
+    await exchangeSsoCode('code-b')
+    expect(localStorage.getItem('user')).toBeNull()
+    expect(localStorage.getItem('selected_organization_id')).toBeNull()
     await api.get('/me')
 
     expect(seen).toEqual([undefined])
-    expect(localStorage.getItem('selected_organization_id')).toBeNull()
   })
 
   it("with Web Locks too, another tab's session change aborts this tab's refresh in flight", async () => {
@@ -1596,19 +1601,6 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(JSON.parse(localStorage.getItem('whm_session_begun')!)).toEqual({ marker, csrf: 'csrf-token-2' })
   })
 
-  it('a replayed callback page sends nothing with the ended session\'s cookies', async () => {
-    localStorage.setItem('whm_session_id', 'ended:session-a')
-    localStorage.setItem('whm_logout_pending', JSON.stringify({ marker: 'ended:session-a', csrf: 'csrf-token-1' }))
-    recordPosts([])
-    stubLocation('/auth/sso/callback')
-    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { id: 'user-a' } }))
-    const { api, whenLogoutSettled } = await loadTab(adapter)
-
-    await expect(api.get('/me')).rejects.toMatchObject({ code: 'ERR_CANCELED' })
-    await whenLogoutSettled()
-    expect(adapter).not.toHaveBeenCalled()
-  })
-
   it('a refresh that lands after its session ended updates the pending logout\'s CSRF value', async () => {
     installWebLocks()
     localStorage.setItem('whm_session_id', 'session-a')
@@ -1684,35 +1676,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     })
   })
 
-  it("an SSO start in another tab aborts this tab's logout requests in flight", async () => {
-    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
-    const signals: AbortSignal[] = []
-    const order: string[] = []
-    recordPosts(order, (label, options) => {
-      if (!label.startsWith('revoke')) return undefined
-      signals.push(options.signal)
-      return new Promise((_, reject) => {
-        options.signal.addEventListener('abort', () => reject(new AxiosError('canceled', AxiosError.ERR_CANCELED)))
-      })
-    })
-    await api.post('/auth/logout', {})
-    await vi.waitFor(() => expect(signals).toHaveLength(1))
-
-    const fence = JSON.stringify({ at: Date.now(), marker: localStorage.getItem('whm_session_id') })
-    localStorage.setItem('whm_sso_started', fence)
-    window.dispatchEvent(new StorageEvent('storage', { key: 'whm_sso_started', newValue: fence }))
-
-    expect(signals[0].aborted).toBe(true)
-    await whenLogoutSettled()
-    // No /auth/logout: it would clear the cookies the SSO callback is about to
-    // set. The logout stays pending for the next sign-in or page load.
-    expect(order).toEqual(['revoke csrf-token-1'])
-    expect(JSON.parse(localStorage.getItem('whm_logout_pending')!)).toMatchObject({ marker: 'ended:' })
-  })
-
-  it("another tab's SSO start leaves an open tab's session alone", async () => {
-    vi.useFakeTimers()
-    installWebLocks()
+  it("another tab's SSO start leaves an open tab alone: it writes nothing, and the open tab refreshes as usual", async () => {
     localStorage.setItem('whm_session_id', 'session-1')
     let rotated = false
     const open = await loadTab(async (config) => {
@@ -1726,27 +1690,17 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
         return refreshOk()
       }
     })
+    const before = { ...localStorage }
 
     await starting.beginSsoSignIn()
-    window.dispatchEvent(
-      new StorageEvent('storage', { key: 'whm_sso_started', newValue: localStorage.getItem('whm_sso_started') }),
-    )
 
-    expect(localStorage.getItem('whm_session_id')).toBe('session-1')
-    // While the SSO is under way the open tab keeps its session but refreshes
-    // nothing (here once the SSO tab's lock is let go, which a real page does
-    // when it leaves): its 401 is surfaced, nothing expires.
-    const during = open.api.get('/contacts').catch((e: AxiosError) => e.response?.status)
-    await vi.advanceTimersByTimeAsync(61_000)
-    expect(await during).toBe(401)
-    expect(rotated).toBe(false)
-    expect(localStorage.getItem('user')).not.toBeNull()
-    // An abandoned SSO lapses: the open tab refreshes and works again.
-    await vi.advanceTimersByTimeAsync(5 * 60_000)
+    expect({ ...localStorage }).toEqual(before)
     expect((await open.api.get('/contacts')).status).toBe(200)
+    expect(rotated).toBe(true)
+    expect(localStorage.getItem('whm_session_id')).toBe('session-1')
   })
 
-  it('an SSO callback that completes while a logout is queued is never revoked', async () => {
+  it('an SSO exchange that starts while a logout is queued goes after it, and is never revoked by it', async () => {
     installWebLocks()
     const releaseHolder = holdLockElsewhere()
     const ending = await loadTab(async (config) => ok(config))
@@ -1754,44 +1708,44 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     recordPosts(order)
     await ending.api.post('/auth/logout', {})
 
-    // In another tab the SSO redirect sets B's cookies and loads the callback.
-    setCookie('whm_csrf=csrf-of-b; path=/')
+    // In another tab, the callback page exchanges B's code meanwhile.
     stubLocation('/auth/sso/callback')
-    await loadTab(async (config) => ok(config, { data: { id: 'user-b' } }))
+    const callback = await loadTab(async (config) => {
+      order.push('exchange')
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      return ok(config, { data: { expires_in: 900, user: { id: 'user-b' } } })
+    })
+    const exchange = callback.exchangeSsoCode('code-b')
+    await tick()
+    expect(order).toEqual([])
     releaseHolder()
+    await exchange
     await ending.whenLogoutSettled()
 
-    // Nothing was sent with B's cookies.
-    expect(order).toEqual([])
+    // The old logout went first, with the old cookies; nothing after B's.
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1', 'exchange'])
     expect(localStorage.getItem('whm_session_id')).toMatch(/^(?!ended:)./)
   })
 
-  it('starting SSO waits for this tab\'s logout, then fences other tabs without starting a session', async () => {
+  it('starting SSO waits for nothing and changes nothing: the exchange does the ordering', async () => {
     installWebLocks()
     const releaseHolder = holdLockElsewhere()
     const fetchSpy = vi.fn(async () => new Response('{}'))
     vi.stubGlobal('fetch', fetchSpy)
-    const { api, beginSsoSignIn } = await loadTab(async (config) => ok(config))
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { beginSsoSignIn } = await loadTab(async (config) => ok(config))
     const order: string[] = []
     recordPosts(order)
+    const before = { ...localStorage }
 
-    await api.post('/auth/logout', {})
-    let started = false
-    const sso = beginSsoSignIn().then(() => {
-      started = true
-    })
-    await tick()
-    expect(started).toBe(false)
-    releaseHolder()
-    await sso
+    await beginSsoSignIn()
 
-    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
-    // The new session begins only at the callback, with the new cookies.
-    expect(localStorage.getItem('whm_session_id')).toBe('ended:')
-    expect(JSON.parse(localStorage.getItem('whm_sso_started')!)).toMatchObject({ marker: 'ended:' })
-    // Leaving for the provider sends no unordered keepalive logout.
+    expect(order).toEqual([])
+    expect({ ...localStorage }).toEqual(before)
+    // Leaving for the provider sends nothing either.
     window.dispatchEvent(new Event('pagehide'))
     expect(fetchSpy).not.toHaveBeenCalled()
+    releaseHolder()
     vi.unstubAllGlobals()
   })
 
@@ -1831,7 +1785,8 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     })
 
     it(`a 401 within one session still refreshes and retries (${locking})`, async () => {
-      if (locking !== 'Web Locks') removeWebLocks()
+      // Without Web Locks no refresh runs at all (see the dedicated test).
+      if (locking !== 'Web Locks') return
       localStorage.setItem('whm_session_id', 'session-a')
       let rotated = false
       const { api } = await loadTab(async (config) => {
@@ -1893,42 +1848,6 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order).not.toContain('refresh')
     expect(held.replayed()).toBe(false)
     // B's session is untouched: no expiry, no replay.
-    expect(localStorage.getItem('whm_session_id')).toBe(sessionB)
-    expect(localStorage.getItem('user')).not.toBeNull()
-    expect(assignedHref).toBeNull()
-  })
-
-  it('a stale refresh failure in another tab never expires a newer session (no Web Locks)', async () => {
-    removeWebLocks()
-    localStorage.setItem('whm_session_id', 'session-a')
-    let failRefresh!: () => void
-    const refreshGate = new Promise<void>((resolve) => {
-      failRefresh = resolve
-    })
-    const stale = await loadTab(async (config) => {
-      throw httpError(401, config)
-    })
-    const order: string[] = []
-    recordPosts(order, async (label) => {
-      if (label === 'refresh') {
-        await refreshGate
-        throw httpError(401)
-      }
-    })
-    const request = stale.api.get('/contacts').then(() => 'resolved', () => 'rejected')
-    await vi.waitFor(() => expect(order).toEqual(['refresh']))
-
-    // Meanwhile, in another tab: logout, then B signs in with SSO (a new
-    // session, no change of auth epoch).
-    const active = await loadTab(async (config) => ok(config))
-    await active.api.post('/auth/logout', {})
-    await active.whenLogoutSettled()
-    localStorage.setItem('whm_session_id', 'session-b')
-    localStorage.setItem('user', JSON.stringify({ id: 'user-b', email: 'b@example.com' }))
-    const sessionB = 'session-b'
-    failRefresh()
-
-    expect(await request).toBe('rejected')
     expect(localStorage.getItem('whm_session_id')).toBe(sessionB)
     expect(localStorage.getItem('user')).not.toBeNull()
     expect(assignedHref).toBeNull()
@@ -2004,12 +1923,6 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       expect(await login).toBe(SESSION_UNSUPPORTED_CODE)
       expect(adapter).not.toHaveBeenCalled()
       expect(sessionsSupported()).toBe(false)
-      // So is an SSO start in a fresh tab of this browser (no fence).
-      const fresh = await loadTab(adapter)
-      const sso = fresh.beginSsoSignIn().catch((e) => e.code)
-      await vi.advanceTimersByTimeAsync(10)
-      expect(await sso).toBe(SESSION_UNSUPPORTED_CODE)
-      expect(localStorage.getItem('whm_sso_started')).toBeNull()
       // A session that already existed still logs out (within this tab).
       await api.post('/auth/logout', {})
       await vi.advanceTimersByTimeAsync(10)
@@ -2018,30 +1931,26 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     })
   }
 
-  it('a lock manager that rejects still lets a session that existed refresh, within the tab', async () => {
+  it('a lock manager that rejects ends a session that existed when it would need a refresh', async () => {
     localStorage.setItem('whm_session_id', 'session-a')
     Object.defineProperty(navigator, 'locks', {
       configurable: true,
       value: { request: vi.fn(() => Promise.reject(new DOMException('Lock manager unavailable', 'SecurityError'))) },
     })
-    let rotated = false
-    const { api, sessionsSupported } = await loadTab(async (config) => {
-      if (!rotated) throw httpError(401, config)
-      return ok(config)
+    const { api, sessionsSupported, whenLogoutSettled } = await loadTab(async (config) => {
+      throw httpError(401, config)
     })
     const order: string[] = []
-    recordPosts(order, (label) => {
-      if (label === 'refresh') {
-        rotated = true
-        return refreshOk()
-      }
-    })
+    recordPosts(order)
 
-    expect((await api.get('/contacts')).status).toBe(200)
+    await expect(api.get('/contacts')).rejects.toMatchObject({ response: { status: 401 } })
+    await whenLogoutSettled()
 
-    expect(order).toEqual(['refresh'])
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
     expect(sessionsSupported()).toBe(false)
-    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+    expect(localStorage.getItem('user')).toBeNull()
+    expect(assignedHref).toBe('/login')
   })
 
   it('a registration answered after the session changed elsewhere reports that it was sent; a refused switch does not', async () => {
@@ -2126,71 +2035,6 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(document.cookie).toContain('whm_csrf=csrf-token-1')
   })
 
-  it("an SSO start in another tab aborts this tab's refresh in flight, and no retry goes out", async () => {
-    vi.useFakeTimers()
-    localStorage.setItem('whm_session_id', 'session-1')
-    const { api } = await loadTab(async (config) => {
-      throw httpError(401, config)
-    })
-    const signals: AbortSignal[] = []
-    const order: string[] = []
-    recordPosts(order, (label, options) => {
-      if (label !== 'refresh') return undefined
-      signals.push(options.signal)
-      return new Promise((_, reject) => {
-        options.signal.addEventListener('abort', () => reject(new AxiosError('canceled', AxiosError.ERR_CANCELED)))
-      })
-    })
-
-    const request = api.get('/contacts').catch((e: AxiosError) => e.response?.status)
-    await vi.waitFor(() => expect(signals).toHaveLength(1))
-    const fence = JSON.stringify({ at: Date.now(), marker: 'session-1' })
-    localStorage.setItem('whm_sso_started', fence)
-    window.dispatchEvent(new StorageEvent('storage', { key: 'whm_sso_started', newValue: fence }))
-    expect(signals[0].aborted).toBe(true)
-    await vi.advanceTimersByTimeAsync(30_000)
-
-    expect(await request).toBe(401)
-    expect(order).toEqual(['refresh'])
-    expect(localStorage.getItem('user')).not.toBeNull()
-    expect(assignedHref).toBeNull()
-  })
-
-  it("an SSO start from another session's state does not hold this session's refreshes", async () => {
-    localStorage.setItem('whm_session_id', 'session-1')
-    // Started before this session began (the marker has moved on since).
-    localStorage.setItem('whm_sso_started', JSON.stringify({ at: Date.now(), marker: 'ended:session-0' }))
-    let rotated = false
-    const { api } = await loadTab(async (config) => {
-      if (!rotated) throw httpError(401, config)
-      return ok(config)
-    })
-    recordPosts([], (label) => {
-      if (label === 'refresh') {
-        rotated = true
-        return refreshOk()
-      }
-    })
-
-    expect((await api.get('/contacts')).status).toBe(200)
-  })
-
-  it('a password sign-in on a replayed callback page ends the replay latch', async () => {
-    localStorage.setItem('whm_session_id', 'ended:session-a')
-    localStorage.setItem('whm_logout_pending', JSON.stringify({ marker: 'ended:session-a', csrf: 'csrf-token-1' }))
-    recordPosts([])
-    stubLocation('/auth/sso/callback')
-    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
-    const { api, whenLogoutSettled } = await loadTab(adapter)
-    await expect(api.get('/me')).rejects.toMatchObject({ code: 'ERR_CANCELED' })
-    await whenLogoutSettled()
-
-    await api.post('/auth/login', { email: 'b@example.com', password: 'x' })
-    await api.get('/contacts')
-
-    expect(adapter.mock.calls.map(([config]) => config.url)).toEqual(['/auth/login', '/contacts'])
-  })
-
   it("the logout's own note records a CSRF value rotated by a refresh that then failed", async () => {
     localStorage.setItem('whm_session_id', 'session-a')
     let failRefresh!: () => void
@@ -2236,6 +2080,166 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
         })
       })
   }
+
+  it('the SSO code exchange begins the new session under the lock, like a password sign-in', async () => {
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    localStorage.setItem('user', JSON.stringify({ id: 'user-a', email: 'a@example.com' }))
+    const sent: Array<{ url?: string; data: unknown }> = []
+    const { exchangeSsoCode } = await loadTab(async (config) => {
+      sent.push({ url: config.url, data: JSON.parse(config.data) })
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      return ok(config, { data: { expires_in: 900, user: { id: 'user-b' } } })
+    })
+    recordPosts([])
+    const request = vi.mocked(navigator.locks.request)
+
+    await exchangeSsoCode('code-b')
+
+    expect(request).toHaveBeenCalled()
+    expect(sent).toEqual([{ url: '/auth/refresh', data: { sso_exchange: 'code-b' } }])
+    const marker = localStorage.getItem('whm_session_id')
+    expect(marker).toMatch(/^(?!ended:)./)
+    expect(JSON.parse(localStorage.getItem('whm_session_begun')!)).toEqual({ marker, csrf: 'csrf-of-b' })
+    expect(localStorage.getItem('user')).toBeNull()
+    expect(Number(localStorage.getItem('whm_auth_expires_at'))).toBeGreaterThan(Date.now())
+  })
+
+  it('an SSO exchange goes after a logout that never got through (the page load finishes it first)', async () => {
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    localStorage.setItem('whm_logout_pending', JSON.stringify({ marker: 'ended:session-a', csrf: 'csrf-token-1' }))
+    const order: string[] = []
+    recordPosts(order)
+    stubLocation('/auth/sso/callback')
+    const { exchangeSsoCode } = await loadTab(async (config) => {
+      order.push('exchange')
+      return ok(config, { data: { expires_in: 900, user: {} } })
+    })
+
+    await exchangeSsoCode('code-b')
+
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1', 'exchange'])
+  })
+
+  it('an SSO exchange answered after the session changed elsewhere is undone, and counts as sent', async () => {
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    let answer!: () => void
+    const gate = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    const { exchangeSsoCode, sentBeforeSessionChange } = await loadTab(async (config) => {
+      await gate
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      return ok(config, { data: { expires_in: 900, user: {} } })
+    })
+    const order: string[] = []
+    recordPosts(order)
+
+    const exchange = exchangeSsoCode('code-b').catch((e) => e)
+    await tick()
+    // Another tab signs C in meanwhile.
+    localStorage.setItem('whm_session_id', 'session-c')
+    answer()
+    const error = await exchange
+
+    expect(error.code).toBe('ERR_CANCELED')
+    expect(sentBeforeSessionChange(error)).toBe(true)
+    expect(order).toEqual(['revoke csrf-of-b', 'logout csrf-of-b'])
+    expect(localStorage.getItem('whm_session_id')).toBe('session-c')
+  })
+
+  it('an unanswered SSO exchange whose cookies arrived is undone before the lock is let go', async () => {
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    const order: string[] = []
+    const { exchangeSsoCode } = await loadTab(async (config) => {
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      order.push('exchange (no answer)')
+      throw new AxiosError('timeout of 15000ms exceeded', AxiosError.ECONNABORTED, config)
+    })
+    recordPosts(order)
+
+    await exchangeSsoCode('code-b').catch(() => undefined)
+
+    expect(order).toEqual(['exchange (no answer)', 'revoke csrf-of-b', 'logout csrf-of-b'])
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+  })
+
+  it('a used or expired SSO code begins nothing', async () => {
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    const { exchangeSsoCode } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const order: string[] = []
+    recordPosts(order)
+
+    await expect(exchangeSsoCode('used-code')).rejects.toMatchObject({ response: { status: 401 } })
+
+    expect(order).toEqual([])
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+    expect(assignedHref).toBeNull()
+  })
+
+  it('without Web Locks the SSO exchange is refused and nothing is sent', async () => {
+    removeWebLocks()
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+    const { exchangeSsoCode, SESSION_UNSUPPORTED_CODE } = await loadTab(adapter)
+    recordPosts([])
+
+    await expect(exchangeSsoCode('code-b')).rejects.toMatchObject({ code: SESSION_UNSUPPORTED_CODE })
+
+    expect(adapter).not.toHaveBeenCalled()
+  })
+
+  it('without Web Locks a session that existed is not refreshed: it ends, with a cookie-neutral revoke, then /auth/logout', async () => {
+    removeWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const posts: Array<{ url: string; body: unknown }> = []
+    postSpy.mockImplementation(async (url: string, body: unknown) => {
+      posts.push({ url: url.replace(/^.*\/api/, ''), body })
+      return { data: { data: {} }, status: 200 }
+    })
+
+    await expect(api.get('/contacts')).rejects.toMatchObject({ response: { status: 401 } })
+    await whenLogoutSettled()
+
+    expect(posts).toEqual([
+      { url: '/auth/refresh', body: { revoke: true, keep_cookies: true } },
+      { url: '/auth/logout', body: {} },
+    ])
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+    expect(localStorage.getItem('user')).toBeNull()
+    expect(assignedHref).toBe('/login')
+  })
+
+  it("a refresh rejected after this tab's own logout reports no expiry", async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    let failRefresh!: () => void
+    const refreshGate = new Promise<void>((resolve) => {
+      failRefresh = resolve
+    })
+    const order: string[] = []
+    recordPosts(order, async (label) => {
+      if (label === 'refresh') {
+        await refreshGate
+        throw httpError(401)
+      }
+    })
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const request = api.get('/contacts').catch(() => undefined)
+    await vi.waitFor(() => expect(order).toEqual(['refresh']))
+    await api.post('/auth/logout', {})
+    failRefresh()
+    await request
+    await whenLogoutSettled()
+
+    // The user logged out: no "session expired" on top of it.
+    expect(sessionEvents).not.toContain('expired')
+    expect(assignedHref).toBeNull()
+  })
 
   it('a held sign-in lock is released by the backstop if no response ever comes', async () => {
     vi.useFakeTimers()
