@@ -125,6 +125,39 @@ describe('SSOCallbackView', () => {
     expect(wrapper.text()).toContain('auth.ssoLinkUsed')
   })
 
+  it('an exchange answered 503 shows the temporary failure, and enters no session', async () => {
+    mocks.query = { code: 'code-b' }
+    mocks.exchange.mockRejectedValueOnce(
+      Object.assign(new Error('unavailable'), {
+        response: { status: 503, data: { message: 'Sign-in is temporarily unavailable, please try again' } },
+      }),
+    )
+
+    const wrapper = mountCallback()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Sign-in is temporarily unavailable, please try again')
+    expect(mocks.setAuth).not.toHaveBeenCalled()
+    expect(mocks.restoreSession).not.toHaveBeenCalled()
+    expect(mocks.push).not.toHaveBeenCalled()
+    expect(mocks.replace).toHaveBeenCalledTimes(1) // only the code off the URL
+  })
+
+  it('without a code, an exchange a reload interrupted says so on every reload (and enters no session)', async () => {
+    mocks.interrupted.mockReturnValue(true)
+    mocks.store = { isAuthenticated: false, user: { role: { name: 'admin' } } }
+    mocks.restoreSession.mockReturnValue(true)
+    for (let reload = 0; reload < 2; reload++) {
+      const wrapper = mountCallback()
+      await flushPromises()
+      expect(wrapper.text()).toContain('auth.ssoInterrupted')
+      wrapper.unmount()
+    }
+    expect(mocks.restoreSession).not.toHaveBeenCalled()
+    expect(mocks.replace).not.toHaveBeenCalled()
+    expect(mocks.exchange).not.toHaveBeenCalled()
+  })
+
   it('without a code, an exchange a reload interrupted says so (and enters no session)', async () => {
     mocks.interrupted.mockReturnValue(true)
     // Even with a session stored from before (the one the SSO was replacing).

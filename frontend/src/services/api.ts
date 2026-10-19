@@ -250,6 +250,9 @@ export function readSessionId(): string {
 // not got through is moot: the jar now holds the new session's cookies.
 function beginSessionMarker(): string {
   writeStoredValue(LOGOUT_PENDING_KEY, null);
+  // A session this tab begins also settles an SSO exchange it once sent and
+  // never saw answered.
+  clearSsoExchangeSent();
   const marker = writeSessionMarker(
     Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
   );
@@ -943,6 +946,9 @@ export async function beginSsoSignIn(): Promise<void> {
  * request with everything a password sign-in has (the lock, an earlier logout
  * first, the new session only on success, the undo of a late or unanswered
  * answer, the timeout). The code is single-use and bound to this browser.
+ * An answer of 503 means the sign-in failed temporarily: start the sign-in
+ * again (the code is usually spent already); the previous session state is
+ * untouched.
  */
 export function exchangeSsoCode(code: string) {
   return api.post("/auth/refresh", { sso_exchange: code }, {
@@ -990,7 +996,9 @@ function dropSsoCode() {
 // Set (in this tab) when an SSO exchange is sent, with the session marker of
 // that moment, and cleared once its outcome is seen here. A tab that finds it
 // after a reload never saw the answer: the exchange's cookies may have landed
-// unseen.
+// unseen, so the stored identity may not be the jar's session any more. It
+// stays (every reload, Back) until a session this tab begins, or a newer
+// session consistent with the jar, settles it.
 const SSO_SENT_KEY = "whm_sso_sent";
 
 function noteSsoExchangeSent() {
@@ -1010,10 +1018,11 @@ function clearSsoExchangeSent() {
 }
 
 /**
- * After a reload, whether an SSO exchange this tab sent was interrupted (its
- * answer never seen here). Not when a newer session, consistent with the jar
- * (its own CSRF value), is live: one that began after the exchange was sent
- * can be shown. Reading it clears it.
+ * Whether an SSO exchange this tab sent is still unsettled: its answer was
+ * never seen here (a reload cut it off). Until it is settled the tab must not
+ * show the stored identity, which may not be the jar's session. A newer
+ * session, consistent with the jar (its own CSRF value), that began after the
+ * exchange was sent settles it, and can be shown.
  */
 export function ssoExchangeInterrupted(): boolean {
   let sent: { marker: string | null } | null = null;
@@ -1022,7 +1031,6 @@ export function ssoExchangeInterrupted(): boolean {
   } catch {
     return false;
   }
-  clearSsoExchangeSent();
   if (!sent) return false;
   const marker = readSessionMarker();
   const begun = readBegunSession();
@@ -1032,6 +1040,7 @@ export function ssoExchangeInterrupted(): boolean {
     marker !== sent.marker &&
     begun?.marker === marker &&
     begun.csrf === getCookie("whm_csrf");
+  if (newerLive) clearSsoExchangeSent();
   return !newerLive;
 }
 

@@ -472,7 +472,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const recorder = vi.fn(async (url: string, init: RequestInit = {}) => {
       const body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body
       try {
-        const custom = (await onFetch(String(url), body, { headers: init.headers })) as
+        const custom = (await onFetch(String(url), body, { headers: init.headers, signal: init.signal })) as
           | { data?: unknown; status?: number }
           | undefined
         return new Response(JSON.stringify(custom?.data ?? { data: {} }), { status: custom?.status ?? 200 })
@@ -1881,7 +1881,57 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(url).toMatch(/\/api\/auth\/refresh$/)
     expect(init).toMatchObject({ method: 'POST', credentials: 'include', keepalive: true })
     expect((init.headers as Record<string, string>)['X-CSRF-Token']).toBe('csrf-token-1')
+    // Without it the server would read no body: a refresh, not a revoke.
+    expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json')
     expect(JSON.parse(init.body as string)).toEqual({ revoke: true, keep_cookies: true })
+    expect(init.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('without Web Locks a revoke that never answers is abandoned at the 7 s budget: one revoke, no /auth/logout', async () => {
+    vi.useFakeTimers()
+    removeWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    let signal: AbortSignal | undefined
+    const fetchSpy = vi.fn(
+      (_url: string, init: RequestInit) =>
+        new Promise<Response>((_, reject) => {
+          signal = init.signal ?? undefined
+          signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))
+        }),
+    )
+    vi.stubGlobal('fetch', fetchSpy)
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    recordPosts(order)
+
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(6_999)
+    expect(signal?.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(signal?.aborted).toBe(true)
+    await whenLogoutSettled()
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    // No /auth/logout (nor anything else) through axios.
+    expect(order).toEqual([])
+  })
+
+  it('without Web Locks a revoke whose transport fails is not retried, and no /auth/logout follows', async () => {
+    removeWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const fetchSpy = vi.fn(async () => {
+      throw new TypeError('Failed to fetch')
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    recordPosts(order)
+
+    await api.post('/auth/logout', {})
+    await whenLogoutSettled()
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(order).toEqual([])
   })
 
   it('a page without Web Locks that logged out sends no keepalive revoke when it closes', async () => {
@@ -1944,18 +1994,33 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order).toEqual(['revoke csrf-token-1'])
   })
 
-  it('an SSO exchange sent and never answered here (the tab reloads) leaves a note: the next page finds it interrupted', async () => {
+  it('an SSO exchange cut off by a reload stays unsettled on every reload, until a sign-in in that tab settles it', async () => {
     localStorage.setItem('whm_session_id', 'session-a')
-    // The answer never comes: the tab goes away while it is out.
+    // The answer never comes: the tab goes away while it is out (and with
+    // it, the lock it held).
     const tab = await loadTab(() => new Promise(() => undefined))
-    recordPosts([])
+    const order: string[] = []
+    recordPosts(order)
     void tab.exchangeSsoCode('code-b').catch(() => undefined)
     await new Promise((resolve) => setTimeout(resolve, 20))
+    installWebLocks()
 
-    const reloaded = await loadTab(async (config) => ok(config))
-    expect(reloaded.ssoExchangeInterrupted()).toBe(true)
-    // Read once.
-    expect(reloaded.ssoExchangeInterrupted()).toBe(false)
+    // Every reload (or Back) finds it unsettled: the stored identity may not
+    // be the jar's session.
+    for (let reload = 0; reload < 2; reload++) {
+      const reloaded = await loadTab(async (config) => ok(config))
+      expect(reloaded.ssoExchangeInterrupted()).toBe(true)
+      expect(reloaded.ssoExchangeInterrupted()).toBe(true)
+    }
+    expect(sessionStorage.getItem('whm_sso_sent')).not.toBeNull()
+
+    // A sign-in in this tab settles it.
+    const signingIn = await loadTab(async (config) => ok(config, { data: { expires_in: 900, user: {} } }))
+    await signingIn.api.post('/auth/login', { email: 'b@example.com', password: 'x' })
+    expect(signingIn.ssoExchangeInterrupted()).toBe(false)
+    expect(sessionStorage.getItem('whm_sso_sent')).toBeNull()
+    // Nothing of the old session was revoked or cleared to get there.
+    expect(order).toEqual([])
   })
 
   it('an SSO exchange whose answer was seen leaves no note (answered, or refused)', async () => {
@@ -1988,6 +2053,8 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     const reloaded = await loadTab(async (config) => ok(config))
     expect(reloaded.ssoExchangeInterrupted()).toBe(false)
+    // Settled: the obsolete note is gone.
+    expect(sessionStorage.getItem('whm_sso_sent')).toBeNull()
   })
 
   it.each([
@@ -2011,6 +2078,26 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     const reloaded = await loadTab(async (config) => ok(config))
     expect(reloaded.ssoExchangeInterrupted()).toBe(true)
+    // And on the next reload too.
+    expect(reloaded.ssoExchangeInterrupted()).toBe(true)
+  })
+
+  it('an SSO exchange answered 503 changes nothing: no revoke or logout, the session from before stays, its note is retired', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { exchangeSsoCode, ssoExchangeInterrupted } = await loadTab(async (config) => {
+      throw httpError(503, config)
+    })
+    const order: string[] = []
+    recordPosts(order)
+
+    await expect(exchangeSsoCode('code-b')).rejects.toMatchObject({ response: { status: 503 } })
+
+    expect(order).toEqual([])
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+    expect(JSON.parse(localStorage.getItem('user')!).id).toBe('user-1')
+    expect(document.cookie).toContain('whm_csrf=csrf-token-1')
+    expect(sessionStorage.getItem('whm_sso_sent')).toBeNull()
+    expect(ssoExchangeInterrupted()).toBe(false)
   })
 
   it('a request sent as user A is never replayed after user B signs in', async () => {

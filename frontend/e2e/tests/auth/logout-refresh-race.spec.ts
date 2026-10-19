@@ -663,6 +663,52 @@ test.describe('Logout during a token refresh', () => {
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
   })
 
+  test('an SSO exchange cut off by a reload: every reload says so, and the session from before is never resumed', async ({
+    page,
+    context,
+    playwright,
+    baseURL,
+  }) => {
+    const newContext = () => playwright.request.newContext({ baseURL })
+    await loginAsAdmin(page)
+    const order: string[] = []
+    const exchangesSent: string[] = []
+    page.on('request', (request) => {
+      if (isExchange(request)) exchangesSent.push(request.url())
+    })
+    // The exchange is answered with B's real session, held: the answer never
+    // reaches the page...
+    const exchange = await answerExchange(page, newContext, TEST_USERS.manager, order, { hold: true })
+    await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
+    await exchange.ready
+    // ...but its cookies land unseen: B's session is the jar's.
+    const issued = exchange.cookies()
+    const host = new URL(baseURL!).hostname
+    const paths: Record<string, string> = { whm_access: '/api', whm_refresh: '/api/auth/refresh', whm_csrf: '/' }
+    await context.addCookies(
+      Object.entries(paths).map(([name, path]) => ({ name, value: issued[name], domain: host, path })),
+    )
+
+    // Every reload of the callback page says the sign-in was interrupted;
+    // none resumes A (still the stored identity) over B's jar.
+    for (let reload = 0; reload < 2; reload++) {
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await expect(page.getByText(/interrupted before it finished/)).toBeVisible()
+      expect(new URL(page.url()).pathname).toBe('/auth/sso/callback')
+    }
+    // Nor do the app's own routes, in this tab.
+    await page.goto('/', { waitUntil: 'domcontentloaded' })
+    await expect(page).toHaveURL(/\/login/)
+
+    // The spent code was sent once, and nothing was revoked or cleared to get
+    // here: B's session (the jar's) still works.
+    expect(exchangesSent).toHaveLength(1)
+    const me = await page.request.get('/api/me')
+    expect(me.status()).toBe(200)
+    expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+    exchange.release()
+  })
+
   test('a replayed or expired SSO code changes nothing', async ({ page, context, playwright, baseURL }) => {
     const newContext = () => playwright.request.newContext({ baseURL })
     await loginAsAdmin(page)
