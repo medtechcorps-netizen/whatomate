@@ -125,6 +125,13 @@ test('built PDF uses real worker, CMap, font and both JS decoders under producti
   const workers: Worker[] = []
   const closed = new Set<Worker>()
   const failures: string[] = []
+  const requestPaths: string[] = []
+  let requestObservationOverflow = false
+  page.context().on('request', request => {
+    const path = new URL(request.url()).pathname
+    if (requestPaths.length >= 256 || path.length > 512) requestObservationOverflow = true
+    else requestPaths.push(path)
+  })
   // BrowserContext also observes requests initiated by the real PDF worker.
   page.context().on('response', response => responses.push(response))
   page.on('worker', worker => { workers.push(worker); worker.on('close', () => closed.add(worker)) })
@@ -189,7 +196,6 @@ test('built PDF uses real worker, CMap, font and both JS decoders under producti
     expect(response!.status()).toBe(200)
     expect(hash(await response!.body())).toBe(hash(readFileSync(resolve(pdfRoot, file))))
   }
-  expect(responses.some(response => new URL(response.url()).pathname.endsWith('.wasm'))).toBe(false)
   const downloadLink = preview.getByTestId('chat-media-preview-download')
   const url = await downloadLink.getAttribute('href')
   expect((await observed(page)).blobs.find(blob => blob.url === url)).toMatchObject({ type: 'application/octet-stream', size: pdf.length })
@@ -215,12 +221,17 @@ test('built PDF uses real worker, CMap, font and both JS decoders under producti
   expect(state.media).toEqual([{ method: 'GET', organization: org }])
   await page.keyboard.press('Escape')
   await expect.poll(() => closed.size).toBe(2)
+  // A refused/aborted fetch may never produce a Response. Observe requests
+  // through both opens so fallback after a failed WASM fetch cannot pass.
+  expect(requestObservationOverflow).toBe(false)
+  expect(requestPaths.some(path => /\.wasm$/i.test(path))).toBe(false)
   // Keep pre-existing application bootstrap violations visible in evidence;
   // the real PDF path may not introduce any additional violation.
   expect((await observed(page)).violations).toEqual(baselineViolations)
   expect(failures).toEqual([])
   await testInfo.attach('pdf-built-evidence', { contentType: 'application/json', body: Buffer.from(JSON.stringify({
-    fixtureSha256: hash(pdf), workerURL, runtimeFilesUsed: used, pixels, secondPixels, workerStarts: workers.length,
+    fixtureSha256: hash(pdf), workerURL, runtimeFilesUsed: used, requestPaths, requestObservationOverflow,
+    pixels, secondPixels, workerStarts: workers.length,
     workerCloses: closed.size, media: state.media, csp: policy, baselineViolations, violations: (await observed(page)).violations,
     decoderCoverage: 'CCITTFaxDecode and JPXDecode rendered; no JBIG2-bitstream, ICC/qcms or WASM execution claim',
   })) })
