@@ -362,6 +362,14 @@
     "reply": "Reply",
     "replyingTo": "Replying to",
     "cancelReply": "Cancel reply",
+    "messageActions": {
+      "react": "React",
+      "reactWith": "React with {emoji}",
+      "copyText": "Copy text",
+      "copied": "Message text copied",
+      "copyFailed": "Could not copy the message text",
+      "originalNotLoaded": "The original message isn't loaded. Scroll up to load older messages."
+    },
     "selectConversation": "Select a conversation",
     "chooseContact": "Choose a contact to start chatting",
     "unreadMessage": "unread message",
