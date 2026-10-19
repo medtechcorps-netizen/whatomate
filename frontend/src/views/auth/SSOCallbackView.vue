@@ -4,9 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import {
-  api,
   exchangeSsoCode,
   keepSsoCode,
+  ssoExchangeInterrupted,
   unsentSsoCode,
   SESSION_BUSY_CODE,
   SESSION_UNSUPPORTED_CODE,
@@ -39,8 +39,15 @@ onMounted(async () => {
   }
   const code = fromUrl || unsentSsoCode()
   if (!code) {
-    // Back after a sign-in, or a reload once the code was sent: a live
-    // session goes on into the app; otherwise the link is spent.
+    // A reload while the exchange was out: its answer was never seen here,
+    // so neither the session from before nor a "used link" can be assumed.
+    if (ssoExchangeInterrupted()) {
+      status.value = 'error'
+      errorMessage.value = t('auth.ssoInterrupted')
+      return
+    }
+    // Back after a sign-in, or a reload once it finished: a live session
+    // goes on into the app; otherwise the link is spent.
     if (authStore.isAuthenticated || authStore.restoreSession()) {
       void router.replace(homeFor(authStore.user))
       return
@@ -50,9 +57,10 @@ onMounted(async () => {
     return
   }
   try {
-    await exchangeSsoCode(code)
-    const response = await api.get('/me')
-    const user = response.data.data
+    // The answer is a sign-in's ({expires_in, user}): its user is applied at
+    // once, as a password sign-in does, with no request in between.
+    const response = await exchangeSsoCode(code)
+    const user = response.data.data.user
 
     // Set auth in store (only user — tokens are in httpOnly cookies)
     authStore.setAuth({ user })

@@ -175,6 +175,7 @@
     "ssoLoginSuccess": "SSO login successful",
     "ssoLoginFailed": "Failed to complete SSO login",
     "ssoLinkUsed": "This sign-in link was already used or has expired. Please start the sign-in again.",
+    "ssoInterrupted": "The sign-in was interrupted before it finished. Please start the sign-in again.",
     "returnToLogin": "Return to login",
     "accountMayExist": "Your account may have been created. Please sign in."
   },

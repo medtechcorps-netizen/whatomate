@@ -3,6 +3,7 @@ package handlers_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"strings"
 	"sync"
@@ -20,6 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 const laneABindPrefix = "whm_sso_bind_"
@@ -355,20 +359,28 @@ func TestLaneA_SSOExchange_RequiresAJSONBody(t *testing.T) {
 	app := newSSOApp(t)
 	attempt := laneASSOCallback(t, app)
 
-	// A form body (what a cross-site form can send) is refused before the
-	// code is touched.
-	form := testutil.NewRequest(t)
-	form.RequestCtx.Request.Header.SetMethod("POST")
-	form.RequestCtx.Request.Header.SetContentType("application/x-www-form-urlencoded")
-	form.RequestCtx.Request.SetBodyString("sso_exchange=" + url.QueryEscape(attempt.code))
-	form.RequestCtx.Request.Header.SetCookie(attempt.bindName, attempt.binding)
-	require.NoError(t, app.RefreshToken(form))
-	assert.Equal(t, fasthttp.StatusUnsupportedMediaType, testutil.GetResponseStatusCode(form))
-	assert.Empty(t, laneASessionCookies(form))
-	laneAAssertNoBindingTouched(t, form)
+	// What a cross-site page can send (a form body), or a type that only
+	// mentions JSON in a parameter, is refused before the code is touched.
+	for _, body := range []struct{ contentType, body string }{
+		{"application/x-www-form-urlencoded", "sso_exchange=" + url.QueryEscape(attempt.code)},
+		{"text/plain;x=application/json", `{"sso_exchange":"` + attempt.code + `"}`},
+	} {
+		req := testutil.NewRequest(t)
+		req.RequestCtx.Request.Header.SetMethod("POST")
+		req.RequestCtx.Request.Header.SetContentType(body.contentType)
+		req.RequestCtx.Request.SetBodyString(body.body)
+		req.RequestCtx.Request.Header.SetCookie(attempt.bindName, attempt.binding)
+		require.NoError(t, app.RefreshToken(req))
+		assert.Equal(t, fasthttp.StatusUnsupportedMediaType, testutil.GetResponseStatusCode(req), body.contentType)
+		assert.Empty(t, laneASessionCookies(req))
+		laneAAssertNoBindingTouched(t, req)
+	}
 
-	// The code is still good for its own browser's JSON exchange.
-	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+	// The code is still good for its own browser's JSON exchange (a charset
+	// parameter is fine).
+	req := laneAExchangeRequest(t, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+	req.RequestCtx.Request.Header.SetContentType("application/json; charset=utf-8")
+	require.NoError(t, app.RefreshToken(req))
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
 }
 
@@ -469,11 +481,12 @@ func TestLaneA_SSOExchange_SoftDeletedUserRejected(t *testing.T) {
 func TestLaneA_SSOExchange_RefusedOnceRemovedFromTheOrganization(t *testing.T) {
 	app := newSSOApp(t)
 	attempt := laneASSOCallback(t, app)
-	// Removed from the organization between the callback and the exchange.
+	// Removed from the organization between the callback and the exchange
+	// (it was their own: users.organization_id still names it).
 	require.NoError(t, app.DB.Where("user_id = ?", attempt.user.ID).Delete(&models.UserOrganization{}).Error)
 
 	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
-	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "No active organization membership")
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "not a member of this organization")
 	assert.Empty(t, laneASessionCookies(req))
 	laneAAssertBindingSpent(t, req, attempt, "/api/auth/refresh")
 }
@@ -573,4 +586,303 @@ func TestLaneA_SSOExchange_TwoAttemptsKeepTheirOwnBinding(t *testing.T) {
 	// B's refresh token is live.
 	refreshed := laneARefresh(t, app, jar["whm_refresh"])
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(refreshed))
+}
+
+// laneASessionClaims returns the access-token claims and the answered
+// organization of a session-issuing response.
+func laneASessionClaims(t *testing.T, req *fastglue.Request) (*middleware.JWTClaims, string) {
+	t.Helper()
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	var envelope struct {
+		Data struct {
+			User struct {
+				OrganizationID string `json:"organization_id"`
+			} `json:"user"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &envelope))
+	return laneAAccessClaims(t, testutil.GetResponseCookie(req, "whm_access")), envelope.Data.User.OrganizationID
+}
+
+// laneALogin signs a testutil user in with its password ("password123").
+func laneALogin(t *testing.T, app *handlers.App, email string) *fastglue.Request {
+	t.Helper()
+	req := testutil.NewJSONRequest(t, map[string]string{"email": email, "password": "password123"})
+	require.NoError(t, app.Login(req))
+	return req
+}
+
+// laneAMembership adds user to orgID with a role of its own there.
+func laneAMembership(t *testing.T, app *handlers.App, userID, orgID uuid.UUID) *models.CustomRole {
+	t.Helper()
+	role := testutil.CreateTestRole(t, app.DB, orgID, "member-"+uuid.NewString()[:8], nil)
+	require.NoError(t, app.DB.Create(&models.UserOrganization{UserID: userID, OrganizationID: orgID, RoleID: &role.ID}).Error)
+	return role
+}
+
+func TestLaneA_SSOCallback_TheLegacyHomeOrganizationGrantsNothing(t *testing.T) {
+	app := newSSOApp(t)
+	// Alice's home organization is A (users.organization_id), and she is also
+	// a member of C. She is removed from A: only her membership row goes.
+	fake := newFakeOAuth(t)
+	orgA := testutil.CreateTestOrganization(t, app.DB)
+	orgC := testutil.CreateTestOrganization(t, app.DB)
+	createCustomSSOProvider(t, app, orgA.ID, fake, func(p *models.SSOProvider) {
+		p.AllowAutoCreate = false
+	})
+	alice := testutil.CreateTestUser(t, app.DB, orgA.ID, testutil.WithEmail(testutil.UniqueEmail("alice")))
+	laneAMembership(t, app, alice.ID, orgC.ID)
+	require.NoError(t, app.DB.Where("user_id = ? AND organization_id = ?", alice.ID, orgA.ID).
+		Delete(&models.UserOrganization{}).Error)
+
+	// A's identity provider vouches for "Alice": A's SSO still refuses her.
+	fake.UserEmail = alice.Email
+	nonce := "legacy-home-" + uuid.NewString()
+	state, _ := json.Marshal(handlers.SSOState{
+		OrgID: orgA.ID.String(), Provider: "custom", Nonce: nonce, ExpiresAt: time.Now().Add(5 * time.Minute),
+	})
+	require.NoError(t, app.Redis.Set(context.Background(), "sso:state:"+nonce, state, 5*time.Minute).Err())
+	req := testutil.NewGETRequest(t)
+	testutil.SetPathParam(req, "provider", "custom")
+	testutil.SetQueryParam(req, "code", "auth-code-xyz")
+	testutil.SetQueryParam(req, "state", nonce)
+	require.NoError(t, app.CallbackSSO(req))
+
+	assert.Contains(t, string(req.RequestCtx.Response.Header.Peek("Location")), "not+a+member")
+	laneAAssertNoBindingTouched(t, req)
+	laneAAssertNoGrantFor(t, app, alice.ID)
+}
+
+func TestLaneA_SSOExchange_RefusedOnceRemovedFromTheHomeOrganizationThoughAMemberElsewhere(t *testing.T) {
+	app := newSSOApp(t)
+	// Alice signs in through the SSO of her home organization A; she is also
+	// a member of C...
+	attempt := laneASSOCallback(t, app)
+	orgC := testutil.CreateTestOrganization(t, app.DB)
+	laneAMembership(t, app, attempt.user.ID, orgC.ID)
+	// ...and is removed from A before the exchange: only the membership row
+	// goes, users.organization_id still says A.
+	require.NoError(t, app.DB.Where("user_id = ? AND organization_id = ?", attempt.user.ID, attempt.orgID).
+		Delete(&models.UserOrganization{}).Error)
+
+	// No session in C (or anywhere) through A's SSO.
+	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "not a member of this organization")
+	assert.Empty(t, laneASessionCookies(req))
+	laneAAssertBindingSpent(t, req, attempt, "/api/auth/refresh")
+}
+
+func TestLaneA_SSOExchange_SuperAdminOfTheOrganization(t *testing.T) {
+	app := newSSOApp(t)
+	// A super admin whose own organization is S, with no membership row there.
+	fake := newFakeOAuth(t)
+	orgS := testutil.CreateTestOrganization(t, app.DB)
+	createCustomSSOProvider(t, app, orgS.ID, fake, func(p *models.SSOProvider) {
+		p.AllowAutoCreate = false
+	})
+	admin := testutil.CreateTestUser(t, app.DB, orgS.ID, testutil.WithEmail(testutil.UniqueEmail("super")))
+	require.NoError(t, app.DB.Model(&models.User{}).Where("id = ?", admin.ID).Update("is_super_admin", true).Error)
+	require.NoError(t, app.DB.Where("user_id = ?", admin.ID).Delete(&models.UserOrganization{}).Error)
+	admin.IsSuperAdmin = true
+
+	attempt := laneASSOCallbackFor(t, app, fake, admin, orgS.ID)
+	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+
+	claims, org := laneASessionClaims(t, req)
+	assert.Equal(t, orgS.ID.String(), org)
+	assert.Equal(t, orgS.ID, claims.OrganizationID)
+	assert.True(t, claims.IsSuperAdmin)
+	laneAAssertBindingSpent(t, req, attempt, "/api/auth/refresh")
+}
+
+func TestLaneA_SSOExchange_FallsBackLikeLogin(t *testing.T) {
+	app := newSSOApp(t)
+	// Home organization H, also a member of B; the membership in H is gone.
+	fake := newFakeOAuth(t)
+	home := testutil.CreateTestOrganization(t, app.DB)
+	orgB := testutil.CreateTestOrganization(t, app.DB)
+	createCustomSSOProvider(t, app, orgB.ID, fake, func(p *models.SSOProvider) {
+		p.AllowAutoCreate = false
+	})
+	user := testutil.CreateTestUser(t, app.DB, home.ID, testutil.WithEmail(testutil.UniqueEmail("fallback")))
+	roleB := laneAMembership(t, app, user.ID, orgB.ID)
+	require.NoError(t, app.DB.Where("user_id = ? AND organization_id = ?", user.ID, home.ID).
+		Delete(&models.UserOrganization{}).Error)
+
+	attempt := laneASSOCallbackFor(t, app, fake, user, orgB.ID)
+	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+
+	// Login's fallback: the other active membership, with its role.
+	claims, org := laneASessionClaims(t, req)
+	assert.Equal(t, orgB.ID.String(), org)
+	assert.Equal(t, orgB.ID, claims.OrganizationID)
+	require.NotNil(t, claims.RoleID)
+	assert.Equal(t, roleB.ID, *claims.RoleID)
+	laneAAssertBindingSpent(t, req, attempt, "/api/auth/refresh")
+}
+
+func TestApp_Login_FallsBackToAnotherMembership(t *testing.T) {
+	app := newTestApp(t)
+	home := testutil.CreateTestOrganization(t, app.DB)
+	orgB := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, home.ID, testutil.WithEmail(testutil.UniqueEmail("login-fallback")))
+	roleB := laneAMembership(t, app, user.ID, orgB.ID)
+	require.NoError(t, app.DB.Where("user_id = ? AND organization_id = ?", user.ID, home.ID).
+		Delete(&models.UserOrganization{}).Error)
+
+	claims, org := laneASessionClaims(t, laneALogin(t, app, user.Email))
+
+	assert.Equal(t, orgB.ID.String(), org)
+	assert.Equal(t, orgB.ID, claims.OrganizationID)
+	require.NotNil(t, claims.RoleID)
+	assert.Equal(t, roleB.ID, *claims.RoleID)
+}
+
+func TestLaneA_SSOExchange_IssuesWhatLoginIssues(t *testing.T) {
+	app := newSSOApp(t)
+	// Home organization A (active), also a member of B with another role; the
+	// sign-in goes through B's SSO.
+	fake := newFakeOAuth(t)
+	orgA := testutil.CreateTestOrganization(t, app.DB)
+	orgB := testutil.CreateTestOrganization(t, app.DB)
+	createCustomSSOProvider(t, app, orgB.ID, fake, func(p *models.SSOProvider) {
+		p.AllowAutoCreate = false
+	})
+	roleA := testutil.CreateTestRole(t, app.DB, orgA.ID, "home-"+uuid.NewString()[:8], nil)
+	user := testutil.CreateTestUser(t, app.DB, orgA.ID,
+		testutil.WithEmail(testutil.UniqueEmail("same-as-login")), testutil.WithRoleID(&roleA.ID))
+	laneAMembership(t, app, user.ID, orgB.ID)
+
+	attempt := laneASSOCallbackFor(t, app, fake, user, orgB.ID)
+	exchanged, exchangedOrg := laneASessionClaims(t,
+		laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding}))
+	loggedIn, loginOrg := laneASessionClaims(t, laneALogin(t, app, user.Email))
+
+	assert.Equal(t, loginOrg, exchangedOrg)
+	assert.Equal(t, loggedIn.OrganizationID, exchanged.OrganizationID)
+	assert.Equal(t, loggedIn.RoleID, exchanged.RoleID)
+	assert.Equal(t, loggedIn.IsSuperAdmin, exchanged.IsSuperAdmin)
+	assert.Equal(t, orgA.ID, exchanged.OrganizationID)
+	require.NotNil(t, exchanged.RoleID)
+	assert.Equal(t, roleA.ID, *exchanged.RoleID)
+}
+
+func TestLaneA_SSOExchange_TwoBindingsInOneRequest(t *testing.T) {
+	app := newSSOApp(t)
+	jar := map[string]string{}
+	a := laneASSOCallback(t, app)
+	laneAApplyCookies(jar, a.callback)
+	b := laneASSOCallback(t, app)
+	laneAApplyCookies(jar, b.callback)
+	require.Len(t, jar, 2)
+
+	// B's exchange carries both bindings: it reads and spends only B's.
+	exchangeB := laneASSOExchange(t, app, b.code, jar)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exchangeB))
+	laneAAssertBindingSpent(t, exchangeB, b, "/api/auth/refresh")
+	laneAApplyCookies(jar, exchangeB)
+	assert.Equal(t, a.binding, jar[a.bindName])
+
+	// A's then succeeds, and the jar ends with A's session.
+	exchangeA := laneASSOExchange(t, app, a.code, jar)
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(exchangeA))
+	laneAAssertBindingSpent(t, exchangeA, a, "/api/auth/refresh")
+	laneAApplyCookies(jar, exchangeA)
+	for _, name := range []string{"whm_access", "whm_refresh", "whm_csrf"} {
+		assert.Equal(t, testutil.GetResponseCookie(exchangeA, name), jar[name], name)
+	}
+	assert.Equal(t, a.user.ID, laneAAccessClaims(t, jar["whm_access"]).UserID)
+}
+
+func TestLaneA_SSOExchange_AnotherAttemptsBindingDoesNotCount(t *testing.T) {
+	app := newSSOApp(t)
+	a := laneASSOCallback(t, app)
+	b := laneASSOCallback(t, app)
+
+	// A's code with only B's binding: refused, and A's attempt is spent.
+	req := laneASSOExchange(t, app, a.code, map[string]string{b.bindName: b.binding})
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "Invalid or expired sign-in")
+	assert.Empty(t, laneASessionCookies(req))
+	laneAAssertBindingSpent(t, req, a, "/api/auth/refresh")
+}
+
+type laneAFaultKey struct{}
+
+func TestLaneA_SSOExchange_MembershipLookupFaultAnswers503(t *testing.T) {
+	app := newSSOApp(t)
+	// Signing in through the SSO of an organization that is not the user's
+	// own...
+	fake := newFakeOAuth(t)
+	home := testutil.CreateTestOrganization(t, app.DB)
+	ssoOrg := testutil.CreateTestOrganization(t, app.DB)
+	createCustomSSOProvider(t, app, ssoOrg.ID, fake, func(p *models.SSOProvider) {
+		p.AllowAutoCreate = false
+	})
+	user := testutil.CreateTestUser(t, app.DB, home.ID, testutil.WithEmail(testutil.UniqueEmail("membership-fault")))
+	laneAMembership(t, app, user.ID, ssoOrg.ID)
+	attempt := laneASSOCallbackFor(t, app, fake, user, ssoOrg.ID)
+
+	// ...the user loads, then the membership lookup fails. The fault is
+	// injected on a gorm instance of this test's own (the same pool), so no
+	// other test sees it.
+	live := app.DB
+	pool, err := live.DB()
+	require.NoError(t, err)
+	isolated, err := gorm.Open(postgres.New(postgres.Config{Conn: pool}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	require.NoError(t, isolated.Callback().Query().Before("gorm:query").Register("lane_a:membership_fault", func(tx *gorm.DB) {
+		if tx.Statement.Table == "user_organizations" && tx.Statement.Context.Value(laneAFaultKey{}) != nil {
+			_ = tx.AddError(errors.New("injected membership lookup fault"))
+		}
+	}))
+	app.DB = isolated.WithContext(context.WithValue(context.Background(), laneAFaultKey{}, true))
+	defer func() { app.DB = live }()
+
+	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusServiceUnavailable, "temporarily unavailable")
+	assert.Empty(t, laneASessionCookies(req))
+	laneAAssertBindingSpent(t, req, attempt, "/api/auth/refresh")
+}
+
+func TestLaneA_SSOExchange_RefusedForAnInactiveResellerMembership(t *testing.T) {
+	app := newSSOApp(t)
+	attempt := laneASSOCallback(t, app)
+	// The membership becomes one derived from a reseller that no longer
+	// grants it (as Login sees it: not an active membership).
+	require.NoError(t, app.DB.Model(&models.UserOrganization{}).
+		Where("user_id = ? AND organization_id = ?", attempt.user.ID, attempt.orgID).
+		Updates(map[string]any{"source": models.MembershipSourceReseller, "reseller_member_id": nil}).Error)
+
+	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusUnauthorized, "not a member of this organization")
+	assert.Empty(t, laneASessionCookies(req))
+	laneAAssertBindingSpent(t, req, attempt, "/api/auth/refresh")
+}
+
+func TestLaneA_SSOExchange_SuperAdminWithAResellerMembership(t *testing.T) {
+	app := newSSOApp(t)
+	// A super admin (own organization S) with a reseller-derived membership of
+	// T, signing in through T's SSO: as for a login, a super admin's
+	// membership counts whatever its source.
+	fake := newFakeOAuth(t)
+	orgS := testutil.CreateTestOrganization(t, app.DB)
+	orgT := testutil.CreateTestOrganization(t, app.DB)
+	createCustomSSOProvider(t, app, orgT.ID, fake, func(p *models.SSOProvider) {
+		p.AllowAutoCreate = false
+	})
+	admin := testutil.CreateTestUser(t, app.DB, orgS.ID, testutil.WithEmail(testutil.UniqueEmail("super-reseller")))
+	require.NoError(t, app.DB.Model(&models.User{}).Where("id = ?", admin.ID).Update("is_super_admin", true).Error)
+	admin.IsSuperAdmin = true
+	require.NoError(t, app.DB.Create(&models.UserOrganization{
+		UserID: admin.ID, OrganizationID: orgT.ID, Source: models.MembershipSourceReseller,
+	}).Error)
+
+	attempt := laneASSOCallbackFor(t, app, fake, admin, orgT.ID)
+	req := laneASSOExchange(t, app, attempt.code, map[string]string{attempt.bindName: attempt.binding})
+
+	claims, _ := laneASessionClaims(t, req)
+	assert.True(t, claims.IsSuperAdmin)
+	laneAAssertBindingSpent(t, req, attempt, "/api/auth/refresh")
 }

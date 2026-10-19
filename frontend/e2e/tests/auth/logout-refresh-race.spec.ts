@@ -397,9 +397,13 @@ test.describe('Logout during a token refresh', () => {
       // Give a clearing /auth/logout every chance to go out.
       await page.waitForTimeout(2_000)
 
-      // The revoke only, cookie-neutral; no refresh, no /auth/logout.
-      expect(order).toEqual(['revoke'])
-      expect(revokeBodies).toEqual([{ revoke: true, keep_cookies: true }])
+      // Revokes only, each cookie-neutral (a page without the lock never
+      // takes a pending logout over, so normally exactly one); no refresh, no
+      // /auth/logout, no cookie changed.
+      expect(order.length).toBeGreaterThanOrEqual(1)
+      expect(order.every((kind) => kind === 'revoke')).toBe(true)
+      expect(revokeBodies).toHaveLength(order.length)
+      for (const body of revokeBodies) expect(body).toEqual({ revoke: true, keep_cookies: true })
       expect(refreshes()).toBe(0)
       for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
         expect(await cookieValue(context, name)).toBe(before[name])
@@ -411,13 +415,21 @@ test.describe('Logout during a token refresh', () => {
       expect(JSON.parse(pending!).marker).toMatch(/^ended:/)
       expect(await page.evaluate(() => localStorage.getItem('whm_session_id'))).toMatch(/^ended:/)
 
-      // The next page that holds the lock finishes the clearing, ordered.
+      // The next page that holds the lock finishes the clearing, ordered:
+      // its own revoke (clearing), then the one /auth/logout.
       const other = await context.newPage()
+      const otherRevokeBodies: unknown[] = []
+      other.on('request', (request) => {
+        const body = request.postData() ?? ''
+        if (request.url().endsWith('/api/auth/refresh') && body.includes('"revoke"')) otherRevokeBodies.push(JSON.parse(body))
+      })
       const cleared = other.waitForResponse('**/api/auth/logout')
       await other.goto('/login', { waitUntil: 'domcontentloaded' })
       expect(await other.evaluate(() => !!navigator.locks)).toBe(true)
       await cleared
-      expect(order).toEqual(['revoke', 'revoke', 'logout'])
+      expect(order.slice(-2)).toEqual(['revoke', 'logout'])
+      expect(order.filter((kind) => kind === 'logout')).toHaveLength(1)
+      expect(otherRevokeBodies).toEqual([{ revoke: true }])
       expect(await cookieValue(context, 'whm_access')).toBeUndefined()
       expect(await cookieValue(context, 'whm_refresh')).toBeUndefined()
       await expect.poll(() => other.evaluate(() => localStorage.getItem('whm_logout_pending'))).toBeNull()

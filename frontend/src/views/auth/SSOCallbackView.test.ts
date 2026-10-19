@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   push: vi.fn(),
   replace: vi.fn(),
   keep: vi.fn(),
+  interrupted: vi.fn(),
   unsent: vi.fn(),
   restoreSession: vi.fn(),
   store: { isAuthenticated: false, user: null as null | { role?: { name: string } } },
@@ -46,12 +47,17 @@ vi.mock('@/services/api', () => ({
   api: { get: mocks.get },
   exchangeSsoCode: mocks.exchange,
   keepSsoCode: mocks.keep,
+  ssoExchangeInterrupted: mocks.interrupted,
   unsentSsoCode: mocks.unsent,
   SESSION_BUSY_CODE: 'ERR_SESSION_BUSY',
   SESSION_UNSUPPORTED_CODE: 'ERR_SESSION_UNSUPPORTED',
 }))
 
 import SSOCallbackView from './SSOCallbackView.vue'
+
+// The exchange answers like a sign-in: {expires_in, user}.
+const USER_B = { id: 'user-b', role: { name: 'admin' } }
+const answer = { data: { data: { expires_in: 900, user: USER_B } } }
 
 function mountCallback() {
   return mount(SSOCallbackView, {
@@ -70,16 +76,16 @@ describe('SSOCallbackView', () => {
     mocks.push.mockReset()
     mocks.replace.mockReset().mockResolvedValue(undefined)
     mocks.keep.mockReset()
+    mocks.interrupted.mockReset().mockReturnValue(false)
     mocks.unsent.mockReset().mockReturnValue(null)
     mocks.restoreSession.mockReset().mockReturnValue(false)
     mocks.store = { isAuthenticated: false, user: null }
     mocks.query = {}
   })
 
-  it('exchanges the one-time code (taking it off the URL), then loads the user', async () => {
+  it('exchanges the one-time code (taking it off the URL) and applies the user it answers, with no /me', async () => {
     mocks.query = { code: 'code-b' }
-    mocks.exchange.mockResolvedValueOnce({ data: { data: { expires_in: 900 } } })
-    mocks.get.mockResolvedValueOnce({ data: { data: { id: 'user-b', role: { name: 'admin' } } } })
+    mocks.exchange.mockResolvedValueOnce(answer)
 
     mountCallback()
     await flushPromises()
@@ -90,8 +96,7 @@ describe('SSOCallbackView', () => {
     expect(mocks.exchange).toHaveBeenCalledWith('code-b')
     expect(mocks.keep.mock.invocationCallOrder[0]).toBeLessThan(mocks.replace.mock.invocationCallOrder[0])
     expect(mocks.replace.mock.invocationCallOrder[0]).toBeLessThan(mocks.exchange.mock.invocationCallOrder[0])
-    expect(mocks.exchange.mock.invocationCallOrder[0]).toBeLessThan(mocks.get.mock.invocationCallOrder[0])
-    expect(mocks.get).toHaveBeenCalledWith('/me')
+    expect(mocks.get).not.toHaveBeenCalled()
     expect(mocks.setAuth).toHaveBeenCalledWith({ user: { id: 'user-b', role: { name: 'admin' } } })
   })
 
@@ -99,8 +104,7 @@ describe('SSOCallbackView', () => {
     mocks.query = { code: 'code-b' }
     let replaced!: () => void
     mocks.replace.mockReturnValueOnce(new Promise<void>((resolve) => (replaced = resolve)))
-    mocks.exchange.mockResolvedValueOnce({ data: { data: { expires_in: 900 } } })
-    mocks.get.mockResolvedValueOnce({ data: { data: { id: 'user-b', role: { name: 'admin' } } } })
+    mocks.exchange.mockResolvedValueOnce(answer)
 
     mountCallback()
     await flushPromises()
@@ -121,10 +125,23 @@ describe('SSOCallbackView', () => {
     expect(wrapper.text()).toContain('auth.ssoLinkUsed')
   })
 
+  it('without a code, an exchange a reload interrupted says so (and enters no session)', async () => {
+    mocks.interrupted.mockReturnValue(true)
+    // Even with a session stored from before (the one the SSO was replacing).
+    mocks.store = { isAuthenticated: false, user: { role: { name: 'admin' } } }
+    mocks.restoreSession.mockReturnValue(true)
+    const wrapper = mountCallback()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('auth.ssoInterrupted')
+    expect(mocks.replace).not.toHaveBeenCalled()
+    expect(mocks.restoreSession).not.toHaveBeenCalled()
+    expect(mocks.exchange).not.toHaveBeenCalled()
+  })
+
   it('a reload while the exchange waited retries the kept, unsent code', async () => {
     mocks.unsent.mockReturnValue('code-b')
-    mocks.exchange.mockResolvedValueOnce({ data: { data: { expires_in: 900 } } })
-    mocks.get.mockResolvedValueOnce({ data: { data: { id: 'user-b', role: { name: 'admin' } } } })
+    mocks.exchange.mockResolvedValueOnce(answer)
 
     mountCallback()
     await flushPromises()

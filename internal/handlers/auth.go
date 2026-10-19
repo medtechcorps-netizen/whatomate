@@ -654,6 +654,29 @@ return 1`,
 // role from user_organizations. Only initial login may fall back to a different
 // active membership; refresh and organization switching must honor the exact
 // organization already selected.
+// ssoOrganizationMember tells whether user may sign in through the SSO of
+// organization orgID. The membership table is the authority, as it is for a
+// login (applyOrganizationMembership): an active membership there (one derived
+// from a reseller only while that is active). The legacy users.organization_id
+// grants nothing by itself (removing a member deletes only the membership),
+// except for a super admin's own organization. The callback checks it, and the
+// exchange again (the grant waits up to ssoExchangeTTL).
+func (a *App) ssoOrganizationMember(user *models.User, orgID uuid.UUID) (bool, error) {
+	if user.IsSuperAdmin && user.OrganizationID == orgID {
+		return true, nil
+	}
+	var memberships []models.UserOrganization
+	if err := a.DB.Where("user_id = ? AND organization_id = ?", user.ID, orgID).
+		Limit(1).Find(&memberships).Error; err != nil {
+		return false, err
+	}
+	if len(memberships) == 0 {
+		return false, nil
+	}
+	// As for a login, a super admin's membership counts whatever its source.
+	return user.IsSuperAdmin || access.ResellerDerivedMembershipActive(a.DB, &memberships[0]), nil
+}
+
 func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, allowFallback bool) error {
 	var membership models.UserOrganization
 	membershipErr := a.DB.Where("user_id = ? AND organization_id = ?", user.ID, orgID).First(&membership).Error

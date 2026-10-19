@@ -299,6 +299,12 @@ function recordPendingCsrf(ended: string) {
   }
 }
 
+// The CSRF value recorded with the pending logout of `ended`, if any.
+function recordedLogoutCsrf(ended?: string): string | null {
+  const pending = readPendingLogout();
+  return ended !== undefined && pending?.marker === ended ? pending.csrf : null;
+}
+
 // A pending logout still applies while no session began after it.
 function pendingLogoutApplies(): PendingLogout | null {
   const pending = readPendingLogout();
@@ -512,7 +518,12 @@ export async function revokeRefreshToken(
     if (current && current !== identity) return;
     if (endedMarker !== undefined && readSessionMarker() !== endedMarker) return;
     // Read the token on every attempt: a refresh in another tab rotates it.
-    const csrfToken = getCookie("whm_csrf");
+    // Without Web Locks nothing orders this revoke against a sign-in in
+    // another tab, so it presents the CSRF value recorded for the ended
+    // session: a newer session's cookies that land meanwhile then fail the
+    // server's check instead of being revoked.
+    const pinned = !webLocks();
+    const csrfToken = pinned ? recordedLogoutCsrf(endedMarker) : getCookie("whm_csrf");
     if (!csrfToken) return;
     try {
       await axios.post(
@@ -531,8 +542,9 @@ export async function revokeRefreshToken(
     } catch (error) {
       if (signal?.aborted) return;
       const status = axios.isAxiosError(error) ? error.response?.status : undefined;
-      // The CSRF cookie was rotated mid-flight: try again with the new one.
-      if (status === 403 && getCookie("whm_csrf") !== csrfToken) continue;
+      // The CSRF cookie was rotated mid-flight: try again with the new one
+      // (never without Web Locks: the new one may be a newer session's).
+      if (status === 403 && !pinned && getCookie("whm_csrf") !== csrfToken) continue;
       // The revoke shares the per-IP refresh rate limit, which a busy
       // clinic behind one NAT address can exhaust: wait and retry a 429.
       // Anything else, or a last failure, still lets the logout go ahead.
@@ -958,6 +970,57 @@ function dropSsoCode() {
   }
 }
 
+// Set (in this tab) when an SSO exchange is sent, with the session marker and
+// CSRF value of that moment, and cleared once its outcome is seen here. A tab
+// that finds it after a reload never saw the answer: the exchange's cookies may
+// have landed unseen.
+const SSO_SENT_KEY = "whm_sso_sent";
+
+function noteSsoExchangeSent() {
+  try {
+    sessionStorage.setItem(
+      SSO_SENT_KEY,
+      JSON.stringify({ marker: readSessionMarker(), csrf: getCookie("whm_csrf") }),
+    );
+  } catch {
+    // Without storage a reload cannot tell.
+  }
+}
+
+function clearSsoExchangeSent() {
+  try {
+    sessionStorage.removeItem(SSO_SENT_KEY);
+  } catch {
+    // Nothing noted.
+  }
+}
+
+/**
+ * After a reload, whether an SSO exchange this tab sent was interrupted (its
+ * answer never seen here). Not when a newer session, consistent with the jar
+ * (its own CSRF value), is live: one that began after the exchange was sent
+ * can be shown. Reading it clears it.
+ */
+export function ssoExchangeInterrupted(): boolean {
+  let sent: { marker: string | null } | null = null;
+  try {
+    sent = JSON.parse(sessionStorage.getItem(SSO_SENT_KEY) ?? "null");
+  } catch {
+    return false;
+  }
+  clearSsoExchangeSent();
+  if (!sent) return false;
+  const marker = readSessionMarker();
+  const begun = readBegunSession();
+  const newerLive =
+    marker !== null &&
+    !isEndedMarker(marker) &&
+    marker !== sent.marker &&
+    begun?.marker === marker &&
+    begun.csrf === getCookie("whm_csrf");
+  return !newerLive;
+}
+
 /** Resolves once a logout started in this tab has finished in the background. */
 export function whenLogoutSettled(): Promise<void> {
   return pendingLogout ?? Promise.resolve();
@@ -1034,7 +1097,8 @@ function startTabPresence() {
 // here, ordered like any other.
 function takeOverPendingLogout() {
   const pending = pendingLogoutApplies();
-  if (!pending || pendingLogoutMarker === pending.marker) return;
+  // A page without Web Locks takes nothing over: it could only revoke again.
+  if (!pending || pendingLogoutMarker === pending.marker || !webLocks()) return;
   ownedLogout = pending.marker;
   pendingLogoutMarker = pending.marker;
   pendingLogout = finishLogout(pending.marker, undefined, true);
@@ -1050,6 +1114,9 @@ function takeOverPendingLogout() {
 function sendLogoutOnPageHide() {
   announceTab("bye");
   stopTabHeartbeat();
+  // Without Web Locks the logout already revoked, cookie-neutral; the
+  // clearing is left to a page that holds the lock.
+  if (!webLocks()) return;
   const pending = pendingLogoutApplies();
   if (!pending || pending.marker !== ownedLogout || anotherTabAlive()) return;
   const csrfToken = getCookie("whm_csrf");
@@ -1261,9 +1328,10 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     locksUnusable = true;
   }
 
-  if (pendingLogoutApplies()) {
+  if (pendingLogoutApplies() && webLocks()) {
     // A logout that never got through (the tab closed first, or it failed):
-    // finish it now, ordered like any other.
+    // finish it now, ordered like any other. A page without Web Locks leaves
+    // it to one that holds the lock (it could only revoke again).
     const pending = pendingLogoutApplies()!;
     ownedLogout = pending.marker;
     pendingLogoutMarker = pending.marker;
@@ -1393,8 +1461,12 @@ api.interceptors.request.use(
             config.headers.delete("X-CSRF-Token");
           }
         }
-        // The exchange goes out now: its code is spent, never to be resent.
-        if (held._ssoExchange) dropSsoCode();
+        // The exchange goes out now: its code is spent, never to be resent,
+        // and until its outcome is seen here a reload must not guess it.
+        if (held._ssoExchange) {
+          dropSsoCode();
+          noteSsoExchangeSent();
+        }
         return config;
       });
     }
@@ -1411,6 +1483,8 @@ api.interceptors.response.use(
     const config = response.config as AuthAwareRequestConfig | undefined;
     const path = requestPath(config?.url);
     if (!isSessionIssuing(config, path)) return response;
+    // The exchange's answer is seen here: a reload from now on need not guess.
+    if (config?._ssoExchange) clearSsoExchangeSent();
     try {
       if (readSessionMarker() !== config?._issueMarker) {
         // The session ended while this was in flight: what it just issued
@@ -1428,6 +1502,8 @@ api.interceptors.response.use(
           // The SSO account's identity and organization are not the ones a
           // previous session stored (a password sign-in clears them before
           // it is sent; the callback page has nothing to clear until now).
+          // The callback page applies the answer's user next, as a sign-in
+          // does, with no request in between.
           clearBrowserOrganizationIdentity();
           writeStoredValue("user", null);
         }
@@ -1452,6 +1528,8 @@ api.interceptors.response.use(
       ) {
         await endIssuedSession();
       }
+      // Its outcome is seen (refused, or undone just now).
+      if (issuing?._ssoExchange) clearSsoExchangeSent();
     } finally {
       // First, so a 401 on an org switch can refresh without waiting on
       // itself; and even if the undo threw.

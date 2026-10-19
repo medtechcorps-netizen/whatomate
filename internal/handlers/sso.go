@@ -258,23 +258,6 @@ type ssoExchangeGrant struct {
 	Binding string `json:"binding"`
 }
 
-// ssoOrganizationMember tells whether user may sign in through the SSO of
-// organization orgID: it is their organization, or they hold a membership
-// there. The callback checks it, and the exchange again (the grant waits up
-// to ssoExchangeTTL).
-func (a *App) ssoOrganizationMember(user *models.User, orgID uuid.UUID) (bool, error) {
-	if user.OrganizationID == orgID {
-		return true, nil
-	}
-	var count int64
-	if err := a.DB.Model(&models.UserOrganization{}).
-		Where("user_id = ? AND organization_id = ?", user.ID, orgID).
-		Count(&count).Error; err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
 // CallbackSSO handles OAuth callback. It does not set the session cookies:
 // they would land with the navigation, unordered against the app's other
 // tabs (their refreshes and logouts). It stores the signed-in user under a
@@ -510,8 +493,10 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 // browser (and cleared here; no other attempt's). Membership, organization
 // and role are resolved now, as a password login does (issueLoginSession),
 // and the user must still be a member of the organization whose SSO it was.
-// A bad code answers 401; a store or lookup fault answers 503, as a refresh
-// does. Only a JSON body is accepted: the refresh route is CSRF-exempt, and a
+// A bad code answers 401. A fault of the code store, or of loading the user or
+// their membership of the SSO's organization, answers 503, as a refresh does;
+// a fault inside issueLoginSession answers as it does for a password login.
+// Only a JSON body is accepted: the refresh route is CSRF-exempt, and a
 // cross-site form can send a form body but not a JSON one.
 func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
 	invalid := func(reason string) error {
@@ -522,7 +507,8 @@ func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
 		a.Log.Error("SSO exchange failed", "reason", reason, "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Sign-in is temporarily unavailable, please try again", nil, "")
 	}
-	if !strings.Contains(string(r.RequestCtx.Request.Header.ContentType()), "application/json") {
+	mediaType, _, _ := strings.Cut(string(r.RequestCtx.Request.Header.ContentType()), ";")
+	if !strings.EqualFold(strings.TrimSpace(mediaType), "application/json") {
 		return r.SendErrorEnvelope(fasthttp.StatusUnsupportedMediaType, "Content-Type must be application/json", nil, "")
 	}
 	if a.Redis == nil {

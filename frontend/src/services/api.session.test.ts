@@ -1787,27 +1787,140 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       )
       expect(assignedHref).toBeNull()
     })
-
-    it(`a 401 within one session still refreshes and retries (${locking})`, async () => {
-      // Without Web Locks no refresh runs at all (see the dedicated test).
-      if (locking !== 'Web Locks') return
-      localStorage.setItem('whm_session_id', 'session-a')
-      let rotated = false
-      const { api } = await loadTab(async (config) => {
-        if (!rotated) throw httpError(401, config)
-        return ok(config)
-      })
-      recordPosts([], (label) => {
-        if (label === 'refresh') {
-          rotated = true
-          return refreshOk()
-        }
-      })
-
-      expect((await api.get('/contacts')).status).toBe(200)
-      expect(localStorage.getItem('whm_session_id')).toBe('session-a')
-    })
   }
+
+  it('a 401 within one session still refreshes and retries', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    let rotated = false
+    const { api } = await loadTab(async (config) => {
+      if (!rotated) throw httpError(401, config)
+      return ok(config)
+    })
+    recordPosts([], (label) => {
+      if (label === 'refresh') {
+        rotated = true
+        return refreshOk()
+      }
+    })
+
+    expect((await api.get('/contacts')).status).toBe(200)
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+  })
+
+  it('a page without Web Locks takes no pending logout over: nothing at load, at a hand-over or at pagehide', async () => {
+    removeWebLocks()
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    FakeBroadcastChannel.channels.clear()
+    const fetchSpy = vi.fn(async () => new Response('{}'))
+    vi.stubGlobal('fetch', fetchSpy)
+    // A logout of this browser is still pending (its cookies to be cleared).
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    localStorage.setItem('whm_logout_pending', JSON.stringify({ marker: 'ended:session-a', csrf: 'csrf-token-1' }))
+    const order: string[] = []
+    recordPosts(order)
+
+    const { whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    await whenLogoutSettled()
+    // A closing tab hands it over...
+    new FakeBroadcastChannel('whm-tabs').postMessage({ type: 'bye', id: 'closing-tab' })
+    await tick()
+    await whenLogoutSettled()
+    // ...and this page closes too.
+    window.dispatchEvent(new Event('pagehide'))
+
+    expect(order).toEqual([])
+    expect(fetchSpy).not.toHaveBeenCalled()
+    // Left for a page that holds the lock.
+    expect(JSON.parse(localStorage.getItem('whm_logout_pending')!).marker).toBe('ended:session-a')
+    FakeBroadcastChannel.channels.clear()
+  })
+
+  it('without Web Locks the revoke presents the CSRF value recorded for its session, and never retries with a newer one', async () => {
+    removeWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke')) {
+        // A newer session's cookies land (another tab signed in) before its
+        // marker does: the server sees a CSRF mismatch.
+        setCookie('whm_csrf=csrf-of-a-newer-session; path=/')
+        throw httpError(403)
+      }
+    })
+
+    await api.post('/auth/logout', {})
+    await whenLogoutSettled()
+
+    expect(order).toEqual(['revoke csrf-token-1'])
+  })
+
+  it('an SSO exchange sent and never answered here (the tab reloads) leaves a note: the next page finds it interrupted', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    // The answer never comes: the tab goes away while it is out.
+    const tab = await loadTab(() => new Promise(() => undefined))
+    recordPosts([])
+    void tab.exchangeSsoCode('code-b').catch(() => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    const reloaded = await loadTab(async (config) => ok(config))
+    expect(reloaded.ssoExchangeInterrupted()).toBe(true)
+    // Read once.
+    expect(reloaded.ssoExchangeInterrupted()).toBe(false)
+  })
+
+  it('an SSO exchange whose answer was seen leaves no note (answered, or refused)', async () => {
+    for (const refused of [false, true]) {
+      sessionStorage.clear()
+      const { exchangeSsoCode, ssoExchangeInterrupted } = await loadTab(async (config) => {
+        if (refused) throw httpError(401, config)
+        setCookie('whm_csrf=csrf-of-b; path=/')
+        return ok(config, { data: { expires_in: 900, user: { id: 'user-b' } } })
+      })
+      recordPosts([])
+      await exchangeSsoCode('code-b').catch(() => undefined)
+
+      expect(ssoExchangeInterrupted()).toBe(false)
+    }
+  })
+
+  it('a session that began in another tab after the exchange was sent, consistent with the jar, is not an interruption', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const tab = await loadTab(() => new Promise(() => undefined))
+    recordPosts([])
+    void tab.exchangeSsoCode('code-b').catch(() => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // Another tab signs in: its marker, its cookies, its begun record.
+    localStorage.setItem('whm_session_id', 'session-c')
+    setCookie('whm_csrf=csrf-of-c; path=/')
+    localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-c', csrf: 'csrf-of-c' }))
+
+    const reloaded = await loadTab(async (config) => ok(config))
+    expect(reloaded.ssoExchangeInterrupted()).toBe(false)
+  })
+
+  it.each([
+    ['the session from before the exchange (nothing changed)', 'csrf-token-1'],
+    ['a session whose cookies are not its own (the answer landed unseen)', 'csrf-of-the-unseen-answer'],
+  ])('%s is an interruption', async (_label, jar) => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-a', csrf: 'csrf-token-1' }))
+    setCookie('whm_csrf=csrf-token-1; path=/')
+    const tab = await loadTab(() => new Promise(() => undefined))
+    recordPosts([])
+    void tab.exchangeSsoCode('code-b').catch(() => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // The answer may have landed unseen (new cookies), or not at all.
+    setCookie(`whm_csrf=${jar}; path=/`)
+    if (jar !== 'csrf-token-1') {
+      // A session marker begun elsewhere whose record does not match the jar.
+      localStorage.setItem('whm_session_id', 'session-c')
+      localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-c', csrf: 'csrf-of-c' }))
+    }
+
+    const reloaded = await loadTab(async (config) => ok(config))
+    expect(reloaded.ssoExchangeInterrupted()).toBe(true)
+  })
 
   it('a request sent as user A is never replayed after user B signs in', async () => {
     localStorage.setItem('whm_session_id', 'session-a')
