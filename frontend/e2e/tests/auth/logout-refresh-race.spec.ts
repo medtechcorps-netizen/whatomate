@@ -268,13 +268,64 @@ async function startGoogleSso(page: Page) {
   await page.getByTestId('sso-provider-google').click()
 }
 
-// The number of requests for the shared session lock still waiting in this
-// origin (any tab).
-async function pendingSessionLocks(page: Page) {
+// Opens, in `page`, a same-origin page that is never the app (answered by the
+// test itself, whatever serves BASE_URL: the Go server or the dev server's SPA
+// fallback). Such a page runs no session code: it holds a lock, or just waits.
+async function openNonAppPage(page: Page) {
+  await page.route('**/__lane_a_blank', (route) =>
+    route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><body></body></html>' }),
+  )
+  await page.goto('/__lane_a_blank', { waitUntil: 'domcontentloaded' })
+}
+
+// The Web Locks client id of `page`'s current document: it holds a probe lock
+// of its own for a moment and reads its id back from navigator.locks.query().
+async function lockClientId(page: Page): Promise<string> {
   return page.evaluate(async () => {
-    const state = await navigator.locks.query()
-    return (state.pending ?? []).filter((lock) => lock.name === 'whm-token-refresh').length
+    const name = `lane-a-probe-${Math.random().toString(36).slice(2)}`
+    return navigator.locks.request(name, async () => {
+      const state = await navigator.locks.query()
+      return state.held?.find((lock) => lock.name === name)?.clientId ?? ''
+    })
   })
+}
+
+// Pages by their Web Locks client id, so a lock snapshot can name them.
+type LockClients = Record<string, string>
+
+async function lockClients(pages: Record<string, Page>): Promise<LockClients> {
+  const clients: LockClients = {}
+  for (const [label, page] of Object.entries(pages)) clients[await lockClientId(page)] = label
+  return clients
+}
+
+// Who holds the shared session lock, and who waits for it (in order), as the
+// origin sees it now, each client named.
+async function sessionLockSnapshot(probe: Page, clients: LockClients) {
+  const state = await probe.evaluate(() => navigator.locks.query())
+  const named = (locks: Array<{ name?: string; clientId?: string }> | undefined) =>
+    (locks ?? [])
+      .filter((lock) => lock.name === 'whm-token-refresh')
+      .map((lock) => clients[lock.clientId ?? ''] ?? `unknown client ${lock.clientId}`)
+  return { held: named(state.held), pending: named(state.pending) }
+}
+
+// Expects exactly `count` requests of the page named `label` to be waiting for
+// the shared session lock. A failure reports the whole snapshot.
+async function expectWaitingSessionLocks(probe: Page, clients: LockClients, label: string, count: number) {
+  let last: { held: string[]; pending: string[] } = { held: [], pending: [] }
+  try {
+    await expect
+      .poll(async () => {
+        last = await sessionLockSnapshot(probe, clients)
+        return last.pending.filter((name) => name === label).length
+      })
+      .toBe(count)
+  } catch (error) {
+    throw new Error(
+      `${(error as Error).message}\nsession lock: held by [${last.held.join(', ')}]; waiting: [${last.pending.join(', ')}]`,
+    )
+  }
 }
 
 // SPA navigation (no reload): the router opens `path` in the running app.
@@ -401,7 +452,8 @@ test.describe('Logout during a token refresh', () => {
       })
 
       // The revoke's request, not its answer: the page leaves for /login at
-      // once, and the navigation may cancel the request in flight.
+      // once, and its document goes away with the answer still out (the
+      // keepalive request itself outlives the navigation).
       const revoked = page.waitForRequest(
         (request) => request.url().endsWith('/api/auth/refresh') && (request.postData() ?? '').includes('"revoke"'),
         { timeout: 10_000 },
@@ -424,9 +476,9 @@ test.describe('Logout during a token refresh', () => {
       for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
         expect(await cookieValue(context, name)).toBe(before[name])
       }
-      // The refresh chain is revoked (the server may finish it just after the
-      // navigation cancelled the request); the clearing waits for a page that
-      // holds the lock.
+      // The refresh chain is revoked: the keepalive revoke survives the
+      // navigation, and the server may finish it just after; the clearing
+      // waits for a page that holds the lock.
       await expect.poll(() => refreshStatus(newContext, before.whm_refresh), { timeout: 10_000 }).toBe(401)
       const pending = await page.evaluate(() => localStorage.getItem('whm_logout_pending'))
       expect(JSON.parse(pending!).marker).toMatch(/^ended:/)
@@ -469,9 +521,16 @@ test.describe('Logout during a token refresh', () => {
     other.on('requestfailed', (request) => {
       if (isRefresh(request)) order.push('refresh failed')
     })
+    // This tab waits on a non-app page while the other tab's refresh comes
+    // due (the expiry is shared: an app page here could take that refresh
+    // first), and returns to the app once it is in flight, with the expiry
+    // due no more.
+    await openNonAppPage(page)
     const held = await holdResponse(other, '/auth/refresh', newContext, order, 'refresh landed')
     await startProactiveRefresh(other)
     await held.ready
+    await other.evaluate(() => localStorage.setItem('whm_auth_expires_at', String(Date.now() + 60 * 60_000)))
+    await page.goto('/', { waitUntil: 'domcontentloaded' })
     // The harness holds the other tab's rotated cookies back.
     expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
     expect(held.cookies().whm_refresh).toBeTruthy()
@@ -518,7 +577,7 @@ test.describe('Logout during a token refresh', () => {
     // showing the session would leave it when it ends (a full navigation,
     // which lets go of the lock).
     const other = await context.newPage()
-    await other.goto('/health', { waitUntil: 'domcontentloaded' })
+    await openNonAppPage(other)
 
     const order: string[] = []
     const sent = recordSessionRequests(context, order)
@@ -537,20 +596,26 @@ test.describe('Logout during a token refresh', () => {
     await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, (route) =>
       route.fulfill({ status: 302, headers: { location: '/auth/sso/callback?code=e2e-code-b' } }),
     )
+    // The page leaves with its logout still queued behind the held lock.
+    expect(order).not.toContain('logout')
+    expect(await page.evaluate(() => localStorage.getItem('whm_logout_pending'))).toContain('ended:')
     await startGoogleSso(page)
     await exchange.started
     await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 30_000 })
+    // Anything that would still go out after the exchange has had time to.
+    await page.waitForTimeout(1_000)
 
     // The exchange waited for the logout ahead of it: the one /auth/logout,
-    // and every revoke, went out before it. (The page left for the provider
-    // while its logout waited: with no other app tab to take it over, the
-    // closing page revoked with keepalive, cookie-neutral, and the callback
-    // page finished the logout, ordered, before its exchange.)
+    // and every revoke, went out before it, and nothing of the old logout
+    // after it. (The page left for the provider while its logout waited: with
+    // no other app tab to take it over, the closing page revoked with
+    // keepalive, cookie-neutral, and the callback page finished the logout,
+    // ordered, before its exchange.)
     const exchangeAt = order.indexOf('exchange')
     expect(exchangeAt).toBeGreaterThan(0)
     expect(order.filter((kind) => kind === 'logout')).toHaveLength(1)
     expect(order.indexOf('logout')).toBeLessThan(exchangeAt)
-    expect(order.slice(0, exchangeAt).every((kind) => kind === 'revoke' || kind === 'logout')).toBe(true)
+    expect(order.lastIndexOf('revoke')).toBeLessThan(exchangeAt)
     const issued = exchange.cookies()
     // Nothing of the old logout carried B's cookies or CSRF token...
     for (const request of sent) {
@@ -584,12 +649,22 @@ test.describe('Logout during a token refresh', () => {
 
       if (first === 'refresh') {
         // The other tab's refresh (A's cookies) is in flight; then this tab's
-        // callback page asks for B's session: the exchange waits for it.
+        // callback page asks for B's session: the exchange waits for it. This
+        // tab waits on a non-app page meanwhile: the expiry is shared, and an
+        // app page here could take that refresh first.
+        await openNonAppPage(page)
         const held = await holdResponse(other, '/auth/refresh', newContext, order, 'refresh landed')
         await startProactiveRefresh(other)
         await held.ready
+        // The expiry is shared: left due, the callback page would also queue a
+        // proactive refresh of the old session at load (a second waiting
+        // request of its own, which the exchange's answer retires). Due no
+        // more, the callback page's one waiting request is its exchange.
+        await other.evaluate(() => localStorage.setItem('whm_auth_expires_at', String(Date.now() + 60 * 60_000)))
         await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
-        await expect.poll(() => pendingSessionLocks(page)).toBe(1)
+        const clients = await lockClients({ 'callback page': page, 'other tab': other })
+        await expectWaitingSessionLocks(page, clients, 'callback page', 1)
+        expect((await sessionLockSnapshot(page, clients)).held).toEqual(['other tab'])
         expect(order).toEqual([])
         held.release()
         await exchange.started
@@ -603,7 +678,8 @@ test.describe('Logout during a token refresh', () => {
         const unauthorized = (await unauthorizedOnce(other, /\/api\/users(\?.*)?$/)).served
         await navigateInApp(other, '/settings/users')
         await unauthorized
-        await expect.poll(() => pendingSessionLocks(other)).toBe(1)
+        const clients = await lockClients({ 'callback page': page, 'other tab': other })
+        await expectWaitingSessionLocks(other, clients, 'other tab', 1)
         await other.waitForTimeout(2_000)
         expect(refreshes()).toBe(0)
         exchange.release()
@@ -838,7 +914,8 @@ test.describe('Logout during a token refresh', () => {
     const unauthorized = (await unauthorizedOnce(other, /\/api\/users(\?.*)?$/)).served
     await navigateInApp(other, '/settings/users')
     await unauthorized
-    await expect.poll(() => pendingSessionLocks(other)).toBe(1)
+    const clients = await lockClients({ 'signing-in page': page, 'other tab': other })
+    await expectWaitingSessionLocks(other, clients, 'other tab', 1)
     await other.waitForTimeout(2_000)
     expect(refreshes()).toBe(0)
 
@@ -909,7 +986,8 @@ test.describe('Logout during a token refresh', () => {
       // shared, so the switching tab's own proactive refresh may come due
       // too, and wait the same way.)
       await startProactiveRefresh(other)
-      await expect.poll(() => pendingSessionLocks(other)).toBeGreaterThanOrEqual(1)
+      const clients = await lockClients({ 'switching tab': page, 'other tab': other })
+      await expectWaitingSessionLocks(other, clients, 'other tab', 1)
       await other.waitForTimeout(2_000)
       expect(refreshes()).toBe(0)
       expect(switchingTabRefreshes()).toBe(0)
@@ -1060,7 +1138,7 @@ test.describe('Logout during a token refresh', () => {
     // showing the session would leave it when it ends (a full navigation,
     // which lets go of the lock).
     const other = await context.newPage()
-    await other.goto('/health', { waitUntil: 'domcontentloaded' })
+    await openNonAppPage(other)
     const order: string[] = []
     recordSessionRequests(context, order)
     page.on('request', (request) => {
