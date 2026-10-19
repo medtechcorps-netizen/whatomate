@@ -1053,6 +1053,10 @@ func TestInboundContinuation_RLSOuterRollbackDoesNotReplayAcceptedSend(
 	)
 	require.NoError(t, err)
 	require.False(t, duplicate)
+	require.NotNil(t, work)
+	// Seed after the input Contact was loaded, so a stale in-memory overwrite
+	// cannot satisfy the later persisted-metadata checks.
+	sentinel := seedInboundOpaqueMetadata(t, app, organization.ID, work.Contact.ID, "continuation-clear")
 
 	var providerCalls atomic.Int32
 	provider := httptest.NewServer(http.HandlerFunc(
@@ -1311,6 +1315,7 @@ func TestInboundContinuation_RLSOuterRollbackDoesNotReplayAcceptedSend(
 	clearedThrough, err := chatbotTrackingClearWatermark(persistedContact.Metadata)
 	require.NoError(t, err)
 	assert.WithinDuration(t, newerInboundAt, clearedThrough, time.Microsecond)
+	requireInboundOpaqueMetadata(t, app, organization.ID, work.Contact.ID, sentinel)
 
 	require.NoError(t, replay())
 	assert.Equal(t, int32(1), providerCalls.Load())
@@ -1330,6 +1335,7 @@ func TestInboundContinuation_RLSOuterRollbackDoesNotReplayAcceptedSend(
 	clearedThrough, err = chatbotTrackingClearWatermark(persistedContact.Metadata)
 	require.NoError(t, err)
 	assert.WithinDuration(t, newerInboundAt, clearedThrough, time.Microsecond)
+	requireInboundOpaqueMetadata(t, app, organization.ID, work.Contact.ID, sentinel)
 }
 
 func TestInboundContinuation_UnresolvedPreAttemptIsTerminalBeforeCallback(
