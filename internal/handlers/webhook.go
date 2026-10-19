@@ -771,7 +771,11 @@ func (a *App) messageEchoesAheadOfStatusRetry(
 }
 
 func (a *App) processIncomingMessage(phoneNumberID string, msg IncomingTextMessage, profileName string) {
-	if a.rlsEnabled() && !a.hasTenantScope() {
+	// H1: a reaction commits its only write in handleIncomingReactionEvent's own short
+	// tenant phase; an outer phone-tenant transaction would pin a second pooled
+	// connection while that phase waits for one.
+	isReaction := msg.Type == "reaction" && msg.Reaction != nil
+	if a.rlsEnabled() && !a.hasTenantScope() && !isReaction {
 		if err := a.withPhoneTenant(phoneNumberID, func(scoped *App) error {
 			scoped.processIncomingMessage(phoneNumberID, msg, profileName)
 			return nil

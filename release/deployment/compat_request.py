@@ -17,6 +17,7 @@ import catalog as compat_catalog
 
 policy, common = resolver.policy, resolver.common
 W0_WORKFLOW_SHA256 = "0f8ae9f3079d4a3c0749721e5100d6df60842b4811059aee02a2ee4d8ced4f6b"
+P0_WORKFLOW_SHA256 = "56005fe2015e8385e6ecfc621a403c06a534ed9a5712e5ec4ec4f9c70407b941"
 
 
 def _need(value):
@@ -147,8 +148,8 @@ def _custody_workflow(resolution):
     _need(type(resolution.workflow) is bytes
           and 0 < len(resolution.workflow) <= policy.MAX_SOURCE_FILE_BYTES
           and common.sha256_bytes(resolution.workflow) == resolution.workflow_sha256
-          and (resolution.workflow_sha256 == W0_WORKFLOW_SHA256
-               or resolution.workflow_sha256 == collect.WORKFLOW_SHA256))
+          and resolution.workflow_sha256 in (W0_WORKFLOW_SHA256, P0_WORKFLOW_SHA256,
+                                             collect.WORKFLOW_SHA256))
 
 
 def _build_request_base(resolution, collected):

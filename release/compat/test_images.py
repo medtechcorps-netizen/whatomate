@@ -27,13 +27,13 @@ class Clock:
 
 
 class BudgetTests(unittest.TestCase):
-    def test_one2400_budget_build1500_reserve900_cleanup180(self):
+    def test_one4500_budget_build3600_reserve900_cleanup180(self):
         clock=Clock();budget=m._Deadline(clock=clock)
-        self.assertEqual((m._TOTAL,m._BUILD,m._CLEANUP),(2400,1500,180))
-        self.assertEqual(budget.build_seconds(),1500)
+        self.assertEqual((m._TOTAL,m._BUILD,m._CLEANUP),(4500,3600,180))
+        self.assertEqual(budget.build_seconds(),3600)
         clock.value+=125
-        self.assertEqual(budget.build_seconds(),1375)
-        clock.value+=1375
+        self.assertEqual(budget.build_seconds(),3475)
+        clock.value+=3475
         self.assertEqual(budget.experiment_seconds(),720)
         clock.value+=720
         self.assertEqual(budget.remaining(),180)
@@ -42,6 +42,24 @@ class BudgetTests(unittest.TestCase):
         clock.value+=180
         with self.assertRaisesRegex(m.proof.InfrastructureFailure,'deadline'):budget.remaining()
 
+    def test_source_work_consumes_build_allowance_before_first_build(self):
+        clock=Clock();budget=m._Deadline(clock=clock);original_end=budget.end
+        clock.value+=600
+        self.assertEqual(budget.build_seconds(),3000)
+        self.assertEqual(budget.build_end,3610)
+        clock.value+=2999
+        self.assertEqual(budget.build_seconds(),1)
+        clock.value+=1
+        with self.assertRaisesRegex(m.proof.InfrastructureFailure,'build-reserve'):budget.build_seconds()
+        self.assertEqual(budget.experiment_seconds(),720)
+        self.assertEqual(budget.end,original_end)
+
+    def test_larger_outer_window_keeps_existing_experiment_maximum(self):
+        clock=Clock();budget=m._Deadline(clock=clock)
+        self.assertEqual(budget.experiment_seconds(),2400)
+        self.assertEqual(m._EXPERIMENT_MIN,720)
+        self.assertEqual(m.runtime.MAX_SECONDS,600)
+
     def test_nonfinite_reversed_clock_and_late_capture_refuse(self):
         for value in (float('nan'),float('inf'),-1,True):
             with self.subTest(value=value),self.assertRaises(m.proof.EvidenceError):m._Deadline(clock=lambda:value)
@@ -49,7 +67,7 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(m.proof.EvidenceError,'clock'):budget.remaining()
         clock=Clock();budget=m._Deadline(clock=clock)
         def capture(*args,**kwargs):
-            self.assertEqual(kwargs['timeout'],600);clock.value+=2401
+            self.assertEqual(kwargs['timeout'],600);clock.value+=4501
             return m.runtime.Capture(0,b'late',b'')
         with patch.object(m.runtime,'bounded_command',side_effect=capture),self.assertRaises(m.proof.InfrastructureFailure):
             budget.capture(['synthetic'],timeout=9999)
@@ -339,7 +357,7 @@ class AdmissionRoundtripTests(unittest.TestCase):
         if self.drift=='context':(work/'context/go.mod').write_bytes(b'changed')
         if self.drift=='plugin':self.plugin.write_bytes(b'changed')
         if self.drift=='iid':(work/'image.id').write_text('sha256:'+'9'*64)
-        if self.drift=='reserve':self.clock.value+=1501
+        if self.drift=='reserve':self.clock.value+=3601
         if self.drift=='label':self.rows[iid]['Config']['Labels'][m.stack.SOURCE_LABEL]='0'*40
         if self.drift=='false':return m.runtime.Capture(False,b'',b'')
         if self.drift=='controller-failure' and role=='controller':return m.runtime.Capture(3,b'',b'')
@@ -352,7 +370,7 @@ class AdmissionRoundtripTests(unittest.TestCase):
         result=self.admit()
         self.assertIs(result.seal,m._SEAL)
         self.assertEqual([x[0] for x in self.builds],['graph','controller','fixture','candidate'])
-        self.assertEqual([x[1] for x in self.builds],[1494,1394,1294,1194])
+        self.assertEqual([x[1] for x in self.builds],[3594,3494,3394,3294])
         self.assertEqual(result.previous.source_sha,self.old)
         for binding in (result.graph,result.controller,result.fixture,result.candidate):
             self.assertEqual(binding.source_sha,self.candidate)
@@ -478,7 +496,7 @@ class AdmissionRoundtripTests(unittest.TestCase):
              patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')),patch.object(m,'_build_environment',return_value=env):
             result=self.admit()
         self.assertTrue(objects[0].closed);self.assertGreaterEqual(objects[0].checks,13)
-        self.assertTrue(result.receipt['cleanup_complete']);self.assertLess(self.builds[0][1],1444)
+        self.assertTrue(result.receipt['cleanup_complete']);self.assertLess(self.builds[0][1],3544)
         self.assertTrue(all(args[3]==objects[0].name for args in self.calls if args[0]==str(self.plugin)))
 
     def test_linux_cleanup_refusal_suppresses_all_completed_builds(self):
@@ -1041,7 +1059,7 @@ class ResolvedAdmissionTests(unittest.TestCase):
         self.assertEqual(result.previous.recipe_sha256,r.previous_recipe.sha256)
         self.assertEqual(result.previous.reference,self.f.previous_ref)
         self.assertEqual([p for p,_ in self.f.builds],['graph','controller','fixture','candidate'])
-        self.assertEqual([s for _,s in self.f.builds],[1494,1394,1294,1194])
+        self.assertEqual([s for _,s in self.f.builds],[3594,3494,3394,3294])
         self.assertTrue(all(b.source_sha==self.f.candidate for b in
                             (result.candidate,result.controller,result.graph,result.fixture)))
         self.assertTrue(result.receipt['cleanup_complete']);self.assertFalse(result.receipt['release_attestation'])
@@ -1122,12 +1140,12 @@ class ResolvedAdmissionTests(unittest.TestCase):
         self.assertFalse(result.receipt['release_attestation'])
 
     def test_caller_deadline_is_not_reset_after_source_operation(self):
-        self.f.clock.value+=1501
+        self.f.clock.value+=3601
         with self.assertRaisesRegex(m.proof.InfrastructureFailure,'build-reserve'):self.admit()
         self.assertEqual(self.f.calls,[]);self.assertEqual(self.f.builds,[])
 
     def test_expired_deadline_refuses_before_source_export_or_work_creation(self):
-        self.f.clock.value+=2401
+        self.f.clock.value+=4501
         with self.assertRaisesRegex(m.proof.InfrastructureFailure,'deadline'):self.admit()
         self.assertEqual(self.f.calls,[]);self.assertEqual(list(self.f.work.iterdir()),[])
 
@@ -1210,7 +1228,7 @@ class RollbackAdmissionTests(unittest.TestCase):
         self.assertEqual((result.target.recipe_sha256,result.live.recipe_sha256),
                          (r.target_recipe.sha256,r.live_recipe.sha256))
         self.assertEqual([role for role,_ in self.f.builds],['graph','controller','fixture','candidate'])
-        self.assertEqual([seconds for _,seconds in self.f.builds],[1492,1392,1292,1192])
+        self.assertEqual([seconds for _,seconds in self.f.builds],[3592,3492,3392,3292])
         for binding in (result.catalog_control,result.controller,result.graph,result.fixture):
             self.assertEqual(binding.source_sha,r.producer.sha)
         self.assertEqual(result.catalog_control.reference,result.catalog_control.image_id)
@@ -1315,12 +1333,12 @@ class RollbackAdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.f.builds),4)
 
     def test_expired_and_consumed_outer_budget_never_gets_fresh_allowance(self):
-        self.prepare();self.f.clock.value+=2401
+        self.prepare();self.f.clock.value+=4501
         with self.assertRaisesRegex(m.proof.InfrastructureFailure,'deadline'):self.admit()
         self.no_effects()
 
     def test_endpoint_pulls_consume_the_single_aggregate_build_cap(self):
-        self.prepare();self.f.clock.value+=1493
+        self.prepare();self.f.clock.value+=3593
         with self.assertRaisesRegex(m.proof.InfrastructureFailure,'build-reserve'):self.admit()
         self.assertEqual(self.f.builds,[])
         self.assertLessEqual(len([a for a in self.f.calls if a[5:7]==['image','pull']]),4)
@@ -1354,7 +1372,7 @@ class RollbackAdmissionTests(unittest.TestCase):
             def __init__(self,*args):self.closed=False;self.name='compat-'+'9'*32
             def start(self):pass
             def check(self):pass
-            def close(self):self.closed=True;events.append('close');outer.f.clock.value+=2400
+            def close(self):self.closed=True;events.append('close');outer.f.clock.value+=4500
             def summary(self):return {'closed':self.closed}
         with patch.object(m,'_host_linux',return_value=True),patch.object(m,'_LinuxBuilder',Backend), \
              patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')), \
@@ -1379,6 +1397,143 @@ class RollbackAdmissionTests(unittest.TestCase):
         self.assertIs(type(caught.exception.__cause__),m._BuildFailure)
         self.assertFalse(m._BuildFailure._public(caught.exception.__cause__)['cleanup_complete'])
         self.assertEqual(events,['start','close']);self.assertEqual(len(self.f.builds),2)
+
+
+class BuildProgressTests(unittest.TestCase):
+    @staticmethod
+    def expire(capture, clock, args, env, seconds, deadline, **kwargs):
+        # Real capture/timeout/finally; only the process and OS edges are fake.
+        class Pipe:
+            def fileno(self):return 10
+            def close(self):pass
+        child=SimpleNamespace(stdout=Pipe(),stderr=Pipe(),pid=123,
+                              poll=lambda:None,wait=lambda **kw:-9)
+        def start(*a,**kw):
+            clock.value+=seconds+1
+            return child
+        native=SimpleNamespace(name='posix',set_blocking=lambda *a:None,killpg=lambda *a:None)
+        with patch.object(m,'os',native),patch.object(m,'signal',SimpleNamespace(SIGKILL=9)),patch.object(m.subprocess,'Popen',side_effect=start):
+            return capture(args,env,seconds,deadline,**kwargs)
+
+    def fixture(self):
+        value=AdmissionRoundtripTests('test_complete_four_builds_same_source_and_monotonic_shared_cap')
+        value.setUp();self.addCleanup(value.doCleanups)
+        return value
+
+    def test_progress_uses_only_existing_clock_samples_and_preserves_budget(self):
+        calls=[];clock=Clock()
+        def sample():calls.append(clock.value);return clock.value
+        deadline=m._Deadline(clock=sample);end=deadline.end
+        clock.value+=20;deadline.remaining();count=len(calls)
+        m._BuildProgress.mark(deadline,'source-inputs')
+        m._BuildProgress.mark(deadline,'role-build','graph')
+        m._BuildProgress.capture(deadline,30)
+        self.assertIsNone(m._BuildProgress.public(deadline))
+        self.assertEqual(len(calls),count)
+        clock.value+=31;deadline.remaining();count=len(calls)
+        m._BuildProgress.failed(deadline)
+        m._BuildProgress.mark(deadline,'builder-cleanup')
+        m._BuildProgress.finish_cleanup(deadline,True)
+        value=m._BuildProgress.public(deadline)
+        self.assertEqual(len(calls),count);self.assertEqual(deadline.end,end)
+        self.assertEqual((value['stage'],value['role'],value['elapsed_seconds']),('role-build','graph',51))
+        self.assertEqual((value['capture_elapsed_seconds'],value['capture_cap_seconds']),(31,30))
+        self.assertEqual(value['pre_admission_end_seconds'],20)
+        self.assertEqual(value['remaining_seconds'],m._TOTAL-51)
+        self.assertEqual(value['build_remaining_seconds'],m._TOTAL-m._EXPERIMENT_MIN-m._CLEANUP-51)
+
+    def test_real_capture_unknown_identifies_each_true_role_without_adopting_iid(self):
+        capture=m._build_capture
+        for target in m._PROGRESS_ROLES:
+            with self.subTest(role=target):
+                f=self.fixture();original=f.capture
+                def edge(args,env,seconds,deadline,**kwargs):
+                    stage,role,*_=deadline._build_progress.active
+                    if (stage,role)==('role-build',target):
+                        return self.expire(capture,f.clock,args,env,seconds,deadline,**kwargs)
+                    return original(args,env,seconds,deadline,**kwargs)
+                with patch.object(m,'_build_capture',side_effect=edge),self.assertRaises(m.proof.InfrastructureFailure) as caught:
+                    f.admit()
+                self.assertIs(type(caught.exception),m.proof.InfrastructureFailure)
+                self.assertEqual(caught.exception.args,('admission-build-unknown',))
+                value=m._BuildProgress.public(f.deadline)
+                self.assertEqual((value['stage'],value['role']),('role-build',target))
+                self.assertEqual(value['completed_roles'],list(m._PROGRESS_ROLES[:m._PROGRESS_ROLES.index(target)]))
+                self.assertEqual([r['role'] for r in value['role_boundaries']],value['completed_roles'])
+                receipt=json.loads((f.work/('candidate-'+f.candidate)/'result.json').read_bytes())
+                self.assertEqual(receipt['failure_code'],'admission-build-unknown')
+                self.assertNotIn('image_id',receipt['roles'][target])
+                self.assertTrue(value['cleanup_complete'])
+                with self.assertRaises(m.proof.EvidenceError):f.admit()
+                self.assertEqual(len(f.builds),m._PROGRESS_ROLES.index(target))
+                f.doCleanups()
+
+    def test_real_capture_pull_and_final_checks_are_not_reported_as_role_builds(self):
+        capture=m._build_capture
+        for target in ('engine-check','pull','pull-check','final-checks'):
+            with self.subTest(stage=target):
+                f=self.fixture();original=f.capture
+                def edge(args,env,seconds,deadline,**kwargs):
+                    if deadline._build_progress.active[0]==target:
+                        return self.expire(capture,f.clock,args,env,seconds,deadline,**kwargs)
+                    return original(args,env,seconds,deadline,**kwargs)
+                with patch.object(m,'_build_capture',side_effect=edge),self.assertRaises(m.proof.InfrastructureFailure) as caught:f.admit()
+                self.assertEqual(caught.exception.args,('admission-build-unknown',))
+                value=m._BuildProgress.public(f.deadline)
+                self.assertEqual(value['stage'],target)
+                self.assertEqual(value['role'],'previous' if target.startswith('pull') else 'none')
+                self.assertEqual(len(value['completed_roles']),4 if target=='final-checks' else 0)
+                f.doCleanups()
+
+    def test_backend_bootstrap_and_cleanup_capture_keep_exact_closed_stage(self):
+        capture=m._build_capture
+        for stage in ('builder-start','builder-create','builder-bootstrap','builder-check','builder-cleanup'):
+            with self.subTest(stage=stage):
+                clock=Clock();deadline=m._Deadline(clock=clock)
+                m._BuildProgress.mark(deadline,stage)
+                with self.assertRaises(m.proof.InfrastructureFailure) as caught:
+                    self.expire(capture,clock,['synthetic'],{},30,deadline)
+                self.assertEqual(caught.exception.args,('admission-build-unknown',))
+                value=m._BuildProgress.public(deadline)
+                self.assertEqual((value['stage'],value['role']),(stage,'none'))
+                self.assertIsNone(value['cleanup_complete'])
+
+    def test_original_failure_survives_later_backend_cleanup_refusal(self):
+        capture=m._build_capture;f=self.fixture();original=f.capture
+        class Backend:
+            def __init__(self,*args):self.closed=False;self.name='compat-'+'9'*32
+            def start(self):pass
+            def check(self):pass
+            def close(self):raise m.proof.InfrastructureFailure('admission-builder-ownership-unresolved')
+            def summary(self):return {'closed':False}
+        def edge(args,env,seconds,deadline,**kwargs):
+            if deadline._build_progress.active[:2]==('role-build','graph'):
+                return self.expire(capture,f.clock,args,env,seconds,deadline,**kwargs)
+            return original(args,env,seconds,deadline,**kwargs)
+        with patch.object(m,'_host_linux',return_value=True),patch.object(m,'_LinuxBuilder',Backend), \
+             patch.object(m,'_LINUX_PLUGIN_SHA',m.sha(b'plugin')),patch.object(m,'_build_capture',side_effect=edge), \
+             self.assertRaises(m.proof.InfrastructureFailure) as caught:f.admit()
+        self.assertEqual(caught.exception.args,('admission-builder-ownership-unresolved',))
+        self.assertEqual(caught.exception.__cause__.args,('admission-build-unknown',))
+        value=m._BuildProgress.public(f.deadline)
+        self.assertEqual((value['stage'],value['role']),('role-build','graph'))
+        self.assertFalse(value['cleanup_complete']);self.assertEqual(f.builds,[])
+
+    def test_invalid_or_foreign_progress_never_formats_private_state(self):
+        class Foreign:
+            def __getattribute__(self,name):raise AssertionError('foreign accessor')
+        self.assertIsNone(m._BuildProgress.public(Foreign()))
+        clock=Clock();deadline=m._Deadline(clock=clock)
+        m._BuildProgress.mark(deadline,'role-build','graph');m._BuildProgress.capture(deadline,30)
+        clock.value+=31;deadline.remaining();m._BuildProgress.failed(deadline)
+        original=deadline._build_progress.failure
+        for index,value in ((0,'PRIVATE_TOKEN'),(1,'https://private/'),(2,float('nan')),
+                            (5,True),(8,('PRIVATE_SQL',)),(9,-1),(10,(('graph',0,1),))):
+            with self.subTest(index=index):
+                parts=list(original);parts[index]=value;deadline._build_progress.failure=tuple(parts)
+                self.assertIsNone(m._BuildProgress.public(deadline))
+        deadline._build_progress=Foreign()
+        self.assertIsNone(m._BuildProgress.public(deadline))
 
 
 if __name__=='__main__':unittest.main()

@@ -175,7 +175,10 @@ def _snapshot(client, reader, producer_sha, wall_clock):
             _need(all(run[key] == latest[key] for key in ('id', 'head_sha', 'workflow_id',
                 'run_number', 'event', 'created_at')) and run['run_attempt'] == number,
                 'collect-attempt')
-            _need(number != last or run == latest, 'collect-latest-changed')
+            # Preserve distinct list/attempt update clocks in the raw snapshot.
+            _need(number != last or (run.keys() == latest.keys()
+                  and all(value == latest[key] for key, value in run.items()
+                          if key != 'updated_at')), 'collect-latest-changed')
             jobs = sorted((_job(item) for item in normal._pages(client,
                 normal.API + f'/actions/runs/{rid}/attempts/{number}/jobs?', 'jobs', 4)),
                 key=lambda item: item['id'])

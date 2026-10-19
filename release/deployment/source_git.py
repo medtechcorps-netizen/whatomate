@@ -131,13 +131,17 @@ class ImmutableGit:
     """One budget, one scope, fixed reads; failures poison the operation."""
 
     def __init__(self, repo: Path, binary: Path, *, limits=Limits(),
-                 capture=runtime.bounded_command, clock=time.monotonic, base_env=None):
+                 capture=runtime.bounded_command, clock=time.monotonic, base_env=None,
+                 profile="default"):
+        _need(type(profile) is str and profile in ("default", "normal-admission"))
+        seconds_limit = 900 if profile == "normal-admission" else 600
         _need(type(limits) is Limits and type(limits.calls) is int and 1 <= limits.calls <= 4096
               and type(limits.total_bytes) is int and 4096 < limits.total_bytes <= 64 * MIB)
         _need(all(type(v) in (int, float) and math.isfinite(v) and 0 < v <= bound
-                  for v, bound in ((limits.seconds, 600), (limits.command_seconds, 15))))
+                  for v, bound in ((limits.seconds, seconds_limit), (limits.command_seconds, 15))))
         _need(isinstance(repo, Path) and repo.is_absolute() and isinstance(binary, Path) and binary.is_absolute())
         self.clock, self.capture, self.limits = clock, capture, limits
+        self._profile = profile
         self.deadline = clock() + limits.seconds
         try:
             self.repo = repo.resolve(strict=True)
@@ -158,6 +162,10 @@ class ImmutableGit:
         self.failed = self.active = self.closed = False
         self._lock = threading.Lock()
         self._metadata = ()
+
+    @property
+    def profile(self):
+        return self._profile
 
     def _fail(self, detail):
         self.failed = True

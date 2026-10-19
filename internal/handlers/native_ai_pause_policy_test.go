@@ -116,7 +116,7 @@ func nativePausePolicyTransfer(t *testing.T, app *App, account *models.WhatsAppA
 		Source:          models.TransferSourceManual,
 		TransferredAt:   time.Now().UTC(),
 	}
-	require.NoError(t, app.saveAndFinalizeTransfer(transfer, account, contact, nil, true))
+	require.NoError(t, app.saveAndFinalizeTransfer(transfer, account, contact, nil, true, nil))
 	return transfer
 }
 
@@ -586,7 +586,7 @@ func TestNativePausePolicy_StartedChatbotTimerMakesPauseWait(t *testing.T) {
 						ContactID: selected.ID, WhatsAppAccount: account.Name, PhoneNumber: selected.PhoneNumber,
 						Status: models.TransferStatusActive, Source: models.TransferSourceManual, TransferredAt: time.Now().UTC(),
 					}
-					return writer.saveAndFinalizeTransfer(transfer, account, &contact, nil, true)
+					return writer.saveAndFinalizeTransfer(transfer, account, &contact, nil, true, nil)
 				})
 			}()
 			pid := <-backendPID

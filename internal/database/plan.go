@@ -50,6 +50,10 @@ func planSeedIDs() [10]string {
 // caller's transaction, change roles, or call any seed writer. Main owns the
 // single shared deadline, witness and physical session disposal.
 func ObservePlanSeeds(ctx context.Context, tx pgx.Tx) (PlanSeedObservations, error) {
+	return observePlanSeeds(ctx, tx, nil)
+}
+
+func observePlanSeeds(ctx context.Context, tx pgx.Tx, owner *PlanSeedHeldOwner) (PlanSeedObservations, error) {
 	var result PlanSeedObservations
 	for i, id := range planSeedIDs() {
 		result.Steps[i] = PlanSeedObservation{ID: id, State: PlanSeedIncomplete, Code: "unavailable"}
@@ -64,7 +68,7 @@ func ObservePlanSeeds(ctx context.Context, tx pgx.Tx) (PlanSeedObservations, err
 	if _, ok := ctx.Deadline(); !ok || ctx.Err() != nil {
 		return result, errPlanSeedSession
 	}
-	if err := planSeedSession(ctx, tx); err != nil {
+	if err := planSeedSession(ctx, tx, owner); err != nil {
 		return result, errPlanSeedSession
 	}
 	for _, i := range [...]int{0, 2, 3, 4, 5, 7, 8, 9} {
@@ -112,7 +116,7 @@ func ObservePlanSeeds(ctx context.Context, tx pgx.Tx) (PlanSeedObservations, err
 		}
 	}
 	result.Steps[1].State, result.Steps[1].Code = planSeedParent(result.Steps[2:7])
-	if err := planSeedSession(ctx, tx); err != nil {
+	if err := planSeedSession(ctx, tx, owner); err != nil {
 		return result, errPlanSeedSession
 	}
 	return result, nil
@@ -134,11 +138,18 @@ func planSeedParent(children []PlanSeedObservation) (PlanSeedState, string) {
 	return PlanSeedClear, ""
 }
 
-func planSeedSession(ctx context.Context, tx pgx.Tx) error {
+func planSeedSession(ctx context.Context, tx pgx.Tx, owner *PlanSeedHeldOwner) error {
+	nativeOwner := false
+	if owner != nil {
+		if err := planSeedHeldOwnerSession(ctx, tx, *owner); err != nil {
+			return errPlanSeedSession
+		}
+		nativeOwner = true
+	}
 	var eligible bool
 	var statement, lock, idle string
-	err := tx.QueryRow(ctx, `SELECT current_user = session_user AND NOT r.rolsuper AND NOT r.rolbypassrls
- AND NOT r.rolcreaterole AND NOT r.rolreplication
+	err := tx.QueryRow(ctx, `SELECT current_user = session_user AND NOT r.rolsuper
+ AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolreplication) OR CAST($1 AS boolean))
  AND pg_catalog.current_setting('server_version_num')::integer / 10000 = 17
  AND NOT pg_catalog.pg_is_in_recovery()
  AND pg_catalog.current_setting('transaction_read_only') = 'on'
@@ -149,7 +160,7 @@ func planSeedSession(ctx context.Context, tx pgx.Tx) error {
  AND (SELECT a.usename = session_user FROM pg_catalog.pg_stat_activity a WHERE a.pid = pg_catalog.pg_backend_pid()),
  pg_catalog.current_setting('statement_timeout'),pg_catalog.current_setting('lock_timeout'),
  pg_catalog.current_setting('idle_in_transaction_session_timeout')
- FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`).Scan(&eligible, &statement, &lock, &idle)
+ FROM pg_catalog.pg_roles r WHERE r.rolname=current_user`, nativeOwner).Scan(&eligible, &statement, &lock, &idle)
 	if err != nil || !eligible {
 		return errPlanSeedSession
 	}
@@ -454,4 +465,86 @@ func planProductCatalog(ctx context.Context, tx pgx.Tx) (bool, error) {
 		}
 	}
 	return drift, nil
+}
+
+// PlanSeedHeldOwner is the native identity already observed on the migration
+// coordinator's separate, still-held connection. It is an expectation, not an
+// authority flag: the observer independently matches it to PostgreSQL before
+// and after reading seeds. It never selects a connection or changes a role.
+type PlanSeedHeldOwner struct {
+	PID          int64
+	DatabaseOID  int64
+	DatabaseName string
+	RoleOID      int64
+	RoleName     string
+	Marker       string
+}
+
+func validPlanSeedHeldOwner(owner PlanSeedHeldOwner) bool {
+	if owner.PID <= 0 || owner.PID >= 1<<32 || owner.DatabaseOID <= 0 || owner.DatabaseOID >= 1<<32 ||
+		owner.RoleOID <= 0 || owner.RoleOID >= 1<<32 || owner.DatabaseName == "" || owner.RoleName == "" ||
+		len(owner.Marker) != 54 || !strings.HasPrefix(owner.Marker, "rereply-plan-lock-") {
+		return false
+	}
+	// A canonical UUIDv4 is nonzero by its version nibble. Validate its
+	// lexical form without adding a package initializer to every seed closure.
+	id := strings.TrimPrefix(owner.Marker, "rereply-plan-lock-")
+	for i := 0; i < len(id); i++ {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if id[i] != '-' {
+				return false
+			}
+		} else if (id[i] < '0' || id[i] > '9') && (id[i] < 'a' || id[i] > 'f') {
+			return false
+		}
+	}
+	return id[14] == '4' && (id[19] == '8' || id[19] == '9' || id[19] == 'a' || id[19] == 'b')
+}
+
+// ObservePlanSeedsOnHeldOwner admits the explicitly bound native migration
+// owner, including a managed owner's CREATEROLE/BYPASSRLS/REPLICATION
+// attributes. The ordinary ObservePlanSeeds API retains its strict role
+// restrictions. This path additionally requires an exact live held-lock
+// witness, and actual database ownership for a privileged owner; superuser,
+// transaction, replication-origin and table-policy checks remain.
+func ObservePlanSeedsOnHeldOwner(ctx context.Context, tx pgx.Tx, owner PlanSeedHeldOwner) (PlanSeedObservations, error) {
+	return observePlanSeeds(ctx, tx, &owner)
+}
+
+func planSeedHeldOwnerSession(ctx context.Context, tx pgx.Tx, owner PlanSeedHeldOwner) error {
+	if !validPlanSeedHeldOwner(owner) {
+		return errPlanSeedSession
+	}
+	// Statistics snapshots must not turn the second check into a stale first
+	// witness. This does not alter database data or the transaction snapshot.
+	if _, err := tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return errPlanSeedSession
+	}
+	var eligible bool
+	err := tx.QueryRow(ctx, `WITH marked AS (
+ SELECT a.pid::bigint AS pid,a.datid::bigint AS database_oid,a.datname::text AS database_name,
+ a.usesysid::bigint AS role_oid,a.usename::text AS role_name
+ FROM pg_catalog.pg_stat_activity a WHERE a.application_name=$1
+), held AS (
+ SELECT l.pid::bigint AS pid,l.database::bigint AS database_oid FROM pg_catalog.pg_locks l
+ WHERE l.locktype='advisory' AND l.mode='ExclusiveLock' AND l.granted AND l.objsubid=2
+ AND l.database=(SELECT oid FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database())
+ AND l.classid::bigint=(pg_catalog.hashtext(pg_catalog.current_database())::bigint & 4294967295)
+ AND l.objid::bigint=1380270905
+)
+ SELECT current_user=session_user AND current_user::text=$2 AND r.oid::bigint=$3
+ AND NOT r.rolsuper
+ AND d.datname::text=$4 AND d.oid::bigint=$5
+ AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolreplication) OR d.datdba=r.oid)
+ AND pg_catalog.pg_backend_pid()::bigint<>$6
+ AND pg_catalog.current_setting('application_name')='rereply-plan-owner'
+ AND (SELECT count(*) FROM marked)=1 AND (SELECT count(*) FROM held)=1
+ AND (SELECT count(*) FROM marked m JOIN held h ON h.pid=m.pid AND h.database_oid=m.database_oid
+  WHERE m.pid=$6 AND m.database_oid=$5 AND m.database_name=$4 AND m.role_oid=$3 AND m.role_name=$2)=1
+ FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database()
+ WHERE r.rolname=current_user`, owner.Marker, owner.RoleName, owner.RoleOID, owner.DatabaseName, owner.DatabaseOID, owner.PID).Scan(&eligible)
+	if err != nil || !eligible || ctx.Err() != nil {
+		return errPlanSeedSession
+	}
+	return nil
 }

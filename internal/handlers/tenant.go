@@ -211,16 +211,20 @@ func (a *App) WithTenantApp(organizationID uuid.UUID, fn func(*App) error) error
 		return nil
 	}
 	var afterCommit []func()
-	err := database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
-		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
-			return err
-		}
-		scoped := root.scopedApp(tx, organizationID)
-		if err := fn(scoped); err != nil {
-			return err
-		}
-		afterCommit = scoped.takeAfterCommit()
-		return nil
+	// The root pool's own context: the tenant transaction keeps today's context;
+	// only a nested receiver's wait for the connection is bounded.
+	err := a.withBoundedRootConnection(root.DB.Statement.Context, 0, func(db *gorm.DB) error {
+		return database.WithTenant(db, organizationID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+				return err
+			}
+			scoped := root.scopedApp(tx, organizationID)
+			if err := fn(scoped); err != nil {
+				return err
+			}
+			afterCommit = scoped.takeAfterCommit()
+			return nil
+		})
 	})
 	if err != nil {
 		return err
@@ -244,27 +248,8 @@ func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) err
 	if root == nil || root.DB == nil {
 		return errors.New("database connection is required")
 	}
-	if a.rlsEnabled() {
-		var afterCommit []func()
-		err := database.WithTenant(root.DB, organizationID, func(tx *gorm.DB) error {
-			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
-				return err
-			}
-			scoped := root.scopedApp(tx, organizationID)
-			if err := fn(scoped); err != nil {
-				return err
-			}
-			afterCommit = scoped.takeAfterCommit()
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		a.runAfterCommit(afterCommit)
-		return nil
-	}
 	var afterCommit []func()
-	err := root.DB.Transaction(func(tx *gorm.DB) error {
+	phase := func(tx *gorm.DB) error {
 		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
 			return err
 		}
@@ -274,6 +259,13 @@ func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) err
 		}
 		afterCommit = scoped.takeAfterCommit()
 		return nil
+	}
+	// The root pool's own context, as in WithTenantApp.
+	err := a.withBoundedRootConnection(root.DB.Statement.Context, 0, func(db *gorm.DB) error {
+		if a.rlsEnabled() {
+			return database.WithTenant(db, organizationID, phase)
+		}
+		return db.Transaction(phase)
 	})
 	if err != nil {
 		return err
@@ -416,15 +408,24 @@ func (a *App) hasTenantScope() bool {
 }
 
 func (a *App) resolveWhatsAppOrganization(phoneID string) (uuid.UUID, error) {
+	if strings.TrimSpace(phoneID) == "" {
+		return uuid.Nil, database.ErrMissingTenant
+	}
+	return a.resolveWhatsAppOrganizationWithDB(a.rootApp().DB, phoneID)
+}
+
+// The caller may bind a deadline to the actual discovery query. Do not reset
+// this DB through rootApp: ingress must release bounded discovery before it
+// queues for organization-scoped phase admission.
+func (a *App) resolveWhatsAppOrganizationWithDB(db *gorm.DB, phoneID string) (uuid.UUID, error) {
 	phoneID = strings.TrimSpace(phoneID)
 	if phoneID == "" {
 		return uuid.Nil, database.ErrMissingTenant
 	}
-	root := a.rootApp()
 	var organizationID uuid.UUID
 	if a.rlsEnabled() {
 		var organizationIDText string
-		if err := root.DB.Raw(
+		if err := db.Raw(
 			"SELECT public.rereply_resolve_whatsapp_org(?)::text",
 			phoneID,
 		).Scan(&organizationIDText).Error; err != nil {
@@ -440,7 +441,7 @@ func (a *App) resolveWhatsAppOrganization(phoneID string) (uuid.UUID, error) {
 		}
 	} else {
 		var account models.WhatsAppAccount
-		if err := root.DB.
+		if err := db.
 			Select("organization_id").
 			Where("BTRIM(phone_id) = BTRIM(?)", phoneID).
 			First(&account).Error; err != nil {

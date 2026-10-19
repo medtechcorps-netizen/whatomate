@@ -95,10 +95,10 @@ BYPASS_BANNER = ("> [!CAUTION]", "> **STAGING BYPASSED: urgent owner-dispatched 
 MANUAL_LINE = "MANUAL INTERVENTION: production state is uncertain; follow docs/emergency-rollback.md"
 # The production job's timeout-minutes in ship.yml; a test keeps it above
 # production_worst_case_seconds() plus a margin.
-PRODUCTION_TIMEOUT_MINUTES = 120
+PRODUCTION_TIMEOUT_MINUTES = 140
 # Clone, gh install, approval gate, chain and attestation verification, the
 # pre-PUT double reads and the backup gate (nominal).
-PREAMBLE_BUDGET_SECONDS = 1200
+PREAMBLE_BUDGET_SECONDS = 2700
 _OLD_GROUP = "rereply" + "-production"
 # A workflow carrying the old lanes' production lock group (assembled at
 # runtime so this file never contains the literal group line).

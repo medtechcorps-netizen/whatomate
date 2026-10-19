@@ -142,13 +142,26 @@ func observeMigrationDataGates(session *gorm.DB, runtimeRole string) (returnErr 
 		}
 	}
 	var eligible bool
+	// A managed migration owner may have CREATEROLE/BYPASSRLS/REPLICATION, but only the
+	// native authenticated database owner on this exact held coordinator lease
+	// may use that path. Restricted schema/table owners retain their old path.
 	if db.Raw(`SELECT current_user = session_user AND current_user <> CAST(? AS text)
- AND NOT r.rolsuper AND NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolreplication
+ AND NOT r.rolsuper
+ AND ((NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolreplication) OR
+  EXISTS(SELECT 1 FROM pg_catalog.pg_database d WHERE d.datname=pg_catalog.current_database() AND d.datdba=r.oid))
+ AND r.oid::bigint=CAST(? AS bigint)
+ AND (SELECT d.oid::bigint FROM pg_catalog.pg_database d WHERE d.datname=pg_catalog.current_database())=CAST(? AS bigint)
+ AND pg_catalog.pg_backend_pid()=CAST(? AS integer)
+ AND EXISTS(SELECT 1 FROM pg_catalog.pg_locks l WHERE l.pid=pg_catalog.pg_backend_pid()
+  AND l.locktype='advisory' AND l.mode='ExclusiveLock' AND l.granted AND l.objsubid=2
+  AND l.database=(SELECT oid FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database())
+  AND l.classid::bigint=(pg_catalog.hashtext(pg_catalog.current_database())::bigint & 4294967295)
+  AND l.objid=CAST(? AS oid))
  AND pg_catalog.current_setting('transaction_read_only') = 'on'
  AND pg_catalog.current_setting('transaction_isolation') = 'repeatable read'
  AND pg_catalog.current_setting('server_encoding') = 'UTF8'
  AND pg_catalog.current_setting('session_replication_role') = 'origin'
- FROM pg_catalog.pg_roles AS r WHERE r.rolname = current_user`, runtimeRole).Row().Scan(&eligible) != nil || !eligible {
+ FROM pg_catalog.pg_roles AS r WHERE r.rolname = current_user`, runtimeRole, before.RoleOID, before.DatabaseOID, before.PID, migrationAdvisoryLockNamespace).Row().Scan(&eligible) != nil || !eligible {
 		return nil
 	}
 	for i := range observations {
@@ -189,6 +202,9 @@ func observeMigrationDataGates(session *gorm.DB, runtimeRole string) (returnErr 
 
 type dataGateSessionSettings struct {
 	PID               int
+	RoleOID           int64
+	AuthenticatedRole string
+	DatabaseOID       int64
 	SearchPath        string
 	Replication       string
 	StatementTimeout  string
@@ -200,7 +216,10 @@ type dataGateSessionSettings struct {
 }
 
 func readDataGateSettings(db *gorm.DB, state *dataGateSessionSettings) error {
-	return db.Raw(`SELECT pg_catalog.pg_backend_pid(), pg_catalog.current_setting('search_path'),
+	return db.Raw(`SELECT pg_catalog.pg_backend_pid(),
+ (SELECT oid::bigint FROM pg_catalog.pg_roles WHERE rolname=current_user),session_user::text,
+ (SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()),
+ pg_catalog.current_setting('search_path'),
  pg_catalog.current_setting('session_replication_role'), pg_catalog.current_setting('statement_timeout'),
  pg_catalog.current_setting('lock_timeout'), pg_catalog.current_setting('idle_in_transaction_session_timeout'),
  pg_catalog.current_setting('transaction_read_only'), pg_catalog.current_setting('transaction_isolation'),
@@ -209,6 +228,6 @@ func readDataGateSettings(db *gorm.DB, state *dataGateSessionSettings) error {
  AND l.database=(SELECT oid FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database())
  AND l.classid::bigint=(pg_catalog.hashtext(pg_catalog.current_database())::bigint & 4294967295)
  AND l.objid=CAST(? AS oid))`, migrationAdvisoryLockNamespace).Row().Scan(
-		&state.PID, &state.SearchPath, &state.Replication, &state.StatementTimeout,
+		&state.PID, &state.RoleOID, &state.AuthenticatedRole, &state.DatabaseOID, &state.SearchPath, &state.Replication, &state.StatementTimeout,
 		&state.LockTimeout, &state.IdleTimeout, &state.ReadOnly, &state.Isolation, &state.MigrationLockHeld)
 }

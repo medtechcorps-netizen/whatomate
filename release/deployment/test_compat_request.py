@@ -313,6 +313,23 @@ class SourceOnlyAndHistoricalTests(unittest.TestCase):
         with self.assertRaises(evidence.CompatRefusal): bridge.validate_current_source(self.old_value)
         with self.assertRaises(evidence.CompatRefusal): bridge.qualify(self.old_value, self.old_history)
 
+    def test_previous_p_context3_replays_real_pair_but_is_not_current(self):
+        with actions.p0_epoch():
+            old_value = resolution()
+            old_history = collected(old_value)
+        self.assertEqual(old_value.workflow, actions.P0_WORKFLOW)
+        self.assertEqual(bridge.P0_WORKFLOW_SHA256, actions.P0_WORKFLOW_SHA256)
+        self.assertIs(bridge._validate_source_custody(old_value), old_value)
+        self.assertTrue(bridge._qualify_context3_custody(old_value, old_history).forward)
+        with self.assertRaises(evidence.CompatRefusal): bridge.validate_current_source(old_value)
+        with self.assertRaises(evidence.CompatRefusal): bridge.qualify(old_value, old_history)
+        changed = old_value.workflow + b'PRIVATE'
+        with self.assertRaises(evidence.CompatRefusal):
+            bridge._validate_source_custody(replace(old_value, workflow=changed,
+                workflow_sha256=source.common.sha256_bytes(changed)))
+        with self.assertRaises(evidence.CompatRefusal):
+            bridge._qualify_context2_custody(replace(old_value, pending=None), old_history)
+
     def test_historical_context2_keeps_exact_old_none_pending_semantics(self):
         old = replace(self.old_value, pending=None)
         with actions.w0_epoch():

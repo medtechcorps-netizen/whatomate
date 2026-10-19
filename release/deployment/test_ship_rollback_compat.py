@@ -144,6 +144,7 @@ class RollbackPreflightTests(unittest.TestCase):
             self.assertNotIn('PRIVATE-stale', options['env'].values())
 
     def test_three_distinct_closed_phase_budgets_share_one_outer_capture(self):
+        self.deadline = 2500.0
         operations, outers = [], []
         original = ship.transport.OperationBudget.__init__
         original_outer = ship.normal._Budget.__init__
@@ -158,6 +159,8 @@ class RollbackPreflightTests(unittest.TestCase):
             result = self.run_preflight()
         self.assertEqual(len(operations), 3)
         self.assertEqual(len(outers), 1)
+        self.assertEqual(outers[0].end, 1000.0)
+        self.assertTrue(all(o.profile == 'default' for o in operations))
         self.assertEqual(len({id(o) for o in operations}), 3)
         self.assertTrue(all(o.closed and not o.failed for o in operations))
         self.assertTrue(outers[0].closed and not outers[0].failed)
@@ -165,6 +168,14 @@ class RollbackPreflightTests(unittest.TestCase):
         self.assertTrue(all(o._deadline <= outers[0].end for o in operations))
         self.assertEqual(sum(o.commands for o in operations), result.command_count)
         self.assertEqual(sum(o.captured_bytes for o in operations), result.captured_bytes)
+
+    def test_rollback_900_aggregate_remains_closed_with_later_caller_deadline(self):
+        self.deadline = 2500.0
+        self.after = lambda phase, argv: setattr(self.case.clock, 'now', 1001.0)
+        self.refuse()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][0], 'source-before')
+        self.assertIsNone(source.records._GIT_OUTPUT_TRANSPORT.get())
 
     def test_new_latest_same_images_still_invalidates_entire_source(self):
         self.change_after_collection(lambda: self.case.add(kind='restore'))

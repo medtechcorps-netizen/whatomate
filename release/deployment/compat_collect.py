@@ -22,7 +22,7 @@ import ship_common as common
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "compat"))
 import runtime
 
-WORKFLOW_SHA256 = "56005fe2015e8385e6ecfc621a403c06a534ed9a5712e5ec4ec4f9c70407b941"
+WORKFLOW_SHA256 = "73c655c829fa36a109dfee621f1efa4529cf89ffa112599a8ff1bb8391b7eff9"
 REPOSITORY_ID = 1297344686
 API = "/repos/" + evidence.REPOSITORY
 WEB = "https://github.com/" + evidence.REPOSITORY
@@ -112,6 +112,7 @@ class ActionsGh(records.Gh):
         _need(type(self._last) in (int, float) and math.isfinite(self._last), "collect-clock")
         self._deadline = self._last + seconds
         self._commands, self._bytes, self._transcript = 0, 0, hashlib.sha256()
+        self._failure_category = None
         self._scope = self._verification_args = None
         self._downloads, self._used_downloads = set(), set()
         self._used = False
@@ -123,9 +124,17 @@ class ActionsGh(records.Gh):
         except (OSError, common.ReleaseError):
             raise evidence.CompatRefusal("compat-stale", "collect-client") from None
 
+    def _note_failure(self, category):
+        # Local diagnostic only; no reason, evidence or policy changes.
+        if self._failure_category is None:
+            self._failure_category = category
+
     def _remaining(self, maximum):
         now = self._clock()
-        _need(type(now) in (int, float) and math.isfinite(now) and self._last <= now < self._deadline, "collect-deadline")
+        valid = type(now) in (int, float) and math.isfinite(now) and self._last <= now < self._deadline
+        if not valid:
+            self._note_failure("deadline")
+        _need(valid, "collect-deadline")
         self._last = now
         return min(maximum, self._deadline - now)
 
@@ -155,21 +164,32 @@ class ActionsGh(records.Gh):
         try:
             _need(_directory(self._config) == self._config_identity, "collect-directory-changed")
             timeout = self._remaining(duration + CLEANUP_RESERVE) - CLEANUP_RESERVE
+            if timeout <= 0:
+                self._note_failure("deadline")
             _need(timeout > 0, "collect-deadline")
             stdout_limit = min(limit, remaining_bytes - STDERR_LIMIT)
             self._commands += 1
             env = dict(self._env)
             env["GH_HOST"] = "github.com"
-            result = self._capture([self.gh_bin, *args], env=env, timeout=timeout,
-                stdout_limit=stdout_limit, stderr_limit=STDERR_LIMIT)
+            try:
+                result = self._capture([self.gh_bin, *args], env=env, timeout=timeout,
+                    stdout_limit=stdout_limit, stderr_limit=STDERR_LIMIT)
+            except Exception:
+                self._note_failure("capture")
+                raise
             self._remaining(duration)
             _need(_directory(self._config) == self._config_identity, "collect-directory-changed")
-            _need(type(result.returncode) is int and type(result.stdout) is bytes and type(result.stderr) is bytes
-                  and len(result.stdout) <= stdout_limit and len(result.stderr) <= STDERR_LIMIT, "collect-capture")
+            valid = (type(result.returncode) is int and type(result.stdout) is bytes and type(result.stderr) is bytes
+                     and len(result.stdout) <= stdout_limit and len(result.stderr) <= STDERR_LIMIT)
+            if not valid:
+                self._note_failure("capture")
+            _need(valid, "collect-capture")
             self._bytes += len(result.stdout) + len(result.stderr)
             _need(self._bytes <= MAX_BYTES, "collect-bound")
             self._transcript.update(common.canonical_file_bytes({"command": self._commands,
                 "returncode": result.returncode, "stdout": _hash(result.stdout), "stderr": _hash(result.stderr)}))
+            if result.returncode != 0:
+                self._note_failure("command-nonzero")
             _need(result.returncode == 0, "collect-transport")
             return result.stdout
         except (OSError, ValueError, runtime.proof.InfrastructureFailure, runtime.proof.EvidenceError):
@@ -193,6 +213,9 @@ class ActionsGh(records.Gh):
         self._verification_args = ["attestation", "verify", subject, *flags, "--format", "json"]
         try:
             return super()._verify(subject, flags, identity, code=code)
+        except common.ReleaseError:
+            self._note_failure("signature")
+            raise
         finally:
             self._verification_args = None
 
@@ -301,7 +324,11 @@ def _snapshot(client, request, steps, observed, *, retain=False, retention_limit
             _need(run["id"] == rid and run["attempt"] == number and run["number"] == latest["number"]
                   and run["event"] == latest["event"] and run["created"] == latest["created"], "collect-attempt")
             if number == latest["attempt"]:
-                _need(run == latest, "collect-latest-changed")
+                # List and attempt endpoints have distinct update clocks. Both
+                # stay in the snapshot; only cross-endpoint identity excludes them.
+                _need(run.keys() == latest.keys()
+                      and all(value == latest[key] for key, value in run.items()
+                              if key != "updated"), "collect-latest-changed")
             raw_jobs = _pages(client, API + f"/actions/runs/{rid}/attempts/{number}/jobs?", "jobs", 4)
             raw_checks = _pages(client, API + f"/check-suites/{run['suite']}/check-runs?filter=all", "check_runs", 4*latest["attempt"])
             checks = {c["id"]:c for c in raw_checks}
@@ -522,7 +549,11 @@ def _outage_snapshot(snapshot, workflow):
               and run['number'] == latest['number'] and run['event'] == latest['event']
               and run['created'] == latest['created'], 'outage-history-run')
         if attempt.run_attempt == latest['attempt']:
-            _need(value['run'] == listings[attempt.run_id], 'outage-history-latest')
+            # Match the collector without changing either retained raw timestamp.
+            listing = listings[attempt.run_id]
+            _need(value['run'].keys() == listing.keys()
+                  and all(item == listing[key] for key, item in value['run'].items()
+                          if key != 'updated_at'), 'outage-history-latest')
         for jid in result.job_ids:
             _need(jid not in jobs, 'outage-history-job-duplicate'); jobs.add(jid)
         for cid in result.check_ids:

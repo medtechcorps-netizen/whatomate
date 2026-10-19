@@ -918,5 +918,59 @@ class BuildDiagnosticTests(unittest.TestCase):
             self.assertLess(len(lines[2]),1024)
 
 
+class BuildProgressDiagnosticTests(unittest.TestCase):
+    def test_projection_is_bounded_and_never_reads_foreign_properties(self):
+        class Foreign:
+            def __getattribute__(self,name):raise AssertionError('private accessor')
+        self.assertIsNone(cli._build_progress_diagnostic(Foreign()))
+        deadline=cli.images._Deadline(clock=lambda:10.)
+        self.assertIsNone(cli._build_progress_diagnostic(deadline))
+        cli.images._BuildProgress.mark(deadline,'role-build','candidate')
+        cli.images._BuildProgress.capture(deadline,30)
+        deadline.last=41.;cli.images._BuildProgress.failed(deadline)
+        line=cli._build_progress_diagnostic(deadline)
+        self.assertTrue(line.startswith('compatibility-build-progress: '))
+        self.assertLess(len(line),2048)
+        data=json.loads(line.split(': ',1)[1])
+        self.assertEqual((data['stage'],data['role'],data['capture_elapsed_seconds']),('role-build','candidate',31))
+        self.assertEqual(data['scope'],'last-sampled-clock; diagnostic-only; capture-incomplete')
+        self.assertNotIn('exit_code',data);self.assertNotIn('stdout',data);self.assertNotIn('stderr',data)
+        deadline._build_progress.failure=('PRIVATE_TOKEN',)
+        self.assertIsNone(cli._build_progress_diagnostic(deadline))
+
+    def test_unknown_capture_reports_original_stage_after_cleanup_without_measured_result(self):
+        env=environment();ctx=cli.context(env)
+        error=cli.proof.InfrastructureFailure('admission-build-unknown')
+        def execute(*args,**kwargs):
+            deadline=kwargs['deadline']
+            cli.images._BuildProgress.mark(deadline,'pull','postgres')
+            cli.images._BuildProgress.capture(deadline,30)
+            deadline.last+=31;cli.images._BuildProgress.failed(deadline)
+            cli.images._BuildProgress.mark(deadline,'builder-cleanup')
+            cli.images._BuildProgress.finish_cleanup(deadline,False)
+            raise error
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve();env['RUNNER_TEMP']=str(root)
+            for name in ('docker','buildx'):
+                (root/name).touch()
+                env['COMPAT_'+('DOCKER' if name=='docker' else 'BUILDX')+'_BIN']=str(root/name)
+            with mock.patch.dict(cli.os.environ,env,clear=True), \
+                 mock.patch.object(cli,'_read_public',return_value=cli.canonical(snapshot(ctx))), \
+                 mock.patch.object(cli,'_scratch',return_value=root),mock.patch.object(cli,'_client'), \
+                 mock.patch.object(cli,'_git_binary',return_value=Path('/synthetic-git')), \
+                 mock.patch.object(cli,'execute',side_effect=execute), \
+                 mock.patch.object(cli,'_write_public') as write,mock.patch.object(cli,'_mark_complete') as mark, \
+                 contextlib.redirect_stderr(io.StringIO()) as stderr,contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(cli.main(['run']),1)
+            write.assert_not_called();mark.assert_not_called()
+            self.assertFalse((root/'public'/'compat-result.json').exists())
+        lines=stderr.getvalue().splitlines();self.assertEqual(len(lines),3)
+        self.assertEqual(lines[0],cli._failure_message(error))
+        self.assertIn('family=infrastructure code=admission-build-unknown',lines[1])
+        data=json.loads(lines[2].split(': ',1)[1])
+        self.assertEqual((data['stage'],data['role'],data['cleanup_complete']),('pull','postgres',False))
+        self.assertNotIn('exit_code',data);self.assertEqual(stdout.getvalue(),'')
+
+
 if __name__ == "__main__":
     unittest.main()

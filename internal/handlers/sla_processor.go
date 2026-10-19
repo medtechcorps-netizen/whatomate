@@ -1265,10 +1265,35 @@ func (a *App) UpdateContactChatbotMessage(contactID uuid.UUID) {
 	}
 	if a.inboundContinuation != nil {
 		orgID := a.inboundContinuationOrganizationID()
-		if err := a.rootApp().WithCommittedTenantApp(
-			orgID,
-			func(scoped *App) error { return update(scoped.DB) },
-		); err != nil {
+		// H1: best-effort reminder bookkeeping. Inside the AI-attempt fence (every
+		// chatbot send) this goroutine holds the organization KEY SHARE that policy
+		// writers queue behind while they pin pooled connections, so wait at most 2s
+		// for a connection there (one inactivity reminder may then be missed) instead
+		// of 45s; outside the fence the derived nested budget (15s) applies.
+		trackingWait := time.Duration(0)
+		if a.inboundContinuation.attemptGuarded {
+			trackingWait = 2 * time.Second
+		}
+		// The root pool's own context, as in WithTenantApp (never a nil Context).
+		rootCtx := context.Background()
+		if root := a.rootApp(); root != nil && root.DB != nil && root.DB.Statement != nil && root.DB.Statement.Context != nil {
+			rootCtx = root.DB.Statement.Context
+		}
+		if err := a.withBoundedRootConnection(rootCtx, trackingWait, func(db *gorm.DB) error {
+			if orgID == uuid.Nil {
+				return database.ErrMissingTenant
+			}
+			phase := func(tx *gorm.DB) error {
+				if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+					return err
+				}
+				return update(tx)
+			}
+			if a.rlsEnabled() {
+				return database.WithTenant(db, orgID, phase)
+			}
+			return db.Transaction(phase)
+		}); err != nil {
 			a.Log.Error(
 				"Failed to update independently committed chatbot tracking",
 				"error", err,
@@ -1292,7 +1317,7 @@ func (a *App) ClearContactChatbotTracking(contactID uuid.UUID) {
 	}
 	if a.inboundContinuation != nil {
 		orgID := a.inboundContinuationOrganizationID()
-		if err := a.rootApp().WithCommittedTenantApp(
+		if err := a.WithCommittedTenantApp(
 			orgID,
 			func(scoped *App) error { return update(scoped.DB) },
 		); err != nil {
@@ -1391,7 +1416,7 @@ func (a *App) clearContactChatbotTrackingForInbound(contactID uuid.UUID) error {
 		}
 		return nil
 	}
-	if err := a.rootApp().WithCommittedTenantApp(organizationID, func(scoped *App) error {
+	if err := a.WithCommittedTenantApp(organizationID, func(scoped *App) error {
 		return update(scoped.DB)
 	}); err != nil {
 		return err

@@ -567,7 +567,7 @@ class EngineTests(unittest.TestCase):
 
     def test_overall_reserved_cleanup_and_result_share_absolute_deadline(self):
         overall=c.image_admission._Deadline(clock=self.w.clock)
-        self.w.clock.now+=1500
+        self.w.clock.now+=3600
         engine=c._Engine(self.p,PREVIOUS,SHA,1,1,c.schema_change.Classification('none',False,(),()),
             FakeContract(),images(),'docker',self.p,clock=self.w.clock,sleep=self.w.clock.sleep,overall=overall)
         self.assertEqual(engine.seconds,720)
@@ -582,7 +582,7 @@ class EngineTests(unittest.TestCase):
         engine=c._Engine(self.p,PREVIOUS,SHA,1,1,c.schema_change.Classification('none',False,(),()),
             FakeContract(),images(),'docker',self.p,clock=self.w.clock,sleep=self.w.clock.sleep,overall=overall)
         def measure():
-            engine.owner.start();self.w.clock.now+=2401
+            engine.owner.start();self.w.clock.now+=4501
             raise c.proof.InfrastructureFailure('synthetic-incomplete')
         with patch.object(engine,'_measure',side_effect=measure),patch.object(c.proof,'result_bytes') as encode:
             with self.assertRaisesRegex(c.proof.InfrastructureFailure,'admission-deadline'):engine.run()
@@ -660,7 +660,7 @@ class AdmissionTests(unittest.TestCase):
         clock=to.Clock();deadline=c.image_admission._Deadline(clock=clock);seen={}
         def verify(*args,**kwargs):clock.now+=100;return PREVIOUS
         def admission(*args,**kwargs):
-            self.assertIs(args[-1],deadline);clock.now+=1400;return images()
+            self.assertIs(args[-1],deadline);clock.now+=3500;return images()
         def contract(*args,**kwargs):
             seen['capture']=kwargs['capture'];return FakeContract()
         class Engine:
@@ -881,10 +881,10 @@ class ResolvedExperimentTests(unittest.TestCase):
 
     def test_deadline_begins_before_real_client_constructor_and_never_restarts(self):
         self.assertEqual(self.w.clock.now, self.started + 40)
-        self.assertEqual(self.deadline.remaining(), 2360)
+        self.assertEqual(self.deadline.remaining(), 4460)
         self.assertTrue(self.case.client.budget.closed)
         self.run_resolved()
-        self.assertEqual(self.deadline.end, self.started + 2400)
+        self.assertEqual(self.deadline.end, self.started + 4500)
         self.assertEqual(self.w.clock.now, self.started + 100)  # Mocked worker interval consumed.
         self.assertTrue(self.w.owner._closed)
 
@@ -1170,7 +1170,7 @@ class RollbackExperimentTests(unittest.TestCase):
         self.assertEqual(self.w.clock.now, self.started + 40)
         self.assertTrue(self.case.client.budget.closed)
         self.run_rollback()
-        self.assertEqual(self.deadline.end, self.started + 2400)
+        self.assertEqual(self.deadline.end, self.started + 4500)
         self.assertEqual(self.w.clock.now, self.started + 100)
 
     def test_complete_false_keeps_actual_reverse_control_final_catalog_and_cleanup(self):

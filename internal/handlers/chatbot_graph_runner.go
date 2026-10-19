@@ -53,8 +53,9 @@ type chatNodeCtx struct {
 type nodeOutcome struct {
 	outcome string
 	yield   bool
-	// finalized means this terminal node committed its exact session before
-	// a handover; the runner must not write that terminal session a second time.
+	// finalized means this terminal node committed its exact session atomically
+	// with its handover (or after an intentional business-hours decline); the
+	// runner must not write that terminal session a second time.
 	finalized bool
 }
 
@@ -235,8 +236,29 @@ func (a *App) completeChatbotFlow(
 	if err := a.requireActiveChatSession(session); err != nil {
 		return err
 	}
+	previousStatus := session.Status
 	session.Status = models.SessionStatusCompleted
-	a.notifyChatbotFlowCompletion(flow, session)
+	if err := a.executeChatbotCompletionWebhook(flow, session); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && !inboundContinuationRequiresManualReview(err) {
+			// H1: a bounded pool/fence/claim wait expired before the webhook's action
+			// claim committed (a post-request checkpoint failure is manual review, see
+			// executeChatbotCompletionWebhookGuarded). Retry before the session-complete
+			// commit: the replay re-sends no earlier graph message (flow/node-scoped
+			// action keys) and claims the never-committed webhook action afresh.
+			session.Status = previousStatus
+			return err
+		}
+		// Same as notifyChatbotFlowCompletion: never log the error itself.
+		flowID := uuid.Nil
+		if flow != nil {
+			flowID = flow.ID
+		}
+		a.Log.Warn(
+			"chatbot completion webhook did not succeed; session will still complete",
+			"flow", flowID,
+			"session", session.ID,
+		)
+	}
 	return a.persistChatSession(session)
 }
 
@@ -330,6 +352,10 @@ func (a *App) executeChatbotCompletionWebhookGuarded(
 	if !claim.Execute {
 		return nil
 	}
+	if err := a.requireInboundContinuationAttemptOwnership(); err != nil {
+		return errors.Join(err, a.resolveInboundContinuationAction(context.Background(), claim,
+			inboundActionStateFailedBeforeDispatch, nil))
+	}
 
 	if session.SessionData == nil {
 		session.SessionData = models.JSONB{}
@@ -358,7 +384,16 @@ func (a *App) executeChatbotCompletionWebhookGuarded(
 		result,
 	)
 	if resolveErr != nil {
-		return fmt.Errorf("resolve chatbot completion webhook checkpoint: %w", resolveErr)
+		// H1: the request was made, so its committed pre_attempt can never be replayed;
+		// type the uncertainty so completeChatbotFlow never retries it (it still logs and
+		// completes the session, as before).
+		return errors.Join(
+			&inboundContinuationManualReviewError{
+				ActionKey: claim.Key,
+				Reason:    "chatbot completion webhook result is uncertain",
+			},
+			fmt.Errorf("resolve chatbot completion webhook checkpoint: %w", resolveErr),
+		)
 	}
 	if requestErr != nil {
 		return errors.New("chatbot completion webhook request failed")
@@ -1043,7 +1078,9 @@ func (a *App) execChatAIResponseDurable(
 // queue. Optionally sends a body message first (e.g. "Connecting you to
 // an agent…"), then creates the transfer row via the same helpers the
 // legacy flow uses (createTransferToTeam / createTransferToQueue, source
-// = TransferSourceFlow), and marks the session completed.
+// = TransferSourceFlow). The session is completed atomically with that
+// handover (or after an intentional business-hours decline); the caller's
+// session is published only after that commit.
 //
 // Terminal: returns yield=true so the runner stops and persists. No
 // outgoing edges are expected on this node.
@@ -1056,10 +1093,22 @@ func (a *App) execChatAIResponseDurable(
 //	  "notes":   "Last seen {{last_query}}"      // optional; templated
 //	}
 func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, error) {
+	// H1: the handover writes in the account's organization. Never send the body for,
+	// or complete, a session or contact of another organization.
+	if ctx.account == nil || ctx.contact == nil || ctx.session == nil {
+		return nodeOutcome{}, errors.New("transfer node requires an account, contact and session")
+	}
+	if ctx.session.OrganizationID != ctx.account.OrganizationID ||
+		(ctx.contact.OrganizationID != uuid.Nil && ctx.contact.OrganizationID != ctx.account.OrganizationID) {
+		return nodeOutcome{}, errors.New("transfer node: chatbot session, contact and account organizations differ")
+	}
 	if body := stringFromConfig(node.Config, "body", "message", "text"); body != "" {
 		message := processTemplate(body, ctx.session.SessionData)
 		if err := a.sendAndSaveTextMessage(ctx.account, ctx.contact, message); err != nil {
-			if inboundContinuationStoppedByPolicy(err) || inboundContinuationRequiresManualReview(err) {
+			if inboundContinuationStoppedByPolicy(err) || inboundContinuationRequiresManualReview(err) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				// H1: a bounded pool/lock wait expired before dispatch: retry before the
+				// session-complete commit; the action ledger replays the body without a resend.
 				return nodeOutcome{}, err
 			}
 			a.Log.Error("transfer node failed to send body",
@@ -1074,38 +1123,77 @@ func (a *App) execChatTransfer(node *ChatNode, ctx *chatNodeCtx) (nodeOutcome, e
 		notes = processTemplate(rawNotes, ctx.session.SessionData)
 	}
 
-	// Complete only the session this runner still owns, before the handover
-	// cancels other active sessions. This is a short committed phase: keeping
-	// its row lock in the outer continuation transaction would deadlock the
-	// handover's independent organization/contact/session transaction.
-	appendChatPath(ctx.session, node, "")
-	ctx.session.Status = models.SessionStatusCompleted
-	if err := database.WithTenantReadCommitted(
-		a.rootApp().DB,
-		ctx.session.OrganizationID,
-		func(tx *gorm.DB) error {
-			if err := requireOrdinaryTenantOrganization(tx, ctx.session.OrganizationID); err != nil {
-				return err
-			}
-			return a.scopedApp(tx, ctx.session.OrganizationID).persistChatSession(ctx.session)
-		},
-	); err != nil {
-		return nodeOutcome{}, err
+	// H1: stage the terminal checkpoint on a copy and commit it atomically with the
+	// handover (or after an intentional business-hours decline). Until then the caller's
+	// session is untouched, so runChatGraph's error path persists the original active
+	// checkpoint and a retry replays this node at the same visit ordinal (the body is
+	// replayed from the action ledger, never resent).
+	var completed *models.ChatbotSession
+	completeOwned := func(tx *gorm.DB) error {
+		completed = nil
+		if ctx.session.OrganizationID != ctx.account.OrganizationID {
+			return errors.New("transfer node: chatbot session organization does not match the handover")
+		}
+		// Rebuilt from the untouched checkpoint on every canonical-write attempt:
+		// persistChatSessionState advances LastActivityAt/CompletedAt before commit.
+		staged := *ctx.session
+		staged.SessionData = maps.Clone(ctx.session.SessionData)
+		if path, ok := staged.SessionData["__path__"].([]any); ok {
+			staged.SessionData["__path__"] = append([]any(nil), path...)
+		}
+		appendChatPath(&staged, node, "")
+		staged.Status = models.SessionStatusCompleted
+		// Exact owned-session CAS on this transaction only: never persistChatSession (its
+		// booking branch opens an independent transaction). This scoped App queues nothing.
+		if err := a.scopedApp(tx, staged.OrganizationID).persistChatSessionState(&staged); err != nil {
+			return err
+		}
+		completed = &staged
+		return nil
 	}
-
+	var handedOver bool
+	var err error
 	teamIDStr := stringFromConfig(node.Config, "team_id")
 	if teamIDStr != "" && teamIDStr != "_general" {
-		if parsed, err := uuid.Parse(teamIDStr); err == nil {
-			a.createTransferToTeam(ctx.account, ctx.contact, parsed, notes, models.TransferSourceFlow)
+		if parsed, parseErr := uuid.Parse(teamIDStr); parseErr == nil {
+			handedOver, err = a.createTransferToTeam(ctx.account, ctx.contact, parsed, notes, models.TransferSourceFlow, completeOwned)
 		} else {
 			a.Log.Warn("transfer node has invalid team_id, falling back to queue",
-				"node", node.ID, "team_id", teamIDStr, "error", err)
-			a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow)
+				"node", node.ID, "team_id", teamIDStr, "error", parseErr)
+			handedOver, err = a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow, completeOwned)
 		}
 	} else {
-		a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow)
+		handedOver, err = a.createTransferToQueue(ctx.account, ctx.contact, models.TransferSourceFlow, completeOwned)
 	}
-
+	if err != nil {
+		// Nothing committed. A bounded pool wait keeps its wedge-guard/DeadlineExceeded
+		// identity for p.fail; lost ownership stays a policy stop.
+		if postgresErrorCode(err) == "55P03" {
+			// Only actual lock-wait expiry is refunded here. Fence expiry is
+			// classified at its own source; assignment preserves its real SQL error.
+			return nodeOutcome{}, fmt.Errorf("transfer node handover: wedge guard: bounded handover or agent-selection lock wait expired: %w: %w", context.DeadlineExceeded, err)
+		}
+		return nodeOutcome{}, fmt.Errorf("transfer node handover: %w", err)
+	}
+	if !handedOver {
+		// Intentional business-hours decline; its reply (if any) succeeded.
+		if err := a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+			return database.WithTenantReadCommitted(db, ctx.session.OrganizationID, func(tx *gorm.DB) error {
+				if err := requireOrdinaryTenantOrganization(tx, ctx.session.OrganizationID); err != nil {
+					return err
+				}
+				return completeOwned(tx)
+			})
+		}); err != nil {
+			return nodeOutcome{}, err
+		}
+	}
+	// Read `completed` only after a nil error: a rolled-back canonical-write attempt can
+	// leave an earlier staged copy behind before a later attempt fails.
+	if completed == nil {
+		return nodeOutcome{}, errors.New("transfer node handover committed without completing its owned session")
+	}
+	*ctx.session = *completed // publish only after commit
 	return nodeOutcome{yield: true, finalized: true}, nil
 }
 
@@ -1146,6 +1234,10 @@ func (a *App) execChatWebhookEffectGuarded(
 	}
 	if !claim.Execute {
 		return nil
+	}
+	if err := a.requireInboundContinuationAttemptOwnership(); err != nil {
+		return errors.Join(err, a.resolveInboundContinuationAction(context.Background(), claim,
+			inboundActionStateFailedBeforeDispatch, nil))
 	}
 
 	replaceVar := func(value string) string {
@@ -1390,8 +1482,10 @@ func (a *App) requireActiveChatSession(s *models.ChatbotSession) error {
 	}
 	// Do not reuse the continuation's possibly older transaction snapshot.
 	// This short read releases its connection before the provider/action fence.
-	return database.WithTenantReadCommitted(a.rootApp().DB, s.OrganizationID, func(tx *gorm.DB) error {
-		return check(a.scopedApp(tx, s.OrganizationID))
+	return a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+		return database.WithTenantReadCommitted(db, s.OrganizationID, func(tx *gorm.DB) error {
+			return check(a.scopedApp(tx, s.OrganizationID))
+		})
 	})
 }
 
@@ -1400,8 +1494,10 @@ func (a *App) requireActiveChatSession(s *models.ChatbotSession) error {
 // + dedicated columns. Called after every yield and on the completion path.
 func (a *App) persistChatSession(s *models.ChatbotSession) error {
 	if s != nil && a.inboundContinuation != nil && a.inboundContinuation.nativeBookingCheckpoint {
-		return database.WithTenantReadCommitted(a.rootApp().DB, s.OrganizationID, func(tx *gorm.DB) error {
-			return a.scopedApp(tx, s.OrganizationID).persistChatSessionState(s)
+		return a.withBoundedRootConnection(context.Background(), 0, func(db *gorm.DB) error {
+			return database.WithTenantReadCommitted(db, s.OrganizationID, func(tx *gorm.DB) error {
+				return a.scopedApp(tx, s.OrganizationID).persistChatSessionState(s)
+			})
 		})
 	}
 	return a.persistChatSessionState(s)

@@ -120,6 +120,8 @@
     "internal/handlers/helpers.go",
     "internal/handlers/import_export.go",
     "internal/handlers/inbound_continuation.go",
+    "internal/handlers/inbound_continuation_admission.go",
+    "internal/handlers/inbound_continuation_capacity.go",
     "internal/handlers/inbox_channels.go",
     "internal/handlers/integrations.go",
     "internal/handlers/invitations.go",
@@ -247,5 +249,5 @@
     "pkg/whatsapp/types.go",
     "pkg/whatsapp/webhook.go"
   ],
-  "closure_sha256": "b20a392962c2fd9773f9cd7353c9321568ace3e9e1b69da0b6ed3c052d7d3d47"
+  "closure_sha256": "4c5c79fa246bff29a9a5da1ce2ec58914d4ae275aeb7c57b6666566bfd32fa0c"
 }

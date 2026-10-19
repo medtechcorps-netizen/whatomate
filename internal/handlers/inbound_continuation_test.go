@@ -1004,11 +1004,14 @@ func TestInboundContinuation_RLSTransferCommitsBeforeCompletionFence(t *testing.
 			MessageID:      uuid.New(),
 			WAMID:          "wamid.rls-transfer-" + uuid.NewString(),
 		}
-		execution.createTransferToQueue(
+		if _, err := execution.createTransferToQueue(
 			account,
 			contact,
 			models.TransferSourceFlow,
-		)
+			nil,
+		); err != nil {
+			return err
+		}
 
 		fenceCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

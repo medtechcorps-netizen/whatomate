@@ -82,7 +82,7 @@ jobs:
     name: compat-run
     needs: release-preview
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 80
     permissions:
       contents: read
       actions: read
@@ -146,13 +146,13 @@ jobs:
               raise SystemExit('compat-setup-budget-exceeded')
           PY
 
-      # 180s setup + 2400s core + <=5s client check + 60s upload leaves55s.
-      # The41-minute step ceiling avoids cutting off the core during cleanup;
-      # it does not extend the core's internally enforced2400-second deadline.
+      # 180s setup + 4500s core + <=5s client check + 60s upload leaves55s.
+      # The76-minute step ceiling avoids cutting off the core during cleanup;
+      # it does not extend the core's internally enforced4500-second deadline.
       # Cold builds can fail this budget; no independent per-image window.
       - name: Run the bounded experiment against the frozen signed selection
         id: experiment
-        timeout-minutes: 41
+        timeout-minutes: 76
         env:
           GH_TOKEN: ${{ github.token }}
         run: /usr/bin/python3 -I -S -B release/compat/cli.py run

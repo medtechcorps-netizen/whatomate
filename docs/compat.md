@@ -428,10 +428,15 @@ broad removal. The Windows launcher contains the build client and its
 descendants in a private Job Object; this does not claim that terminating a
 client cancels all Docker daemon work.
 
-One 2,400-second deadline covers release verification, pulls, all four builds,
-the experiment and cleanup. The aggregate pull/build phase is capped at
-1,500 seconds and must retain at least 720 seconds for the experiment plus
-180 seconds for cleanup. A later phase never receives a fresh overall budget.
+One 4,500-second deadline covers release verification, pulls, all four builds,
+the experiment and cleanup. The aggregate verification/pull/build phase ends
+at most 3,600 seconds after that original start and must retain at least 720
+seconds for the experiment plus 180 seconds for cleanup. Verification time
+already spent reduces the build allowance; no phase resets the clock. The
+generic source-operation ceiling remains 600 seconds. The experiment keeps
+its existing 2,400-second maximum and every command retains its narrower cap.
+The larger build allocation accommodates observed slow successful snapshot
+downloads; it does not change package pins, retry policy or image acceptance.
 Cold-build timing and actual Linux backend composition still require real
 hosted validation for each candidate. The readiness switch is enabled; the
 accepted local advisory does not replace hosted qualification.
@@ -583,10 +588,10 @@ permissions. No deployment environment, provider credentials or production actio
 is part of this workflow. The existing CI release-tests job also discovers the compatibility
 unit and workflow tests.
 
-The experiment job is capped at 45 minutes. Checkout, artifact download and
-tool setup share 180 seconds; the core uses 2,400 seconds, the client version
+The experiment job is capped at 80 minutes. Checkout, artifact download and
+tool setup share 180 seconds; the core uses 4,500 seconds, the client version
 probe at most five seconds and result upload at most 60 seconds, leaving
-55 seconds of margin. The step ceiling does not extend the core deadline.
+55 seconds of margin. The 76-minute step ceiling does not extend the core deadline.
 The separate signing job has an 18-minute ceiling: checkout and two downloads
 have one minute each, pinned GitHub CLI installation one minute, publisher
 execution 11 minutes, and the two signing steps one minute each, leaving one
@@ -1090,3 +1095,17 @@ format 7 retain their original workflow, field sets and times. Fresh collection
 and new encoding require the current workflow; an old head's envelope uses its
 own reviewed steps. Trusted setup continuity and the last observation horizon
 remain explicit limits.
+
+### H1 bootstrap closure CI prerequisite
+
+For the H1 capacity repair, the same ordinary CI predicate also recognizes one
+closed bootstrap closure refresh: the preexisting `BackfillChatbotFlowGraph`
+entry retains its complete identity and revision, all other registry entries
+remain identical, and only the two reviewed continuation capacity files are
+added to both its closure and the migration closure. Registry and migration
+metadata must transition together once across the full first-parent history;
+intermediate changes to other active artifacts are refused. The Go resolver
+still proves the generated hashes and separately reviewed caps. This adds no
+seed or schema operation and grants no compatibility, staging, deployment or
+rollback authority. The unchanged-registry route and public legacy guards
+retain their existing behavior.

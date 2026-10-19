@@ -487,7 +487,7 @@ class _Engine:
                 self._cleanup_transport()
                 self.owner.cleanup()
             else:
-                # Cleanup consumes the reserved part of the SAME2400s clock.
+                # Cleanup consumes the reserved part of the SAME overall clock.
                 # The global capture also clamps every actual command.
                 seconds = min(image_admission._CLEANUP, self.overall.remaining())
                 with _Budget(self.owner, clock=self.clock, seconds=seconds) as cleanup:
