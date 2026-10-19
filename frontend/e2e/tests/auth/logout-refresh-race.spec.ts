@@ -208,6 +208,61 @@ async function startGoogleSso(page: Page) {
   await page.getByTestId('sso-provider-google').click()
 }
 
+// The number of requests for the shared session lock still waiting in this
+// origin (any tab).
+async function pendingSessionLocks(page: Page) {
+  return page.evaluate(async () => {
+    const state = await navigator.locks.query()
+    return (state.pending ?? []).filter((lock) => lock.name === 'whm-token-refresh').length
+  })
+}
+
+// SPA navigation (no reload): the router opens `path` in the running app.
+async function navigateInApp(page: Page, path: string) {
+  await page.evaluate((to) => {
+    window.history.pushState({}, '', to)
+    window.dispatchEvent(new PopStateEvent('popstate', { state: {} }))
+  }, path)
+}
+
+// Answers the next GET of `page` matching `pattern` with a 401 (once).
+async function unauthorizedOnce(page: Page, pattern: RegExp) {
+  let answered = false
+  let served!: () => void
+  const done = new Promise<void>((resolve) => {
+    served = resolve
+  })
+  await page.route(pattern, async (route) => {
+    if (answered || route.request().method() !== 'GET') {
+      await route.continue()
+      return
+    }
+    answered = true
+    await route.fulfill({ status: 401, json: { status: 'error', message: 'Unauthorized' } })
+    served()
+  })
+  return done
+}
+
+const UNSUPPORTED = "This browser can't keep sessions safe across tabs."
+
+// Counts the "unsupported browser" messages a page shows (from its load on).
+const countUnsupportedMessages = (text: string) => {
+  const counter = window as unknown as { __unsupported: number }
+  counter.__unsupported = 0
+  new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of Array.from(record.addedNodes)) {
+        if (node.textContent?.includes(text)) counter.__unsupported++
+      }
+    }
+  }).observe(document, { subtree: true, childList: true })
+}
+
+async function unsupportedMessages(page: Page) {
+  return page.evaluate(() => (window as unknown as { __unsupported: number }).__unsupported)
+}
+
 const withoutWebLocks = () => {
   Object.defineProperty(Navigator.prototype, 'locks', { configurable: true, get: () => undefined })
 }
@@ -425,6 +480,65 @@ test.describe('Logout during a token refresh', () => {
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
   })
 
+  test('an API 401 while the refresh fails (a transient server fault) keeps the session', async ({
+    page,
+    context,
+  }) => {
+    // The websocket token request right after the sign-in gets a 401, and the
+    // refresh answers 503 (every attempt).
+    await unauthorizedOnce(page, /\/api\/auth\/ws-token(\?.*)?$/)
+    let refreshes = 0
+    await page.route('**/api/auth/refresh', async (route) => {
+      if ((route.request().postData() ?? '').includes('"revoke"')) {
+        await route.continue()
+        return
+      }
+      refreshes++
+      await route.fulfill({ status: 503, json: { status: 'error', message: 'Service unavailable' } })
+    })
+    await loginAsAdmin(page)
+    const marker = await page.evaluate(() => localStorage.getItem('whm_session_id'))
+    const refresh = await cookieValue(context, 'whm_refresh')
+    await expect.poll(() => refreshes, { timeout: 20_000 }).toBeGreaterThan(0)
+    // Every retry runs out meanwhile.
+    await page.waitForTimeout(10_000)
+
+    // Still signed in: no sign-out, no ended session, the same cookies.
+    expect(page.url()).not.toContain('/login')
+    expect(await page.evaluate(() => localStorage.getItem('whm_session_id'))).toBe(marker)
+    expect(await page.evaluate(() => localStorage.getItem('user'))).toBeTruthy()
+    expect(await page.evaluate(() => localStorage.getItem('whm_logout_pending'))).toBeNull()
+    expect(await cookieValue(context, 'whm_refresh')).toBe(refresh)
+    await page.unroute('**/api/auth/refresh')
+    expect((await page.request.get('/api/me')).status()).toBe(200)
+  })
+
+  test('an API 401 that comes back after a good refresh is replayed once, not looped', async ({ page }) => {
+    // The websocket token request gets a 401 twice (the request and its one
+    // replay); the refresh itself works.
+    const tokenAt: number[] = []
+    await page.route('**/api/auth/ws-token', async (route) => {
+      tokenAt.push(Date.now())
+      if (tokenAt.length <= 2) {
+        await route.fulfill({ status: 401, json: { status: 'error', message: 'Unauthorized' } })
+        return
+      }
+      await route.continue()
+    })
+    const refreshes = countRefreshes(page)
+    await loginAsAdmin(page)
+    await expect.poll(() => tokenAt.length, { timeout: 20_000 }).toBeGreaterThanOrEqual(2)
+    await page.waitForTimeout(3_000)
+
+    // One refresh, one replay right after it; anything later is the socket's
+    // own reconnect (at least 1 s later), not a client loop.
+    expect(refreshes()).toBe(1)
+    if (tokenAt.length > 2) expect(tokenAt[2] - tokenAt[1]).toBeGreaterThanOrEqual(900)
+    expect(page.url()).not.toContain('/login')
+    expect(await page.evaluate(() => localStorage.getItem('user'))).toBeTruthy()
+    expect((await page.request.get('/api/me')).status()).toBe(200)
+  })
+
   test("a sign-in and another tab's refresh never overlap: the sign-in's cookies stay", async ({
     page,
     context,
@@ -445,10 +559,15 @@ test.describe('Logout during a token refresh', () => {
     await held.ready
     expect(held.cookies().whm_refresh).toBeTruthy()
 
-    // The other tab's refresh comes due while the sign-in holds the lock: it
-    // waits, and sends nothing with A's cookies.
-    await startProactiveRefresh(other)
-    await other.waitForTimeout(3_000)
+    // An API call of the other tab gets a 401 while the sign-in holds the
+    // lock (the sign-in already cleared the stored identity, so no proactive
+    // refresh would run): its refresh waits for the lock, and sends nothing
+    // with A's cookies.
+    const unauthorized = unauthorizedOnce(other, /\/api\/users(\?.*)?$/)
+    await navigateInApp(other, '/settings/users')
+    await unauthorized
+    await expect.poll(() => pendingSessionLocks(other)).toBe(1)
+    await other.waitForTimeout(2_000)
     expect(refreshes()).toBe(0)
 
     held.release()
@@ -515,7 +634,8 @@ test.describe('Logout during a token refresh', () => {
       // The other tab's refresh comes due while the switch holds the lock: it
       // waits, and sends nothing with the pre-switch cookies.
       await startProactiveRefresh(other)
-      await other.waitForTimeout(3_000)
+      await expect.poll(() => pendingSessionLocks(other)).toBe(1)
+      await other.waitForTimeout(2_000)
       expect(refreshes()).toBe(0)
 
       const reloaded = page.waitForEvent('domcontentloaded')
@@ -530,6 +650,38 @@ test.describe('Logout during a token refresh', () => {
       }
       const me = await page.request.get('/api/me')
       expect((await me.json()).data.organization_id).toBe(secondOrg.id)
+    })
+
+    test('without Web Locks an org switch is refused, says why, and sends nothing', async ({ page, context }) => {
+      await loginAs(page, user)
+      const before: Record<string, string | undefined> = {}
+      for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) before[name] = await cookieValue(context, name)
+      const orgBefore = (await (await page.request.get('/api/me')).json()).data.organization_id
+      const other = await context.newPage()
+      await other.addInitScript(withoutWebLocks)
+      await other.addInitScript(countUnsupportedMessages, UNSUPPORTED)
+      await other.goto('/profile', { waitUntil: 'domcontentloaded' })
+      expect(await other.evaluate(() => !!navigator.locks)).toBe(false)
+      const switches: string[] = []
+      other.on('request', (request) => {
+        if (request.url().includes('/api/auth/switch-org')) switches.push(request.url())
+      })
+      let reloaded = false
+      other.on('load', () => {
+        reloaded = true
+      })
+
+      await other.getByTestId('organization-switcher').click()
+      await other.getByRole('option', { name: secondOrg.name }).click()
+      await expect.poll(() => unsupportedMessages(other)).toBeGreaterThan(0)
+      await other.waitForTimeout(1_000)
+
+      expect(switches).toEqual([])
+      expect(reloaded).toBe(false)
+      for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+        expect(await cookieValue(context, name)).toBe(before[name])
+      }
+      expect((await (await page.request.get('/api/me')).json()).data.organization_id).toBe(orgBefore)
     })
   })
 
@@ -703,25 +855,49 @@ test.describe('Logout during a token refresh', () => {
       before[name] = await cookieValue(context, name)
       expect(before[name]).toBeTruthy()
     }
+    const stored = await page.evaluate(() => ({
+      user: localStorage.getItem('user'),
+      organization: localStorage.getItem('selected_organization_id'),
+    }))
+    expect(stored.user).toBeTruthy()
     const other = await context.newPage()
     await other.addInitScript(withoutWebLocks)
+    await other.addInitScript(countUnsupportedMessages, UNSUPPORTED)
     await other.goto('/login', { waitUntil: 'domcontentloaded' })
     expect(await other.evaluate(() => !!navigator.locks)).toBe(false)
     const issuing: string[] = []
     other.on('request', (request) => {
       if (/\/api\/auth\/(login|register|switch-org|sso\/[^/]+\/init)/.test(request.url())) issuing.push(request.url())
     })
-    const unsupported = other.getByText("This browser can't keep sessions safe across tabs.", { exact: false })
 
-    // A password sign-in as B is refused before anything is sent.
+    // A password sign-in as B is refused before anything is sent (or cleared).
     await submitSignIn(other, TEST_USERS.manager)
-    await expect(unsupported.first()).toBeVisible()
+    await expect.poll(() => unsupportedMessages(other)).toBe(1)
     // So is an SSO start: the page never leaves for the provider.
     await offerGoogleSso(other)
     await startGoogleSso(other)
-    await other.waitForTimeout(1_000)
+    await expect.poll(() => unsupportedMessages(other)).toBe(2)
     expect(other.url()).toContain('/login')
+    // And a registration from an invitation.
+    await other.goto('/register?invite=e2e-unsupported-browser', { waitUntil: 'domcontentloaded' })
+    await other.locator('#fullName').fill('Unsupported Browser')
+    await other.locator('#email').fill('unsupported-browser@e2e.test')
+    await other.locator('#password').fill('a-long-password-1')
+    await other.locator('#confirmPassword').fill('a-long-password-1')
+    await other.locator('form button[type="submit"]').click()
+    await expect.poll(() => unsupportedMessages(other)).toBe(1)
     expect(issuing).toEqual([])
+
+    // The stored identity is untouched, and the first tab still shows A.
+    expect(
+      await page.evaluate(() => ({
+        user: localStorage.getItem('user'),
+        organization: localStorage.getItem('selected_organization_id'),
+      })),
+    ).toEqual(stored)
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    expect(page.url()).not.toContain('/login')
+    expect(JSON.parse((await page.evaluate(() => localStorage.getItem('user')))!).email).toBe(TEST_USERS.admin.email)
 
     // The browser's session is untouched: the same cookies, still A.
     for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {

@@ -14,7 +14,12 @@ import {
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { organizationsService, SESSION_UNSUPPORTED_CODE } from '@/services/api'
+import {
+  organizationsService,
+  sessionsSupported,
+  SESSION_BUSY_CODE,
+  SESSION_UNSUPPORTED_CODE,
+} from '@/services/api'
 import { wsService } from '@/services/websocket'
 import { toast } from 'vue-sonner'
 import { Building2, Plus, Loader2 } from 'lucide-vue-next'
@@ -100,7 +105,12 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
     }
     window.location.reload()
   } else {
-    // Multi-org users: call switchOrg API for new JWT tokens, then reload
+    // Multi-org users: call switchOrg API for new JWT tokens, then reload.
+    // Without Web Locks no switch is sent.
+    if (!sessionsSupported()) {
+      toast.error(t('errors.unsupportedBrowser'))
+      return
+    }
     try {
       await authStore.switchOrg(value)
       wsService.disconnect()
@@ -108,7 +118,16 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
       window.location.reload()
     } catch (error: any) {
       // If switch fails, don't reload
-      if (error?.code === SESSION_UNSUPPORTED_CODE) toast.error(t('errors.unsupportedBrowser'))
+      if (error?.code === SESSION_UNSUPPORTED_CODE) {
+        toast.error(t('errors.unsupportedBrowser'))
+      } else if (
+        error?.code === SESSION_BUSY_CODE ||
+        error?.code === 'ERR_CANCELED' ||
+        error?.code === 'ECONNABORTED' ||
+        error?.code === 'ETIMEDOUT'
+      ) {
+        toast.error(t('errors.timeout'))
+      }
     }
   }
 }

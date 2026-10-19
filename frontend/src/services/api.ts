@@ -463,9 +463,22 @@ function delay(ms: number, signal?: AbortSignal) {
   });
 }
 
+// Set once the lock manager refused a request (a sandboxed or opaque-origin
+// page, a broken implementation): from then on this page has no Web Locks.
+let locksUnusable = false;
+
 function webLocks(): LockManager | null {
+  if (locksUnusable) return null;
   const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
   return locks?.request ? locks : null;
+}
+
+/**
+ * Whether this browser can keep sessions apart across tabs (Web Locks). Views
+ * check it before starting a sign-in, which clears the stored identity first.
+ */
+export function sessionsSupported(): boolean {
+  return webLocks() !== null;
 }
 
 // postRefresh rotates the cookies via POST /auth/refresh. It carries the CSRF
@@ -645,7 +658,19 @@ async function refreshAcrossTabs(
   };
   const locks = webLocks();
   if (locks) {
-    await locks.request(REFRESH_LOCK_NAME, run);
+    let entered = false;
+    try {
+      await locks.request(REFRESH_LOCK_NAME, () => {
+        entered = true;
+        return run();
+      });
+      return;
+    } catch (error) {
+      if (entered) throw error;
+      // The lock manager refused: as without Web Locks (below).
+      locksUnusable = true;
+    }
+    await run();
   } else {
     // A refresh after this tab's own logout is refused by run() (the session
     // ended); one already in flight is waited for by that logout.
@@ -707,6 +732,7 @@ function holdRefreshLock(): Promise<(() => void) | null> {
   }
   return new Promise((resolveHold) => {
     let timedOut = false;
+    let granted = false;
     const controller =
       typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = setTimeout(() => {
@@ -714,13 +740,27 @@ function holdRefreshLock(): Promise<(() => void) | null> {
       controller?.abort();
       resolveHold(null);
     }, SESSION_CHANGE_LOCK_WAIT_MS);
-    locks
-      .request(REFRESH_LOCK_NAME, controller ? { signal: controller.signal } : {}, () => {
-        if (timedOut) return undefined;
-        clearTimeout(timer);
-        return new Promise<void>((release) => resolveHold(() => release()));
-      })
-      .catch(() => undefined);
+    // The lock manager refused (it threw, or rejected before granting): this
+    // page has no usable Web Locks. Settle now, as without them, never at the
+    // 20 s cap; a session change then refuses as unsupported.
+    const unusable = () => {
+      if (timedOut || granted) return;
+      locksUnusable = true;
+      clearTimeout(timer);
+      resolveHold(holdRefreshLock());
+    };
+    try {
+      locks
+        .request(REFRESH_LOCK_NAME, controller ? { signal: controller.signal } : {}, () => {
+          if (timedOut) return undefined;
+          granted = true;
+          clearTimeout(timer);
+          return new Promise<void>((release) => resolveHold(() => release()));
+        })
+        .catch(unusable);
+    } catch {
+      unusable();
+    }
   });
 }
 
@@ -891,6 +931,13 @@ export async function beginSsoSignIn(): Promise<void> {
   if (!webLocks()) throw sessionUnsupportedError();
   const release = await holdRefreshLock();
   if (!release) throw sessionBusyError();
+  // The lock manager refused meanwhile: as without Web Locks.
+  if (!webLocks()) {
+    release();
+    throw sessionUnsupportedError();
+  }
+  // Nothing of this start is in flight by the backstop: it only lets go of a
+  // page that never left.
   setTimeout(release, SESSION_LOCK_BACKSTOP_MS);
   await finishPendingLogout();
   // An earlier logout that still did not get through comes first: never start
@@ -1117,8 +1164,46 @@ function scheduleProactiveRefresh() {
   }, wait);
 }
 
+// The window and document listeners this module instance added.
+const detachers: Array<() => void> = [];
+
+function onWindow<K extends keyof WindowEventMap>(
+  type: K,
+  listener: (event: WindowEventMap[K]) => void,
+) {
+  window.addEventListener(type, listener);
+  detachers.push(() => window.removeEventListener(type, listener));
+}
+
+function onDocument<K extends keyof DocumentEventMap>(
+  type: K,
+  listener: (event: DocumentEventMap[K]) => void,
+) {
+  document.addEventListener(type, listener);
+  detachers.push(() => document.removeEventListener(type, listener));
+}
+
+/**
+ * Test-only: detaches this module instance (its window and document
+ * listeners, tab channel, heartbeat and timers), so that only an instance
+ * loaded later reacts to page events.
+ */
+export function disposeForTests() {
+  for (const detach of detachers.splice(0)) detach();
+  tabChannel?.close();
+  tabChannel = null;
+  if (tabHeartbeat !== null) {
+    clearInterval(tabHeartbeat);
+    tabHeartbeat = null;
+  }
+  if (proactiveRefreshTimer !== null) {
+    clearTimeout(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+}
+
 if (typeof window !== "undefined" && typeof document !== "undefined") {
-  document.addEventListener("visibilitychange", () => {
+  onDocument("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
     if (expiresAt && expiresAt - Date.now() <= PROACTIVE_REFRESH_LEAD_MS) {
@@ -1127,7 +1212,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
       scheduleProactiveRefresh();
     }
   });
-  window.addEventListener("storage", (event) => {
+  onWindow("storage", (event) => {
     if (event.key === AUTH_EXPIRES_AT_KEY) scheduleProactiveRefresh();
     // Another tab began a session: this tab's logout requests still in flight
     // must not clear its cookies.
@@ -1146,8 +1231,8 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
       refreshAbort?.abort();
     }
   });
-  window.addEventListener("pagehide", sendLogoutOnPageHide);
-  window.addEventListener("pageshow", (event) => {
+  onWindow("pagehide", sendLogoutOnPageHide);
+  onWindow("pageshow", (event) => {
     // Back from the back/forward cache: say hello again.
     if (event.persisted) {
       announceTab("hello");
@@ -1260,7 +1345,20 @@ api.interceptors.request.use(
       return holdRefreshLock().then(async (release) => {
         // The lock stayed busy: refuse ("please try again"), never send unlocked.
         if (!release) throw sessionBusyError(config);
-        const backstop = setTimeout(release, SESSION_LOCK_BACKSTOP_MS);
+        // The lock manager refused meanwhile: as without Web Locks.
+        if (!webLocks()) {
+          release();
+          throw sessionUnsupportedError(config);
+        }
+        // The backstop, if no answer ever comes: abort the request and let go
+        // of the lock only once it has settled (its own error path releases
+        // it, after undoing whatever it set), never with it still in flight.
+        const transport = new AbortController();
+        const outer = config.signal;
+        if (outer?.aborted) transport.abort();
+        else outer?.addEventListener?.("abort", () => transport.abort());
+        config.signal = transport.signal;
+        const backstop = setTimeout(() => transport.abort(), SESSION_LOCK_BACKSTOP_MS);
         held._releaseSessionLock = () => {
           clearTimeout(backstop);
           release();

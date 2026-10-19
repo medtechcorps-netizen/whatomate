@@ -3,7 +3,13 @@ import { ref, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
-import { api, beginSsoSignIn, SESSION_BUSY_CODE, SESSION_UNSUPPORTED_CODE } from '@/services/api'
+import {
+  api,
+  beginSsoSignIn,
+  sessionsSupported,
+  SESSION_BUSY_CODE,
+  SESSION_UNSUPPORTED_CODE,
+} from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -104,6 +110,12 @@ const handleLogin = async () => {
     toast.error(t('auth.enterEmailPassword'))
     return
   }
+  // Without Web Locks no sign-in is sent: say so before a sign-in attempt
+  // clears the stored identity.
+  if (!sessionsSupported()) {
+    toast.error(t('errors.unsupportedBrowser'))
+    return
+  }
 
   isLoading.value = true
 
@@ -148,6 +160,10 @@ const initiateSSO = async (provider: string) => {
     return
   }
   if (isSSOStarting.value) return
+  if (!sessionsSupported()) {
+    toast.error(t('errors.unsupportedBrowser'))
+    return
+  }
   isSSOStarting.value = true
   // Ordered like a password sign-in: an earlier logout finishes first, then a
   // new session begins. The page stays busy until it leaves for the provider.

@@ -133,10 +133,15 @@ function stubLocation(pathname = '/chat') {
   Object.defineProperty(window, 'location', { configurable: true, value: fake })
 }
 
+// Every tab loaded in a test; afterEach detaches them, so no earlier test's
+// instance reacts to a later test's page events.
+const loadedTabs: ApiModule[] = []
+
 async function loadTab(adapter: Adapter): Promise<ApiModule> {
   vi.resetModules()
   const mod = await import('./api')
   mod.api.defaults.adapter = vi.fn(adapter) as unknown as typeof mod.api.defaults.adapter
+  loadedTabs.push(mod)
   return mod
 }
 
@@ -154,7 +159,8 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
   // Transform the module graph (i18n locales included) once, so a cold first
   // import cannot eat into a test's own time budget.
   beforeAll(async () => {
-    await import('./api')
+    // Detached at once: this instance must not react to any test's events.
+    ;(await import('./api')).disposeForTests()
   }, 60_000)
 
   beforeEach(() => {
@@ -173,6 +179,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
   })
 
   afterEach(() => {
+    while (loadedTabs.length) loadedTabs.pop()!.disposeForTests()
     window.removeEventListener('whm:auth-session', onSessionEvent)
     vi.clearAllTimers()
     vi.useRealTimers()
@@ -325,6 +332,81 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     expect(postSpy).toHaveBeenCalledTimes(1)
     expect(localStorage.getItem('user')).toBeNull()
+    expect(assignedHref).toBe('/login')
+    expect(sessionEvents).toEqual(['expired'])
+  })
+
+  // A transient server fault answers API requests with 401 (say, a database
+  // error behind the tenant check): only a refresh can tell a dead session.
+  it('an API 401 while the refresh answers 503 keeps the session: nothing cleared, ended or redirected', async () => {
+    vi.useFakeTimers()
+    localStorage.setItem('whm_session_id', 'session-a')
+    localStorage.setItem('selected_organization_id', 'org-a')
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      throw httpError(401, config)
+    })
+    const { api } = await loadTab(adapter)
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label === 'refresh') throw httpError(503)
+    })
+
+    const settled = api.get('/contacts').then(
+      () => 'resolved',
+      (error: AxiosError) => error.response?.status,
+    )
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    // The request fails; the session stays as it is.
+    expect(await settled).toBe(401)
+    expect(adapter).toHaveBeenCalledTimes(1)
+    expect(order.length).toBeGreaterThan(0)
+    expect(order.every((label) => label === 'refresh')).toBe(true)
+    expect(localStorage.getItem('user')).not.toBeNull()
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+    expect(localStorage.getItem('selected_organization_id')).toBe('org-a')
+    expect(localStorage.getItem('whm_logout_pending')).toBeNull()
+    expect(assignedHref).toBeNull()
+    expect(sessionEvents).not.toContain('expired')
+  })
+
+  it('an API 401 that comes back after a good refresh is replayed once, no more, and ends nothing', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      throw httpError(401, config)
+    })
+    const { api } = await loadTab(adapter)
+    const order: string[] = []
+    recordPosts(order, (label) => (label === 'refresh' ? refreshOk() : undefined))
+
+    await expect(api.get('/contacts')).rejects.toMatchObject({ response: { status: 401 } })
+    await tick()
+
+    // One refresh and one replay, then the 401 is the caller's.
+    expect(adapter).toHaveBeenCalledTimes(2)
+    expect(order).toEqual(['refresh'])
+    expect(localStorage.getItem('user')).not.toBeNull()
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+    expect(localStorage.getItem('whm_logout_pending')).toBeNull()
+    expect(assignedHref).toBeNull()
+    expect(sessionEvents).toEqual(['refreshed'])
+  })
+
+  it('an API 401 with a refresh 401 ends the session (a genuinely invalid one)', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { api } = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label === 'refresh') throw httpError(401)
+    })
+
+    await expect(api.get('/contacts')).rejects.toMatchObject({ response: { status: 401 } })
+
+    expect(order).toEqual(['refresh'])
+    expect(localStorage.getItem('user')).toBeNull()
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
     expect(assignedHref).toBe('/login')
     expect(sessionEvents).toEqual(['expired'])
   })
@@ -1866,6 +1948,68 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order.slice(1, 3)).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
   })
 
+  for (const failure of ['throws', 'rejects'] as const) {
+    it(`a lock manager that ${failure} counts as none: the sign-in is refused at once, a logout still goes through`, async () => {
+      vi.useFakeTimers()
+      localStorage.setItem('whm_session_id', 'session-a')
+      const request = vi.fn((..._args: unknown[]) => {
+        if (failure === 'throws') throw new DOMException('Lock manager unavailable', 'SecurityError')
+        return Promise.reject(new DOMException('Lock manager unavailable', 'SecurityError'))
+      })
+      Object.defineProperty(navigator, 'locks', { configurable: true, value: { request } })
+      const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
+      const { api, sessionsSupported, whenLogoutSettled, SESSION_UNSUPPORTED_CODE } = await loadTab(adapter)
+      const order: string[] = []
+      recordPosts(order)
+      expect(sessionsSupported()).toBe(true)
+
+      const login = api.post('/auth/login', { email: 'b@example.com', password: 'x' }).catch((e) => e.code)
+      await vi.advanceTimersByTimeAsync(10)
+
+      // Not "busy" after 20 s: unsupported, now, and nothing was sent.
+      expect(await login).toBe(SESSION_UNSUPPORTED_CODE)
+      expect(adapter).not.toHaveBeenCalled()
+      expect(sessionsSupported()).toBe(false)
+      // So is an SSO start in a fresh tab of this browser (no fence).
+      const fresh = await loadTab(adapter)
+      const sso = fresh.beginSsoSignIn().catch((e) => e.code)
+      await vi.advanceTimersByTimeAsync(10)
+      expect(await sso).toBe(SESSION_UNSUPPORTED_CODE)
+      expect(localStorage.getItem('whm_sso_started')).toBeNull()
+      // A session that already existed still logs out (within this tab).
+      await api.post('/auth/logout', {})
+      await vi.advanceTimersByTimeAsync(10)
+      await whenLogoutSettled()
+      expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+    })
+  }
+
+  it('a lock manager that rejects still lets a session that existed refresh, within the tab', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: { request: vi.fn(() => Promise.reject(new DOMException('Lock manager unavailable', 'SecurityError'))) },
+    })
+    let rotated = false
+    const { api, sessionsSupported } = await loadTab(async (config) => {
+      if (!rotated) throw httpError(401, config)
+      return ok(config)
+    })
+    const order: string[] = []
+    recordPosts(order, (label) => {
+      if (label === 'refresh') {
+        rotated = true
+        return refreshOk()
+      }
+    })
+
+    expect((await api.get('/contacts')).status).toBe(200)
+
+    expect(order).toEqual(['refresh'])
+    expect(sessionsSupported()).toBe(false)
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+  })
+
   it('without Web Locks no sign-in, registration, org switch or SSO start is sent', async () => {
     removeWebLocks()
     localStorage.setItem('whm_session_id', 'session-a')
@@ -1989,11 +2133,23 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     })
   })
 
+  // A transport that never answers (it ignores the request timeout) but, like
+  // XHR and fetch, settles once aborted, after `settleMs`.
+  function hungUntilAborted(settleMs = 0) {
+    return (config: InternalAxiosRequestConfig) =>
+      new Promise((_, reject) => {
+        config.signal?.addEventListener?.('abort', () => {
+          setTimeout(() => reject(new AxiosError('canceled', AxiosError.ERR_CANCELED, config)), settleMs)
+        })
+      })
+  }
+
   it('a held sign-in lock is released by the backstop if no response ever comes', async () => {
     vi.useFakeTimers()
     installWebLocks()
+    const hung = hungUntilAborted()
     const signIn = await loadTab(async (config) => {
-      if (config.url === '/auth/login') return new Promise(() => undefined)
+      if (config.url === '/auth/login') return hung(config)
       return ok(config)
     })
     const other = await loadTab(async (config) => {
@@ -2002,14 +2158,54 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const order: string[] = []
     recordPosts(order, (label) => (label === 'refresh' ? refreshOk() : undefined))
 
-    void signIn.api.post('/auth/login', { email: 'a@example.com', password: 'x' })
+    const login = signIn.api.post('/auth/login', { email: 'a@example.com', password: 'x' }).catch((e) => e.code)
     await vi.advanceTimersByTimeAsync(10)
     void other.api.get('/contacts').catch(() => undefined)
     await vi.advanceTimersByTimeAsync(55_000)
     expect(order).toEqual([])
 
     await vi.advanceTimersByTimeAsync(6_000)
+    expect(await login).toBe('ERR_CANCELED')
     expect(order).toEqual(['refresh'])
+  })
+
+  it('the backstop lets go of the lock only once the aborted sign-in has settled', async () => {
+    vi.useFakeTimers()
+    installWebLocks()
+    // Aborted at 60 s, the transport takes 3 s more to settle.
+    const hung = hungUntilAborted(3_000)
+    let abortedAt = 0
+    const signIn = await loadTab(async (config) => {
+      if (config.url !== '/auth/login') return ok(config)
+      config.signal?.addEventListener?.('abort', () => {
+        abortedAt = Date.now()
+      })
+      return hung(config)
+    })
+    const other = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const order: string[] = []
+    let refreshAt = 0
+    recordPosts(order, (label) => {
+      if (label === 'refresh') {
+        refreshAt = Date.now()
+        return refreshOk()
+      }
+    })
+    const start = Date.now()
+
+    void signIn.api.post('/auth/login', { email: 'a@example.com', password: 'x' }).catch(() => undefined)
+    await vi.advanceTimersByTimeAsync(10)
+    void other.api.get('/contacts').catch(() => undefined)
+    await vi.advanceTimersByTimeAsync(61_000)
+    // Aborted at the backstop, but still settling: the lock is still held.
+    expect(abortedAt - start).toBeGreaterThanOrEqual(60_000)
+    expect(order).toEqual([])
+
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(order).toEqual(['refresh'])
+    expect(refreshAt - abortedAt).toBeGreaterThanOrEqual(3_000)
   })
 
   it('a logout that never got through is finished on the next load', async () => {
