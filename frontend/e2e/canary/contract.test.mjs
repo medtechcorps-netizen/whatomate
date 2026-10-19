@@ -99,9 +99,9 @@ test('Playwright package, lock roots, installed package and container pins agree
   // PR9 adds e2e-staging. Its exact version and immutable digest must join this
   // contract when that branch lands; PR11 also works before that dependency.
   const ship = file('../../../.github/workflows/ship.yml')
-  const staging = ship.match(/^  e2e-staging:\r?\n[\s\S]*?(?=^  [a-zA-Z0-9_-]+:|(?![\s\S]))/m)
+  const staging = ship.match(/^ {2}e2e-staging:\r?\n[\s\S]*?(?=^ {2}[a-zA-Z0-9_-]+:|(?![\s\S]))/m)
   if (staging) {
-    const images = staging[0].match(/^      image: .+$/gm) || []
+    const images = staging[0].match(/^ {6}image: .+$/gm) || []
     assert.deepEqual(images, [`      image: mcr.microsoft.com/playwright:v${version}-noble@sha256:8fb7af3bb488c51364d6554876a8eddf377736608327dbdf4177b4901faf7bc9`])
   }
 })
@@ -157,7 +157,7 @@ test('failure progress and provisioning errors never serialize sensitive call lo
   t.mock.method(console, 'log', value => output.push(value))
   t.mock.method(console, 'error', value => output.push(value))
   const reporter = new PrivateReporter()
-  reporter.onError(new Error(`locator.fill(\"${secret}\")`))
+  reporter.onError(new Error(`locator.fill("${secret}")`))
   reporter.onTestEnd({ title: UI_CHECKS[0], expectedStatus: 'passed', outcome: () => 'unexpected' },
     { status: 'failed', retry: 0, error: { message: secret, stack: secret }, stdout: [secret], attachments: [{ body: secret }] })
   assert.equal(output.some(value => value.includes(secret)), false)

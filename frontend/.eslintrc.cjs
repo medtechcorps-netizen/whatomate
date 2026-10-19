@@ -21,6 +21,12 @@ module.exports = {
   },
   overrides: [
     {
+      files: ['e2e/canary/*.mjs'],
+      env: {
+        node: true
+      }
+    },
+    {
       files: ['*.cjs', 'postcss.config.cjs', 'tailwind.config.cjs'],
       env: {
         node: true,
