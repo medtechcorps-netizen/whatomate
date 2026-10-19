@@ -785,6 +785,96 @@ test.describe('Logout during a token refresh', () => {
     exchange.release()
   })
 
+  test('ordinary Back after an interrupted SSO exchange never restores A over the unseen B jar', async ({
+    page,
+    context,
+    playwright,
+    baseURL,
+  }, testInfo) => {
+    // Keep the project's normal Chromium launch policy. Playwright 1.57 adds
+    // --disable-back-forward-cache; do not remove it to claim production cache
+    // eligibility. This control proves a new-document Back, not BFCache.
+    const cdp = await context.newCDPSession(page)
+    await cdp.send('Page.enable')
+    const { arguments: launchArguments } = await cdp.send('Browser.getBrowserCommandLine')
+    const cacheFailures: string[][] = []
+    cdp.on('Page.backForwardCacheNotUsed', (event) => {
+      cacheFailures.push(event.notRestoredExplanations.map((reason) => reason.reason))
+    })
+    await page.addInitScript(() => {
+      const observation = { id: crypto.randomUUID(), persistedShows: [] as boolean[] }
+      ;(window as unknown as { __r1History: typeof observation }).__r1History = observation
+      window.addEventListener('pageshow', (event) => observation.persistedShows.push(event.persisted))
+    })
+    const historyState = () => page.evaluate(() =>
+      (window as unknown as { __r1History: { id: string; persistedShows: boolean[] } }).__r1History,
+    )
+    const newContext = () => playwright.request.newContext({ baseURL })
+    let releaseExchange: (() => void) | undefined
+    try {
+      await loginAsAdmin(page)
+      await expect(page.locator('aside').getByRole('button').filter({ hasText: TEST_USERS.admin.email })).toBeVisible()
+      const original = await historyState()
+      const originalPath = new URL(page.url()).pathname
+      const order: string[] = []
+      recordSessionRequests(context, order)
+      const exchangesSent: string[] = []
+      page.on('request', (request) => {
+        if (isExchange(request)) exchangesSent.push(request.url())
+      })
+      const exchange = await answerExchange(page, newContext, TEST_USERS.manager, order, { hold: true })
+      releaseExchange = exchange.release
+      await page.goto('/auth/sso/callback?code=e2e-history-code-b', { waitUntil: 'domcontentloaded' })
+      await exchange.ready
+      await expect.poll(() => page.evaluate(() => sessionStorage.getItem('whm_sso_sent'))).not.toBeNull()
+      expect(await page.evaluate(() => JSON.parse(localStorage.getItem('user')!).email)).toBe(TEST_USERS.admin.email)
+
+      // As in the reload uncertainty control, inject B's actual issued cookies
+      // without delivering the response. This is not the separate real SSO
+      // callback/exchange proof; it fixes the uncertain jar state under test.
+      const issued = exchange.cookies()
+      const paths: Record<string, string> = { whm_access: '/api', whm_refresh: '/api/auth/refresh', whm_csrf: '/' }
+      const host = new URL(baseURL!).hostname
+      for (const name of Object.keys(paths)) expect(issued[name]).toBeTruthy()
+      await context.addCookies(
+        Object.entries(paths).map(([name, path]) => ({ name, value: issued[name], domain: host, path })),
+      )
+      // Returning to the prior authenticated history entry must run the actual
+      // router's interrupted-note check before it restores persisted user A.
+      await page.goBack({ waitUntil: 'domcontentloaded' })
+      await expect(page).toHaveURL(/\/login(?:\?|$)/)
+      await expect(page.getByTestId('password-sign-in')).toBeVisible()
+      await expect(page.locator('aside')).toHaveCount(0)
+      await expect.poll(async () => (await historyState()).persistedShows).toEqual([false])
+      const returned = await historyState()
+      await testInfo.attach('ordinary-back-observation', {
+        contentType: 'application/json',
+        body: JSON.stringify({
+          originalPath,
+          returnedPath: new URL(page.url()).pathname,
+          backForwardCacheDisabledByLaunch: launchArguments.includes('--disable-back-forward-cache'),
+          newDocument: original.id !== returned.id,
+          returnedPageshowPersisted: returned.persistedShows,
+          cacheNotRestoredReasons: cacheFailures,
+          bfcacheRestorationQualified: false,
+        }),
+      })
+      expect(returned.id).not.toBe(original.id)
+      expect(returned.persistedShows).toEqual([false])
+      expect(await page.evaluate(() => sessionStorage.getItem('whm_sso_sent'))).not.toBeNull()
+      expect(await page.evaluate(() => JSON.parse(localStorage.getItem('user')!).email)).toBe(TEST_USERS.admin.email)
+      expect(exchangesSent).toHaveLength(1)
+      expect(order.filter((kind) => kind === 'revoke' || kind === 'logout')).toEqual([])
+      for (const name of Object.keys(paths)) expect(await cookieValue(context, name)).toBe(issued[name])
+      const me = await page.request.get('/api/me')
+      expect(me.status()).toBe(200)
+      expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+    } finally {
+      releaseExchange?.()
+      await cdp.detach()
+    }
+  })
+
   test('a replayed or expired SSO code changes nothing', async ({ page, context, playwright, baseURL }) => {
     const newContext = () => playwright.request.newContext({ baseURL })
     await loginAsAdmin(page)

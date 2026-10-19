@@ -179,6 +179,56 @@ describe('SSOCallbackView after a reload cut its exchange off', () => {
     expect(JSON.parse(localStorage.getItem('user')!).id).toBe('user-a')
   })
 
+  it('same-document Back remounts the interrupted callback without adopting A or replaying its sent code', async () => {
+    const sent: string[] = []
+    const { api, router, store, wrapper } = await loadCallbackPage('/auth/sso/callback?code=code-b', (config) => {
+      sent.push(config.url ?? '')
+      return new Promise(() => undefined)
+    })
+    expect(sent).toEqual(['/auth/refresh'])
+    expect(sessionStorage.getItem('whm_sso_code')).toBeNull()
+    // This is the ordinary SPA history path, not a synthetic pageshow or a
+    // BFCache claim. The unseen answer's B cookies may already be present.
+    document.cookie = 'whm_csrf=csrf-of-b; path=/'
+    await router.push('/login')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/login')
+    router.back()
+    await vi.waitFor(() => expect(router.currentRoute.value.path).toBe('/auth/sso/callback'))
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('auth.ssoInterrupted')
+    expect(store.user).toBeNull()
+    expect(api.ssoExchangeInterrupted()).toBe(true)
+    expect(sent).toEqual(['/auth/refresh'])
+    expect(revokesAndLogouts).toEqual([])
+    expect(JSON.parse(localStorage.getItem('user')!).id).toBe('user-a')
+    expect(document.cookie).toContain('whm_csrf=csrf-of-b')
+  })
+
+  it('same-document Back accepts a newer C only when its begun session matches the current jar', async () => {
+    const sent: string[] = []
+    const { router, store } = await loadCallbackPage('/auth/sso/callback?code=code-b', (config) => {
+      sent.push(config.url ?? '')
+      return new Promise(() => undefined)
+    })
+    expect(sent).toEqual(['/auth/refresh'])
+    await router.push('/login')
+    localStorage.setItem('whm_session_id', 'session-c')
+    localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-c', csrf: 'csrf-of-c' }))
+    localStorage.setItem('user', JSON.stringify({ ...USER_A, id: 'user-c', email: 'c@example.com' }))
+    document.cookie = 'whm_csrf=csrf-of-c; path=/'
+    router.back()
+    await vi.waitFor(() => expect(store.user?.id).toBe('user-c'))
+    await flushPromises()
+
+    expect(router.currentRoute.value.path).toBe('/')
+    expect(sessionStorage.getItem('whm_sso_sent')).toBeNull()
+    expect(sent).toEqual(['/auth/refresh'])
+    expect(revokesAndLogouts).toEqual([])
+    expect(document.cookie).toContain('whm_csrf=csrf-of-c')
+  })
+
   it('a newer session that began elsewhere, consistent with the jar, settles it: the page goes on into that session', async () => {
     await loadCallbackPage('/auth/sso/callback?code=code-b', () => new Promise(() => undefined))
     installWebLocks()
