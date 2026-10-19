@@ -1099,7 +1099,8 @@
     "notFound": "El recurso solicitado no fue encontrado.",
     "validation": "Verifique sus datos e intente de nuevo.",
     "serverError": "Error del servidor. Por favor intente de nuevo más tarde.",
-    "timeout": "La solicitud ha expirado. Por favor intente de nuevo."
+    "timeout": "La solicitud ha expirado. Por favor intente de nuevo.",
+    "unsupportedBrowser": "Este navegador no puede mantener las sesiones seguras entre pestañas. Actualice su navegador (o use HTTPS)."
   },
   "validation": {
     "required": "Este campo es obligatorio",

@@ -3,7 +3,7 @@ import { ref, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
-import { api, beginSsoSignIn, SESSION_BUSY_CODE } from '@/services/api'
+import { api, beginSsoSignIn, SESSION_BUSY_CODE, SESSION_UNSUPPORTED_CODE } from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -118,7 +118,10 @@ const handleLogin = async () => {
     // refused, not sent; a timeout or a lost answer is not a wrong password
     // either. In both cases the user just tries again.
     let message: string
-    if (
+    if (error?.code === SESSION_UNSUPPORTED_CODE) {
+      // No Web Locks: this browser cannot keep sessions apart across tabs.
+      message = t('errors.unsupportedBrowser')
+    } else if (
       error?.code === SESSION_BUSY_CODE ||
       error?.code === 'ERR_CANCELED' ||
       error?.code === 'ECONNABORTED' ||
@@ -150,9 +153,11 @@ const initiateSSO = async (provider: string) => {
   // new session begins. The page stays busy until it leaves for the provider.
   try {
     await beginSsoSignIn()
-  } catch {
+  } catch (error: any) {
     isSSOStarting.value = false
-    toast.error(t('errors.timeout'))
+    toast.error(
+      error?.code === SESSION_UNSUPPORTED_CODE ? t('errors.unsupportedBrowser') : t('errors.timeout'),
+    )
     return
   }
   const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')

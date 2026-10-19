@@ -14,7 +14,7 @@ import {
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { organizationsService } from '@/services/api'
+import { organizationsService, SESSION_UNSUPPORTED_CODE } from '@/services/api'
 import { wsService } from '@/services/websocket'
 import { toast } from 'vue-sonner'
 import { Building2, Plus, Loader2 } from 'lucide-vue-next'
@@ -106,8 +106,9 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
       wsService.disconnect()
       organizationsStore.selectOrganization(value)
       window.location.reload()
-    } catch {
+    } catch (error: any) {
       // If switch fails, don't reload
+      if (error?.code === SESSION_UNSUPPORTED_CODE) toast.error(t('errors.unsupportedBrowser'))
     }
   }
 }
@@ -165,7 +166,7 @@ const refreshOrgs = async () => {
         :disabled="Boolean(organizationsStore.organizationSwitchBlocker)"
         @update:model-value="handleOrgChange"
       >
-        <SelectTrigger class="h-8 text-[13px]">
+        <SelectTrigger class="h-8 text-[13px]" data-testid="organization-switcher">
           <SelectValue placeholder="Select organization" />
         </SelectTrigger>
         <SelectContent>

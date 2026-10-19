@@ -1271,7 +1271,8 @@
     "notFound": "The requested resource was not found.",
     "validation": "Please check your input and try again.",
     "serverError": "Server error. Please try again later.",
-    "timeout": "Request timed out. Please try again."
+    "timeout": "Request timed out. Please try again.",
+    "unsupportedBrowser": "This browser can't keep sessions safe across tabs. Please update your browser (or use HTTPS)."
   },
   "validation": {
     "required": "This field is required",

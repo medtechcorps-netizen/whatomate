@@ -573,6 +573,36 @@ func TestLaneA_RefreshToken_KeepaliveRevokeSetsNoCookies(t *testing.T) {
 	assert.GreaterOrEqual(t, cleared, 3)
 }
 
+func TestLaneA_RefreshToken_KeepaliveRevokeStoreFailureSetsNoCookies(t *testing.T) {
+	f := newLaneARefreshFixture(t)
+	unreachable := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 200 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+	t.Cleanup(func() { _ = unreachable.Close() })
+	f.app.Redis = unreachable
+
+	// The closing page's keepalive revoke while the store is down: 503, and the
+	// jar is left as it is (a newer session's cookies may be in it by now).
+	req := testutil.NewJSONRequest(t, map[string]any{"revoke": true, "keep_cookies": true})
+	req.RequestCtx.Request.Header.SetCookie("whm_refresh", f.token)
+	req.RequestCtx.Request.Header.SetCookie("whm_csrf", "csrf-1")
+	req.RequestCtx.Request.Header.Set("X-CSRF-Token", "csrf-1")
+	require.NoError(t, f.app.RefreshToken(req))
+	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req))
+	cookies := 0
+	req.RequestCtx.Response.Header.VisitAllCookie(func(_, _ []byte) { cookies++ })
+	assert.Zero(t, cookies, "a failed keepalive revoke must not set or clear any cookie")
+
+	// Control: a plain revoke on the same failure path clears them.
+	plain := laneARevoke(t, f.app, f.token, "csrf-1", "csrf-1")
+	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(plain))
+	cleared := 0
+	plain.RequestCtx.Response.Header.VisitAllCookie(func(_, _ []byte) { cleared++ })
+	assert.GreaterOrEqual(t, cleared, 3)
+}
+
 func TestLaneA_RefreshToken_KeepaliveRevokeStillNeedsCSRF(t *testing.T) {
 	f := newLaneARefreshFixture(t)
 	req := testutil.NewJSONRequest(t, map[string]any{"revoke": true, "keep_cookies": true})

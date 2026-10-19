@@ -1,39 +1,68 @@
-import { test, expect, type APIRequestContext, type BrowserContext, type Page } from '@playwright/test'
-import { loginAsAdmin, logout, TEST_USERS, type TestUser } from '../../helpers'
+import {
+  test,
+  expect,
+  request as playwrightRequest,
+  type APIRequestContext,
+  type BrowserContext,
+  type Page,
+} from '@playwright/test'
+import { ApiHelper, loginAsAdmin, logout, TEST_USERS, type TestUser } from '../../helpers'
+import {
+  createTestScope,
+  createUserWithPermissions,
+  loginAs,
+  SUPER_ADMIN,
+  type TestUserHandle,
+} from '../../framework'
 
-// A logout must not race refresh work already in flight. A refresh response
-// sets new auth cookies; if it lands after /auth/logout cleared them, the
-// browser is signed back in. The client exits at once but sends the revoke
-// and /auth/logout only after that response landed (shared Web Lock), and a
-// later sign-in (password or SSO) waits for the logout in turn.
+// No cookie-setting answer may land on the wrong session. A refresh, sign-in
+// or org switch answer sets new auth cookies; if it lands after a logout or a
+// newer sign-in, the browser holds the wrong session. So:
+// - every cookie-changing request runs under one Web Lock shared by all tabs;
+// - a session change in one tab aborts another tab's refresh in flight (its
+//   late Set-Cookie is discarded);
+// - while an SSO sign-in is at the identity provider, no tab refreshes or
+//   logs out the session it started from;
+// - without Web Locks the app signs nobody in (fail closed).
 //
-// The refresh response is held back for real: it is fetched upstream through
-// a separate request context (its own cookie jar), so the browser's jar only
-// changes when route.fulfill delivers it. Each test first proves that.
+// Answers are held back for real: each is fetched upstream through a separate
+// request context (its own cookie jar), so the browser's jar only changes when
+// route.fulfill delivers it. Each test first proves that.
 //
 // Negative controls: against 3d086ef5 (before R1-AUTH-1) the ordering
-// assertions here fail (the revoke and logout go out before the refresh
-// lands, and the late Set-Cookie signs the browser back in). Against 04344c17
-// the 7 s case fails: that build only raced the revoke against the budget, so
-// the pending attempt was never aborted; its held answer (which revokes and
-// clears the cookies) lands after B has signed in and clears B's cookies, and
-// the jar and /me checks fail. A build without the budget abort never fails
-// the attempt at all (it gets its answer at ~7.5 s).
+// assertions here fail (the revoke and logout go out before the refresh lands,
+// and the late Set-Cookie signs the browser back in). Against 04344c17 the 7 s
+// case fails: that build only raced the revoke against the budget, so the
+// pending attempt was never aborted; its held answer (which revokes and clears
+// the cookies) lands after B has signed in and clears B's cookies, and the jar
+// and /me checks fail. A build without the budget abort never fails the
+// attempt at all (it gets its answer at ~7.5 s). Expected to fail against
+// f9f8c65d (not yet run): the no-Web-Locks case (that build signed in through
+// a best-effort fallback) and the SSO case (the open tab's refresh went out
+// while B was at the identity provider, and its held answer replaced B's
+// cookies).
 
 type Held = {
+  // The browser sent the request (it reached the route handler).
   started: Promise<void>
+  // The upstream answer is in hand (status, headers and cookies captured):
+  // the server has acted, the browser's jar is still unchanged.
+  ready: Promise<void>
   release: () => void
-  successorRefresh: () => string | undefined
+  // The auth cookie values the held answer sets.
+  cookies: () => Record<string, string>
 }
 
-// holdRefreshResponse holds the next refresh response of `page` until
+// holdResponse holds the next answer of `page` to `path` (under /api) until
 // release(). Revoke calls (POST /auth/refresh {revoke:true}) pass through.
-async function holdRefreshResponse(
+async function holdResponse(
   page: Page,
+  path: string,
   newContext: () => Promise<APIRequestContext>,
   order: string[],
+  landed: string,
 ): Promise<Held> {
-  let successor: string | undefined
+  let cookies: Record<string, string> = {}
   let release!: () => void
   const gate = new Promise<void>((resolve) => {
     release = resolve
@@ -42,8 +71,12 @@ async function holdRefreshResponse(
   const started = new Promise<void>((resolve) => {
     seen = resolve
   })
+  let captured!: () => void
+  const ready = new Promise<void>((resolve) => {
+    captured = resolve
+  })
   let held = false
-  await page.route('**/api/auth/refresh', async (route) => {
+  await page.route(`**/api${path}`, async (route) => {
     const request = route.request()
     if ((request.postData() ?? '').includes('"revoke"') || held) {
       await route.continue()
@@ -61,18 +94,15 @@ async function holdRefreshResponse(
       data: request.postDataBuffer() ?? undefined,
       maxRedirects: 0,
     })
-    successor = response
-      .headersArray()
-      .filter((header) => header.name.toLowerCase() === 'set-cookie')
-      .map((header) => /^whm_refresh=([^;]+)/.exec(header.value)?.[1])
-      .find(Boolean)
+    cookies = setCookies(response.headersArray())
+    captured()
     await gate
-    order.push('refresh landed')
+    order.push(landed)
     // The browser may have aborted it meanwhile: then nothing is delivered.
     await route.fulfill({ response }).catch(() => undefined)
     await upstream.dispose()
   })
-  return { started, release: () => release(), successorRefresh: () => successor }
+  return { started, ready, release: () => release(), cookies: () => cookies }
 }
 
 // Records the revoke and logout requests the browser sends, with the cookies
@@ -90,6 +120,19 @@ function recordSessionRequests(context: BrowserContext, order: string[]) {
     sent.push({ kind, cookie: headers.cookie ?? '', csrf: headers['x-csrf-token'] ?? '' })
   })
   return sent
+}
+
+function isRefresh(request: { url(): string; postData(): string | null }) {
+  return request.url().endsWith('/api/auth/refresh') && !(request.postData() ?? '').includes('"revoke"')
+}
+
+// Counts the refresh requests (not revokes) `page` sends.
+function countRefreshes(page: Page) {
+  let count = 0
+  page.on('request', (request) => {
+    if (isRefresh(request)) count++
+  })
+  return () => count
 }
 
 // The auth cookie values a response sets.
@@ -115,11 +158,16 @@ async function startProactiveRefresh(page: Page) {
   })
 }
 
-// Signs in on a login page that is already open (no reload).
-async function signInHere(page: Page, user: TestUser) {
+// Fills the password form on a login page that is already open (no reload).
+async function submitSignIn(page: Page, user: TestUser) {
   await page.locator('input[name="email"], input[type="email"]').fill(user.email)
   await page.locator('input[name="password"], input[type="password"]').fill(user.password)
   await page.getByTestId('password-sign-in').click()
+}
+
+// Signs in on a login page that is already open (no reload).
+async function signInHere(page: Page, user: TestUser) {
+  await submitSignIn(page, user)
   await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 45_000 })
 }
 
@@ -133,32 +181,67 @@ async function expectRefreshRejected(newContext: () => Promise<APIRequestContext
   }
 }
 
+// B's real session, as an identity provider round trip would set it.
+async function sessionOf(newContext: () => Promise<APIRequestContext>, user: TestUser) {
+  const idp = await newContext()
+  const signIn = await idp.post('/api/auth/login', { data: { email: user.email, password: user.password } })
+  expect(signIn.status()).toBe(200)
+  const cookies = (await idp.storageState()).cookies
+  await idp.dispose()
+  return {
+    cookies,
+    refresh: cookies.find((c) => c.name === 'whm_refresh')!.value,
+    csrf: cookies.find((c) => c.name === 'whm_csrf')!.value,
+  }
+}
+
+// Lets `page` discover the Google SSO provider for a workspace code.
+async function offerGoogleSso(page: Page) {
+  await page.route(/\/api\/auth\/sso\/providers(?:\?.*)?$/, (route) =>
+    route.fulfill({ json: { data: [{ provider: 'google', name: 'Google' }] } }),
+  )
+}
+
+async function startGoogleSso(page: Page) {
+  await page.getByTestId('sso-workspace-code').fill('klinik-relive-a1b2c3d4')
+  await page.getByTestId('sso-discover-button').click()
+  await page.getByTestId('sso-provider-google').click()
+}
+
+const withoutWebLocks = () => {
+  Object.defineProperty(Navigator.prototype, 'locks', { configurable: true, get: () => undefined })
+}
+
 test.describe('Logout during a token refresh', () => {
   test.describe.configure({ timeout: 120_000 })
 
-  for (const locking of ['Web Locks', 'no Web Locks']) {
+  for (const locking of ['Web Locks', 'no Web Locks (a session from before)']) {
     test(`a refresh response that lands after the click cannot revive the session (${locking})`, async ({
       page,
       context,
       playwright,
       baseURL,
     }) => {
-      if (locking === 'no Web Locks') {
-        await page.addInitScript(() => {
-          Object.defineProperty(Navigator.prototype, 'locks', { configurable: true, get: () => undefined })
-        })
-      }
       const newContext = () => playwright.request.newContext({ baseURL })
       await loginAsAdmin(page)
+      if (locking !== 'Web Locks') {
+        // A session that already existed, in a browser without Web Locks: it
+        // still refreshes and logs out, ordered within its tab.
+        await page.addInitScript(withoutWebLocks)
+        await page.reload({ waitUntil: 'domcontentloaded' })
+      }
       expect(await page.evaluate(() => !!navigator.locks)).toBe(locking === 'Web Locks')
       const originalRefresh = await cookieValue(context, 'whm_refresh')
       expect(originalRefresh).toBeTruthy()
 
       const order: string[] = []
       recordSessionRequests(context, order)
-      const held = await holdRefreshResponse(page, newContext, order)
+      const held = await holdResponse(page, '/auth/refresh', newContext, order, 'refresh landed')
       await startProactiveRefresh(page)
-      await held.started
+      await held.ready
+      // The harness really holds the cookie write back.
+      expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
+      expect(held.cookies().whm_refresh).toBeTruthy()
 
       // The user is out at once, refresh or not.
       await logout(page)
@@ -166,9 +249,6 @@ test.describe('Logout during a token refresh', () => {
       // Give an unordered logout every chance to go out first.
       await page.waitForTimeout(1_000)
       expect(order).toEqual([])
-      // The harness really holds the cookie write back.
-      expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
-      expect(held.successorRefresh()).toBeTruthy()
 
       const loggedOut = page.waitForResponse('**/api/auth/logout')
       held.release()
@@ -179,11 +259,11 @@ test.describe('Logout during a token refresh', () => {
       expect(await cookieValue(context, 'whm_refresh')).toBeUndefined()
       expect((await page.request.get('/api/me')).status()).toBe(401)
       // Neither the original refresh token nor its successor mints a session.
-      await expectRefreshRejected(newContext, [originalRefresh, held.successorRefresh()])
+      await expectRefreshRejected(newContext, [originalRefresh, held.cookies().whm_refresh])
     })
   }
 
-  test("another tab's refresh lands first, then the logout, then a new sign-in that survives", async ({
+  test("another tab's refresh in flight is aborted by the logout, and a new sign-in survives", async ({
     page,
     context,
     playwright,
@@ -197,31 +277,43 @@ test.describe('Logout during a token refresh', () => {
 
     const order: string[] = []
     recordSessionRequests(context, order)
-    const held = await holdRefreshResponse(other, newContext, order)
+    other.on('requestfailed', (request) => {
+      if (isRefresh(request)) order.push('refresh failed')
+    })
+    const held = await holdResponse(other, '/auth/refresh', newContext, order, 'refresh landed')
     await startProactiveRefresh(other)
-    await held.started
+    await held.ready
+    // The harness holds the other tab's rotated cookies back.
+    expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
+    expect(held.cookies().whm_refresh).toBeTruthy()
 
     await logout(page)
     await expect(page).toHaveURL(/\/login/)
-    // Signing in as B waits (busy) for the refresh and the logout.
-    const signedIn = signInHere(page, TEST_USERS.manager)
-    await page.waitForTimeout(1_000)
-    expect(order).toEqual([])
-    expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
+    // The logout aborts the other tab's refresh at once (its late Set-Cookie
+    // can no longer land), so the revoke and the logout go right out, while
+    // the refresh answer is still held.
+    await expect.poll(() => order.includes('refresh failed'), { timeout: 5_000 }).toBe(true)
+    await expect
+      .poll(() => order.filter((kind) => kind === 'revoke' || kind === 'logout'), { timeout: 10_000 })
+      .toEqual(['revoke', 'logout'])
 
+    await signInHere(page, TEST_USERS.manager)
+    const sessionB = await cookieValue(context, 'whm_refresh')
+    // The held answer comes too late: nothing of it is delivered.
     held.release()
-    await signedIn
-    expect(order.slice(0, 3)).toEqual(['refresh landed', 'revoke', 'logout'])
+    await expect.poll(() => order.includes('refresh landed')).toBe(true)
+    await other.waitForTimeout(1_000)
+    expect(order.indexOf('logout')).toBeLessThan(order.indexOf('refresh landed'))
 
     // B's session is the one in the jar, and it works.
-    const sessionB = await cookieValue(context, 'whm_refresh')
     expect(sessionB).toBeTruthy()
     expect(sessionB).not.toBe(originalRefresh)
-    expect(sessionB).not.toBe(held.successorRefresh())
+    expect(sessionB).not.toBe(held.cookies().whm_refresh)
+    expect(await cookieValue(context, 'whm_refresh')).toBe(sessionB)
     const me = await page.request.get('/api/me')
     expect(me.status()).toBe(200)
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
-    await expectRefreshRejected(newContext, [originalRefresh, held.successorRefresh()])
+    await expectRefreshRejected(newContext, [originalRefresh, held.cookies().whm_refresh])
   })
 
   test('an SSO sign-in started during a queued logout is never revoked by it', async ({
@@ -231,15 +323,7 @@ test.describe('Logout during a token refresh', () => {
     baseURL,
   }) => {
     const newContext = () => playwright.request.newContext({ baseURL })
-    // B's real session, as an identity provider round trip would set it.
-    const idp = await newContext()
-    const signInB = await idp.post('/api/auth/login', {
-      data: { email: TEST_USERS.manager.email, password: TEST_USERS.manager.password },
-    })
-    expect(signInB.status()).toBe(200)
-    const cookiesB = (await idp.storageState()).cookies
-    const refreshB = cookiesB.find((c) => c.name === 'whm_refresh')!.value
-    const csrfB = cookiesB.find((c) => c.name === 'whm_csrf')!.value
+    const b = await sessionOf(newContext, TEST_USERS.manager)
 
     await loginAsAdmin(page)
     const originalRefresh = await cookieValue(context, 'whm_refresh')
@@ -248,46 +332,205 @@ test.describe('Logout during a token refresh', () => {
 
     const order: string[] = []
     const sent = recordSessionRequests(context, order)
-    const held = await holdRefreshResponse(other, newContext, order)
-    await startProactiveRefresh(other)
-    await held.started
+    // Another tab holds the session lock for 8 s: the logout queues behind it.
+    await other.evaluate(() => {
+      void navigator.locks.request('whm-token-refresh', () => new Promise((resolve) => setTimeout(resolve, 8_000)))
+    })
 
     await logout(page)
     await expect(page).toHaveURL(/\/login/)
 
-    await page.route(/\/api\/auth\/sso\/providers(?:\?.*)?$/, (route) =>
-      route.fulfill({ json: { data: [{ provider: 'google', name: 'Google' }] } }),
-    )
+    await offerGoogleSso(page)
     await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, async (route) => {
       order.push('sso')
-      await context.addCookies(cookiesB)
+      await context.addCookies(b.cookies)
       await route.fulfill({ status: 302, headers: { location: '/auth/sso/callback' } })
     })
-    await page.getByTestId('sso-workspace-code').fill('klinik-relive-a1b2c3d4')
-    await page.getByTestId('sso-discover-button').click()
-    await page.getByTestId('sso-provider-google').click()
+    await startGoogleSso(page)
     await page.waitForTimeout(1_000)
-    // The SSO start waits for the refresh and the logout ahead of it.
+    // The SSO start waits for the logout ahead of it.
     expect(order).toEqual([])
 
-    held.release()
-    await page.waitForURL(/\/auth\/sso\/callback/)
+    await page.waitForURL(/\/auth\/sso\/callback/, { timeout: 20_000 })
     await expect.poll(() => order.includes('sso')).toBe(true)
-    expect(order.indexOf('logout')).toBeLessThan(order.indexOf('sso'))
+    expect(order.slice(0, 3)).toEqual(['revoke', 'logout', 'sso'])
     await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 15_000 })
 
     // Nothing of the old logout carried B's cookies or CSRF token...
     for (const request of sent) {
-      expect(request.cookie).not.toContain(refreshB)
-      expect(request.csrf).not.toBe(csrfB)
+      expect(request.cookie).not.toContain(b.refresh)
+      expect(request.csrf).not.toBe(b.csrf)
     }
     // ...and B's session is the one in the jar, and it works.
-    expect(await cookieValue(context, 'whm_refresh')).toBe(refreshB)
+    expect(await cookieValue(context, 'whm_refresh')).toBe(b.refresh)
     const me = await page.request.get('/api/me')
     expect(me.status()).toBe(200)
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
-    await expectRefreshRejected(newContext, [originalRefresh, held.successorRefresh()])
-    await idp.dispose()
+    await expectRefreshRejected(newContext, [originalRefresh])
+  })
+
+  test('an open tab refreshes nothing while an SSO sign-in in another tab is at the identity provider', async ({
+    page,
+    context,
+    playwright,
+    baseURL,
+  }) => {
+    const newContext = () => playwright.request.newContext({ baseURL })
+    const b = await sessionOf(newContext, TEST_USERS.manager)
+
+    await loginAsAdmin(page)
+    const other = await context.newPage()
+    await other.goto('/', { waitUntil: 'domcontentloaded' })
+    const refreshes = countRefreshes(other)
+    const order: string[] = []
+    // A refresh the open tab sent now would carry A's cookies; held here, its
+    // answer would land after B's.
+    const held = await holdResponse(other, '/auth/refresh', newContext, order, 'refresh landed')
+
+    // This tab starts an SSO sign-in as B while A's session is live, and
+    // leaves for the identity provider (a page without the app: the lock is
+    // let go).
+    await page.goto('/login', { waitUntil: 'domcontentloaded' })
+    await offerGoogleSso(page)
+    await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, async (route) => {
+      order.push('sso')
+      await route.fulfill({ status: 302, headers: { location: '/__mock_idp' } })
+    })
+    await page.route('**/__mock_idp', (route) =>
+      route.fulfill({ contentType: 'text/html', body: '<html><body>Identity provider</body></html>' }),
+    )
+    await startGoogleSso(page)
+    await page.waitForURL(/__mock_idp/)
+    expect(await page.evaluate(() => localStorage.getItem('whm_sso_started'))).toBeTruthy()
+
+    // While B is at the identity provider, the open tab's refresh comes due.
+    await startProactiveRefresh(other)
+    await other.waitForTimeout(3_000)
+    expect(refreshes()).toBe(0)
+    // It keeps A's session meanwhile (it is not sent to the login page).
+    expect(other.url()).not.toContain('/login')
+
+    // The provider redirects back: B's cookies, then the callback page.
+    await context.addCookies(b.cookies)
+    await page.goto('/auth/sso/callback', { waitUntil: 'domcontentloaded' })
+    await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 15_000 })
+    // A refresh held from the provider phase would land now.
+    held.release()
+    await other.waitForTimeout(1_000)
+
+    expect(refreshes()).toBe(0)
+    expect(await cookieValue(context, 'whm_refresh')).toBe(b.refresh)
+    const me = await page.request.get('/api/me')
+    expect(me.status()).toBe(200)
+    expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+  })
+
+  test("a sign-in and another tab's refresh never overlap: the sign-in's cookies stay", async ({
+    page,
+    context,
+    playwright,
+    baseURL,
+  }) => {
+    const newContext = () => playwright.request.newContext({ baseURL })
+    await loginAsAdmin(page)
+    const other = await context.newPage()
+    await other.goto('/', { waitUntil: 'domcontentloaded' })
+    const refreshes = countRefreshes(other)
+
+    // This tab signs in as B while A's session is live; B's answer is held.
+    await page.goto('/login', { waitUntil: 'domcontentloaded' })
+    const order: string[] = []
+    const held = await holdResponse(page, '/auth/login', newContext, order, 'login landed')
+    await submitSignIn(page, TEST_USERS.manager)
+    await held.ready
+    expect(held.cookies().whm_refresh).toBeTruthy()
+
+    // The other tab's refresh comes due while the sign-in holds the lock: it
+    // waits, and sends nothing with A's cookies.
+    await startProactiveRefresh(other)
+    await other.waitForTimeout(3_000)
+    expect(refreshes()).toBe(0)
+
+    held.release()
+    await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 45_000 })
+    await other.waitForTimeout(3_000)
+
+    // The jar holds exactly the sign-in's cookies.
+    expect(refreshes()).toBe(0)
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+      expect(await cookieValue(context, name)).toBe(held.cookies()[name])
+    }
+    const me = await page.request.get('/api/me')
+    expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+  })
+
+  test.describe('a user in two organizations', () => {
+    const scope = createTestScope('logout-refresh-race-switch')
+    let user: TestUserHandle
+    let secondOrg: { id: string; name: string }
+
+    test.beforeAll(async () => {
+      const reqContext = await playwrightRequest.newContext()
+      const api = new ApiHelper(reqContext)
+      await api.login(SUPER_ADMIN.email, SUPER_ADMIN.password)
+      user = await createUserWithPermissions(api, scope, {
+        permissions: [{ resource: 'users', action: 'read' }],
+      })
+      const org = await api.createOrganization(scope.name('second-org'))
+      secondOrg = { id: org.id, name: org.name }
+      await api.addOrgMember(user.user.id, undefined, secondOrg.id)
+      await reqContext.dispose()
+    })
+
+    test.afterAll(async () => {
+      const reqContext = await playwrightRequest.newContext()
+      const api = new ApiHelper(reqContext)
+      await api.login(SUPER_ADMIN.email, SUPER_ADMIN.password)
+      try { await api.removeOrgMember(user.user.id, secondOrg.id) } catch { /* ignore */ }
+      try { await api.deleteUser(user.user.id) } catch { /* ignore */ }
+      try { await api.deleteRole(user.role.id) } catch { /* ignore */ }
+      await reqContext.dispose()
+    })
+
+    test("an org switch and another tab's refresh never overlap: the switch's cookies stay", async ({
+      page,
+      context,
+      playwright,
+      baseURL,
+    }) => {
+      const newContext = () => playwright.request.newContext({ baseURL })
+      await loginAs(page, user)
+      const other = await context.newPage()
+      await other.goto('/profile', { waitUntil: 'domcontentloaded' })
+      const refreshes = countRefreshes(other)
+
+      // This tab switches to the second organization; the answer is held.
+      const order: string[] = []
+      const held = await holdResponse(page, '/auth/switch-org', newContext, order, 'switch landed')
+      await page.getByTestId('organization-switcher').click()
+      await page.getByRole('option', { name: secondOrg.name }).click()
+      await held.ready
+      expect(held.cookies().whm_refresh).toBeTruthy()
+
+      // The other tab's refresh comes due while the switch holds the lock: it
+      // waits, and sends nothing with the pre-switch cookies.
+      await startProactiveRefresh(other)
+      await other.waitForTimeout(3_000)
+      expect(refreshes()).toBe(0)
+
+      const reloaded = page.waitForEvent('domcontentloaded')
+      held.release()
+      await reloaded
+      await other.waitForTimeout(3_000)
+
+      // The jar holds exactly the switch's cookies, for the second organization.
+      expect(refreshes()).toBe(0)
+      for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+        expect(await cookieValue(context, name)).toBe(held.cookies()[name])
+      }
+      const me = await page.request.get('/api/me')
+      expect((await me.json()).data.organization_id).toBe(secondOrg.id)
+    })
   })
 
   test('a revoke still pending at the 7 s budget is aborted before the next sign-in goes out', async ({
@@ -450,49 +693,42 @@ test.describe('Logout during a token refresh', () => {
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
   })
 
-  test('without Web Locks in any tab, a late refresh cannot replace a fresh sign-in', async ({
+  test('without Web Locks a page cannot sign in, says why, and leaves the cookies alone', async ({
     page,
     context,
-    playwright,
-    baseURL,
   }) => {
-    await context.addInitScript(() => {
-      Object.defineProperty(Navigator.prototype, 'locks', { configurable: true, get: () => undefined })
-    })
-    const newContext = () => playwright.request.newContext({ baseURL })
     await loginAsAdmin(page)
-    const originalRefresh = await cookieValue(context, 'whm_refresh')
-    const other = await context.newPage()
-    await other.goto('/', { waitUntil: 'domcontentloaded' })
-    expect(await page.evaluate(() => !!navigator.locks)).toBe(false)
-    expect(await other.evaluate(() => !!navigator.locks)).toBe(false)
-
-    const order: string[] = []
-    recordSessionRequests(context, order)
-    const held = await holdRefreshResponse(other, newContext, order)
-    await startProactiveRefresh(other)
-    await held.started
-    // The harness holds the other tab's rotated cookies back.
-    expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
-    expect(held.successorRefresh()).toBeTruthy()
-
-    await logout(page)
-    await expect(page).toHaveURL(/\/login/)
-    // The same user signs in again at once: a fresh session behind the same
-    // /me, so only the exact cookies can show which session the jar holds.
-    const signInAnswer = page.waitForResponse('**/api/auth/login')
-    await signInHere(page, TEST_USERS.admin)
-    const issued = setCookies(await (await signInAnswer).headersArray())
-    expect(issued.whm_refresh).toBeTruthy()
-
-    held.release()
-    await other.waitForTimeout(3_000)
-
-    // The jar holds exactly the fresh sign-in's cookies.
+    const before: Record<string, string | undefined> = {}
     for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
-      expect(await cookieValue(context, name)).toBe(issued[name])
+      before[name] = await cookieValue(context, name)
+      expect(before[name]).toBeTruthy()
     }
-    expect((await page.request.get('/api/me')).status()).toBe(200)
-    await expectRefreshRejected(newContext, [originalRefresh, held.successorRefresh()])
+    const other = await context.newPage()
+    await other.addInitScript(withoutWebLocks)
+    await other.goto('/login', { waitUntil: 'domcontentloaded' })
+    expect(await other.evaluate(() => !!navigator.locks)).toBe(false)
+    const issuing: string[] = []
+    other.on('request', (request) => {
+      if (/\/api\/auth\/(login|register|switch-org|sso\/[^/]+\/init)/.test(request.url())) issuing.push(request.url())
+    })
+    const unsupported = other.getByText("This browser can't keep sessions safe across tabs.", { exact: false })
+
+    // A password sign-in as B is refused before anything is sent.
+    await submitSignIn(other, TEST_USERS.manager)
+    await expect(unsupported.first()).toBeVisible()
+    // So is an SSO start: the page never leaves for the provider.
+    await offerGoogleSso(other)
+    await startGoogleSso(other)
+    await other.waitForTimeout(1_000)
+    expect(other.url()).toContain('/login')
+    expect(issuing).toEqual([])
+
+    // The browser's session is untouched: the same cookies, still A.
+    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+      expect(await cookieValue(context, name)).toBe(before[name])
+    }
+    const me = await page.request.get('/api/me')
+    expect(me.status()).toBe(200)
+    expect((await me.json()).data.email).toBe(TEST_USERS.admin.email)
   })
 })

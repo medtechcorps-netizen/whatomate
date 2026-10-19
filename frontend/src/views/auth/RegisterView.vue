@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
+import { SESSION_UNSUPPORTED_CODE } from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -57,7 +58,10 @@ const handleRegister = async () => {
     toast.success(t('auth.registrationSuccess'))
     router.push('/')
   } catch (error: any) {
-    const message = error.response?.data?.message || t('auth.registrationFailed')
+    const message =
+      error?.code === SESSION_UNSUPPORTED_CODE
+        ? t('errors.unsupportedBrowser')
+        : error.response?.data?.message || t('auth.registrationFailed')
     toast.error(message)
   } finally {
     isLoading.value = false
