@@ -1297,10 +1297,8 @@ func coexistenceMediaErrorText(err error) string {
 	}
 	value := coexistenceMediaErrorURLPattern.ReplaceAllString(err.Error(), "<redacted_url>")
 	const maxLength = 2000
-	if len(value) > maxLength {
-		return value[:maxLength]
-	}
-	return value
+	// Rune-safe so a stored error never contains a split multi-byte character.
+	return truncateString(value, maxLength)
 }
 
 func coexistenceMediaPayloadString(payload models.JSONB, key string) string {

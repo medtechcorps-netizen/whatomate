@@ -2,6 +2,7 @@ package assignment
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,6 +61,39 @@ func (a *Assigner) AssignToTeam(teamID, orgID uuid.UUID, excludeAgentIDs []uuid.
 	}
 }
 
+// AssignChatToTeamChecked selects an agent only after every required SQL operation
+// succeeds. It preserves the original SQL error for the caller's retry policy;
+// even a failed round-robin timestamp update returns no selected agent. The caller
+// owns the transaction, its lock bounds, and whether a failure is retryable.
+func (a *Assigner) AssignChatToTeamChecked(teamID, orgID uuid.UUID, excludeAgentIDs []uuid.UUID) (*uuid.UUID, error) {
+	cfg, err := a.getTeamConfig(teamID, true)
+	if err != nil || cfg == nil {
+		return nil, err
+	}
+	if cfg.Strategy == models.AssignmentStrategyManual {
+		return nil, nil
+	}
+	available, err := a.filterAvailableChecked(cfg.MemberIDs, excludeAgentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("read team agent availability: %w", err)
+	}
+	if len(available) == 0 {
+		return nil, nil
+	}
+	if cfg.Strategy == models.AssignmentStrategyLoadBalanced {
+		loads, err := chatLoadCounts(a.db, orgID, available)
+		if err != nil {
+			return nil, fmt.Errorf("read team agent chat loads: %w", err)
+		}
+		return a.selectLeastLoaded(available, loads), nil
+	}
+	agentID, err := a.selectRoundRobin(teamID, available)
+	if err != nil {
+		return nil, err
+	}
+	return agentID, nil
+}
+
 // GetAvailableAgents returns the user IDs of available agents in the team,
 // excluding the given IDs. Used for broadcast fallback after rotation exhausts
 // individual agents.
@@ -80,24 +114,36 @@ func (a *Assigner) assignRoundRobin(teamID, orgID uuid.UUID, memberIDs []uuid.UU
 		a.log.Debug("No available agents for round-robin", "team_id", teamID)
 		return nil
 	}
+	agentID, _ := a.selectRoundRobin(teamID, available)
+	return agentID
+}
 
+func (a *Assigner) selectRoundRobin(teamID uuid.UUID, available []uuid.UUID) (*uuid.UUID, error) {
 	// Among available agents, pick the one with oldest last_assigned_at
 	var members []models.TeamMember
 	err := a.db.
 		Where("team_id = ? AND user_id IN ?", teamID, available).
 		Order("last_assigned_at ASC NULLS FIRST").
 		Find(&members).Error
-	if err != nil || len(members) == 0 {
+	if err != nil {
+		return nil, fmt.Errorf("read round-robin team members: %w", err)
+	}
+	if len(members) == 0 {
 		a.log.Debug("No team members found for round-robin", "team_id", teamID)
-		return nil
+		return nil, nil
 	}
 
 	selected := members[0]
 	now := time.Now()
-	a.db.Model(&selected).Update("last_assigned_at", now)
+	err = a.db.Model(&selected).Update("last_assigned_at", now).Error
 
 	a.log.Debug("Round-robin assigned to agent", "team_id", teamID, "user_id", selected.UserID)
-	return &selected.UserID
+	if err != nil {
+		// The legacy wrapper retains its historical best-effort timestamp behavior;
+		// the checked entry point discards this candidate when an error is returned.
+		return &selected.UserID, fmt.Errorf("update round-robin assignment timestamp: %w", err)
+	}
+	return &selected.UserID, nil
 }
 
 // assignLoadBalanced selects the available agent with the fewest active items
@@ -110,7 +156,10 @@ func (a *Assigner) assignLoadBalanced(orgID uuid.UUID, memberIDs []uuid.UUID, ex
 	}
 
 	loadMap := loadCounter(a.db, orgID, available)
+	return a.selectLeastLoaded(available, loadMap)
+}
 
+func (a *Assigner) selectLeastLoaded(available []uuid.UUID, loadMap map[uuid.UUID]int64) *uuid.UUID {
 	var lowestUserID *uuid.UUID
 	var lowestCount int64 = -1
 	for _, uid := range available {
@@ -131,8 +180,13 @@ func (a *Assigner) assignLoadBalanced(orgID uuid.UUID, memberIDs []uuid.UUID, ex
 // filterAvailable returns user IDs from memberIDs that are active, available,
 // and not in the exclude list.
 func (a *Assigner) filterAvailable(memberIDs []uuid.UUID, excludeAgentIDs []uuid.UUID) []uuid.UUID {
+	available, _ := a.filterAvailableChecked(memberIDs, excludeAgentIDs)
+	return available
+}
+
+func (a *Assigner) filterAvailableChecked(memberIDs []uuid.UUID, excludeAgentIDs []uuid.UUID) ([]uuid.UUID, error) {
 	if len(memberIDs) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Build exclude set
@@ -149,17 +203,17 @@ func (a *Assigner) filterAvailable(memberIDs []uuid.UUID, excludeAgentIDs []uuid
 		}
 	}
 	if len(candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Query DB for availability (this changes frequently, not cached)
 	var availableIDs []uuid.UUID
-	a.db.Model(&models.User{}).
+	err := a.db.Model(&models.User{}).
 		Select("id").
 		Where("id IN ? AND is_available = ? AND is_active = ?", candidates, true, true).
-		Pluck("id", &availableIDs)
+		Pluck("id", &availableIDs).Error
 
-	return availableIDs
+	return availableIDs, err
 }
 
 // ResolvePerAgentTimeout returns the per-agent timeout in seconds using the

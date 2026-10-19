@@ -1307,6 +1307,8 @@
       "internal/handlers/helpers.go",
       "internal/handlers/import_export.go",
       "internal/handlers/inbound_continuation.go",
+      "internal/handlers/inbound_continuation_admission.go",
+      "internal/handlers/inbound_continuation_capacity.go",
       "internal/handlers/inbox_channels.go",
       "internal/handlers/integrations.go",
       "internal/handlers/invitations.go",
@@ -1428,7 +1430,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "077f683a714bb344976aff31a284e1ea2cb69ff9e6a7bee0645ec1531cbc8f3f"
+    "closure_sha256": "99e138e95fa6a1ece362fc8b558314acc1b5ce41ee5daed2c5a883f3701def59"
   },
   {
     "id": "BackfillLegacyWhatsAppInbox",

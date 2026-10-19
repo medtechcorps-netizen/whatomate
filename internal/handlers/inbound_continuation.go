@@ -57,9 +57,24 @@ type inboundContinuationExecution struct {
 	actionScope    string
 	actionIndex    int
 	attemptGuarded bool
+	// Only the audited captured generated-text route sends without an outer
+	// history transaction. Its verification and event reads still enter tenant scope.
+	detachedGeneratedApply bool
 	// Booking commits session proposals independently before provider I/O.
 	// Its graph checkpoint must therefore not reuse an older outer snapshot.
 	nativeBookingCheckpoint bool
+	// Only a prepared nonlegacy route supplies this job-local session. Graph
+	// persistence advances the same object before its next provider boundary.
+	preparedSession *models.ChatbotSession
+	// Ownership survives the initiating caller, but ends on an actual lease
+	// failure. It gates new attempts without cancelling an accepted request or
+	// its independent result checkpoint.
+	ownershipCtx context.Context
+	jobID        uuid.UUID
+	workerID     string
+	// Bound only during one physical guard; the callback reuses that existing
+	// READ COMMITTED transaction after the independent action claim commits.
+	attemptOwnershipCheck func() error
 }
 
 type inboundContinuationPolicyStop struct {
@@ -148,13 +163,8 @@ func NewInboundContinuationProcessor(
 		},
 		stopCh: make(chan struct{}),
 	}
-	processor.process = func(
-		ctx context.Context,
-		scoped *App,
-		work *persistedIncomingMessage,
-	) error {
-		return scoped.continuePersistedIncomingMessage(ctx, work)
-	}
+	// A nil override selects the production phased processor. Tests that supply
+	// process retain the ordinary transactional callback boundary.
 	return processor
 }
 
@@ -209,6 +219,9 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
+	if err := p.app.checkInboundContinuationEntry(ctx); err != nil {
+		return err
+	}
 	p.runMu.Lock()
 	defer p.runMu.Unlock()
 
@@ -221,35 +234,71 @@ func (p *InboundContinuationProcessor) RunOnce(ctx context.Context) error {
 	if remaining <= 0 {
 		remaining = defaultInboundContinuationBatch
 	}
+	var running sync.WaitGroup
+	errorsCh := make(chan error, remaining+1)
 	var runErrors []error
-	for remaining > 0 {
+	// Admission precedes each claim. The dispatcher therefore never parks a
+	// claimed, unheartbeated batch behind a local queue. Each claimed invocation
+	// has a distinct owner, including retries overlapping a lost lease.
+	for remaining > 0 && ctx.Err() == nil {
 		madeProgress := false
 		for _, organizationID := range organizationIDs {
 			if remaining <= 0 || ctx.Err() != nil {
 				break
 			}
-			job, claimErr := p.claim(ctx, organizationID, nil)
+			mode := p.inboundRecoveryPreparationMode()
+			release, preparationMode, admitErr := p.acquirePreparationCapacity(ctx, organizationID, mode)
+			if admitErr != nil {
+				runErrors = append(runErrors, admitErr)
+				remaining = 0
+				break
+			}
+			worker := p.claimWorker()
+			job, claimErr := worker.claim(ctx, organizationID, nil)
 			if claimErr != nil {
+				release()
 				runErrors = append(runErrors, claimErr)
 				continue
 			}
 			if job == nil {
+				release()
 				continue
 			}
 			madeProgress = true
 			remaining--
-			if processErr := p.processClaimed(ctx, organizationID, job); processErr != nil {
-				runErrors = append(runErrors, processErr)
+			if p.process != nil || !p.app.rlsEnabled() {
+				if err := worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode); err != nil {
+					runErrors = append(runErrors, err)
+				}
+				continue
 			}
+			running.Add(1)
+			go func() {
+				defer running.Done()
+				if err := worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode); err != nil {
+					errorsCh <- err
+				}
+			}()
 		}
 		if !madeProgress {
 			break
 		}
 	}
+	running.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		runErrors = append(runErrors, err)
+	}
 	if ctx.Err() != nil {
 		runErrors = append(runErrors, ctx.Err())
 	}
 	return errors.Join(runErrors...)
+}
+
+func (p *InboundContinuationProcessor) claimWorker() *InboundContinuationProcessor {
+	return &InboundContinuationProcessor{app: p.app, interval: p.interval, lease: p.lease,
+		batchSize: p.batchSize, workerID: p.workerID + ":" + uuid.NewString(), now: p.now,
+		process: p.process, stopCh: p.stopCh}
 }
 
 // ProcessMessage provides the low-latency post-ACK path. The same durable
@@ -267,11 +316,45 @@ func (p *InboundContinuationProcessor) ProcessMessage(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	job, err := p.claim(ctx, organizationID, &messageID)
-	if err != nil || job == nil {
+	if err := p.app.checkInboundContinuationEntry(ctx); err != nil {
 		return err
 	}
-	return p.processClaimed(ctx, organizationID, job)
+	preparationMode, err := p.hintInboundContinuationPreparationMode(ctx, organizationID, messageID)
+	if err != nil {
+		return err
+	}
+	preparationCtx := ctx
+	if preparationMode == inboundContinuationWriter {
+		// A hinted writer retains the existing replacement-writer eligibility,
+		// including dynamic tiny-pool refusal, without marking the claim context.
+		preparationCtx = p.app.markInboundContinuationContext(ctx)
+	}
+	release, preparationMode, err := p.acquirePreparationCapacity(preparationCtx, organizationID, preparationMode)
+	if err != nil {
+		return err
+	}
+	worker := p.claimWorker()
+	job, err := worker.claim(ctx, organizationID, &messageID)
+	if err != nil || job == nil {
+		release()
+		return err
+	}
+	return worker.processClaimed(p.app.markInboundContinuationContext(ctx), organizationID, job, release, preparationMode)
+}
+
+// Ordinary recovery claims and validates under Reader1 when the pool supports
+// Perform; tiny pools retain Fresh Writer1. Actual existing-session/media mutation
+// still acquires Writer1. The fast path keeps its separate advisory mode choice.
+// Both release preparation before ordinary model admission unless the actual
+// reader can safely be retained. Custom callbacks retain generic admission.
+// RunOnce still enqueues tenants serially and claims at most one bounded batch.
+func (p *InboundContinuationProcessor) acquirePreparationCapacity(ctx context.Context, organizationID uuid.UUID, mode int) (func(), int, error) {
+	if p.process != nil || !p.app.rlsEnabled() {
+		release, err := p.app.acquireInboundContinuationCapacity(ctx, p.stopCh, 1)
+		return release, inboundContinuationUnscoped, err
+	}
+	release, err := p.app.acquireInboundContinuationPhase(ctx, p.stopCh, 1, organizationID.String(), mode)
+	return release, mode, err
 }
 
 func (p *InboundContinuationProcessor) listOrganizations(
@@ -407,7 +490,10 @@ func (p *InboundContinuationProcessor) processClaimed(
 	ctx context.Context,
 	organizationID uuid.UUID,
 	job *models.ScheduledJob,
+	releasePreparation func(),
+	preparationMode int,
 ) (resultErr error) {
+	defer releasePreparation()
 	if job == nil {
 		return nil
 	}
@@ -424,14 +510,20 @@ func (p *InboundContinuationProcessor) processClaimed(
 
 	processCtx, cancelProcess := context.WithCancel(ctx)
 	defer cancelProcess()
+	// An accepted result may need to finish applying after the initiating HTTP
+	// fast path expires. Its durable owner must keep renewing until that work is
+	// done; only an actual lease failure cancels this independent ownership scope.
+	ownershipCtx, cancelOwnership := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelOwnership()
 	heartbeatDone := make(chan error, 1)
 	go func() {
 		heartbeatErr := p.maintainLease(
-			processCtx,
+			ownershipCtx,
 			organizationID,
 			job.ID,
 		)
 		if heartbeatErr != nil {
+			cancelOwnership()
 			cancelProcess()
 		}
 		heartbeatDone <- heartbeatErr
@@ -444,59 +536,123 @@ func (p *InboundContinuationProcessor) processClaimed(
 	// Revalidate durable identity and repair the one proven display projection
 	// in a short committed phase. Authority/contact/message locks must be
 	// released before the provider scope and its independent action ledger.
-	scopeErr := p.app.WithCommittedTenantApp(organizationID, func(scoped *App) error {
-		if err := database.LockOrganizationPolicyScope(scoped.DB, organizationID); err != nil {
-			return err
+	phaseOneFenceExpired := false
+	scopeErr := func() error {
+		if p.process == nil && p.app.rlsEnabled() {
+			return p.app.withContinuationReaderApp(organizationID, func(scoped *App) error {
+				var err error
+				work, err = loadInboundContinuationWorkMode(scoped, organizationID, job, true)
+				return err
+			})
 		}
-		var loadErr error
-		work, loadErr = loadInboundContinuationWork(scoped, organizationID, job)
-		return loadErr
-	})
-	if scopeErr == nil {
-		scopeErr = p.app.WithTenantApp(organizationID, func(scoped *App) error {
-			if p.process == nil {
-				return errors.New("inbound continuation processor is not configured")
+		return p.app.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+			// H1: this phase holds a pooled connection while it waits for the organization
+			// fence. Every in-flight AI-attempt guard holds that fence's KEY SHARE, and a guard
+			// holder may itself be waiting for a pooled connection, so an unbounded wait here
+			// closes a pool+lock cycle. Nothing has been claimed yet: bound only the fence
+			// statements (the COMMIT keeps the transaction context) so this waiter yields
+			// (20s) before any post-claim wait inside the fence (45s) and retries cleanly.
+			fenceParent := scoped.DB.Statement.Context
+			if fenceParent == nil {
+				fenceParent = context.Background()
 			}
-			executionApp := scoped.scopedApp(scoped.DB, organizationID)
-			// executionApp carries per-job action state, but the surrounding scoped
-			// App owns the transaction commit. Move every deferred realtime callback
-			// to that owner on all exits; adoptAfterCommit drains the nested queue so
-			// it cannot be delivered twice.
-			defer scoped.adoptAfterCommit(executionApp)
-			executionApp.inboundContinuation = &inboundContinuationExecution{
-				OrganizationID: work.OrganizationID,
-				ContactID:      work.Contact.ID,
-				MessageID:      work.Persisted.ID,
-				WAMID:          work.Message.ID,
+			fenceCtx, cancelFence := context.WithTimeout(fenceParent, 20*time.Second)
+			fenceErr := database.LockOrganizationPolicyScope(scoped.DB.WithContext(fenceCtx), organizationID)
+			phaseOneFenceExpired = fenceErr != nil && errors.Is(fenceCtx.Err(), context.DeadlineExceeded)
+			cancelFence()
+			if fenceErr != nil {
+				return fenceErr
 			}
-			alreadyCompleted, checkpointErr := executionApp.
-				inboundContinuationAlreadyCompleted(work.Persisted.ID)
-			if checkpointErr != nil {
-				continuationErr = checkpointErr
-				return nil
-			}
-			if alreadyCompleted {
-				return nil
-			}
-			// Keep durable side-effect checkpoints even when processing reports a
-			// retryable error. Returning the error from this callback would roll
-			// back a successful provider send and its marker under RLS.
-			continuationErr = p.process(processCtx, executionApp, work)
-			if inboundContinuationStoppedByPolicy(continuationErr) {
-				// Policy stops are terminal successful consumption of this inbound
-				// job. Sticky suppression remains on the inbound Message and Resume
-				// never resurrects any cancelled or skipped provider action.
-				continuationErr = nil
-			}
-			if continuationErr == nil {
-				continuationErr = executionApp.markInboundContinuationCompleted(
-					work.Persisted.ID,
-				)
-			}
-			return nil
+			var loadErr error
+			work, loadErr = loadInboundContinuationWork(scoped, organizationID, job)
+			return loadErr
 		})
+	}()
+	if scopeErr != nil && phaseOneFenceExpired {
+		scopeErr = fmt.Errorf("wedge guard: organization policy fence not acquired within 20s before the continuation: %w: %w", context.DeadlineExceeded, scopeErr)
+	}
+	if scopeErr == nil && p.process == nil && p.app.rlsEnabled() {
+		executionApp := p.app.rootApp().scopedApp(p.app.rootApp().DB, organizationID)
+		// No transaction is owned by this App. Every preparation read explicitly
+		// enters tenant scope, and the remote phase uses its independent guard.
+		executionApp.tenantOrgID = uuid.Nil
+		executionApp.inboundContinuation = &inboundContinuationExecution{
+			OrganizationID: work.OrganizationID, ContactID: work.Contact.ID,
+			MessageID: work.Persisted.ID, WAMID: work.Message.ID,
+			ownershipCtx: ownershipCtx, jobID: job.ID, workerID: p.workerID,
+		}
+		alreadyCompleted := false
+		scopeErr = executionApp.WithTenantApp(organizationID, func(scoped *App) error {
+			var err error
+			alreadyCompleted, err = scoped.inboundContinuationAlreadyCompleted(work.Persisted.ID)
+			return err
+		})
+		if scopeErr == nil && !alreadyCompleted {
+			continuationErr = p.processPreparedIncoming(processCtx, ownershipCtx, executionApp, work, job, releasePreparation, preparationMode)
+			if inboundContinuationStoppedByPolicy(continuationErr) {
+				continuationErr = executionApp.WithTenantApp(organizationID, func(scoped *App) error {
+					return scoped.markInboundContinuationCompleted(work.Persisted.ID)
+				})
+			}
+		}
+	}
+	if scopeErr == nil && (p.process != nil || !p.app.rlsEnabled()) {
+		releasePreparation()
+		releaseApply, admissionErr := p.app.acquireInboundContinuationCapacity(processCtx, p.stopCh, 3)
+		if admissionErr != nil {
+			scopeErr = admissionErr
+		} else {
+			defer releaseApply()
+			scopeErr = p.app.WithTenantApp(organizationID, func(scoped *App) error {
+				executionApp := scoped.scopedApp(scoped.DB, organizationID)
+				// executionApp carries per-job action state, but the surrounding scoped
+				// App owns the transaction commit. Move every deferred realtime callback
+				// to that owner on all exits; adoptAfterCommit drains the nested queue so
+				// it cannot be delivered twice.
+				defer scoped.adoptAfterCommit(executionApp)
+				executionApp.inboundContinuation = &inboundContinuationExecution{
+					OrganizationID: work.OrganizationID,
+					ContactID:      work.Contact.ID,
+					MessageID:      work.Persisted.ID,
+					WAMID:          work.Message.ID,
+					ownershipCtx:   ownershipCtx,
+					jobID:          job.ID,
+					workerID:       p.workerID,
+				}
+				alreadyCompleted, checkpointErr := executionApp.
+					inboundContinuationAlreadyCompleted(work.Persisted.ID)
+				if checkpointErr != nil {
+					continuationErr = checkpointErr
+					return nil
+				}
+				if alreadyCompleted {
+					return nil
+				}
+				// Keep durable side-effect checkpoints even when processing reports a
+				// retryable error. Returning the error from this callback would roll
+				// back a successful provider send and its marker under RLS.
+				if p.process != nil {
+					continuationErr = p.process(processCtx, executionApp, work)
+				} else {
+					continuationErr = executionApp.continuePersistedIncomingMessage(processCtx, work)
+				}
+				if inboundContinuationStoppedByPolicy(continuationErr) {
+					// Policy stops are terminal successful consumption of this inbound
+					// job. Sticky suppression remains on the inbound Message and Resume
+					// never resurrects any cancelled or skipped provider action.
+					continuationErr = nil
+				}
+				if continuationErr == nil {
+					continuationErr = executionApp.markInboundContinuationCompleted(
+						work.Persisted.ID,
+					)
+				}
+				return nil
+			})
+		}
 	}
 	cancelProcess()
+	cancelOwnership()
 	heartbeatErr := <-heartbeatDone
 
 	processErr := scopeErr
@@ -506,10 +662,15 @@ func (p *InboundContinuationProcessor) processClaimed(
 	if processErr == nil {
 		processErr = heartbeatErr
 	}
+	// H1: the job's terminal bookkeeping must not inherit the run's deadline. The
+	// fast-path ctx (2 min) can expire during these writes' pool wait; the inner write
+	// then fails and the job stays 'processing' until its 5-minute lease goes stale.
+	// Both writes are lease-guarded (locked_by), so an uncancellable write is safe.
+	settleCtx := context.WithoutCancel(ctx)
 	if processErr != nil {
-		return p.fail(ctx, organizationID, job, processErr)
+		return p.fail(settleCtx, organizationID, job, processErr)
 	}
-	if err := p.complete(ctx, organizationID, job.ID); err != nil {
+	if err := p.complete(settleCtx, organizationID, job.ID); err != nil {
 		return fmt.Errorf("complete inbound continuation %s: %w", job.ID, err)
 	}
 	return nil
@@ -578,6 +739,10 @@ func loadInboundContinuationWork(
 	organizationID uuid.UUID,
 	job *models.ScheduledJob,
 ) (*persistedIncomingMessage, error) {
+	return loadInboundContinuationWorkMode(app, organizationID, job, false)
+}
+
+func loadInboundContinuationWorkMode(app *App, organizationID uuid.UUID, job *models.ScheduledJob, continuationValidation bool) (*persistedIncomingMessage, error) {
 	if app == nil || app.DB == nil || job == nil || job.AggregateID == nil {
 		return nil, errors.New("inbound continuation message reference is missing")
 	}
@@ -618,7 +783,7 @@ func loadInboundContinuationWork(
 		Identity: coexistenceContactIdentity{
 			Phone: inbound.From, UserID: inbound.FromUserID, ParentUserID: inbound.FromParentUserID,
 		},
-		Lock: true, RepairProjection: true,
+		Lock: true, RepairProjection: true, continuationValidation: continuationValidation,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve inbound continuation message: %w", err)
@@ -743,7 +908,15 @@ func (p *InboundContinuationProcessor) fail(
 			maxAttempts = defaultInboundContinuationMaxTry
 		}
 		manualReview := inboundContinuationRequiresManualReview(cause)
-		if manualReview || job.Attempts >= maxAttempts {
+		// H1: a "wedge guard" timeout is pool/lock congestion met while this job held
+		// its continuation transaction, not a fault of the job. Refund the attempt (at
+		// most 16 times per job) so a busy period cannot exhaust MaxAttempts; the
+		// backoff below still grows with the deferrals.
+		wedgeDeferrals, _ := inboundContinuationExactInteger(job.Payload["wedge_guard_deferrals"])
+		wedgeGuard := !manualReview && wedgeDeferrals < 16 &&
+			errors.Is(cause, context.DeadlineExceeded) &&
+			strings.Contains(cause.Error(), "wedge guard")
+		if manualReview || (job.Attempts >= maxAttempts && !wedgeGuard) {
 			status = models.ScheduledJobStatusFailed
 		}
 		updates := map[string]any{
@@ -761,9 +934,15 @@ func (p *InboundContinuationProcessor) fail(
 			)
 			updates["payload"] = payload
 		}
+		if wedgeGuard {
+			deferredPayload := cloneInboundContinuationJSONB(job.Payload)
+			deferredPayload["wedge_guard_deferrals"] = wedgeDeferrals + 1
+			updates["payload"] = deferredPayload
+			updates["attempts"] = gorm.Expr("GREATEST(attempts - 1, 0)")
+		}
 		if status == models.ScheduledJobStatusPending {
 			updates["run_at"] = p.now().UTC().Add(
-				inboundContinuationBackoff(job.Attempts),
+				inboundContinuationBackoff(job.Attempts + wedgeDeferrals),
 			)
 		}
 		result := tx.Model(&models.ScheduledJob{}).
@@ -809,11 +988,8 @@ func inboundContinuationError(err error) string {
 		return ""
 	}
 	const maxLength = 2000
-	value := err.Error()
-	if len(value) > maxLength {
-		return value[:maxLength]
-	}
-	return value
+	// Rune-safe so a stored error never contains a split multi-byte character.
+	return truncateString(err.Error(), maxLength)
 }
 
 func cloneInboundContinuationJSONB(source models.JSONB) models.JSONB {
@@ -856,6 +1032,10 @@ func (a *App) runInboundContinuationSendGuarded(
 	}
 	if claim != nil && !claim.Execute {
 		return a.recoverResolvedInboundContinuationSend(claim)
+	}
+	if err := a.requireInboundContinuationAttemptOwnership(); err != nil {
+		return errors.Join(err, a.resolveInboundContinuationAction(context.Background(), claim,
+			inboundActionStateFailedBeforeDispatch, nil))
 	}
 
 	message, err := send()
@@ -904,8 +1084,9 @@ func (a *App) runInboundContinuationSendGuarded(
 
 	if claim != nil && claim.Key != "" {
 		// The metadata marker is useful for operators, but the separately
-		// committed action ledger is the replay authority. Keep the marker in
-		// the current tenant transaction so it commits with the Message.
+		// committed action ledger is the replay authority. H1: the marker
+		// commits in its own short transaction, never on the continuation
+		// transaction (see markInboundContinuationAction).
 		if markerErr := a.markInboundContinuationAction(
 			message.ID,
 			claim.Key,
@@ -988,24 +1169,41 @@ func (a *App) withInboundContinuationPhysicalAIAttempt(
 	attemptCtx, cancel := context.WithTimeout(ctx, defaultInboundAIAttemptTimeout)
 	defer cancel()
 
-	return database.WithTenantReadCommitted(
-		root.DB.WithContext(attemptCtx),
-		execution.OrganizationID,
-		func(guardTx *gorm.DB) error {
-			if err := database.LockOrganizationAIAttemptScope(
-				guardTx,
-				execution.OrganizationID,
-			); err != nil {
-				return &inboundContinuationPolicyStop{Reason: err.Error()}
+	return a.withBoundedRootConnection(attemptCtx, 0, func(guardDB *gorm.DB) error {
+		return database.WithTenantReadCommitted(guardDB, execution.OrganizationID, func(guardTx *gorm.DB) error {
+			// H1: bound only the organization-lock wait. Expiry means a policy writer held
+			// the fence (possibly while waiting on this continuation's own transaction):
+			// retry, never a silent policy stop.
+			lockCtx, cancelLock := context.WithTimeout(attemptCtx, 30*time.Second)
+			lockErr := database.LockOrganizationAIAttemptScope(guardTx.WithContext(lockCtx), execution.OrganizationID)
+			lockExpired := lockCtx.Err() != nil
+			cancelLock()
+			if lockErr != nil {
+				if lockExpired {
+					return fmt.Errorf("wedge guard: organization AI attempt fence not acquired within 30s: %w: %w", context.DeadlineExceeded, lockErr)
+				}
+				return &inboundContinuationPolicyStop{Reason: lockErr.Error()}
 			}
 			if err := a.requireInboundContinuationPolicyTx(guardTx); err != nil {
 				return err
 			}
+			if err := a.requirePreparedContinuationSessionTx(guardTx, execution.preparedSession); err != nil {
+				return err
+			}
+			if err := a.requireInboundContinuationOwnershipTx(guardTx); err != nil {
+				return err
+			}
 			execution.attemptGuarded = true
-			defer func() { execution.attemptGuarded = false }()
+			execution.attemptOwnershipCheck = func() error {
+				return a.requireInboundContinuationOwnershipTx(guardTx)
+			}
+			defer func() {
+				execution.attemptGuarded = false
+				execution.attemptOwnershipCheck = nil
+			}()
 			return attempt()
-		},
-	)
+		})
+	})
 }
 
 // requireInboundContinuationPolicyTx shares the current-contact and sticky
@@ -1128,11 +1326,16 @@ func (a *App) claimInboundContinuationAction(
 	if !execution.attemptGuarded {
 		return nil, &inboundContinuationPolicyStop{Reason: "provider action has no organization attempt guard"}
 	}
+	// H1: a claim precedes every provider effect, so an expired wait here is a clean
+	// retry that frees this goroutine's continuation and guard connections. Give it
+	// the shortest budget so claim waiters yield before post-claim waiters.
+	claimCtx, cancelClaim := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelClaim()
 
 	now := time.Now().UTC()
 	var claimed *inboundContinuationActionClaim
 	err = a.withIndependentInboundContinuationAction(
-		ctx,
+		claimCtx,
 		organizationID,
 		func(tx *gorm.DB) error {
 			actionPayload := models.JSONB{
@@ -1279,10 +1482,90 @@ func (a *App) withIndependentInboundContinuationAction(
 	if a == nil || a.rootApp() == nil || fn == nil {
 		return errors.New("independent inbound action transaction is required")
 	}
-	root := a.rootApp()
-	return root.WithTenantApp(organizationID, func(scoped *App) error {
-		return scoped.DB.WithContext(ctx).Transaction(fn)
+	if organizationID == uuid.Nil {
+		return database.ErrMissingTenant
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// H1: enter through this nested App so the pool wait is bounded. A deadline on ctx is
+	// the explicit WAIT budget only; the ledger transaction itself runs without it, so its
+	// COMMIT can never be cancelled into an ambiguous outcome.
+	wait := time.Duration(0)
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		if wait = time.Until(deadline); wait <= 0 {
+			return fmt.Errorf("wedge guard: inbound action ledger wait budget already spent: %w", context.DeadlineExceeded)
+		}
+		ctx = context.WithoutCancel(ctx)
+	}
+	return a.withBoundedRootConnection(ctx, wait, func(db *gorm.DB) error {
+		if !a.rlsEnabled() {
+			if err := requireOrdinaryTenantOrganization(db, organizationID); err != nil {
+				return err
+			}
+			return db.Transaction(fn)
+		}
+		return database.WithTenant(db, organizationID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+				return err
+			}
+			return tx.Transaction(fn) // savepoint, as today
+		})
 	})
+}
+
+// withBoundedRootConnection runs run on its own root-pool connection (H1 pool-wedge
+// guard). A goroutine that may already own a pooled connection (its App's DB is a
+// transaction, or it carries an inbound continuation) must never wait forever for
+// another. Only the WAIT is bounded; the transaction run begins uses ctx (or the root
+// context) exactly as before. wait > 0 is an explicit budget; wait == 0 derives it:
+// 15s nested, 45s inside the AI-attempt fence, unbounded for a root receiver.
+// run must finish every transaction it begins before returning; callers run
+// after-commit callbacks only after this returns (connection already released).
+func (a *App) withBoundedRootConnection(ctx context.Context, wait time.Duration, run func(db *gorm.DB) error) error {
+	root := a.rootApp()
+	if root == nil || root.DB == nil || root.DB.Statement == nil || run == nil {
+		return errors.New("database connection is required")
+	}
+	txDB := root.DB
+	if ctx != nil {
+		txDB = root.DB.WithContext(ctx)
+	}
+	if _, rootIsTx := root.DB.Statement.ConnPool.(gorm.TxCommitter); rootIsTx {
+		return run(txDB) // transaction-rooted test App: savepoints, no pool wait
+	}
+	if wait <= 0 {
+		execution := a.inboundContinuation
+		nested := execution != nil
+		if a.DB != nil && a.DB.Statement != nil {
+			if _, ownsTx := a.DB.Statement.ConnPool.(gorm.TxCommitter); ownsTx {
+				nested = true
+			}
+		}
+		if !nested {
+			return run(txDB) // root receiver holds nothing: unchanged, unbounded
+		}
+		wait = 15 * time.Second
+		if execution != nil && execution.attemptGuarded {
+			wait = 45 * time.Second // post-claim waits here end in manual review
+		}
+	}
+	txCtx := txDB.Statement.Context
+	if txCtx == nil {
+		txCtx = context.Background()
+	}
+	waitCtx, cancelWait := context.WithTimeout(txCtx, wait)
+	defer cancelWait()
+	acquired := false
+	err := txDB.WithContext(waitCtx).Connection(func(pinned *gorm.DB) error {
+		acquired = true
+		cancelWait() // *sql.Conn keeps no reference to waitCtx
+		return run(pinned.WithContext(txCtx))
+	})
+	if err != nil && !acquired && errors.Is(err, context.DeadlineExceeded) && (ctx == nil || ctx.Err() == nil) {
+		return fmt.Errorf("wedge guard: no pooled database connection within %s while this goroutine may hold another: %w", wait, err)
+	}
+	return err
 }
 
 func validateInboundContinuationActionProof(
@@ -1497,6 +1780,10 @@ func (a *App) runInboundContinuationCapturedActionGuarded(
 	if !claim.Execute {
 		return claim.Result, nil
 	}
+	if err := a.requireInboundContinuationAttemptOwnership(); err != nil {
+		return nil, errors.Join(err, a.resolveInboundContinuationAction(context.Background(), claim,
+			inboundActionStateFailedBeforeDispatch, nil))
+	}
 
 	result := action()
 	if result == nil {
@@ -1519,6 +1806,35 @@ func (a *App) runInboundContinuationCapturedActionGuarded(
 	return result, nil
 }
 
+// withInboundContinuationDetachedApplyRead is limited to send verification,
+// resolved-send lookup and realtime payload reads. Close this short read scope
+// before recovery opens its independent SLA restoration transaction. Ordinary
+// callers retain their existing transaction and snapshot.
+func (a *App) withInboundContinuationDetachedApplyRead(read func(*gorm.DB) error) error {
+	if a == nil || a.DB == nil || read == nil {
+		return errors.New("inbound send verification requires an app database and callback")
+	}
+	execution := a.inboundContinuation
+	if execution == nil || !execution.detachedGeneratedApply {
+		return read(a.DB)
+	}
+	root := a.rootApp()
+	if !execution.attemptGuarded || execution.OrganizationID == uuid.Nil ||
+		a.tenantOrgID != uuid.Nil || root == nil || root.DB == nil ||
+		a.DB.Statement == nil || root.DB.Statement == nil ||
+		a.DB.Statement.ConnPool != root.DB.Statement.ConnPool {
+		return errors.New("detached generated send verification requires its guarded root pool")
+	}
+	if err := a.requireInboundContinuationPoolEntry(); err != nil {
+		return err
+	}
+	// Keep the root's uncancelled context, independently of the physical
+	// guard deadline, just as the former outer verification transaction did.
+	return a.WithTenantApp(execution.OrganizationID, func(scoped *App) error {
+		return read(scoped.DB)
+	})
+}
+
 func (a *App) recoverResolvedInboundContinuationSend(
 	claim *inboundContinuationActionClaim,
 ) error {
@@ -1535,15 +1851,17 @@ func (a *App) recoverResolvedInboundContinuationSend(
 	}
 
 	var message models.Message
-	err = a.DB.Unscoped().
-		Select("id", "organization_id", "contact_id", "created_at", "status", "error_message", "metadata").
-		Where(
-			"id = ? AND organization_id = ? AND direction = ?",
-			messageID,
-			a.inboundContinuationOrganizationID(),
-			models.DirectionOutgoing,
-		).
-		First(&message).Error
+	err = a.withInboundContinuationDetachedApplyRead(func(db *gorm.DB) error {
+		return db.Unscoped().
+			Select("id", "organization_id", "contact_id", "created_at", "status", "error_message", "metadata").
+			Where(
+				"id = ? AND organization_id = ? AND direction = ?",
+				messageID,
+				a.inboundContinuationOrganizationID(),
+				models.DirectionOutgoing,
+			).
+			First(&message).Error
+	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return &inboundContinuationManualReviewError{
 			ActionKey: claim.Key,
@@ -1577,7 +1895,7 @@ func (a *App) recoverResolvedInboundContinuationSend(
 		}
 
 		organizationID := a.inboundContinuationOrganizationID()
-		restoreErr := a.rootApp().WithCommittedTenantApp(
+		restoreErr := a.WithCommittedTenantApp(
 			organizationID,
 			func(scoped *App) error {
 				var contact models.Contact
@@ -1653,7 +1971,7 @@ func (a *App) markInboundContinuationAction(
 		return nil
 	}
 	organizationID := a.inboundContinuationOrganizationID()
-	return a.DB.Transaction(func(tx *gorm.DB) error {
+	mark := func(tx *gorm.DB) error {
 		var message models.Message
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where(
@@ -1678,14 +1996,43 @@ func (a *App) markInboundContinuationAction(
 		return tx.Model(&models.Message{}).
 			Where("id = ? AND organization_id = ?", messageID, organizationID).
 			Update("metadata", metadata).Error
+	}
+	// H1: commit this operator marker in its own short transaction, never on the
+	// continuation transaction. A FOR UPDATE lock on the independently committed
+	// response, held until the continuation commits, inverts the global
+	// contact-then-message order: a status receipt for this response locks the contact
+	// and waits for the row, and a later handover or send of this same continuation then
+	// waits for that contact while the continuation waits for it in Go (a cycle
+	// PostgreSQL cannot see). The marker is best effort (its caller only logs) and the
+	// action ledger stays the replay authority, so inside the AI-attempt fence it waits
+	// at most 2s for a connection, like the other best-effort writes there.
+	markWait := time.Duration(0) // derived: 15s nested
+	if execution.attemptGuarded {
+		markWait = 2 * time.Second
+	}
+	// The root pool's own context, as in WithTenantApp (never a nil Context).
+	rootCtx := context.Background()
+	if root := a.rootApp(); root != nil && root.DB != nil && root.DB.Statement != nil && root.DB.Statement.Context != nil {
+		rootCtx = root.DB.Statement.Context
+	}
+	return a.withBoundedRootConnection(rootCtx, markWait, func(db *gorm.DB) error {
+		if organizationID == uuid.Nil {
+			return database.ErrMissingTenant
+		}
+		if a.rlsEnabled() {
+			return database.WithTenant(db, organizationID, mark)
+		}
+		return db.Transaction(mark)
 	})
 }
 
 func (a *App) verifySynchronousChatbotSend(messageID uuid.UUID) error {
 	var message models.Message
-	if err := a.DB.Select("id", "status", "error_message").
-		Where("id = ?", messageID).
-		First(&message).Error; err != nil {
+	if err := a.withInboundContinuationDetachedApplyRead(func(db *gorm.DB) error {
+		return db.Select("id", "status", "error_message").
+			Where("id = ?", messageID).
+			First(&message).Error
+	}); err != nil {
 		return fmt.Errorf("verify synchronous chatbot send: %w", err)
 	}
 	switch message.Status {

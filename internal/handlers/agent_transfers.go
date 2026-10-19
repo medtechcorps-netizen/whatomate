@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -597,7 +598,7 @@ func (a *App) CreateAgentTransfer(r *fastglue.Request) error {
 		OrganizationID: orgID,
 		Name:           req.WhatsAppAccount,
 	}
-	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true); err != nil {
+	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true, nil); err != nil {
 		if errors.Is(err, errActiveAgentTransferExists) {
 			return r.SendErrorEnvelope(fasthttp.StatusConflict, "Contact already has an active transfer", nil, "")
 		}
@@ -1328,7 +1329,20 @@ func (a *App) broadcastTransferAssigned(transfer *models.AgentTransfer) {
 
 // saveAndFinalizeTransfer handles the common post-creation steps for agent transfers:
 // sets SLA deadlines, saves to DB, updates contact assignment, optionally ends chatbot sessions, and broadcasts.
-func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *models.WhatsAppAccount, contact *models.Contact, settings *models.ChatbotSettings, endChatbotSession bool) error {
+//
+// completeOwnedSession is for graph handovers only (nil elsewhere). It runs on the
+// canonical write's own transaction after the handover row is created, or an
+// already-active transfer is proven under the same organization/contact locks, and
+// BEFORE contacthandoff.CutoffTx, so the handover and the graph's terminal
+// checkpoint commit or roll back together. It is invoked once per canonical-write
+// attempt and must rebuild its state each time. It must not acquire another
+// connection, perform provider I/O, or queue after-commit or realtime work: a
+// scoped App it builds is never drained. Its ownership compare-and-set (CAS) relies
+// on READ COMMITTED, the production default of WithCommittedTenantApp's WithTenant.
+// With a callback, an already-active transfer only completes the session; nothing
+// is created, cut off, reassigned, re-SLA'd or announced, and
+// errActiveAgentTransferExists is returned AFTER that commit.
+func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *models.WhatsAppAccount, contact *models.Contact, settings *models.ChatbotSettings, endChatbotSession bool, completeOwnedSession func(*gorm.DB) error) error {
 	// Set SLA deadlines
 	if settings != nil {
 		a.SetSLADeadlines(transfer, settings)
@@ -1343,13 +1357,65 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	baseTransfer := *transfer
 	var savedTransfer models.AgentTransfer
 	var canonicalContact models.Contact
+	existingProven := false
+	// H1, nested handover only: one wall-clock budget for the organization fence, shared
+	// by every canonical-write attempt; it starts once the handover's own connection is held.
+	var fenceDeadline time.Time
 
 	write := func(tx *gorm.DB) error {
-		if lockErr := database.LockOrganizationPolicyScope(
-			tx,
-			baseTransfer.OrganizationID,
-		); lockErr != nil {
+		existingProven = false
+		nested := a.inboundContinuation != nil
+		if nested {
+			// Bound each fence statement as well as their combined wall-clock time.
+			// PostgreSQL restarts statement_timeout for the advisory and row queries;
+			// the child context below keeps both inside the same 40s deadline across
+			// canonical-write retries. It never owns this transaction or its COMMIT.
+			budget := time.Until(fenceDeadline)
+			if budget < time.Millisecond {
+				budget = time.Millisecond
+			}
+			if err := tx.Exec(
+				"SELECT pg_catalog.set_config('statement_timeout', ?, true)",
+				strconv.FormatInt(budget.Milliseconds(), 10),
+			).Error; err != nil {
+				return err
+			}
+		}
+		fenceDB := tx
+		cancelFence := func() {}
+		if nested {
+			parent := tx.Statement.Context
+			if parent == nil {
+				parent = context.Background()
+			}
+			fenceCtx, cancel := context.WithDeadline(parent, fenceDeadline)
+			fenceDB, cancelFence = tx.WithContext(fenceCtx), cancel
+		}
+		lockErr := database.LockOrganizationPolicyScope(fenceDB, baseTransfer.OrganizationID)
+		fenceExpired := nested && errors.Is(fenceDB.Statement.Context.Err(), context.DeadlineExceeded)
+		cancelFence()
+		if lockErr != nil {
+			if nested && (fenceExpired || postgresErrorCode(lockErr) == "57014") {
+				// Classify only cancellation at this bounded fence. Keep the original
+				// SQL cause when supplied; a client deadline can have no SQLSTATE.
+				return errors.Join(errors.New("wedge guard: nested handover organization fence exceeded its 40s budget"), context.DeadlineExceeded, lockErr)
+			}
 			return lockErr
+		}
+		if nested {
+			// H1 defence in depth, after the fence is held: a holder of a contact/transfer/
+			// session row lock this attempt needs that waits (directly or through another
+			// session) on this continuation closes a cycle PostgreSQL cannot detect. Bound
+			// each post-fence lock wait at 3s; canonicalContactWriteTransaction retries
+			// 55P03 (six attempts, re-entering the fence on the shared budget), and the
+			// caller turns a final 55P03 into a refunded wedge-guard deferral. The fence's
+			// statement_timeout must not outlive the fence (the COMMIT included).
+			if err := tx.Exec("SET LOCAL statement_timeout TO DEFAULT").Error; err != nil {
+				return err
+			}
+			if err := tx.Exec("SET LOCAL lock_timeout = '3s'").Error; err != nil {
+				return err
+			}
 		}
 		canonical, err := contactutil.ResolveCanonicalContactForUpdate(
 			tx,
@@ -1364,7 +1430,24 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		candidate.ContactID = canonical.ID
 		candidate.PhoneNumber = canonical.PhoneNumber
 		if err := createActiveAgentTransferTx(tx, &candidate); err != nil {
-			return err
+			if completeOwnedSession == nil || !errors.Is(err, errActiveAgentTransferExists) {
+				return err
+			}
+			// H1: an active handover already exists, proven under these same organization/
+			// contact locks: complete only the graph's owned session; never create, cut off,
+			// reassign, re-SLA or re-announce the transfer.
+			if err := completeOwnedSession(tx); err != nil {
+				return err
+			}
+			existingProven = true
+			return nil
+		}
+		if completeOwnedSession != nil {
+			// H1: complete the exact owned session BEFORE CutoffTx cancels every active
+			// session of the contact, so handover and terminal checkpoint commit together.
+			if err := completeOwnedSession(tx); err != nil {
+				return err
+			}
 		}
 		// Manual Pause and AI handoff share one durable epoch. Resume must not
 		// revive an old offer or a pre-cutoff inbound admitted after this write.
@@ -1422,9 +1505,10 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		// completion callback under the independent organization AI fence. Commit
 		// the transfer policy first so that callback cannot wait on an UPDATE lock
 		// held by its own outer transaction.
-		err = a.rootApp().WithCommittedTenantApp(
+		err = a.WithCommittedTenantApp(
 			baseTransfer.OrganizationID,
 			func(scoped *App) error {
+				fenceDeadline = time.Now().Add(40 * time.Second)
 				return canonicalContactWriteTransaction(scoped.DB, write)
 			},
 		)
@@ -1433,6 +1517,9 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	}
 	if err != nil {
 		return err
+	}
+	if existingProven {
+		return errActiveAgentTransferExists // committed; nothing new to publish
 	}
 
 	*transfer = savedTransfer
@@ -1469,11 +1556,30 @@ func suppressUnfinishedInboundForTransfer(tx *gorm.DB, organizationID, contactID
 		Update("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(metadata))).Error
 }
 
-// createTransferToQueue creates an unassigned agent transfer that goes to the queue
-func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *models.Contact, source models.TransferSource) {
-	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-		a.Log.Debug("Contact already has active transfer, skipping", "contact_id", contact.ID, "source", source)
-		return
+// createTransferToQueue creates an unassigned agent transfer that goes to the queue.
+//
+// The bool reports whether an active handover exists for the contact, created now
+// or already active. false with a nil error is only the intentional business-hours
+// decline, and its reply, if configured, succeeded. Every other failure is returned
+// with nothing committed. completeOwnedSession is the graph's owned-session
+// completion (see saveAndFinalizeTransfer); nil for every other caller.
+func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *models.Contact, source models.TransferSource, completeOwnedSession func(*gorm.DB) error) (bool, error) {
+	existing := false
+	if completeOwnedSession == nil {
+		if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
+			a.Log.Debug("Contact already has active transfer, skipping", "contact_id", contact.ID, "source", source)
+			return true, nil
+		}
+	} else {
+		// H1: advisory only for a graph handover: an existing transfer is proven and the
+		// owned session completed under the canonical locks below. Query errors stay errors.
+		var active int64
+		if err := a.DB.Model(&models.AgentTransfer{}).
+			Where("organization_id = ? AND contact_id = ? AND status = ?", account.OrganizationID, contact.ID, models.TransferStatusActive).
+			Count(&active).Error; err != nil {
+			return false, err
+		}
+		existing = active > 0
 	}
 
 	settings, _ := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
@@ -1481,13 +1587,15 @@ func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *mo
 	// Suppress transfers outside business hours — flow steps and the
 	// chatbot-disabled fallback would otherwise hand off to a human at
 	// 11pm. createTransferFromKeyword already does this; mirror it here.
-	if settings != nil && settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
+	if !existing && settings != nil && settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
 		if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
 			a.Log.Info("Outside business hours, sending out-of-hours message instead of queue transfer", "contact_id", contact.ID, "source", source)
 			if settings.BusinessHours.OutOfHoursMessage != "" {
-				_ = a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage)
+				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
+					return false, err // H1: retried by the caller; the action ledger never resends an accepted reply
+				}
 			}
-			return
+			return false, nil
 		}
 	}
 
@@ -1502,35 +1610,54 @@ func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *mo
 		TransferredAt:   time.Now(),
 	}
 
-	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, false); err != nil {
+	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, false, completeOwnedSession); err != nil {
 		if errors.Is(err, errActiveAgentTransferExists) {
 			a.Log.Debug("Concurrent active transfer already exists, skipping queue transfer", "contact_id", contact.ID, "source", source)
-			return
+			return true, nil
+		}
+		if inboundContinuationStoppedByPolicy(err) {
+			a.Log.Info("Queue transfer stopped by chatbot session ownership", "error", err, "contact_id", contact.ID, "source", string(source))
+			return false, err
 		}
 		a.Log.Error("Failed to create transfer to queue", "error", err, "contact_id", contact.ID, "source", string(source))
-		return
+		return false, err
 	}
 
 	a.Log.Info("Transfer created to agent queue", "transfer_id", transfer.ID, "contact_id", contact.ID, "source", source)
+	return true, nil
 }
 
-// createTransferFromKeyword creates an agent transfer triggered by a keyword rule
-func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact *models.Contact) {
-	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
+// createTransferFromKeyword creates an agent transfer triggered by a keyword rule.
+// As for createTransferToQueue, true means a handover exists; false with a nil
+// error is an intentional business-hours decline whose configured reply succeeded.
+// Preserve actual errors so only genuine bounded waits qualify for a refund.
+func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact *models.Contact) (bool, error) {
+	var active int64
+	if err := a.DB.Model(&models.AgentTransfer{}).
+		Where("organization_id = ? AND contact_id = ? AND status = ?", account.OrganizationID, contact.ID, models.TransferStatusActive).
+		Count(&active).Error; err != nil {
+		return false, err
+	}
+	if active > 0 {
 		a.Log.Info("Contact already has active transfer, skipping keyword transfer", "contact_id", contact.ID)
-		return
+		return true, nil
 	}
 
-	settings, _ := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	settings, err := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
+	if err != nil {
+		return false, err
+	}
 
 	// Check business hours - if outside hours, send out of hours message instead of transfer
 	if settings != nil && settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
 		if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
 			a.Log.Info("Outside business hours, sending out of hours message instead of transfer", "contact_id", contact.ID)
 			if settings.BusinessHours.OutOfHoursMessage != "" {
-				_ = a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage)
+				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
+					return false, err
+				}
 			}
-			return
+			return false, nil
 		}
 	}
 
@@ -1555,13 +1682,13 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 		TransferredAt:   time.Now(),
 	}
 
-	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true); err != nil {
+	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true, nil); err != nil {
 		if errors.Is(err, errActiveAgentTransferExists) {
 			a.Log.Debug("Concurrent active transfer already exists, skipping keyword transfer", "contact_id", contact.ID)
-			return
+			return true, nil
 		}
 		a.Log.Error("Failed to create keyword-triggered transfer", "error", err, "contact_id", contact.ID)
-		return
+		return false, keywordTransferHandoverError(err, a.inboundContinuation != nil)
 	}
 
 	var agentIDStr string
@@ -1573,32 +1700,86 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 		"contact_id", contact.ID,
 		"agent_id", agentIDStr,
 	)
+	return true, nil
 }
 
-// createTransferToTeam creates an agent transfer to a specific team with appropriate assignment
-func (a *App) createTransferToTeam(account *models.WhatsAppAccount, contact *models.Contact, teamID uuid.UUID, notes string, source models.TransferSource) {
-	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
-		a.Log.Debug("Contact already has active transfer, skipping team transfer", "contact_id", contact.ID, "team_id", teamID)
-		return
+// createTransferToTeam creates an agent transfer to a specific team with appropriate assignment.
+//
+// Outcome and completeOwnedSession as for createTransferToQueue.
+func (a *App) createTransferToTeam(account *models.WhatsAppAccount, contact *models.Contact, teamID uuid.UUID, notes string, source models.TransferSource, completeOwnedSession func(*gorm.DB) error) (bool, error) {
+	existing := false
+	if completeOwnedSession == nil {
+		if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
+			a.Log.Debug("Contact already has active transfer, skipping team transfer", "contact_id", contact.ID, "team_id", teamID)
+			return true, nil
+		}
+	} else {
+		// H1: advisory only for a graph handover (see createTransferToQueue).
+		var active int64
+		if err := a.DB.Model(&models.AgentTransfer{}).
+			Where("organization_id = ? AND contact_id = ? AND status = ?", account.OrganizationID, contact.ID, models.TransferStatusActive).
+			Count(&active).Error; err != nil {
+			return false, err
+		}
+		existing = active > 0
 	}
 
 	settings, _ := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
 
 	// Suppress transfers outside business hours (same reason as
 	// createTransferToQueue / createTransferFromKeyword).
-	if settings != nil && settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
+	if !existing && settings != nil && settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
 		if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
 			a.Log.Info("Outside business hours, sending out-of-hours message instead of team transfer", "contact_id", contact.ID, "team_id", teamID, "source", source)
 			if settings.BusinessHours.OutOfHoursMessage != "" {
-				_ = a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage)
+				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
+					return false, err // H1: retried by the caller; the action ledger never resends an accepted reply
+				}
 			}
-			return
+			return false, nil
 		}
 	}
 
 	var agentID *uuid.UUID
-	if a.Assigner != nil {
-		agentID = a.Assigner.AssignToTeam(teamID, account.OrganizationID, nil, assignment.ChatLoadCounter)
+	if !existing && a.Assigner != nil {
+		if a.inboundContinuation == nil {
+			agentID = a.Assigner.AssignToTeam(teamID, account.OrganizationID, nil, assignment.ChatLoadCounter)
+		} else {
+			// H1: never select on the continuation transaction. Round-robin UPDATEs the
+			// chosen team_members row; on that transaction the row lock would be held across
+			// the handover's own (bounded) connection wait below, and concurrent same-team
+			// handovers, each pinning its own continuation connection, would pick the same
+			// member and queue behind it in PostgreSQL: a pool+lock convoy. Select in a short
+			// transaction of its own that commits at once (as on the continuation transaction,
+			// the round-robin timestamp stays committed even if the handover then fails).
+			organizationID := account.OrganizationID
+			root := a.rootApp()
+			if root == nil || root.DB == nil || root.DB.Statement == nil {
+				return false, errors.New("team transfer agent selection requires the root database")
+			}
+			// The root pool's own context, as in WithTenantApp.
+			assignErr := a.withBoundedRootConnection(root.DB.Statement.Context, 0, func(db *gorm.DB) error {
+				assign := func(tx *gorm.DB) error {
+					if err := tx.Exec("SET LOCAL lock_timeout = '3s'").Error; err != nil {
+						return err
+					}
+					var selectionErr error
+					agentID, selectionErr = a.Assigner.WithDB(tx).AssignChatToTeamChecked(teamID, organizationID, nil)
+					return selectionErr
+				}
+				if a.rlsEnabled() {
+					return database.WithTenant(db, organizationID, assign)
+				}
+				return db.Transaction(assign)
+			})
+			if assignErr != nil {
+				// Every failed selection, including a round-robin timestamp write,
+				// retries with its real cause. An aborted transaction is not proof
+				// of congestion or of a valid selected agent.
+				a.Log.Error("Failed to select a team agent for the transfer", "error", assignErr, "contact_id", contact.ID, "team_id", teamID)
+				return false, assignErr
+			}
+		}
 	}
 
 	transfer := models.AgentTransfer{
@@ -1615,13 +1796,17 @@ func (a *App) createTransferToTeam(account *models.WhatsAppAccount, contact *mod
 		TransferredAt:   time.Now(),
 	}
 
-	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true); err != nil {
+	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true, completeOwnedSession); err != nil {
 		if errors.Is(err, errActiveAgentTransferExists) {
 			a.Log.Debug("Concurrent active transfer already exists, skipping team transfer", "contact_id", contact.ID, "team_id", teamID)
-			return
+			return true, nil
+		}
+		if inboundContinuationStoppedByPolicy(err) {
+			a.Log.Info("Team transfer stopped by chatbot session ownership", "error", err, "contact_id", contact.ID, "team_id", teamID)
+			return false, err
 		}
 		a.Log.Error("Failed to create team transfer", "error", err, "contact_id", contact.ID, "team_id", teamID)
-		return
+		return false, err
 	}
 
 	var agentIDStrLog string
@@ -1635,6 +1820,7 @@ func (a *App) createTransferToTeam(account *models.WhatsAppAccount, contact *mod
 		"agent_id", agentIDStrLog,
 		"source", source,
 	)
+	return true, nil
 }
 
 // ReturnAgentTransfersToQueue returns all active transfers assigned to an agent back to their team queues
