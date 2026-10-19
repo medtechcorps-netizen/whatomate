@@ -3,7 +3,12 @@ import { ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
-import { sessionsSupported, SESSION_BUSY_CODE, SESSION_UNSUPPORTED_CODE } from '@/services/api'
+import {
+  sentBeforeSessionChange,
+  sessionsSupported,
+  SESSION_BUSY_CODE,
+  SESSION_UNSUPPORTED_CODE,
+} from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -64,6 +69,14 @@ const handleRegister = async () => {
     toast.success(t('auth.registrationSuccess'))
     router.push('/')
   } catch (error: any) {
+    if (sentBeforeSessionChange(error)) {
+      // The server got the registration (the invitation is used, the account
+      // exists), but a session change in another tab undid what it issued
+      // here: sign in with the new account instead.
+      toast.info(t('auth.accountMayExist'))
+      router.push({ path: '/login', query: { email: email.value } })
+      return
+    }
     let message: string
     if (error?.code === SESSION_UNSUPPORTED_CODE) {
       message = t('errors.unsupportedBrowser')

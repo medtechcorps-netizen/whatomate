@@ -1397,6 +1397,40 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(document.cookie).toContain('whm_csrf=csrf-of-b')
   })
 
+  it('the lock is let go even when undoing an unanswered sign-in throws', async () => {
+    vi.useFakeTimers()
+    const cookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie')!
+    const signIn = await loadTab(async (config) => {
+      // The jar cannot be read any more by the time the request fails (a
+      // revoked storage backend, say): the undo throws.
+      Object.defineProperty(document, 'cookie', {
+        configurable: true,
+        get() {
+          throw new DOMException('Access denied', 'SecurityError')
+        },
+        set(value: string) {
+          cookie.set!.call(document, value)
+        },
+      })
+      throw new AxiosError('timeout of 15000ms exceeded', AxiosError.ECONNABORTED, config)
+    })
+    const other = await loadTab(async (config) => {
+      throw httpError(401, config)
+    })
+    const order: string[] = []
+    recordPosts(order, (label) => (label === 'refresh' ? refreshOk() : undefined))
+
+    const login = signIn.api.post('/auth/login', { email: 'a@example.com', password: 'x' }).catch(() => undefined)
+    await vi.advanceTimersByTimeAsync(10)
+    await login
+    delete (document as unknown as { cookie?: string }).cookie
+    void other.api.get('/contacts').catch(() => undefined)
+    await vi.advanceTimersByTimeAsync(100)
+
+    // Not held until the 60 s backstop.
+    expect(order).toEqual(['refresh'])
+  })
+
   it('a no-answer sign-in is undone before the lock is let go', async () => {
     installWebLocks()
     const order: string[] = []
@@ -2008,6 +2042,65 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order).toEqual(['refresh'])
     expect(sessionsSupported()).toBe(false)
     expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+  })
+
+  it('a registration answered after the session changed elsewhere reports that it was sent; a refused switch does not', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    let answer!: () => void
+    const gate = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    const { api, sentBeforeSessionChange } = await loadTab(async (config) => {
+      if (config.url === '/auth/register') {
+        await gate
+        return ok(config, { data: { expires_in: 900, user: {} } })
+      }
+      return ok(config)
+    })
+    recordPosts([])
+
+    const registration = api.post('/auth/register', { email: 'b@example.com' }).catch((e) => e)
+    await tick()
+    // An unrelated stored session ends in another tab meanwhile.
+    localStorage.setItem('whm_session_id', 'ended:session-a')
+    answer()
+    const error = await registration
+
+    expect(sentBeforeSessionChange(error)).toBe(true)
+    // Refused before it was sent: nothing reached the server.
+    const switched = await api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e)
+    expect(sentBeforeSessionChange(switched)).toBe(false)
+    expect(sentBeforeSessionChange(new Error('other'))).toBe(false)
+  })
+
+  for (const probe of ['rejects', 'throws'] as const) {
+    it(`a lock manager whose query ${probe} counts as none from load, before any sign-in`, async () => {
+      Object.defineProperty(navigator, 'locks', {
+        configurable: true,
+        value: {
+          request: vi.fn(),
+          query: vi.fn(() => {
+            if (probe === 'throws') throw new DOMException('Lock manager unavailable', 'SecurityError')
+            return Promise.reject(new DOMException('Lock manager unavailable', 'SecurityError'))
+          }),
+        },
+      })
+      const { sessionsSupported } = await loadTab(async (config) => ok(config))
+      await tick()
+
+      expect(sessionsSupported()).toBe(false)
+    })
+  }
+
+  it('a working lock manager passes the load probe', async () => {
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: { request: vi.fn(), query: vi.fn(async () => ({ held: [], pending: [] })) },
+    })
+    const { sessionsSupported } = await loadTab(async (config) => ok(config))
+    await tick()
+
+    expect(sessionsSupported()).toBe(true)
   })
 
   it('without Web Locks no sign-in, registration, org switch or SSO start is sent', async () => {

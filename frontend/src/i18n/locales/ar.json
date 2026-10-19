@@ -167,7 +167,8 @@
     "ssoMissingTokens": "استجابة غير صالحة. الرموز مفقودة.",
     "ssoLoginSuccess": "تم تسجيل الدخول بنجاح",
     "ssoLoginFailed": "فشل إكمال تسجيل الدخول الموحد",
-    "returnToLogin": "العودة إلى تسجيل الدخول"
+    "returnToLogin": "العودة إلى تسجيل الدخول",
+    "accountMayExist": "ربما تم إنشاء حسابك. يرجى تسجيل الدخول."
   },
   "resources": {
     "account": "حساب",

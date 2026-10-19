@@ -136,7 +136,8 @@
     "ssoMissingTokens": "अमान्य SSO कॉलबैक। टोकन गायब हैं।",
     "ssoLoginSuccess": "SSO लॉगिन सफल",
     "ssoLoginFailed": "SSO लॉगिन पूरा करने में विफल",
-    "returnToLogin": "लॉगिन पर वापस लौटें"
+    "returnToLogin": "लॉगिन पर वापस लौटें",
+    "accountMayExist": "आपका खाता शायद बन चुका है। कृपया साइन इन करें।"
   },
   "resources": {
     "account": "खाता",

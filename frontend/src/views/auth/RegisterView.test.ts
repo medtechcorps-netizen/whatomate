@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   supported: true,
   toastError: vi.fn(),
   toastSuccess: vi.fn(),
+  toastInfo: vi.fn(),
   push: vi.fn(),
 }))
 
@@ -21,7 +22,7 @@ vi.mock('vue-i18n', () => ({
 }))
 
 vi.mock('vue-sonner', () => ({
-  toast: { error: mocks.toastError, success: mocks.toastSuccess },
+  toast: { error: mocks.toastError, success: mocks.toastSuccess, info: mocks.toastInfo },
 }))
 
 vi.mock('@/stores/auth', () => ({
@@ -30,6 +31,7 @@ vi.mock('@/stores/auth', () => ({
 
 vi.mock('@/services/api', () => ({
   sessionsSupported: () => mocks.supported,
+  sentBeforeSessionChange: (error: { sentBeforeSessionChange?: boolean }) => error?.sentBeforeSessionChange === true,
   SESSION_BUSY_CODE: 'ERR_SESSION_BUSY',
   SESSION_UNSUPPORTED_CODE: 'ERR_SESSION_UNSUPPORTED',
 }))
@@ -62,7 +64,20 @@ describe('RegisterView refusals', () => {
     mocks.register.mockReset()
     mocks.toastError.mockReset()
     mocks.toastSuccess.mockReset()
+    mocks.toastInfo.mockReset()
     mocks.push.mockReset()
+  })
+
+  it('a registration the server got, undone by a session change elsewhere, sends the user to sign in', async () => {
+    mocks.register.mockRejectedValueOnce(
+      Object.assign(new Error('The session changed'), { code: 'ERR_CANCELED', sentBeforeSessionChange: true }),
+    )
+
+    await submitRegistration()
+
+    expect(mocks.toastInfo).toHaveBeenCalledWith('auth.accountMayExist')
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    expect(mocks.push).toHaveBeenCalledWith({ path: '/login', query: { email: 'b@example.com' } })
   })
 
   it('without Web Locks says why and starts no registration (nothing is cleared)', async () => {

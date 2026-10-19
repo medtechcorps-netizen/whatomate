@@ -136,7 +136,8 @@
     "ssoMissingTokens": "Callback SSO inválido. Faltan tokens.",
     "ssoLoginSuccess": "Inicio de sesión SSO exitoso",
     "ssoLoginFailed": "Error al completar el inicio de sesión SSO",
-    "returnToLogin": "Volver al inicio de sesión"
+    "returnToLogin": "Volver al inicio de sesión",
+    "accountMayExist": "Es posible que su cuenta se haya creado. Inicie sesión."
   },
   "resources": {
     "account": "cuenta",

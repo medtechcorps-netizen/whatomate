@@ -499,9 +499,11 @@ test.describe('Logout during a token refresh', () => {
     await loginAsAdmin(page)
     const marker = await page.evaluate(() => localStorage.getItem('whm_session_id'))
     const refresh = await cookieValue(context, 'whm_refresh')
-    await expect.poll(() => refreshes, { timeout: 20_000 }).toBeGreaterThan(0)
-    // Every retry runs out meanwhile.
-    await page.waitForTimeout(10_000)
+    // The refresh and its three retries (REFRESH_RETRY_DELAYS_MS) all fail...
+    await expect.poll(() => refreshes, { timeout: 30_000 }).toBe(4)
+    // ...and then nothing more is tried for this request.
+    await page.waitForTimeout(1_000)
+    expect(refreshes).toBe(4)
 
     // Still signed in: no sign-out, no ended session, the same cookies.
     expect(page.url()).not.toContain('/login')
@@ -670,6 +672,7 @@ test.describe('Logout during a token refresh', () => {
       other.on('load', () => {
         reloaded = true
       })
+      const selected = await other.evaluate(() => localStorage.getItem('selected_organization_id'))
 
       await other.getByTestId('organization-switcher').click()
       await other.getByRole('option', { name: secondOrg.name }).click()
@@ -678,10 +681,15 @@ test.describe('Logout during a token refresh', () => {
 
       expect(switches).toEqual([])
       expect(reloaded).toBe(false)
+      // Nothing was selected either: the stored selection is as it was.
+      expect(await other.evaluate(() => localStorage.getItem('selected_organization_id'))).toBe(selected)
       for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
         expect(await cookieValue(context, name)).toBe(before[name])
       }
-      expect((await (await page.request.get('/api/me')).json()).data.organization_id).toBe(orgBefore)
+      const me = await page.request.get('/api/me', {
+        headers: selected ? { 'X-Organization-ID': selected } : {},
+      })
+      expect((await me.json()).data.organization_id).toBe(orgBefore)
     })
   })
 

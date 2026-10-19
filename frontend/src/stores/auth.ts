@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '@/services/api'
+import { AUTH_SESSION_EVENT } from '@/lib/authSessionEvent'
 import {
   clearBrowserOrganizationIdentity,
   setSelectedOrganizationId,
@@ -346,6 +347,22 @@ export const useAuthStore = defineStore('auth', () => {
       productEntitlementsLoaded.value = true
       return false
     }
+  }
+
+  // Entitlements that could not load during an outage load again once the
+  // session is back, instead of staying unavailable until a reload.
+  if (typeof window !== 'undefined') {
+    window.addEventListener(AUTH_SESSION_EVENT, (event) => {
+      const state = (event as CustomEvent<{ state?: string }>).detail?.state
+      if (
+        (state === 'reconnected' || state === 'refreshed') &&
+        user.value &&
+        productEntitlementMode.value === 'unavailable'
+      ) {
+        productEntitlementsLoaded.value = false
+        void ensureProductEntitlements()
+      }
+    })
   }
 
   async function ensureProductEntitlements(): Promise<boolean> {

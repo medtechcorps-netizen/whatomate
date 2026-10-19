@@ -142,8 +142,9 @@ export const SESSION_UNSUPPORTED_CODE = "ERR_SESSION_UNSUPPORTED";
 const RECONNECT_TOAST_ID = "whm-session-reconnect";
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-/** Window event fired with `{ state }` whenever the session state changes. */
-export const AUTH_SESSION_EVENT = "whm:auth-session";
+import { AUTH_SESSION_EVENT } from "@/lib/authSessionEvent";
+
+export { AUTH_SESSION_EVENT };
 export type AuthSessionState =
   | "refreshed"
   | "reconnecting"
@@ -703,6 +704,17 @@ function isSessionChange(error: unknown): boolean {
   return axios.isAxiosError(error) && error.message === "The session changed";
 }
 
+/**
+ * Whether a sign-in or registration was answered after the browser's session
+ * changed elsewhere, so what it issued was undone here: the server has acted
+ * on it (an account created, an invitation used). The user should sign in.
+ */
+export function sentBeforeSessionChange(error: unknown): boolean {
+  if (!isSessionChange(error)) return false;
+  const config = (error as AxiosError).config as AuthAwareRequestConfig | undefined;
+  return config?._issueMarker !== undefined;
+}
+
 // onSessionChanged handles refresh work refused because the session changed or
 // ended: never an expiry or a replay. A tab still showing a session that
 // another tab ended leaves it, as a rejected refresh would have.
@@ -1241,6 +1253,18 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   });
   startTabPresence();
   scheduleProactiveRefresh();
+  // Probe the lock manager once at load: one that refuses (a sandboxed or
+  // opaque-origin page) counts as none before a first sign-in clears anything.
+  try {
+    const locks = webLocks();
+    if (locks && typeof locks.query === "function") {
+      void locks.query().catch(() => {
+        locksUnusable = true;
+      });
+    }
+  } catch {
+    locksUnusable = true;
+  }
 
   if (isOnSsoCallbackPage()) {
     const pending = pendingLogoutApplies();
@@ -1437,16 +1461,20 @@ api.interceptors.response.use(
     // still have had its cookies stored: if the CSRF cookie changed, undo what
     // it issued before letting go of the lock.
     const issuing = error.config as AuthAwareRequestConfig | undefined;
-    if (
-      issuing?._releaseSessionLock &&
-      issuing._issueMarker !== undefined &&
-      !error.response &&
-      leftCookiesWithoutAnswer(issuing)
-    ) {
-      await endIssuedSession();
+    try {
+      if (
+        issuing?._releaseSessionLock &&
+        issuing._issueMarker !== undefined &&
+        !error.response &&
+        leftCookiesWithoutAnswer(issuing)
+      ) {
+        await endIssuedSession();
+      }
+    } finally {
+      // First, so a 401 on an org switch can refresh without waiting on
+      // itself; and even if the undo threw.
+      releaseSessionLock(error.config);
     }
-    // First, so a 401 on an org switch can refresh without waiting on itself.
-    releaseSessionLock(error.config);
     const originalRequest = error.config as AuthAwareRequestConfig | undefined;
 
     if (

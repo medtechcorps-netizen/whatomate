@@ -11,11 +11,12 @@ const mocks = vi.hoisted(() => ({
   toastError: vi.fn(),
   toastSuccess: vi.fn(),
   push: vi.fn(),
+  query: {} as Record<string, string>,
 }))
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({ push: mocks.push, replace: vi.fn() }),
-  useRoute: () => ({ query: {} }),
+  useRoute: () => ({ query: mocks.query }),
 }))
 
 vi.mock('vue-i18n', () => ({
@@ -67,6 +68,7 @@ describe('LoginView without Web Locks', () => {
     mocks.get.mockReset().mockResolvedValue({ data: { data: [{ provider: 'google', name: 'Google' }] } })
     mocks.toastError.mockReset()
     mocks.push.mockReset()
+    mocks.query = {}
     assignedHref = null
     Object.defineProperty(window, 'location', {
       configurable: true,
@@ -98,6 +100,14 @@ describe('LoginView without Web Locks', () => {
     expect(mocks.login).not.toHaveBeenCalled()
     expect(mocks.toastError).toHaveBeenCalledWith('errors.unsupportedBrowser')
     expect(mocks.push).not.toHaveBeenCalled()
+  })
+
+  it('fills in the email handed over (after a registration that needs a sign-in)', async () => {
+    mocks.query = { email: 'b@example.com' }
+    const wrapper = mountLogin()
+    await flushPromises()
+
+    expect((wrapper.get('#email').element as HTMLInputElement).value).toBe('b@example.com')
   })
 
   it('says why and starts no SSO sign-in', async () => {

@@ -88,6 +88,9 @@ watch(organization, () => {
 })
 
 onMounted(async () => {
+  // An email handed over (say, after a registration that needs a sign-in).
+  if (typeof route.query.email === 'string' && !email.value) email.value = route.query.email
+
   // Check for SSO error in query params
   const ssoError = route.query.sso_error as string
   if (ssoError) {

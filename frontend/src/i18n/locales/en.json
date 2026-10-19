@@ -174,7 +174,8 @@
     "ssoMissingTokens": "Invalid SSO callback. Missing tokens.",
     "ssoLoginSuccess": "SSO login successful",
     "ssoLoginFailed": "Failed to complete SSO login",
-    "returnToLogin": "Return to login"
+    "returnToLogin": "Return to login",
+    "accountMayExist": "Your account may have been created. Please sign in."
   },
   "sessionSecurity": {
     "reconnecting": "Reconnecting…",

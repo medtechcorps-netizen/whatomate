@@ -99,6 +99,7 @@ describe('OrganizationSwitcher refusals', () => {
     await chooseSecondOrganization()
 
     expect(mocks.switchOrg).not.toHaveBeenCalled()
+    expect(mocks.selectOrganization).not.toHaveBeenCalled()
     expect(mocks.toastError).toHaveBeenCalledWith('errors.unsupportedBrowser')
     expect(mocks.reload).not.toHaveBeenCalled()
   })
