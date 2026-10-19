@@ -815,7 +815,9 @@ test.describe('Logout during a token refresh', () => {
     let releaseExchange: (() => void) | undefined
     try {
       await loginAsAdmin(page)
-      await expect(page.locator('aside').getByRole('button').filter({ hasText: TEST_USERS.admin.email })).toBeVisible()
+      const authenticatedNavigation = page.getByRole('navigation', { name: 'Main navigation', exact: true })
+      await expect(authenticatedNavigation).toBeVisible()
+      await expect(authenticatedNavigation.getByRole('button').filter({ hasText: TEST_USERS.admin.email })).toBeVisible()
       const original = await historyState()
       const originalPath = new URL(page.url()).pathname
       const order: string[] = []
@@ -878,7 +880,7 @@ test.describe('Logout during a token refresh', () => {
       }
       await expect(page).toHaveURL(/\/login(?:\?|$)/)
       await expect(page.getByTestId('password-sign-in')).toBeVisible()
-      await expect(page.locator('aside')).toHaveCount(0)
+      await expect(authenticatedNavigation).toHaveCount(0)
       expect(await page.evaluate(() => sessionStorage.getItem('whm_sso_sent'))).not.toBeNull()
       expect(await page.evaluate(() => JSON.parse(localStorage.getItem('user')!).email)).toBe(TEST_USERS.admin.email)
       expect(exchangesSent).toHaveLength(1)
