@@ -580,8 +580,15 @@ func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
 	sentBefore := f.mock.sentMessageCount()
 
-	// The source-message lookup hits a database deadline.
+	// The source-message lookup hits a database deadline. The hook counts its
+	// hits and records whether the matched query had already failed, so the
+	// test proves the injected deadline (not some earlier error) was the cause.
 	sourceID := text.ID
+	var (
+		hookMu        sync.Mutex
+		sourceHits    int
+		priorQueryErr []error
+	)
 	sourceHook := "laneE:source_lookup_" + uuid.NewString()
 	require.NoError(t, f.app.DB.Callback().Query().After("gorm:query").Register(sourceHook, func(db *gorm.DB) {
 		if db.Statement.Table != "messages" {
@@ -589,6 +596,10 @@ func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
 		}
 		for _, v := range db.Statement.Vars {
 			if v == any(sourceID) {
+				hookMu.Lock()
+				sourceHits++
+				priorQueryErr = append(priorQueryErr, db.Error)
+				hookMu.Unlock()
 				_ = db.AddError(context.DeadlineExceeded)
 				return
 			}
@@ -599,6 +610,10 @@ func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
 	req = f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
 	removeSourceHook()
 
+	hookMu.Lock()
+	assert.Equal(t, 1, sourceHits, "exactly one source-message lookup, after authorization")
+	assert.Equal(t, []error{nil}, priorQueryErr, "the matched query had not already failed")
+	hookMu.Unlock()
 	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
 	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
 	assert.Len(t, f.messagesFor(t, f.target.ID), 1, "only the warm-up forward exists")
