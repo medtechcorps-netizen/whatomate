@@ -569,20 +569,35 @@ func TestLaneEForwardRefusesDeletedSource(t *testing.T) {
 
 // Q5 (definite rejection): a failure before anything is persisted answers 503
 // forward_temporarily_unavailable; nothing is saved and nothing reaches Meta.
+// The failure is injected on the forward's own reads, after authorization:
+// an expired context on the whole DB would fail the request's tenant check
+// first (SendMessage answers 401 for that, which is not the forward path).
 func TestLaneEForwardDefiniteRejectionIsRetryable(t *testing.T) {
 	f := laneENewForwardFixture(t)
 	text := f.storedMessage(t, f.source, models.MessageTypeText, "first", "")
-	// Warm the permission cache with one ordinary forward.
+	// One ordinary forward first, so the counts below have a baseline.
 	req := f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
 	sentBefore := f.mock.sentMessageCount()
 
-	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-	healthy := f.app.DB
-	f.app.DB = f.app.DB.WithContext(expired)
+	// The source-message lookup hits a database deadline.
+	sourceID := text.ID
+	sourceHook := "laneE:source_lookup_" + uuid.NewString()
+	require.NoError(t, f.app.DB.Callback().Query().After("gorm:query").Register(sourceHook, func(db *gorm.DB) {
+		if db.Statement.Table != "messages" {
+			return
+		}
+		for _, v := range db.Statement.Vars {
+			if v == any(sourceID) {
+				_ = db.AddError(context.DeadlineExceeded)
+				return
+			}
+		}
+	}))
+	removeSourceHook := func() { _ = f.app.DB.Callback().Query().Remove(sourceHook) }
+	t.Cleanup(removeSourceHook)
 	req = f.forward(t, f.user.ID, f.target.ID, map[string]any{"forward_of_message_id": text.ID.String()})
-	f.app.DB = healthy
+	removeSourceHook()
 
 	assert.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
 	assert.Equal(t, "forward_temporarily_unavailable", laneERefusal(t, req).ErrorType)
