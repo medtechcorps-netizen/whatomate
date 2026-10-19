@@ -46,21 +46,20 @@ test.describe('WhatsApp Accounts - List View', () => {
     await expect(page.locator('input').first()).toBeVisible()
   })
 
-  test('should show delete confirmation from list', async ({ page }) => {
-    // Find the destructive (red) delete button in the first data row
-    const firstRow = page.locator('tbody tr').first()
-    if (!(await firstRow.isVisible({ timeout: 3000 }).catch(() => false))) {
-      test.skip(true, 'No accounts in list')
-      return
-    }
-    const deleteBtn = firstRow.locator('button.text-destructive, button:has(svg.text-destructive)').first()
-    if (!(await deleteBtn.isVisible({ timeout: 3000 }).catch(() => false))) {
-      test.skip(true, 'No delete button found')
-      return
-    }
+  test('should show delete confirmation from list', async ({ page, request }) => {
+    const account = await seedAdminAccount(request)
+    await accountsPage.goto()
+    const accountRow = page.locator('tbody tr').filter({
+      has: page.locator(`a[href="/settings/accounts/${account.id}"]`),
+    })
+    await expect(accountRow).toBeVisible()
+    const deleteBtn = accountRow.locator('button.text-destructive, button:has(svg.text-destructive)').first()
+    await expect(deleteBtn).toBeVisible()
     await deleteBtn.click()
     await expect(accountsPage.alertDialog).toBeVisible({ timeout: 5000 })
+    await expect(accountsPage.alertDialog).toContainText(account.name)
     await accountsPage.cancelDelete()
+    await expect(accountRow).toBeVisible()
   })
 
   test('should load detail page from list', async ({ page, request }) => {
