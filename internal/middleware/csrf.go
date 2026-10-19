@@ -16,10 +16,15 @@ func CSRFProtection() fastglue.FastMiddleware {
 			return r
 		}
 
-		// The token refresh endpoint is exempt. A refresh only rotates the
-		// caller's own auth cookies; a cross-site page cannot read the response
-		// and gains nothing from triggering it. Its credential, whm_refresh, is
-		// SameSite=Lax (never sent on cross-site POSTs) and scoped to this path.
+		// The token refresh endpoint is exempt. Each of its actions needs a
+		// credential a cross-site POST never carries, and a cross-site page
+		// cannot read the response:
+		// - a refresh rotates the caller's own cookies with whm_refresh,
+		//   SameSite=Lax and scoped to this path;
+		// - a revoke ({"revoke": true}) checks the CSRF header in the handler;
+		// - the SSO code exchange ({"sso_exchange": code}), which issues a
+		//   session, needs its attempt's binding cookie (SameSite=Lax, httpOnly,
+		//   this path) and a JSON body, which a cross-site form cannot send.
 		// Without the exemption, a refresh that carries a freshly rotated
 		// whm_access cookie (path /api covers this route) but no X-CSRF-Token
 		// header is rejected with 403, which logs the user out. The API is

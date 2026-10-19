@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   beginSsoSignIn: vi.fn(),
   get: vi.fn(),
   supported: true,
+  // What the load-time probe of the lock manager finds (default: supported).
+  known: undefined as boolean | undefined,
   toastError: vi.fn(),
   toastSuccess: vi.fn(),
   push: vi.fn(),
@@ -35,6 +37,7 @@ vi.mock('@/services/api', () => ({
   api: { get: mocks.get },
   beginSsoSignIn: mocks.beginSsoSignIn,
   sessionsSupported: () => mocks.supported,
+  whenSessionsSupportKnown: () => Promise.resolve(mocks.known ?? mocks.supported),
   SESSION_BUSY_CODE: 'ERR_SESSION_BUSY',
   SESSION_UNSUPPORTED_CODE: 'ERR_SESSION_UNSUPPORTED',
 }))
@@ -63,6 +66,7 @@ function mountLogin() {
 describe('LoginView without Web Locks', () => {
   beforeEach(() => {
     mocks.supported = false
+    mocks.known = undefined
     mocks.login.mockReset()
     mocks.beginSsoSignIn.mockReset()
     mocks.get.mockReset().mockResolvedValue({ data: { data: [{ provider: 'google', name: 'Google' }] } })
@@ -86,6 +90,35 @@ describe('LoginView without Web Locks', () => {
 
   afterEach(() => {
     Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
+  })
+
+  const notice = '[data-testid="login-unsupported-notice"]'
+
+  it('says why on arrival (a session from before ends here at its first refresh need)', async () => {
+    const wrapper = mountLogin()
+
+    expect(wrapper.find(notice).exists()).toBe(true)
+    expect(wrapper.get(notice).text()).toBe('errors.unsupportedBrowser')
+    expect(wrapper.get(notice).attributes('role')).toBe('alert')
+  })
+
+  it('says why once the load probe finds a lock manager that refuses', async () => {
+    mocks.supported = true
+    mocks.known = false
+    const wrapper = mountLogin()
+    expect(wrapper.find(notice).exists()).toBe(false)
+
+    await flushPromises()
+
+    expect(wrapper.find(notice).exists()).toBe(true)
+  })
+
+  it('shows no notice where Web Locks work', async () => {
+    mocks.supported = true
+    const wrapper = mountLogin()
+    await flushPromises()
+
+    expect(wrapper.find(notice).exists()).toBe(false)
   })
 
   it('says why and starts no password sign-in (so nothing stored is cleared)', async () => {
@@ -142,6 +175,8 @@ describe('LoginView without Web Locks', () => {
     expect(mocks.login).toHaveBeenCalledTimes(1)
     expect(mocks.toastError).toHaveBeenCalledWith(message)
     expect(mocks.push).not.toHaveBeenCalled()
+    // Only an unsupported refusal leaves the standing notice.
+    expect(wrapper.find(notice).exists()).toBe(code === 'ERR_SESSION_UNSUPPORTED')
   })
 
   it('maps an SSO start refused as unsupported to that message', async () => {
@@ -159,5 +194,6 @@ describe('LoginView without Web Locks', () => {
     expect(mocks.beginSsoSignIn).toHaveBeenCalledTimes(1)
     expect(mocks.toastError).toHaveBeenCalledWith('errors.unsupportedBrowser')
     expect(assignedHref).toBeNull()
+    expect(wrapper.find(notice).exists()).toBe(true)
   })
 })

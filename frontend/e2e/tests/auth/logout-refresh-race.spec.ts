@@ -36,12 +36,17 @@ import {
 // pending attempt was never aborted; its held answer (which revokes and clears
 // the cookies) lands after B has signed in and clears B's cookies, and the jar
 // and /me checks fail. A build without the budget abort never fails the
-// attempt at all (it gets its answer at ~7.5 s). Expected to fail against
-// f9f8c65d (not yet run): the no-Web-Locks case (that build signed in through
-// a best-effort fallback). The SSO exchange cases need the exchange (the
-// callback page of fdb8937b and earlier never sends one). The no-Web-Locks
-// logout cases need the cookie-neutral logout (3ee42429 and earlier send a
-// clearing /auth/logout).
+// attempt at all (it gets its answer at ~7.5 s). Expected to fail, at gate
+// time:
+// - the "page cannot sign in" case against f9f8c65d (that build signed in
+//   through a best-effort fallback);
+// - the SSO exchange ordering cases against this build with the exchange not
+//   session-issuing (isSessionIssuing without `|| config?._ssoExchange ===
+//   true`): the pending-lock, order and refresh-count checks fail. (Against
+//   fdb8937b they fail earlier, at the exchange that is never sent, which
+//   shows nothing about the ordering checks.)
+// - the no-Web-Locks logout cases against 3ee42429 (it sends a clearing
+//   /auth/logout), and their login-page notice against 0938ea91.
 //
 // The identity provider is not run here: the callback page is opened with a
 // code, and its exchange is answered with a real session of the user (a
@@ -386,6 +391,8 @@ test.describe('Logout during a token refresh', () => {
       if (ending === 'a logout click') await logout(page)
       else await startProactiveRefresh(page)
       await expect(page).toHaveURL(/\/login/)
+      // The login page says why at once, not only after a sign-in attempt.
+      await expect(page.getByTestId('login-unsupported-notice')).toContainText(UNSUPPORTED)
       await revoked
       // Give a clearing /auth/logout every chance to go out.
       await page.waitForTimeout(2_000)
@@ -1051,6 +1058,9 @@ test.describe('Logout during a token refresh', () => {
     await other.addInitScript(countUnsupportedMessages, UNSUPPORTED)
     await other.goto('/login', { waitUntil: 'domcontentloaded' })
     expect(await other.evaluate(() => !!navigator.locks)).toBe(false)
+    // It says why on arrival; each refused attempt says so once more.
+    await expect(other.getByTestId('login-unsupported-notice')).toContainText(UNSUPPORTED)
+    const onArrival = await unsupportedMessages(other)
     const issuing: string[] = []
     other.on('request', (request) => {
       if (/\/api\/auth\/(login|register|switch-org|sso\/[^/]+\/init)/.test(request.url())) issuing.push(request.url())
@@ -1058,11 +1068,11 @@ test.describe('Logout during a token refresh', () => {
 
     // A password sign-in as B is refused before anything is sent (or cleared).
     await submitSignIn(other, TEST_USERS.manager)
-    await expect.poll(() => unsupportedMessages(other)).toBe(1)
+    await expect.poll(() => unsupportedMessages(other)).toBe(onArrival + 1)
     // So is an SSO start: the page never leaves for the provider.
     await offerGoogleSso(other)
     await startGoogleSso(other)
-    await expect.poll(() => unsupportedMessages(other)).toBe(2)
+    await expect.poll(() => unsupportedMessages(other)).toBe(onArrival + 2)
     expect(other.url()).toContain('/login')
     // And a registration from an invitation.
     await other.goto('/register?invite=e2e-unsupported-browser', { waitUntil: 'domcontentloaded' })

@@ -9,6 +9,10 @@ const mocks = vi.hoisted(() => ({
   setAuth: vi.fn(),
   push: vi.fn(),
   replace: vi.fn(),
+  keep: vi.fn(),
+  unsent: vi.fn(),
+  restoreSession: vi.fn(),
+  store: { isAuthenticated: false, user: null as null | { role?: { name: string } } },
   query: {} as Record<string, string>,
 }))
 
@@ -26,12 +30,23 @@ vi.mock('vue-sonner', () => ({
 }))
 
 vi.mock('@/stores/auth', () => ({
-  useAuthStore: () => ({ setAuth: mocks.setAuth }),
+  useAuthStore: () => ({
+    setAuth: mocks.setAuth,
+    restoreSession: mocks.restoreSession,
+    get isAuthenticated() {
+      return mocks.store.isAuthenticated
+    },
+    get user() {
+      return mocks.store.user
+    },
+  }),
 }))
 
 vi.mock('@/services/api', () => ({
   api: { get: mocks.get },
   exchangeSsoCode: mocks.exchange,
+  keepSsoCode: mocks.keep,
+  unsentSsoCode: mocks.unsent,
   SESSION_BUSY_CODE: 'ERR_SESSION_BUSY',
   SESSION_UNSUPPORTED_CODE: 'ERR_SESSION_UNSUPPORTED',
 }))
@@ -53,7 +68,11 @@ describe('SSOCallbackView', () => {
     mocks.get.mockReset()
     mocks.setAuth.mockReset()
     mocks.push.mockReset()
-    mocks.replace.mockReset()
+    mocks.replace.mockReset().mockResolvedValue(undefined)
+    mocks.keep.mockReset()
+    mocks.unsent.mockReset().mockReturnValue(null)
+    mocks.restoreSession.mockReset().mockReturnValue(false)
+    mocks.store = { isAuthenticated: false, user: null }
     mocks.query = {}
   })
 
@@ -65,20 +84,69 @@ describe('SSOCallbackView', () => {
     mountCallback()
     await flushPromises()
 
+    // Kept (this tab, until sent), then off the URL, then exchanged, then /me.
+    expect(mocks.keep).toHaveBeenCalledWith('code-b')
     expect(mocks.replace).toHaveBeenCalledWith({ query: { code: undefined } })
     expect(mocks.exchange).toHaveBeenCalledWith('code-b')
+    expect(mocks.keep.mock.invocationCallOrder[0]).toBeLessThan(mocks.replace.mock.invocationCallOrder[0])
+    expect(mocks.replace.mock.invocationCallOrder[0]).toBeLessThan(mocks.exchange.mock.invocationCallOrder[0])
     expect(mocks.exchange.mock.invocationCallOrder[0]).toBeLessThan(mocks.get.mock.invocationCallOrder[0])
     expect(mocks.get).toHaveBeenCalledWith('/me')
     expect(mocks.setAuth).toHaveBeenCalledWith({ user: { id: 'user-b', role: { name: 'admin' } } })
   })
 
-  it('without a code it exchanges nothing and asks for nothing', async () => {
+  it('sends the exchange only once the code is off the URL', async () => {
+    mocks.query = { code: 'code-b' }
+    let replaced!: () => void
+    mocks.replace.mockReturnValueOnce(new Promise<void>((resolve) => (replaced = resolve)))
+    mocks.exchange.mockResolvedValueOnce({ data: { data: { expires_in: 900 } } })
+    mocks.get.mockResolvedValueOnce({ data: { data: { id: 'user-b', role: { name: 'admin' } } } })
+
+    mountCallback()
+    await flushPromises()
+    expect(mocks.exchange).not.toHaveBeenCalled()
+
+    replaced()
+    await flushPromises()
+    expect(mocks.exchange).toHaveBeenCalledWith('code-b')
+  })
+
+  it('without a code (and none kept, no session) says the link is spent, and sends nothing', async () => {
     const wrapper = mountCallback()
     await flushPromises()
 
     expect(mocks.exchange).not.toHaveBeenCalled()
     expect(mocks.get).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain('auth.ssoLoginFailed')
+    expect(mocks.replace).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('auth.ssoLinkUsed')
+  })
+
+  it('a reload while the exchange waited retries the kept, unsent code', async () => {
+    mocks.unsent.mockReturnValue('code-b')
+    mocks.exchange.mockResolvedValueOnce({ data: { data: { expires_in: 900 } } })
+    mocks.get.mockResolvedValueOnce({ data: { data: { id: 'user-b', role: { name: 'admin' } } } })
+
+    mountCallback()
+    await flushPromises()
+
+    expect(mocks.exchange).toHaveBeenCalledWith('code-b')
+    expect(mocks.keep).not.toHaveBeenCalled()
+    expect(mocks.setAuth).toHaveBeenCalledWith({ user: { id: 'user-b', role: { name: 'admin' } } })
+  })
+
+  it.each([
+    ['in this page (Back after the sign-in)', true, false],
+    ['stored (a reload after the sign-in)', false, true],
+  ])('without a code, a live session %s goes on into the app', async (_label, inStore, restored) => {
+    mocks.store = { isAuthenticated: inStore, user: { role: { name: 'agent' } } }
+    mocks.restoreSession.mockReturnValue(restored)
+    const wrapper = mountCallback()
+    await flushPromises()
+
+    expect(mocks.exchange).not.toHaveBeenCalled()
+    expect(mocks.get).not.toHaveBeenCalled()
+    expect(mocks.replace).toHaveBeenCalledWith('/analytics/agents')
+    expect(wrapper.text()).not.toContain('auth.ssoFailed')
   })
 
   it.each([

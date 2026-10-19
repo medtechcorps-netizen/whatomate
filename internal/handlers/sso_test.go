@@ -900,6 +900,7 @@ func TestApp_CallbackSSO_DisabledExistingUserRejected(t *testing.T) {
 	require.NoError(t, app.CallbackSSO(req))
 	loc := string(req.RequestCtx.Response.Header.Peek("Location"))
 	assert.Contains(t, loc, "Account+is+disabled")
-	// No cookies set when account is disabled.
-	assert.Empty(t, testutil.GetResponseCookie(req, "whm_access"))
+	// A refused callback grants nothing: no binding cookie, no exchange grant.
+	laneAAssertNoBindingTouched(t, req)
+	laneAAssertNoGrantFor(t, app, user.ID)
 }

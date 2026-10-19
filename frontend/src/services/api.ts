@@ -178,8 +178,9 @@ let pendingLogoutMarker: string | null = null;
 // aborts it, so its late Set-Cookie can never land after that change.
 let refreshAbort: AbortController | null = null;
 // The logout request (revoke or /auth/logout) this tab has in flight: a new
-// session begun in another tab (an SSO callback, which needs no lock) aborts
-// it, so its cookie-clearing answer cannot land on that session.
+// session begun in another tab aborts it, so its cookie-clearing answer cannot
+// land on that session. (Every session now begins under the lock, after any
+// logout queued before it, so this is defensive.)
 let logoutRequests: AbortController | null = null;
 // The ended marker of the logout this tab started (it navigates by itself).
 let endedHere: string | null = null;
@@ -454,6 +455,14 @@ export function sessionsSupported(): boolean {
   return webLocks() !== null;
 }
 
+// The load-time probe of the lock manager (a refusing one counts as none).
+let lockProbe: Promise<void> = Promise.resolve();
+
+/** sessionsSupported(), once the load-time probe of the lock manager settled. */
+export function whenSessionsSupportKnown(): Promise<boolean> {
+  return lockProbe.then(() => sessionsSupported());
+}
+
 // postRefresh rotates the cookies via POST /auth/refresh. It carries the CSRF
 // double-submit header: whenever a fresh whm_access cookie rides along (path
 // /api covers /api/auth/refresh), the CSRF middleware of older servers rejects
@@ -471,8 +480,8 @@ function postRefresh(signal?: AbortSignal) {
   );
 }
 
-// sendRefresh sends one refresh attempt that another tab's session change or
-// SSO start can abort (an aborted request's late Set-Cookie is discarded).
+// sendRefresh sends one refresh attempt that another tab's session change can
+// abort (an aborted request's late Set-Cookie is discarded).
 async function sendRefresh() {
   const abort = new AbortController();
   refreshAbort = abort;
@@ -877,9 +886,9 @@ function leftCookiesWithoutAnswer(config: AuthAwareRequestConfig): boolean {
   const marker = readSessionMarker();
   const csrf = getCookie("whm_csrf");
   if (marker !== config._issueMarker) {
-    // Another session began meanwhile (an SSO callback needs no lock). Its
-    // cookies are intact while the jar holds the CSRF value it began with;
-    // otherwise this request's late cookies replaced them.
+    // Another session began meanwhile (defensive: every session begins under
+    // the lock). Its cookies are intact while the jar holds the CSRF value it
+    // began with; otherwise this request's late cookies replaced them.
     const begun = readBegunSession();
     return !(begun && begun.marker === marker && begun.csrf === csrf);
   }
@@ -910,6 +919,43 @@ export function exchangeSsoCode(code: string) {
   return api.post("/auth/refresh", { sso_exchange: code }, {
     _ssoExchange: true,
   } as AxiosRequestConfig);
+}
+
+// The SSO code a callback page took off its URL, kept in this tab until its
+// exchange is sent (a reload while the exchange waits for the lock retries
+// it). The server honours a code for 60 s.
+const SSO_CODE_KEY = "whm_sso_code";
+const SSO_CODE_LIFETIME_MS = 60_000;
+
+/** Keeps the callback's code in this tab until its exchange is sent. */
+export function keepSsoCode(code: string) {
+  try {
+    sessionStorage.setItem(SSO_CODE_KEY, JSON.stringify({ code, at: Date.now() }));
+  } catch {
+    // Without storage a reload just cannot retry.
+  }
+}
+
+/** The kept SSO code whose exchange was never sent, if it is still valid. */
+export function unsentSsoCode(): string | null {
+  try {
+    const kept = JSON.parse(sessionStorage.getItem(SSO_CODE_KEY) ?? "null");
+    if (typeof kept?.code === "string" && Date.now() - Number(kept.at) < SSO_CODE_LIFETIME_MS) {
+      return kept.code;
+    }
+    sessionStorage.removeItem(SSO_CODE_KEY);
+  } catch {
+    // Nothing kept.
+  }
+  return null;
+}
+
+function dropSsoCode() {
+  try {
+    sessionStorage.removeItem(SSO_CODE_KEY);
+  } catch {
+    // Nothing kept.
+  }
 }
 
 /** Resolves once a logout started in this tab has finished in the background. */
@@ -1204,9 +1250,12 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   try {
     const locks = webLocks();
     if (locks && typeof locks.query === "function") {
-      void locks.query().catch(() => {
-        locksUnusable = true;
-      });
+      lockProbe = locks.query().then(
+        () => undefined,
+        () => {
+          locksUnusable = true;
+        },
+      );
     }
   } catch {
     locksUnusable = true;
@@ -1344,6 +1393,8 @@ api.interceptors.request.use(
             config.headers.delete("X-CSRF-Token");
           }
         }
+        // The exchange goes out now: its code is spent, never to be resent.
+        if (held._ssoExchange) dropSsoCode();
         return config;
       });
     }

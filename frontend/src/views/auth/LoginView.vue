@@ -7,6 +7,7 @@ import {
   api,
   beginSsoSignIn,
   sessionsSupported,
+  whenSessionsSupportKnown,
   SESSION_BUSY_CODE,
   SESSION_UNSUPPORTED_CODE,
 } from '@/services/api'
@@ -36,6 +37,9 @@ const ssoProviders = ref<SSOProvider[]>([])
 const organization = ref('')
 const isSSODiscovering = ref(false)
 const hasDiscoveredSSO = ref(false)
+// Without Web Locks no sign-in can start here, and a session from before ends
+// at its first refresh need and lands here: say why up front.
+const browserUnsupported = ref(!sessionsSupported())
 
 // SSO provider icons (using simple SVG paths)
 const providerIcons: Record<string, string> = {
@@ -88,6 +92,9 @@ watch(organization, () => {
 })
 
 onMounted(async () => {
+  void whenSessionsSupportKnown().then((supported) => {
+    browserUnsupported.value = !supported
+  })
   // An email handed over (say, after a registration that needs a sign-in).
   if (typeof route.query.email === 'string' && !email.value) email.value = route.query.email
 
@@ -116,6 +123,7 @@ const handleLogin = async () => {
   // Without Web Locks no sign-in is sent: say so before a sign-in attempt
   // clears the stored identity.
   if (!sessionsSupported()) {
+    browserUnsupported.value = true
     toast.error(t('errors.unsupportedBrowser'))
     return
   }
@@ -135,6 +143,7 @@ const handleLogin = async () => {
     let message: string
     if (error?.code === SESSION_UNSUPPORTED_CODE) {
       // No Web Locks: this browser cannot keep sessions apart across tabs.
+      browserUnsupported.value = true
       message = t('errors.unsupportedBrowser')
     } else if (
       error?.code === SESSION_BUSY_CODE ||
@@ -164,16 +173,19 @@ const initiateSSO = async (provider: string) => {
   }
   if (isSSOStarting.value) return
   if (!sessionsSupported()) {
+    browserUnsupported.value = true
     toast.error(t('errors.unsupportedBrowser'))
     return
   }
   isSSOStarting.value = true
-  // Ordered like a password sign-in: an earlier logout finishes first, then a
-  // new session begins. The page stays busy until it leaves for the provider.
+  // The session begins only at the callback's code exchange, under the lock
+  // like a password sign-in. The page stays busy until it leaves for the
+  // provider.
   try {
     await beginSsoSignIn()
   } catch (error: any) {
     isSSOStarting.value = false
+    if (error?.code === SESSION_UNSUPPORTED_CODE) browserUnsupported.value = true
     toast.error(
       error?.code === SESSION_UNSUPPORTED_CODE ? t('errors.unsupportedBrowser') : t('errors.timeout'),
     )
@@ -215,6 +227,14 @@ const initiateSSO = async (provider: string) => {
           </div>
 
           <div class="rounded-[1.4rem] border border-white/[0.09] bg-white/[0.035] p-5 shadow-2xl shadow-black/20 backdrop-blur-xl light:border-[#697046]/15 light:bg-white/70 light:shadow-[#545a37]/10 sm:p-6">
+            <div
+              v-if="browserUnsupported"
+              role="alert"
+              data-testid="login-unsupported-notice"
+              class="mb-5 rounded-xl border border-red-400/30 bg-red-500/[0.08] px-4 py-3 text-sm leading-5 text-red-100 light:border-red-600/25 light:bg-red-50 light:text-red-800"
+            >
+              {{ $t('errors.unsupportedBrowser') }}
+            </div>
             <form @submit.prevent="handleLogin">
               <div class="space-y-5">
                 <div class="space-y-2">

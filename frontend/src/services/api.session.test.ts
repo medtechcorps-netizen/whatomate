@@ -165,6 +165,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
   beforeEach(() => {
     localStorage.clear()
+    sessionStorage.clear()
     localStorage.setItem('user', JSON.stringify({ id: 'user-1', email: 'a@example.com' }))
     setCookie('whm_csrf=csrf-token-1; path=/')
     stubLocation('/chat')
@@ -2036,7 +2037,6 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(adapter).not.toHaveBeenCalled()
     expect(order).toEqual([])
     expect(localStorage.getItem('whm_session_id')).toBe('session-a')
-    expect(localStorage.getItem('whm_sso_started')).toBeNull()
     expect(document.cookie).toContain('whm_csrf=csrf-token-1')
   })
 
@@ -2186,12 +2186,66 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
   it('without Web Locks the SSO exchange is refused and nothing is sent', async () => {
     removeWebLocks()
     const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
-    const { exchangeSsoCode, SESSION_UNSUPPORTED_CODE } = await loadTab(adapter)
+    const { exchangeSsoCode, keepSsoCode, unsentSsoCode, SESSION_UNSUPPORTED_CODE } = await loadTab(adapter)
     recordPosts([])
+    keepSsoCode('code-b')
 
     await expect(exchangeSsoCode('code-b')).rejects.toMatchObject({ code: SESSION_UNSUPPORTED_CODE })
 
     expect(adapter).not.toHaveBeenCalled()
+    // Never sent: still kept.
+    expect(unsentSsoCode()).toBe('code-b')
+  })
+
+  it('a kept SSO code stays kept while its exchange waits for the lock, and is dropped once it is sent', async () => {
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config, { data: { expires_in: 900, user: {} } }))
+    const { exchangeSsoCode, keepSsoCode, unsentSsoCode } = await loadTab(adapter)
+    recordPosts([])
+    const release = holdLockElsewhere()
+    keepSsoCode('code-b')
+
+    const exchange = exchangeSsoCode('code-b')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // A reload now would retry it: it was not sent.
+    expect(adapter).not.toHaveBeenCalled()
+    expect(unsentSsoCode()).toBe('code-b')
+
+    release()
+    await exchange
+    expect(adapter).toHaveBeenCalledTimes(1)
+    expect(unsentSsoCode()).toBeNull()
+  })
+
+  it('a kept SSO code is offered for its 60 s life only', async () => {
+    vi.useFakeTimers()
+    const { keepSsoCode, unsentSsoCode } = await loadTab(async (config) => ok(config))
+    keepSsoCode('code-b')
+
+    vi.advanceTimersByTime(59_000)
+    expect(unsentSsoCode()).toBe('code-b')
+    vi.advanceTimersByTime(2_000)
+    expect(unsentSsoCode()).toBeNull()
+    expect(sessionStorage.getItem('whm_sso_code')).toBeNull()
+  })
+
+  it('reports Web Locks support once the load probe of the lock manager has settled', async () => {
+    let refuse!: () => void
+    const query = vi.fn(
+      () =>
+        new Promise((_, reject) => {
+          refuse = () => reject(new DOMException('Lock manager unavailable', 'SecurityError'))
+        }),
+    )
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: { request: vi.fn(), query } })
+    const { sessionsSupported, whenSessionsSupportKnown } = await loadTab(async (config) => ok(config))
+    const known = whenSessionsSupportKnown()
+    // Before the probe answers, the page still counts as supported...
+    expect(sessionsSupported()).toBe(true)
+
+    refuse()
+    // ...and the answer is what the probe found.
+    expect(await known).toBe(false)
+    expect(sessionsSupported()).toBe(false)
   })
 
   it('without Web Locks a session that existed is not refreshed: it ends, with a cookie-neutral revoke and no /auth/logout', async () => {

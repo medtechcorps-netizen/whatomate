@@ -510,10 +510,20 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 // browser (and cleared here; no other attempt's). Membership, organization
 // and role are resolved now, as a password login does (issueLoginSession),
 // and the user must still be a member of the organization whose SSO it was.
+// A bad code answers 401; a store or lookup fault answers 503, as a refresh
+// does. Only a JSON body is accepted: the refresh route is CSRF-exempt, and a
+// cross-site form can send a form body but not a JSON one.
 func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
 	invalid := func(reason string) error {
 		a.Log.Warn("SSO exchange rejected", "reason", reason)
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid or expired sign-in, please try again", nil, "")
+	}
+	unavailable := func(reason string, err error) error {
+		a.Log.Error("SSO exchange failed", "reason", reason, "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Sign-in is temporarily unavailable, please try again", nil, "")
+	}
+	if !strings.Contains(string(r.RequestCtx.Request.Header.ContentType()), "application/json") {
+		return r.SendErrorEnvelope(fasthttp.StatusUnsupportedMediaType, "Content-Type must be application/json", nil, "")
 	}
 	if a.Redis == nil {
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "SSO state storage is unavailable", nil, "")
@@ -522,7 +532,10 @@ func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
 	defer cancel()
 	stored, err := a.Redis.GetDel(ctx, "sso:exchange:"+code).Bytes()
 	if err != nil {
-		return invalid("sso_code_unknown")
+		if isRedisNil(err) {
+			return invalid("sso_code_unknown")
+		}
+		return unavailable("sso_store_unavailable", err)
 	}
 	var grant ssoExchangeGrant
 	if err := json.Unmarshal(stored, &grant); err != nil || grant.Attempt == "" {
@@ -544,14 +557,17 @@ func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
 	}
 	var user models.User
 	if err := a.DB.Preload("Role").Where("id = ?", userID).First(&user).Error; err != nil {
-		return invalid("sso_user_gone")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return invalid("sso_user_gone")
+		}
+		return unavailable("sso_user_lookup_failed", err)
 	}
 	if !user.IsActive {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Account is disabled", nil, "")
 	}
 	member, err := a.ssoOrganizationMember(&user, orgID)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Failed to verify organization membership", nil, "")
+		return unavailable("sso_membership_lookup_failed", err)
 	}
 	if !member {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "User is not a member of this organization", nil, "")

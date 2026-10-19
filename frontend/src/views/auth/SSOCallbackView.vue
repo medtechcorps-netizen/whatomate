@@ -6,6 +6,8 @@ import { useAuthStore } from '@/stores/auth'
 import {
   api,
   exchangeSsoCode,
+  keepSsoCode,
+  unsentSsoCode,
   SESSION_BUSY_CODE,
   SESSION_UNSUPPORTED_CODE,
 } from '@/services/api'
@@ -21,14 +23,33 @@ const authStore = useAuthStore()
 const status = ref<'loading' | 'success' | 'error'>('loading')
 const errorMessage = ref('')
 
+const homeFor = (user: { role?: { name?: string } } | null | undefined) =>
+  user?.role?.name === 'agent' ? '/analytics/agents' : '/'
+
 onMounted(async () => {
   // The SSO redirect set no cookie: it handed over a one-time code, bound to
-  // this browser. Take it off the URL (it is single-use), then exchange it
-  // for the session, ordered like a password sign-in.
-  const code = typeof route.query.code === 'string' ? route.query.code : ''
-  if (code) void router.replace({ query: { ...route.query, code: undefined } })
+  // this browser. Take it off the URL (it is single-use; kept in this tab
+  // until its exchange is sent, so a reload while it waits retries it), then
+  // exchange it for the session, ordered like a password sign-in.
+  const fromUrl = typeof route.query.code === 'string' ? route.query.code : ''
+  if (fromUrl) {
+    keepSsoCode(fromUrl)
+    // Off the URL before the exchange is sent (history, Referer).
+    await router.replace({ query: { ...route.query, code: undefined } }).catch(() => undefined)
+  }
+  const code = fromUrl || unsentSsoCode()
+  if (!code) {
+    // Back after a sign-in, or a reload once the code was sent: a live
+    // session goes on into the app; otherwise the link is spent.
+    if (authStore.isAuthenticated || authStore.restoreSession()) {
+      void router.replace(homeFor(authStore.user))
+      return
+    }
+    status.value = 'error'
+    errorMessage.value = t('auth.ssoLinkUsed')
+    return
+  }
   try {
-    if (!code) throw new Error('missing code')
     await exchangeSsoCode(code)
     const response = await api.get('/me')
     const user = response.data.data
@@ -41,11 +62,7 @@ onMounted(async () => {
 
     // Redirect based on role
     setTimeout(() => {
-      if (user.role?.name === 'agent') {
-        router.push('/analytics/agents')
-      } else {
-        router.push('/')
-      }
+      router.push(homeFor(user))
     }, 1000)
   } catch (error: any) {
     status.value = 'error'
