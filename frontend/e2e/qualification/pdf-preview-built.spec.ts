@@ -112,7 +112,9 @@ async function openBuiltChat(page: Page) {
   expect(scripts.length).toBeGreaterThan(0)
   expect(scripts.every(url => new URL(url).origin === new URL(page.url()).origin && /\/assets\/.+\.js$/.test(new URL(url).pathname))).toBe(true)
   expect(scripts.some(url => /@vite|\/src\//.test(url))).toBe(false)
-  return page.locator(`[data-message-id="${messageId}"] [data-testid="chat-message-media"]`)
+  const media = page.locator(`[data-message-id="${messageId}"] [data-testid="chat-message-media"]`)
+  await expect(media).toBeVisible()
+  return media
 }
 
 async function observed(page: Page) {
