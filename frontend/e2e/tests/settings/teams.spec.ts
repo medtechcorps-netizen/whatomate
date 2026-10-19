@@ -1,6 +1,6 @@
 import { test, expect, type APIRequestContext } from '@playwright/test'
 import { TablePage } from '../../pages'
-import { loginAsAdmin, createTeamFixture, expectMetadataVisible, expectActivityLogVisible, ApiHelper } from '../../helpers'
+import { loginAsAdmin, createTeamFixture, expectActivityLogVisible, ApiHelper } from '../../helpers'
 import { createTestScope, SUPER_ADMIN } from '../../framework'
 
 const scope = createTestScope('teams')
@@ -61,6 +61,7 @@ test.describe('Teams - List View', () => {
     ])
     expect(searchResponse.ok()).toBe(true)
     const link = page.locator(`tbody a[href="/settings/teams/${team.id}"]`)
+      .and(page.getByRole('link', { name: team.name, exact: true }))
     await expect(link).toBeVisible()
     await link.click()
     await expect(page).toHaveURL(new RegExp(`/settings/teams/${team.id}$`))
@@ -190,7 +191,7 @@ test.describe('Teams - Detail Page CRUD', () => {
     await page.goto(`/settings/teams/${team.id}`)
     await page.waitForLoadState('networkidle')
     await expect(page.locator('input').first()).toHaveValue(team.name)
-    await expectMetadataVisible(page)
+    await expect(page.getByRole('heading', { name: 'Metadata', exact: true })).toBeVisible({ timeout: 15000 })
   })
 
   test('should show activity log', async ({ page, request }) => {
