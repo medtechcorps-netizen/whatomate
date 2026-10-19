@@ -1835,6 +1835,48 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     FakeBroadcastChannel.channels.clear()
   })
 
+  it('a page without Web Locks that logged out sends no keepalive revoke when it closes', async () => {
+    removeWebLocks()
+    const fetchSpy = vi.fn(async () => new Response('{}'))
+    vi.stubGlobal('fetch', fetchSpy)
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    recordPosts(order)
+
+    await api.post('/auth/logout', {})
+    await whenLogoutSettled()
+    // Its own logout is still pending (the clearing waits for the lock).
+    expect(JSON.parse(localStorage.getItem('whm_logout_pending')!).marker).toBe('ended:session-a')
+    window.dispatchEvent(new Event('pagehide'))
+
+    expect(order).toEqual(['revoke csrf-token-1'])
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('without Web Locks a revoke retried after a 429 still presents the recorded CSRF value', async () => {
+    vi.useFakeTimers()
+    removeWebLocks()
+    localStorage.setItem('whm_session_id', 'session-a')
+    const { api, whenLogoutSettled } = await loadTab(async (config) => ok(config))
+    const order: string[] = []
+    let first = true
+    recordPosts(order, (label) => {
+      if (label.startsWith('revoke') && first) {
+        first = false
+        // A newer session's cookies land meanwhile (its marker not yet).
+        setCookie('whm_csrf=csrf-of-a-newer-session; path=/')
+        throw httpError(429)
+      }
+    })
+
+    await api.post('/auth/logout', {})
+    await vi.advanceTimersByTimeAsync(1_000)
+    await whenLogoutSettled()
+
+    expect(order).toEqual(['revoke csrf-token-1', 'revoke csrf-token-1'])
+  })
+
   it('without Web Locks the revoke presents the CSRF value recorded for its session, and never retries with a newer one', async () => {
     removeWebLocks()
     localStorage.setItem('whm_session_id', 'session-a')
@@ -1880,6 +1922,8 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       recordPosts([])
       await exchangeSsoCode('code-b').catch(() => undefined)
 
+      // Cleared as the answer was seen.
+      expect(sessionStorage.getItem('whm_sso_sent')).toBeNull()
       expect(ssoExchangeInterrupted()).toBe(false)
     }
   })
