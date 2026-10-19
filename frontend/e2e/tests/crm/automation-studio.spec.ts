@@ -1,6 +1,8 @@
 import { test, expect, type Page } from '@playwright/test'
+import { randomUUID } from 'node:crypto'
 import { loginAsAdmin } from '../../helpers'
 import { AutomationStudioPage } from '../../pages'
+import type { AutomationPolicy, AutomationPolicyCreateInput } from '../../../src/services/automationPolicies'
 
 async function enableCRMEntitlement(page: Page) {
   await page.route('**/api/product/entitlements**', async (route) => {
@@ -205,6 +207,99 @@ test.describe('CRM Automation Studio', () => {
     await expect(studio.canvas).toBeVisible()
     await expect(studio.palette).toBeVisible()
     await expect(page.getByRole('button', { name: 'Wait' })).toBeVisible()
+  })
+
+  test('remeasures the same node IDs before fitting an existing-policy conflict reload', async ({ page }, testInfo) => {
+    // One page-scoped API fixture exercises frontend conflict reload, not server conflict handling.
+    const id = randomUUID()
+    const name = `Measurement reload ${id}`
+    const path = `/api/automation-policies/${id}`
+    let saved: AutomationPolicy | null = null
+    let creates = 0
+    let reads = 0
+    let conflicts = 0
+    await page.route(url => url.pathname === '/api/automation-policies' || url.pathname === path, async route => {
+      const request = route.request()
+      const requestPath = new URL(request.url()).pathname
+      if (request.method() === 'POST' && requestPath === '/api/automation-policies') {
+        const input = request.postDataJSON() as AutomationPolicyCreateInput
+        expect(input.name).toBe(name)
+        expect(++creates).toBe(1)
+        saved = { ...input, id, status: 'draft', version: 1, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' }
+        await route.fulfill({ status: 200, json: { data: saved } })
+      } else if (request.method() === 'GET' && requestPath === path) {
+        expect(saved).not.toBeNull()
+        expect(++reads).toBeLessThanOrEqual(2)
+        await route.fulfill({ status: 200, json: { data: saved } })
+      } else if (request.method() === 'PUT' && requestPath === path) {
+        expect(request.postDataJSON()).toMatchObject({ name: `${name} edited`, version: 1 })
+        expect(++conflicts).toBe(1)
+        await route.fulfill({ status: 409, json: { message: 'Synthetic revision conflict' } })
+      } else {
+        await route.fallback()
+      }
+    })
+
+    await studio.useTemplate('post-visit')
+    const nodeIds = () => studio.canvas.locator('.vue-flow__node').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-id')).sort())
+    await expect.poll(async () => {
+      const graph = await graphGeometry(page)
+      return graph.nodes.length === 4 && graph.nodes.every(node => node.contained)
+    }).toBe(true)
+    const originalIds = await nodeIds()
+    expect(originalIds).toHaveLength(4)
+    expect(originalIds.every(id => typeof id === 'string' && id.length > 0)).toBe(true)
+    expect(new Set(originalIds).size).toBe(4)
+    await page.getByLabel('Policy name').fill(name)
+    await studio.saveDraft.click()
+    await expect(page).toHaveURL(new RegExp(`/crm/automations/${id}$`))
+    await expect.poll(() => reads).toBe(1)
+    await expect.poll(async () => {
+      const graph = await graphGeometry(page)
+      return graph.nodes.length === 4 && graph.nodes.every(node => node.contained)
+    }).toBe(true)
+    expect(await nodeIds()).toEqual(originalIds)
+    const originalStudio = await page.locator('.automation-studio').elementHandle()
+    if (!originalStudio) throw new Error('Existing policy studio missing')
+
+    const gate = await holdRealNodeMeasurements(page)
+    let held: MeasurementStatus | null = null
+    try {
+      await page.getByLabel('Policy name').fill(`${name} edited`)
+      await studio.saveDraft.click()
+      await expect.poll(() => conflicts).toBe(1)
+      await expect.poll(() => reads).toBe(2)
+      await expect.poll(async () => (await gate.status()).heldNodes).toBe(4)
+      await gate.hold()
+      held = await gate.status()
+      expect(held.queued).toBeGreaterThanOrEqual(4)
+      expect(held.elapsed).toBeGreaterThanOrEqual(190)
+      expect(held.overflow).toBe(false)
+      expect(await originalStudio.evaluate(node => node.isConnected)).toBe(true)
+      expect(await page.locator('.automation-studio').evaluate((node, previous) => node === previous, originalStudio)).toBe(true)
+      expect(await nodeIds()).toEqual(originalIds)
+      // Cached dimensions would expose these same-ID nodes before their new measurements.
+      expect(await studio.canvas.locator('.vue-flow__node').evaluateAll(nodes =>
+        nodes.length === 4 && nodes.every(node => getComputedStyle(node).visibility === 'hidden'))).toBe(true)
+      await gate.release()
+      await expect.poll(async () => studio.canvas.locator('.vue-flow__node').evaluateAll(nodes =>
+        nodes.length === 4 && nodes.every(node => getComputedStyle(node).visibility === 'visible'))).toBe(true)
+      await expect.poll(async () => {
+        const graph = await graphGeometry(page)
+        return graph.nodes.length === 4 && graph.nodes.every(node => node.contained)
+      }).toBe(true)
+      await studio.canvas.getByText('Create follow-up', { exact: true }).click()
+      await expect(page.getByText('Internal action only')).toBeVisible()
+      await expect(page.getByLabel('Policy name')).toHaveValue(name)
+      expect({ creates, reads, conflicts }).toEqual({ creates: 1, reads: 2, conflicts: 1 })
+    } finally {
+      const final = await gate.status()
+      await gate.restore()
+      await testInfo.attach('same-id-native-measurement-reload', {
+        body: Buffer.from(JSON.stringify({ originalIds, held, final, creates, reads, conflicts, apiFixture: 'page-scoped-create-get-conflict', nativeEntriesOnly: true })),
+        contentType: 'application/json',
+      })
+    }
   })
 
   for (const mobile of [false, true]) {
