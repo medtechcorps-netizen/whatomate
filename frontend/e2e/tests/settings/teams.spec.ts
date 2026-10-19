@@ -77,7 +77,8 @@ test.describe('Teams - List View', () => {
     await deleteButton.click()
     const dialog = page.locator('[role="alertdialog"]')
     await expect(dialog).toBeVisible({ timeout: 3000 })
-    await expect(dialog).toContainText(team.name)
+    await expect(dialog.getByRole('heading', { name: 'Delete Team', exact: true })).toBeVisible()
+    await expect(dialog).toContainText('Active transfers will remain but will no longer be associated with this team.')
     // This case exercises cancellation; the detail case below deletes its own team.
     await dialog.getByRole('button', { name: /Cancel/i }).click()
     await expect(dialog).not.toBeVisible()
