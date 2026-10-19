@@ -158,6 +158,7 @@ async function graphGeometry(page: Page) {
     })
     return { nodes, transform: { x: transform.e, y: transform.f, zoom: transform.a } }
   })
+}
 
 test.describe('CRM Automation Studio', () => {
   let studio: AutomationStudioPage
