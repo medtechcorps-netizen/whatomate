@@ -1,6 +1,6 @@
 import { test, expect, type APIRequestContext } from '@playwright/test'
 import { TablePage } from '../../pages'
-import { loginAsAdmin, createTeamFixture, navigateToFirstItem, expectMetadataVisible, expectActivityLogVisible, ApiHelper } from '../../helpers'
+import { loginAsAdmin, createTeamFixture, expectMetadataVisible, expectActivityLogVisible, ApiHelper } from '../../helpers'
 import { createTestScope, SUPER_ADMIN } from '../../framework'
 
 const scope = createTestScope('teams')
@@ -48,12 +48,23 @@ test.describe('Teams - List View', () => {
     await expect(page.locator('input').first()).toBeVisible()
   })
 
-  test('should load detail page from list', async ({ page }) => {
-    const href = await navigateToFirstItem(page)
-    if (href) {
-      expect(page.url()).toMatch(/\/settings\/teams\/[a-f0-9-]+/)
-      await expect(page.getByText('Details')).toBeVisible()
-    }
+  test('should load detail page from list', async ({ page, request }) => {
+    const { team } = await seedAdminTeam(request, 'list-detail')
+    await page.goto('/settings/teams')
+    const [searchResponse] = await Promise.all([
+      page.waitForResponse(response => {
+        const url = new URL(response.url())
+        return response.request().method() === 'GET' && url.pathname === '/api/teams' &&
+          url.searchParams.get('search') === team.name && url.searchParams.get('page') === '1'
+      }),
+      tablePage.searchInput.fill(team.name),
+    ])
+    expect(searchResponse.ok()).toBe(true)
+    const link = page.locator(`tbody a[href="/settings/teams/${team.id}"]`)
+    await expect(link).toBeVisible()
+    await link.click()
+    await expect(page).toHaveURL(new RegExp(`/settings/teams/${team.id}$`))
+    await expect(page.getByText('Details')).toBeVisible()
   })
 
   test('should delete team from list', async ({ page, request }) => {
@@ -174,13 +185,12 @@ test.describe('Teams - Detail Page CRUD', () => {
     expect((await api.get(`/api/teams/${team.id}`)).status()).toBe(404)
   })
 
-  test('should show metadata', async ({ page }) => {
-    await page.goto('/settings/teams')
+  test('should show metadata', async ({ page, request }) => {
+    const { team } = await seedAdminTeam(request, 'metadata')
+    await page.goto(`/settings/teams/${team.id}`)
     await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expectMetadataVisible(page)
-    }
+    await expect(page.locator('input').first()).toHaveValue(team.name)
+    await expectMetadataVisible(page)
   })
 
   test('should show activity log', async ({ page, request }) => {
@@ -237,13 +247,12 @@ test.describe('Teams - Table Sorting', () => {
 })
 
 test.describe('Team Members', () => {
-  test('should show members section on detail page', async ({ page }) => {
+  test('should show members section on detail page', async ({ page, request }) => {
     await loginAsAdmin(page)
-    await page.goto('/settings/teams')
+    const { team } = await seedAdminTeam(request, 'members')
+    await page.goto(`/settings/teams/${team.id}`)
     await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expect(page.getByRole('heading', { name: /Members/ })).toBeVisible({ timeout: 5000 })
-    }
+    await expect(page.locator('input').first()).toHaveValue(team.name)
+    await expect(page.getByRole('heading', { name: /Members/ })).toBeVisible({ timeout: 5000 })
   })
 })
