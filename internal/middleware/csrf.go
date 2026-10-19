@@ -16,6 +16,24 @@ func CSRFProtection() fastglue.FastMiddleware {
 			return r
 		}
 
+		// The token refresh endpoint is exempt. Each of its actions needs a
+		// credential a cross-site POST never carries, and a cross-site page
+		// cannot read the response:
+		// - a refresh rotates the caller's own cookies with whm_refresh,
+		//   SameSite=Lax and scoped to this path;
+		// - a revoke ({"revoke": true}) checks the CSRF header in the handler;
+		// - the SSO code exchange ({"sso_exchange": code}), which issues a
+		//   session, needs its attempt's binding cookie (SameSite=Lax, httpOnly,
+		//   this path) and a JSON body, which a cross-site form cannot send.
+		// Without the exemption, a refresh that carries a freshly rotated
+		// whm_access cookie (path /api covers this route) but no X-CSRF-Token
+		// header is rejected with 403, which logs the user out. The API is
+		// served at /api/... (a base path is stripped before routing), matching
+		// the public-route checks in the auth middleware.
+		if method == "POST" && string(r.RequestCtx.Path()) == "/api/auth/refresh" {
+			return r
+		}
+
 		// Skip if the request uses header-based auth (API key or Bearer token).
 		// These are not automatically attached by the browser, so CSRF is not a concern.
 		if len(r.RequestCtx.Request.Header.Peek("Authorization")) > 0 ||

@@ -1,8 +1,12 @@
 import axios, {
+  AxiosError,
   type AxiosInstance,
-  type AxiosError,
+  type AxiosRequestConfig,
+  type AxiosResponse,
   type InternalAxiosRequestConfig,
 } from "axios";
+import { toast } from "vue-sonner";
+import { i18n } from "@/i18n";
 import { resolveOrganizationHeader } from "@/lib/organizationHeaders";
 import {
   clearBrowserOrganizationIdentity,
@@ -51,9 +55,1345 @@ export function getRequestHeaders(opts?: {
   return headers;
 }
 
+// ---------------------------------------------------------------------------
+// Session refresh coordination
+//
+// The access token lives in an httpOnly cookie that every tab shares. When it
+// expires, the first 401 rotates it via POST /auth/refresh (single-use refresh
+// token). The rules below keep a burst of 401s — across tabs, or staggered in
+// one tab right after a refresh — from logging the user out:
+//
+// - Every request is stamped with the shared "auth epoch" it was sent under.
+//   The epoch advances (in localStorage, so all tabs see it) after each
+//   successful login or refresh. A 401 for a request sent under an older epoch
+//   is stale: the cookie has already been rotated, so it is retried once
+//   without refreshing again.
+// - Refreshes are serialized across tabs with the Web Locks API, and inside the
+//   lock a tab skips its own refresh when another tab advanced the epoch while
+//   it waited.
+// - Only a definitive 401/403 from /auth/refresh ends the session. Network
+//   errors, 5xx and 429 are retried with backoff behind a non-blocking
+//   "Reconnecting…" toast, and the user stays signed in if they still fail.
+// - While a tab is visible the access token is refreshed shortly before it
+//   expires, using expires_in from the login/refresh responses.
+// ---------------------------------------------------------------------------
+
+const AUTH_EPOCH_KEY = "whm_auth_epoch";
+const AUTH_EXPIRES_AT_KEY = "whm_auth_expires_at";
+// Same lock name as earlier builds so tabs on old and new bundles still
+// serialize their refreshes during a deploy.
+const REFRESH_LOCK_NAME = "whm-token-refresh";
+const PROACTIVE_REFRESH_LEAD_MS = 60_000;
+// Delays before each retry of a transient refresh failure (~10 s in total).
+const REFRESH_RETRY_DELAYS_MS = [1_000, 3_000, 6_000];
+const REFRESH_REQUEST_TIMEOUT_MS = 15_000;
+const REVOKE_REQUEST_TIMEOUT_MS = 5_000;
+// Waits before retrying a rate-limited revoke.
+const REVOKE_RETRY_DELAYS_MS = [1_000, 2_000];
+// Session changes (logout, sign-in, org switch) are ordered after other work
+// on the shared refresh lock and wait at most this long for it. Most holders
+// finish well inside it: a refresh attempt and the sign-in or org switch
+// request itself time out after 15 s, a logout after 7 + 5 s. A sign-in that
+// first has to finish an earlier logout can hold longer. A wait that runs out
+// never goes ahead unlocked: a logout is deferred (its pending record is
+// finished by the next sign-in or page load, under the lock), and a sign-in
+// is refused with SESSION_BUSY_CODE ("please try again").
+const SESSION_CHANGE_LOCK_WAIT_MS = 20_000;
+const SESSION_ISSUING_TIMEOUT_MS = 15_000;
+// What a background logout may spend revoking before it aborts the revoke and
+// logs out anyway.
+const LOGOUT_REVOKE_BUDGET_MS = 7_000;
+const LOGOUT_REQUEST_TIMEOUT_MS = 5_000;
+// A held sign-in lock is released by this backstop even if its response is
+// never seen. It is above the longest hold: a pending logout finished first
+// (7 + 5 s), the request (15 s) and undoing what a late answer issued
+// (5 + 5 s).
+const SESSION_LOCK_BACKSTOP_MS = 60_000;
+// The marker and CSRF value of the session that began last (kept current
+// across its refreshes): tells whether the jar still holds that session's
+// cookies.
+const SESSION_BEGUN_KEY = "whm_session_begun";
+// Each open tab refreshes its own liveness stamp; a frozen or discarded tab's
+// stamp goes stale, so a closing tab does not count on it.
+const TAB_ALIVE_PREFIX = "whm_tab_alive:";
+const TAB_HEARTBEAT_MS = 5_000;
+const TAB_ALIVE_WINDOW_MS = 15_000;
+const SESSION_MARKER_KEY = "whm_session_id";
+// The ended marker and CSRF value of a logout that has not got through yet.
+const LOGOUT_PENDING_KEY = "whm_logout_pending";
+// Same-origin tabs announce themselves here, so a closing tab knows whether
+// another one can finish its logout in order.
+const TAB_CHANNEL_NAME = "whm-tabs";
+/** Error code of a sign-in refused because the session lock stayed busy. */
+export const SESSION_BUSY_CODE = "ERR_SESSION_BUSY";
+/**
+ * Error code of a sign-in or org switch refused because this browser has no
+ * Web Locks (an outdated browser, or plain HTTP off localhost): sessions could
+ * not be kept apart across its tabs.
+ */
+export const SESSION_UNSUPPORTED_CODE = "ERR_SESSION_UNSUPPORTED";
+const RECONNECT_TOAST_ID = "whm-session-reconnect";
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+import { AUTH_SESSION_EVENT } from "@/lib/authSessionEvent";
+
+export { AUTH_SESSION_EVENT };
+export type AuthSessionState =
+  | "refreshed"
+  | "reconnecting"
+  | "reconnected"
+  | "unavailable"
+  | "expired";
+
+type AuthAwareRequestConfig = InternalAxiosRequestConfig & {
+  _retry?: boolean;
+  _authEpoch?: number;
+  // The logical session marker the request was sent under: a request is never
+  // refreshed for, or replayed under, another session.
+  _sessionMarker?: string | null;
+  // A sign-in or org switch holds the refresh lock until its response.
+  _releaseSessionLock?: () => void;
+  // The marker and CSRF cookie when a sign-in or org switch was sent, with
+  // the lock held.
+  _issueMarker?: string | null;
+  _issueCsrf?: string | null;
+  // An SSO callback page's code exchange (POST /auth/refresh): issues a
+  // session like a sign-in.
+  _ssoExchange?: boolean;
+};
+
+// Login/refresh responses whose Set-Cookie starts a new auth epoch.
+const SESSION_ISSUING_PATHS = ["/auth/login", "/auth/register", "/auth/switch-org"];
+
+function isSessionIssuing(config: AuthAwareRequestConfig | undefined, path: string): boolean {
+  return SESSION_ISSUING_PATHS.includes(path) || config?._ssoExchange === true;
+}
+
+let memoryAuthEpoch = 0;
+let memorySessionMarker: string | null = null;
+// The logout still being completed in the background, if any.
+let pendingLogout: Promise<void> | null = null;
+let pendingLogoutMarker: string | null = null;
+// The refresh request this tab has in flight: another tab's session change
+// aborts it, so its late Set-Cookie can never land after that change.
+let refreshAbort: AbortController | null = null;
+// The logout request (revoke or /auth/logout) this tab has in flight: a new
+// session begun in another tab aborts it, so its cookie-clearing answer cannot
+// land on that session. (Every session now begins under the lock, after any
+// logout queued before it, so this is defensive.)
+let logoutRequests: AbortController | null = null;
+// The ended marker of the logout this tab started (it navigates by itself).
+let endedHere: string | null = null;
+// The pending logout this tab is responsible for: one it started, took over
+// from a closing tab or resumed on load (kept when its lock wait was deferred).
+let ownedLogout: string | null = null;
+let refreshInFlight: Promise<void> | null = null;
+let proactiveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function readStoredNumber(key: string): number {
+  try {
+    const value = Number(localStorage.getItem(key));
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeStoredValue(key: string, value: string | null) {
+  try {
+    if (value === null) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, value);
+    }
+  } catch {
+    // In-memory state still covers this tab when storage is denied.
+  }
+}
+
+// The logical session marker changes when a session begins (a successful
+// login or register, an SSO sign-in) or ends (logout, expiry); never on token
+// rotation, a CSRF change or an org switch. A live marker is the session id;
+// an ended one is "ended:<that id>", so ending the same session twice writes
+// the same value. Refresh work captures the marker when it starts and may only
+// act while it is unchanged and live.
+const ENDED_MARKER_PREFIX = "ended:";
+
+function readSessionMarker(): string | null {
+  try {
+    return localStorage.getItem(SESSION_MARKER_KEY);
+  } catch {
+    return memorySessionMarker;
+  }
+}
+
+function writeSessionMarker(marker: string): string {
+  memorySessionMarker = marker;
+  writeStoredValue(SESSION_MARKER_KEY, marker);
+  return marker;
+}
+
+function isEndedMarker(marker: string | null | undefined): boolean {
+  return !!marker && marker.startsWith(ENDED_MARKER_PREFIX);
+}
+
+/**
+ * The id of the logical session this browser is in, or has just ended ("" for
+ * a session from before ids existed). Stable across token rotation.
+ */
+export function readSessionId(): string {
+  const marker = readSessionMarker() ?? "";
+  return isEndedMarker(marker) ? marker.slice(ENDED_MARKER_PREFIX.length) : marker;
+}
+
+// beginSessionMarker starts a new logical session. An older logout that has
+// not got through is moot: the jar now holds the new session's cookies.
+function beginSessionMarker(): string {
+  writeStoredValue(LOGOUT_PENDING_KEY, null);
+  const marker = writeSessionMarker(
+    Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
+  );
+  writeStoredValue(SESSION_BEGUN_KEY, JSON.stringify({ marker, csrf: getCookie("whm_csrf") }));
+  return marker;
+}
+
+function readBegunSession(): { marker: string; csrf: string | null } | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SESSION_BEGUN_KEY) || "null");
+    return parsed && typeof parsed.marker === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// A refresh rotated the current session's cookies: note its new CSRF value.
+function noteBegunCsrf(marker: string | null) {
+  const begun = readBegunSession();
+  if (begun && begun.marker === marker) {
+    writeStoredValue(SESSION_BEGUN_KEY, JSON.stringify({ marker, csrf: getCookie("whm_csrf") }));
+  }
+}
+
+function endSessionMarker(): string {
+  return writeSessionMarker(ENDED_MARKER_PREFIX + readSessionId());
+}
+
+type PendingLogout = { marker: string; csrf: string | null };
+
+function readPendingLogout(): PendingLogout | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LOGOUT_PENDING_KEY) || "null");
+    return parsed && typeof parsed.marker === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// recordPendingCsrf notes the jar's current CSRF value in the pending logout
+// of `ended` (a refresh of that session rotated it after the end).
+function recordPendingCsrf(ended: string) {
+  const pending = readPendingLogout();
+  const csrf = getCookie("whm_csrf");
+  if (pending?.marker === ended && csrf && csrf !== pending.csrf) {
+    writeStoredValue(LOGOUT_PENDING_KEY, JSON.stringify({ ...pending, csrf }));
+  }
+}
+
+// The CSRF value recorded with the pending logout of `ended`, if any.
+function recordedLogoutCsrf(ended?: string): string | null {
+  const pending = readPendingLogout();
+  return ended !== undefined && pending?.marker === ended ? pending.csrf : null;
+}
+
+// A pending logout still applies while no session began after it.
+function pendingLogoutApplies(): PendingLogout | null {
+  const pending = readPendingLogout();
+  return pending && pending.marker === readSessionMarker() ? pending : null;
+}
+
+function sessionChangedError(config?: InternalAxiosRequestConfig) {
+  return new AxiosError("The session changed", AxiosError.ERR_CANCELED, config);
+}
+
+function sessionBusyError(config?: InternalAxiosRequestConfig) {
+  return new AxiosError("The session is busy, please try again", SESSION_BUSY_CODE, config);
+}
+
+function sessionUnsupportedError(config?: InternalAxiosRequestConfig) {
+  return new AxiosError(
+    "This browser cannot keep sessions apart across tabs",
+    SESSION_UNSUPPORTED_CODE,
+    config,
+  );
+}
+
+function readAuthEpoch(): number {
+  return Math.max(memoryAuthEpoch, readStoredNumber(AUTH_EPOCH_KEY));
+}
+
+function advanceAuthEpoch() {
+  memoryAuthEpoch = Math.max(Date.now(), readAuthEpoch() + 1);
+  writeStoredValue(AUTH_EPOCH_KEY, String(memoryAuthEpoch));
+}
+
+function emitAuthSessionState(state: AuthSessionState) {
+  try {
+    window.dispatchEvent(
+      new CustomEvent(AUTH_SESSION_EVENT, { detail: { state } }),
+    );
+  } catch {
+    // Observers are optional.
+  }
+}
+
+function showReconnectToast(state: "reconnecting" | "dismiss" | "unavailable") {
+  const t = i18n.global.t;
+  try {
+    if (state === "reconnecting") {
+      toast.loading(t("sessionSecurity.reconnecting"), {
+        id: RECONNECT_TOAST_ID,
+      });
+    } else if (state === "dismiss") {
+      toast.dismiss(RECONNECT_TOAST_ID);
+    } else {
+      toast.error(t("sessionSecurity.reconnectFailed"), {
+        id: RECONNECT_TOAST_ID,
+        description: t("sessionSecurity.reconnectFailedDesc"),
+      });
+    }
+  } catch {
+    // A toast failure must never affect the request flow.
+  }
+}
+
+function requestPath(url?: string): string {
+  if (!url) return "";
+  const path = url.split("?")[0];
+  const apiIndex = path.indexOf("/api/auth/");
+  return apiIndex >= 0 ? path.slice(apiIndex + 4) : path;
+}
+
+// Endpoints that must never trigger a refresh: they either establish or end
+// the session themselves, or are public.
+function isSessionlessAuthEndpoint(url?: string): boolean {
+  const path = requestPath(url);
+  return (
+    path === "/auth/login" ||
+    path === "/auth/register" ||
+    path === "/auth/refresh" ||
+    path === "/auth/logout" ||
+    path === "/auth/sso" ||
+    path.startsWith("/auth/sso/")
+  );
+}
+
+// A 401 from /auth/refresh is the server's verdict. A 403 counts only when it
+// carries the app's own JSON error envelope; an HTML page from a proxy, WAF or
+// edge is treated as transient.
+function isDefinitiveRefreshFailure(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  const status = error.response?.status;
+  if (status === 401) return true;
+  if (status !== 403) return false;
+  const data = error.response?.data as { status?: unknown } | null | undefined;
+  return !!data && typeof data === "object" && data.status === "error";
+}
+
+function hasStoredUser(): boolean {
+  try {
+    return !!localStorage.getItem("user");
+  } catch {
+    return false;
+  }
+}
+
+function clearSessionTiming() {
+  if (proactiveRefreshTimer !== null) {
+    clearTimeout(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+  writeStoredValue(AUTH_EXPIRES_AT_KEY, null);
+}
+
+function recordSessionExpiry(expiresInSeconds: unknown) {
+  if (typeof expiresInSeconds !== "number" || !(expiresInSeconds > 0)) return;
+  writeStoredValue(
+    AUTH_EXPIRES_AT_KEY,
+    String(Date.now() + expiresInSeconds * 1000),
+  );
+  scheduleProactiveRefresh();
+}
+
+function onSessionIssued(expiresInSeconds: unknown) {
+  advanceAuthEpoch();
+  recordSessionExpiry(expiresInSeconds);
+}
+
+function delay(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+// Set once the lock manager refused a request (a sandboxed or opaque-origin
+// page, a broken implementation): from then on this page has no Web Locks.
+let locksUnusable = false;
+
+function webLocks(): LockManager | null {
+  if (locksUnusable) return null;
+  const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+  return locks?.request ? locks : null;
+}
+
+/**
+ * Whether this browser can keep sessions apart across tabs (Web Locks). Views
+ * check it before starting a sign-in, which clears the stored identity first.
+ */
+export function sessionsSupported(): boolean {
+  return webLocks() !== null;
+}
+
+// The load-time probe of the lock manager (a refusing one counts as none).
+let lockProbe: Promise<void> = Promise.resolve();
+
+/** sessionsSupported(), once the load-time probe of the lock manager settled. */
+export function whenSessionsSupportKnown(): Promise<boolean> {
+  return lockProbe.then(() => sessionsSupported());
+}
+
+// postRefresh rotates the cookies via POST /auth/refresh. It carries the CSRF
+// double-submit header: whenever a fresh whm_access cookie rides along (path
+// /api covers /api/auth/refresh), the CSRF middleware of older servers rejects
+// a header-less refresh with 403.
+function postRefresh(signal?: AbortSignal) {
+  const headers: Record<string, string> = {};
+  const csrfToken = getCookie("whm_csrf");
+  if (csrfToken) {
+    headers["X-CSRF-Token"] = csrfToken;
+  }
+  return axios.post(
+    `${API_BASE_URL}/auth/refresh`,
+    {},
+    { withCredentials: true, timeout: REFRESH_REQUEST_TIMEOUT_MS, headers, signal },
+  );
+}
+
+// sendRefresh sends one refresh attempt that another tab's session change can
+// abort (an aborted request's late Set-Cookie is discarded).
+async function sendRefresh() {
+  const abort = new AbortController();
+  refreshAbort = abort;
+  try {
+    return await postRefresh(abort.signal);
+  } finally {
+    if (refreshAbort === abort) refreshAbort = null;
+  }
+}
+
+/**
+ * Revokes the server-side refresh token. The whm_refresh cookie is only sent
+ * to /auth/refresh, so /auth/logout alone cannot revoke it; logout calls this
+ * first. Failures never block the logout. Every attempt stops once a newer
+ * session began (the marker left `endedMarker`), or another identity signed
+ * in, or `signal` aborted, which also aborts the request in flight.
+ */
+export async function revokeRefreshToken(
+  endedMarker?: string,
+  identity: string = storedIdentity(),
+  signal?: AbortSignal,
+): Promise<void> {
+  for (let attempt = 0; attempt <= REVOKE_RETRY_DELAYS_MS.length; attempt++) {
+    if (signal?.aborted) return;
+    // A different session signed in from another tab while this one waited:
+    // its token is not this logout's to revoke.
+    const current = storedIdentity();
+    if (current && current !== identity) return;
+    if (endedMarker !== undefined && readSessionMarker() !== endedMarker) return;
+    // Read the token on every attempt: a refresh in another tab rotates it.
+    // Without Web Locks nothing orders this revoke against a sign-in in
+    // another tab, so it presents the CSRF value recorded for the ended
+    // session: a newer session's cookies that land meanwhile then fail the
+    // server's check instead of being revoked.
+    const pinned = !webLocks();
+    const csrfToken = pinned ? recordedLogoutCsrf(endedMarker) : getCookie("whm_csrf");
+    if (!csrfToken) return;
+    let status: number | undefined;
+    try {
+      if (pinned) {
+        // Without Web Locks: cookie-neutral (this page cannot order a cookie
+        // change against other tabs, so it changes none; no /auth/logout
+        // follows), and with keepalive: the page may leave at once (a full
+        // navigation to the login page), and no other page finishes this
+        // revoke for it.
+        const response = await fetch(`${API_BASE_URL}/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+          keepalive: true,
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+          body: JSON.stringify({ revoke: true, keep_cookies: true }),
+          signal,
+        });
+        if (response.ok) return;
+        status = response.status;
+      } else {
+        await axios.post(
+          `${API_BASE_URL}/auth/refresh`,
+          { revoke: true },
+          {
+            withCredentials: true,
+            timeout: REVOKE_REQUEST_TIMEOUT_MS,
+            headers: { "X-CSRF-Token": csrfToken },
+            signal,
+          },
+        );
+        return;
+      }
+    } catch (error) {
+      if (signal?.aborted) return;
+      status = axios.isAxiosError(error) ? error.response?.status : undefined;
+    }
+    // The CSRF cookie was rotated mid-flight: try again with the new one
+    // (never without Web Locks: the new one may be a newer session's).
+    if (status === 403 && !pinned && getCookie("whm_csrf") !== csrfToken) continue;
+    // The revoke shares the per-IP refresh rate limit, which a busy clinic
+    // behind one NAT address can exhaust: wait and retry a 429. Anything else,
+    // or a last failure, still lets the logout go ahead.
+    if (status !== 429 || attempt >= REVOKE_RETRY_DELAYS_MS.length) return;
+    await delay(REVOKE_RETRY_DELAYS_MS[attempt], signal);
+  }
+}
+
+// storedIdentity identifies the signed-in user and organization of this
+// browser, so a logout can tell when another tab signed someone else in.
+function storedIdentity(): string {
+  try {
+    const user = JSON.parse(localStorage.getItem("user") || "null");
+    return user?.id ? `${user.id}|${user.organization_id ?? ""}` : "";
+  } catch {
+    return "";
+  }
+}
+
+// refreshWithRetry refreshes once, retrying transient failures (network,
+// timeout, 5xx, 429) with backoff. It throws the last error when the refresh
+// is definitively rejected or every retry failed.
+async function refreshWithRetry(
+  requestEpoch: number,
+  marker: string | null,
+): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    // The session changed (a logout, or a new sign-in) while this refresh was
+    // queued or backing off: it must not touch the new state.
+    if (readSessionMarker() !== marker || isEndedMarker(marker)) {
+      if (attempt > 0) showReconnectToast("dismiss");
+      throw sessionChangedError();
+    }
+    let response;
+    try {
+      response = await sendRefresh();
+    } catch (refreshError) {
+      // Stale work first: once the session changed, this outcome belongs to
+      // no one (no expiry, no reconnect state, no retry).
+      if (readSessionMarker() !== marker) {
+        if (attempt > 0) showReconnectToast("dismiss");
+        throw sessionChangedError();
+      }
+      // Without Web Locks (a session from before) another tab may have
+      // rotated the cookie while this request was in flight; its success is
+      // ours too.
+      if (readAuthEpoch() > requestEpoch) {
+        if (attempt > 0) showReconnectToast("dismiss");
+        return;
+      }
+      if (isDefinitiveRefreshFailure(refreshError)) {
+        if (attempt > 0) showReconnectToast("dismiss");
+        throw refreshError;
+      }
+      if (attempt >= REFRESH_RETRY_DELAYS_MS.length) {
+        showReconnectToast("unavailable");
+        emitAuthSessionState("unavailable");
+        throw refreshError;
+      }
+      if (attempt === 0) {
+        showReconnectToast("reconnecting");
+        emitAuthSessionState("reconnecting");
+      }
+      await delay(REFRESH_RETRY_DELAYS_MS[attempt]);
+      continue;
+    }
+    // A session change that started while this request was in flight waits
+    // for it (shared lock) and ends what it issued; leave no bookkeeping.
+    if (readSessionMarker() !== marker) {
+      if (attempt > 0) showReconnectToast("dismiss");
+      const now = readSessionMarker();
+      // This refresh rotated the session that has just ended: its pending
+      // logout must now go out with the new CSRF value.
+      if (now === ENDED_MARKER_PREFIX + (marker ?? "")) recordPendingCsrf(now);
+      throw sessionChangedError();
+    }
+    onSessionIssued(response?.data?.data?.expires_in);
+    noteBegunCsrf(marker);
+    if (attempt > 0) showReconnectToast("dismiss");
+    emitAuthSessionState(attempt > 0 ? "reconnected" : "refreshed");
+    return;
+  }
+}
+
+// refreshAcrossTabs serializes the refresh across all same-origin tabs. Each
+// tab re-checks the shared epoch once it holds the lock, so a tab whose 401
+// predates another tab's refresh just retries with the rotated cookie instead
+// of spending (and losing) the single-use refresh token again. Without Web
+// Locks it refuses (SESSION_UNSUPPORTED_CODE): a session that already existed
+// then ends (endUnsupportedSession).
+async function refreshAcrossTabs(
+  requestEpoch: number,
+  marker: string | null,
+): Promise<void> {
+  const run = async () => {
+    if (readSessionMarker() !== marker) throw sessionChangedError();
+    if (readAuthEpoch() > requestEpoch) return;
+    await refreshWithRetry(requestEpoch, marker);
+  };
+  const locks = webLocks();
+  if (locks) {
+    let entered = false;
+    try {
+      await locks.request(REFRESH_LOCK_NAME, () => {
+        entered = true;
+        return run();
+      });
+      return;
+    } catch (error) {
+      if (entered) throw error;
+      // The lock manager refused: as without Web Locks (below).
+      locksUnusable = true;
+    }
+  }
+  // Without Web Locks no refresh runs at all: its answer could land on a
+  // session another tab began. The caller ends the session instead.
+  throw sessionUnsupportedError();
+}
+
+// ensureFreshSession resolves once the session is newer than requestEpoch. A
+// single refresh per tab is in flight at a time; concurrent callers share it.
+// Work for a request sent under another session, or for an ended session, is
+// refused (sessionChangedError): it is never refreshed for or replayed.
+function ensureFreshSession(
+  requestEpoch: number,
+  requestMarker: string | null = readSessionMarker(),
+): Promise<void> {
+  const marker = readSessionMarker();
+  if (marker !== requestMarker || isEndedMarker(marker)) {
+    return Promise.reject(sessionChangedError());
+  }
+  if (readAuthEpoch() > requestEpoch) return Promise.resolve();
+  if (!refreshInFlight) {
+    refreshInFlight = refreshAcrossTabs(requestEpoch, marker).finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
+}
+
+function isSessionChange(error: unknown): boolean {
+  return axios.isAxiosError(error) && error.message === "The session changed";
+}
+
+/**
+ * Whether a sign-in or registration was answered after the browser's session
+ * changed elsewhere, so what it issued was undone here: the server has acted
+ * on it (an account created, an invitation used). The user should sign in.
+ */
+export function sentBeforeSessionChange(error: unknown): boolean {
+  if (!isSessionChange(error)) return false;
+  const config = (error as AxiosError).config as AuthAwareRequestConfig | undefined;
+  return config?._issueMarker !== undefined;
+}
+
+// onSessionChanged handles refresh work refused because the session changed or
+// ended: never an expiry or a replay. A tab still showing a session that
+// another tab ended leaves it, as a rejected refresh would have.
+function onSessionChanged() {
+  const marker = readSessionMarker();
+  if (isEndedMarker(marker) && marker !== endedHere && !isOnLoginPage()) {
+    expireSession();
+  }
+}
+
+// holdRefreshLock waits until no other work holds the shared refresh lock
+// (Web Locks), for at most SESSION_CHANGE_LOCK_WAIT_MS, then keeps refreshes
+// and other session changes out until release() is called. It resolves null
+// when the wait ran out: the caller must not go ahead as if it held the lock.
+// Ownership never lapses on a timer: only release() (or the page going away)
+// ends it, and the sign-in backstop calls release() for its own grant only.
+// Without Web Locks nothing else mutates cookies (no sign-in, exchange or
+// refresh runs there): the logout of a session that already existed goes
+// ahead at once.
+function holdRefreshLock(): Promise<(() => void) | null> {
+  const locks = webLocks();
+  if (!locks) return Promise.resolve(() => undefined);
+  return new Promise((resolveHold) => {
+    let timedOut = false;
+    let granted = false;
+    const controller =
+      typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller?.abort();
+      resolveHold(null);
+    }, SESSION_CHANGE_LOCK_WAIT_MS);
+    // The lock manager refused (it threw, or rejected before granting): this
+    // page has no usable Web Locks. Settle now, as without them, never at the
+    // 20 s cap; a session change then refuses as unsupported.
+    const unusable = () => {
+      if (timedOut || granted) return;
+      locksUnusable = true;
+      clearTimeout(timer);
+      resolveHold(holdRefreshLock());
+    };
+    try {
+      locks
+        .request(REFRESH_LOCK_NAME, controller ? { signal: controller.signal } : {}, () => {
+          if (timedOut) return undefined;
+          granted = true;
+          clearTimeout(timer);
+          return new Promise<void>((release) => resolveHold(() => release()));
+        })
+        .catch(unusable);
+    } catch {
+      unusable();
+    }
+  });
+}
+
+// finishLogout ends the server session of `ended` once the work ahead of it
+// on the shared lock has settled: a refresh or sign-in response applied after
+// the logout would otherwise put cookies back. The user has already left; this
+// only orders the network requests, within bounded waits.
+async function finishLogout(
+  ended: string,
+  identity?: string,
+  recorded = false,
+): Promise<void> {
+  const release = await holdRefreshLock();
+  try {
+    // The lock stayed busy: defer, never run unlocked. The pending record is
+    // finished by the next sign-in or page load (or a tab taking over).
+    if (!release) return;
+    try {
+      // A sign-in (in any tab) that got the lock first has already finished it.
+      if (recorded && readPendingLogout()?.marker !== ended) return;
+      await sendLogoutRequests(ended, identity);
+    } finally {
+      release();
+    }
+  } finally {
+    if (pendingLogoutMarker === ended) pendingLogoutMarker = null;
+  }
+}
+
+// sendLogoutRequests revokes the refresh token (aborted after
+// LOGOUT_REVOKE_BUDGET_MS) and then calls /auth/logout, for the session that
+// `ended` ended, unless a newer session began. The caller holds the lock.
+// A page that cannot hold the shared lock only revokes, cookie-neutral: the
+// cookie clearing stays pending for a page that can order it.
+async function sendLogoutRequests(ended: string, identity?: string): Promise<void> {
+  // A newer sign-in has begun: its session is not this logout's to end.
+  if (readSessionMarker() !== ended) return;
+  recordPendingCsrf(ended);
+  const revoke = new AbortController();
+  logoutRequests = revoke;
+  const budget = setTimeout(() => revoke.abort(), LOGOUT_REVOKE_BUDGET_MS);
+  try {
+    await revokeRefreshToken(ended, identity, revoke.signal);
+  } finally {
+    clearTimeout(budget);
+    // Nothing of the revoke may land after this point.
+    revoke.abort();
+  }
+  if (!webLocks()) return;
+  if (readSessionMarker() !== ended) return;
+  // Someone else signed in meanwhile: the cookies are theirs now.
+  const current = storedIdentity();
+  if (identity !== undefined && current && current !== identity) return;
+  const logout = new AbortController();
+  logoutRequests = logout;
+  const csrfToken = getCookie("whm_csrf");
+  try {
+    await axios.post(
+      `${API_BASE_URL}/auth/logout`,
+      {},
+      {
+        withCredentials: true,
+        timeout: LOGOUT_REQUEST_TIMEOUT_MS,
+        headers: csrfToken ? { "X-CSRF-Token": csrfToken } : {},
+        signal: logout.signal,
+      },
+    );
+    if (readPendingLogout()?.marker === ended) writeStoredValue(LOGOUT_PENDING_KEY, null);
+  } catch {
+    // The pending record stays: the next sign-in or page load retries it.
+  } finally {
+    if (logoutRequests === logout) logoutRequests = null;
+  }
+}
+
+// finishPendingLogout completes, under the lock the caller holds, a logout
+// whose tab went away before it got through (and that no sign-in has
+// superseded since).
+// The queued logout of the same record then finds nothing left to do.
+async function finishPendingLogout(): Promise<void> {
+  const pending = pendingLogoutApplies();
+  if (pending) await sendLogoutRequests(pending.marker);
+}
+
+
+// endIssuedSession revokes and clears what a sign-in or org switch response
+// just set, because the session ended while it was in flight. The caller holds
+// the lock.
+// A newer session begun meanwhile (in another tab) aborts it and stops it
+// before its /auth/logout.
+async function endIssuedSession(): Promise<void> {
+  const marker = readSessionMarker();
+  const controller = new AbortController();
+  logoutRequests = controller;
+  try {
+    const csrfToken = getCookie("whm_csrf");
+    if (csrfToken) {
+      await axios
+        .post(
+          `${API_BASE_URL}/auth/refresh`,
+          { revoke: true },
+          {
+            withCredentials: true,
+            timeout: REVOKE_REQUEST_TIMEOUT_MS,
+            headers: { "X-CSRF-Token": csrfToken },
+            signal: controller.signal,
+          },
+        )
+        .catch(() => undefined);
+    }
+    if (controller.signal.aborted || readSessionMarker() !== marker) return;
+    const current = getCookie("whm_csrf");
+    const pending = pendingLogoutApplies();
+    await axios
+      .post(
+        `${API_BASE_URL}/auth/logout`,
+        {},
+        {
+          withCredentials: true,
+          timeout: LOGOUT_REQUEST_TIMEOUT_MS,
+          headers: current ? { "X-CSRF-Token": current } : {},
+          signal: controller.signal,
+        },
+      )
+      .then(
+        () => {
+          // This also completed a logout that was still pending.
+          if (pending && readPendingLogout()?.marker === pending.marker) {
+            writeStoredValue(LOGOUT_PENDING_KEY, null);
+          }
+        },
+        () => undefined,
+      );
+  } finally {
+    if (logoutRequests === controller) logoutRequests = null;
+  }
+}
+
+// leftCookiesWithoutAnswer tells whether a sign-in or org switch that got no
+// answer left cookies of its own in the jar (to be undone under its lock).
+function leftCookiesWithoutAnswer(config: AuthAwareRequestConfig): boolean {
+  const marker = readSessionMarker();
+  const csrf = getCookie("whm_csrf");
+  if (marker !== config._issueMarker) {
+    // Another session began meanwhile (defensive: every session begins under
+    // the lock). Its cookies are intact while the jar holds the CSRF value it
+    // began with; otherwise this request's late cookies replaced them.
+    const begun = readBegunSession();
+    return !(begun && begun.marker === marker && begun.csrf === csrf);
+  }
+  // Nothing else can change the cookies under this lock: a changed CSRF
+  // cookie is this request's.
+  return csrf !== config._issueCsrf;
+}
+
+/**
+ * Called before the browser leaves for the identity provider. The SSO
+ * callback sets no cookie: the callback page exchanges a one-time code for
+ * the session (exchangeSsoCode), ordered under the lock like a password
+ * sign-in, so nothing needs ordering here. Without Web Locks it refuses: the
+ * exchange could not be ordered, and would be refused anyway.
+ */
+export async function beginSsoSignIn(): Promise<void> {
+  if (!webLocks()) throw sessionUnsupportedError();
+}
+
+/**
+ * Exchanges the one-time code an SSO callback put in the page URL for the
+ * session: POST /auth/refresh {"sso_exchange": code}, a session-issuing
+ * request with everything a password sign-in has (the lock, an earlier logout
+ * first, the new session only on success, the undo of a late or unanswered
+ * answer, the timeout). The code is single-use and bound to this browser.
+ * A received application 503 requires a fresh sign-in, never a replay of this
+ * single-use code (a store error does not prove it remains unspent). This
+ * failure path neither issues a new auth identity nor expires the previously
+ * settled session. Attempt code/binding/note bookkeeping may change; an earlier
+ * pending logout still settles before the exchange, under its existing rules.
+ */
+export function exchangeSsoCode(code: string) {
+  return api.post("/auth/refresh", { sso_exchange: code }, {
+    _ssoExchange: true,
+  } as AxiosRequestConfig);
+}
+
+// The SSO code a callback page took off its URL, kept in this tab until its
+// exchange is sent (a reload while the exchange waits for the lock retries
+// it). The server honours a code for 60 s.
+const SSO_CODE_KEY = "whm_sso_code";
+const SSO_CODE_LIFETIME_MS = 60_000;
+
+/** Keeps the callback's code in this tab until its exchange is sent. */
+export function keepSsoCode(code: string) {
+  try {
+    sessionStorage.setItem(SSO_CODE_KEY, JSON.stringify({ code, at: Date.now() }));
+  } catch {
+    // Without storage a reload just cannot retry.
+  }
+}
+
+/** The kept SSO code whose exchange was never sent, if it is still valid. */
+export function unsentSsoCode(): string | null {
+  try {
+    const kept = JSON.parse(sessionStorage.getItem(SSO_CODE_KEY) ?? "null");
+    if (typeof kept?.code === "string" && Date.now() - Number(kept.at) < SSO_CODE_LIFETIME_MS) {
+      return kept.code;
+    }
+    sessionStorage.removeItem(SSO_CODE_KEY);
+  } catch {
+    // Nothing kept.
+  }
+  return null;
+}
+
+function dropSsoCode() {
+  try {
+    sessionStorage.removeItem(SSO_CODE_KEY);
+  } catch {
+    // Nothing kept.
+  }
+}
+
+// Set (in this tab) when an SSO exchange is sent, with the session marker of
+// that moment, and cleared once its outcome is seen here. A tab that finds it
+// after a reload never saw the answer: the exchange's cookies may have landed
+// unseen, so the stored identity may not be the jar's session any more. It
+// stays (every reload, Back) until a newer session consistent with the jar
+// settles it: one another tab began, or a sign-in in this tab.
+const SSO_SENT_KEY = "whm_sso_sent";
+
+function noteSsoExchangeSent() {
+  try {
+    sessionStorage.setItem(SSO_SENT_KEY, JSON.stringify({ marker: readSessionMarker() }));
+  } catch {
+    // Without storage a reload cannot tell.
+  }
+}
+
+function clearSsoExchangeSent() {
+  try {
+    sessionStorage.removeItem(SSO_SENT_KEY);
+  } catch {
+    // Nothing noted.
+  }
+}
+
+/**
+ * Whether an SSO exchange this tab sent is still unsettled: its answer was
+ * never seen here (a reload cut it off). Until it is settled the tab must not
+ * show the stored identity, which may not be the jar's session. A newer
+ * session, consistent with the jar (its own CSRF value), that began after the
+ * exchange was sent settles it, and can be shown.
+ */
+export function ssoExchangeInterrupted(): boolean {
+  let sent: { marker: string | null } | null = null;
+  try {
+    sent = JSON.parse(sessionStorage.getItem(SSO_SENT_KEY) ?? "null");
+  } catch {
+    return false;
+  }
+  if (!sent) return false;
+  const marker = readSessionMarker();
+  const begun = readBegunSession();
+  const newerLive =
+    marker !== null &&
+    !isEndedMarker(marker) &&
+    marker !== sent.marker &&
+    begun?.marker === marker &&
+    begun.csrf === getCookie("whm_csrf");
+  if (newerLive) clearSsoExchangeSent();
+  return !newerLive;
+}
+
+/** Resolves once a logout started in this tab has finished in the background. */
+export function whenLogoutSettled(): Promise<void> {
+  return pendingLogout ?? Promise.resolve();
+}
+
+// Other same-origin tabs this tab has heard from. Only one whose liveness
+// stamp is fresh counts as able to take a logout over: a frozen, discarded or
+// crashed tab's stamp goes stale.
+const tabId = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+const otherTabs = new Set<string>();
+let tabChannel: BroadcastChannel | null = null;
+let tabHeartbeat: ReturnType<typeof setInterval> | null = null;
+
+function beatTab() {
+  writeStoredValue(TAB_ALIVE_PREFIX + tabId, String(Date.now()));
+}
+
+function startTabHeartbeat() {
+  if (!tabChannel) return;
+  beatTab();
+  if (tabHeartbeat === null) tabHeartbeat = setInterval(beatTab, TAB_HEARTBEAT_MS);
+}
+
+function stopTabHeartbeat() {
+  if (tabHeartbeat !== null) {
+    clearInterval(tabHeartbeat);
+    tabHeartbeat = null;
+  }
+  writeStoredValue(TAB_ALIVE_PREFIX + tabId, null);
+}
+
+function anotherTabAlive(): boolean {
+  for (const id of otherTabs) {
+    const at = readStoredNumber(TAB_ALIVE_PREFIX + id);
+    if (at > 0 && Date.now() - at < TAB_ALIVE_WINDOW_MS) return true;
+  }
+  return false;
+}
+
+function announceTab(type: "hello" | "here" | "bye") {
+  try {
+    tabChannel?.postMessage({ type, id: tabId });
+  } catch {
+    // Presence is best effort.
+  }
+}
+
+function startTabPresence() {
+  if (typeof BroadcastChannel === "undefined") return;
+  try {
+    tabChannel = new BroadcastChannel(TAB_CHANNEL_NAME);
+  } catch {
+    tabChannel = null;
+    return;
+  }
+  tabChannel.onmessage = (event: MessageEvent) => {
+    const { type, id } = (event.data ?? {}) as { type?: string; id?: unknown };
+    if (typeof id !== "string" || id === tabId) return;
+    if (type === "hello") {
+      otherTabs.add(id);
+      announceTab("here");
+    } else if (type === "here") {
+      otherTabs.add(id);
+    } else if (type === "bye") {
+      otherTabs.delete(id);
+      takeOverPendingLogout();
+    }
+  };
+  announceTab("hello");
+  startTabHeartbeat();
+}
+
+// A tab that closed with its logout still pending handed it over: finish it
+// here, ordered like any other.
+function takeOverPendingLogout() {
+  const pending = pendingLogoutApplies();
+  // A page without Web Locks takes nothing over: it could only revoke again.
+  if (!pending || pendingLogoutMarker === pending.marker || !webLocks()) return;
+  ownedLogout = pending.marker;
+  pendingLogoutMarker = pending.marker;
+  pendingLogout = finishLogout(pending.marker, undefined, true);
+}
+
+// The tab closes while a logout is still pending. If another live tab is open
+// it takes the logout over and finishes it under the lock. Otherwise this tab
+// revokes the session's refresh chain with keepalive, cookie-neutral
+// (keep_cookies): its answer may arrive after a newer session set its own
+// cookies, and must not clear them. The pending record stays, so the next page
+// load clears the old cookies, ordered. (Tabs that all close at the same moment
+// each see the others still live and leave it all to the next page load.)
+function sendLogoutOnPageHide() {
+  announceTab("bye");
+  stopTabHeartbeat();
+  // Without Web Locks the logout already revoked, cookie-neutral; the
+  // clearing is left to a page that holds the lock.
+  if (!webLocks()) return;
+  const pending = pendingLogoutApplies();
+  if (!pending || pending.marker !== ownedLogout || anotherTabAlive()) return;
+  const csrfToken = getCookie("whm_csrf");
+  if (!csrfToken) return;
+  try {
+    void fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ revoke: true, keep_cookies: true }),
+    }).catch(() => undefined);
+  } catch {
+    // Best effort.
+  }
+}
+
+function releaseSessionLock(config: unknown) {
+  const held = config as AuthAwareRequestConfig | undefined;
+  const release = held?._releaseSessionLock;
+  if (release) {
+    held._releaseSessionLock = undefined;
+    release();
+  }
+}
+
+function isOnLoginPage(): boolean {
+  try {
+    return window.location.pathname.replace(/\/+$/, "").endsWith("/login");
+  } catch {
+    return false;
+  }
+}
+
+function isUnsupported(error: unknown): boolean {
+  return axios.isAxiosError(error) && error.code === SESSION_UNSUPPORTED_CODE;
+}
+
+// endUnsupportedSession ends a session that existed in a browser without Web
+// Locks once it would need a refresh (which may not run there): logged out
+// cookie-neutral (the refresh chain revoked; the cookie clearing stays pending
+// for a page that holds the lock), and the user is sent to the login page,
+// which says why a sign-in is refused. Once: a second refresh need (another
+// 401, the proactive timer) finds the session already ended and only leaves.
+function endUnsupportedSession() {
+  if (!isEndedMarker(readSessionMarker())) void api.post("/auth/logout", {}).catch(() => undefined);
+  expireSession();
+}
+
+// expireSession ends the session after a definitive refresh rejection: clear
+// the browser identity and send the user to the login page.
+function expireSession() {
+  // Idempotent: a session already ended elsewhere keeps the same marker, so a
+  // logout still in progress for it is not cancelled.
+  endSessionMarker();
+  clearSessionTiming();
+  showReconnectToast("dismiss");
+  emitAuthSessionState("expired");
+
+  clearBrowserOrganizationIdentity();
+  for (const key of [
+    "user",
+    "auth_token",
+    "refresh_token",
+    "break_started_at",
+  ]) {
+    let removed = false;
+    try {
+      localStorage.removeItem(key);
+      removed = localStorage.getItem(key) === null;
+    } catch {
+      // Fall through to a non-sensitive tombstone where writes work.
+    }
+    if (!removed) {
+      try {
+        localStorage.setItem(key, "");
+      } catch {
+        // A denied storage backend must not skip redirect/isolation.
+      }
+    }
+  }
+  if (!isOnLoginPage()) {
+    window.location.href = basePath + "/login";
+  }
+}
+
+async function runProactiveRefresh() {
+  proactiveRefreshTimer = null;
+  // Hidden tabs wait for visibilitychange; a visible tab keeps the session warm.
+  if (document.visibilityState === "hidden" || !hasStoredUser()) return;
+  const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
+  if (!expiresAt) return;
+  if (expiresAt - Date.now() > PROACTIVE_REFRESH_LEAD_MS) {
+    // Another tab already extended the session.
+    scheduleProactiveRefresh();
+    return;
+  }
+  try {
+    await ensureFreshSession(readAuthEpoch());
+  } catch (refreshError) {
+    if (isSessionChange(refreshError)) {
+      onSessionChanged();
+    } else if (isDefinitiveRefreshFailure(refreshError)) {
+      expireSession();
+    } else if (isUnsupported(refreshError)) {
+      endUnsupportedSession();
+    }
+    // Transient failures keep the user signed in; the next 401 retries.
+  }
+}
+
+function scheduleProactiveRefresh() {
+  if (proactiveRefreshTimer !== null) {
+    clearTimeout(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+  const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
+  if (!expiresAt) return;
+  const wait = Math.min(
+    Math.max(0, expiresAt - PROACTIVE_REFRESH_LEAD_MS - Date.now()),
+    MAX_TIMER_DELAY_MS,
+  );
+  proactiveRefreshTimer = setTimeout(() => {
+    void runProactiveRefresh();
+  }, wait);
+}
+
+// The window and document listeners this module instance added.
+const detachers: Array<() => void> = [];
+
+function onWindow<K extends keyof WindowEventMap>(
+  type: K,
+  listener: (event: WindowEventMap[K]) => void,
+) {
+  window.addEventListener(type, listener);
+  detachers.push(() => window.removeEventListener(type, listener));
+}
+
+function onDocument<K extends keyof DocumentEventMap>(
+  type: K,
+  listener: (event: DocumentEventMap[K]) => void,
+) {
+  document.addEventListener(type, listener);
+  detachers.push(() => document.removeEventListener(type, listener));
+}
+
+/**
+ * Test-only: detaches this module instance (its window and document
+ * listeners, tab channel, heartbeat and timers), so that only an instance
+ * loaded later reacts to page events.
+ */
+export function disposeForTests() {
+  for (const detach of detachers.splice(0)) detach();
+  tabChannel?.close();
+  tabChannel = null;
+  if (tabHeartbeat !== null) {
+    clearInterval(tabHeartbeat);
+    tabHeartbeat = null;
+  }
+  if (proactiveRefreshTimer !== null) {
+    clearTimeout(proactiveRefreshTimer);
+    proactiveRefreshTimer = null;
+  }
+}
+
+if (typeof window !== "undefined" && typeof document !== "undefined") {
+  onDocument("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
+    if (expiresAt && expiresAt - Date.now() <= PROACTIVE_REFRESH_LEAD_MS) {
+      void runProactiveRefresh();
+    } else {
+      scheduleProactiveRefresh();
+    }
+  });
+  onWindow("storage", (event) => {
+    if (event.key === AUTH_EXPIRES_AT_KEY) scheduleProactiveRefresh();
+    // Another tab began a session: this tab's logout requests still in flight
+    // must not clear its cookies.
+    if (event.key === SESSION_MARKER_KEY && event.newValue && !isEndedMarker(event.newValue)) {
+      logoutRequests?.abort();
+    }
+    // Another tab's session change: this tab's refresh in flight is stale, and
+    // its late Set-Cookie must not land after that change.
+    if (event.key === SESSION_MARKER_KEY) refreshAbort?.abort();
+  });
+  onWindow("pagehide", sendLogoutOnPageHide);
+  onWindow("pageshow", (event) => {
+    // Back from the back/forward cache: say hello again.
+    if (event.persisted) {
+      announceTab("hello");
+      startTabHeartbeat();
+    }
+  });
+  startTabPresence();
+  scheduleProactiveRefresh();
+  // Probe the lock manager once at load: one that refuses (a sandboxed or
+  // opaque-origin page) counts as none before a first sign-in clears anything.
+  try {
+    const locks = webLocks();
+    if (locks && typeof locks.query === "function") {
+      lockProbe = locks.query().then(
+        () => undefined,
+        () => {
+          locksUnusable = true;
+        },
+      );
+    }
+  } catch {
+    locksUnusable = true;
+  }
+
+  if (pendingLogoutApplies() && webLocks()) {
+    // A logout that never got through (the tab closed first, or it failed):
+    // finish it now, ordered like any other. A page without Web Locks leaves
+    // it to one that holds the lock (it could only revoke again).
+    const pending = pendingLogoutApplies()!;
+    ownedLogout = pending.marker;
+    pendingLogoutMarker = pending.marker;
+    pendingLogout = finishLogout(pending.marker, undefined, true);
+  }
+}
+
 // Request interceptor to add CSRF token and organization header
 api.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
+    // Stamp the auth epoch and logical session the request is sent under.
+    (config as AuthAwareRequestConfig)._authEpoch = readAuthEpoch();
+    (config as AuthAwareRequestConfig)._sessionMarker = readSessionMarker();
+    const path = requestPath(config.url);
+    if (path === "/auth/logout") {
+      // The user leaves at once: this request answers immediately. The
+      // server-side logout (revoke, then /auth/logout) runs in the background,
+      // ordered after any refresh in flight, and every refresh queued or
+      // backing off for this session stops (the marker changed).
+      const identity = storedIdentity();
+      clearSessionTiming();
+      const ended = endSessionMarker();
+      endedHere = ended;
+      ownedLogout = ended;
+      writeStoredValue(
+        LOGOUT_PENDING_KEY,
+        JSON.stringify({ marker: ended, csrf: getCookie("whm_csrf") }),
+      );
+      pendingLogoutMarker = ended;
+      pendingLogout = finishLogout(ended, identity, readPendingLogout()?.marker === ended);
+      config.adapter = async (requestConfig) => ({
+        data: { data: { status: "logged_out" } },
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config: requestConfig,
+      });
+      return config;
+    }
     // Add CSRF token on mutating requests (cookie-based auth sends cookies automatically)
     const method = (config.method || "").toUpperCase();
     if (
@@ -76,6 +1416,83 @@ api.interceptors.request.use(
     if (organizationId) {
       config.headers.set("X-Organization-ID", organizationId);
     }
+    if (isSessionIssuing(config as AuthAwareRequestConfig, path)) {
+      // A sign-in or org switch waits (bounded; the caller shows its normal
+      // busy state) until refresh work and an earlier logout have settled,
+      // and keeps refreshes and logouts out until its own response (at most
+      // SESSION_ISSUING_TIMEOUT_MS). A successful sign-in starts a new logical
+      // session; an org switch keeps it (the auth epoch already retires
+      // refreshes issued before the switch).
+      const held = config as AuthAwareRequestConfig;
+      // A retried request (401, refresh, replay) starts afresh.
+      held._issueMarker = undefined;
+      held._issueCsrf = undefined;
+      // Without Web Locks nothing keeps this tab's new session apart from
+      // another tab's refresh or logout: refuse (outdated browser, or plain
+      // HTTP off localhost).
+      if (!webLocks()) return Promise.reject(sessionUnsupportedError(config));
+      const startMarker = readSessionMarker();
+      return holdRefreshLock().then(async (release) => {
+        // The lock stayed busy: refuse ("please try again"), never send unlocked.
+        if (!release) throw sessionBusyError(config);
+        // The lock manager refused meanwhile: as without Web Locks.
+        if (!webLocks()) {
+          release();
+          throw sessionUnsupportedError(config);
+        }
+        // The backstop, if no answer ever comes: abort the request and let go
+        // of the lock only once it has settled (its own error path releases
+        // it, after undoing whatever it set), never with it still in flight.
+        const transport = new AbortController();
+        const outer = config.signal;
+        if (outer?.aborted) transport.abort();
+        else outer?.addEventListener?.("abort", () => transport.abort());
+        config.signal = transport.signal;
+        const backstop = setTimeout(() => transport.abort(), SESSION_LOCK_BACKSTOP_MS);
+        held._releaseSessionLock = () => {
+          clearTimeout(backstop);
+          release();
+        };
+        if (path === "/auth/switch-org") {
+          // An org switch belongs to the session it was asked in: never after
+          // that session ended or another began.
+          const marker = readSessionMarker();
+          if (marker !== startMarker || isEndedMarker(marker)) {
+            releaseSessionLock(held);
+            throw sessionChangedError(config);
+          }
+        } else {
+          // A logout whose tab went away is completed first. If it still does
+          // not get through, no new session starts over the old one's
+          // cookies: refuse, and keep it pending.
+          await finishPendingLogout();
+          if (pendingLogoutApplies()) {
+            releaseSessionLock(held);
+            throw sessionBusyError(config);
+          }
+        }
+        held._issueMarker = readSessionMarker();
+        held._issueCsrf = getCookie("whm_csrf");
+        if (!config.timeout || config.timeout > SESSION_ISSUING_TIMEOUT_MS) {
+          config.timeout = SESSION_ISSUING_TIMEOUT_MS;
+        }
+        if (method !== "GET") {
+          const csrfToken = getCookie("whm_csrf");
+          if (csrfToken) {
+            config.headers.set("X-CSRF-Token", csrfToken);
+          } else {
+            config.headers.delete("X-CSRF-Token");
+          }
+        }
+        // The exchange goes out now: its code is spent, never to be resent,
+        // and until its outcome is seen here a reload must not guess it.
+        if (held._ssoExchange) {
+          dropSsoCode();
+          noteSsoExchangeSent();
+        }
+        return config;
+      });
+    }
     return config;
   },
   (error: AxiosError) => {
@@ -83,116 +1500,95 @@ api.interceptors.request.use(
   },
 );
 
-// Token refresh mutex — ensures only one refresh runs at a time.
-// Without this, multiple concurrent 401s each trigger a refresh, but the
-// single-use refresh token (JTI deleted from Redis) causes all but the first
-// to fail, which clears auth and logs the user out.
-let isRefreshing = false;
-let refreshSubscribers: Array<(success: boolean) => void> = [];
-
-function onRefreshComplete(success: boolean) {
-  refreshSubscribers.forEach((cb) => cb(success));
-  refreshSubscribers = [];
-}
-
-// refreshAccessToken posts to /auth/refresh. The refresh token is single-use
-// with rotation, so two tabs refreshing at once would have the loser's token
-// rejected as "revoked" and get logged out. The Web Locks API serializes the
-// refresh across all same-origin tabs: each tab refreshes in turn using the
-// cookie rotated by the previous holder, so every refresh succeeds instead of
-// racing. The in-tab `isRefreshing` mutex still dedupes concurrent 401s within
-// a single tab. Falls back to a plain request where Web Locks is unavailable
-// (older browsers / insecure contexts).
-async function refreshAccessToken(): Promise<void> {
-  const doRefresh = () =>
-    axios.post(`${API_BASE_URL}/auth/refresh`, {}, { withCredentials: true });
-
-  if (navigator.locks?.request) {
-    await navigator.locks.request("whm-token-refresh", async () => {
-      await doRefresh();
-    });
-  } else {
-    await doRefresh();
-  }
-}
-
-// Response interceptor for error handling
+// Response interceptor: session bookkeeping and 401 handling
 api.interceptors.response.use(
-  (response) => response,
-  async (error: AxiosError) => {
-    const originalRequest = error.config as InternalAxiosRequestConfig & {
-      _retry?: boolean;
-    };
-
-    // Skip token refresh logic for auth endpoints
-    const isAuthEndpoint = originalRequest?.url?.startsWith("/auth/");
-
-    // Handle 401 errors - try to refresh token (but not for auth endpoints)
-    if (
-      error.response?.status === 401 &&
-      !originalRequest._retry &&
-      !isAuthEndpoint
-    ) {
-      originalRequest._retry = true;
-
-      // If a refresh is already in flight, queue this request to wait for it
-      if (isRefreshing) {
-        return new Promise((resolve, reject) => {
-          refreshSubscribers.push((success: boolean) => {
-            if (success) {
-              resolve(api(originalRequest));
-            } else {
-              reject(error);
-            }
-          });
-        });
+  async (response: AxiosResponse) => {
+    const config = response.config as AuthAwareRequestConfig | undefined;
+    const path = requestPath(config?.url);
+    if (!isSessionIssuing(config, path)) return response;
+    // The exchange's answer is seen here: a reload from now on need not guess.
+    if (config?._ssoExchange) clearSsoExchangeSent();
+    try {
+      if (readSessionMarker() !== config?._issueMarker) {
+        // The session ended while this was in flight: what it just issued
+        // must not outlive that end. Revoke it and clear the jar (the lock is
+        // still held), and report no sign-in.
+        await endIssuedSession();
+        throw sessionChangedError(config);
       }
-
-      isRefreshing = true;
-
-      try {
-        // Browser sends whm_refresh cookie automatically via withCredentials.
-        // Serialized across tabs via Web Locks to avoid single-use-token races.
-        await refreshAccessToken();
-
-        // Cookies are updated by the server response — notify waiting requests
-        onRefreshComplete(true);
-        isRefreshing = false;
-
-        // Retry the original request
-        return api(originalRequest);
-      } catch {
-        // Refresh failed — notify waiting requests and redirect to login
-        onRefreshComplete(false);
-        isRefreshing = false;
-
-        clearBrowserOrganizationIdentity();
-        for (const key of [
-          "user",
-          "auth_token",
-          "refresh_token",
-          "break_started_at",
-        ]) {
-          let removed = false;
-          try {
-            localStorage.removeItem(key);
-            removed = localStorage.getItem(key) === null;
-          } catch {
-            // Fall through to a non-sensitive tombstone where writes work.
-          }
-          if (!removed) {
-            try {
-              localStorage.setItem(key, "");
-            } catch {
-              // A denied storage backend must not skip redirect/isolation.
-            }
-          }
+      if (path === "/auth/switch-org") {
+        // Same session, new cookies: keep its begun record current.
+        noteBegunCsrf(readSessionMarker());
+      } else {
+        beginSessionMarker();
+        if (config?._ssoExchange) {
+          // The SSO account's identity and organization are not the ones a
+          // previous session stored (a password sign-in clears them before
+          // it is sent; the callback page has nothing to clear until now).
+          // The callback page applies the answer's user next, as a sign-in
+          // does, with no request in between.
+          clearBrowserOrganizationIdentity();
+          writeStoredValue("user", null);
         }
-        window.location.href = basePath + "/login";
       }
+      onSessionIssued(response.data?.data?.expires_in);
+    } finally {
+      releaseSessionLock(config);
+    }
+    return response;
+  },
+  async (error: AxiosError) => {
+    // A sign-in or org switch that got no answer (timeout, network, abort) may
+    // still have had its cookies stored: if the CSRF cookie changed, undo what
+    // it issued before letting go of the lock.
+    const issuing = error.config as AuthAwareRequestConfig | undefined;
+    try {
+      if (
+        issuing?._releaseSessionLock &&
+        issuing._issueMarker !== undefined &&
+        !error.response &&
+        leftCookiesWithoutAnswer(issuing)
+      ) {
+        await endIssuedSession();
+      }
+      // Its outcome is seen (refused, or undone just now).
+      if (issuing?._ssoExchange) clearSsoExchangeSent();
+    } finally {
+      // First, so a 401 on an org switch can refresh without waiting on
+      // itself; and even if the undo threw.
+      releaseSessionLock(error.config);
+    }
+    const originalRequest = error.config as AuthAwareRequestConfig | undefined;
+
+    if (
+      error.response?.status !== 401 ||
+      !originalRequest ||
+      originalRequest._retry ||
+      isSessionlessAuthEndpoint(originalRequest.url)
+    ) {
+      return Promise.reject(error);
     }
 
-    return Promise.reject(error);
+    // One retry per request: either after a refresh, or straight away when
+    // the cookie was already rotated after this request was sent. Never for
+    // a request sent under another (or an ended) session.
+    originalRequest._retry = true;
+    const requestMarker = originalRequest._sessionMarker ?? null;
+    try {
+      await ensureFreshSession(originalRequest._authEpoch ?? 0, requestMarker);
+    } catch (refreshError) {
+      if (isSessionChange(refreshError)) {
+        onSessionChanged();
+      } else if (isDefinitiveRefreshFailure(refreshError)) {
+        expireSession();
+      } else if (isUnsupported(refreshError)) {
+        endUnsupportedSession();
+      }
+      // Transient failure: keep the user signed in and surface the 401.
+      return Promise.reject(error);
+    }
+    if (readSessionMarker() !== requestMarker) return Promise.reject(error);
+    return api(originalRequest);
   },
 );
 

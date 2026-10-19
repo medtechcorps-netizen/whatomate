@@ -3,7 +3,14 @@ import { ref, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
-import { api } from '@/services/api'
+import {
+  api,
+  beginSsoSignIn,
+  sessionsSupported,
+  whenSessionsSupportKnown,
+  SESSION_BUSY_CODE,
+  SESSION_UNSUPPORTED_CODE,
+} from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -30,6 +37,9 @@ const ssoProviders = ref<SSOProvider[]>([])
 const organization = ref('')
 const isSSODiscovering = ref(false)
 const hasDiscoveredSSO = ref(false)
+// Without Web Locks no sign-in can start here, and a session from before ends
+// at its first refresh need and lands here: say why up front.
+const browserUnsupported = ref(!sessionsSupported())
 
 // SSO provider icons (using simple SVG paths)
 const providerIcons: Record<string, string> = {
@@ -82,6 +92,12 @@ watch(organization, () => {
 })
 
 onMounted(async () => {
+  void whenSessionsSupportKnown().then((supported) => {
+    browserUnsupported.value = !supported
+  })
+  // An email handed over (say, after a registration that needs a sign-in).
+  if (typeof route.query.email === 'string' && !email.value) email.value = route.query.email
+
   // Check for SSO error in query params
   const ssoError = route.query.sso_error as string
   if (ssoError) {
@@ -104,6 +120,13 @@ const handleLogin = async () => {
     toast.error(t('auth.enterEmailPassword'))
     return
   }
+  // Without Web Locks no sign-in is sent: say so before a sign-in attempt
+  // clears the stored identity.
+  if (!sessionsSupported()) {
+    browserUnsupported.value = true
+    toast.error(t('errors.unsupportedBrowser'))
+    return
+  }
 
   isLoading.value = true
 
@@ -114,17 +137,58 @@ const handleLogin = async () => {
     const redirect = route.query.redirect as string
     router.push(redirect || '/')
   } catch (error: any) {
-    const message = error.response?.data?.message || t('auth.invalidCredentials')
+    // A sign-in that could not be ordered after an earlier logout in time is
+    // refused, not sent; a timeout or a lost answer is not a wrong password
+    // either. In both cases the user just tries again.
+    let message: string
+    if (error?.code === SESSION_UNSUPPORTED_CODE) {
+      // No Web Locks: this browser cannot keep sessions apart across tabs.
+      browserUnsupported.value = true
+      message = t('errors.unsupportedBrowser')
+    } else if (
+      error?.code === SESSION_BUSY_CODE ||
+      error?.code === 'ERR_CANCELED' ||
+      error?.code === 'ECONNABORTED' ||
+      error?.code === 'ETIMEDOUT'
+    ) {
+      message = t('errors.timeout')
+    } else if (!error?.response) {
+      message = t('errors.network')
+    } else {
+      message = error.response.data?.message || t('auth.invalidCredentials')
+    }
     toast.error(message)
   } finally {
     isLoading.value = false
   }
 }
 
-const initiateSSO = (provider: string) => {
+const isSSOStarting = ref(false)
+
+const initiateSSO = async (provider: string) => {
   const selector = organization.value.trim().toLowerCase()
   if (!selector) {
     toast.error(t('auth.workspaceCodeRequired'))
+    return
+  }
+  if (isSSOStarting.value) return
+  if (!sessionsSupported()) {
+    browserUnsupported.value = true
+    toast.error(t('errors.unsupportedBrowser'))
+    return
+  }
+  isSSOStarting.value = true
+  // The session begins only at the callback's code exchange, under the lock
+  // like a password sign-in. The page stays busy until it leaves for the
+  // provider.
+  try {
+    await beginSsoSignIn()
+  } catch (error: any) {
+    isSSOStarting.value = false
+    if (error?.code === SESSION_UNSUPPORTED_CODE) browserUnsupported.value = true
+    toast.error(
+      error?.code === SESSION_UNSUPPORTED_CODE ? t('errors.unsupportedBrowser') : t('errors.timeout'),
+    )
     return
   }
   const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
@@ -163,6 +227,14 @@ const initiateSSO = (provider: string) => {
           </div>
 
           <div class="rounded-[1.4rem] border border-white/[0.09] bg-white/[0.035] p-5 shadow-2xl shadow-black/20 backdrop-blur-xl light:border-[#697046]/15 light:bg-white/70 light:shadow-[#545a37]/10 sm:p-6">
+            <div
+              v-if="browserUnsupported"
+              role="alert"
+              data-testid="login-unsupported-notice"
+              class="mb-5 rounded-xl border border-red-400/30 bg-red-500/[0.08] px-4 py-3 text-sm leading-5 text-red-100 light:border-red-600/25 light:bg-red-50 light:text-red-800"
+            >
+              {{ $t('errors.unsupportedBrowser') }}
+            </div>
             <form @submit.prevent="handleLogin">
               <div class="space-y-5">
                 <div class="space-y-2">
@@ -270,9 +342,11 @@ const initiateSSO = (provider: string) => {
                 :class="providerColors[provider.provider] || providerColors.custom"
                 type="button"
                 :data-testid="`sso-provider-${provider.provider}`"
+                :disabled="isSSOStarting"
                 @click="initiateSSO(provider.provider)"
               >
-                <svg class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+                <Loader2 v-if="isSSOStarting" class="h-5 w-5 animate-spin" />
+                <svg v-else class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
                   <path :d="providerIcons[provider.provider] || providerIcons.custom" />
                 </svg>
                 {{ provider.name }}
