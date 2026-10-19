@@ -513,8 +513,11 @@ test.describe('Logout during a token refresh', () => {
     const newContext = () => playwright.request.newContext({ baseURL })
     await loginAsAdmin(page)
     const originalRefresh = await cookieValue(context, 'whm_refresh')
+    // The lock holder is a same-origin page that is not the app: an app tab
+    // showing the session would leave it when it ends (a full navigation,
+    // which lets go of the lock).
     const other = await context.newPage()
-    await other.goto('/', { waitUntil: 'domcontentloaded' })
+    await other.goto('/health', { waitUntil: 'domcontentloaded' })
 
     const order: string[] = []
     const sent = recordSessionRequests(context, order)
@@ -537,8 +540,16 @@ test.describe('Logout during a token refresh', () => {
     await exchange.started
     await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 30_000 })
 
-    // The exchange waited for the logout ahead of it.
-    expect(order.slice(0, 3)).toEqual(['revoke', 'logout', 'exchange'])
+    // The exchange waited for the logout ahead of it: the one /auth/logout,
+    // and every revoke, went out before it. (The page left for the provider
+    // while its logout waited: with no other app tab to take it over, the
+    // closing page revoked with keepalive, cookie-neutral, and the callback
+    // page finished the logout, ordered, before its exchange.)
+    const exchangeAt = order.indexOf('exchange')
+    expect(exchangeAt).toBeGreaterThan(0)
+    expect(order.filter((kind) => kind === 'logout')).toHaveLength(1)
+    expect(order.indexOf('logout')).toBeLessThan(exchangeAt)
+    expect(order.slice(0, exchangeAt).every((kind) => kind === 'revoke' || kind === 'logout')).toBe(true)
     const issued = exchange.cookies()
     // Nothing of the old logout carried B's cookies or CSRF token...
     for (const request of sent) {
@@ -998,8 +1009,11 @@ test.describe('Logout during a token refresh', () => {
     const newContext = () => playwright.request.newContext({ baseURL })
     await loginAsAdmin(page)
     const originalRefresh = await cookieValue(context, 'whm_refresh')
+    // The lock holder is a same-origin page that is not the app: an app tab
+    // showing the session would leave it when it ends (a full navigation,
+    // which lets go of the lock).
     const other = await context.newPage()
-    await other.goto('/', { waitUntil: 'domcontentloaded' })
+    await other.goto('/health', { waitUntil: 'domcontentloaded' })
     const order: string[] = []
     recordSessionRequests(context, order)
     page.on('request', (request) => {
@@ -1081,10 +1095,18 @@ test.describe('Logout during a token refresh', () => {
       before[name] = await cookieValue(context, name)
       expect(before[name]).toBeTruthy()
     }
-    const stored = await page.evaluate(() => ({
-      user: localStorage.getItem('user'),
-      organization: localStorage.getItem('selected_organization_id'),
-    }))
+    // The stored identity: who, and which organization. (The app may rewrite
+    // the stored user in the background with a fuller profile of the same
+    // user; that is not a change of identity.)
+    const storedIdentity = () =>
+      page.evaluate(() => {
+        const user = JSON.parse(localStorage.getItem('user') ?? 'null')
+        return {
+          user: user && { id: user.id, email: user.email, organization_id: user.organization_id },
+          organization: localStorage.getItem('selected_organization_id'),
+        }
+      })
+    const stored = await storedIdentity()
     expect(stored.user).toBeTruthy()
     const other = await context.newPage()
     await other.addInitScript(withoutWebLocks)
@@ -1118,12 +1140,7 @@ test.describe('Logout during a token refresh', () => {
     expect(issuing).toEqual([])
 
     // The stored identity is untouched, and the first tab still shows A.
-    expect(
-      await page.evaluate(() => ({
-        user: localStorage.getItem('user'),
-        organization: localStorage.getItem('selected_organization_id'),
-      })),
-    ).toEqual(stored)
+    expect(await storedIdentity()).toEqual(stored)
     await page.reload({ waitUntil: 'domcontentloaded' })
     expect(page.url()).not.toContain('/login')
     expect(JSON.parse((await page.evaluate(() => localStorage.getItem('user')))!).email).toBe(TEST_USERS.admin.email)
