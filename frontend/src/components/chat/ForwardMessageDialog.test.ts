@@ -359,6 +359,9 @@ describe('forward capacity contract (client)', () => {
     expect(forwardDeliveryState(forward({ forward_dispatch: 'provider', forward_dispatch_at: at(60_000) }), now)).toBeNull()
     // No marker on this copy: the server's state at fetch time.
     expect(forwardDeliveryState(forward({ forward_delivery_state: 'uncertain' }), now)).toBe('uncertain')
+    // A stalled server state wins when a skewed local clock says "not yet".
+    expect(forwardDeliveryState(forward({ forward_dispatch: 'queued', created_at: at(60_000), forward_delivery_state: 'delayed' }), now)).toBe('delayed')
+    expect(forwardDeliveryState(forward({ forward_dispatch: 'provider', forward_dispatch_at: at(60_000), forward_delivery_state: 'uncertain' }), now)).toBe('uncertain')
     expect(forwardDeliveryState(forward({ forward_delivery_state: 'interrupted' }), now)).toBeNull()
     // Settled since the fetch, or not a forward: no state.
     expect(forwardDeliveryState(forward({ status: 'sent', forward_delivery_state: 'delayed' }), now)).toBeNull()

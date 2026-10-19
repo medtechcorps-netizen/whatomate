@@ -86,8 +86,9 @@ export const FORWARD_STALLED_AFTER_MS = 3 * 60_000
  * - "uncertain": a send attempt began (provider phase) but its result was not
  *   recorded past the stall age; it may have been sent.
  * The dispatch marker comes with the message (GET and the forward response),
- * so an open chat applies the rule as the message ages; without it, the
- * server's state at fetch time is used. Only a pending forward has a state.
+ * so an open chat applies the rule as the message ages. A stalled state the
+ * server already reported still wins when the local clock (which may be
+ * skewed) says "not yet". Only a pending forward has a state.
  */
 export function forwardDeliveryState(message: Message, now: number = Date.now()): ForwardDeliveryState {
   if (message.status !== 'pending' || !isForwardedMessage(message)) return null
@@ -100,14 +101,14 @@ export function forwardDeliveryState(message: Message, now: number = Date.now())
     const at = since ? Date.parse(since) : Number.NaN
     return Number.isFinite(at) && now - at > FORWARD_STALLED_AFTER_MS
   }
-  if (extended.forward_dispatch === 'queued') {
-    return stalledSince(message.created_at) ? 'delayed' : null
-  }
-  if (extended.forward_dispatch === 'provider') {
-    return stalledSince(extended.forward_dispatch_at || message.updated_at) ? 'uncertain' : null
+  let derived: ForwardDeliveryState = null
+  if (extended.forward_dispatch === 'queued' && stalledSince(message.created_at)) {
+    derived = 'delayed'
+  } else if (extended.forward_dispatch === 'provider' && stalledSince(extended.forward_dispatch_at || message.updated_at)) {
+    derived = 'uncertain'
   }
   const server = extended.forward_delivery_state
-  return server === 'delayed' || server === 'uncertain' ? server : null
+  return derived ?? (server === 'delayed' || server === 'uncertain' ? server : null)
 }
 
 /** How often an open chat re-applies the stall rule. */

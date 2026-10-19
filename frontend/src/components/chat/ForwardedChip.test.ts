@@ -73,6 +73,20 @@ describe('ForwardedChip', () => {
     expect(note.text()).toBe('chat.forward.uncertainDeliveryNote')
   })
 
+  it('runs one shared clock only while a chip is mounted', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    const before = vi.getTimerCount()
+    const first = mountChip(forward())
+    const second = mountChip(forward({ id: 'f-2' }))
+    expect(vi.getTimerCount()).toBe(before + 1)
+    first.unmount()
+    expect(vi.getTimerCount()).toBe(before + 1)
+    second.unmount()
+    expect(vi.getTimerCount()).toBe(before)
+    mounted.splice(0)
+  })
+
   it('uses the server state when this copy has no marker', () => {
     const note = mountChip(forward({ forward_dispatch: undefined, forward_delivery_state: 'delayed' }))
       .get('[data-forward-delivery-state]')

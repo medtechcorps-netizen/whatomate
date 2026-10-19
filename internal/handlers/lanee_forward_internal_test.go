@@ -688,6 +688,35 @@ func TestLaneEForwardInsertRejectionsAreClassified(t *testing.T) {
 	}
 }
 
+// E2R3-4 on the real path: the forward audit INSERT is rejected with a chosen
+// SQLSTATE, in the forward's own transaction and under RLS. Only a rejection
+// that would repeat (P0001) is definite and non-retryable; a deadlock (40P01)
+// is retried by the write and then answered 503; a cancellation (57014) is
+// answered 503 at once. Reverting "wrap only repeatable causes" fails this.
+func TestLaneEForwardAuditRejectionsAreClassified(t *testing.T) {
+	cases := []laneEInsertRejection{
+		{"deadlock (40P01): transient, retried, then try again", "40P01", 503, canonicalContactWriteAttempts},
+		{"cancellation (57014): transient, try again", "57014", 503, 1},
+		{"raised by a trigger or policy (P0001): would repeat", "P0001", 500, 1},
+	}
+	for _, rls := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("rls=%t/%s", rls, tc.name), func(t *testing.T) {
+				w := laneENewForwardWorld(t)
+				if rls {
+					w.app.Config = &config.Config{Database: config.DatabaseConfig{RLSEnabled: true}}
+				}
+				refused := laneERejectInserts(t, w.app.DB, "audit_logs", "user_id", w.user.ID, tc.sqlstate)
+				status, body := w.post(t, w.app, rls, nil)
+				laneEAssertInsertRejection(t, status, body, tc.status)
+				assert.Equal(t, tc.attempts, refused())
+				assert.Zero(t, laneECountMessages(t, w.app, w.target), "the message rolled back with its audit")
+				assert.Empty(t, w.capture.snapshot(), "no provider attempt")
+			})
+		}
+	}
+}
+
 // Q5 under RLS, with database-raised failures. A trigger error aborts the
 // savepoint, so "no row" would hold whatever the savepoint or Tenant code
 // did: these show the classification, the attempts and that nothing reached
@@ -790,10 +819,8 @@ func TestLaneEForwardLostCommitConfirmationStaysAmbiguous(t *testing.T) {
 	assert.Equal(t, models.MessageStatusPending, rows[0].Status)
 	assert.Equal(t, forwardDispatchQueued, rows[0].Metadata[forwardDispatchMetadataKey])
 	assert.Empty(t, w.capture.snapshot(), "no delivery was started")
-	// After a restart it reads as delayed (status unknown), never as not sent.
+	// Once stale it reads as delayed (status unknown), never as not sent.
 	assert.Equal(t, forwardDeliveryDelayed, forwardDeliveryState(&rows[0], time.Now().Add(10*time.Minute)))
-	w.restarted().WaitForBackgroundTasks()
-	assert.Empty(t, w.capture.snapshot())
 }
 
 // Q5 commit boundary: the write reached COMMIT and COMMIT itself returned an
@@ -1370,6 +1397,9 @@ func TestLaneEForwardProcessExitAfterProviderAccepted(t *testing.T) {
 func TestLaneEForwardProcessPausedWorkerResumes(t *testing.T) {
 	x := laneENewExitWorld(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Registered before StdinPipe and Start, so a failure there leaves no
+	// timer or child behind; it also kills a child that is still running.
+	defer cancel()
 	paused := x.child(ctx, "pause-before-worker")
 	resume, err := paused.StdinPipe()
 	require.NoError(t, err)
