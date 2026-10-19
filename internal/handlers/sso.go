@@ -106,8 +106,44 @@ var providerDisplayNames = map[string]string{
 	"custom":    "Custom SSO",
 }
 
+// SSO availability gate. Single sign-on is offered only when this server runs
+// in the "development" or "test" environment (Config.App.Environment, matched
+// exactly). Elsewhere every entry point that lists, starts, completes or
+// enables an SSO sign-in refuses: GetPublicSSOProviders (empty list),
+// InitSSO, CallbackSSO, exchangeSSOSession and enabling a provider in
+// UpdateSSOProvider. Reading, disabling and deleting provider settings, and
+// password sign-in, refresh, revoke and logout, are unaffected.
+//
+// This is a temporary availability gate, not identity binding: it does not
+// decide who may sign in through which provider. Removing it requires the
+// separately reviewed SSO identity-binding repair.
+const ssoUnavailableMessage = "Single sign-on is temporarily unavailable."
+
+// ssoAvailableInEnvironment reports whether SSO is offered in environment.
+// Only the exact canonical names qualify; an empty, unknown or differently
+// written value refuses.
+func ssoAvailableInEnvironment(environment string) bool {
+	switch environment {
+	case "development", "test":
+		return true
+	default:
+		return false
+	}
+}
+
+// ssoAvailable applies ssoAvailableInEnvironment to this server. A missing
+// configuration refuses.
+func (a *App) ssoAvailable() bool {
+	return a != nil && a.Config != nil && ssoAvailableInEnvironment(a.Config.App.Environment)
+}
+
 // GetPublicSSOProviders returns enabled SSO providers for login page (public, no auth)
 func (a *App) GetPublicSSOProviders(r *fastglue.Request) error {
+	if !a.ssoAvailable() {
+		// Same answer as an organization with no provider, before any query.
+		r.RequestCtx.Response.Header.Set("Cache-Control", "no-store")
+		return r.SendEnvelope([]SSOProviderPublic{})
+	}
 	var providers []models.SSOProvider
 	organization, validSelector := normalizeSSOOrganizationSelector(
 		string(r.RequestCtx.QueryArgs().Peek("organization")),
@@ -164,6 +200,9 @@ func (a *App) GetPublicSSOProviders(r *fastglue.Request) error {
 
 // InitSSO initiates OAuth flow for a provider
 func (a *App) InitSSO(r *fastglue.Request) error {
+	if !a.ssoAvailable() {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, ssoUnavailableMessage, nil, "")
+	}
 	provider := r.RequestCtx.UserValue("provider").(string)
 
 	// Validate provider
@@ -265,6 +304,12 @@ type ssoExchangeGrant struct {
 // redirects to the frontend callback page, which exchanges the code under
 // the app's session lock (POST /auth/refresh {"sso_exchange": code}).
 func (a *App) CallbackSSO(r *fastglue.Request) error {
+	if !a.ssoAvailable() {
+		// Before the state is read or redeemed: an already-issued state does
+		// not complete a sign-in either.
+		a.redirectWithError(r, ssoUnavailableMessage)
+		return nil
+	}
 	provider := r.RequestCtx.UserValue("provider").(string)
 	code := string(r.RequestCtx.QueryArgs().Peek("code"))
 	stateNonce := string(r.RequestCtx.QueryArgs().Peek("state"))
@@ -504,6 +549,12 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 // Only a JSON body is accepted: the refresh route is CSRF-exempt, and a
 // cross-site form can send a form body but not a JSON one.
 func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {
+	if !a.ssoAvailable() {
+		// Before the code is redeemed or the binding cookie touched: a grant
+		// issued earlier does not complete a sign-in either. Plain refresh and
+		// revoke on the same route are not gated.
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, ssoUnavailableMessage, nil, "")
+	}
 	invalid := func(reason string) error {
 		a.Log.Warn("SSO exchange rejected", "reason", reason)
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid or expired sign-in, please try again", nil, "")
@@ -625,6 +676,11 @@ func (a *App) UpdateSSOProvider(r *fastglue.Request) error {
 	var req SSOProviderRequest
 	if err := a.decodeRequest(r, &req); err != nil {
 		return nil
+	}
+	if req.IsEnabled && !a.ssoAvailable() {
+		// Creating, re-enabling or re-saving an enabled provider is refused
+		// before anything is read, encrypted or saved. Disabled edits proceed.
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, ssoUnavailableMessage, nil, "")
 	}
 
 	// Validate custom provider fields
@@ -949,7 +1005,10 @@ func (a *App) fetchGitHubEmail(token *oauth2.Token) (string, error) {
 }
 
 func (a *App) redirectWithError(r *fastglue.Request, message string) {
-	basePath := sanitizeRedirectPath(a.Config.Server.BasePath)
+	basePath := ""
+	if a.Config != nil {
+		basePath = sanitizeRedirectPath(a.Config.Server.BasePath)
+	}
 	encodedMsg := url.QueryEscape(message)
 	redirectURL := fmt.Sprintf("%s/login?sso_error=%s", basePath, encodedMsg)
 	r.RequestCtx.Redirect(redirectURL, fasthttp.StatusTemporaryRedirect)

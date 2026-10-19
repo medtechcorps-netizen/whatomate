@@ -96,7 +96,7 @@ func newSSOApp(t *testing.T) *handlers.App {
 	t.Helper()
 	app := newTestApp(t)
 	app.Config = &config.Config{
-		App:    config.AppConfig{Environment: "development", EncryptionKey: ssoTestEncryptionKey},
+		App:    config.AppConfig{Environment: "test", EncryptionKey: ssoTestEncryptionKey},
 		JWT:    config.JWTConfig{Secret: testutil.TestJWTSecret, AccessExpiryMins: 15, RefreshExpiryDays: 7},
 		Server: config.ServerConfig{},
 	}
