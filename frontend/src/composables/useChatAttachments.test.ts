@@ -831,6 +831,232 @@ describe('useChatAttachments deadlines and the last file', () => {
   })
 })
 
+describe('useChatAttachments reply with attachment', () => {
+  it('asks for the reply with the batch patient, and only the first file quotes it', async () => {
+    const replyTo = vi.fn(() => 'incoming-1')
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo, onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png'), file('c.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(replyTo).toHaveBeenCalledTimes(1)
+    expect(replyTo).toHaveBeenCalledWith(expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+    expect(onReplySent).toHaveBeenCalledWith('incoming-1', expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await settle()
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm3' })
+    await done
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not move the quote to the next file when the first one fails', async () => {
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(new Error('Failed to send message'))
+    await settle()
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+
+    // Retrying the failed first file quotes again while the reply is still set.
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[2].request.file.name).toBe('a.png')
+    expect(calls[2].request.reply_to_message_id).toBe('incoming-1')
+    calls[2].result.resolve({ id: 'm1' })
+    await retry
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the reply when the provider rejects the quoting file', async () => {
+    const live = realtime()
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent, subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'failed', error_message: 'Reply context invalid' } })
+    await settle()
+    calls[1].result.resolve({ id: 'm2', status: 'sent' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+  })
+
+  it('sends without a quote when there is no reply', async () => {
+    const { attachments, calls } = setup({ replyTo: () => undefined })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+  })
+})
+
+describe('useChatAttachments reply quote ownership', () => {
+  function replyRefused() {
+    return Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { message: 'Reply message not found for this contact' } },
+    })
+  }
+
+  it('binds the quote to the first file when the batch starts', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(attachments.items.value.map(item => item.quotesReply)).toEqual(['incoming-1', null])
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+  })
+
+  it('(a) unconfirmed A + failed B: retrying B does not inherit A\'s quote', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', responseDeadlineMs: 20 })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
+    calls[0].progress(100, 100)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    await settle()
+    calls[1].result.reject(new Error('Failed to send message'))
+    await done
+    expect(attachments.items.value.map(item => item.status)).toEqual(['unconfirmed', 'failed'])
+
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[2].request.file.name).toBe('b.png')
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm2' })
+    await retry
+  })
+
+  it('(b) A fails and is removed: retrying B does not inherit the quote', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(new Error('Failed to send message'))
+    await settle()
+    calls[1].result.reject(new Error('Failed to send message'))
+    await done
+
+    attachments.remove(attachments.items.value[0].id)
+    expect(attachments.items.value.map(item => item.file.name)).toEqual(['b.png'])
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[2].request.file.name).toBe('b.png')
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm2' })
+    await retry
+  })
+
+  it('a resumed run after Stop does not move the quote to the next file', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(30, 100)
+    attachments.stop()
+    await done
+    expect(attachments.items.value.map(item => item.status)).toEqual(['unconfirmed', 'ready'])
+
+    const resumed = attachments.sendAll()
+    await settle()
+    expect(calls[1].request.file.name).toBe('b.png')
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await resumed
+  })
+
+  it('the owner sends without the quote once the agent cancels the reply', async () => {
+    let reply: string | undefined = 'incoming-1'
+    const { attachments, calls } = setup({ replyTo: () => reply })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(new Error('Failed to send message'))
+    await done
+    reply = undefined
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm1' })
+    await retry
+  })
+
+  it('offers send-without-quote when the server refuses the reply, and the quote never moves', async () => {
+    const onReplyRejected = vi.fn()
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplyRejected, onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(replyRefused())
+    await settle()
+    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', replyRejected: true })
+    expect(onReplyRejected).toHaveBeenCalledWith('incoming-1', expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.reject(new Error('Failed to send message'))
+    await done
+
+    // Only A is resent, as a plain attachment; B's failure is left for Retry.
+    const plain = attachments.sendWithoutQuote(attachments.items.value[0].id)
+    await settle()
+    expect(calls).toHaveLength(3)
+    expect(calls[2].request.file.name).toBe('a.png')
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm1' })
+    await plain
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'failed'])
+    expect(onReplySent).not.toHaveBeenCalled()
+
+    // Even with the reply still selected, no other file picks the quote up.
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[3].request.file.name).toBe('b.png')
+    expect(calls[3].request).not.toHaveProperty('reply_to_message_id')
+    calls[3].result.resolve({ id: 'm2' })
+    await retry
+  })
+
+  it('ignores send-without-quote for a file the server did not refuse', async () => {
+    const { attachments } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png')])
+    expect(await attachments.sendWithoutQuote(attachments.items.value[0].id)).toBeNull()
+  })
+
+  it('a new staging session can quote again', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png')])
+    const first = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1' })
+    await first
+    // All sent: the dialog closed and its claims went with it.
+    attachments.stage([file('b.png', 'image/png')])
+    const second = attachments.sendAll()
+    await settle()
+    expect(calls[1].request.reply_to_message_id).toBe('incoming-1')
+    calls[1].result.resolve({ id: 'm2' })
+    await second
+  })
+})
+
 describe('useChatAttachments workspace and session binding', () => {
   // Reactive identity: a same-tab change through the stores.
   function reactiveIdentity(marker: string | null = 'session-1') {
@@ -1099,486 +1325,6 @@ describe('useChatAttachments ambiguous failure after upload (FU-12)', () => {
   })
 })
 
-describe('useChatAttachments round 4: workspace identity, holds and teardown', () => {
-  afterEach(() => {
-    // Lift the module-level override suppression set by an SPA login.
-    setSelectedOrganizationId('cleanup')
-    localStorage.clear()
-  })
-
-  it('B-WS-1: sees another tab switching organization after an SPA login (override suppressed)', async () => {
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
-    clearBrowserOrganizationIdentity()
-    const session = {
-      userId: () => 'agent-1',
-      isAuthenticated: () => true,
-      workspace: () => readWorkspaceIdentity('org-A'),
-    }
-    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-
-    // The same agent switches to org B in another tab.
-    localStorage.setItem('selected_organization_id', 'org-B')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
-    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
-
-    expect(calls[0].signal.aborted).toBe(true)
-    await done
-    expect(calls).toHaveLength(1)
-    expect(onSent).not.toHaveBeenCalled()
-    expect(onBatchFinished).not.toHaveBeenCalled()
-    expect(attachments.items.value).toHaveLength(0)
-  })
-
-  it('readWorkspaceIdentity follows the effective request organization', () => {
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-H' }))
-    const atLoad = readWorkspaceIdentity('org-H')
-    // A super-admin switcher selecting its own organization after load is not a switch.
-    setSelectedOrganizationId('org-H')
-    expect(readWorkspaceIdentity('org-H')).toBe(atLoad)
-    // Selecting another organization is.
-    setSelectedOrganizationId('org-X')
-    expect(readWorkspaceIdentity('org-H')).not.toBe(atLoad)
-    // With a selected organization stored, a persisted-user rewrite alone
-    // (a stale tab) is ignored: switch-org always writes the key as well.
-    setSelectedOrganizationId('org-H')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
-    expect(readWorkspaceIdentity('org-H')).toBe(atLoad)
-    // Without one (e.g. a tab that signed in without reloading), the persisted
-    // user's organization is the cross-tab signal.
-    localStorage.removeItem('selected_organization_id')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-H' }))
-    const withoutSelection = readWorkspaceIdentity('org-H')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
-    expect(readWorkspaceIdentity('org-H')).not.toBe(withoutSelection)
-  })
-
-  it('readWorkspaceIdentity sees raw shared writes while this tab\'s override is suppressed', () => {
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
-    clearBrowserOrganizationIdentity()
-    const before = readWorkspaceIdentity('org-A')
-    localStorage.setItem('selected_organization_id', 'org-B')
-    expect(readWorkspaceIdentity('org-A')).not.toBe(before)
-  })
-
-  it('B-T1: a silent change during the only file tears down without reporting', async () => {
-    const ws = { workspace: 'org-1' }
-    const session = { userId: () => 'agent-1', isAuthenticated: () => true, workspace: () => ws.workspace }
-    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
-    attachments.stage([file('a.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    ws.workspace = 'org-2'
-    calls[0].result.resolve({ id: 'm1' })
-    await done
-    expect(onSent).not.toHaveBeenCalled()
-    expect(onBatchFinished).not.toHaveBeenCalled()
-    expect(attachments.items.value).toHaveLength(0)
-    expect(attachments.isOpen.value).toBe(false)
-  })
-
-  it('B-WS-2: overlapping batches from two instances each release only their own hold', async () => {
-    const holds = new Map<string, string>()
-    const holdWorkspace = (recipient: string, holdId: string) => {
-      holds.set(holdId, recipient)
-      return () => holds.delete(holdId)
-    }
-    const first = setup({ holdWorkspace })
-    const second = setup({ holdWorkspace })
-    first.attachments.stage([file('a.png', 'image/png')])
-    second.attachments.stage([file('b.png', 'image/png')])
-    const firstDone = first.attachments.sendAll()
-    const secondDone = second.attachments.sendAll()
-    await settle()
-    expect(holds.size).toBe(2)
-    first.calls[0].result.resolve({ id: 'm1' })
-    await firstDone
-    // The finished batch released its own hold; the other one still blocks switching.
-    expect(holds.size).toBe(1)
-    second.calls[0].result.resolve({ id: 'm2' })
-    await secondDone
-    expect(holds.size).toBe(0)
-  })
-
-  it('B-FU12-1: any 5xx after the full upload is unconfirmed, bare or enveloped; a 4xx stays failed', async () => {
-    const cases: Array<[unknown, string]> = [
-      [Object.assign(new Error('520'), { response: { status: 520, data: '<html>Web server is returning an unknown error</html>' } }), 'unconfirmed'],
-      [Object.assign(new Error('500'), { response: { status: 500, data: '' } }), 'unconfirmed'],
-      [Object.assign(new Error('500'), { response: { status: 500, data: { status: 'error', message: 'Failed to send message' } } }), 'unconfirmed'],
-      [Object.assign(new Error('400'), { response: { status: 400, data: { status: 'error', message: 'Invalid multipart form' } } }), 'failed'],
-    ]
-    for (const [error, expected] of cases) {
-      const { attachments, calls } = setup()
-      attachments.stage([file('a.png', 'image/png')])
-      const done = attachments.sendAll()
-      await settle()
-      calls[0].progress(100, 100)
-      calls[0].result.reject(error)
-      await done
-      expect(attachments.items.value[0].status).toBe(expected)
-    }
-  })
-})
-
-describe('useChatAttachments round 5: enveloped 5xx and stale persisted user', () => {
-  afterEach(() => {
-    setSelectedOrganizationId('cleanup')
-    localStorage.clear()
-  })
-
-  it('keeps an enveloped 5xx after the full upload unconfirmed: the envelope proves nothing about dispatch', async () => {
-    for (const status of [500, 503]) {
-      const { attachments, calls, onBatchFinished } = setup()
-      attachments.stage([file('a.png', 'image/png')])
-      const done = attachments.sendAll()
-      await settle()
-      calls[0].progress(100, 100)
-      calls[0].result.reject(
-        Object.assign(new Error(`Request failed with status code ${status}`), {
-          response: { status, data: { status: 'error', message: 'Failed to send message' } },
-        }),
-      )
-      await done
-      expect(attachments.items.value[0].status).toBe('unconfirmed')
-      expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ failed: 0, unconfirmed: 1 }))
-      expect(await attachments.retryFailed()).toBeNull()
-    }
-  })
-
-  it('B4-WS-1: a stale tab rewriting the persisted user with its old organization does not cancel the batch', async () => {
-    // This tab switched to org B: the selected organization is stored.
-    setSelectedOrganizationId('org-B')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
-    const session = {
-      userId: () => 'agent-1',
-      isAuthenticated: () => true,
-      workspace: () => readWorkspaceIdentity('org-B'),
-    }
-    const { attachments, calls, onBatchFinished } = setup({ session })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-
-    // A stale tab still on org A toggles availability and rewrites 'user'.
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A', is_available: false }))
-    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
-
-    expect(calls[0].signal.aborted).toBe(false)
-    calls[0].result.resolve({ id: 'm1' })
-    await settle()
-    expect(calls).toHaveLength(2)
-    calls[1].result.resolve({ id: 'm2' })
-    await done
-    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 2 }))
-  })
-
-  it('still stops when the stored selected organization itself changes', async () => {
-    setSelectedOrganizationId('org-B')
-    const session = { userId: () => 'agent-1', isAuthenticated: () => true, workspace: () => readWorkspaceIdentity('org-B') }
-    const { attachments, calls, onBatchFinished } = setup({ session })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    localStorage.setItem('selected_organization_id', 'org-C')
-    window.dispatchEvent(new StorageEvent('storage', { key: 'selected_organization_id' }))
-    expect(calls[0].signal.aborted).toBe(true)
-    await done
-    expect(onBatchFinished).not.toHaveBeenCalled()
-  })
-})
-
-describe('useChatAttachments round 6: account in the identity', () => {
-  afterEach(() => {
-    setSelectedOrganizationId('cleanup')
-    localStorage.clear()
-  })
-
-  it('R5-B-1: another account signing in through SSO in another tab ends the batch, even with a stored key', async () => {
-    setSelectedOrganizationId('org-A')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
-    const session = {
-      userId: () => 'agent-1',
-      isAuthenticated: () => true,
-      workspace: () => readWorkspaceIdentity('org-A', 'agent-1'),
-    }
-    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-
-    // SSO in another tab writes 'user' for a different account; the key is untouched.
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-2', organization_id: 'org-B' }))
-    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
-
-    expect(calls[0].signal.aborted).toBe(true)
-    await done
-    expect(calls).toHaveLength(1)
-    expect(onSent).not.toHaveBeenCalled()
-    expect(onBatchFinished).not.toHaveBeenCalled()
-  })
-
-  it('R5-B-I3: in a suppressed tab, the other tab\'s user write alone (before its key write) already stops the batch', async () => {
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
-    clearBrowserOrganizationIdentity()
-    const session = {
-      userId: () => 'agent-1',
-      isAuthenticated: () => true,
-      workspace: () => readWorkspaceIdentity('org-A', 'agent-1'),
-    }
-    const { attachments, calls, onBatchFinished } = setup({ session })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-
-    // switch-org in the other tab: applyAuth writes 'user' first...
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
-    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
-    expect(calls[0].signal.aborted).toBe(true)
-    // ...and the selection key afterwards: nothing more happens.
-    localStorage.setItem('selected_organization_id', 'org-B')
-    window.dispatchEvent(new StorageEvent('storage', { key: 'selected_organization_id' }))
-    await done
-    expect(calls).toHaveLength(1)
-    expect(onBatchFinished).not.toHaveBeenCalled()
-  })
-
-  it('a same-agent stale rewrite still does not cancel (no false cancel from the account part)', () => {
-    setSelectedOrganizationId('org-B')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
-    const before = readWorkspaceIdentity('org-B', 'agent-1')
-    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A', is_available: false }))
-    expect(readWorkspaceIdentity('org-B', 'agent-1')).toBe(before)
-  })
-})
-
-describe('useChatAttachments reply with attachment', () => {
-  it('asks for the reply with the batch patient, and only the first file quotes it', async () => {
-    const replyTo = vi.fn(() => 'incoming-1')
-    const onReplySent = vi.fn()
-    const { attachments, calls } = setup({ replyTo, onReplySent })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png'), file('c.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    expect(replyTo).toHaveBeenCalledTimes(1)
-    expect(replyTo).toHaveBeenCalledWith(expect.objectContaining({ contactId: 'contact-a' }))
-    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
-    calls[0].result.resolve({ id: 'm1' })
-    await settle()
-    expect(onReplySent).toHaveBeenCalledTimes(1)
-    expect(onReplySent).toHaveBeenCalledWith('incoming-1', expect.objectContaining({ contactId: 'contact-a' }))
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    calls[1].result.resolve({ id: 'm2' })
-    await settle()
-    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
-    calls[2].result.resolve({ id: 'm3' })
-    await done
-    expect(onReplySent).toHaveBeenCalledTimes(1)
-  })
-
-  it('does not move the quote to the next file when the first one fails', async () => {
-    const onReplySent = vi.fn()
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    calls[0].result.reject(new Error('Failed to send message'))
-    await settle()
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    calls[1].result.resolve({ id: 'm2' })
-    await done
-    expect(onReplySent).not.toHaveBeenCalled()
-
-    // Retrying the failed first file quotes again while the reply is still set.
-    const retry = attachments.retryFailed()
-    await settle()
-    expect(calls[2].request.file.name).toBe('a.png')
-    expect(calls[2].request.reply_to_message_id).toBe('incoming-1')
-    calls[2].result.resolve({ id: 'm1' })
-    await retry
-    expect(onReplySent).toHaveBeenCalledTimes(1)
-  })
-
-  it('keeps the reply when the provider rejects the quoting file', async () => {
-    const live = realtime()
-    const onReplySent = vi.fn()
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent, subscribeRealtime: live.subscribeRealtime })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    calls[0].result.resolve({ id: 'm1', status: 'pending' })
-    await settle()
-    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'failed', error_message: 'Reply context invalid' } })
-    await settle()
-    calls[1].result.resolve({ id: 'm2', status: 'sent' })
-    await done
-    expect(onReplySent).not.toHaveBeenCalled()
-  })
-
-  it('sends without a quote when there is no reply', async () => {
-    const { attachments, calls } = setup({ replyTo: () => undefined })
-    attachments.stage([file('a.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
-    calls[0].result.resolve({ id: 'm1' })
-    await done
-  })
-})
-
-describe('useChatAttachments reply quote ownership', () => {
-  function replyRefused() {
-    return Object.assign(new Error('Request failed with status code 400'), {
-      response: { status: 400, data: { message: 'Reply message not found for this contact' } },
-    })
-  }
-
-  it('binds the quote to the first file when the batch starts', async () => {
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    expect(attachments.items.value.map(item => item.quotesReply)).toEqual(['incoming-1', null])
-    calls[0].result.resolve({ id: 'm1' })
-    await settle()
-    calls[1].result.resolve({ id: 'm2' })
-    await done
-  })
-
-  it('(a) unconfirmed A + failed B: retrying B does not inherit A\'s quote', async () => {
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', responseDeadlineMs: 20 })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
-    calls[0].progress(100, 100)
-    await new Promise(resolve => setTimeout(resolve, 40))
-    await settle()
-    calls[1].result.reject(new Error('Failed to send message'))
-    await done
-    expect(attachments.items.value.map(item => item.status)).toEqual(['unconfirmed', 'failed'])
-
-    const retry = attachments.retryFailed()
-    await settle()
-    expect(calls[2].request.file.name).toBe('b.png')
-    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
-    calls[2].result.resolve({ id: 'm2' })
-    await retry
-  })
-
-  it('(b) A fails and is removed: retrying B does not inherit the quote', async () => {
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    calls[0].result.reject(new Error('Failed to send message'))
-    await settle()
-    calls[1].result.reject(new Error('Failed to send message'))
-    await done
-
-    attachments.remove(attachments.items.value[0].id)
-    expect(attachments.items.value.map(item => item.file.name)).toEqual(['b.png'])
-    const retry = attachments.retryFailed()
-    await settle()
-    expect(calls[2].request.file.name).toBe('b.png')
-    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
-    calls[2].result.resolve({ id: 'm2' })
-    await retry
-  })
-
-  it('a resumed run after Stop does not move the quote to the next file', async () => {
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    calls[0].progress(30, 100)
-    attachments.stop()
-    await done
-    expect(attachments.items.value.map(item => item.status)).toEqual(['unconfirmed', 'ready'])
-
-    const resumed = attachments.sendAll()
-    await settle()
-    expect(calls[1].request.file.name).toBe('b.png')
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    calls[1].result.resolve({ id: 'm2' })
-    await resumed
-  })
-
-  it('the owner sends without the quote once the agent cancels the reply', async () => {
-    let reply: string | undefined = 'incoming-1'
-    const { attachments, calls } = setup({ replyTo: () => reply })
-    attachments.stage([file('a.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    calls[0].result.reject(new Error('Failed to send message'))
-    await done
-    reply = undefined
-    const retry = attachments.retryFailed()
-    await settle()
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    calls[1].result.resolve({ id: 'm1' })
-    await retry
-  })
-
-  it('offers send-without-quote when the server refuses the reply, and the quote never moves', async () => {
-    const onReplyRejected = vi.fn()
-    const onReplySent = vi.fn()
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplyRejected, onReplySent })
-    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
-    const done = attachments.sendAll()
-    await settle()
-    calls[0].result.reject(replyRefused())
-    await settle()
-    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', replyRejected: true })
-    expect(onReplyRejected).toHaveBeenCalledWith('incoming-1', expect.objectContaining({ contactId: 'contact-a' }))
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    calls[1].result.reject(new Error('Failed to send message'))
-    await done
-
-    // Only A is resent, as a plain attachment; B's failure is left for Retry.
-    const plain = attachments.sendWithoutQuote(attachments.items.value[0].id)
-    await settle()
-    expect(calls).toHaveLength(3)
-    expect(calls[2].request.file.name).toBe('a.png')
-    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
-    calls[2].result.resolve({ id: 'm1' })
-    await plain
-    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'failed'])
-    expect(onReplySent).not.toHaveBeenCalled()
-
-    // Even with the reply still selected, no other file picks the quote up.
-    const retry = attachments.retryFailed()
-    await settle()
-    expect(calls[3].request.file.name).toBe('b.png')
-    expect(calls[3].request).not.toHaveProperty('reply_to_message_id')
-    calls[3].result.resolve({ id: 'm2' })
-    await retry
-  })
-
-  it('ignores send-without-quote for a file the server did not refuse', async () => {
-    const { attachments } = setup({ replyTo: () => 'incoming-1' })
-    attachments.stage([file('a.png', 'image/png')])
-    expect(await attachments.sendWithoutQuote(attachments.items.value[0].id)).toBeNull()
-  })
-
-  it('a new staging session can quote again', async () => {
-    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
-    attachments.stage([file('a.png', 'image/png')])
-    const first = attachments.sendAll()
-    await settle()
-    calls[0].result.resolve({ id: 'm1' })
-    await first
-    // All sent: the dialog closed and its claims went with it.
-    attachments.stage([file('b.png', 'image/png')])
-    const second = attachments.sendAll()
-    await settle()
-    expect(calls[1].request.reply_to_message_id).toBe('incoming-1')
-    calls[1].result.resolve({ id: 'm2' })
-    await second
-  })
-})
-
 describe('useChatAttachments INT-2 follow-ups', () => {
   function refused(message = 'Reply message not found for this contact') {
     return Object.assign(new Error('Request failed with status code 400'), {
@@ -1751,6 +1497,129 @@ describe('isReplyRejection', () => {
   })
 })
 
+describe('useChatAttachments round 4: workspace identity, holds and teardown', () => {
+  afterEach(() => {
+    // Lift the module-level override suppression set by an SPA login.
+    setSelectedOrganizationId('cleanup')
+    localStorage.clear()
+  })
+
+  it('B-WS-1: sees another tab switching organization after an SPA login (override suppressed)', async () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    clearBrowserOrganizationIdentity()
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-A'),
+    }
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // The same agent switches to org B in another tab.
+    localStorage.setItem('selected_organization_id', 'org-B')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+  })
+
+  it('readWorkspaceIdentity follows the effective request organization', () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-H' }))
+    const atLoad = readWorkspaceIdentity('org-H')
+    // A super-admin switcher selecting its own organization after load is not a switch.
+    setSelectedOrganizationId('org-H')
+    expect(readWorkspaceIdentity('org-H')).toBe(atLoad)
+    // Selecting another organization is.
+    setSelectedOrganizationId('org-X')
+    expect(readWorkspaceIdentity('org-H')).not.toBe(atLoad)
+    // With a selected organization stored, a persisted-user rewrite alone
+    // (a stale tab) is ignored: switch-org always writes the key as well.
+    setSelectedOrganizationId('org-H')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    expect(readWorkspaceIdentity('org-H')).toBe(atLoad)
+    // Without one (e.g. a tab that signed in without reloading), the persisted
+    // user's organization is the cross-tab signal.
+    localStorage.removeItem('selected_organization_id')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-H' }))
+    const withoutSelection = readWorkspaceIdentity('org-H')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    expect(readWorkspaceIdentity('org-H')).not.toBe(withoutSelection)
+  })
+
+  it('readWorkspaceIdentity sees raw shared writes while this tab\'s override is suppressed', () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    clearBrowserOrganizationIdentity()
+    const before = readWorkspaceIdentity('org-A')
+    localStorage.setItem('selected_organization_id', 'org-B')
+    expect(readWorkspaceIdentity('org-A')).not.toBe(before)
+  })
+
+  it('B-T1: a silent change during the only file tears down without reporting', async () => {
+    const ws = { workspace: 'org-1' }
+    const session = { userId: () => 'agent-1', isAuthenticated: () => true, workspace: () => ws.workspace }
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    ws.workspace = 'org-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+    expect(attachments.isOpen.value).toBe(false)
+  })
+
+  it('B-WS-2: overlapping batches from two instances each release only their own hold', async () => {
+    const holds = new Map<string, string>()
+    const holdWorkspace = (recipient: string, holdId: string) => {
+      holds.set(holdId, recipient)
+      return () => holds.delete(holdId)
+    }
+    const first = setup({ holdWorkspace })
+    const second = setup({ holdWorkspace })
+    first.attachments.stage([file('a.png', 'image/png')])
+    second.attachments.stage([file('b.png', 'image/png')])
+    const firstDone = first.attachments.sendAll()
+    const secondDone = second.attachments.sendAll()
+    await settle()
+    expect(holds.size).toBe(2)
+    first.calls[0].result.resolve({ id: 'm1' })
+    await firstDone
+    // The finished batch released its own hold; the other one still blocks switching.
+    expect(holds.size).toBe(1)
+    second.calls[0].result.resolve({ id: 'm2' })
+    await secondDone
+    expect(holds.size).toBe(0)
+  })
+
+  it('B-FU12-1: any 5xx after the full upload is unconfirmed, bare or enveloped; a 4xx stays failed', async () => {
+    const cases: Array<[unknown, string]> = [
+      [Object.assign(new Error('520'), { response: { status: 520, data: '<html>Web server is returning an unknown error</html>' } }), 'unconfirmed'],
+      [Object.assign(new Error('500'), { response: { status: 500, data: '' } }), 'unconfirmed'],
+      [Object.assign(new Error('500'), { response: { status: 500, data: { status: 'error', message: 'Failed to send message' } } }), 'unconfirmed'],
+      [Object.assign(new Error('400'), { response: { status: 400, data: { status: 'error', message: 'Invalid multipart form' } } }), 'failed'],
+    ]
+    for (const [error, expected] of cases) {
+      const { attachments, calls } = setup()
+      attachments.stage([file('a.png', 'image/png')])
+      const done = attachments.sendAll()
+      await settle()
+      calls[0].progress(100, 100)
+      calls[0].result.reject(error)
+      await done
+      expect(attachments.items.value[0].status).toBe(expected)
+    }
+  })
+})
+
 describe('useChatAttachments INT2-R4: quote callbacks after a silent identity change', () => {
   function refused() {
     return Object.assign(new Error('Request failed with status code 400'), {
@@ -1817,5 +1686,136 @@ describe('useChatAttachments INT2-R4: quote callbacks after a silent identity ch
     await done
     expect(onReplySent).not.toHaveBeenCalled()
     expect(attachments.items.value).toHaveLength(0)
+  })
+})
+
+describe('useChatAttachments round 5: enveloped 5xx and stale persisted user', () => {
+  afterEach(() => {
+    setSelectedOrganizationId('cleanup')
+    localStorage.clear()
+  })
+
+  it('keeps an enveloped 5xx after the full upload unconfirmed: the envelope proves nothing about dispatch', async () => {
+    for (const status of [500, 503]) {
+      const { attachments, calls, onBatchFinished } = setup()
+      attachments.stage([file('a.png', 'image/png')])
+      const done = attachments.sendAll()
+      await settle()
+      calls[0].progress(100, 100)
+      calls[0].result.reject(
+        Object.assign(new Error(`Request failed with status code ${status}`), {
+          response: { status, data: { status: 'error', message: 'Failed to send message' } },
+        }),
+      )
+      await done
+      expect(attachments.items.value[0].status).toBe('unconfirmed')
+      expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ failed: 0, unconfirmed: 1 }))
+      expect(await attachments.retryFailed()).toBeNull()
+    }
+  })
+
+  it('B4-WS-1: a stale tab rewriting the persisted user with its old organization does not cancel the batch', async () => {
+    // This tab switched to org B: the selected organization is stored.
+    setSelectedOrganizationId('org-B')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-B'),
+    }
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // A stale tab still on org A toggles availability and rewrites 'user'.
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A', is_available: false }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+
+    expect(calls[0].signal.aborted).toBe(false)
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(calls).toHaveLength(2)
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+    expect(onBatchFinished).toHaveBeenCalledWith(expect.objectContaining({ sent: 2 }))
+  })
+
+  it('still stops when the stored selected organization itself changes', async () => {
+    setSelectedOrganizationId('org-B')
+    const session = { userId: () => 'agent-1', isAuthenticated: () => true, workspace: () => readWorkspaceIdentity('org-B') }
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    localStorage.setItem('selected_organization_id', 'org-C')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'selected_organization_id' }))
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+})
+
+describe('useChatAttachments round 6: account in the identity', () => {
+  afterEach(() => {
+    setSelectedOrganizationId('cleanup')
+    localStorage.clear()
+  })
+
+  it('R5-B-1: another account signing in through SSO in another tab ends the batch, even with a stored key', async () => {
+    setSelectedOrganizationId('org-A')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-A', 'agent-1'),
+    }
+    const { attachments, calls, onBatchFinished, onSent } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // SSO in another tab writes 'user' for a different account; the key is untouched.
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-2', organization_id: 'org-B' }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onSent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+
+  it('R5-B-I3: in a suppressed tab, the other tab\'s user write alone (before its key write) already stops the batch', async () => {
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A' }))
+    clearBrowserOrganizationIdentity()
+    const session = {
+      userId: () => 'agent-1',
+      isAuthenticated: () => true,
+      workspace: () => readWorkspaceIdentity('org-A', 'agent-1'),
+    }
+    const { attachments, calls, onBatchFinished } = setup({ session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+
+    // switch-org in the other tab: applyAuth writes 'user' first...
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    window.dispatchEvent(new StorageEvent('storage', { key: 'user' }))
+    expect(calls[0].signal.aborted).toBe(true)
+    // ...and the selection key afterwards: nothing more happens.
+    localStorage.setItem('selected_organization_id', 'org-B')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'selected_organization_id' }))
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onBatchFinished).not.toHaveBeenCalled()
+  })
+
+  it('a same-agent stale rewrite still does not cancel (no false cancel from the account part)', () => {
+    setSelectedOrganizationId('org-B')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-B' }))
+    const before = readWorkspaceIdentity('org-B', 'agent-1')
+    localStorage.setItem('user', JSON.stringify({ id: 'agent-1', organization_id: 'org-A', is_available: false }))
+    expect(readWorkspaceIdentity('org-B', 'agent-1')).toBe(before)
   })
 })

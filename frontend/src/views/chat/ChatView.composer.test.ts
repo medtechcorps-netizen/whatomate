@@ -634,6 +634,121 @@ describe('ChatView composer', () => {
     expect(mocks.toastError).not.toHaveBeenCalled()
   })
 
+  function replyMessage(id: string, contactId: string, body: string) {
+    return {
+      id,
+      contact_id: contactId,
+      direction: 'incoming',
+      message_type: 'text',
+      content: { body },
+      status: 'received',
+      created_at: '2026-10-01T00:00:00Z',
+    }
+  }
+
+  it('sends a media batch as a reply: only the first file quotes, then the reply bar clears', async () => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('incoming-9', 'first', 'Can you send the lab results?')
+    await nextTick()
+    const calls = sendMediaDeferred()
+    wrapper.findComponent(ChatDropZoneOverlay).vm.$emit('files', [png('lab-1.png'), png('lab-2.png')])
+    await nextTick()
+    expect(wrapper.findComponent(MediaSendDialog).props('replyPreview')).toBe('Can you send the lab results?')
+    wrapper.findComponent(MediaSendDialog).vm.$emit('send')
+    await flushPromises()
+
+    expect(calls[0].request).toMatchObject({ contact_id: 'first', reply_to_message_id: 'incoming-9' })
+    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].resolve({ data: { data: { id: 'msg-2', status: 'sent' } } })
+    await flushPromises()
+  })
+
+  it('never quotes a message from another patient', async () => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('incoming-other', 'second', 'Other patient')
+    await nextTick()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png'])
+    expect(wrapper.findComponent(MediaSendDialog).props('replyPreview')).toBe('')
+    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
+    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+  })
+
+  it('keeps a reply to one patient out of a batch still sending to another after a switch', async () => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('incoming-a', 'first', 'From patient A')
+    await nextTick()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a-1.png', 'a-2.png'])
+    expect(calls[0].request).toMatchObject({ contact_id: 'first', reply_to_message_id: 'incoming-a' })
+
+    // The agent switches to patient B and starts a reply there.
+    mocks.route!.params.contactId = 'second'
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('incoming-b', 'second', 'From patient B')
+    await nextTick()
+
+    calls[0].resolve({ data: { data: { id: 'msg-a1', status: 'sent' } } })
+    await flushPromises()
+    // A's batch continues for A without any quote, and B's reply bar stays.
+    expect(calls[1].request).toMatchObject({ contact_id: 'first' })
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+    calls[1].resolve({ data: { data: { id: 'msg-a2', status: 'sent' } } })
+    await flushPromises()
+
+    // B's own batch then quotes B's message.
+    await stageAndSend(['b-1.png'])
+    expect(calls[2].request).toMatchObject({ contact_id: 'second', reply_to_message_id: 'incoming-b' })
+    calls[2].resolve({ data: { data: { id: 'msg-b1', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends without a quote when no reply is active (R2 behaviour)', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png'])
+    expect(wrapper.findComponent(MediaSendDialog).props('replyPreview')).toBe('')
+    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
+    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+  })
+
+  it('clears a refused reply and sends the file without the quote on request', async () => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('incoming-stale', 'first', 'Old message')
+    await nextTick()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['a.png'])
+    expect(calls[0].request).toMatchObject({ reply_to_message_id: 'incoming-stale' })
+    calls[0].reject(Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { message: 'Reply message not found for this contact' } },
+    }))
+    await flushPromises()
+    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
+    const dialog = wrapper.findComponent(MediaSendDialog)
+    const [refused] = dialog.props('items')
+    expect(refused).toMatchObject({ status: 'failed', replyRejected: true })
+
+    dialog.vm.$emit('send-without-quote', refused.id)
+    await flushPromises()
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
+    await flushPromises()
+  })
+
   it('reports a file left unconfirmed by the response deadline as a warning, not an error', async () => {
     wrapper = mountView()
     await settle()
@@ -774,120 +889,5 @@ describe('ChatView composer', () => {
     calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
     await flushPromises()
     expect(mocks.toastSuccess).toHaveBeenCalledWith('chat.composer.batchSentOne')
-  })
-
-  function replyMessage(id: string, contactId: string, body: string) {
-    return {
-      id,
-      contact_id: contactId,
-      direction: 'incoming',
-      message_type: 'text',
-      content: { body },
-      status: 'received',
-      created_at: '2026-10-01T00:00:00Z',
-    }
-  }
-
-  it('sends a media batch as a reply: only the first file quotes, then the reply bar clears', async () => {
-    wrapper = mountView()
-    await settle()
-    mocks.contactsStore!.replyingTo = replyMessage('incoming-9', 'first', 'Can you send the lab results?')
-    await nextTick()
-    const calls = sendMediaDeferred()
-    wrapper.findComponent(ChatDropZoneOverlay).vm.$emit('files', [png('lab-1.png'), png('lab-2.png')])
-    await nextTick()
-    expect(wrapper.findComponent(MediaSendDialog).props('replyPreview')).toBe('Can you send the lab results?')
-    wrapper.findComponent(MediaSendDialog).vm.$emit('send')
-    await flushPromises()
-
-    expect(calls[0].request).toMatchObject({ contact_id: 'first', reply_to_message_id: 'incoming-9' })
-    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
-    await flushPromises()
-    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    calls[1].resolve({ data: { data: { id: 'msg-2', status: 'sent' } } })
-    await flushPromises()
-  })
-
-  it('never quotes a message from another patient', async () => {
-    wrapper = mountView()
-    await settle()
-    mocks.contactsStore!.replyingTo = replyMessage('incoming-other', 'second', 'Other patient')
-    await nextTick()
-    const calls = sendMediaDeferred()
-    await stageAndSend(['a.png'])
-    expect(wrapper.findComponent(MediaSendDialog).props('replyPreview')).toBe('')
-    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
-    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
-    await flushPromises()
-    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
-  })
-
-  it('keeps a reply to one patient out of a batch still sending to another after a switch', async () => {
-    wrapper = mountView()
-    await settle()
-    mocks.contactsStore!.replyingTo = replyMessage('incoming-a', 'first', 'From patient A')
-    await nextTick()
-    const calls = sendMediaDeferred()
-    await stageAndSend(['a-1.png', 'a-2.png'])
-    expect(calls[0].request).toMatchObject({ contact_id: 'first', reply_to_message_id: 'incoming-a' })
-
-    // The agent switches to patient B and starts a reply there.
-    mocks.route!.params.contactId = 'second'
-    await settle()
-    mocks.contactsStore!.replyingTo = replyMessage('incoming-b', 'second', 'From patient B')
-    await nextTick()
-
-    calls[0].resolve({ data: { data: { id: 'msg-a1', status: 'sent' } } })
-    await flushPromises()
-    // A's batch continues for A without any quote, and B's reply bar stays.
-    expect(calls[1].request).toMatchObject({ contact_id: 'first' })
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
-    calls[1].resolve({ data: { data: { id: 'msg-a2', status: 'sent' } } })
-    await flushPromises()
-
-    // B's own batch then quotes B's message.
-    await stageAndSend(['b-1.png'])
-    expect(calls[2].request).toMatchObject({ contact_id: 'second', reply_to_message_id: 'incoming-b' })
-    calls[2].resolve({ data: { data: { id: 'msg-b1', status: 'sent' } } })
-    await flushPromises()
-    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
-  })
-
-  it('sends without a quote when no reply is active (R2 behaviour)', async () => {
-    wrapper = mountView()
-    await settle()
-    const calls = sendMediaDeferred()
-    await stageAndSend(['a.png'])
-    expect(wrapper.findComponent(MediaSendDialog).props('replyPreview')).toBe('')
-    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
-    calls[0].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
-    await flushPromises()
-    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
-  })
-
-  it('clears a refused reply and sends the file without the quote on request', async () => {
-    wrapper = mountView()
-    await settle()
-    mocks.contactsStore!.replyingTo = replyMessage('incoming-stale', 'first', 'Old message')
-    await nextTick()
-    const calls = sendMediaDeferred()
-    await stageAndSend(['a.png'])
-    expect(calls[0].request).toMatchObject({ reply_to_message_id: 'incoming-stale' })
-    calls[0].reject(Object.assign(new Error('Request failed with status code 400'), {
-      response: { status: 400, data: { message: 'Reply message not found for this contact' } },
-    }))
-    await flushPromises()
-    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
-    const dialog = wrapper.findComponent(MediaSendDialog)
-    const [refused] = dialog.props('items')
-    expect(refused).toMatchObject({ status: 'failed', replyRejected: true })
-
-    dialog.vm.$emit('send-without-quote', refused.id)
-    await flushPromises()
-    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
-    calls[1].resolve({ data: { data: { id: 'msg-1', status: 'sent' } } })
-    await flushPromises()
   })
 })
