@@ -970,18 +970,15 @@ function dropSsoCode() {
   }
 }
 
-// Set (in this tab) when an SSO exchange is sent, with the session marker and
-// CSRF value of that moment, and cleared once its outcome is seen here. A tab
-// that finds it after a reload never saw the answer: the exchange's cookies may
-// have landed unseen.
+// Set (in this tab) when an SSO exchange is sent, with the session marker of
+// that moment, and cleared once its outcome is seen here. A tab that finds it
+// after a reload never saw the answer: the exchange's cookies may have landed
+// unseen.
 const SSO_SENT_KEY = "whm_sso_sent";
 
 function noteSsoExchangeSent() {
   try {
-    sessionStorage.setItem(
-      SSO_SENT_KEY,
-      JSON.stringify({ marker: readSessionMarker(), csrf: getCookie("whm_csrf") }),
-    );
+    sessionStorage.setItem(SSO_SENT_KEY, JSON.stringify({ marker: readSessionMarker() }));
   } catch {
     // Without storage a reload cannot tell.
   }

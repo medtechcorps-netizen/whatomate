@@ -492,10 +492,15 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 // the binding cookie of its own attempt, set by the callback in the same
 // browser (and cleared here; no other attempt's). Membership, organization
 // and role are resolved now, as a password login does (issueLoginSession),
-// and the user must still be a member of the organization whose SSO it was.
+// and the user must still be a member of the organization whose SSO it was,
+// by the membership table (ssoOrganizationMember): an inactive reseller-derived
+// membership there refuses the sign-in even when the user's own organization
+// membership is active (a password login would succeed through that one).
 // A bad code answers 401. A fault of the code store, or of loading the user or
-// their membership of the SSO's organization, answers 503, as a refresh does;
-// a fault inside issueLoginSession answers as it does for a password login.
+// their membership row in the SSO's organization, answers 503, as a refresh
+// does; a fault inside the reseller check counts as no active membership
+// (401, as for a login), and a fault inside issueLoginSession answers as it
+// does for a password login.
 // Only a JSON body is accepted: the refresh route is CSRF-exempt, and a
 // cross-site form can send a form body but not a JSON one.
 func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {

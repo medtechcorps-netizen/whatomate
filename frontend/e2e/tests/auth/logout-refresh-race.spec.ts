@@ -182,6 +182,17 @@ async function signInHere(page: Page, user: TestUser) {
   await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 45_000 })
 }
 
+// The status a refresh with `token` gets now (from a context of its own).
+async function refreshStatus(newContext: () => Promise<APIRequestContext>, token: string | undefined) {
+  expect(token).toBeTruthy()
+  const outsider = await newContext()
+  try {
+    return (await outsider.post('/api/auth/refresh', { headers: { Cookie: `whm_refresh=${token}` } })).status()
+  } finally {
+    await outsider.dispose()
+  }
+}
+
 async function expectRefreshRejected(newContext: () => Promise<APIRequestContext>, tokens: Array<string | undefined>) {
   for (const token of tokens) {
     expect(token).toBeTruthy()
@@ -387,7 +398,11 @@ test.describe('Logout during a token refresh', () => {
         if (request.url().endsWith('/api/auth/refresh') && body.includes('"revoke"')) revokeBodies.push(JSON.parse(body))
       })
 
-      const revoked = page.waitForResponse((response) => response.url().endsWith('/api/auth/refresh'))
+      // The revoke's request, not its answer: the page leaves for /login at
+      // once, and the navigation may cancel the request in flight.
+      const revoked = page.waitForRequest(
+        (request) => request.url().endsWith('/api/auth/refresh') && (request.postData() ?? '').includes('"revoke"'),
+      )
       if (ending === 'a logout click') await logout(page)
       else await startProactiveRefresh(page)
       await expect(page).toHaveURL(/\/login/)
@@ -397,20 +412,19 @@ test.describe('Logout during a token refresh', () => {
       // Give a clearing /auth/logout every chance to go out.
       await page.waitForTimeout(2_000)
 
-      // Revokes only, each cookie-neutral (a page without the lock never
-      // takes a pending logout over, so normally exactly one); no refresh, no
+      // Exactly one revoke, cookie-neutral (a page without the lock never
+      // takes a pending logout over, at load or at pagehide); no refresh, no
       // /auth/logout, no cookie changed.
-      expect(order.length).toBeGreaterThanOrEqual(1)
-      expect(order.every((kind) => kind === 'revoke')).toBe(true)
-      expect(revokeBodies).toHaveLength(order.length)
-      for (const body of revokeBodies) expect(body).toEqual({ revoke: true, keep_cookies: true })
+      expect(order).toEqual(['revoke'])
+      expect(revokeBodies).toEqual([{ revoke: true, keep_cookies: true }])
       expect(refreshes()).toBe(0)
       for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
         expect(await cookieValue(context, name)).toBe(before[name])
       }
-      // The refresh chain is revoked; the clearing waits for a page that
+      // The refresh chain is revoked (the server may finish it just after the
+      // navigation cancelled the request); the clearing waits for a page that
       // holds the lock.
-      await expectRefreshRejected(newContext, [before.whm_refresh])
+      await expect.poll(() => refreshStatus(newContext, before.whm_refresh), { timeout: 10_000 }).toBe(401)
       const pending = await page.evaluate(() => localStorage.getItem('whm_logout_pending'))
       expect(JSON.parse(pending!).marker).toMatch(/^ended:/)
       expect(await page.evaluate(() => localStorage.getItem('whm_session_id'))).toMatch(/^ended:/)
@@ -427,8 +441,7 @@ test.describe('Logout during a token refresh', () => {
       await other.goto('/login', { waitUntil: 'domcontentloaded' })
       expect(await other.evaluate(() => !!navigator.locks)).toBe(true)
       await cleared
-      expect(order.slice(-2)).toEqual(['revoke', 'logout'])
-      expect(order.filter((kind) => kind === 'logout')).toHaveLength(1)
+      expect(order).toEqual(['revoke', 'revoke', 'logout'])
       expect(otherRevokeBodies).toEqual([{ revoke: true }])
       expect(await cookieValue(context, 'whm_access')).toBeUndefined()
       expect(await cookieValue(context, 'whm_refresh')).toBeUndefined()
