@@ -785,15 +785,17 @@ test.describe('Logout during a token refresh', () => {
     exchange.release()
   })
 
-  test('ordinary Back after an interrupted SSO exchange never restores A over the unseen B jar', async ({
+  test('Back after an interrupted SSO exchange never restores A over the unseen B jar', async ({
     page,
     context,
     playwright,
     baseURL,
   }, testInfo) => {
-    // Keep the project's normal Chromium launch policy. Playwright 1.57 adds
-    // --disable-back-forward-cache; do not remove it to claim production cache
-    // eligibility. This control proves a new-document Back, not BFCache.
+    // The default project proves new-document Back. A separate, explicitly
+    // selected natural-lifecycle project may remove only Playwright's cache
+    // disable default; even then a cache restoration must be observed, never
+    // assumed from the launch policy or forced with feature flags.
+    const naturalLifecycle = testInfo.project.metadata.r1HistoryMode === 'natural'
     const cdp = await context.newCDPSession(page)
     await cdp.send('Page.enable')
     const { arguments: launchArguments } = await cdp.send('Browser.getBrowserCommandLine')
@@ -842,25 +844,41 @@ test.describe('Logout during a token refresh', () => {
       // Returning to the prior authenticated history entry must run the actual
       // router's interrupted-note check before it restores persisted user A.
       await page.goBack({ waitUntil: 'domcontentloaded' })
-      await expect(page).toHaveURL(/\/login(?:\?|$)/)
-      await expect(page.getByTestId('password-sign-in')).toBeVisible()
-      await expect(page.locator('aside')).toHaveCount(0)
-      await expect.poll(async () => (await historyState()).persistedShows).toEqual([false])
+      await expect.poll(async () => {
+        const state = await historyState()
+        return state.id !== original.id ? state.persistedShows.length > 0 : state.persistedShows.at(-1) === true
+      }).toBe(true)
       const returned = await historyState()
-      await testInfo.attach('ordinary-back-observation', {
+      const restoredFromCache = original.id === returned.id && returned.persistedShows.at(-1) === true
+      const newDocument = original.id !== returned.id && returned.persistedShows.every((persisted) => !persisted)
+      // Preserve the lifecycle observation even when the following security
+      // oracle fails. A natural-launch new document leaves BFCache unqualified.
+      await testInfo.attach('back-lifecycle-observation', {
         contentType: 'application/json',
         body: JSON.stringify({
           originalPath,
           returnedPath: new URL(page.url()).pathname,
+          project: testInfo.project.name,
+          browserVersion: context.browser()?.version(),
+          naturalLifecycle,
           backForwardCacheDisabledByLaunch: launchArguments.includes('--disable-back-forward-cache'),
-          newDocument: original.id !== returned.id,
+          newDocument,
           returnedPageshowPersisted: returned.persistedShows,
           cacheNotRestoredReasons: cacheFailures,
-          bfcacheRestorationQualified: false,
+          cacheRestorationObserved: restoredFromCache,
+          bfcacheSecurityQualified: false, // This observation precedes the assertions below.
         }),
       })
-      expect(returned.id).not.toBe(original.id)
-      expect(returned.persistedShows).toEqual([false])
+      if (naturalLifecycle) {
+        expect(launchArguments).not.toContain('--disable-back-forward-cache')
+        expect(restoredFromCache || newDocument).toBe(true)
+      } else {
+        expect(newDocument).toBe(true)
+        expect(returned.persistedShows).toEqual([false])
+      }
+      await expect(page).toHaveURL(/\/login(?:\?|$)/)
+      await expect(page.getByTestId('password-sign-in')).toBeVisible()
+      await expect(page.locator('aside')).toHaveCount(0)
       expect(await page.evaluate(() => sessionStorage.getItem('whm_sso_sent'))).not.toBeNull()
       expect(await page.evaluate(() => JSON.parse(localStorage.getItem('user')!).email)).toBe(TEST_USERS.admin.email)
       expect(exchangesSent).toHaveLength(1)
