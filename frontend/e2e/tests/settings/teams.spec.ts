@@ -59,6 +59,15 @@ test.describe('Teams - List View', () => {
   test('should delete team from list', async ({ page, request }) => {
     const { api, team } = await seedAdminTeam(request, 'delete-list')
     await page.goto('/settings/teams')
+    const [searchResponse] = await Promise.all([
+      page.waitForResponse(response => {
+        const url = new URL(response.url())
+        return response.request().method() === 'GET' && url.pathname === '/api/teams' &&
+          url.searchParams.get('search') === team.name && url.searchParams.get('page') === '1'
+      }),
+      tablePage.searchInput.fill(team.name),
+    ])
+    expect(searchResponse.ok()).toBe(true)
     const row = page.locator('tbody tr').filter({
       has: page.locator(`a[href="/settings/teams/${team.id}"]`),
     })
