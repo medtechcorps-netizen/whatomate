@@ -36,6 +36,7 @@
     "dompurify": "^3.4.0",
     "grid-layout-plus": "^1.1.1",
     "lucide-vue-next": "^0.303.0",
+    "pdfjs-dist": "6.3.289",
     "pinia": "^2.1.7",
     "reka-ui": "^2.7.0",
     "tailwind-merge": "^2.2.0",

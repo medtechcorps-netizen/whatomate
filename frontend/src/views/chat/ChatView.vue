@@ -15,14 +15,13 @@ import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
 import { useUsersStore } from '@/stores/users'
 import { useTransfersStore } from '@/stores/transfers'
 import { wsService } from '@/services/websocket'
-import { contactsService, chatbotService, messagesService, customActionsService, accountsService, cannedResponsesService, effectiveAIIsAllowed, getRequestHeaders, type ContactIdentityReviewEffectiveState, type CustomAction, type ActionResult, type CannedResponse } from '@/services/api'
+import { contactsService, chatbotService, messagesService, customActionsService, accountsService, cannedResponsesService, effectiveAIIsAllowed, type ContactIdentityReviewEffectiveState, type CustomAction, type ActionResult, type CannedResponse } from '@/services/api'
 import { useTagsStore } from '@/stores/tags'
 import { TagBadge } from '@/components/ui/tag-badge'
 import { getTagColorClass } from '@/lib/constants'
 import { getErrorMessage } from '@/lib/api-utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Textarea } from '@/components/ui/textarea'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -117,6 +116,13 @@ import MessageActions from '@/components/chat/MessageActions.vue'
 import MessageContextMenu from '@/components/chat/MessageContextMenu.vue'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
+import MediaSendDialog from '@/components/chat/MediaSendDialog.vue'
+import ComposerFormatToolbar from '@/components/chat/ComposerFormatToolbar.vue'
+import WhatsAppText from '@/components/chat/WhatsAppText.vue'
+import ChatDropZoneOverlay from '@/components/chat/ChatDropZoneOverlay.vue'
+import { readLogicalSessionMarker, readWorkspaceIdentity, useChatAttachments } from '@/composables/useChatAttachments'
+import { useComposerFormatting } from '@/composables/useComposerFormatting'
+import { CHAT_ATTACHMENT_ACCEPT, filesFromClipboard, summarizeFileNames } from '@/lib/chatAttachments'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import ConversationNotes from '@/components/chat/ConversationNotes.vue'
 import CallButton from '@/components/calling/CallButton.vue'
@@ -234,13 +240,90 @@ const selectedAccount = ref<string | null>(null)
 const contactAccounts = ref<string[]>([])
 const orgAccounts = ref<any[]>([])
 
-// File upload state
+// Attachments: the paperclip, drag-and-drop onto the chat panel and paste
+// into the composer all stage files in MediaSendDialog, which sends each file
+// as its own WhatsApp message, one request at a time.
 const fileInputRef = ref<HTMLInputElement | null>(null)
-const selectedFile = ref<File | null>(null)
-const filePreviewUrl = ref<string | null>(null)
-const isMediaDialogOpen = ref(false)
-const mediaCaption = ref('')
-const isUploadingMedia = ref(false)
+const chatPanelRef = ref<HTMLElement | null>(null)
+const chatAttachments = useChatAttachments({
+  resolveTarget: () => {
+    const contact = contactsStore.currentContact
+    if (!contact) return null
+    const generation = contactSelectionGeneration
+    const id = contact.id
+    return {
+      contactId: id,
+      label: currentContactDisplayName.value,
+      isActive: () => isContactSelectionActive(generation, id),
+    }
+  },
+  getWhatsAppAccount: () => selectedAccount.value,
+  // Paces uploads on each message leaving 'pending' (status_update /
+  // realtime_sync), which keeps a batch from pinning DB pool connections.
+  subscribeRealtime: listener => wsService.onInboxActivity(listener),
+  // A batch belongs to the agent who confirmed it: sign-out, expiry or another
+  // user ends it silently (no prompt, no patient-named report).
+  session: {
+    userId: () => authStore.user?.id ?? null,
+    isAuthenticated: () => authStore.isAuthenticated,
+    // The workspace requests go to (override or token organization, in this
+    // tab or written by another): any change ends the batch instead of
+    // re-scoping it.
+    workspace: () => readWorkspaceIdentity(authStore.user?.organization_id ?? null, authStore.user?.id ?? null),
+    logicalSession: readLogicalSessionMarker,
+  },
+  // Coordinated boundary: the workspace switcher refuses while files are sending.
+  holdWorkspace: (recipient, holdId) => {
+    organizationsStore.blockOrganizationSwitch(holdId, t('chat.composer.workspaceSwitchBlocked', { name: recipient }))
+    return () => organizationsStore.unblockOrganizationSwitch(holdId)
+  },
+  onSent: message => {
+    // addMessage dedupes against the WebSocket echo.
+    contactsStore.addMessage(message as Message)
+    scrollToBottom()
+  },
+  // Every batch ends with a report, including one that kept sending after the
+  // agent left the chat; it names the patient so nothing goes unnoticed.
+  onBatchFinished: summary => {
+    const { sent, failed, notSent, unconfirmed, recipient } = summary
+    if (failed === 0 && notSent === 0 && unconfirmed === 0) {
+      const key = summary.detached
+        ? (sent === 1 ? 'chat.composer.batchSentToOne' : 'chat.composer.batchSentToMany')
+        : (sent === 1 ? 'chat.composer.batchSentOne' : 'chat.composer.batchSentMany')
+      toast.success(t(key, { count: sent, name: recipient }))
+      return
+    }
+    const missing = [...summary.failedNames, ...summary.notSentNames]
+    // The "may have been sent" part only appears when a file is unconfirmed.
+    const report = unconfirmed > 0
+      ? t('chat.composer.batchReportWithUnconfirmed', { name: recipient, sent, failed, notSent, unconfirmed })
+      : t('chat.composer.batchReport', { name: recipient, sent, failed, notSent })
+    const notes: string[] = []
+    if (missing.length > 0) {
+      notes.push(t(
+        summary.detached ? 'chat.composer.batchReportDetached' : 'chat.composer.batchReportFiles',
+        { files: summarizeFileNames(missing) },
+      ))
+    }
+    if (unconfirmed > 0) {
+      notes.push(t(
+        unconfirmed === 1 ? 'chat.composer.batchReportUnconfirmedOne' : 'chat.composer.batchReportUnconfirmedMany',
+        { files: summarizeFileNames(summary.unconfirmedNames) },
+      ))
+    }
+    const description = notes.join(' ')
+    // Red only when nothing reached the server and something definitely
+    // failed; a file that may have been sent is a warning, not an error.
+    if (failed > 0 && sent === 0 && unconfirmed === 0 && !summary.stopped) toast.error(report, { description })
+    else toast.warning(report, { description })
+  },
+})
+const {
+  items: stagedAttachments,
+  isOpen: isMediaDialogOpen,
+  isSending: isUploadingMedia,
+  isStopping: isStoppingMedia,
+} = chatAttachments
 
 // Canned responses slash command state
 const cannedPickerOpen = ref(false)
@@ -265,6 +348,10 @@ let stickyDateTimeout: ReturnType<typeof setTimeout> | null = null
 
 // Emoji picker state
 const emojiPickerOpen = ref(false)
+let refocusComposerAfterEmoji = false
+
+// Composer formatting toolbar/shortcuts and caret-aware inserts
+const composerFormatting = useComposerFormatting(messageInput, messageInputRef, autoResizeTextarea)
 
 // Template picker state
 const templatePickerRef = ref<HTMLElement | null>(null)
@@ -1018,7 +1105,7 @@ function invalidateContactSelection() {
   retryingMessageId.value = null
   isSendingCanned.value = false
   isSendingTemplate.value = false
-  isUploadingMedia.value = false
+  chatAttachments.reset()
 }
 
 function isContactSelectionRequested(generation: number, id: string) {
@@ -1518,8 +1605,18 @@ function closeCannedPicker() {
 }
 
 function insertEmoji(emoji: string) {
-  messageInput.value += emoji
+  refocusComposerAfterEmoji = true
   emojiPickerOpen.value = false
+  composerFormatting.insertText(emoji)
+}
+
+// Return focus to the composer (with the caret after the emoji) instead of
+// the picker trigger.
+function onEmojiPickerCloseAutoFocus(event: Event) {
+  if (!refocusComposerAfterEmoji) return
+  refocusComposerAfterEmoji = false
+  event.preventDefault()
+  messageInputRef.value?.focus()
 }
 
 // Template message handling
@@ -2118,122 +2215,43 @@ function hasProtectedMedia(message: Message): boolean {
   return !!message.media_url && PROTECTED_MEDIA_MESSAGE_TYPES.has(message.message_type)
 }
 
-// File upload functions
+// Attachment entry points (paperclip, drop, paste) share one staging dialog.
 function openFilePicker() {
   fileInputRef.value?.click()
 }
 
+function stageAttachments(files: File[]) {
+  const result = chatAttachments.stage(files)
+  if (result.refused === 'busy') {
+    toast.warning(t('chat.composer.busySending', { name: chatAttachments.sendingTo.value }))
+    return
+  }
+  if (result.overflow > 0 && !result.refused) {
+    toast.warning(t('chat.composer.tooManyFiles', { max: chatAttachments.maxFiles, count: result.overflow }))
+  }
+}
+
 function handleFileSelect(event: Event) {
   const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (!file) return
-
-  // Validate file type
-  const allowedTypes = ['image/', 'video/', 'audio/', 'application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument']
-  const isAllowed = allowedTypes.some(type => file.type.startsWith(type))
-  if (!isAllowed) {
-    toast.error(t('chat.unsupportedFileType'), {
-      description: t('chat.unsupportedFileTypeDesc')
-    })
-    return
-  }
-
-  // Validate file size (16MB limit for WhatsApp)
-  const maxSize = 16 * 1024 * 1024
-  if (file.size > maxSize) {
-    toast.error(t('chat.fileTooLarge'), {
-      description: t('chat.fileTooLargeDesc')
-    })
-    return
-  }
-
-  selectedFile.value = file
-  mediaCaption.value = ''
-
-  // Create preview URL for images and videos
-  if (file.type.startsWith('image/') || file.type.startsWith('video/')) {
-    filePreviewUrl.value = URL.createObjectURL(file)
-  } else {
-    filePreviewUrl.value = null
-  }
-
-  isMediaDialogOpen.value = true
-
-  // Reset input so same file can be selected again
+  const files = Array.from(input.files ?? [])
+  // Reset input so the same file can be selected again
   input.value = ''
+  if (files.length > 0) stageAttachments(files)
 }
 
-function closeMediaDialog() {
-  isMediaDialogOpen.value = false
-  if (filePreviewUrl.value) {
-    URL.revokeObjectURL(filePreviewUrl.value)
-    filePreviewUrl.value = null
-  }
-  selectedFile.value = null
-  mediaCaption.value = ''
+function handleComposerPaste(event: ClipboardEvent) {
+  const files = filesFromClipboard(event.clipboardData)
+  if (files.length === 0) return
+  event.preventDefault()
+  stageAttachments(files)
 }
 
-function getMediaType(mimeType: string): string {
-  if (mimeType.startsWith('image/')) return 'image'
-  if (mimeType.startsWith('video/')) return 'video'
-  if (mimeType.startsWith('audio/')) return 'audio'
-  return 'document'
+function onMediaDialogOpenChange(open: boolean) {
+  if (!open) chatAttachments.close()
 }
 
-async function sendMediaMessage() {
-  if (!selectedFile.value || !contactsStore.currentContact) return
-
-  const contactIdAtSend = contactsStore.currentContact.id
-  const selectionGeneration = contactSelectionGeneration
-  isUploadingMedia.value = true
-  try {
-    const formData = new FormData()
-    formData.append('file', selectedFile.value)
-    formData.append('contact_id', contactIdAtSend)
-    formData.append('type', getMediaType(selectedFile.value.type))
-    if (mediaCaption.value.trim()) {
-      formData.append('caption', mediaCaption.value.trim())
-    }
-    if (selectedAccount.value) {
-      formData.append('whatsapp_account', selectedAccount.value)
-    }
-
-    const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
-    const response = await fetch(`${basePath}/api/messages/media`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: getRequestHeaders({ csrf: true }),
-      body: formData
-    })
-
-    if (!response.ok) {
-      const error = await response.json()
-      throw new Error(error.message || 'Failed to send media')
-    }
-
-    const result = await response.json()
-    if (!isContactSelectionActive(selectionGeneration, contactIdAtSend)) return
-
-    // Add the message to the store (addMessage has duplicate checking for WebSocket)
-    if (result.data) {
-      contactsStore.addMessage(result.data)
-      scrollToBottom()
-    }
-
-    toast.success(t('chat.mediaSent'))
-    closeMediaDialog()
-  } catch (error: any) {
-    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
-      toast.error(t('chat.mediaFailed'), {
-        description: error.message || t('chat.mediaFailedDesc')
-      })
-    }
-  } finally {
-    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
-      isUploadingMedia.value = false
-    }
-  }
-}
+// Files staged for one conversation are never sent to another.
+watch(contactId, () => chatAttachments.reset())
 </script>
 
 <template>
@@ -2401,7 +2419,14 @@ async function sendMediaMessage() {
     </div>
 
     <!-- Chat Area -->
-    <div class="flex-1 flex flex-col bg-[#0f0f10] light:bg-gray-50">
+    <div ref="chatPanelRef" class="relative flex-1 flex flex-col bg-[#0f0f10] light:bg-gray-50">
+      <!-- Files dropped anywhere on the chat panel go to the staging dialog -->
+      <ChatDropZoneOverlay
+        v-if="contactsStore.currentContact"
+        :target="chatPanelRef"
+        :recipient-name="currentContactDisplayName"
+        @files="stageAttachments"
+      />
       <!-- No Contact Selected -->
       <div
         v-if="!contactsStore.currentContact"
@@ -2813,7 +2838,7 @@ async function sendMediaMessage() {
                   <span class="chat-bubble-time"><span>{{ formatMessageTime(message.created_at) }}</span></span>
                 </div>
                 <!-- Text content (for text messages or captions) -->
-                <span v-else-if="getMessageContent(message)" class="whitespace-pre-wrap break-words">{{ getMessageContent(message) }}<span class="chat-bubble-time"><span>{{ formatMessageTime(message.created_at) }}</span><component v-if="message.direction === 'outgoing'" :is="getMessageStatusIcon(message.status)" :class="['h-4 w-4 status-icon', getMessageStatusClass(message.status)]" /></span></span>
+                <span v-else-if="getMessageContent(message)" class="whitespace-pre-wrap break-words"><WhatsAppText :text="getMessageContent(message)" /><span class="chat-bubble-time"><span>{{ formatMessageTime(message.created_at) }}</span><component v-if="message.direction === 'outgoing'" :is="getMessageStatusIcon(message.status)" :class="['h-4 w-4 status-icon', getMessageStatusClass(message.status)]" /></span></span>
                 <!-- Fallback for media without URL -->
                 <span v-else-if="isMediaMessage(message) && !message.media_url" class="text-muted-foreground italic">[{{ message.message_type.charAt(0).toUpperCase() + message.message_type.slice(1) }}]<span class="chat-bubble-time"><span>{{ formatMessageTime(message.created_at) }}</span><component v-if="message.direction === 'outgoing'" :is="getMessageStatusIcon(message.status)" :class="['h-4 w-4 status-icon', getMessageStatusClass(message.status)]" /></span></span>
                 <!-- Interactive buttons - WhatsApp style -->
@@ -2962,6 +2987,7 @@ async function sendMediaMessage() {
 
         <!-- Message Input -->
         <div class="p-4 border-t border-white/[0.08] light:border-gray-200 bg-[#0f0f10] light:bg-white">
+          <ComposerFormatToolbar class="-mt-2 mb-1.5" @format="composerFormatting.applyFormat" />
           <form @submit.prevent="sendMessage" class="flex items-center gap-2 p-2 rounded-xl bg-white/[0.06] light:bg-gray-100 border border-white/[0.08] light:border-gray-200">
             <Tooltip>
               <TooltipTrigger as-child>
@@ -2972,7 +2998,7 @@ async function sendMediaMessage() {
                         <Smile class="w-[18px] h-[18px] text-white/40 light:text-gray-500" />
                       </button>
                     </PopoverTrigger>
-                    <PopoverContent side="top" align="start" class="w-auto p-0">
+                    <PopoverContent side="top" align="start" class="w-auto p-0" @close-auto-focus="onEmojiPickerCloseAutoFocus">
                       <EmojiPicker
                         :native="true"
                         :disable-skin-tones="true"
@@ -3020,7 +3046,8 @@ async function sendMediaMessage() {
             <input
               ref="fileInputRef"
               type="file"
-              accept="image/*,video/*,audio/*,.pdf,.doc,.docx"
+              multiple
+              :accept="CHAT_ATTACHMENT_ACCEPT"
               class="hidden"
               @change="handleFileSelect"
             />
@@ -3031,6 +3058,8 @@ async function sendMediaMessage() {
               rows="1"
               class="flex-1 bg-transparent text-[14px] text-white light:text-gray-900 placeholder:text-white/30 light:placeholder:text-gray-400 focus:outline-none resize-none min-h-[36px] max-h-[120px] py-2 overflow-y-auto"
               @keydown.enter.exact.prevent="sendMessage"
+              @keydown="composerFormatting.onKeydown"
+              @paste="handleComposerPaste"
               @input="autoResizeTextarea"
             />
             <button type="submit" class="w-9 h-9 rounded-lg bg-emerald-600 hover:bg-emerald-500 light:bg-emerald-500 light:hover:bg-emerald-600 flex items-center justify-center transition-colors disabled:opacity-50" :disabled="!messageInput.trim() || isSending">
@@ -3276,83 +3305,27 @@ async function sendMediaMessage() {
       </DialogContent>
     </Dialog>
 
-    <!-- Media Preview Dialog -->
-    <Dialog v-model:open="isMediaDialogOpen">
-      <DialogContent class="max-w-md">
-        <DialogHeader>
-          <DialogTitle>{{ $t('chat.sendMedia') }}</DialogTitle>
-          <DialogDescription>
-            {{ selectedFile?.name }}
-          </DialogDescription>
-        </DialogHeader>
-        <div class="py-4 space-y-4">
-          <!-- Image preview -->
-          <div v-if="selectedFile?.type.startsWith('image/') && filePreviewUrl" class="flex justify-center">
-            <img
-              :src="filePreviewUrl"
-              :alt="selectedFile.name"
-              class="max-w-full max-h-[300px] rounded-lg object-contain"
-            />
-          </div>
-          <!-- Video preview -->
-          <div v-else-if="selectedFile?.type.startsWith('video/') && filePreviewUrl" class="flex justify-center">
-            <video
-              :src="filePreviewUrl"
-              controls
-              class="max-w-full max-h-[300px] rounded-lg"
-            />
-          </div>
-          <!-- Audio preview -->
-          <div v-else-if="selectedFile?.type.startsWith('audio/')" class="flex justify-center">
-            <div class="flex items-center gap-3 px-4 py-3 bg-muted rounded-lg">
-              <div class="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
-                <Paperclip class="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <p class="font-medium text-sm">{{ selectedFile.name }}</p>
-                <p class="text-xs text-muted-foreground">{{ $t('chat.audioFile') }}</p>
-              </div>
-            </div>
-          </div>
-          <!-- Document preview -->
-          <div v-else-if="selectedFile" class="flex justify-center">
-            <div class="flex items-center gap-3 px-4 py-3 bg-muted rounded-lg">
-              <div class="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
-                <FileText class="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <p class="font-medium text-sm truncate max-w-[200px]">{{ selectedFile.name }}</p>
-                <p class="text-xs text-muted-foreground">
-                  {{ (selectedFile.size / 1024).toFixed(1) }} KB
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <!-- Caption input (not for audio) -->
-          <div v-if="selectedFile && !selectedFile.type.startsWith('audio/')">
-            <Textarea
-              v-model="mediaCaption"
-              :placeholder="$t('chat.mediaCaption') + '...'"
-              class="min-h-[60px] max-h-[100px] resize-none"
-              :rows="2"
-            />
-          </div>
-
-          <!-- Actions -->
-          <div class="flex justify-end gap-2">
-            <Button variant="outline" @click="closeMediaDialog" :disabled="isUploadingMedia">
-              {{ $t('common.cancel') }}
-            </Button>
-            <Button @click="sendMediaMessage" :disabled="isUploadingMedia">
-              <Send v-if="!isUploadingMedia" class="mr-2 h-4 w-4" />
-              <span v-if="isUploadingMedia">{{ $t('chat.sending') }}...</span>
-              <span v-else>{{ $t('chat.send') }}</span>
-            </Button>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
+    <!-- Media staging dialog: up to 10 files, one WhatsApp message each -->
+    <MediaSendDialog
+      :open="isMediaDialogOpen"
+      :items="stagedAttachments"
+      :recipient-name="currentContactDisplayName"
+      :recipient-detail="currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text"
+      :sending="isUploadingMedia"
+      :stopping="isStoppingMedia"
+      :max-files="chatAttachments.maxFiles"
+      :service-window-expired="isServiceWindowExpired"
+      @update:open="onMediaDialogOpenChange"
+      @remove="chatAttachments.remove"
+      @update:caption="chatAttachments.setCaption"
+      @send-as-document="chatAttachments.sendAsDocument"
+      @convert="chatAttachments.convertToJpeg"
+      @convert-all="chatAttachments.convertAllToJpeg"
+      @send="chatAttachments.sendAll"
+      @retry-failed="chatAttachments.retryFailed"
+      @stop="chatAttachments.stop"
+      @add-more="openFilePicker"
+    />
 
     <!-- Add Contact Dialog -->
     <CreateContactDialog v-model:open="isAddContactOpen" @created="onContactCreated" />

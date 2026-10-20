@@ -344,16 +344,37 @@ test.describe("Chat media in a non-default workspace", () => {
     // load from the same bubble would show up here.
     expect(mediaRequests).toEqual([{ messageId: imageMessageId, organizationId: selectedWorkspaceId }]);
 
-    // Clicking the image opens the already-authorized bytes in a new tab.
+    // Clicking the image opens the already-authorized bytes in the in-app
+    // preview, not a new tab.
     const imageSource = await media.locator("img").getAttribute("src");
-    const popupPromise = page.waitForEvent("popup");
+    expect(imageSource).toMatch(/^blob:/);
+    const popups: string[] = [];
+    page.on("popup", (popup) => popups.push(popup.url()));
     await media.getByRole("button").click();
-    const popup = await popupPromise;
-    await popup.waitForLoadState();
-    expect(popup.url()).toBe(imageSource);
-    expect(await popup.evaluate(() => document.contentType)).toBe("image/png");
-    await popup.close();
+    const preview = page.getByTestId("chat-media-preview");
+    await expect(preview).toBeVisible();
+    await expect(preview).toHaveAttribute("data-preview-kind", "image");
+    const previewImage = preview.locator("img");
+    await expect(previewImage).toHaveAttribute("src", imageSource ?? "");
+    await expect
+      .poll(() => previewImage.evaluate((image) => (image instanceof HTMLImageElement ? image.naturalWidth : 0)))
+      .toBe(imageWidth);
+    const download = preview.getByTestId("chat-media-preview-download");
+    await expect(download).toHaveAttribute("href", imageSource ?? "");
+    await expect(download).toHaveAttribute("download", "image.png");
+
+    await page.keyboard.press("Escape");
+    await expect(preview).toBeHidden();
+    await expect(media.locator("img")).toHaveAttribute("src", imageSource ?? "");
+    expect(popups).toEqual([]);
     expect(mediaRequests).toHaveLength(1);
+
+    // "Open image in new tab" still gets an image: the object URL keeps its
+    // raster type and nothing else.
+    const newTab = await page.context().newPage();
+    await newTab.goto(imageSource ?? "");
+    expect(await newTab.evaluate(() => document.contentType)).toBe("image/png");
+    await newTab.close();
   });
 
   test("loads the transcript's images newest first, a few at a time", async ({ page }) => {
