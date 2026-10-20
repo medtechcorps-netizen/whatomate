@@ -6,6 +6,8 @@ export const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).
 
 export type Upload = {
   ordinal: number
+  connectionId: number
+  connectionRequestOrdinal: number
   organization: string
   contact: string
   kind: string
@@ -17,6 +19,8 @@ export type Upload = {
   responseClosed: boolean
   closedBeforeResponseEnd: boolean
   responseStatus: number | null
+  lossBeforeHeaders: boolean | null
+  responseBytesWrittenAtLoss: number | null
 }
 
 // A test-owned receiver, not the media handler or a provider simulator. The
@@ -31,11 +35,19 @@ export async function multipartReceiver(upstreamValue: string) {
   const faults: string[] = []
   const replies = new Map<number, ServerResponse>()
   const sockets = new Set<Socket>()
+  const connections = new Map<Socket, { id: number; requests: number }>()
+  let connectionCount = 0
   const proxies = new Set<ReturnType<typeof httpRequest>>()
   let proxiedBytes = 0
   let proxyRequests = 0
   let closed = false
   const server = createServer((req, res) => {
+    const connection = connections.get(req.socket)
+    if (!connection) { faults.push('unknown-receiver-connection'); res.destroy(); return }
+    connection.requests += 1
+    // Empty responses on reused sockets can be replayed below XMLHttpRequest.
+    // Close every test-owned response and prove socket freshness at loss time.
+    res.setHeader('connection', 'close')
     const path = req.url ?? ''
     if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\')) {
       faults.push('invalid-path'); res.writeHead(400).end(); return
@@ -48,9 +60,11 @@ export async function multipartReceiver(upstreamValue: string) {
     }
     if (url.pathname === '/api/messages/media' && req.method === 'POST' && !url.search) {
       if (uploads.length >= 8) { faults.push('upload-count-cap'); res.writeHead(413).end(); return }
-      const record: Upload = { ordinal: uploads.length + 1, organization: '', contact: '', kind: '',
+      const record: Upload = { ordinal: uploads.length + 1, connectionId: connection.id,
+        connectionRequestOrdinal: connection.requests, organization: '', contact: '', kind: '',
         filename: '', fileBytes: 0, fileSha256: '', bodyBytes: 0, bodyComplete: false,
-        responseClosed: false, closedBeforeResponseEnd: false, responseStatus: null }
+        responseClosed: false, closedBeforeResponseEnd: false, responseStatus: null,
+        lossBeforeHeaders: null, responseBytesWrittenAtLoss: null }
       uploads.push(record)
       replies.set(record.ordinal, res)
       res.on('close', () => {
@@ -112,7 +126,9 @@ export async function multipartReceiver(upstreamValue: string) {
         chunks.push(chunk)
       })
       response.on('end', () => {
-        if (!res.destroyed) res.writeHead(response.statusCode ?? 502, response.headers).end(Buffer.concat(chunks))
+        if (!res.destroyed) res.writeHead(response.statusCode ?? 502, {
+          ...response.headers, connection: 'close',
+        }).end(Buffer.concat(chunks))
       })
       response.on('error', () => { if (!closed) faults.push('proxy-response-error'); res.destroy() })
     })
@@ -124,7 +140,12 @@ export async function multipartReceiver(upstreamValue: string) {
   })
   server.requestTimeout = 15_000
   server.headersTimeout = 10_000
-  server.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)) })
+  server.on('connection', socket => {
+    if (++connectionCount > 1024) { faults.push('connection-count-cap'); socket.destroy(); return }
+    sockets.add(socket)
+    connections.set(socket, { id: connectionCount, requests: 0 })
+    socket.on('close', () => { sockets.delete(socket); connections.delete(socket) })
+  })
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve() })
@@ -145,7 +166,12 @@ export async function multipartReceiver(upstreamValue: string) {
     },
     loseResponse(ordinal: number) {
       const response = replies.get(ordinal)
-      if (!response || !uploads[ordinal - 1]?.bodyComplete) throw new Error('receiver-loss-state')
+      const record = uploads[ordinal - 1]
+      if (!response || !record?.bodyComplete || record.connectionRequestOrdinal !== 1 ||
+          response.headersSent || response.writableEnded || response.destroyed ||
+          !response.socket || response.socket.bytesWritten !== 0) throw new Error('receiver-loss-state')
+      record.lossBeforeHeaders = true
+      record.responseBytesWrittenAtLoss = response.socket.bytesWritten
       response.destroy()
     },
     async close() {

@@ -267,7 +267,14 @@ for (const response of [
   test(`marks a completed native upload with ${response.label} unconfirmed without retry`, async ({ app }) => {
     await stage(app, [first]); await uploaded(app)
     if (response.status) app.receiver.respond(1, response.status, response.body, response.json)
-    else app.receiver.loseResponse(1)
+    else {
+      // A true zero-response loss on a proven unused connection, not an empty
+      // response on a reused socket that the browser may transparently replay.
+      expect(app.receiver.uploads[0].connectionId).toBeGreaterThan(0)
+      expect(app.receiver.uploads[0].connectionRequestOrdinal).toBe(1)
+      app.receiver.loseResponse(1)
+      expect(app.receiver.uploads[0]).toMatchObject({ lossBeforeHeaders: true, responseBytesWrittenAtLoss: 0 })
+    }
     await expect(app.page.getByTestId('composer-media-item')).toHaveAttribute('data-status', 'unconfirmed')
     await expect(app.page.getByTestId('composer-media-unconfirmed')).toBeVisible()
     await expect(app.page.getByTestId('composer-media-retry')).toHaveCount(0)
