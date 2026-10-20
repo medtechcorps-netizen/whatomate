@@ -846,11 +846,23 @@ test.describe('Logout during a token refresh', () => {
       // Returning to the prior authenticated history entry must run the actual
       // router's interrupted-note check before it restores persisted user A.
       await page.goBack({ waitUntil: 'domcontentloaded' })
+      let returned = original
       await expect.poll(async () => {
-        const state = await historyState()
-        return state.id !== original.id ? state.persistedShows.length > 0 : state.persistedShows.at(-1) === true
+        let state: typeof original
+        try {
+          state = await historyState()
+        } catch (error) {
+          // Back can replace the execution context between poll attempts.
+          // Only that transient observation failure is eligible for polling.
+          if (error instanceof Error && error.message === 'page.evaluate: Execution context was destroyed, most likely because of a navigation') {
+            return false
+          }
+          throw error
+        }
+        const ready = state.id !== original.id ? state.persistedShows.length > 0 : state.persistedShows.at(-1) === true
+        if (ready) returned = state
+        return ready
       }).toBe(true)
-      const returned = await historyState()
       const restoredFromCache = original.id === returned.id && returned.persistedShows.at(-1) === true
       const newDocument = original.id !== returned.id && returned.persistedShows.every((persisted) => !persisted)
       // Preserve the lifecycle observation even when the following security
