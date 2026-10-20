@@ -76,6 +76,9 @@ const test = base.extend<{ app: ReloadApp; corruptSecond: boolean }>({
     let decodeOverflow: boolean | null = null
     const cleanupErrors: string[] = []
     try {
+      // Install before app code can arm timers, so the later negative oracle
+      // also observes a counterfactual retry armed during native decode.
+      if (corruptSecond) await page.clock.install()
       await page.addInitScript(({ user, org }) => {
         localStorage.setItem('user', JSON.stringify(user))
         localStorage.setItem('selected_organization_id', org)
@@ -253,7 +256,6 @@ test.describe('native image decode failure', () => {
     await expect(retry).toBeVisible()
     // Explicit browser-clock observation of the unchanged production 5s/15s
     // remaining budget. This does not inject progress, decode or socket events.
-    await app.page.clock.install()
     app.status('delivered'); app.status('read')
     await expect(app.page.locator(`[data-testid="chat-message"][data-message-id="${imageId}"] .status-icon`))
       .toHaveClass(/text-blue-400/)
