@@ -6,7 +6,7 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 // unrelated mutations and off-origin traffic are refused.
 const id = (n: number) => `e3900000-0000-4000-8000-${String(n).padStart(12, '0')}`
 const workspace = id(91)
-const loginWorkspace = id(90)
+const otherWorkspace = id(90)
 const userId = id(92)
 const sourceId = id(1)
 const sourceMessageId = id(101)
@@ -68,7 +68,9 @@ async function fixture(page: Page, baseURL: string | undefined, options: {
   }
   const user = {
     id: userId, email: 'r3-ui@example.test', full_name: 'Synthetic R3 Agent',
-    organization_id: loginWorkspace, organization_name: 'Synthetic Login',
+    // Ordinary users' active workspace is their authenticated organization.
+    // A distinct membership does not select a different active workspace.
+    organization_id: workspace, organization_name: 'Synthetic R3 Workspace',
     is_super_admin: false, is_reseller_admin: false,
     role: {
       id: id(93), name: 'agent', is_system: false,
@@ -154,8 +156,8 @@ async function fixture(page: Page, baseURL: string | undefined, options: {
     if (path === '/api/auth/ws-token' && method === 'GET') return ok({ token: '' })
     if (path === '/api/me/organizations' && method === 'GET') {
       return ok({ organizations: [
-        { organization_id: loginWorkspace, name: 'Synthetic Login', is_default: true, role_name: 'agent' },
-        { organization_id: workspace, name: 'Synthetic R3 Workspace', is_default: false, role_name: 'agent' },
+        { organization_id: workspace, name: 'Synthetic R3 Workspace', is_default: true, role_name: 'agent' },
+        { organization_id: otherWorkspace, name: 'Synthetic Other Workspace', is_default: false, role_name: 'agent' },
       ] })
     }
     if (path === '/api/contacts' || path.startsWith('/api/contacts/')) {
@@ -299,7 +301,11 @@ test.describe('R3 built Chat inbox and forwarding — synthetic API outcomes', (
     await row(page, sourceId).click()
     await expect(bubble(page, sourceMessageId)).toBeVisible()
     await page.getByTestId('chat-more-options').click()
-    await expect(page.getByTestId('chat-next-step-menu')).toBeVisible()
+    await expect(page.getByTestId('chat-more-options')).toHaveAttribute('aria-expanded', 'true')
+    // The portal wrapper does not forward its test id to the rendered menu.
+    const menu = page.getByRole('menu', { name: 'More options', exact: true })
+    await expect(menu).toBeVisible()
+    await expect(menu.getByRole('menuitem', { name: 'Show customer workspace', exact: true })).toBeVisible()
     await expect(page.getByTestId('chat-menu-mark-read')).toHaveCount(0)
     await expect(page.getByTestId('chat-menu-mark-unread')).toHaveCount(0)
     expect(f.reads.filter(r => r.body.mark)).toEqual([])
