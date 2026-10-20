@@ -3427,13 +3427,13 @@ func forwardSendFailedRefusal() *messageForwardRefusal {
 // delivery worker gave up before the provider because the server was busy
 // (raw database errors are logged, never stored).
 func forwardServerBusyError() error {
-	return errors.New("Not sent: the server was too busy to send this forward. Forward it again from the original message.")
+	return errors.New("Not sent: the server was too busy to send this forward. Forward it again from the original message.") //nolint:staticcheck // ST1005: persisted user-facing sentence, displayed verbatim with punctuation.
 }
 
 // forwardAttachmentCopyError is the stored, user-facing reason for a
 // forwarded attachment that could not be copied before the upload.
 func forwardAttachmentCopyError() error {
-	return errors.New("Not sent: the attachment could not be copied for this forward. Forward it again from the original message.")
+	return errors.New("Not sent: the attachment could not be copied for this forward. Forward it again from the original message.") //nolint:staticcheck // ST1005: persisted user-facing sentence, displayed verbatim with punctuation.
 }
 
 func forwardOutcomeUnknownRefusal() *messageForwardRefusal {
