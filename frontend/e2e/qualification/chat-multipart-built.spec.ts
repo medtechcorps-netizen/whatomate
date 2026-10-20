@@ -134,12 +134,12 @@ const test = base.extend<{ app: App }>({
   },
 })
 
-async function stage(app: App, files = [first, second]) {
+async function stage(app: App, files = [first, second], { expectActiveHold = true }: { expectActiveHold?: boolean } = {}) {
   await app.page.locator('input[type="file"][multiple]').setInputFiles(files)
   await expect(app.page.getByTestId('composer-media-item')).toHaveCount(files.length)
   await expect(app.page.getByTestId('composer-media-send')).toBeEnabled()
   await app.page.getByTestId('composer-media-send').click()
-  await expect(app.page.getByTestId('organization-switcher')).toBeDisabled()
+  if (expectActiveHold) await expect(app.page.getByTestId('organization-switcher')).toBeDisabled()
 }
 
 async function uploaded(app: App, ordinal = 1, file = first, detached = false) {
@@ -302,8 +302,11 @@ test('a completed-upload 422 remains failed and only an explicit Retry sends it 
 
 test('a network refusal before native upload completion stays failed rather than unconfirmed', async ({ app }) => {
   await app.page.route(/\/api\/messages\/media$/, route => route.abort('connectionrefused'))
-  await stage(app, [first])
+  // A native refusal can settle before click resolves; assert the released hold
+  // after the native terminal event instead of requiring a transient active hold.
+  await stage(app, [first], { expectActiveHold: false })
   await nativeEnded(app, 1)
+  await expect(app.page.getByTestId('organization-switcher')).toBeEnabled()
   expect(await app.page.evaluate(() => window.__r2Uploads[0])).toMatchObject({
     uploadLoad: false, uploadLoaded: 0, error: true, status: 0,
   })
