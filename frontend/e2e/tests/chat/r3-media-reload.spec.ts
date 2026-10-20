@@ -64,6 +64,7 @@ const test = base.extend<{ app: ReloadApp; corruptSecond: boolean }>({
     const requests: MediaRequest[] = []
     const faults: string[] = []
     const sentStatuses: string[] = []
+    const selectedContacts: string[] = []
     const sockets: WebSocketRoute[] = []
     let inFlight = 0
     let maxInFlight = 0
@@ -106,6 +107,8 @@ const test = base.extend<{ app: ReloadApp; corruptSecond: boolean }>({
           const message = JSON.parse(String(raw))
           if (message.type === 'auth' && message.payload?.token === 'synthetic-r3-media') authMessages++
           else if (message.type === 'ping') socket.send(JSON.stringify({ type: 'pong' }))
+          else if (message.type === 'set_contact' && message.payload?.contact_id === contactId &&
+                   Object.keys(message.payload).length === 1) selectedContacts.push(contactId)
           else faults.push('unexpected-socket-message')
         })
       })
@@ -201,7 +204,7 @@ const test = base.extend<{ app: ReloadApp; corruptSecond: boolean }>({
       try { await context.close() } catch { cleanupErrors.push('context-close') }
       const evidence = Buffer.from(JSON.stringify({
         schema: 1, syntheticApiAndSocket: true, nativeImageDecode: true,
-        requests, maxInFlight, inFlight, sentStatuses, authMessages, socketMessages,
+        requests, maxInFlight, inFlight, sentStatuses, selectedContacts, authMessages, socketMessages,
         decodeErrors, decodeOverflow, faults, cleanupErrors,
       }))
       expect(evidence.length).toBeLessThanOrEqual(16 * 1024)
