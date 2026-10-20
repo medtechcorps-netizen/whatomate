@@ -1543,3 +1543,287 @@ test.afterEach(async ({ context }, testInfo) => {
     })),
   })
 })
+
+// Deterministic controls for transport attempts versus acknowledged logout.
+// The original case and its request-count assertion above remain unchanged.
+type RecoveryEvent = Record<string, string | number | boolean>
+function recoveryLedger(context: BrowserContext) {
+  const events: RecoveryEvent[] = []
+  const errors: string[] = []
+  const detach: Array<() => void> = []
+  const requests = new Map<import('@playwright/test').Request, number>()
+  const tabs = new Map<Page, number>()
+  const start = performance.now()
+  let bytes = 0
+  let overflow = false
+  const add = (row: RecoveryEvent) => {
+    const event = { at_ms: Math.round(performance.now() - start), ...row }
+    const size = Buffer.byteLength(JSON.stringify(event)) + 1
+    if (events.length >= 256 || bytes + size > 48 * 1024) { overflow = true; return }
+    bytes += size
+    events.push(event)
+  }
+  const register = (page: Page) => {
+    if (tabs.has(page)) return
+    const tab = tabs.size + 1
+    tabs.set(page, tab)
+    const loaded = () => add({ action: 'document-ready', tab })
+    const closed = () => add({ action: 'page-close', tab })
+    page.on('domcontentloaded', loaded)
+    page.on('close', closed)
+    detach.push(() => { page.off('domcontentloaded', loaded); page.off('close', closed) })
+  }
+  const sent = (request: import('@playwright/test').Request) => {
+    try {
+      const path = new URL(request.url()).pathname
+      if (!['/api/auth/refresh', '/api/auth/logout', '/api/auth/login', '/api/me'].includes(path)) return
+      const page = request.frame().page()
+      register(page)
+      if (requests.size >= 256) { overflow = true; return }
+      const id = requests.size + 1
+      requests.set(request, id)
+      const kind = path.endsWith('/refresh') ? ((request.postData() ?? '').includes('"revoke"') ? 'revoke' : 'refresh')
+        : path.endsWith('/logout') ? 'logout' : path.endsWith('/login') ? 'login' : 'me'
+      add({ action: 'request-start', id, tab: tabs.get(page)!, kind })
+    } catch {
+      if (errors.length < 16) errors.push('request-observer')
+      else overflow = true
+    }
+  }
+  const response = (value: import('@playwright/test').Response) => {
+    const id = requests.get(value.request())
+    if (id !== undefined) add({ action: 'response', id, status: value.status() })
+  }
+  const finished = (request: import('@playwright/test').Request) => {
+    const id = requests.get(request)
+    if (id !== undefined) add({ action: 'request-finished', id })
+  }
+  const failed = (request: import('@playwright/test').Request) => {
+    const id = requests.get(request)
+    if (id === undefined) return
+    const value = request.failure()?.errorText ?? ''
+    add({ action: 'request-failed', id, failure: /^net::ERR_[A-Z_]+$/.test(value) ? value : 'other-network-error' })
+  }
+  context.on('page', register)
+  context.on('request', sent)
+  context.on('response', response)
+  context.on('requestfinished', finished)
+  context.on('requestfailed', failed)
+  detach.push(() => {
+    context.off('page', register); context.off('request', sent); context.off('response', response)
+    context.off('requestfinished', finished); context.off('requestfailed', failed)
+  })
+  for (const page of context.pages()) register(page)
+  return {
+    add, events, errors,
+    id: (request: import('@playwright/test').Request) => requests.get(request),
+    finish: () => { for (const fn of detach) fn(); return { events, errors, overflow } },
+  }
+}
+
+// One real response, isolated upstream cookie jar, explicit gate, finite fetch.
+// No response headers or cookie values enter the attachment.
+async function holdRecoveryResponse(
+  target: Page | BrowserContext,
+  path: '/auth/refresh' | '/auth/logout',
+  newContext: () => Promise<APIRequestContext>,
+  note: (event: RecoveryEvent) => void,
+) {
+  type Request = import('@playwright/test').Request
+  type Route = import('@playwright/test').Route
+  let request: Request | undefined
+  let cookies: Record<string, string> = {}
+  let releaseGate!: (action: 'deliver' | 'abort') => void
+  const gate = new Promise<'deliver' | 'abort'>((resolve) => { releaseGate = resolve })
+  let readyResolve!: () => void
+  let readyReject!: (error: Error) => void
+  const ready = new Promise<void>((resolve, reject) => { readyResolve = resolve; readyReject = reject })
+  // The readiness rejection is also awaited by the body; suppress only an
+  // unhandled-promise warning if an earlier assertion has already failed.
+  void ready.catch(() => undefined)
+  let doneResolve!: () => void
+  const done = new Promise<void>((resolve) => { doneResolve = resolve })
+  const cleanupErrors: string[] = []
+  const pattern = `**/api${path}`
+  const handler = async (route: Route) => {
+    const incoming = route.request()
+    if (request || (path === '/auth/refresh' && (incoming.postData() ?? '').includes('"revoke"'))) {
+      await route.continue()
+      return
+    }
+    request = incoming
+    let upstream: APIRequestContext | undefined
+    try {
+      upstream = await newContext()
+      const headers = await incoming.allHeaders()
+      delete headers['content-length']
+      delete headers.host
+      const response = await upstream.fetch(incoming.url(), {
+        method: incoming.method(), headers, data: incoming.postDataBuffer() ?? undefined,
+        maxRedirects: 0, timeout: 10_000,
+      })
+      if ((await response.body()).byteLength > 16 * 1024) throw new Error('upstream-response-cap')
+      if (response.status() !== 200) throw new Error('upstream-not-200')
+      cookies = setCookies(response.headersArray())
+      note({ action: 'upstream-ready', path, status: response.status() })
+      readyResolve()
+      const action = await gate
+      note({ action: 'release-response', path, delivery: action })
+      try {
+        if (action === 'deliver') await route.fulfill({ response })
+        else await route.abort('aborted')
+      } catch {
+        // Page navigation may already have cancelled this route. The test
+        // must prove the browser requestfailed event separately.
+        note({ action: 'route-already-ended', path })
+      }
+    } catch {
+      cleanupErrors.push('held-upstream-failed')
+      readyReject(new Error('held-upstream-failed'))
+      await route.abort('failed').catch(() => undefined)
+    } finally {
+      if (upstream) {
+        try { await upstream.dispose() } catch { cleanupErrors.push('upstream-dispose') }
+      }
+      doneResolve()
+    }
+  }
+  await target.route(pattern, handler)
+  return {
+    ready, done, cookies: () => cookies,
+    request: () => { if (!request) throw new Error('held-request-missing'); return request },
+    release: (action: 'deliver' | 'abort') => releaseGate(action),
+    cleanup: async () => {
+      releaseGate('abort')
+      await target.unroute(pattern, handler)
+      if (request) await done
+      return cleanupErrors
+    },
+  }
+}
+
+test.describe('Logout recovery response controls', () => {
+  test.describe.configure({ timeout: 120_000 })
+
+  for (const arm of ['acknowledged', 'interrupted'] as const) {
+    test(`logout recovery control: ${arm} first clearing response preserves a new sign-in`, async ({
+      page, context, playwright, baseURL,
+    }, testInfo) => {
+      const ledger = recoveryLedger(context)
+      const checks: Record<string, boolean> = {}
+      const cleanupErrors: string[] = []
+      let other: Page | undefined
+      let heldRefresh: Awaited<ReturnType<typeof holdRecoveryResponse>> | undefined
+      let heldLogout: Awaited<ReturnType<typeof holdRecoveryResponse>> | undefined
+      const newContext = () => playwright.request.newContext({ baseURL })
+      const pendingPresent = (tab: Page) => tab.evaluate(() => localStorage.getItem('whm_logout_pending') !== null)
+      try {
+        await loginAsAdmin(page)
+        const originalRefresh = await cookieValue(context, 'whm_refresh')
+        expect(Boolean(originalRefresh)).toBe(true)
+        other = await context.newPage()
+        await other.goto('/', { waitUntil: 'domcontentloaded' })
+        const order: string[] = []
+        recordSessionRequests(context, order)
+        await openNonAppPage(page)
+        heldRefresh = await holdRecoveryResponse(other, '/auth/refresh', newContext, ledger.add)
+        await startProactiveRefresh(other)
+        await heldRefresh.ready
+        await other.evaluate(() => localStorage.setItem('whm_auth_expires_at', String(Date.now() + 60 * 60_000)))
+        await page.goto('/', { waitUntil: 'domcontentloaded' })
+        expect((await cookieValue(context, 'whm_refresh')) === originalRefresh).toBe(true)
+        expect(Boolean(heldRefresh.cookies().whm_refresh)).toBe(true)
+        heldLogout = await holdRecoveryResponse(context, '/auth/logout', newContext, ledger.add)
+        await logout(page)
+        await heldLogout.ready
+        const firstRequest = heldLogout.request()
+        const firstId = ledger.id(firstRequest)!
+        expect(typeof firstId).toBe('number')
+        const owner = firstRequest.frame().page()
+        const refreshId = ledger.id(heldRefresh.request())!
+        await expect.poll(() => ledger.events.some(e => e.action === 'request-failed' && e.id === refreshId), { timeout: 5_000 }).toBe(true)
+        for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+          expect(Boolean(await cookieValue(context, name))).toBe(false)
+        }
+        expect(await pendingPresent(owner)).toBe(true)
+        checks.real_revoke_cleared_cookies_pending_unacknowledged = true
+        ledger.add({ action: 'pending-observation', present: true, phase: 'before-control' })
+
+        if (arm === 'interrupted') {
+          // Server has answered upstream, but no logout response is delivered
+          // to the originating document before a deliberate full navigation.
+          const failed = owner.waitForEvent('requestfailed', {
+            predicate: request => request === firstRequest, timeout: 10_000,
+          })
+          await owner.goto('/login', { waitUntil: 'domcontentloaded' })
+          await failed
+          heldLogout.release('abort')
+          await heldLogout.done
+          expect(ledger.events.some(e => e.action === 'response' && e.id === firstId)).toBe(false)
+          await expect.poll(() => order.filter(k => k === 'logout').length, { timeout: 10_000 }).toBe(2)
+          const logoutIds = ledger.events.filter(e => e.action === 'request-start' && e.kind === 'logout').map(e => e.id)
+          expect(logoutIds.length).toBe(2)
+          const recoveryId = logoutIds[1]!
+          await expect.poll(() => ledger.events.some(e => e.action === 'response' && e.id === recoveryId && e.status === 200), { timeout: 10_000 }).toBe(true)
+          await expect.poll(() => ledger.events.some(e => e.action === 'request-finished' && e.id === recoveryId), { timeout: 10_000 }).toBe(true)
+          checks.first_browser_response_interrupted = true
+          checks.exact_one_recovery_completed = true
+        } else {
+          heldLogout.release('deliver')
+          await heldLogout.done
+          await expect.poll(() => ledger.events.some(e => e.action === 'response' && e.id === firstId && e.status === 200), { timeout: 10_000 }).toBe(true)
+          await expect.poll(() => ledger.events.some(e => e.action === 'request-finished' && e.id === firstId), { timeout: 10_000 }).toBe(true)
+          await expect.poll(() => pendingPresent(owner), { timeout: 10_000 }).toBe(false)
+          ledger.add({ action: 'pending-observation', present: false, phase: 'acknowledged-before-navigation' })
+          checks.acknowledged_before_navigation = true
+          await owner.goto('/login', { waitUntil: 'domcontentloaded' })
+        }
+        await expect.poll(() => pendingPresent(page), { timeout: 10_000 }).toBe(false)
+        ledger.add({ action: 'pending-observation', present: false, phase: 'before-B' })
+        const expectedAttempts = arm === 'interrupted' ? ['revoke', 'logout', 'logout'] : ['revoke', 'logout']
+        expect(order.filter(k => k === 'revoke' || k === 'logout')).toEqual(expectedAttempts)
+        const preBEvents = ledger.events.length
+        await signInHere(page, TEST_USERS.manager)
+        const sessionB = await cookieValue(context, 'whm_refresh')
+        heldRefresh.release('deliver')
+        await heldRefresh.done
+        await other.waitForTimeout(1_000)
+        expect(Boolean(sessionB)).toBe(true)
+        expect(sessionB !== originalRefresh).toBe(true)
+        expect(sessionB !== heldRefresh.cookies().whm_refresh).toBe(true)
+        expect((await cookieValue(context, 'whm_refresh')) === sessionB).toBe(true)
+        const me = await page.request.get('/api/me')
+        expect(me.status()).toBe(200)
+        expect((await me.json()).data.email === TEST_USERS.manager.email).toBe(true)
+        await expectRefreshRejected(newContext, [originalRefresh, heldRefresh.cookies().whm_refresh])
+        expect(order.filter(k => k === 'revoke' || k === 'logout')).toEqual(expectedAttempts)
+        const clearIds = ledger.events.filter(e => e.action === 'request-start' && (e.kind === 'logout' || e.kind === 'revoke')).map(e => e.id)
+        expect(ledger.events.slice(preBEvents).some(e => clearIds.includes(e.id) && ['request-start', 'response', 'request-finished'].includes(String(e.action)))).toBe(false)
+        checks.no_A_clearing_after_B_attempt = true
+        checks.B_cookie_identity_and_me_preserved = true
+        checks.both_old_refresh_tokens_rejected = true
+        checks.exact_revoke_and_clearing_attempts = true
+      } finally {
+        for (const [name, held] of [['logout', heldLogout], ['refresh', heldRefresh]] as const) {
+          if (held) {
+            try { cleanupErrors.push(...await held.cleanup()) } catch { cleanupErrors.push(`${name}-cleanup`) }
+          }
+        }
+        if (other && !other.isClosed()) {
+          try { await other.close() } catch { cleanupErrors.push('other-page-close') }
+        }
+        ledger.add({ action: 'test-end', status: testInfo.status ?? 'unknown' })
+        const captured = ledger.finish()
+        await testInfo.attach('auth-logout-recovery-control', {
+          contentType: 'application/json',
+          body: Buffer.from(JSON.stringify({
+            schema_version: 1, test_title: testInfo.title, arm, ...captured, checks, cleanup_errors: cleanupErrors,
+          })),
+        })
+        expect(captured.overflow).toBe(false)
+        expect(captured.errors).toEqual([])
+        expect(cleanupErrors).toEqual([])
+      }
+    })
+  }
+})
