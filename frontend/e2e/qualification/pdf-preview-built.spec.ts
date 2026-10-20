@@ -108,10 +108,19 @@ async function openBuiltChat(page: Page) {
   expect(response?.headers()['content-security-policy']).toBe(policy)
   expect(policy).not.toContain("'unsafe-eval'")
   expect(policy).not.toContain("'wasm-unsafe-eval'")
-  const scripts = await page.locator('script[src]').evaluateAll(elements => elements.map(el => (el as HTMLScriptElement).src))
-  expect(scripts.length).toBeGreaterThan(0)
-  expect(scripts.every(url => new URL(url).origin === new URL(page.url()).origin && /\/assets\/.+\.js$/.test(new URL(url).pathname))).toBe(true)
-  expect(scripts.some(url => /@vite|\/src\//.test(url))).toBe(false)
+  const scripts = await page.locator('script[src]').evaluateAll(elements => elements.map(el => ({
+    src: (el as HTMLScriptElement).src, type: (el as HTMLScriptElement).type,
+  })))
+  const origin = new URL(page.url()).origin
+  const emittedScript = (path: string) => /^\/assets\/.+\.js$/.test(path)
+  expect(scripts.every(({ src }) => {
+    const url = new URL(src)
+    return url.origin === origin && !url.search && !url.hash
+      && (url.pathname === '/theme-init.js' || emittedScript(url.pathname))
+  })).toBe(true)
+  expect(scripts.filter(({ src }) => new URL(src).pathname === '/theme-init.js')).toHaveLength(1)
+  expect(scripts.some(({ src, type }) => type === 'module' && emittedScript(new URL(src).pathname))).toBe(true)
+  expect(scripts.some(({ src }) => /@vite|\/src\//.test(src))).toBe(false)
   const media = page.locator(`[data-message-id="${messageId}"] [data-testid="chat-message-media"]`)
   await expect(media).toBeVisible()
   return media
