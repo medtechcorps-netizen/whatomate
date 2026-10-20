@@ -668,6 +668,8 @@ func storeCustomActionRedirect(targetURL string) (string, error) {
 
 // buildActionContext builds the context object for variable replacement
 func buildActionContext(contact models.Contact, user models.User, org models.Organization) map[string]any {
+	// Internal inbox state (the manual unread mark) is not customer data.
+	metadata, _ := contactMetadataForResponse(contact.Metadata)
 	return map[string]any{
 		"contact": map[string]any{
 			"id":           contact.ID.String(),
@@ -675,7 +677,7 @@ func buildActionContext(contact models.Contact, user models.User, org models.Org
 			"name":         contact.ProfileName,
 			"profile_name": contact.ProfileName,
 			"tags":         contact.Tags,
-			"metadata":     contact.Metadata,
+			"metadata":     metadata,
 		},
 		"user": map[string]any{
 			"id":    user.ID.String(),

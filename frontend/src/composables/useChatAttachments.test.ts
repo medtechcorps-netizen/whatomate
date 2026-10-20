@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   SESSION_ENDING_EVENT,
   isAmbiguousAfterUpload,
+  isReplyRejection,
   messageStatusFromRealtimeEvent,
   readWorkspaceIdentity,
   useChatAttachments,
@@ -830,6 +831,232 @@ describe('useChatAttachments deadlines and the last file', () => {
   })
 })
 
+describe('useChatAttachments reply with attachment', () => {
+  it('asks for the reply with the batch patient, and only the first file quotes it', async () => {
+    const replyTo = vi.fn(() => 'incoming-1')
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo, onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png'), file('c.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(replyTo).toHaveBeenCalledTimes(1)
+    expect(replyTo).toHaveBeenCalledWith(expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+    expect(onReplySent).toHaveBeenCalledWith('incoming-1', expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await settle()
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm3' })
+    await done
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not move the quote to the next file when the first one fails', async () => {
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(new Error('Failed to send message'))
+    await settle()
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+
+    // Retrying the failed first file quotes again while the reply is still set.
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[2].request.file.name).toBe('a.png')
+    expect(calls[2].request.reply_to_message_id).toBe('incoming-1')
+    calls[2].result.resolve({ id: 'm1' })
+    await retry
+    expect(onReplySent).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the reply when the provider rejects the quoting file', async () => {
+    const live = realtime()
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplySent, subscribeRealtime: live.subscribeRealtime })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1', status: 'pending' })
+    await settle()
+    live.emit({ type: 'status_update', payload: { message_id: 'm1', status: 'failed', error_message: 'Reply context invalid' } })
+    await settle()
+    calls[1].result.resolve({ id: 'm2', status: 'sent' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+  })
+
+  it('sends without a quote when there is no reply', async () => {
+    const { attachments, calls } = setup({ replyTo: () => undefined })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request).not.toHaveProperty('reply_to_message_id')
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+  })
+})
+
+describe('useChatAttachments reply quote ownership', () => {
+  function replyRefused() {
+    return Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { message: 'Reply message not found for this contact' } },
+    })
+  }
+
+  it('binds the quote to the first file when the batch starts', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(attachments.items.value.map(item => item.quotesReply)).toEqual(['incoming-1', null])
+    calls[0].result.resolve({ id: 'm1' })
+    await settle()
+    calls[1].result.resolve({ id: 'm2' })
+    await done
+  })
+
+  it('(a) unconfirmed A + failed B: retrying B does not inherit A\'s quote', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', responseDeadlineMs: 20 })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.reply_to_message_id).toBe('incoming-1')
+    calls[0].progress(100, 100)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    await settle()
+    calls[1].result.reject(new Error('Failed to send message'))
+    await done
+    expect(attachments.items.value.map(item => item.status)).toEqual(['unconfirmed', 'failed'])
+
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[2].request.file.name).toBe('b.png')
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm2' })
+    await retry
+  })
+
+  it('(b) A fails and is removed: retrying B does not inherit the quote', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(new Error('Failed to send message'))
+    await settle()
+    calls[1].result.reject(new Error('Failed to send message'))
+    await done
+
+    attachments.remove(attachments.items.value[0].id)
+    expect(attachments.items.value.map(item => item.file.name)).toEqual(['b.png'])
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[2].request.file.name).toBe('b.png')
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm2' })
+    await retry
+  })
+
+  it('a resumed run after Stop does not move the quote to the next file', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(30, 100)
+    attachments.stop()
+    await done
+    expect(attachments.items.value.map(item => item.status)).toEqual(['unconfirmed', 'ready'])
+
+    const resumed = attachments.sendAll()
+    await settle()
+    expect(calls[1].request.file.name).toBe('b.png')
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm2' })
+    await resumed
+  })
+
+  it('the owner sends without the quote once the agent cancels the reply', async () => {
+    let reply: string | undefined = 'incoming-1'
+    const { attachments, calls } = setup({ replyTo: () => reply })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(new Error('Failed to send message'))
+    await done
+    reply = undefined
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.resolve({ id: 'm1' })
+    await retry
+  })
+
+  it('offers send-without-quote when the server refuses the reply, and the quote never moves', async () => {
+    const onReplyRejected = vi.fn()
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1', onReplyRejected, onReplySent })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(replyRefused())
+    await settle()
+    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', replyRejected: true })
+    expect(onReplyRejected).toHaveBeenCalledWith('incoming-1', expect.objectContaining({ contactId: 'contact-a' }))
+    expect(calls[1].request).not.toHaveProperty('reply_to_message_id')
+    calls[1].result.reject(new Error('Failed to send message'))
+    await done
+
+    // Only A is resent, as a plain attachment; B's failure is left for Retry.
+    const plain = attachments.sendWithoutQuote(attachments.items.value[0].id)
+    await settle()
+    expect(calls).toHaveLength(3)
+    expect(calls[2].request.file.name).toBe('a.png')
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    calls[2].result.resolve({ id: 'm1' })
+    await plain
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'failed'])
+    expect(onReplySent).not.toHaveBeenCalled()
+
+    // Even with the reply still selected, no other file picks the quote up.
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[3].request.file.name).toBe('b.png')
+    expect(calls[3].request).not.toHaveProperty('reply_to_message_id')
+    calls[3].result.resolve({ id: 'm2' })
+    await retry
+  })
+
+  it('ignores send-without-quote for a file the server did not refuse', async () => {
+    const { attachments } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png')])
+    expect(await attachments.sendWithoutQuote(attachments.items.value[0].id)).toBeNull()
+  })
+
+  it('a new staging session can quote again', async () => {
+    const { attachments, calls } = setup({ replyTo: () => 'incoming-1' })
+    attachments.stage([file('a.png', 'image/png')])
+    const first = attachments.sendAll()
+    await settle()
+    calls[0].result.resolve({ id: 'm1' })
+    await first
+    // All sent: the dialog closed and its claims went with it.
+    attachments.stage([file('b.png', 'image/png')])
+    const second = attachments.sendAll()
+    await settle()
+    expect(calls[1].request.reply_to_message_id).toBe('incoming-1')
+    calls[1].result.resolve({ id: 'm2' })
+    await second
+  })
+})
+
 describe('useChatAttachments workspace and session binding', () => {
   // Reactive identity: a same-tab change through the stores.
   function reactiveIdentity(marker: string | null = 'session-1') {
@@ -1098,6 +1325,178 @@ describe('useChatAttachments ambiguous failure after upload (FU-12)', () => {
   })
 })
 
+describe('useChatAttachments INT-2 follow-ups', () => {
+  function refused(message = 'Reply message not found for this contact') {
+    return Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { status: 'error', message } },
+    })
+  }
+
+  it('INT2-PLAIN-ACTION-REBIND: a plain resend never binds a newly selected reply', async () => {
+    let reply: string | undefined = 'Q1'
+    const onReplyRejected = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => reply, onReplyRejected })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.reply_to_message_id).toBe('Q1')
+    calls[0].result.reject(refused())
+    await settle()
+    calls[1].result.reject(new Error('Failed to send message'))
+    await done
+    expect(onReplyRejected).toHaveBeenCalledWith('Q1', expect.anything())
+
+    // The agent picks another message to reply to, then sends A without quote.
+    reply = 'Q2'
+    const plain = attachments.sendWithoutQuote(attachments.items.value[0].id)
+    await settle()
+    expect(calls).toHaveLength(3)
+    expect(calls[2].request.file.name).toBe('a.png')
+    expect(calls[2].request).not.toHaveProperty('reply_to_message_id')
+    expect(attachments.items.value[0].quotesReply).toBeNull()
+    calls[2].result.resolve({ id: 'm-a' })
+    await plain
+    expect(attachments.items.value[0].quotesReply).toBeNull()
+    // B is not resent by the plain action.
+    expect(calls).toHaveLength(3)
+    expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'failed'])
+
+    // Q2 was left unclaimed: an intentional send now quotes it (Q1 stays claimed).
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(calls[3].request.file.name).toBe('b.png')
+    expect(calls[3].request.reply_to_message_id).toBe('Q2')
+    calls[3].result.resolve({ id: 'm-b' })
+    await retry
+  })
+
+  it('send-without-quote while another file is converting changes nothing', async () => {
+    const pending = deferred<File>()
+    const { attachments, calls } = setup({ replyTo: () => 'Q1', convertImage: () => pending.promise })
+    attachments.stage([file('a.png', 'image/png'), file('c.webp', 'image/webp')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(refused())
+    await done
+    const a = attachments.items.value[0]
+    expect(a).toMatchObject({ status: 'failed', replyRejected: true, quotesReply: 'Q1' })
+
+    void attachments.convertToJpeg(attachments.items.value[1].id)
+    expect(await attachments.sendWithoutQuote(a.id)).toBeNull()
+    expect(calls).toHaveLength(1)
+    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', replyRejected: true, quotesReply: 'Q1' })
+    pending.resolve(file('c.jpg', 'image/jpeg'))
+    await settle()
+  })
+
+  it('resets the refusal on the next attempt (thrown error)', async () => {
+    let reply: string | undefined = 'Q1'
+    const { attachments, calls } = setup({ replyTo: () => reply })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(refused())
+    await done
+    expect(attachments.items.value[0].replyRejected).toBe(true)
+
+    reply = undefined
+    const retry = attachments.retryFailed()
+    await settle()
+    expect(attachments.items.value[0].replyRejected).toBe(false)
+    calls[1].result.reject(new Error('Failed to send message'))
+    await retry
+    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', replyRejected: false, errorMessage: 'Failed to send message' })
+  })
+
+  it('resets the refusal on the next attempt (2xx with status failed)', async () => {
+    let reply: string | undefined = 'Q1'
+    const { attachments, calls } = setup({ replyTo: () => reply })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].result.reject(refused('Invalid reply message ID'))
+    await done
+    reply = undefined
+    const retry = attachments.retryFailed()
+    await settle()
+    calls[1].result.resolve({ id: 'm1', status: 'failed', error_message: 'Media upload error' })
+    await retry
+    expect(attachments.items.value[0]).toMatchObject({ status: 'failed', replyRejected: false, errorMessage: 'Media upload error' })
+  })
+
+  it('stops the quote with the batch when the workspace changes', async () => {
+    const ws = reactive({ workspace: 'org-1' })
+    const onReplySent = vi.fn()
+    const onReplyRejected = vi.fn()
+    const session = { userId: () => 'agent-1', isAuthenticated: () => true, workspace: () => ws.workspace }
+    const { attachments, calls } = setup({ replyTo: () => 'Q1', onReplySent, onReplyRejected, session })
+    attachments.stage([file('a.png', 'image/png'), file('b.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.reply_to_message_id).toBe('Q1')
+    ws.workspace = 'org-2'
+    await nextTick()
+    expect(calls[0].signal.aborted).toBe(true)
+    await done
+    expect(calls).toHaveLength(1)
+    expect(onReplySent).not.toHaveBeenCalled()
+    expect(onReplyRejected).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+  })
+})
+
+describe('isReplyRejection', () => {
+  const http = (status: number, data?: unknown) =>
+    Object.assign(new Error(`Request failed with status code ${status}`), { response: { status, data } })
+
+  it.each([
+    ['400 Invalid reply message ID', http(400, { status: 'error', message: 'Invalid reply message ID' })],
+    ['400 Reply message not found for this contact', http(400, { status: 'error', message: 'Reply message not found for this contact' })],
+  ])('is true for %s', (_label, error) => {
+    expect(isReplyRejection(error)).toBe(true)
+  })
+
+  const abort = Object.assign(new Error('canceled'), { name: 'CanceledError', code: 'ERR_CANCELED' })
+  const negatives: Array<[string, unknown]> = [
+    ['400 WhatsApp account not found', http(400, { status: 'error', message: 'WhatsApp account not found' })],
+    ['500 with a reply message text', http(500, { status: 'error', message: 'Reply message not found for this contact' })],
+    ['400 without data.message', http(400, {})],
+    ['an abort', abort],
+  ]
+
+  it.each(negatives)('is false for %s', (_label, error) => {
+    expect(isReplyRejection(error)).toBe(false)
+  })
+
+  it.each(negatives.filter(([label]) => label !== 'an abort'))(
+    'does not report a refusal for %s',
+    async (_label, error) => {
+      const onReplyRejected = vi.fn()
+      const { attachments, calls } = setup({ replyTo: () => 'Q1', onReplyRejected })
+      attachments.stage([file('a.png', 'image/png')])
+      const done = attachments.sendAll()
+      await settle()
+      calls[0].result.reject(error)
+      await done
+      expect(onReplyRejected).not.toHaveBeenCalled()
+      expect(attachments.items.value[0].replyRejected).toBe(false)
+    },
+  )
+
+  it('does not report a refusal for an aborted quoting upload', async () => {
+    const onReplyRejected = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'Q1', onReplyRejected })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    calls[0].progress(30, 100)
+    attachments.stop()
+    await done
+    expect(onReplyRejected).not.toHaveBeenCalled()
+    expect(attachments.items.value[0]).toMatchObject({ status: 'unconfirmed', replyRejected: false })
+  })
+})
+
 describe('useChatAttachments round 4: workspace identity, holds and teardown', () => {
   afterEach(() => {
     // Lift the module-level override suppression set by an SPA login.
@@ -1218,6 +1617,75 @@ describe('useChatAttachments round 4: workspace identity, holds and teardown', (
       await done
       expect(attachments.items.value[0].status).toBe(expected)
     }
+  })
+})
+
+describe('useChatAttachments INT2-R4: quote callbacks after a silent identity change', () => {
+  function refused() {
+    return Object.assign(new Error('Request failed with status code 400'), {
+      response: { status: 400, data: { status: 'error', message: 'Reply message not found for this contact' } },
+    })
+  }
+
+  // No event, no reactivity: the change is only seen by the checks themselves.
+  function plainIdentity() {
+    const ws = { workspace: 'org-1', marker: 'session-1' }
+    return {
+      ws,
+      session: {
+        userId: () => 'agent-1',
+        isAuthenticated: () => true,
+        workspace: () => ws.workspace,
+        logicalSession: () => ws.marker,
+      },
+    }
+  }
+
+  it('(a) workspace changed while the quoting upload is pending, then 200: no onReplySent', async () => {
+    const { ws, session } = plainIdentity()
+    const onReplySent = vi.fn()
+    const { attachments, calls, onBatchFinished } = setup({ replyTo: () => 'Q1', onReplySent, session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    expect(calls[0].request.reply_to_message_id).toBe('Q1')
+    ws.workspace = 'org-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+    expect(onBatchFinished).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+  })
+
+  it('(b) workspace changed, then the 400 refusal: no onReplyRejected, and send-without-quote sends nothing', async () => {
+    const { ws, session } = plainIdentity()
+    const onReplyRejected = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'Q1', onReplyRejected, session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    const id = attachments.items.value[0].id
+    ws.workspace = 'org-2'
+    calls[0].result.reject(refused())
+    await done
+    expect(onReplyRejected).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
+    expect(await attachments.sendWithoutQuote(id)).toBeNull()
+    expect(calls).toHaveLength(1)
+  })
+
+  it('(c) the same user signed in again while the quoting upload is pending, then 200: no onReplySent', async () => {
+    const { ws, session } = plainIdentity()
+    const onReplySent = vi.fn()
+    const { attachments, calls } = setup({ replyTo: () => 'Q1', onReplySent, session })
+    attachments.stage([file('a.png', 'image/png')])
+    const done = attachments.sendAll()
+    await settle()
+    ws.marker = 'session-2'
+    calls[0].result.resolve({ id: 'm1' })
+    await done
+    expect(onReplySent).not.toHaveBeenCalled()
+    expect(attachments.items.value).toHaveLength(0)
   })
 })
 

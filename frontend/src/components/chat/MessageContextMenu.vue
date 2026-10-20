@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
-import { Copy, Reply } from 'lucide-vue-next'
+import { Copy, Forward, Reply } from 'lucide-vue-next'
 import {
   ContextMenu,
   ContextMenuContent,
@@ -11,6 +11,7 @@ import {
   ContextMenuTrigger,
 } from '@/components/ui/context-menu'
 import type { Message } from '@/stores/contacts'
+import { canOfferForward } from './messageForward'
 
 /**
  * Right-click / long-press menu for chat bubbles.
@@ -27,11 +28,13 @@ const props = defineProps<{
   quickReactions: readonly string[]
   /** Focused synchronously by Reply, inside the user gesture (iOS keyboard). */
   composer?: HTMLElement | null
+  canForward?: boolean
 }>()
 
 const emit = defineEmits<{
   reply: [message: Message]
   react: [messageId: string, emoji: string]
+  forward: [message: Message]
 }>()
 
 const { t } = useI18n()
@@ -68,6 +71,9 @@ function messageCopyText(message: Message): string {
 }
 
 const copyText = computed(() => (target.value ? messageCopyText(target.value) : ''))
+const showForward = computed(() =>
+  props.canForward === true && target.value !== null && canOfferForward(target.value),
+)
 
 function messageAt(eventTarget: EventTarget | null): { message: Message; bubble: HTMLElement } | null {
   const container = props.container
@@ -262,6 +268,11 @@ function copyTarget() {
   const text = copyText.value
   if (text) void copyMessageText(text)
 }
+
+function forwardTarget() {
+  const message = target.value
+  if (message) queueAction(() => emit('forward', message))
+}
 </script>
 
 <template>
@@ -297,6 +308,10 @@ function copyTarget() {
       <ContextMenuItem @select="replyToTarget">
         <Reply class="mr-2 h-4 w-4" aria-hidden="true" />
         {{ t('chat.reply') }}
+      </ContextMenuItem>
+      <ContextMenuItem v-if="showForward" @select="forwardTarget">
+        <Forward class="mr-2 h-4 w-4" aria-hidden="true" />
+        {{ t('chat.forward.action') }}
       </ContextMenuItem>
       <ContextMenuItem v-if="copyText" @select="copyTarget">
         <Copy class="mr-2 h-4 w-4" aria-hidden="true" />

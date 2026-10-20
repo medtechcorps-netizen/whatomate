@@ -1712,6 +1712,8 @@ func TestNonSMBPhoneRevealReconcilesPlaceholderWithPhoneOwner(t *testing.T) {
 		bsuidOnlyInboundMessage(t, "wamid.reconcile-first-"+uid, "", userID, "Hai"), "Reconcile User")
 	require.True(t, strings.HasPrefix(placeholderWork.Contact.PhoneNumber, "bsuid:"))
 	phoneOwner := testutil.CreateTestContact(t, app.DB, org.ID)
+	placeholderSentinel := seedInboundOpaqueMetadata(t, app, org.ID, placeholderWork.Contact.ID, "reconciliation-placeholder")
+	ownerSentinel := seedInboundOpaqueMetadata(t, app, org.ID, phoneOwner.ID, "reconciliation-owner")
 
 	revealWork := persistNonSMBInbound(t, app, account,
 		bsuidOnlyInboundMessage(t, "wamid.reconcile-phone-"+uid, strings.TrimPrefix(phoneOwner.PhoneNumber, "+"), userID, "Phone"),
@@ -1725,6 +1727,8 @@ func TestNonSMBPhoneRevealReconcilesPlaceholderWithPhoneOwner(t *testing.T) {
 	assert.Empty(t, placeholder.BSUID)
 	assert.Equal(t, phoneOwner.ID.String(), placeholder.Metadata["coexistence_reconciled_contact_id"])
 	assert.Equal(t, placeholderWork.Contact.PhoneNumber, placeholder.PhoneNumber)
+	requireInboundOpaqueMetadata(t, app, org.ID, placeholderWork.Contact.ID, placeholderSentinel)
+	requireInboundOpaqueMetadata(t, app, org.ID, phoneOwner.ID, ownerSentinel)
 
 	var holders int64
 	require.NoError(t, app.DB.Model(&models.Contact{}).

@@ -12,7 +12,6 @@ import {
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { useOmnichannelUnreadStore } from '@/stores/omnichannelUnread'
-import { useUsersStore } from '@/stores/users'
 import { useTransfersStore } from '@/stores/transfers'
 import { wsService } from '@/services/websocket'
 import { contactsService, chatbotService, messagesService, customActionsService, accountsService, cannedResponsesService, effectiveAIIsAllowed, type ContactIdentityReviewEffectiveState, type CustomAction, type ActionResult, type CannedResponse } from '@/services/api'
@@ -101,19 +100,29 @@ import {
   Plus,
   CalendarClock,
   CalendarPlus,
-  Copy
+  Copy,
+  MailCheck,
+  MailOpen
 } from 'lucide-vue-next'
 import { getInitials, getAvatarGradient } from '@/lib/utils'
+import { contactHasUnread } from '@/lib/chatInboxState'
 import { contactAddressDisplay, contactDisplayName, isPlaceholderPhone } from '@/lib/contactAddress'
 import type { WorkspaceRequestedAction } from '@/lib/crmFlow'
 import { useColorMode } from '@/composables/useColorMode'
 import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
+import { useAssignableUsers } from '@/composables/useAssignableUsers'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
+import ChatListFilters from '@/components/chat/ChatListFilters.vue'
+import ChatRowActionsMenu from '@/components/chat/ChatRowActionsMenu.vue'
+import ContactAssigneeBadge from '@/components/chat/ContactAssigneeBadge.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 import MessageActions from '@/components/chat/MessageActions.vue'
 import MessageContextMenu from '@/components/chat/MessageContextMenu.vue'
+import ForwardMessageDialog from '@/components/chat/ForwardMessageDialog.vue'
+import ForwardedChip from '@/components/chat/ForwardedChip.vue'
+import { isForwardedMessage } from '@/components/chat/messageForward'
 import PreviewButtonGroup from '@/components/chatbot/flow-preview/PreviewButtonGroup.vue'
 import TemplatePicker from '@/components/chat/TemplatePicker.vue'
 import MediaSendDialog from '@/components/chat/MediaSendDialog.vue'
@@ -139,7 +148,6 @@ const contactsStore = useContactsStore()
 const authStore = useAuthStore()
 const organizationsStore = useOrganizationsStore()
 const omnichannelUnreadStore = useOmnichannelUnreadStore()
-const usersStore = useUsersStore()
 const transfersStore = useTransfersStore()
 const tagsStore = useTagsStore()
 const notesStore = useNotesStore()
@@ -258,6 +266,22 @@ const chatAttachments = useChatAttachments({
     }
   },
   getWhatsAppAccount: () => selectedAccount.value,
+  // Reply with attachment: the first file of the batch quotes the reply-bar
+  // message, and only when that message belongs to the batch's patient.
+  replyTo: target => {
+    const reply = contactsStore.replyingTo
+    if (!reply || reply.contact_id !== target.contactId || !target.isActive()) return undefined
+    return reply.id
+  },
+  onReplySent: (replyToMessageId, target) => {
+    if (target.isActive() && contactsStore.replyingTo?.id === replyToMessageId) contactsStore.clearReplyingTo()
+  },
+  // The server cannot quote that message for this patient: drop the stale
+  // reply bar (a text reply would fail the same way). The dialog offers to
+  // send the file without the quote.
+  onReplyRejected: (replyToMessageId, target) => {
+    if (target.isActive() && contactsStore.replyingTo?.id === replyToMessageId) contactsStore.clearReplyingTo()
+  },
   // Paces uploads on each message leaving 'pending' (status_update /
   // realtime_sync), which keeps a batch from pinning DB pool connections.
   subscribeRealtime: listener => wsService.onInboxActivity(listener),
@@ -324,6 +348,13 @@ const {
   isSending: isUploadingMedia,
   isStopping: isStoppingMedia,
 } = chatAttachments
+// What the first file of a batch will quote, shown in the staging dialog.
+const mediaReplyPreview = computed(() => {
+  const reply = contactsStore.replyingTo
+  const contact = contactsStore.currentContact
+  if (!reply || !contact || reply.contact_id !== contact.id) return ''
+  return getMessageContent(reply) || '[Media]'
+})
 
 // Canned responses slash command state
 const cannedPickerOpen = ref(false)
@@ -491,6 +522,7 @@ async function acknowledgeVisibleChatBoundary() {
 
   const contactID = currentContact.id
   const cursorKey = `${contactID}:${messageID}`
+  releaseManualUnreadCursor(currentContact)
   if (acknowledgedReadCursorByContact.get(contactID) === messageID) return
   if (readCursorInFlightKey === cursorKey) return
   if (readCursorInFlightKey !== null) {
@@ -558,23 +590,16 @@ const activeTransfer = computed(() => {
 
 const activeTransferId = computed(() => activeTransfer.value?.id || null)
 
-// Check if current user can assign contacts (admin or manager only)
-const canAssignContacts = computed(() => {
-  // Try store first, then fallback to localStorage
-  let role = authStore.userRole
-  if (!role || role === 'agent') {
-    try {
-      const storedUser = localStorage.getItem('user')
-      if (storedUser) {
-        const user = JSON.parse(storedUser)
-        role = user.role?.name || user.role // Support both old and new format
-      }
-    } catch {
-      // ignore
-    }
-  }
-  return role === 'admin' || role === 'manager'
-})
+// Assigning a contact is authorized by contacts:write on the server
+// (AssignContact), so the UI uses the same permission instead of role names.
+const canAssignContacts = computed(() => authStore.hasPermission('contacts', 'write'))
+// Without contacts:read a user only ever sees their own chats, so the
+// Unassigned view would always be empty for them.
+const canSeeUnassignedChats = computed(() => authStore.hasPermission('contacts', 'read'))
+// Manual read and unread change team-shared state, authorized like the
+// shared read path.
+const canChangeChatReadState = computed(() => authStore.hasPermission('chat', 'write'))
+const currentUserId = computed(() => authStore.user?.id ?? null)
 
 // "Next step" menu gates. These mirror the gates CustomerRevenueWorkspace
 // applies to its own buttons, plus the product entitlement for each module.
@@ -704,9 +729,13 @@ function toggleConversationAI() {
 }
 
 // Get list of users for assignment
-const assignableUsers = computed(() => {
-  return usersStore.users.filter(u => u.is_active)
-})
+// Members offered by the Assign dialog. Without users:read (default
+// managers) they come from the organization member list.
+const {
+  users: assignableUsers,
+  load: loadAssignableUsers,
+  nameOf: assignableUserName,
+} = useAssignableUsers()
 
 // Icon mapping for custom actions
 const actionIconMap: Record<string, any> = {
@@ -842,11 +871,9 @@ onMounted(async () => {
   // Fetch transfers to track active transfers
   transfersStore.fetchTransfers({ status: 'active' })
 
-  // Fetch users if can assign contacts
+  // Fetch the people a contact can be assigned to
   if (canAssignContacts.value) {
-    usersStore.fetchUsers().catch(() => {
-      // Silently fail if user list can't be loaded
-    })
+    void loadAssignableUsers()
   }
 
   // Fetch custom actions for admins/managers
@@ -1274,6 +1301,48 @@ async function switchAccount(accountName: string) {
 
 function handleContactClick(contact: Contact) {
   router.push(`/chat/${contact.id}`)
+}
+
+// A chat marked unread by hand must be acknowledged again when its boundary is
+// next read, even if this session acknowledged the same latest message before
+// the mark. Clearing the local flag first keeps it to one acknowledgement.
+function releaseManualUnreadCursor(contact: Contact) {
+  if (!contact.manual_unread) return
+  contact.manual_unread = false
+  acknowledgedReadCursorByContact.delete(contact.id)
+}
+
+async function markChatRead(contactID: string) {
+  try {
+    await contactsStore.markContactReadState(contactID, 'read')
+    if (contactsStore.currentContact?.id === contactID) {
+      newMessagesCount.value = 0
+      firstUnreadId.value = null
+    }
+    // The navbar badge follows this user's inbox cursor, which a manual read
+    // advances on the server.
+    const organizationID = organizationsStore.selectedOrgId || authStore.organizationId
+    const userID = authStore.user?.id
+    if (organizationID && userID) void omnichannelUnreadStore.refresh(organizationID, userID)
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('chat.readState.markReadFailed')))
+  }
+}
+
+async function markChatUnread(contactID: string) {
+  try {
+    await contactsStore.markContactReadState(contactID, 'unread')
+    acknowledgedReadCursorByContact.delete(contactID)
+    // Leave an open chat, as messaging apps do: reading it in place would
+    // acknowledge it straight away and undo the mark.
+    if (contactsStore.currentContact?.id === contactID) {
+      contactsStore.setCurrentContact(null)
+      contactsStore.clearMessages()
+      router.push('/chat')
+    }
+  } catch (error) {
+    toast.error(getErrorMessage(error, t('chat.readState.markUnreadFailed')))
+  }
 }
 
 async function sendMessage() {
@@ -1811,6 +1880,21 @@ function replyToMessage(message: Message) {
   })
 }
 
+// Forward: a new outbound message per target, built server-side.
+const canForwardMessages = computed(() => authStore.hasPermission('chat', 'write'))
+const forwardingMessage = ref<Message | null>(null)
+const isForwardDialogOpen = ref(false)
+const forwardPreview = computed(() => {
+  const message = forwardingMessage.value
+  if (!message) return ''
+  return getMessageContent(message) || `[${message.message_type}]`
+})
+
+function openForwardDialog(message: Message) {
+  forwardingMessage.value = message
+  isForwardDialogOpen.value = true
+}
+
 // Watch for slash commands in message input
 watch(messageInput, (val) => {
   if (val.startsWith('/')) {
@@ -1833,7 +1917,8 @@ async function assignContactToUser(userId: string | null) {
     // Update current contact with new assignment
     contactsStore.currentContact = {
       ...contactsStore.currentContact,
-      assigned_user_id: userId || undefined
+      assigned_user_id: userId || undefined,
+      assigned_user_name: assignableUserName(userId),
     }
     // Refresh contacts list
     await contactsStore.fetchContacts()
@@ -1924,9 +2009,12 @@ async function resumeChatbot() {
       })
     }
 
-    // Check if current contact is still in the list (may have been unassigned)
+    // Check if current contact is still in the list (may have been unassigned).
+    // Under a chip filter the list is narrower than what the user may see,
+    // so absence there does not mean the contact became invisible.
     if (currentContactId && contactsStore.currentContact?.id === currentContactId) {
-      const stillExists = contactsStore.contacts.some(c => c.id === currentContactId)
+      const stillExists = (contactsStore.listFilter ?? 'all') !== 'all'
+        || contactsStore.contacts.some(c => c.id === currentContactId)
       if (!stillExists) {
         // Contact no longer visible to this user, navigate away
         contactsStore.setCurrentContact(null)
@@ -2350,6 +2438,11 @@ watch(contactId, () => chatAttachments.reset())
             <X class="h-3 w-3 ml-1" />
           </TagBadge>
         </div>
+        <ChatListFilters
+          :model-value="contactsStore.listFilter"
+          :show-unassigned="canSeeUnassignedChats"
+          @update:model-value="contactsStore.setListFilter"
+        />
       </div>
 
       <!-- Held messages that have no contact yet (protected staged queue) -->
@@ -2391,9 +2484,18 @@ watch(contactId, () => chatAttachments.reset())
                 <p class="flex-1 min-w-0 text-xs text-white/50 light:text-gray-500 truncate">
                   {{ contactListAddress(contact) }}
                 </p>
+                <ContactAssigneeBadge :contact="contact" :current-user-id="currentUserId" />
                 <Badge v-if="contact.unread_count > 0" class="flex-shrink-0 h-5 text-[10px] bg-emerald-500/20 text-emerald-400 light:bg-emerald-100 light:text-emerald-700">
                   {{ contact.unread_count }}
                 </Badge>
+                <span
+                  v-else-if="contact.manual_unread"
+                  data-testid="chat-contact-manual-unread"
+                  class="flex-shrink-0 h-2.5 w-2.5 rounded-full bg-emerald-400 light:bg-emerald-600"
+                  role="img"
+                  :aria-label="$t('chat.readState.markedUnread')"
+                  :title="$t('chat.readState.markedUnread')"
+                />
                 <Badge
                   v-if="!effectiveAIIsAllowed(contact.identity_review_ai_state)"
                   class="flex-shrink-0 h-5 text-[10px] bg-amber-500/20 text-amber-300 light:bg-amber-100 light:text-amber-800"
@@ -2403,6 +2505,12 @@ watch(contactId, () => chatAttachments.reset())
                 </Badge>
               </div>
             </div>
+            <ChatRowActionsMenu
+              :contact="contact"
+              :can-change-read-state="canChangeChatReadState"
+              @mark-read="markChatRead"
+              @mark-unread="markChatUnread"
+            />
           </div>
 
           <!-- Loading indicator for infinite scroll -->
@@ -2412,7 +2520,9 @@ watch(contactId, () => chatAttachments.reset())
 
           <div v-if="contactsStore.sortedContacts.length === 0" class="p-3 text-center text-white/40 light:text-gray-500">
             <User class="h-6 w-6 mx-auto mb-1.5 opacity-50" />
-            <p class="text-sm">{{ $t('chat.noContacts') }}</p>
+            <p class="text-sm">
+              {{ (contactsStore.listFilter ?? 'all') === 'all' ? $t('chat.noContacts') : $t('chat.filters.noMatches') }}
+            </p>
           </div>
         </div>
       </ScrollArea>
@@ -2460,6 +2570,11 @@ watch(contactId, () => chatAttachments.reset())
                 <Badge v-if="activeTransferId" class="text-[10px] h-5 bg-orange-500/20 text-orange-400 light:bg-orange-100 light:text-orange-700">
                   AI paused
                 </Badge>
+                <ContactAssigneeBadge
+                  :contact="contactsStore.currentContact"
+                  :current-user-id="currentUserId"
+                  variant="header"
+                />
                 <button
                   v-if="currentContactAIBlocked"
                   type="button"
@@ -2657,6 +2772,22 @@ watch(contactId, () => chatAttachments.reset())
                   <UserPlus class="mr-2 h-4 w-4" aria-hidden="true" />
                   <span>{{ $t('chat.assignToAgent') }}</span>
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-if="canChangeChatReadState && contactHasUnread(contactsStore.currentContact)"
+                  data-testid="chat-menu-mark-read"
+                  @select="markChatRead(contactsStore.currentContact.id)"
+                >
+                  <MailCheck class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>{{ $t('chat.readState.markRead') }}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  v-else-if="canChangeChatReadState"
+                  data-testid="chat-menu-mark-unread"
+                  @select="markChatUnread(contactsStore.currentContact.id)"
+                >
+                  <MailOpen class="mr-2 h-4 w-4" aria-hidden="true" />
+                  <span>{{ $t('chat.readState.markUnread') }}</span>
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -2756,6 +2887,7 @@ watch(contactId, () => chatAttachments.reset())
                   message.direction === 'outgoing' ? 'chat-bubble-outgoing' : 'chat-bubble-incoming'
                 ]"
               >
+                <ForwardedChip v-if="isForwardedMessage(message)" :message="message" />
                 <!-- Reply preview (if this message is replying to another) -->
                 <div
                   v-if="message.is_reply && message.reply_to_message"
@@ -2943,6 +3075,8 @@ watch(contactId, () => chatAttachments.reset())
                 :quick-reactions="quickReactionEmojis"
                 :reaction-open="reactionPickerMessageId === message.id"
                 :retrying="retryingMessageId === message.id"
+                :can-forward="canForwardMessages"
+                @forward="openForwardDialog"
                 @update:reaction-open="(open: boolean) => reactionPickerMessageId = open ? message.id : null"
                 @react="sendReaction"
                 @reply="replyToMessage"
@@ -3293,7 +3427,7 @@ watch(contactId, () => chatAttachments.reset())
                   class="ml-auto h-4 w-4 text-primary"
                 />
                 <Badge v-else variant="outline" class="ml-auto text-xs">
-                  {{ user.role?.name }}
+                  {{ user.role_name }}
                 </Badge>
               </Button>
               <p v-if="filteredAssignableUsers.length === 0" class="text-sm text-muted-foreground text-center py-4">
@@ -3313,6 +3447,7 @@ watch(contactId, () => chatAttachments.reset())
       :recipient-detail="currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text"
       :sending="isUploadingMedia"
       :stopping="isStoppingMedia"
+      :reply-preview="mediaReplyPreview"
       :max-files="chatAttachments.maxFiles"
       :service-window-expired="isServiceWindowExpired"
       @update:open="onMediaDialogOpenChange"
@@ -3323,6 +3458,7 @@ watch(contactId, () => chatAttachments.reset())
       @convert-all="chatAttachments.convertAllToJpeg"
       @send="chatAttachments.sendAll"
       @retry-failed="chatAttachments.retryFailed"
+      @send-without-quote="chatAttachments.sendWithoutQuote"
       @stop="chatAttachments.stop"
       @add-more="openFilePicker"
     />
@@ -3339,7 +3475,8 @@ watch(contactId, () => chatAttachments.reset())
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
     />
-    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" @react="sendReaction" @reply="replyToMessage" />
+    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" :can-forward="canForwardMessages" @react="sendReaction" @reply="replyToMessage" @forward="openForwardDialog" />
+    <ForwardMessageDialog v-model:open="isForwardDialogOpen" :message="forwardingMessage" :preview="forwardPreview" />
   </div>
 </template>
 

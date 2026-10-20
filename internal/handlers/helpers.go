@@ -244,3 +244,9 @@ func parseDateRange(startStr, endStr string) (start, end time.Time, errMsg strin
 	end = endOfDay(end)
 	return start, end, ""
 }
+
+// logAuditStrict writes an audit entry on db (normally the caller's own
+// transaction) and returns its error, for callers that must fail closed.
+func logAuditStrict(db *gorm.DB, orgID, userID uuid.UUID, resourceType string, resourceID uuid.UUID, action models.AuditAction, oldData, newData any) error {
+	return audit.LogAudit(db, orgID, userID, audit.GetUserName(db, userID), resourceType, resourceID, action, oldData, newData)
+}

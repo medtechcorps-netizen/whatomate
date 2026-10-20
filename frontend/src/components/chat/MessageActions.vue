@@ -1,31 +1,36 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Loader2, Reply, RotateCw, SmilePlus } from 'lucide-vue-next'
+import { Forward, Loader2, Reply, RotateCw, SmilePlus } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import type { Message } from '@/stores/contacts'
+import { canOfferForward, isForwardedMessage } from './messageForward'
 
 /**
- * Per-bubble action strip (react, reply, retry). It keeps the established
- * footprint beside the bubble: a 24px-wide column, visible but muted at rest
- * and at full strength when the row is hovered or focused. Touch screens have
- * no hover, so the strip is always at full strength there. Reply stays a real
- * <button> with the lucide-reply icon inside the message list; the
- * chat-composer E2E spec relies on that.
+ * Per-bubble action strip (react, reply, forward, retry). It keeps the
+ * established footprint beside the bubble: two 24px rows, visible but muted
+ * at rest and at full strength when the row is hovered or focused. A third or
+ * fourth action opens a second column instead of a taller strip, so
+ * single-line rows keep their height. Touch screens have no hover, so the
+ * strip is always at full strength there. Reply stays a real <button> with
+ * the lucide-reply icon inside the message list; the chat-composer E2E spec
+ * relies on that.
  */
 const props = defineProps<{
   message: Message
   quickReactions: readonly string[]
   reactionOpen: boolean
   retrying?: boolean
+  canForward?: boolean
 }>()
 
 const emit = defineEmits<{
   reply: [message: Message]
   react: [messageId: string, emoji: string]
   retry: [message: Message]
+  forward: [message: Message]
   'update:reactionOpen': [open: boolean]
 }>()
 
@@ -34,11 +39,17 @@ const { t } = useI18n()
 const reactLabel = computed(() => t('chat.messageActions.react'))
 const replyLabel = computed(() => t('chat.reply'))
 const retryLabel = computed(() => t('chat.retry'))
+const forwardLabel = computed(() => t('chat.forward.action'))
 
+const showForward = computed(() => props.canForward === true && canOfferForward(props.message))
+
+// A forwarded bubble is never re-sent from here: its content lives on the
+// original message, so a failed forward is forwarded again from there.
 const canRetry = computed(() =>
   props.message.direction === 'outgoing' &&
   props.message.status === 'failed' &&
-  props.message.message_type !== 'template',
+  props.message.message_type !== 'template' &&
+  !isForwardedMessage(props.message),
 )
 </script>
 
@@ -46,7 +57,7 @@ const canRetry = computed(() =>
   <div
     data-testid="chat-message-actions"
     :class="[
-      'message-actions flex flex-col gap-0.5 transition-opacity self-center ml-1',
+      'message-actions grid grid-flow-col grid-rows-2 auto-cols-max gap-0.5 transition-opacity self-center ml-1',
       reactionOpen && 'is-open',
     ]"
   >
@@ -98,6 +109,21 @@ const canRetry = computed(() =>
         </Button>
       </TooltipTrigger>
       <TooltipContent>{{ replyLabel }}</TooltipContent>
+    </Tooltip>
+    <Tooltip v-if="showForward">
+      <TooltipTrigger as-child>
+        <Button
+          variant="ghost"
+          size="icon"
+          class="h-6 w-6"
+          data-testid="chat-message-forward"
+          :aria-label="forwardLabel"
+          @click="emit('forward', message)"
+        >
+          <Forward class="h-3 w-3" aria-hidden="true" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ forwardLabel }}</TooltipContent>
     </Tooltip>
     <Tooltip v-if="canRetry">
       <TooltipTrigger as-child>

@@ -35,13 +35,39 @@ export interface Contact {
   last_inbound_at?: string
   service_window_open?: boolean
   unread_count: number
+  // Team-shared "Mark as unread"; cleared by any read.
+  manual_unread?: boolean
   assigned_user_id?: string
+  assigned_user_name?: string
+  // Agent of the active transfer, which also makes the chat theirs.
+  transfer_agent_id?: string
+  transfer_agent_name?: string
   whatsapp_account?: string
   marketing_opt_out?: boolean
   identity_review_ai_state: ContactIdentityReviewEffectiveState
   created_at: string
   updated_at: string
 }
+
+// Chat list views. 'all' is the default list the release canary reads.
+export type ContactListFilter = 'all' | 'unread' | 'mine' | 'unassigned'
+
+export function contactListFilterParams(
+  filter: ContactListFilter,
+): { unread?: 'true'; assigned?: 'me' | 'unassigned' } {
+  switch (filter) {
+    case 'unread':
+      return { unread: 'true' }
+    case 'mine':
+      return { assigned: 'me' }
+    case 'unassigned':
+      return { assigned: 'unassigned' }
+    default:
+      return {}
+  }
+}
+
+const CONTACT_UPDATE_REFRESH_DELAY_MS = 250
 
 export interface ReplyPreview {
   id: string
@@ -106,6 +132,9 @@ export const useContactsStore = defineStore('contacts', () => {
   const selectedTags = ref<string[]>([])
   const replyingTo = ref<Message | null>(null)
   const accountFilter = ref<string | null>(null)
+  const listFilter = ref<ContactListFilter>('all')
+  let contactUpdateRefreshHandle: ReturnType<typeof setTimeout> | null = null
+  const pendingContactUpdates = new Set<string>()
   const activeOrganizationScope = computed(
     () => organizationsStore.selectedOrgId || authStore.organizationId || '',
   )
@@ -144,7 +173,22 @@ export const useContactsStore = defineStore('contacts', () => {
 
   // Search is now driven server-side via fetchContacts({ search }), so the
   // visible list is whatever the server returned — no extra local filtering.
-  const filteredContacts = computed(() => contacts.value)
+  // The one addition: under a non-default filter the open chat stays listed
+  // after it stops matching (for example once it has been read), so the
+  // selection does not vanish from under the reader. It is added only when
+  // absent, which keeps exactly one row per contact.
+  const filteredContacts = computed(() => {
+    const open = currentContact.value
+    if (
+      listFilter.value === 'all' ||
+      !open ||
+      normalizeContactSearch(searchQuery.value) !== '' ||
+      contacts.value.some(contact => contact.id === open.id)
+    ) {
+      return contacts.value
+    }
+    return [...contacts.value, open]
+  })
 
   const sortedContacts = computed(() => {
     return [...filteredContacts.value].sort((a, b) => {
@@ -199,10 +243,25 @@ export const useContactsStore = defineStore('contacts', () => {
     selectedTags.value = []
     replyingTo.value = null
     accountFilter.value = null
+    listFilter.value = 'all'
+    if (contactUpdateRefreshHandle !== null) {
+      clearTimeout(contactUpdateRefreshHandle)
+      contactUpdateRefreshHandle = null
+    }
+    pendingContactUpdates.clear()
     messageRefreshQueued = false
   }
 
-  async function fetchContacts(params?: { search?: string; page?: number; limit?: number; tags?: string }) {
+  // Every list refresh (realtime, catch-up poll, search, tags, read
+  // acknowledgement) inherits the active filter unless a caller overrides it.
+  async function fetchContacts(params?: {
+    search?: string
+    page?: number
+    limit?: number
+    tags?: string
+    unread?: 'true'
+    assigned?: 'me' | 'unassigned'
+  }) {
     const loadGeneration = ++contactLoadGeneration
     const identity = identityGeneration
     const organizationScope = activeOrganizationScope.value
@@ -222,6 +281,7 @@ export const useContactsStore = defineStore('contacts', () => {
         limit: contactsLimit.value,
         tags: tagsParam,
         search: currentSearch,
+        ...contactListFilterParams(listFilter.value),
         ...params
       }, controller.signal)
       if (
@@ -274,7 +334,8 @@ export const useContactsStore = defineStore('contacts', () => {
         page: nextPage,
         limit: contactsLimit.value,
         tags: tagsParam,
-        search
+        search,
+        ...contactListFilterParams(listFilter.value),
       }, controller.signal)
       if (
         loadGeneration !== moreContactsLoadGeneration ||
@@ -461,7 +522,10 @@ export const useContactsStore = defineStore('contacts', () => {
     content: any,
     replyToMessageId?: string,
     whatsappAccount?: string,
-    extra?: { interactive?: Parameters<typeof messagesService.send>[1]['interactive'] },
+    extra?: {
+      interactive?: Parameters<typeof messagesService.send>[1]['interactive']
+      forwardOfMessageId?: string
+    },
   ) {
     const identity = identityGeneration
     const organizationScope = activeOrganizationScope.value
@@ -472,6 +536,7 @@ export const useContactsStore = defineStore('contacts', () => {
         reply_to_message_id: replyToMessageId,
         whatsapp_account: whatsappAccount,
         ...(extra?.interactive ? { interactive: extra.interactive } : {}),
+        ...(extra?.forwardOfMessageId ? { forward_of_message_id: extra.forwardOfMessageId } : {}),
       })
       // API returns { status: "success", data: { ... } }
       const newMessage = response.data.data || response.data
@@ -568,10 +633,24 @@ export const useContactsStore = defineStore('contacts', () => {
     }
 
     // Check if message already exists
-    const exists = messages.value.some(m => m.id === message.id)
-    if (!exists) {
+    const index = messages.value.findIndex(m => m.id === message.id)
+    if (index === -1) {
       messages.value.push(message)
       messages.value.sort(compareMessageIngestionOrder)
+      return
+    }
+    // The socket copy can arrive before the send response. Keep its fields
+    // (a newer status included) and only fill what it lacks, such as the
+    // CRM-only is_forwarded flag the socket payload does not carry.
+    const current = messages.value[index] as unknown as Record<string, unknown>
+    const late = message as unknown as Record<string, unknown>
+    const missing = Object.keys(late).filter(key =>
+      (current[key] === undefined || current[key] === null) && late[key] !== undefined && late[key] !== null,
+    )
+    if (missing.length > 0) {
+      const merged = { ...current }
+      for (const key of missing) merged[key] = late[key]
+      messages.value[index] = merged as unknown as Message
     }
   }
 
@@ -646,6 +725,75 @@ export const useContactsStore = defineStore('contacts', () => {
     }
   }
 
+  function setListFilter(filter: ContactListFilter) {
+    if (listFilter.value === filter) return
+    listFilter.value = filter
+    void fetchContacts()
+  }
+
+  function applyLocalReadState(contactId: string, mark: 'read' | 'unread', manualUnread: boolean) {
+    const apply = (contact: Contact) => {
+      contact.manual_unread = manualUnread
+      // A shared read clears the badge at once; the refetch below restores
+      // the canonical count (a read-only reader leaves it unchanged).
+      if (mark === 'read' && !manualUnread) contact.unread_count = 0
+    }
+    const listed = contacts.value.find(contact => contact.id === contactId)
+    if (listed) apply(listed)
+    if (currentContact.value?.id === contactId && currentContact.value !== listed) {
+      apply(currentContact.value)
+    }
+  }
+
+  // Manual "Mark as read" / "Mark as unread" from a row or header menu. Read
+  // state is shared by the whole team. Errors propagate to the caller.
+  async function markContactReadState(contactId: string, mark: 'read' | 'unread') {
+    const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
+    const response = await contactsService.markManualReadState(contactId, mark)
+    if (
+      identity !== identityGeneration ||
+      organizationScope !== activeOrganizationScope.value
+    ) return
+    const data = (response.data as any)?.data ?? response.data
+    applyLocalReadState(contactId, mark, data?.manual_unread === true)
+    void fetchContacts()
+  }
+
+  // A contact_update event (assignment, transfer or read state changed) can
+  // move rows in or out of the active filter. Bursts coalesce into one fetch.
+  // The list refresh also refreshes the open chat when it is listed; a chat
+  // pinned outside the filtered list is re-read on its own when it changed.
+  function scheduleContactsRefresh(contactId?: string) {
+    if (contactId) pendingContactUpdates.add(contactId)
+    if (contactUpdateRefreshHandle !== null) return
+    const identity = identityGeneration
+    contactUpdateRefreshHandle = setTimeout(async () => {
+      contactUpdateRefreshHandle = null
+      const changed = new Set(pendingContactUpdates)
+      pendingContactUpdates.clear()
+      if (identity !== identityGeneration) return
+      await fetchContacts()
+      const open = currentContact.value
+      if (
+        identity !== identityGeneration ||
+        !open ||
+        !changed.has(open.id) ||
+        contacts.value.some(contact => contact.id === open.id)
+      ) return
+      const fresh = await fetchContact(open.id)
+      if (!fresh || currentContact.value !== open) return
+      Object.assign(open, {
+        unread_count: fresh.unread_count,
+        manual_unread: fresh.manual_unread,
+        assigned_user_id: fresh.assigned_user_id,
+        assigned_user_name: fresh.assigned_user_name,
+        transfer_agent_id: fresh.transfer_agent_id,
+        transfer_agent_name: fresh.transfer_agent_name,
+      })
+    }, CONTACT_UPDATE_REFRESH_DELAY_MS)
+  }
+
   watch(activeOrganizationScope, (organizationScope, previousScope) => {
     if (organizationScope !== previousScope) resetForIdentityChange()
   })
@@ -703,6 +851,11 @@ export const useContactsStore = defineStore('contacts', () => {
     setReplyingTo,
     clearReplyingTo,
     updateMessageReactions,
-    updateContactTags
+    updateContactTags,
+    // Inbox state
+    listFilter,
+    setListFilter,
+    markContactReadState,
+    scheduleContactsRefresh
   }
 })

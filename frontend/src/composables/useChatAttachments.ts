@@ -44,6 +44,10 @@ export interface StagedAttachment {
   convertedFrom: string | null
   /** The last in-browser JPEG conversion failed (e.g. HEIC outside Safari). */
   conversionFailed: boolean
+  /** The reply this file quotes. Bound once per staging session; never moves to another file. */
+  quotesReply: string | null
+  /** The server refused to quote that reply (not a message of this contact). */
+  replyRejected: boolean
 }
 
 /** The conversation a batch was staged for. */
@@ -110,11 +114,16 @@ export interface UseChatAttachmentsOptions {
   /** Sending WhatsApp account, read when a batch starts. */
   getWhatsAppAccount?: () => string | null | undefined
   /**
-   * Message the batch replies to, read when a batch starts. Only the first
-   * file sent in the batch carries it. Not wired yet: the media endpoint
-   * does not read reply_to_message_id today.
+   * Message the batch replies to, read when a batch starts with the batch's
+   * patient, so a reply from another conversation can be refused. Only the
+   * first file of the batch quotes it, even if that file fails; the server
+   * also checks the quoted message belongs to the same contact.
    */
-  replyTo?: () => string | null | undefined
+  replyTo?: (target: ChatAttachmentTarget) => string | null | undefined
+  /** The file quoting replyTo was accepted by the server (e.g. clear the reply bar). */
+  onReplySent?: (replyToMessageId: string, target: ChatAttachmentTarget) => void
+  /** The server refused to quote replyTo for this contact (e.g. clear the stale reply bar). */
+  onReplyRejected?: (replyToMessageId: string, target: ChatAttachmentTarget) => void
   /** Called with each message the server created, while its conversation is still open. */
   onSent?: (message: unknown) => void
   onBatchFinished?: (summary: BatchSummary) => void
@@ -300,6 +309,13 @@ function createPreviewUrl(file: File, validation: AttachmentValidation): string 
   }
 }
 
+/** 400 "Reply message not found for this contact" / "Invalid reply message ID" from the media handler. */
+export function isReplyRejection(error: unknown): boolean {
+  const response = (error as { response?: { status?: number; data?: { message?: unknown } } } | null)?.response
+  if (response?.status !== 400) return false
+  return typeof response.data?.message === 'string' && /reply message/i.test(response.data.message)
+}
+
 function revokePreviewUrl(url: string | null) {
   if (!url || typeof URL === 'undefined' || typeof URL.revokeObjectURL !== 'function') return
   try {
@@ -385,6 +401,10 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   let sequence = 0
   // Bumped by reset(); a conversion that sees a different value is dropped.
   let generation = 0
+  // Replies whose quote was bound to a file in this staging session. A quote
+  // belongs to that file only: it never moves to another one, whatever
+  // happens to it (unconfirmed, failed, removed, sent without the quote).
+  const claimedReplies = new Set<string>()
 
   const sendableCount = computed(() => items.value.filter(item => item.status === 'ready').length)
   const failedCount = computed(() => items.value.filter(item => item.status === 'failed').length)
@@ -403,6 +423,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
    */
   function reset() {
     generation++
+    claimedReplies.clear()
     if (activeBatch) activeBatch.detached = true
     for (const item of items.value) revokePreviewUrl(item.previewUrl)
     items.value = []
@@ -437,6 +458,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         errorMessage: null,
         convertedFrom: null,
         conversionFailed: false,
+        quotesReply: null,
+        replyRejected: false,
       })
     }
     if (items.value.length > 0) isOpen.value = true
@@ -513,7 +536,18 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     for (const id of ids) await convertToJpeg(id)
   }
 
-  async function runBatch(statuses: StagedAttachmentStatus[]): Promise<BatchSummary | null> {
+  interface RunOptions {
+    /** Only these staged files. */
+    onlyIds?: string[]
+    /**
+     * Send without any quote: no reply is read or bound, and the files' own
+     * quotes are dropped at their attempt ("Send without quote").
+     */
+    plain?: boolean
+  }
+
+  async function runBatch(statuses: StagedAttachmentStatus[], run: RunOptions = {}): Promise<BatchSummary | null> {
+    const { onlyIds, plain = false } = run
     if (activeBatch || !target || convertingCount.value > 0) return null
     if (!target.isActive()) {
       reset()
@@ -521,7 +555,9 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     }
     // The batch holds its own references, so it can finish after the
     // staging dialog is reset.
-    const queue = items.value.filter(item => statuses.includes(item.status))
+    const queue = items.value.filter(
+      item => statuses.includes(item.status) && (!onlyIds || onlyIds.includes(item.id)),
+    )
     if (queue.length === 0) return null
 
     if (session && !session.isAuthenticated()) return null
@@ -542,7 +578,15 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     isStopping.value = false
     sendingTo.value = batch.target.label ?? ''
     const whatsappAccount = options.getWhatsAppAccount?.() || undefined
-    let replyTo = options.replyTo?.() || undefined
+    // The reply selected right now, for this batch's patient. Its quote is
+    // bound to the first file of the first batch that sees it. A plain run
+    // neither reads nor binds it, so a newly selected reply stays unclaimed
+    // for a later, intentional send.
+    const replyTo = plain ? undefined : options.replyTo?.(batch.target) || undefined
+    if (replyTo && !claimedReplies.has(replyTo)) {
+      claimedReplies.add(replyTo)
+      queue[0].quotesReply = replyTo
+    }
 
     // Status changes are logged from the start, so an update that arrives
     // before its HTTP response still counts.
@@ -642,6 +686,9 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         if (batch.stopRequested) break
         if (!item.validation.ok) continue
         const isLast = index === queue.length - 1
+        // Only the file that owns the quote sends it, and only while that
+        // reply is still selected (the agent may have cancelled it).
+        const quotes = item.quotesReply && item.quotesReply === replyTo ? replyTo : undefined
 
         const kind = item.validation.kind
         const caption = kindSupportsCaption(kind) ? item.caption.trim() : ''
@@ -649,9 +696,11 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         let responseDeadline: ReturnType<typeof setTimeout> | null = null
         batch.controller = controller
         batch.uploadComplete = false
+        if (plain) item.quotesReply = null
         item.status = 'sending'
         item.progress = 0
         item.errorMessage = null
+        item.replyRejected = false
         try {
           const message = await send(
             {
@@ -660,7 +709,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
               type: kind,
               ...(caption ? { caption } : {}),
               ...(whatsappAccount ? { whatsapp_account: whatsappAccount } : {}),
-              ...(replyTo ? { reply_to_message_id: replyTo } : {}),
+              ...(quotes ? { reply_to_message_id: quotes } : {}),
             },
             {
               signal: controller.signal,
@@ -676,7 +725,6 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
             },
           )
           item.progress = 100
-          replyTo = undefined
           if (message && !batch.terminated && sessionIsCurrent(batch) && batch.target.isActive()) {
             options.onSent?.(message)
           }
@@ -708,6 +756,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
             item.errorMessage = outcome.errorMessage ?? null
           } else {
             item.status = 'sent'
+            if (quotes && !batch.terminated && sessionIsCurrent(batch)) options.onReplySent?.(quotes, batch.target)
           }
         } catch (error) {
           if (controller.signal.aborted) {
@@ -723,6 +772,10 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
           } else {
             item.status = 'failed'
             item.errorMessage = getErrorMessage(error, '') || null
+            if (quotes && isReplyRejection(error)) {
+              item.replyRejected = true
+              if (!batch.terminated && sessionIsCurrent(batch)) options.onReplyRejected?.(quotes, batch.target)
+            }
           }
         } finally {
           if (responseDeadline) clearTimeout(responseDeadline)
@@ -789,6 +842,18 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   }
 
   /**
+   * The server refused to quote the reply for this file: send just that file
+   * again, as a plain attachment. Nothing is changed unless the run actually
+   * starts; the refused reply stays claimed, so no other file picks it up, and
+   * a reply selected since then is left for a later send.
+   */
+  function sendWithoutQuote(id: string) {
+    const item = find(id)
+    if (!item || item.status !== 'failed' || !item.replyRejected) return Promise.resolve(null)
+    return runBatch(['failed'], { onlyIds: [id], plain: true })
+  }
+
+  /**
    * Stops the running batch: files not started stay 'ready'. A file still
    * uploading is aborted and marked 'unconfirmed' (progress events lag, so
    * the server may have it); one already uploaded is left to finish, bounded
@@ -840,6 +905,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     convertAllToJpeg,
     sendAll,
     retryFailed,
+    sendWithoutQuote,
     stop,
     close,
     reset,

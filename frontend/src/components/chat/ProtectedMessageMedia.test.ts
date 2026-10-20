@@ -5,8 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ProtectedMessageMedia from './ProtectedMessageMedia.vue'
 import { chatMediaLoadLimiter } from '@/lib/chatMedia'
 
-const mocks = vi.hoisted(() => ({ getMedia: vi.fn(), openPdfPreview: vi.fn() }))
-vi.mock('@/services/api', () => ({ messagesService: { getMedia: mocks.getMedia } }))
+const mocks = vi.hoisted(() => ({
+  getMedia: vi.fn(),
+  openPdfPreview: vi.fn(),
+  // Every way messagesService can send; the media bubble must never call one.
+  sending: { list: vi.fn(), send: vi.fn(), sendTemplate: vi.fn(), sendReaction: vi.fn(), sendMedia: vi.fn() },
+}))
+vi.mock('@/services/api', () => ({ messagesService: { getMedia: mocks.getMedia, ...mocks.sending } }))
 // Sniffing stays real; pdf.js itself is covered by pdfPreview.test.ts.
 vi.mock('@/lib/pdfPreview', async importOriginal => ({
   ...(await importOriginal<typeof import('@/lib/pdfPreview')>()),
@@ -382,7 +387,7 @@ describe('ProtectedMessageMedia', () => {
   it('fails closed instead of falling back to the login workspace when no workspace is known', async () => {
     const view = await mountLoaded({ organizationId: '  ' })
     expect(mocks.getMedia).not.toHaveBeenCalled()
-    expect(view.get('[role="alert"]').text()).toContain('chat.mediaLoadFailed')
+    expect(view.get('[data-testid="chat-message-media-error"]').text()).toContain('chat.mediaLoadFailed')
     expect(view.find('img').exists()).toBe(false)
   })
 
@@ -445,7 +450,7 @@ describe('ProtectedMessageMedia', () => {
   it('shows a retryable failure as an alert when the media request fails', async () => {
     mocks.getMedia.mockRejectedValueOnce(new Error('404')).mockResolvedValueOnce(mediaResponse())
     const view = await mountLoaded()
-    expect(view.get('[role="alert"]').text()).toContain('chat.mediaLoadFailed')
+    expect(view.get('[data-testid="chat-message-media-error"]').text()).toContain('chat.mediaLoadFailed')
     expect(view.find('img').exists()).toBe(false)
 
     await view.get('button').trigger('click')
@@ -528,7 +533,7 @@ describe('ProtectedMessageMedia', () => {
     await view.get('button').trigger('click')
     await flushPromises()
 
-    const alert = view.get('[role="alert"]')
+    const alert = view.get('[data-testid="chat-message-media-error"]')
     expect(alert.text()).toContain('lab-report.pdf')
     expect(alert.text()).toContain('chat.mediaLoadFailed')
     expect(alert.get('[title="lab-report.pdf"]').text()).toBe('lab-report.pdf')
@@ -543,7 +548,7 @@ describe('ProtectedMessageMedia', () => {
   it('does not label a failed image with a filename', async () => {
     mocks.getMedia.mockRejectedValueOnce(new Error('404'))
     const view = await mountLoaded({ message: { ...imageMessage, media_filename: 'IMG_0001.jpg' } })
-    expect(view.get('[role="alert"]').text()).not.toContain('IMG_0001.jpg')
+    expect(view.get('[data-testid="chat-message-media-error"]').text()).not.toContain('IMG_0001.jpg')
   })
 
   it('names a document without a filename with the translated fallback', async () => {
@@ -609,5 +614,441 @@ describe('ProtectedMessageMedia', () => {
     await flushPromises()
     expect(mocks.getMedia).not.toHaveBeenCalled()
     expect(view.get('button').text()).toContain('brochure.pdf')
+  })
+
+  describe('a forwarded image whose media is still being copied', () => {
+    const notFound = () => Object.assign(new Error('Request failed with status code 404'), { response: { status: 404 } })
+    // As the live socket delivers a forward: outgoing and pending, with no
+    // forward marker (the socket payload carries none).
+    const pendingImage = { ...imageMessage, direction: 'outgoing' as const, status: 'pending' }
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    })
+
+    afterEach(() => {
+      vi.useRealTimers()
+      for (const send of Object.values(mocks.sending)) expect(send).not.toHaveBeenCalled()
+    })
+
+    async function wait(ms: number) {
+      await vi.advanceTimersByTimeAsync(ms)
+      await flushPromises()
+    }
+
+    it('loads again by itself once the message leaves pending, and shows the image', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockResolvedValueOnce(mediaResponse())
+      const view = await mountLoaded({ message: pendingImage })
+      expect(view.attributes('data-media-status')).toBe('error')
+
+      // Nothing changes while the message is still pending.
+      await wait(30_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(1)
+
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(mocks.getMedia).toHaveBeenLastCalledWith('message-1', 'workspace-b', expect.objectContaining({
+        signal: expect.any(AbortSignal),
+      }))
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(view.get('img').attributes('src')).toBe('blob:protected-photo')
+
+      // Later status changes leave the loaded image alone.
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await wait(30_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+    })
+
+    it('tries at most three times, with growing waits, then leaves Retry to the agent', async () => {
+      mocks.getMedia.mockRejectedValue(notFound())
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+
+      await wait(999)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(1)
+      await wait(1)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      await wait(5_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(3)
+      await wait(15_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(4)
+
+      // The budget is spent: neither time nor further status changes load again.
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await view.setProps({ message: { ...pendingImage, status: 'read' } })
+      await wait(120_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(4)
+      expect(view.get('[data-testid="chat-message-media-error"]').text()).toContain('chat.mediaLoadFailed')
+
+      // Retry still works.
+      mocks.getMedia.mockResolvedValueOnce(mediaResponse())
+      await view.get('[data-testid="chat-message-media-error"] button').trigger('click')
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(5)
+      expect(view.attributes('data-media-status')).toBe('ready')
+    })
+
+    it("keeps the failure, its alert and Retry's focus in place while it tries again", async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia
+        .mockRejectedValueOnce(notFound())
+        .mockReturnValueOnce(quietTry.promise)
+        .mockResolvedValueOnce(mediaResponse())
+      const view = mount(ProtectedMessageMedia, {
+        props: { organizationId: 'workspace-b', message: pendingImage },
+        attachTo: document.body,
+      })
+      wrappers.push(view)
+      await flushPromises()
+      const alert = view.get('[data-testid="chat-message-media-error"]').element
+      const retryButton = view.get('[data-testid="chat-message-media-error"] button').element as HTMLButtonElement
+      retryButton.focus()
+      expect(document.activeElement).toBe(retryButton)
+
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      // The try is running, yet the bubble shows no loading box: the alert is
+      // the same element (announced once) and Retry still has focus.
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(view.attributes('data-media-status')).toBe('error')
+      expect(view.attributes('aria-busy')).toBeUndefined()
+      expect(view.get('[data-testid="chat-message-media-error"]').element).toBe(alert)
+      expect(document.activeElement).toBe(retryButton)
+
+      quietTry.reject(notFound())
+      await flushPromises()
+      expect(view.get('[data-testid="chat-message-media-error"]').element).toBe(alert)
+      expect(document.activeElement).toBe(retryButton)
+
+      // The next try succeeds; focus moves from Retry to the image that replaced it.
+      await wait(5_000)
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(document.activeElement).toBe(view.get('button').element)
+    })
+
+    it('arms no second try while one runs: later statuses during a slow quiet load change nothing', async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      const { signal } = requestOptions(1)
+
+      // Delivery and read receipts arrive while the try is still running.
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await view.setProps({ message: { ...pendingImage, status: 'read' } })
+      await flushPromises()
+      expect(vi.getTimerCount()).toBe(0)
+
+      quietTry.resolve(mediaResponse())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('ready')
+      await vi.runAllTimersAsync()
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(signal.aborted).toBe(false)
+      expect(revokeURL).not.toHaveBeenCalled()
+      expect(view.get('img').attributes('src')).toBe('blob:protected-photo')
+    })
+
+    it('reloads once when a slow first request fails while statuses keep arriving', async () => {
+      const first = deferred<ReturnType<typeof mediaResponse>>()
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockReturnValueOnce(first.promise).mockReturnValueOnce(quietTry.promise)
+      const view = mountMedia({ message: pendingImage })
+      await flushPromises()
+      for (const status of ['sent', 'delivered', 'read']) {
+        await view.setProps({ message: { ...pendingImage, status } })
+      }
+      first.reject(notFound())
+      await flushPromises()
+      expect(vi.getTimerCount()).toBe(1)
+
+      // More events while the try waits and while it runs.
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await wait(1_000)
+      await view.setProps({ message: { ...pendingImage, status: 'read' } })
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(vi.getTimerCount()).toBe(0)
+
+      quietTry.resolve(mediaResponse())
+      await vi.runAllTimersAsync()
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(revokeURL).not.toHaveBeenCalled()
+      expect(view.attributes('data-media-status')).toBe('ready')
+    })
+
+    it('leaves focus where the agent moved it while the try was running', async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
+      const composer = document.createElement('input')
+      document.body.appendChild(composer)
+      const view = mount(ProtectedMessageMedia, {
+        props: { organizationId: 'workspace-b', message: pendingImage },
+        attachTo: document.body,
+      })
+      wrappers.push(view)
+      await flushPromises()
+      ;(view.get('[data-testid="chat-message-media-error"] button').element as HTMLButtonElement).focus()
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+
+      composer.focus()
+      quietTry.resolve(mediaResponse())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(document.activeElement).toBe(composer)
+    })
+
+    it('announces the failure as a polite status, never an alert', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound())
+      const view = await mountLoaded({ message: pendingImage })
+      expect(view.get('[data-testid="chat-message-media-error"]').attributes('role')).toBe('status')
+      expect(view.find('[role="alert"]').exists()).toBe(false)
+    })
+
+    it('does not pull focus to the image when the agent left Retry before the swap', async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
+      const view = mount(ProtectedMessageMedia, {
+        props: { organizationId: 'workspace-b', message: pendingImage },
+        attachTo: document.body,
+      })
+      wrappers.push(view)
+      await flushPromises()
+      ;(view.get('[data-testid="chat-message-media-error"] button').element as HTMLButtonElement).focus()
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+
+      // Focus leaves Retry while the try runs, so nothing in the bubble has it at the swap.
+      ;(document.activeElement as HTMLElement | null)?.blur()
+      quietTry.resolve(mediaResponse())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(document.activeElement).toBe(document.body)
+    })
+
+    it('moves focus to the image when the agent reached Retry only while the try was running', async () => {
+      const quietTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockReturnValueOnce(quietTry.promise)
+      const composer = document.createElement('input')
+      document.body.appendChild(composer)
+      const view = mount(ProtectedMessageMedia, {
+        props: { organizationId: 'workspace-b', message: pendingImage },
+        attachTo: document.body,
+      })
+      wrappers.push(view)
+      await flushPromises()
+      // The try starts while focus is elsewhere...
+      composer.focus()
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      // ...then the agent tabs onto Retry before it finishes.
+      ;(view.get('[data-testid="chat-message-media-error"] button').element as HTMLButtonElement).focus()
+
+      quietTry.resolve(mediaResponse())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('ready')
+      expect(document.activeElement).toBe(view.get('button').element)
+    })
+
+    it('pending 404, then sent, then a successful reload, then a decode error: only Retry is left', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockResolvedValueOnce(mediaResponse())
+      const view = await mountLoaded({ message: pendingImage })
+      expect(view.attributes('data-media-status')).toBe('error')
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(view.attributes('data-media-status')).toBe('ready')
+
+      await view.get('img').trigger('error')
+      await flushPromises()
+      // Nothing is scheduled: the failure is the decode, not missing media.
+      expect(vi.getTimerCount()).toBe(0)
+      expect(view.attributes('data-media-status')).toBe('error')
+      expect(view.get('[data-testid="chat-message-media-error"] button').text()).toContain('common.retry')
+      await wait(60_000)
+      await view.setProps({ message: { ...pendingImage, status: 'delivered' } })
+      await view.setProps({ message: { ...pendingImage, status: 'read' } })
+      await wait(60_000)
+      expect(vi.getTimerCount()).toBe(0)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+
+      // Retry is still the way back.
+      mocks.getMedia.mockResolvedValueOnce(mediaResponse())
+      await view.get('[data-testid="chat-message-media-error"] button').trigger('click')
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(3)
+      expect(view.attributes('data-media-status')).toBe('ready')
+    })
+
+    it('cancels a scheduled reload when the workspace changes', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockResolvedValueOnce(mediaResponse())
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      expect(vi.getTimerCount()).toBe(1)
+
+      await view.setProps({ organizationId: 'workspace-c' })
+      await flushPromises()
+      expect(vi.getTimerCount()).toBe(0)
+      // The new workspace loads once, by itself, as any image does.
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(mocks.getMedia.mock.calls[1][1]).toBe('workspace-c')
+      await wait(60_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(view.attributes('data-media-status')).toBe('ready')
+    })
+
+    it('ignores a try that is still running when the workspace changes', async () => {
+      const runningTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia
+        .mockRejectedValueOnce(notFound())
+        .mockReturnValueOnce(runningTry.promise)
+        .mockResolvedValueOnce(mediaResponse())
+      createURL.mockReturnValueOnce('blob:workspace-c-photo')
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      const { signal } = requestOptions(1)
+
+      await view.setProps({ organizationId: 'workspace-c' })
+      await flushPromises()
+      expect(signal.aborted).toBe(true)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(3)
+      expect(view.get('img').attributes('src')).toBe('blob:workspace-c-photo')
+
+      // The old workspace's try ends late: it neither replaces the image nor schedules another.
+      runningTry.reject(notFound())
+      await flushPromises()
+      await wait(60_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(3)
+      expect(createURL).toHaveBeenCalledTimes(1)
+      expect(view.get('img').attributes('src')).toBe('blob:workspace-c-photo')
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('does not let a stale try schedule reloads for the new workspace when its load fails too', async () => {
+      const runningTry = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia
+        .mockRejectedValueOnce(notFound())
+        .mockReturnValueOnce(runningTry.promise)
+        .mockRejectedValueOnce(notFound())
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(1_000)
+      await view.setProps({ organizationId: 'workspace-c' })
+      await flushPromises()
+      // The message is no longer pending, so this failure is left to Retry.
+      expect(view.attributes('data-media-status')).toBe('error')
+
+      runningTry.reject(notFound())
+      await flushPromises()
+      expect(vi.getTimerCount()).toBe(0)
+      await wait(60_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(3)
+    })
+
+    it('notices the message leaving pending while the first load is still failing', async () => {
+      const first = deferred<ReturnType<typeof mediaResponse>>()
+      mocks.getMedia.mockReturnValueOnce(first.promise).mockResolvedValueOnce(mediaResponse())
+      const view = mountMedia({ message: pendingImage })
+      await flushPromises()
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      first.reject(notFound())
+      await flushPromises()
+      expect(view.attributes('data-media-status')).toBe('error')
+
+      await wait(1_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(view.attributes('data-media-status')).toBe('ready')
+    })
+
+    it('does not wait for the timer after Retry, and does not load twice', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound()).mockResolvedValueOnce(mediaResponse())
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await view.get('[data-testid="chat-message-media-error"] button').trigger('click')
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+
+      await wait(30_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(2)
+      expect(view.attributes('data-media-status')).toBe('ready')
+    })
+
+    it('stops a scheduled reload when the bubble unmounts', async () => {
+      mocks.getMedia.mockRejectedValueOnce(notFound())
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      view.unmount()
+      wrappers = []
+      await wait(30_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(1)
+    })
+
+    it('gives new media a fresh budget', async () => {
+      mocks.getMedia.mockRejectedValue(notFound())
+      const view = await mountLoaded({ message: pendingImage })
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(21_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(4)
+
+      const copy = { ...pendingImage, media_url: 'organizations/workspace-b/messages/images/copy.jpg' }
+      await view.setProps({ message: copy })
+      await flushPromises()
+      expect(mocks.getMedia).toHaveBeenCalledTimes(5)
+      await view.setProps({ message: { ...copy, status: 'sent' } })
+      await wait(21_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(8)
+    })
+
+    it.each([
+      ['an incoming image', { ...imageMessage, direction: 'incoming' as const, status: 'received' }, 'read'],
+      ['an outgoing image that was already sent', { ...pendingImage, status: 'sent' }, 'delivered'],
+      ['a template header image', { ...pendingImage, message_type: 'template' }, 'sent'],
+    ])('leaves %s to Retry', async (_, message, nextStatus) => {
+      mocks.getMedia.mockRejectedValue(notFound())
+      const view = await mountLoaded({ message })
+      expect(view.attributes('data-media-status')).toBe('error')
+      await view.setProps({ message: { ...message, status: nextStatus } })
+      await wait(60_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(1)
+    })
+
+    it('leaves documents, video and audio to Retry, since they load only when asked', async () => {
+      mocks.getMedia.mockRejectedValue(notFound())
+      vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined)
+      const kinds = [
+        { ...pendingImage, message_type: 'document', media_mime_type: 'application/pdf', media_filename: 'lab.pdf' },
+        { ...pendingImage, message_type: 'video', media_mime_type: 'video/mp4' },
+        { ...pendingImage, message_type: 'audio', media_mime_type: 'audio/ogg' },
+      ]
+      for (const message of kinds) {
+        const view = mountMedia({ message })
+        await view.get('button').trigger('click')
+        await flushPromises()
+        expect(view.attributes('data-media-status')).toBe('error')
+        await view.setProps({ message: { ...message, status: 'sent' } })
+        await wait(30_000)
+        expect(view.attributes('data-media-status')).toBe('error')
+      }
+      expect(mocks.getMedia).toHaveBeenCalledTimes(3)
+    })
+
+    it('does not reload an image that failed to decode, whatever the status does', async () => {
+      const view = await mountLoaded({ message: pendingImage })
+      await view.get('img').trigger('error')
+      await view.setProps({ message: { ...pendingImage, status: 'sent' } })
+      await wait(30_000)
+      expect(mocks.getMedia).toHaveBeenCalledTimes(1)
+      expect(view.attributes('data-media-status')).toBe('error')
+    })
   })
 })

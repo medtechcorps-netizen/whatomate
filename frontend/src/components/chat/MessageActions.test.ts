@@ -62,7 +62,8 @@ describe('MessageActions', () => {
   it('keeps the established strip footprint and marks an open picker', async () => {
     const wrapper = mountActions()
     const strip = wrapper.get('[data-testid="chat-message-actions"]')
-    for (const cls of ['flex', 'flex-col', 'gap-0.5', 'self-center', 'ml-1']) {
+    // Two rows tall; extra actions add a column, never height.
+    for (const cls of ['grid', 'grid-rows-2', 'grid-flow-col', 'gap-0.5', 'self-center', 'ml-1']) {
       expect(strip.classes()).toContain(cls)
     }
     for (const button of strip.findAll('button')) {
@@ -127,5 +128,28 @@ describe('MessageActions', () => {
     for (const icon of ['[class*="lucide-send"]', '[class*="lucide-paperclip"]', '.lucide-smile-icon', '[class*="lucide-x"]']) {
       expect(wrapper.find(icon).exists()).toBe(false)
     }
+  })
+
+  it('offers Forward only with permission and for forwardable messages', async () => {
+    expect(mountActions().find('[data-testid="chat-message-forward"]').exists()).toBe(false)
+    expect(
+      mountActions({ canForward: true, message: message({ message_type: 'sticker', media_url: '/m' }) })
+        .find('[data-testid="chat-message-forward"]').exists(),
+    ).toBe(false)
+
+    const wrapper = mountActions({ canForward: true })
+    const forward = wrapper.get('[data-testid="chat-message-forward"]')
+    expect(forward.element.tagName).toBe('BUTTON')
+    expect(forward.attributes('aria-label')).toBe('chat.forward.action')
+    expect(forward.find('[class*="lucide-forward"]').exists()).toBe(true)
+    // chat.spec locates the composer send button by lucide-send.
+    expect(forward.find('[class*="lucide-send"]').exists()).toBe(false)
+    await forward.trigger('click')
+    expect(wrapper.findComponent(MessageActions).emitted('forward')?.[0]?.[0]).toMatchObject({ id: 'm-1' })
+  })
+
+  it('never offers Retry on a failed forwarded bubble (it is forwarded again instead)', () => {
+    const failedForward = { ...message({ direction: 'outgoing', status: 'failed' }), is_forwarded: true } as Message
+    expect(mountActions({ message: failedForward }).findAll('[class*="lucide-rotate-cw"]')).toHaveLength(0)
   })
 })

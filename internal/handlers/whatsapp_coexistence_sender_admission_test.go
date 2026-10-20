@@ -542,6 +542,7 @@ func TestCoexistencePhoneAppEchoThenCustomerReplyEndsInOneContact(t *testing.T) 
 			var echoed models.Message
 			require.NoError(t, app.DB.Where("organization_id = ? AND whats_app_message_id = ?", organizationID, echoWAMID).First(&echoed).Error)
 			require.Equal(t, models.DirectionOutgoing, echoed.Direction)
+			sentinel := seedInboundOpaqueMetadata(t, app, organizationID, echoed.ContactID, "phone-app-recipient")
 
 			reply := coexistenceAdmissionMessage(t, "wamid.echo-reply-"+uuid.NewString(), phone, bsuid, "Thanks!")
 			work, duplicate := admitCoexistenceAdmissionMessage(t, app, account, reply, "Echo Customer")
@@ -556,12 +557,14 @@ func TestCoexistencePhoneAppEchoThenCustomerReplyEndsInOneContact(t *testing.T) 
 				assert.NotContains(t, contact.Metadata, coexistenceIdentityAdmissionKey, "already bound by the echo itself")
 			} else {
 				assert.Equal(t, string(coexistenceSenderAdmissionPhoneAppRecipient), contact.Metadata[coexistenceIdentityAdmissionKey])
+				assert.Equal(t, reply.ID, contact.Metadata[coexistenceIdentityAdmissionWAMIDKey])
 			}
 			assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{}, "organization_id = ? AND phone_number = ?", organizationID, phone))
 			assert.EqualValues(t, 1, countCoexistenceAdmissionRows(t, app.DB, &models.Contact{}, "organization_id = ? AND bs_uid = ?", organizationID, bsuid))
 			assert.EqualValues(t, 2, countCoexistenceAdmissionRows(t, app.DB, &models.Message{}, "organization_id = ? AND contact_id = ?", organizationID, contact.ID))
 			assert.Zero(t, countCoexistenceAdmissionRows(t, app.DB, &models.WhatsAppIdentityReviewHold{}, "organization_id = ?", organizationID))
 			assert.Zero(t, countCoexistenceStagedReceipts(t, app, organizationID, reply.ID))
+			requireInboundOpaqueMetadata(t, app, organizationID, echoed.ContactID, sentinel)
 
 			// A different WhatsApp user now writing from the same phone is a real
 			// conflict and is held without touching the bound contact.
@@ -571,6 +574,7 @@ func TestCoexistencePhoneAppEchoThenCustomerReplyEndsInOneContact(t *testing.T) 
 			assert.Nil(t, otherWork)
 			assert.EqualValues(t, 1, countCoexistenceStagedReceipts(t, app, organizationID, other.ID))
 			assert.Equal(t, bsuid, loadCoexistenceAdmissionContact(t, app.DB, organizationID, contact.ID).BSUID)
+			requireInboundOpaqueMetadata(t, app, organizationID, echoed.ContactID, sentinel)
 		})
 	}
 }

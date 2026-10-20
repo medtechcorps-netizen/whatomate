@@ -10,6 +10,7 @@ const user = { id: 'fc555555-5555-4555-8555-555555555555', email: 'multipart@exa
   is_super_admin: true, is_reseller_admin: false }
 const first = { name: 'synthetic-first.txt', mimeType: 'text/plain', buffer: Buffer.from('First synthetic attachment.\n') }
 const second = { name: 'synthetic-second.txt', mimeType: 'text/plain', buffer: Buffer.from('Second synthetic attachment.\n') }
+const replyIds = ['fc666666-6666-4666-8666-666666666661', 'fc666666-6666-4666-8666-666666666662']
 type NativeUpload = { name: string; sent: boolean; uploadLoaded: number; uploadTotal: number;
   uploadLoad: boolean; aborted: boolean; error: boolean; ended: boolean; status: number }
 declare global {
@@ -18,7 +19,7 @@ declare global {
 type Receiver = Awaited<ReturnType<typeof multipartReceiver>>
 type App = { page: Page; context: BrowserContext; receiver: Receiver }
 
-async function syntheticApi(page: Page, receiver: Receiver) {
+async function syntheticApi(page: Page, receiver: Receiver, withReplies = false) {
   await page.addInitScript(({ user, org }) => {
     if (!localStorage.getItem('user')) localStorage.setItem('user', JSON.stringify(user))
     if (!localStorage.getItem('selected_organization_id')) localStorage.setItem('selected_organization_id', org)
@@ -85,13 +86,18 @@ async function syntheticApi(page: Page, receiver: Receiver) {
   for (const row of contacts) {
     await page.route(new RegExp(`/api/contacts/${row.id}(?:\\?.*)?$`), route => route.fulfill({ json: { data: row } }))
     await page.route(new RegExp(`/api/contacts/${row.id}/messages(?:\\?.*)?$`), route =>
-      route.fulfill({ json: { data: { messages: [], has_more: false } } }))
+      route.fulfill({ json: { data: { messages: withReplies && row.id === contact ? replyIds.map((id, index) => ({
+        id, contact_id: contact, direction: 'incoming', message_type: 'text',
+        content: { body: `Synthetic quote Q${index + 1}` }, status: 'delivered',
+        created_at: `2026-10-01T00:0${index}:00Z`, updated_at: `2026-10-01T00:0${index}:00Z`,
+      })) : [], has_more: false } } }))
   }
 }
 
-const test = base.extend<{ app: App }>({
-  app: async ({ browser, baseURL }, use, testInfo) => {
-    const receiver = await multipartReceiver(baseURL ?? '')
+const test = base.extend<{ app: App; withReplies: boolean }>({
+  withReplies: [false, { option: true }],
+  app: async ({ browser, baseURL, withReplies }, use, testInfo) => {
+    const receiver = await multipartReceiver(baseURL ?? '', withReplies ? replyIds : [])
     let context: BrowserContext | undefined
     let page: Page | undefined
     let cleanup: unknown = null
@@ -106,7 +112,7 @@ const test = base.extend<{ app: App }>({
         return route.abort('blockedbyclient')
       })
       page = await context.newPage()
-      await syntheticApi(page, receiver)
+      await syntheticApi(page, receiver, withReplies)
       const response = await page.goto(`${receiver.origin}/chat/${contact}`)
       expect(response?.status()).toBe(200)
       expect(response?.headers()['content-security-policy']).toContain("default-src 'self'")
@@ -317,4 +323,80 @@ test('a network refusal before native upload completion stays failed rather than
   await app.page.waitForTimeout(750)
   expect(await app.page.evaluate(() => window.__r2Uploads.length)).toBe(1)
   expect(app.receiver.uploads).toHaveLength(0)
+})
+
+// These two cases add R3 quote-field/wiring evidence to the same native
+// transport fixture. Synthetic acceptance is not backend/provider proof.
+test.describe('R3 native attachment quote ownership', () => {
+  test.use({ withReplies: true })
+
+  async function reply(app: App, index: number) {
+    // The stable message wrapper carries the ID itself, not a private store.
+    const row = app.page.locator(`[data-testid="chat-message"][data-message-id="${replyIds[index]}"]`)
+    await expect(row).toBeVisible()
+    await row.getByTestId('chat-message-reply').click()
+    await expect(app.page.getByRole('button', { name: 'Cancel reply', exact: true })).toBeVisible()
+  }
+
+  test('only the first native attachment quotes the selected message', async ({ app }) => {
+    await reply(app, 0)
+    await stage(app)
+    await uploaded(app)
+    expect(app.receiver.uploads[0].replyTo).toBe(replyIds[0])
+    await expect(app.page.getByTestId('composer-media-reply')).toContainText('Synthetic quote Q1')
+    accepted(app)
+    await uploaded(app, 2, second)
+    expect(app.receiver.uploads[1].replyTo).toBeNull()
+    await expect(app.page.getByTestId('composer-media-reply')).toHaveCount(0)
+    accepted(app, 2)
+    await nativeEnded(app, 2)
+    await expect(app.page.getByTestId('composer-media-dialog')).toHaveCount(0)
+    await expect(app.page.getByRole('button', { name: 'Cancel reply', exact: true })).toHaveCount(0)
+    expect(app.receiver.uploads.map(row => row.replyTo)).toEqual([replyIds[0], null])
+    await noResend(app, 2)
+  })
+
+  test('plain resend and another file retry never inherit the refused quote', async ({ app }) => {
+    await reply(app, 0)
+    await stage(app)
+    await uploaded(app)
+    expect(app.receiver.uploads[0].replyTo).toBe(replyIds[0])
+    app.receiver.respond(1, 400, { status: 'error', message: 'Reply message not found for this contact' })
+    await uploaded(app, 2, second)
+    expect(app.receiver.uploads[1].replyTo).toBeNull()
+    app.receiver.respond(2, 422, { message: 'Synthetic pre-dispatch refusal' })
+    await nativeEnded(app, 2)
+    await expect(app.page.getByTestId('composer-media-item')).toHaveCount(2)
+    for (const item of await app.page.getByTestId('composer-media-item').all()) {
+      await expect(item).toHaveAttribute('data-status', 'failed')
+    }
+    await expect(app.page.getByTestId('composer-media-reply')).toHaveCount(0)
+    await expect(app.page.getByTestId('composer-media-send-without-quote')).toHaveCount(1)
+    await noResend(app, 2)
+    await app.page.getByTestId('composer-media-send-without-quote').click()
+    await uploaded(app, 3, first)
+    expect(app.receiver.uploads[2].replyTo).toBeNull()
+    accepted(app, 3)
+    await nativeEnded(app, 3)
+    await expect(app.page.getByTestId('composer-media-item').nth(0)).toHaveAttribute('data-status', 'sent')
+    await expect(app.page.getByTestId('composer-media-item').nth(1)).toHaveAttribute('data-status', 'failed')
+    await noResend(app, 3)
+    await app.page.getByTestId('composer-media-retry').click()
+    await uploaded(app, 4, second)
+    expect(app.receiver.uploads[3].replyTo).toBeNull()
+    accepted(app, 4)
+    await nativeEnded(app, 4)
+    await expect(app.page.getByTestId('composer-media-dialog')).toHaveCount(0)
+    // Closing a failed dialog discards its files, so a new Q2 is selected only
+    // after the old batch completes through ordinary controls.
+    await reply(app, 1)
+    await stage(app, [first])
+    await uploaded(app, 5, first)
+    expect(app.receiver.uploads[4].replyTo).toBe(replyIds[1])
+    accepted(app, 5)
+    await nativeEnded(app, 5)
+    await expect(app.page.getByTestId('composer-media-dialog')).toHaveCount(0)
+    expect(app.receiver.uploads.map(row => row.replyTo)).toEqual([replyIds[0], null, null, null, replyIds[1]])
+    await noResend(app, 5)
+  })
 })

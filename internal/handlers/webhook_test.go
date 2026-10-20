@@ -2606,6 +2606,44 @@ func TestWebhookHandler_smb_message_echoes(t *testing.T) {
 	assert.Equal(t, "Hello from Business App!", message.Content)
 }
 
+// These test-only helpers seed unrelated persisted metadata before a real inbound
+// writer. Each assertion reloads the exact owned row, rather than the writer's
+// in-memory Contact; the opaque key deliberately has no product schema meaning.
+func seedInboundOpaqueMetadata(t *testing.T, app *App, orgID, contactID uuid.UUID, label string) string {
+	t.Helper()
+	sentinel := map[string]any{
+		"owner": contactID.String(),
+		"label": label,
+		"nested": map[string]any{
+			"keep":  "opaque",
+			"items": []any{"first", true, nil, map[string]any{"last": false}},
+		},
+	}
+	expected, err := json.Marshal(sentinel)
+	require.NoError(t, err)
+	seed, err := json.Marshal(map[string]any{"codex_r3_opaque_sentinel": sentinel})
+	require.NoError(t, err)
+	result := app.DB.Model(&models.Contact{}).
+		Where("organization_id = ? AND id = ? AND (metadata IS NULL OR jsonb_typeof(metadata) = 'object')", orgID, contactID).
+		Update("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || CAST(? AS jsonb)", string(seed)))
+	require.NoError(t, result.Error)
+	require.EqualValues(t, 1, result.RowsAffected)
+	require.NoError(t, app.setContactManualUnread(orgID, contactID))
+	requireInboundOpaqueMetadata(t, app, orgID, contactID, string(expected))
+	return string(expected)
+}
+
+func requireInboundOpaqueMetadata(t *testing.T, app *App, orgID, contactID uuid.UUID, expected string) models.Contact {
+	t.Helper()
+	var persisted models.Contact
+	require.NoError(t, app.DB.Where("organization_id = ? AND id = ?", orgID, contactID).First(&persisted).Error)
+	require.Equal(t, true, persisted.Metadata["manual_unread"], "the unrelated shared unread flag must survive")
+	actual, err := json.Marshal(persisted.Metadata["codex_r3_opaque_sentinel"])
+	require.NoError(t, err)
+	require.JSONEq(t, expected, string(actual), "the complete row-specific opaque metadata must survive")
+	return persisted
+}
+
 func TestWebhookHandler_smb_app_state_sync(t *testing.T) {
 	app := webhookTestApp(t)
 
@@ -2676,6 +2714,15 @@ func TestWebhookHandler_smb_app_state_sync(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 	assert.Equal(t, "Synced Contact Name", contact.ProfileName)
 
+	sentinel := seedInboundOpaqueMetadata(t, app, org.ID, contact.ID, "state-sync")
+	updatedAdd := bytes.Replace(bodyAdd, []byte("Synced Contact Name"), []byte("Updated Synced Contact Name"), 1)
+	updatedAdd = bytes.Replace(updatedAdd, []byte("1738346006"), []byte("1738346010"), 1)
+	sendSignedWebhook(t, app, updatedAdd)
+	updated := requireInboundOpaqueMetadata(t, app, org.ID, contact.ID, sentinel)
+	assert.Equal(t, "Updated Synced Contact Name", updated.ProfileName)
+	assert.Equal(t, true, updated.Metadata["coexistence_app_contact"])
+	assert.Equal(t, time.Unix(1738346010, 0).UTC().Format(time.RFC3339), updated.Metadata["coexistence_app_contact_synced_at"])
+
 	var syncState models.WhatsAppCoexistenceState
 	require.NoError(t, app.DB.Where(
 		"organization_id = ? AND whats_app_account_id = ?",
@@ -2731,6 +2778,9 @@ func TestWebhookHandler_smb_app_state_sync(t *testing.T) {
 	assert.False(t, preserved.DeletedAt.Valid)
 	assert.Equal(t, false, preserved.Metadata["coexistence_app_contact"])
 	assert.NotEmpty(t, preserved.Metadata["coexistence_app_contact_removed_at"])
+	assert.Equal(t, contact.ID, preserved.ID)
+	assert.Equal(t, time.Unix(1738346020, 0).UTC().Format(time.RFC3339), preserved.Metadata["coexistence_app_contact_removed_at"])
+	requireInboundOpaqueMetadata(t, app, org.ID, contact.ID, sentinel)
 
 	// A normal contact delta must not repair or complete a failed one-time
 	// request: this webhook field has no request correlation or terminal marker.

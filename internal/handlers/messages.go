@@ -88,6 +88,19 @@ type OutgoingMessageRequest struct {
 	// Reply context
 	ReplyToMessage *models.Message
 
+	// forwardedFrom is set only by the forward handler from a server-loaded
+	// source message and is recorded as metadata.forwarded_from.
+	forwardedFrom *messageForwardSource
+
+	// forwardMedia defers a forwarded attachment's storage copy and Meta
+	// upload to the asynchronous delivery goroutine, after the request
+	// committed and before any provider transaction opens.
+	forwardMedia *forwardMediaCopy
+
+	// forwardOutcome, set only by the forward handler, records which phase of
+	// the pending-message write a failure happened in (see forwardSendOutcome).
+	forwardOutcome *forwardSendOutcome
+
 	// legacyWhatsAppReply is populated only by the fail-closed, exact
 	// Omnichannel reply endpoint. Established Chat callers cannot opt into or
 	// influence this server-derived binding.
@@ -213,6 +226,9 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	if req.Contact == nil || req.Contact.ID == uuid.Nil {
 		return nil, fmt.Errorf("%w: contact is required", errOutgoingContactNotFound)
 	}
+	if req.forwardMedia != nil && !opts.Async {
+		return nil, errors.New("a forwarded attachment requires asynchronous delivery")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -243,7 +259,18 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	// Message persistence and the contact-list preview are one fact. Resolve
 	// and lock the canonical contact in the same transaction so a concurrent
 	// merge cannot strand either write on a soft-deleted alias.
+	if req.forwardOutcome != nil {
+		// Mirrors outgoingPreProviderTransaction's branch: an asynchronous send
+		// entered through an RLS Tenant request writes its pending row as a
+		// savepoint of that request transaction.
+		req.forwardOutcome.writeRequested = true
+		req.forwardOutcome.requestTransaction = opts.Async && a.rlsEnabled() && a.hasTenantScope()
+	}
 	err := a.outgoingPreProviderTransaction(ctx, organizationID, opts.Async, func(tx *gorm.DB) error {
+		if req.forwardOutcome != nil {
+			req.forwardOutcome.writeStarted = true
+			req.forwardOutcome.reachedCommit = false
+		}
 		if req.legacyWhatsAppReply != nil {
 			// The pending Message insert below locks the organization row (write
 			// guard and foreign keys) while this transaction owns the shadow, so
@@ -299,6 +326,14 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 				contact,
 			); visibilityErr != nil {
 				return visibilityErr
+			}
+		}
+
+		if req.forwardedFrom != nil {
+			// The request checked the path contact; this is the canonical one,
+			// locked, on this transaction's own connection.
+			if refusal := a.checkForwardTargetTx(tx, organizationID, contact, time.Now()); refusal != nil {
+				return &forwardTargetRefusedError{refusal: refusal}
 			}
 		}
 
@@ -377,6 +412,12 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		if createErr := tx.Create(candidate).Error; createErr != nil {
 			return fmt.Errorf("failed to create message: %w", createErr)
 		}
+		if req.forwardedFrom != nil {
+			// PDPA: no audit entry, no forward. Same transaction as the insert.
+			if auditErr := recordForwardAudit(tx, organizationID, opts.SentByUserID, candidate, req.forwardedFrom); auditErr != nil {
+				return auditErr
+			}
+		}
 		if req.legacyWhatsAppReply != nil {
 			if mirrorErr := persistStrictLegacyReplyMirror(tx, &req, candidate); mirrorErr != nil {
 				return mirrorErr
@@ -405,6 +446,11 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		contact.LastMessagePreview = preview
 		msg = candidate
 		canonicalContact = *contact
+		if req.forwardOutcome != nil {
+			// Returning nil hands the transaction to COMMIT. From here on an
+			// error (from COMMIT itself or after it was sent) is ambiguous.
+			req.forwardOutcome.reachedCommit = true
+		}
 		return nil
 	})
 	if err != nil {
@@ -465,13 +511,13 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			// Send the appropriate media type
 			switch req.Type {
 			case models.MessageTypeImage:
-				return a.WhatsApp.SendImageMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption)
+				return a.WhatsApp.SendImageMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption, replyToMsgID)
 			case models.MessageTypeVideo:
-				return a.WhatsApp.SendVideoMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption)
+				return a.WhatsApp.SendVideoMessage(sendCtx, waAccount, rcpt, mediaID, req.Caption, replyToMsgID)
 			case models.MessageTypeAudio:
-				return a.WhatsApp.SendAudioMessage(sendCtx, waAccount, rcpt, mediaID)
+				return a.WhatsApp.SendAudioMessage(sendCtx, waAccount, rcpt, mediaID, replyToMsgID)
 			default: // document
-				return a.WhatsApp.SendDocumentMessage(sendCtx, waAccount, rcpt, mediaID, req.MediaFilename, req.Caption)
+				return a.WhatsApp.SendDocumentMessage(sendCtx, waAccount, rcpt, mediaID, req.MediaFilename, req.Caption, replyToMsgID)
 			}
 
 		case models.MessageTypeInteractive:
@@ -540,6 +586,75 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 			root.wg.Add(1)
 			go func() {
 				defer root.wg.Done()
+				// No transaction is open here: the request has committed and the
+				// provider transaction starts in deliverOutgoingMessage.
+				if req.forwardMedia != nil {
+					if prepareErr := root.prepareForwardedMedia(&req); prepareErr != nil {
+						if settlementErr := root.settleOutgoingFailureBeforeProvider(
+							msg,
+							req,
+							opts,
+							prepareErr,
+						); settlementErr != nil {
+							root.Log.Error(
+								"Failed to settle forwarded message after media preparation failed",
+								"error", settlementErr,
+								"prepare_error", prepareErr,
+								"organization_id", organizationID,
+								"message_id", msg.ID,
+							)
+						}
+						return
+					}
+				}
+				if req.forwardedFrom != nil {
+					// Single-use queued -> provider transition, committed before the
+					// provider transaction opens. Fail closed: if the marker commit
+					// is ambiguous this worker stops (and records "not sent", which
+					// is true because it never calls the provider); if the row is no
+					// longer pending and queued, it stops without touching it.
+					claimed, markErr := root.claimForwardProviderPhase(organizationID, msg.ID)
+					if markErr != nil {
+						// Either way the provider is never called. Before COMMIT
+						// (e.g. no pool connection within the deadline) the marker
+						// certainly did not commit; after it, it may have. The row
+						// is settled "not sent" with user-safe text, which is true:
+						// a settled row can never be claimed or delivered. If this
+						// settlement fails too, the row stays pending and later
+						// reads as delayed (queued) or uncertain (provider).
+						var claimErr *forwardClaimError
+						root.Log.Error(
+							"Forward provider-phase claim failed; not dispatching",
+							"error", markErr,
+							"marker_may_have_committed", errors.As(markErr, &claimErr) && claimErr.reachedCommit,
+							"organization_id", organizationID,
+							"message_id", msg.ID,
+						)
+						if settlementErr := root.settleOutgoingFailureBeforeProvider(
+							msg,
+							req,
+							opts,
+							forwardServerBusyError(),
+						); settlementErr != nil {
+							root.Log.Error(
+								"Failed to settle forwarded message after its dispatch marker failed",
+								"error", settlementErr,
+								"marker_error", markErr,
+								"organization_id", organizationID,
+								"message_id", msg.ID,
+							)
+						}
+						return
+					}
+					if !claimed {
+						root.Log.Warn(
+							"Forwarded message is no longer pending and queued; not dispatching",
+							"organization_id", organizationID,
+							"message_id", msg.ID,
+						)
+						return
+					}
+				}
 				asyncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 
@@ -1631,6 +1746,15 @@ func (a *App) createOutgoingMessage(req OutgoingMessageRequest, opts MessageSend
 		msg.ReplyToMessageID = &replyID
 	}
 
+	if req.forwardedFrom != nil {
+		if msg.Metadata == nil {
+			msg.Metadata = models.JSONB{}
+		}
+		msg.Metadata[forwardedFromMetadataKey] = req.forwardedFrom.metadata()
+		// Durable phase marker: "queued" until the provider phase is recorded.
+		msg.Metadata[forwardDispatchMetadataKey] = forwardDispatchQueued
+	}
+
 	return msg
 }
 
@@ -1961,6 +2085,33 @@ func (a *App) broadcastReactionUpdate(orgID uuid.UUID, messageID, contactID uuid
 			"contact_id": contactID.String(),
 			"reactions":  reactions,
 		},
+	})
+}
+
+// broadcastContactUpdate tells connected clients that a contact's inbox state
+// (assignment, transfer agent or manual read state) changed. It reaches every
+// socket of the organization, including agents limited to their own chats, so
+// the payload is only the contact ID and the kind of change; clients refetch
+// the canonical row through their own scoped API. It is queued until the
+// surrounding tenant transaction commits and does no database work, so it is
+// safe on paths that already hold a transaction.
+func (a *App) broadcastContactUpdate(orgID, contactID uuid.UUID, kind string) {
+	if a == nil || orgID == uuid.Nil || contactID == uuid.Nil {
+		return
+	}
+	payload := map[string]any{
+		"contact_id": contactID.String(),
+		"kind":       kind,
+	}
+	a.afterTenantCommit(func() {
+		root := a.rootApp()
+		if root == nil || root.WSHub == nil {
+			return
+		}
+		root.WSHub.BroadcastToOrg(orgID, websocket.WSMessage{
+			Type:    websocket.TypeContactUpdate,
+			Payload: payload,
+		})
 	})
 }
 
@@ -2481,4 +2632,989 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 		UpdatedAt:       message.UpdatedAt,
 	}
 	return r.SendEnvelope(response)
+}
+
+// ============================================================================
+// Message forwarding
+// ============================================================================
+
+// The WhatsApp Cloud API has no forward call and no settable "Forwarded"
+// label, so a forward is a new outbound message built from a stored message of
+// the same organization. Text is copied; media bytes are read from tenant
+// storage, stored again for the new row, and uploaded to Meta through the
+// MediaData path. Inbound Meta media IDs are never reused.
+
+const (
+	forwardedFromMetadataKey = "forwarded_from"
+
+	// forwardMediaCopyTimeout bounds the tenant-storage read and write of one
+	// forwarded attachment; forwardMediaUploadTimeout bounds its Meta upload.
+	// Both run after the request commits, with no transaction open.
+	forwardMediaCopyTimeout   = 20 * time.Second
+	forwardMediaUploadTimeout = 30 * time.Second
+
+	// forwardRequestTimeout bounds every statement the forward request runs:
+	// lookups, the pending-message write and the audit entry.
+	forwardRequestTimeout = 15 * time.Second
+
+	// mediaReplyPreviewTimeout bounds the reply-preview reload of a media send.
+	mediaReplyPreviewTimeout = 5 * time.Second
+
+	// forwardAccountCheckTimeout bounds the account read before a forwarded
+	// attachment's upload; forwardRateLimitTimeout bounds the Redis counter.
+	forwardAccountCheckTimeout = 5 * time.Second
+	forwardRateLimitTimeout    = 2 * time.Second
+
+	// forwardRateLimitPerMinute caps forwards per user. The UI sends at most
+	// five per action, one request each.
+	forwardRateLimitPerMinute = 30
+
+	// WhatsApp Cloud API media limits. A larger attachment is refused before
+	// its bytes are read, so a delivery goroutine never holds an oversized copy.
+	forwardImageMaxBytes      = 5 << 20
+	forwardAudioVideoMaxBytes = 16 << 20
+	forwardDocumentMaxBytes   = 100 << 20
+
+	forwardErrorInvalid            fastglue.ErrorType = "forward_invalid"
+	forwardErrorSourceNotFound     fastglue.ErrorType = "forward_source_not_found"
+	forwardErrorUnsupportedType    fastglue.ErrorType = "forward_unsupported_type"
+	forwardErrorMediaPending       fastglue.ErrorType = "forward_media_pending"
+	forwardErrorWindowClosed       fastglue.ErrorType = "forward_window_closed"
+	forwardErrorIdentityReview     fastglue.ErrorType = "forward_identity_review"
+	forwardErrorTargetNotFound     fastglue.ErrorType = "forward_target_not_found"
+	forwardErrorAccountUnavailable fastglue.ErrorType = "forward_account_unavailable"
+	forwardErrorSourceDeleted      fastglue.ErrorType = "forward_source_deleted"
+	forwardErrorRateLimited        fastglue.ErrorType = "forward_rate_limited"
+
+	// forwardErrorTemporarilyUnavailable: definitely not accepted (nothing
+	// committed, no provider effect); the client may offer a manual retry.
+	// forwardErrorOutcomeUnknown: the server cannot prove either way; the
+	// client shows "may have been forwarded" and never retries by itself.
+	forwardErrorTemporarilyUnavailable fastglue.ErrorType = "forward_temporarily_unavailable"
+	forwardErrorOutcomeUnknown         fastglue.ErrorType = "forward_outcome_unknown"
+)
+
+// messageForwardSource is the server-derived provenance of a forwarded message.
+type messageForwardSource struct {
+	MessageID uuid.UUID
+	ContactID uuid.UUID
+}
+
+func (s *messageForwardSource) metadata() map[string]any {
+	return map[string]any{
+		"message_id": s.MessageID.String(),
+		"contact_id": s.ContactID.String(),
+	}
+}
+
+// messageIsForwarded reports whether stored metadata carries forward provenance.
+func messageIsForwarded(metadata models.JSONB) bool {
+	if metadata == nil {
+		return false
+	}
+	value, ok := metadata[forwardedFromMetadataKey]
+	return ok && value != nil
+}
+
+// forwardableMessageType lists the message types a forward can rebuild from
+// stored content. Stickers, locations, contacts, interactive and template
+// messages need provider objects or approvals this server cannot replay.
+func forwardableMessageType(messageType models.MessageType) bool {
+	switch messageType {
+	case models.MessageTypeText,
+		models.MessageTypeImage,
+		models.MessageTypeVideo,
+		models.MessageTypeAudio,
+		models.MessageTypeDocument:
+		return true
+	default:
+		return false
+	}
+}
+
+// messageForwardRefusal is a forward the server declines before it persists a
+// message or calls Meta.
+type messageForwardRefusal struct {
+	Status    int
+	ErrorType fastglue.ErrorType
+	Message   string
+}
+
+func (refusal *messageForwardRefusal) send(r *fastglue.Request) error {
+	return r.SendErrorEnvelope(refusal.Status, refusal.Message, nil, refusal.ErrorType)
+}
+
+// messageForwardAudit is the audit-log payload for one forwarded message. It
+// records provenance only, never message content.
+type messageForwardAudit struct {
+	Operation              string `json:"operation"`
+	ForwardedFromMessageID string `json:"forwarded_from_message_id"`
+	ForwardedFromContactID string `json:"forwarded_from_contact_id"`
+	TargetContactID        string `json:"target_contact_id"`
+	MessageType            string `json:"message_type"`
+}
+
+// loadForwardSource loads the message to forward and checks that the user may
+// read it: same organization, a contact visible to the user, and inside the
+// user's current-conversation window. Every miss is the same 404 so a forward
+// cannot probe for messages the user cannot see.
+func (a *App) loadForwardSource(
+	orgID, userID, sourceID uuid.UUID,
+) (*models.Message, *messageForwardRefusal, error) {
+	notFound := &messageForwardRefusal{
+		Status:    fasthttp.StatusNotFound,
+		ErrorType: forwardErrorSourceNotFound,
+		Message:   "Message to forward not found",
+	}
+	var source models.Message
+	if err := a.DB.Where("id = ? AND organization_id = ?", sourceID, orgID).
+		First(&source).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, notFound, nil
+		}
+		return nil, nil, fmt.Errorf("load forward source: %w", err)
+	}
+
+	var visible int64
+	visibleQuery := a.scopeAssignedContact(
+		a.DB.Model(&models.Contact{}).Where("id = ? AND organization_id = ?", source.ContactID, orgID),
+		userID,
+		orgID,
+	)
+	if err := visibleQuery.Count(&visible).Error; err != nil {
+		return nil, nil, fmt.Errorf("check forward source visibility: %w", err)
+	}
+	if visible == 0 {
+		return nil, notFound, nil
+	}
+	restricted, cutoff, err := a.customerConversationScope(orgID, userID, []uuid.UUID{source.ContactID})
+	if err != nil {
+		return nil, nil, fmt.Errorf("scope forward source conversation: %w", err)
+	}
+	if (restricted && cutoff == nil) || (cutoff != nil && source.CreatedAt.Before(cutoff.UTC())) {
+		return nil, notFound, nil
+	}
+
+	if revoked, _ := source.Metadata[coexistenceMediaRevokedMetadataKey].(bool); revoked {
+		return nil, &messageForwardRefusal{
+			Status:    fasthttp.StatusGone,
+			ErrorType: forwardErrorSourceDeleted,
+			Message:   "This message was deleted and cannot be forwarded",
+		}, nil
+	}
+	if !forwardableMessageType(source.MessageType) {
+		return nil, &messageForwardRefusal{
+			Status:    fasthttp.StatusUnprocessableEntity,
+			ErrorType: forwardErrorUnsupportedType,
+			Message:   fmt.Sprintf("%s messages cannot be forwarded", source.MessageType),
+		}, nil
+	}
+	if source.MessageType == models.MessageTypeText {
+		if strings.TrimSpace(source.Content) == "" {
+			return nil, &messageForwardRefusal{
+				Status:    fasthttp.StatusUnprocessableEntity,
+				ErrorType: forwardErrorUnsupportedType,
+				Message:   "This message has no text to forward",
+			}, nil
+		}
+		return &source, nil, nil
+	}
+	if strings.TrimSpace(source.MediaURL) == "" {
+		// Coexistence and inbound media are hydrated asynchronously; until the
+		// bytes are in tenant storage there is nothing this server may resend.
+		return nil, &messageForwardRefusal{
+			Status:    fasthttp.StatusConflict,
+			ErrorType: forwardErrorMediaPending,
+			Message:   "This attachment has not finished downloading yet. Try again shortly.",
+		}, nil
+	}
+	return &source, nil, nil
+}
+
+// checkForwardTarget refuses a target contact that cannot receive a free-form
+// message now. Meta reports a closed customer-service window (131047) only
+// asynchronously, after the message was accepted, so the window is checked
+// before anything is persisted.
+func (a *App) checkForwardTarget(orgID uuid.UUID, contact *models.Contact, now time.Time) *messageForwardRefusal {
+	return a.checkForwardTargetTx(a.DB, orgID, contact, now)
+}
+
+// checkForwardTargetTx is checkForwardTarget on an explicit session, so the
+// send path can repeat it on the canonical contact under its row lock.
+func (a *App) checkForwardTargetTx(db *gorm.DB, orgID uuid.UUID, contact *models.Contact, now time.Time) *messageForwardRefusal {
+	state, err := a.GetWhatsAppIdentityReviewEffectiveState(db, orgID, contact.ID)
+	if err != nil {
+		// Fail closed, but say what happened: nothing was sent.
+		a.Log.Error("Failed to read identity-review state for forward target",
+			"error", err, "organization_id", orgID, "contact_id", contact.ID)
+		return forwardNotAcceptedRefusal()
+	}
+	if state.Blocked {
+		return &messageForwardRefusal{
+			Status:    fasthttp.StatusConflict,
+			ErrorType: forwardErrorIdentityReview,
+			Message:   "This contact's WhatsApp identity is under review. Resolve the review before forwarding to it.",
+		}
+	}
+	if contact.LastInboundAt == nil || now.Sub(*contact.LastInboundAt) >= 24*time.Hour {
+		return &messageForwardRefusal{
+			Status:    fasthttp.StatusConflict,
+			ErrorType: forwardErrorWindowClosed,
+			Message:   "The 24-hour service window for this contact is closed. Send an approved template instead.",
+		}
+	}
+	return nil
+}
+
+// forwardMediaCopy is the deferred copy of a forwarded attachment: read
+// SourceKey, write the new message's own object, then upload the bytes to Meta.
+// DestinationKey is planned in the request (no I/O there) and stored as the
+// new row's media_url, so the copy needs no later database write.
+type forwardMediaCopy struct {
+	OrganizationID uuid.UUID
+	SourceKey      string
+	ObjectSubdir   string
+	LocalSubdir    string
+	ObjectName     string
+	DestinationKey string
+	MimeType       string
+}
+
+// planForwardMedia names the forwarded attachment's own object with the same
+// layout saveMessageMedia uses, without touching storage.
+func (a *App) planForwardMedia(orgID uuid.UUID, source *models.Message) *forwardMediaCopy {
+	mimeType := strings.TrimSpace(source.MediaMimeType)
+	if mimeType == "" {
+		mimeType = getMimeTypeFromExtension(forwardMediaExtension(source.MediaURL))
+	}
+	subdir := "documents"
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		subdir = "images"
+	case strings.HasPrefix(mimeType, "video/"):
+		subdir = "videos"
+	case strings.HasPrefix(mimeType, "audio/"):
+		subdir = "audio"
+	}
+	ext := getExtensionFromMimeType(mimeType)
+	if ext == "" {
+		ext = forwardMediaExtension(source.MediaFilename)
+	}
+	if ext == "" {
+		ext = ".bin"
+	}
+	plan := &forwardMediaCopy{
+		OrganizationID: orgID,
+		SourceKey:      source.MediaURL,
+		ObjectSubdir:   "messages/" + subdir,
+		LocalSubdir:    subdir,
+		ObjectName:     uuid.New().String() + ext,
+		MimeType:       mimeType,
+	}
+	if a.Config != nil && strings.EqualFold(a.Config.Storage.Type, "s3") {
+		plan.DestinationKey = tenantObjectKey(orgID, plan.ObjectSubdir, plan.ObjectName)
+	} else {
+		plan.DestinationKey = plan.LocalSubdir + "/" + plan.ObjectName
+	}
+	return plan
+}
+
+func forwardMediaExtension(name string) string {
+	dot := strings.LastIndex(name, ".")
+	if dot < 0 || strings.ContainsAny(name[dot:], "/\\") {
+		return ""
+	}
+	return strings.ToLower(name[dot:])
+}
+
+// prepareForwardedMedia runs in the delivery goroutine with no transaction or
+// pooled connection held: it copies the attachment in tenant storage and
+// uploads it to Meta, leaving only the send for the provider transaction.
+func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
+	plan := req.forwardMedia
+	if plan == nil || req.Account == nil {
+		a.Log.Error("Forwarded attachment plan is incomplete")
+		return forwardAttachmentCopyError()
+	}
+	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
+	defer cancelStorage()
+	limit := forwardMediaSizeLimit(req.Type)
+	if size, known := a.forwardSourceSize(storageCtx, plan); known && size > limit {
+		return forwardTooLargeError(limit)
+	}
+	data, _, err := a.loadTenantMedia(storageCtx, plan.OrganizationID, plan.SourceKey)
+	if err != nil || len(data) == 0 {
+		a.Log.Error("Failed to read media to forward",
+			"error", err, "organization_id", plan.OrganizationID)
+		return errors.New("the forwarded attachment is no longer available")
+	}
+	if int64(len(data)) > limit {
+		return forwardTooLargeError(limit)
+	}
+	key, err := a.saveTenantMedia(
+		storageCtx,
+		plan.OrganizationID,
+		plan.ObjectSubdir,
+		plan.LocalSubdir,
+		plan.ObjectName,
+		data,
+		plan.MimeType,
+	)
+	if err != nil || key != plan.DestinationKey {
+		a.Log.Error("Failed to store forwarded attachment",
+			"error", err, "organization_id", plan.OrganizationID, "key_matches_plan", key == plan.DestinationKey)
+		return forwardAttachmentCopyError()
+	}
+
+	if err := a.requireForwardAccountActive(plan.OrganizationID, req.Account.ID); err != nil {
+		return err
+	}
+	// Patient photos, videos and voice notes carry no file name; Graph needs
+	// one. The document name shown to the customer stays MediaFilename.
+	uploadName := strings.TrimSpace(req.MediaFilename)
+	if uploadName == "" {
+		uploadName = plan.ObjectName
+	}
+	// Graph matches bare media types: "audio/ogg; codecs=opus" (a stored
+	// voice note) is uploaded as "audio/ogg". The stored type is unchanged.
+	uploadType := mediaTypeEssence(plan.MimeType)
+	if uploadType == "" {
+		uploadType = plan.MimeType
+	}
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), forwardMediaUploadTimeout)
+	defer cancelUpload()
+	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, uploadType, uploadName)
+	if err != nil {
+		return fmt.Errorf("failed to upload media: %w", err)
+	}
+	req.MediaID = mediaID
+	req.MediaData = nil
+	return nil
+}
+
+// outgoingSessionContext is the context of a request session, so a derived deadline
+// keeps the tenant and realtime values bound to it.
+func outgoingSessionContext(db *gorm.DB) context.Context {
+	if db != nil && db.Statement != nil && db.Statement.Context != nil {
+		return db.Statement.Context
+	}
+	return context.Background()
+}
+
+// forwardSessionApp is a read view of this request's session under ctx: the
+// same connection (the RLS request transaction when there is one), with a
+// deadline on every statement. The request App itself is left untouched, so
+// delivery started after commit never sees the deadline.
+func (a *App) forwardSessionApp(ctx context.Context) *App {
+	session := a.rootApp().scopedApp(a.DB.WithContext(ctx), a.tenantOrgID)
+	session.tenantOrgID = a.tenantOrgID
+	session.afterCommitScoped = a.afterCommitScoped
+	return session
+}
+
+// forwardMessage serves POST /api/contacts/{id}/messages with
+// forward_of_message_id: {id} is the target contact. SendMessage has already
+// checked chat:write and parsed the body. One request forwards to one target;
+// the UI sends at most five, one by one, and reports each result.
+func (a *App) forwardMessage(
+	r *fastglue.Request,
+	orgID, userID, targetContactID uuid.UUID,
+	req *SendMessageRequest,
+) error {
+	// This handler opens no transaction. Under RLS the Tenant route wrapper
+	// already owns one request transaction; every statement below runs on that
+	// one connection under one deadline, and storage or Meta I/O happens only
+	// after commit, in the delivery goroutine.
+	ctx, cancel := context.WithTimeout(outgoingSessionContext(a.DB), forwardRequestTimeout)
+	defer cancel()
+	session := a.forwardSessionApp(ctx)
+
+	if !session.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
+	}
+	if !a.allowForward(orgID, userID) {
+		return r.SendErrorEnvelope(fasthttp.StatusTooManyRequests,
+			"Too many forwards in the last minute. Wait a moment and try again.", nil, forwardErrorRateLimited)
+	}
+	sourceID, err := uuid.Parse(strings.TrimSpace(req.ForwardOfMessageID))
+	if err != nil || sourceID == uuid.Nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid forward message ID", nil, forwardErrorInvalid)
+	}
+	if strings.TrimSpace(req.ReplyToMessageID) != "" ||
+		req.Interactive != nil ||
+		strings.TrimSpace(req.Content.Body) != "" {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest,
+			"A forward cannot also carry a reply, new text, or interactive content", nil, forwardErrorInvalid)
+	}
+
+	// Every failure before SendOutgoingMessage is definite: nothing was
+	// persisted and nothing was sent.
+	source, refusal, err := session.loadForwardSource(orgID, userID, sourceID)
+	if err != nil {
+		a.Log.Error("Failed to load message to forward", "error", err, "organization_id", orgID)
+		return forwardNotAcceptedRefusal().send(r)
+	}
+	if refusal != nil {
+		return refusal.send(r)
+	}
+
+	var contact models.Contact
+	targetQuery := session.scopeAssignedContact(
+		session.DB.Where("id = ? AND organization_id = ?", targetContactID, orgID),
+		userID,
+		orgID,
+	)
+	if err := targetQuery.First(&contact).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			a.Log.Error("Failed to load forward target", "error", err, "organization_id", orgID)
+			return forwardNotAcceptedRefusal().send(r)
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, forwardErrorTargetNotFound)
+	}
+	if refusal := session.checkForwardTarget(orgID, &contact, time.Now()); refusal != nil {
+		return refusal.send(r)
+	}
+
+	accountName := contact.WhatsAppAccount
+	if req.WhatsAppAccount != "" {
+		accountName = req.WhatsAppAccount
+	}
+	account, refusal := session.resolveForwardAccount(orgID, accountName)
+	if refusal != nil {
+		return refusal.send(r)
+	}
+	if a.rlsEnabled() && a.hasTenantScope() && !a.usesCurrentTenantPreProvider(account.OrganizationID) {
+		// Would fail the same way every time: not a "try again" condition.
+		return forwardSendFailedRefusal().send(r)
+	}
+
+	msgReq := OutgoingMessageRequest{
+		Account: account,
+		Contact: &contact,
+		Type:    source.MessageType,
+		forwardedFrom: &messageForwardSource{
+			MessageID: source.ID,
+			ContactID: source.ContactID,
+		},
+	}
+	if source.MessageType == models.MessageTypeText {
+		msgReq.Content = source.Content
+	} else {
+		plan := a.planForwardMedia(orgID, source)
+		msgReq.forwardMedia = plan
+		msgReq.MediaURL = plan.DestinationKey
+		msgReq.MediaMimeType = plan.MimeType
+		msgReq.MediaFilename = source.MediaFilename
+		if source.MessageType != models.MessageTypeAudio {
+			msgReq.Caption = source.Content
+		}
+	}
+
+	// The failure contract below depends on this exact call: Async=true, so
+	// the pending row is written by outgoingPreProviderTransaction and provider
+	// delivery is only registered (startAsyncDelivery) after it returns.
+	opts := DefaultSendOptions()
+	opts.SentByUserID = &userID
+	outcome := &forwardSendOutcome{}
+	msgReq.forwardOutcome = outcome
+
+	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
+	if err != nil {
+		var refused *forwardTargetRefusedError
+		if errors.As(err, &refused) {
+			return refused.refusal.send(r)
+		}
+		a.Log.Error("Failed to forward message", "error", err, "organization_id", orgID, "source_message_id", source.ID)
+		if errors.Is(err, errOutgoingContactNotFound) ||
+			errors.Is(err, errOutgoingContactAccessRevoked) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, forwardErrorTargetNotFound)
+		}
+		return forwardSendFailureRefusal(err, opts.Async, *outcome).send(r)
+	}
+
+	return r.SendEnvelope(MessageResponse{
+		ID:              message.ID,
+		ContactID:       message.ContactID,
+		Direction:       message.Direction,
+		MessageType:     message.MessageType,
+		Content:         map[string]string{"body": message.Content},
+		MediaURL:        message.MediaURL,
+		MediaMimeType:   message.MediaMimeType,
+		MediaFilename:   message.MediaFilename,
+		Status:          message.Status,
+		WhatsAppAccount: message.WhatsAppAccount,
+		IngestedAt:      message.IngestedAt,
+		CreatedAt:       message.CreatedAt,
+		UpdatedAt:       message.UpdatedAt,
+		IsForwarded:     true,
+		ForwardDispatch: forwardDispatchQueued,
+	})
+}
+
+// attachMediaReplyPreview fills the reply fields of a media-send response. The
+// unified sender already validated the reply; a failed reload only drops the
+// preview and never undoes the send.
+func (a *App) attachMediaReplyPreview(orgID uuid.UUID, message *models.Message, response *MessageResponse) {
+	if message == nil || response == nil || !message.IsReply || message.ReplyToMessageID == nil {
+		return
+	}
+	response.IsReply = true
+	replyToID := message.ReplyToMessageID.String()
+	response.ReplyToMessageID = &replyToID
+	ctx, cancel := context.WithTimeout(outgoingSessionContext(a.DB), mediaReplyPreviewTimeout)
+	defer cancel()
+	var reply models.Message
+	if err := a.DB.WithContext(ctx).Where(
+		"id = ? AND organization_id = ? AND contact_id = ?",
+		*message.ReplyToMessageID,
+		orgID,
+		message.ContactID,
+	).First(&reply).Error; err != nil {
+		a.Log.Error("Failed to reload validated reply message", "error", err, "message_id", message.ID)
+		return
+	}
+	response.ReplyToMessage = &ReplyPreview{
+		ID:          reply.ID.String(),
+		Content:     map[string]string{"body": reply.Content},
+		MessageType: reply.MessageType,
+		Direction:   reply.Direction,
+	}
+}
+
+// forwardTargetRefusedError carries a target refusal found under the
+// canonical-contact lock back to the forward handler.
+type forwardTargetRefusedError struct {
+	refusal *messageForwardRefusal
+}
+
+func (e *forwardTargetRefusedError) Error() string {
+	if e == nil || e.refusal == nil {
+		return "forward target refused"
+	}
+	return e.refusal.Message
+}
+
+// recordForwardAudit writes the per-target forward audit entry on the
+// pending-message transaction: provenance ids only, never content.
+func recordForwardAudit(
+	tx *gorm.DB,
+	orgID uuid.UUID,
+	userID *uuid.UUID,
+	message *models.Message,
+	source *messageForwardSource,
+) error {
+	if userID == nil || *userID == uuid.Nil || message == nil || source == nil {
+		return &forwardAuditError{err: errors.New("forward audit requires the forwarding user and message")}
+	}
+	if err := logAuditStrict(tx, orgID, *userID, "message", message.ID, models.AuditActionCreated, nil, messageForwardAudit{
+		Operation:              "forwarded",
+		ForwardedFromMessageID: source.MessageID.String(),
+		ForwardedFromContactID: source.ContactID.String(),
+		TargetContactID:        message.ContactID.String(),
+		MessageType:            string(message.MessageType),
+	}); err != nil {
+		if forwardFailureRepeats(err) {
+			return &forwardAuditError{err: err}
+		}
+		// Transient (deadline, cancellation, dropped connection, retryable
+		// SQLSTATE): classified by phase, so the client may try again.
+		return fmt.Errorf("record forward audit: %w", err)
+	}
+	return nil
+}
+
+// forwardFailureRepeats reports whether PostgreSQL rejected a forward's write
+// in a way that would repeat on a retry: a data error (22), an integrity
+// constraint (23), a syntax, privilege or row-level-security policy error
+// (42), or an exception raised by a trigger or guard function (P0). Anything
+// else, such as a deadline, a cancellation (57014), a dropped connection, or a
+// deadlock or lock timeout left after retries (40P01, 55P03), is transient.
+func forwardFailureRepeats(err error) bool {
+	code := postgresErrorCode(err)
+	if len(code) != 5 {
+		return false
+	}
+	switch code[:2] {
+	case "22", "23", "42", "P0":
+		return true
+	default:
+		return false
+	}
+}
+
+// requireForwardAccountActive re-reads the sending account in one short
+// committed transaction before a forwarded attachment's upload, so a
+// disconnected account is not used; no transaction is held during the upload.
+// The provider transaction re-checks under its account lock before the send.
+func (a *App) requireForwardAccountActive(orgID, accountID uuid.UUID) error {
+	var account models.WhatsAppAccount
+	err := a.withForwardTenantTx(orgID, func(tx *gorm.DB) error {
+		return tx.Select("id", "status").
+			Where("id = ? AND organization_id = ?", accountID, orgID).
+			First(&account).Error
+	})
+	if err != nil {
+		a.Log.Error("Failed to check WhatsApp account before a forwarded upload",
+			"error", err, "organization_id", orgID)
+		return forwardServerBusyError()
+	}
+	return whatsappaccount.RequireActiveForOutbound(&account)
+}
+
+// withForwardTenantTx runs one short committed tenant transaction for the
+// delivery goroutine, which holds no other connection. The deadline covers the
+// pool acquisition, BEGIN, the tenant binding and the statements.
+func (a *App) withForwardTenantTx(orgID uuid.UUID, fn func(tx *gorm.DB) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), forwardAccountCheckTimeout)
+	defer cancel()
+	root := a.rootApp()
+	if root == nil || root.DB == nil {
+		return errors.New("database connection is required")
+	}
+	run := func(tx *gorm.DB) error {
+		if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+			return err
+		}
+		return fn(tx)
+	}
+	db := root.DB.WithContext(ctx)
+	if root.rlsEnabled() {
+		return database.WithTenant(db, orgID, run)
+	}
+	return db.Transaction(run)
+}
+
+// allowForward counts a user's forwards per minute in Redis. Without Redis,
+// or if Redis fails, it allows the forward: the limit is a brake on misuse,
+// and every forward is still individually checked and audited.
+func (a *App) allowForward(orgID, userID uuid.UUID) bool {
+	root := a.rootApp()
+	if root == nil || root.Redis == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), forwardRateLimitTimeout)
+	defer cancel()
+	key := fmt.Sprintf("rereply:forward_rate:%s:%s:%d", orgID, userID, time.Now().Unix()/60)
+	count, err := root.Redis.Incr(ctx, key).Result()
+	if err != nil {
+		a.Log.Warn("Forward rate limit unavailable", "error", err, "organization_id", orgID)
+		return true
+	}
+	if count == 1 {
+		_ = root.Redis.Expire(ctx, key, 2*time.Minute).Err()
+	}
+	return count <= forwardRateLimitPerMinute
+}
+
+// forwardMediaSizeLimit is the WhatsApp Cloud API limit for a media type.
+func forwardMediaSizeLimit(messageType models.MessageType) int64 {
+	switch messageType {
+	case models.MessageTypeImage:
+		return forwardImageMaxBytes
+	case models.MessageTypeAudio, models.MessageTypeVideo:
+		return forwardAudioVideoMaxBytes
+	default:
+		return forwardDocumentMaxBytes
+	}
+}
+
+func forwardTooLargeError(limit int64) error {
+	return fmt.Errorf("this attachment is larger than WhatsApp allows (%d MB) and cannot be forwarded", limit>>20)
+}
+
+// forwardSourceSize reads an object-store attachment's size from a listing,
+// without downloading it. Local development storage reports unknown; its
+// bytes are size-checked right after the read instead.
+func (a *App) forwardSourceSize(ctx context.Context, plan *forwardMediaCopy) (int64, bool) {
+	if a.ObjectStore == nil || !isTenantObjectKey(plan.OrganizationID, plan.SourceKey) {
+		return 0, false
+	}
+	objects, err := a.ObjectStore.ListPrefix(ctx, plan.SourceKey)
+	if err != nil {
+		return 0, false
+	}
+	for _, object := range objects {
+		if object.Key == plan.SourceKey {
+			return object.Size, true
+		}
+	}
+	return 0, false
+}
+
+// ---- Forward capacity contract and dispatch phases -------------------------
+
+const (
+	forwardDispatchMetadataKey   = "forward_dispatch"
+	forwardDispatchAtMetadataKey = "forward_dispatch_at"
+	forwardDispatchQueued        = "queued"
+	forwardDispatchProvider      = "provider"
+
+	// Each delivery phase has its own deadline, but nothing bounds the time
+	// before a phase starts or a paused process. Past this age a pending
+	// forward is shown as stalled, never as "not sent".
+	forwardDeliveryStalledAfter = 3 * time.Minute
+
+	forwardDeliveryDelayed   = "delayed"
+	forwardDeliveryUncertain = "uncertain"
+)
+
+// forwardNotAcceptedRefusal is a definite pre-acceptance failure: nothing was
+// committed and nothing reached Meta, so a manual retry is safe.
+func forwardNotAcceptedRefusal() *messageForwardRefusal {
+	return &messageForwardRefusal{
+		Status:    fasthttp.StatusServiceUnavailable,
+		ErrorType: forwardErrorTemporarilyUnavailable,
+		Message:   "The server is busy, so this forward was not sent. Try again in a moment.",
+	}
+}
+
+// forwardSendOutcome is the forward call path's typed phase record, filled by
+// SendOutgoingMessage, so a failure is classified by where it happened instead
+// of by error text.
+type forwardSendOutcome struct {
+	// writeRequested: the call passed its up-front checks and asked for the
+	// pending-row write. A failure before that is an input or invariant
+	// rejection, which would repeat.
+	writeRequested bool
+	// requestTransaction: the pending row is a savepoint of the caller's RLS
+	// Tenant request transaction (asynchronous send).
+	requestTransaction bool
+	// writeStarted: the pre-provider write began on an acquired connection.
+	writeStarted bool
+	// reachedCommit: the last write attempt returned nil, so its transaction
+	// went on to COMMIT. Before that, an error comes from a statement inside
+	// the write; GORM then rolls the transaction back and never sends COMMIT,
+	// so nothing was committed. After it, an error comes from COMMIT itself or
+	// from anything after COMMIT was sent (a dropped connection, a context
+	// cancelled during COMMIT): the row may have committed. Reset per retry.
+	reachedCommit bool
+}
+
+// forwardAuditError is a per-target forward audit failure that would repeat
+// (a missing actor or message, or a permanent SQLSTATE class; see
+// forwardFailureRepeats). Transient audit failures are not wrapped.
+type forwardAuditError struct {
+	err error
+}
+
+func (e *forwardAuditError) Error() string {
+	if e == nil || e.err == nil {
+		return "record forward audit"
+	}
+	return "record forward audit: " + e.err.Error()
+}
+
+func (e *forwardAuditError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+// forwardSendFailedRefusal is a definite failure that would repeat (the
+// audit cannot be written, an up-front check, a tenant-scope mismatch, a
+// permanent database rejection before COMMIT). It is
+// the response an ordinary send gives for a failed send; it never says "try
+// again", and the client never retries a 500 by itself.
+func forwardSendFailedRefusal() *messageForwardRefusal {
+	return &messageForwardRefusal{
+		Status:  fasthttp.StatusInternalServerError,
+		Message: "Failed to send message",
+	}
+}
+
+// forwardServerBusyError is the stored, user-facing reason for a forward the
+// delivery worker gave up before the provider because the server was busy
+// (raw database errors are logged, never stored).
+func forwardServerBusyError() error {
+	return errors.New("Not sent: the server was too busy to send this forward. Forward it again from the original message.") //nolint:staticcheck // ST1005: persisted user-facing sentence, displayed verbatim with punctuation.
+}
+
+// forwardAttachmentCopyError is the stored, user-facing reason for a
+// forwarded attachment that could not be copied before the upload.
+func forwardAttachmentCopyError() error {
+	return errors.New("Not sent: the attachment could not be copied for this forward. Forward it again from the original message.") //nolint:staticcheck // ST1005: persisted user-facing sentence, displayed verbatim with punctuation.
+}
+
+func forwardOutcomeUnknownRefusal() *messageForwardRefusal {
+	return &messageForwardRefusal{
+		Status:    fasthttp.StatusInternalServerError,
+		ErrorType: forwardErrorOutcomeUnknown,
+		Message:   "The server could not confirm this forward. It may have been sent: check the chat before forwarding again.",
+	}
+}
+
+// forwardAccountUnavailableRefusal: no usable WhatsApp account (missing,
+// inactive or without valid credentials). Definite and non-retryable; the
+// same status and message an ordinary send returns.
+func forwardAccountUnavailableRefusal() *messageForwardRefusal {
+	return &messageForwardRefusal{
+		Status:    fasthttp.StatusBadRequest,
+		ErrorType: forwardErrorAccountUnavailable,
+		Message:   "Failed to resolve WhatsApp account",
+	}
+}
+
+// forwardSendFailureRefusal maps an error from the forward handler's own
+// SendOutgoingMessage call to the client contract. It is valid only for that
+// call (asynchronous, DefaultSendOptions), whose invariants are:
+//   - provider delivery is registered (startAsyncDelivery) only after the
+//     pending-row write returns, so an error means no provider effect;
+//   - inside an RLS Tenant request, the pending row is a savepoint of the
+//     request transaction, and Tenant rolls an error response back.
+//
+// Failures that would repeat are definite and non-retryable, with the codes
+// an ordinary send returns: an inactive account, the audit write, an up-front
+// invariant, or a statement PostgreSQL rejected permanently before COMMIT (a
+// constraint, a policy, a guard trigger; see forwardFailureRepeats). Other
+// definite failures are 503 "try again". Outside a request transaction, any
+// error once the write reached COMMIT (from COMMIT itself, or after COMMIT was
+// sent) is ambiguous, whatever its SQLSTATE: 500 forward_outcome_unknown.
+func forwardSendFailureRefusal(err error, async bool, outcome forwardSendOutcome) *messageForwardRefusal {
+	var auditErr *forwardAuditError
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, whatsappaccount.ErrOutboundInactive):
+		return forwardAccountUnavailableRefusal()
+	case errors.As(err, &auditErr), !outcome.writeRequested:
+		return forwardSendFailedRefusal()
+	case !async:
+		return forwardOutcomeUnknownRefusal()
+	case outcome.requestTransaction, !outcome.writeStarted, !outcome.reachedCommit:
+		if forwardFailureRepeats(err) {
+			return forwardSendFailedRefusal()
+		}
+		return forwardNotAcceptedRefusal()
+	default:
+		return forwardOutcomeUnknownRefusal()
+	}
+}
+
+// claimForwardProviderPhase is the single-use queued -> provider transition,
+// committed in its own short transaction before the provider transaction
+// opens. It reports claimed only when exactly one row moved, i.e. the forward
+// was still pending and still queued.
+//
+// Re-entry policy: a second claim, a settled row or a missing row moves
+// nothing, and the caller must not call the provider or touch the row. Any
+// error (a *forwardClaimError) stops the caller before the provider.
+func (a *App) claimForwardProviderPhase(orgID, messageID uuid.UUID) (bool, error) {
+	var moved int64
+	reachedCommit := false
+	err := a.withForwardTenantTx(orgID, func(tx *gorm.DB) error {
+		result := tx.Model(&models.Message{}).
+			Where(
+				"organization_id = ? AND id = ? AND status = ? AND metadata ->> ? = ?",
+				orgID, messageID, models.MessageStatusPending,
+				forwardDispatchMetadataKey, forwardDispatchQueued,
+			).
+			Update("metadata", gorm.Expr(
+				"COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(?::text, ?::text, ?::text, ?::text)",
+				forwardDispatchMetadataKey, forwardDispatchProvider,
+				forwardDispatchAtMetadataKey, time.Now().UTC().Format(time.RFC3339Nano),
+			))
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected > 1 {
+			return fmt.Errorf("forward dispatch claim moved %d rows", result.RowsAffected)
+		}
+		moved = result.RowsAffected
+		reachedCommit = true
+		return nil
+	})
+	if err != nil {
+		return false, &forwardClaimError{reachedCommit: reachedCommit, err: err}
+	}
+	return moved == 1, nil
+}
+
+// forwardClaimError is a failed provider-phase claim. Without reachedCommit it
+// failed before or inside its UPDATE (pool acquisition, BEGIN, tenant binding,
+// the statement), so the marker certainly did not commit. With it, COMMIT
+// failed or its answer was lost, so the marker may have committed.
+type forwardClaimError struct {
+	reachedCommit bool
+	err           error
+}
+
+func (e *forwardClaimError) Error() string {
+	if e == nil || e.err == nil {
+		return "claim forward provider phase"
+	}
+	return "claim forward provider phase: " + e.err.Error()
+}
+
+func (e *forwardClaimError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+// forwardDeliveryState derives, read-only, what a stalled forward means for the
+// people reading the chat. Neither state claims the message was not sent, and
+// nothing ever resends it automatically:
+//   - "delayed": still "queued" (no provider phase recorded) long after it
+//     should have been sent. Its worker may be dead or merely paused; a paused
+//     worker can still send it later. Status unknown.
+//   - "uncertain": the provider phase was recorded but no result was. It may
+//     have been sent.
+//
+// A settled (sent/failed) or recent forward has no derived state.
+func forwardDeliveryState(message *models.Message, now time.Time) string {
+	if message == nil || message.Status != models.MessageStatusPending || !messageIsForwarded(message.Metadata) {
+		return ""
+	}
+	phase, _ := message.Metadata[forwardDispatchMetadataKey].(string)
+	switch phase {
+	case forwardDispatchQueued:
+		if now.Sub(message.CreatedAt) > forwardDeliveryStalledAfter {
+			return forwardDeliveryDelayed
+		}
+	case forwardDispatchProvider:
+		since := message.UpdatedAt
+		if raw, ok := message.Metadata[forwardDispatchAtMetadataKey].(string); ok {
+			if at, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+				since = at
+			}
+		}
+		if now.Sub(since) > forwardDeliveryStalledAfter {
+			return forwardDeliveryUncertain
+		}
+	}
+	return ""
+}
+
+// resolveForwardAccount mirrors resolveWhatsAppAccount for the forward
+// handler, keeping the cause: a missing or unusable account is a definite,
+// non-retryable refusal; a failed lookup (database or deadline) is a definite
+// 503, because nothing has been persisted yet.
+func (a *App) resolveForwardAccount(orgID uuid.UUID, accountName string) (*models.WhatsAppAccount, *messageForwardRefusal) {
+	var account models.WhatsAppAccount
+	var err error
+	if accountName != "" {
+		err = a.DB.Where("name = ? AND organization_id = ?", accountName, orgID).First(&account).Error
+	} else {
+		err = a.DB.Where("organization_id = ? AND is_default_outgoing = ?", orgID, true).First(&account).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			err = a.DB.Where("organization_id = ?", orgID).First(&account).Error
+		}
+	}
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, forwardAccountUnavailableRefusal()
+		}
+		a.Log.Error("Failed to resolve WhatsApp account for forward", "error", err, "organization_id", orgID)
+		return nil, forwardNotAcceptedRefusal()
+	}
+	if account.OrganizationID != orgID {
+		return nil, forwardSendFailedRefusal()
+	}
+	if err := a.prepareWhatsAppAccountForOutbound(&account); err != nil {
+		a.Log.Warn("WhatsApp account cannot send a forward", "error", err, "organization_id", orgID, "account", account.Name)
+		return nil, forwardAccountUnavailableRefusal()
+	}
+	return &account, nil
 }

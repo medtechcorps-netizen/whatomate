@@ -9,6 +9,7 @@ import {
   Loader2,
   Music,
   Plus,
+  Quote,
   RotateCw,
   Send,
   ShieldCheck,
@@ -49,8 +50,10 @@ const props = withDefaults(
     serviceWindowExpired?: boolean
     /** Stop was pressed; the current file is finishing. */
     stopping?: boolean
+    /** The reply-bar message the first file will quote. */
+    replyPreview?: string
   }>(),
-  { recipientDetail: '', sending: false, maxFiles: 10, serviceWindowExpired: false, stopping: false },
+  { recipientDetail: '', sending: false, maxFiles: 10, serviceWindowExpired: false, stopping: false, replyPreview: '' },
 )
 
 const emit = defineEmits<{
@@ -62,6 +65,7 @@ const emit = defineEmits<{
   'convert-all': []
   send: []
   'retry-failed': []
+  'send-without-quote': [id: string]
   stop: []
   'add-more': []
 }>()
@@ -183,6 +187,18 @@ function onOpenChange(open: boolean) {
       </div>
 
       <div
+        v-if="replyPreview"
+        class="flex items-start gap-2 rounded-lg border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-xs text-muted-foreground light:border-gray-200 light:bg-gray-50"
+        data-testid="composer-media-reply"
+      >
+        <Quote class="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <p class="min-w-0">
+          {{ t('chat.composer.replyQuote') }}
+          <span class="line-clamp-2 break-words text-foreground">{{ replyPreview }}</span>
+        </p>
+      </div>
+
+      <div
         v-if="serviceWindowExpired"
         class="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-500"
         role="alert"
@@ -297,6 +313,13 @@ function onOpenChange(open: boolean) {
             <p v-else-if="item.asDocument && item.status === 'ready'" class="text-xs text-muted-foreground">
               {{ t('chat.composer.willSendAsDocument') }}
             </p>
+            <p
+              v-if="item.quotesReply && !item.replyRejected && item.status !== 'sent'"
+              class="text-xs text-muted-foreground"
+              data-testid="composer-media-quotes"
+            >
+              {{ t('chat.composer.quotesReply') }}
+            </p>
 
             <div v-if="item.status === 'sending'" class="space-y-1" role="status">
               <Progress :model-value="item.progress" class="h-1.5" />
@@ -321,6 +344,22 @@ function onOpenChange(open: boolean) {
               <AlertTriangle class="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
               <span>{{ t('chat.composer.unconfirmed') }}</span>
             </p>
+            <div v-else-if="item.status === 'failed' && item.replyRejected" class="space-y-1" role="alert" data-testid="composer-media-reply-rejected">
+              <p class="flex items-start gap-1 text-xs text-destructive">
+                <AlertTriangle class="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
+                <span>{{ t('chat.composer.replyRejected') }}</span>
+              </p>
+              <Button
+                variant="outline"
+                size="xs"
+                class="text-xs"
+                :disabled="busy"
+                data-testid="composer-media-send-without-quote"
+                @click="emit('send-without-quote', item.id)"
+              >
+                {{ t('chat.composer.sendWithoutQuote') }}
+              </Button>
+            </div>
             <p v-else-if="item.status === 'failed'" class="flex items-start gap-1 text-xs text-destructive" role="alert">
               <AlertTriangle class="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
               <span>{{ item.errorMessage || t('chat.composer.failedDefault') }}</span>

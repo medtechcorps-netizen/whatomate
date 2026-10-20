@@ -41,7 +41,11 @@ type ContactResponse struct {
 	LastMessageAt         *time.Time                           `json:"last_message_at"`
 	LastMessagePreview    string                               `json:"last_message_preview"`
 	UnreadCount           int                                  `json:"unread_count"`
+	ManualUnread          bool                                 `json:"manual_unread"`
 	AssignedUserID        *uuid.UUID                           `json:"assigned_user_id,omitempty"`
+	AssignedUserName      string                               `json:"assigned_user_name,omitempty"`
+	TransferAgentID       *uuid.UUID                           `json:"transfer_agent_id,omitempty"`
+	TransferAgentName     string                               `json:"transfer_agent_name,omitempty"`
 	WhatsAppAccount       string                               `json:"whatsapp_account,omitempty"`
 	LastInboundAt         *time.Time                           `json:"last_inbound_at,omitempty"`
 	ServiceWindowOpen     bool                                 `json:"service_window_open"`
@@ -74,6 +78,17 @@ type MessageResponse struct {
 	IngestedAt          *time.Time           `json:"ingested_at,omitempty"`
 	CreatedAt           time.Time            `json:"created_at"`
 	UpdatedAt           time.Time            `json:"updated_at"`
+	// IsForwarded marks an agent forward for the CRM only; the customer
+	// receives an ordinary message.
+	IsForwarded bool `json:"is_forwarded,omitempty"`
+	// ForwardDeliveryState is "delayed" (status unknown, may still be sent)
+	// or "uncertain" (may have been sent) for a stalled forward. Neither
+	// means "not sent"; neither is resent automatically.
+	ForwardDeliveryState string `json:"forward_delivery_state,omitempty"`
+	// ForwardDispatch and ForwardDispatchAt expose a forward's dispatch
+	// marker so an open chat can apply the same rule as it ages.
+	ForwardDispatch   string `json:"forward_dispatch,omitempty"`
+	ForwardDispatchAt string `json:"forward_dispatch_at,omitempty"`
 }
 
 // ReplyPreview contains a preview of the replied-to message
@@ -561,13 +576,38 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 	pg := parsePagination(r)
 	search := string(r.RequestCtx.QueryArgs().Peek("search"))
 	tagsParam := string(r.RequestCtx.QueryArgs().Peek("tags"))
+	unreadOnly := strings.EqualFold(strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("unread"))), "true")
+	assignedFilter := strings.ToLower(strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("assigned"))))
+	if assignedFilter != "" && assignedFilter != "me" && assignedFilter != "unassigned" {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid assigned filter", nil, "")
+	}
 
 	var contacts []models.Contact
-	query := a.ScopeToOrg(a.DB, userID, orgID)
+	listDB := a.DB
+	if unreadOnly || assignedFilter != "" {
+		// The filters add correlated subqueries; bound the Count and page
+		// query so a slow plan cannot hold the request's connection.
+		boundedDB, cancel := contactListDB(a.DB)
+		defer cancel()
+		listDB = boundedDB
+	}
+	query := a.ScopeToOrg(listDB, userID, orgID)
 
 	// Users without contacts:read permission can only see contacts assigned to them
 	// or contacts with an active chat transfer to them
 	query = a.scopeAssignedContact(query, userID, orgID)
+
+	// Inbox filters narrow the visible set before Count, so totals and
+	// pagination describe the filtered list.
+	switch assignedFilter {
+	case "me":
+		query = a.whereContactAssignedTo(query, userID, orgID)
+	case "unassigned":
+		query = whereContactUnassigned(query, orgID)
+	}
+	if unreadOnly {
+		query = whereContactUnread(query, orgID)
+	}
 
 	if search != "" {
 		// Limit search string length to prevent abuse
@@ -630,14 +670,9 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 			}
 		}
 	}
+	listState := a.loadContactListState(orgID, contacts)
 	response := make([]ContactResponse, len(contacts))
 	for i, c := range contacts {
-		// Count unread messages
-		var unreadCount int64
-		a.DB.Model(&models.Message{}).
-			Where("contact_id = ? AND direction = ? AND status != ?", c.ID, models.DirectionIncoming, models.MessageStatusRead).
-			Count(&unreadCount)
-
 		tags := []string{}
 		if c.Tags != nil {
 			for _, t := range c.Tags {
@@ -660,6 +695,7 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 		if !exists {
 			effectiveState = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
 		}
+		metadata, manualUnread := contactMetadataForResponse(c.Metadata)
 		response[i] = ContactResponse{
 			ID:                    c.ID,
 			PhoneNumber:           phoneNumber,
@@ -667,10 +703,11 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 			ProfileName:           profileName,
 			Status:                "active",
 			Tags:                  tags,
-			Metadata:              c.Metadata,
+			Metadata:              metadata,
 			LastMessageAt:         c.LastMessageAt,
 			LastMessagePreview:    c.LastMessagePreview,
-			UnreadCount:           int(unreadCount),
+			UnreadCount:           listState.unread[c.ID],
+			ManualUnread:          manualUnread,
 			AssignedUserID:        c.AssignedUserID,
 			WhatsAppAccount:       c.WhatsAppAccount,
 			LastInboundAt:         c.LastInboundAt,
@@ -680,9 +717,245 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 			CreatedAt:             c.CreatedAt,
 			UpdatedAt:             c.UpdatedAt,
 		}
+		listState.applyAssignee(&response[i], c.AssignedUserID)
 	}
 
 	return r.SendEnvelope(listEnvelope("contacts", response, total, pg))
+}
+
+// contactManualUnreadKey is the contacts.metadata key that records a
+// team-shared "Mark as unread". It is internal state: responses report it as
+// manual_unread and strip it from the returned metadata, so a contact edit
+// form never echoes it back. A person's read clears it; a chatbot reply,
+// which stores the exchange as read, does not.
+const contactManualUnreadKey = "manual_unread"
+
+// contactStateQueryTimeout bounds each supplementary contact-state statement
+// so a slow query cannot pin a pooled connection indefinitely.
+const contactStateQueryTimeout = 5 * time.Second
+
+// contactMetadataForResponse returns the metadata to expose for a contact and
+// whether a team member marked it unread by hand. The stored map is never
+// mutated; a copy is made only when the internal flag is present.
+func contactMetadataForResponse(metadata models.JSONB) (any, bool) {
+	value, present := metadata[contactManualUnreadKey]
+	if !present {
+		return metadata, false
+	}
+	visible := make(models.JSONB, len(metadata))
+	for key, item := range metadata {
+		if key != contactManualUnreadKey {
+			visible[key] = item
+		}
+	}
+	manualUnread, _ := value.(bool)
+	return visible, manualUnread
+}
+
+// contactStateDB derives a deadline from the DB's own statement context, so a
+// request-scoped tenant transaction keeps its bound values (realtime owner,
+// tenant) while the new statements cannot run unbounded.
+func contactStateDB(db *gorm.DB) (*gorm.DB, context.CancelFunc) {
+	parent := context.Background()
+	if db.Statement != nil && db.Statement.Context != nil {
+		parent = db.Statement.Context
+	}
+	ctx, cancel := context.WithTimeout(parent, contactStateQueryTimeout)
+	return db.WithContext(ctx), cancel
+}
+
+// contactListQueryTimeout bounds a filtered contact list's Count and page
+// query together.
+const contactListQueryTimeout = 10 * time.Second
+
+// contactListDB is contactStateDB with the list timeout.
+func contactListDB(db *gorm.DB) (*gorm.DB, context.CancelFunc) {
+	parent := context.Background()
+	if db.Statement != nil && db.Statement.Context != nil {
+		parent = db.Statement.Context
+	}
+	ctx, cancel := context.WithTimeout(parent, contactListQueryTimeout)
+	return db.WithContext(ctx), cancel
+}
+
+// contactManualUnreadJSON is the containment document for the manual flag.
+func contactManualUnreadJSON() string {
+	return `{"` + contactManualUnreadKey + `":true}`
+}
+
+// contactMetadataWithoutManualUnread removes the manual flag from an object
+// and leaves any other stored value (SQL NULL or a JSON scalar) unchanged:
+// jsonb "-" raises on a scalar, and a read must never fail because of it.
+func contactMetadataWithoutManualUnread() clause.Expr {
+	return gorm.Expr(
+		"CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata - CAST(? AS text) ELSE metadata END",
+		contactManualUnreadKey,
+	)
+}
+
+// whereContactUnread keeps contacts the team has not read: an incoming,
+// not-deleted message whose status is not read, or a manual "Mark as unread".
+// Read state is shared by the whole team. Chatbot-handled exchanges are stored
+// as read, so they only reappear when a person marks them unread; a chatbot
+// reply does not clear that mark, only a person reading the chat does.
+func whereContactUnread(query *gorm.DB, orgID uuid.UUID) *gorm.DB {
+	manualUnread := contactManualUnreadJSON()
+	return query.Where(`(contacts.metadata @> ?::jsonb OR EXISTS (
+		SELECT 1
+		FROM messages AS unread_message
+		WHERE unread_message.organization_id = ?
+		  AND unread_message.contact_id = contacts.id
+		  AND unread_message.deleted_at IS NULL
+		  AND unread_message.direction = ?
+		  AND unread_message.status <> ?
+	))`, manualUnread, orgID, models.DirectionIncoming, models.MessageStatusRead)
+}
+
+// whereContactAssignedTo keeps contacts that belong to userID: the stored
+// assignee, or an active agent transfer to them. assigned_user_id is often
+// unset unless AssignToSameAgent is on, so the transfer counts on its own.
+func (a *App) whereContactAssignedTo(query *gorm.DB, userID, orgID uuid.UUID) *gorm.DB {
+	return query.Where("(assigned_user_id = ? OR id IN (?))",
+		userID,
+		a.DB.Model(&models.AgentTransfer{}).
+			Select("contact_id").
+			Where("agent_id = ? AND organization_id = ? AND status = ?", userID, orgID, models.TransferStatusActive),
+	)
+}
+
+// whereContactUnassigned keeps contacts with no stored assignee and no active
+// transfer to a specific agent. A transfer still waiting in a team queue has
+// no agent and so remains unassigned.
+func whereContactUnassigned(query *gorm.DB, orgID uuid.UUID) *gorm.DB {
+	return query.Where(`(contacts.assigned_user_id IS NULL AND NOT EXISTS (
+		SELECT 1
+		FROM agent_transfers AS assigned_transfer
+		WHERE assigned_transfer.organization_id = ?
+		  AND assigned_transfer.contact_id = contacts.id
+		  AND assigned_transfer.deleted_at IS NULL
+		  AND assigned_transfer.status = ?
+		  AND assigned_transfer.agent_id IS NOT NULL
+	))`, orgID, models.TransferStatusActive)
+}
+
+// contactListState is the per-contact inbox state that is not stored on the
+// contact row: the team-shared unread count, the active transfer's agent and
+// the display names of assignees.
+type contactListState struct {
+	unread    map[uuid.UUID]int
+	transfers map[uuid.UUID]uuid.UUID
+	names     map[uuid.UUID]string
+}
+
+// applyAssignee fills the assignee and transfer-agent fields of a response.
+func (s contactListState) applyAssignee(response *ContactResponse, assignedUserID *uuid.UUID) {
+	if assignedUserID != nil {
+		response.AssignedUserName = s.names[*assignedUserID]
+	}
+	if agentID, ok := s.transfers[response.ID]; ok {
+		agent := agentID
+		response.TransferAgentID = &agent
+		response.TransferAgentName = s.names[agentID]
+	}
+}
+
+// loadContactListState batch-loads contactListState for one page of contacts
+// with three bounded queries instead of one query per row. They run inside one
+// savepoint on the request's own connection: an SQL error rolls back only the
+// savepoint, is logged, and leaves the rest of the state empty while the
+// request continues. A deadline or connection failure still fails the
+// request, because it breaks the connection itself.
+func (a *App) loadContactListState(orgID uuid.UUID, contacts []models.Contact) contactListState {
+	state := contactListState{
+		unread:    make(map[uuid.UUID]int, len(contacts)),
+		transfers: make(map[uuid.UUID]uuid.UUID),
+		names:     make(map[uuid.UUID]string),
+	}
+	if a == nil || a.DB == nil || orgID == uuid.Nil || len(contacts) == 0 {
+		return state
+	}
+	contactIDs := make([]uuid.UUID, 0, len(contacts))
+	userIDs := make([]uuid.UUID, 0, len(contacts))
+	seenUsers := make(map[uuid.UUID]bool)
+	for i := range contacts {
+		contactIDs = append(contactIDs, contacts[i].ID)
+		if assigned := contacts[i].AssignedUserID; assigned != nil && !seenUsers[*assigned] {
+			seenUsers[*assigned] = true
+			userIDs = append(userIDs, *assigned)
+		}
+	}
+
+	db, cancel := contactStateDB(a.DB)
+	defer cancel()
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var unreadRows []struct {
+			ContactID uuid.UUID
+			Unread    int
+		}
+		if err := tx.Model(&models.Message{}).
+			Select("contact_id, COUNT(*) AS unread").
+			Where(
+				"organization_id = ? AND contact_id IN ? AND deleted_at IS NULL AND direction = ? AND status <> ?",
+				orgID,
+				contactIDs,
+				models.DirectionIncoming,
+				models.MessageStatusRead,
+			).
+			Group("contact_id").
+			Scan(&unreadRows).Error; err != nil {
+			return fmt.Errorf("count unread contact messages: %w", err)
+		}
+		for _, row := range unreadRows {
+			state.unread[row.ContactID] = row.Unread
+		}
+
+		var transfers []models.AgentTransfer
+		if err := tx.Select("id", "contact_id", "agent_id", "transferred_at").
+			Where(
+				"organization_id = ? AND contact_id IN ? AND status = ? AND agent_id IS NOT NULL",
+				orgID,
+				contactIDs,
+				models.TransferStatusActive,
+			).
+			Order("transferred_at DESC, id DESC").
+			Find(&transfers).Error; err != nil {
+			return fmt.Errorf("load active contact transfers: %w", err)
+		}
+		for _, transfer := range transfers {
+			if transfer.AgentID == nil {
+				continue
+			}
+			if _, exists := state.transfers[transfer.ContactID]; exists {
+				continue
+			}
+			state.transfers[transfer.ContactID] = *transfer.AgentID
+			if !seenUsers[*transfer.AgentID] {
+				seenUsers[*transfer.AgentID] = true
+				userIDs = append(userIDs, *transfer.AgentID)
+			}
+		}
+
+		if len(userIDs) == 0 {
+			return nil
+		}
+		var users []models.User
+		if err := tx.Model(&models.User{}).
+			Select("users.id", "users.full_name").
+			Where("users.id IN ?", userIDs).
+			Where(orgMemberUserCondition, orgID, orgID).
+			Find(&users).Error; err != nil {
+			return fmt.Errorf("load contact assignee names: %w", err)
+		}
+		for _, user := range users {
+			state.names[user.ID] = user.FullName
+		}
+		return nil
+	})
+	if err != nil {
+		a.Log.Error("Failed to load contact list state", "error", err, "organization_id", orgID)
+	}
+	return state
 }
 
 // scopeAssignedContact narrows a contact query for users who lack the
@@ -696,12 +969,7 @@ func (a *App) scopeAssignedContact(query *gorm.DB, userID, orgID uuid.UUID) *gor
 	if a.HasPermission(userID, models.ResourceContacts, models.ActionRead, orgID) {
 		return query
 	}
-	return query.Where("assigned_user_id = ? OR id IN (?)",
-		userID,
-		a.DB.Model(&models.AgentTransfer{}).
-			Select("contact_id").
-			Where("agent_id = ? AND organization_id = ? AND status = ?", userID, orgID, models.TransferStatusActive),
-	)
+	return a.whereContactAssignedTo(query, userID, orgID)
 }
 
 // GetContact returns a single contact
@@ -920,6 +1188,12 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 			IngestedAt:          m.IngestedAt,
 			CreatedAt:           m.CreatedAt,
 			UpdatedAt:           m.UpdatedAt,
+			IsForwarded:         messageIsForwarded(m.Metadata),
+		}
+		msgResp.ForwardDeliveryState = forwardDeliveryState(&m, time.Now())
+		if msgResp.IsForwarded {
+			msgResp.ForwardDispatch, _ = m.Metadata[forwardDispatchMetadataKey].(string)
+			msgResp.ForwardDispatchAt, _ = m.Metadata[forwardDispatchAtMetadataKey].(string)
 		}
 
 		if m.IsReply && m.ReplyToMessageID != nil {
@@ -961,6 +1235,10 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 
 type MarkContactReadRequest struct {
 	LastVisibleMessageID *uuid.UUID `json:"last_visible_message_id,omitempty"`
+	// Mark is a manual inbox action: "read" resolves the latest incoming
+	// message server-side and follows the visible-cursor path; "unread" sets
+	// the team-shared manual unread flag. Automatic reads leave it empty.
+	Mark string `json:"mark,omitempty"`
 }
 
 // MarkContactRead marks incoming messages from a contact as read. When the
@@ -968,6 +1246,8 @@ type MarkContactReadRequest struct {
 // the current user's provider-neutral inbox cursor.
 // Called from the frontend when a new message arrives for the chat the
 // user is currently viewing, so the sidebar unread badge stays at zero.
+// A manual mark ("read" or "unread") comes from the inbox row and header
+// menus; see MarkContactReadRequest.Mark.
 func (a *App) MarkContactRead(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
@@ -986,6 +1266,13 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 			return nil
 		}
 	}
+	manualMark := strings.ToLower(strings.TrimSpace(request.Mark))
+	if manualMark != "" && manualMark != "read" && manualMark != "unread" {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid read state", nil, "")
+	}
+	if manualMark != "" && request.LastVisibleMessageID != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Send either a visible message or a manual read state", nil, "")
+	}
 
 	var contact models.Contact
 	query := a.DB.Where("id = ? AND organization_id = ?", contactID, orgID)
@@ -1001,6 +1288,51 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 		models.ActionWrite,
 		orgID,
 	)
+	if manualMark == "unread" {
+		// Unread is team-shared state, so it needs the same chat:write
+		// authority as the shared read path. It makes no provider call.
+		if !sharedLegacyWrite {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to change read state", nil, "")
+		}
+		if err := a.setContactManualUnread(orgID, contactID); err != nil {
+			a.Log.Error("Failed to mark contact unread", "error", err, "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update read state", nil, "")
+		}
+		a.broadcastContactUpdate(orgID, contactID, "read_state")
+		return r.SendEnvelope(map[string]any{
+			"status":        "ok",
+			"cursor_synced": false,
+			"manual_unread": true,
+		})
+	}
+	if manualMark == "read" {
+		synced, err := a.markContactReadByHand(orgID, userID, contactID, &contact, sharedLegacyWrite)
+		if err != nil {
+			a.Log.Error("Failed to mark contact read", "error", err, "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update read state", nil, "")
+		}
+		manualUnread := false
+		if sharedLegacyWrite {
+			// The shared read above clears the mark in its own statement. This
+			// covers a user with no visible message (nothing was read). It
+			// locks only the already-scoped contact row, and only when set.
+			cleared, err := a.clearContactManualUnread(orgID, contactID)
+			if err != nil {
+				a.Log.Error("Failed to clear manual unread", "error", err, "organization_id", orgID)
+				return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update read state", nil, "")
+			}
+			if cleared {
+				a.broadcastContactUpdate(orgID, contactID, "read_state")
+			}
+		} else {
+			_, manualUnread = contactMetadataForResponse(contact.Metadata)
+		}
+		return r.SendEnvelope(map[string]any{
+			"status":        "ok",
+			"cursor_synced": synced,
+			"manual_unread": manualUnread,
+		})
+	}
 	var visibleMessage models.Message
 	var verifiedLegacyConversationID uuid.UUID
 	var conversationCutoff *time.Time
@@ -1072,6 +1404,148 @@ func (a *App) MarkContactRead(r *fastglue.Request) error {
 		"status":        "ok",
 		"cursor_synced": cursorSynced,
 	})
+}
+
+// markContactReadByHand is the manual "Mark as read". It covers every
+// conversation of the contact that userID may see, not only the newest one:
+// a patient who wrote to two clinic numbers has one conversation per account.
+//   - The reader's own inbox cursor advances to the newest visible incoming
+//     message of each linked conversation, so the navbar badge clears.
+//   - With chat:write, every visible unread incoming message is marked read in
+//     one call to the shared read path. It locks those conversations in id
+//     order and then the contact, the same order as the visible-cursor read,
+//     and clears the manual unread mark in the same statement. Nobody opened
+//     these messages, so no WhatsApp read receipts are sent.
+//
+// It never repairs the legacy inbox mirror. That repair locks a conversation
+// and then the contact per message, so in one request transaction it would
+// put a contact lock before later conversation locks and deadlock against a
+// concurrent read. Unlinked messages are still marked read below; the
+// after-commit mirror and the backfill link them later.
+//
+// With chat:write it first locks every conversation it will touch in one
+// statement ordered by id: the newest rows' conversations and those with an
+// unread row. The cursor phase locks only conversations whose binding it can
+// verify (not, say, one on a deleted WhatsApp number), and the shared read
+// then locks the rest; without the up-front lock a lower-id conversation
+// could be locked after a higher-id one and deadlock against a concurrent
+// whole-contact read. Every later conversation lock re-takes a held row.
+//
+// It reports whether at least one inbox cursor was proven and advanced.
+func (a *App) markContactReadByHand(
+	orgID, userID, contactID uuid.UUID,
+	contact *models.Contact,
+	sharedWrite bool,
+) (bool, error) {
+	restricted, cutoff, err := a.customerConversationScope(orgID, userID, []uuid.UUID{contactID})
+	if err != nil {
+		return false, err
+	}
+	if restricted && cutoff == nil {
+		return false, nil
+	}
+	db, cancel := contactStateDB(a.DB)
+	defer cancel()
+
+	newestSQL := `SELECT DISTINCT ON (inbox_conversation_id) *
+		FROM messages
+		WHERE organization_id = ? AND contact_id = ? AND direction = ? AND deleted_at IS NULL
+		  AND inbox_conversation_id IS NOT NULL`
+	args := []any{orgID, contactID, models.DirectionIncoming}
+	if cutoff != nil {
+		newestSQL += " AND created_at >= ?"
+		args = append(args, cutoff.UTC())
+	}
+	newestSQL += `
+		ORDER BY inbox_conversation_id, COALESCE(ingested_at, created_at) DESC, id DESC`
+	var newest []models.Message
+	if err := db.Raw(newestSQL, args...).Scan(&newest).Error; err != nil {
+		return false, err
+	}
+
+	var unread []models.Message
+	if sharedWrite {
+		unreadQuery := db.Where(
+			"organization_id = ? AND contact_id = ? AND direction = ? AND status <> ?",
+			orgID,
+			contactID,
+			models.DirectionIncoming,
+			models.MessageStatusRead,
+		)
+		if cutoff != nil {
+			unreadQuery = unreadQuery.Where("created_at >= ?", cutoff.UTC())
+		}
+		if err := unreadQuery.Find(&unread).Error; err != nil {
+			return false, err
+		}
+		conversationSet := make(map[uuid.UUID]struct{})
+		for _, messages := range [][]models.Message{newest, unread} {
+			for i := range messages {
+				if id := messages[i].InboxConversationID; id != nil && *id != uuid.Nil {
+					conversationSet[*id] = struct{}{}
+				}
+			}
+		}
+		if len(conversationSet) > 0 {
+			conversationIDs := make([]uuid.UUID, 0, len(conversationSet))
+			for id := range conversationSet {
+				conversationIDs = append(conversationIDs, id)
+			}
+			var locked []models.InboxConversation
+			if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id").
+				Where("organization_id = ? AND contact_id = ? AND id IN ?", orgID, contactID, conversationIDs).
+				Order("id").
+				Find(&locked).Error; err != nil {
+				return false, err
+			}
+		}
+	}
+
+	cursorSynced := false
+	if len(newest) > 0 {
+		syncResult, err := a.syncLegacyVisibleMessagesRead(orgID, userID, contactID, newest, false)
+		if err != nil {
+			return false, err
+		}
+		cursorSynced = len(syncResult.VerifiedMessageConversations) > 0
+	}
+	if !sharedWrite {
+		return cursorSynced, nil
+	}
+	return cursorSynced, a.markSelectedMessagesAsReadWithReceipts(orgID, contactID, contact, unread, false, false)
+}
+
+// setContactManualUnread records a team-shared manual unread mark. It is one
+// statement on the contact row and acquires no other lock.
+func (a *App) setContactManualUnread(orgID, contactID uuid.UUID) error {
+	db, cancel := contactStateDB(a.DB)
+	defer cancel()
+	result := db.Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", contactID, orgID).
+		Update("metadata", gorm.Expr(
+			"CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{}'::jsonb END || CAST(? AS jsonb)",
+			contactManualUnreadJSON(),
+		))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// clearContactManualUnread removes the manual unread mark and reports whether
+// it was set. The containment guard makes it a no-op, without a row lock,
+// when the flag is not set.
+func (a *App) clearContactManualUnread(orgID, contactID uuid.UUID) (bool, error) {
+	db, cancel := contactStateDB(a.DB)
+	defer cancel()
+	result := db.Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ? AND metadata @> CAST(? AS jsonb)", contactID, orgID, contactManualUnreadJSON()).
+		Update("metadata", contactMetadataWithoutManualUnread())
+	return result.RowsAffected > 0, result.Error
 }
 
 // markMessagesAsRead marks messages as read and sends read receipts
@@ -1160,6 +1634,27 @@ func (a *App) markSelectedMessagesAsRead(
 	unreadMessages []models.Message,
 	mirrorEntireContact bool,
 ) error {
+	return a.markSelectedMessagesAsReadWithReceipts(
+		orgID,
+		contactID,
+		contact,
+		unreadMessages,
+		mirrorEntireContact,
+		true,
+	)
+}
+
+// markSelectedMessagesAsReadWithReceipts is markSelectedMessagesAsRead with
+// the provider side effect made explicit. A manual "Mark as read" passes
+// sendReceipts=false: nobody opened those messages, so the customer must not
+// receive WhatsApp read receipts for them.
+func (a *App) markSelectedMessagesAsReadWithReceipts(
+	orgID, contactID uuid.UUID,
+	contact *models.Contact,
+	unreadMessages []models.Message,
+	mirrorEntireContact bool,
+	sendReceipts bool,
+) error {
 	if a == nil || a.DB == nil || contact == nil || orgID == uuid.Nil || contactID == uuid.Nil {
 		return errors.New("message read-state scope is required")
 	}
@@ -1191,6 +1686,7 @@ func (a *App) markSelectedMessagesAsRead(
 		return conversationIDs[i].String() < conversationIDs[j].String()
 	})
 
+	hadManualUnread := false
 	if err := a.DB.Transaction(func(tx *gorm.DB) error {
 		conversationQuery := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Select("id").
@@ -1207,13 +1703,29 @@ func (a *App) markSelectedMessagesAsRead(
 			return err
 		}
 
-		var lockedContact models.Contact
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Select("id").
-			Where("id = ? AND organization_id = ?", contactID, orgID).
-			First(&lockedContact).Error; err != nil {
-			return err
+		// The same contact row lock as before; it also reports whether a
+		// manual unread mark is set, as a boolean so no stored metadata shape
+		// can fail the read.
+		var lockedContact struct {
+			ID              uuid.UUID
+			HadManualUnread bool
 		}
+		locked := tx.Model(&models.Contact{}).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select(
+				"id, COALESCE(metadata @> CAST(? AS jsonb), false) AS had_manual_unread",
+				contactManualUnreadJSON(),
+			).
+			Where("id = ? AND organization_id = ?", contactID, orgID).
+			Limit(1).
+			Scan(&lockedContact)
+		if locked.Error != nil {
+			return locked.Error
+		}
+		if locked.RowsAffected != 1 {
+			return gorm.ErrRecordNotFound
+		}
+		hadManualUnread = lockedContact.HadManualUnread
 		if len(messageIDs) > 0 {
 			if err := tx.Model(&models.Message{}).
 				Where(
@@ -1237,9 +1749,19 @@ func (a *App) markSelectedMessagesAsRead(
 			  AND unread_message.direction = ?
 			  AND unread_message.status != ?
 		)`, orgID, contactID, models.DirectionIncoming, models.MessageStatusRead)
+		contactUpdates := map[string]any{"is_read": isReadExpression}
+		if !mirrorEntireContact {
+			// A person's visible-cursor read (Chat, automatic or manual, and
+			// Omnichannel) also ends a manual "Mark as unread". The
+			// whole-contact path also serves chatbot replies, which must not
+			// dismiss a teammate's reminder. The same statement writes the
+			// contact row locked above, so the flag takes no extra lock or
+			// connection.
+			contactUpdates["metadata"] = contactMetadataWithoutManualUnread()
+		}
 		updated := tx.Model(&models.Contact{}).
 			Where("id = ? AND organization_id = ?", contactID, orgID).
-			Update("is_read", isReadExpression)
+			Updates(contactUpdates)
 		if updated.Error != nil {
 			return updated.Error
 		}
@@ -1260,6 +1782,13 @@ func (a *App) markSelectedMessagesAsRead(
 		return nil
 	}); err != nil {
 		return err
+	}
+	if !mirrorEntireContact && hadManualUnread {
+		// Queued until the surrounding tenant transaction commits.
+		a.broadcastContactUpdate(orgID, contactID, "read_state")
+	}
+	if !sendReceipts {
+		return nil
 	}
 
 	for accountName, messages := range messagesByAccount {
@@ -1328,6 +1857,10 @@ type SendMessageRequest struct {
 	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
 	WhatsAppAccount  string `json:"whatsapp_account,omitempty"`
 
+	// ForwardOfMessageID re-sends a stored message of this organization to
+	// the path contact. The server derives the type and content.
+	ForwardOfMessageID string `json:"forward_of_message_id,omitempty"`
+
 	// Interactive message fields (for type="interactive")
 	Interactive *InteractiveContent `json:"interactive,omitempty"`
 }
@@ -1377,6 +1910,9 @@ func (a *App) SendMessage(r *fastglue.Request) error {
 	var req SendMessageRequest
 	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid request body", nil, "")
+	}
+	if strings.TrimSpace(req.ForwardOfMessageID) != "" {
+		return a.forwardMessage(r, orgID, userID, contactID, &req)
 	}
 
 	// Get contact (users without full read permission can only message their assigned contacts)
@@ -1650,6 +2186,17 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 		formWhatsAppAccount = accountValues[0]
 	}
 
+	// Optional reply context. The unified sender reloads this ID under the
+	// canonical-contact lock and validates organization and contact ownership.
+	var replyToMessage *models.Message
+	if replyValues := form.Value["reply_to_message_id"]; len(replyValues) > 0 && strings.TrimSpace(replyValues[0]) != "" {
+		replyToID, parseErr := uuid.Parse(strings.TrimSpace(replyValues[0]))
+		if parseErr != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid reply message ID", nil, "")
+		}
+		replyToMessage = &models.Message{BaseModel: models.BaseModel{ID: replyToID}}
+	}
+
 	// Get uploaded file
 	files := form.File["file"]
 	if len(files) == 0 {
@@ -1704,14 +2251,15 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 
 	// Build and send via unified message sender
 	msgReq := OutgoingMessageRequest{
-		Account:       account,
-		Contact:       &contact,
-		Type:          models.MessageType(mediaType),
-		MediaData:     fileData,
-		MediaURL:      mediaPath,
-		MediaMimeType: mimeType,
-		MediaFilename: fileHeader.Filename,
-		Caption:       caption,
+		Account:        account,
+		Contact:        &contact,
+		Type:           models.MessageType(mediaType),
+		MediaData:      fileData,
+		MediaURL:       mediaPath,
+		MediaMimeType:  mimeType,
+		MediaFilename:  fileHeader.Filename,
+		Caption:        caption,
+		ReplyToMessage: replyToMessage,
 	}
 
 	opts := DefaultSendOptions()
@@ -1746,6 +2294,7 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 		CreatedAt:       message.CreatedAt,
 		UpdatedAt:       message.UpdatedAt,
 	}
+	a.attachMediaReplyPreview(orgID, message, &response)
 
 	return r.SendEnvelope(response)
 }
@@ -2110,17 +2659,12 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 
 		// Validate the assignee in the same transaction as the update. This
 		// prevents an organization change or deletion from racing the write.
+		// Membership follows the auth layer (home organization or a live
+		// user_organizations row) so a removed or deactivated member cannot be
+		// assigned and a member whose home is another organization can.
 		if req.UserID != nil {
-			var user models.User
-			if userErr := tx.Where(
-				"id = ? AND organization_id = ?",
-				*req.UserID,
-				orgID,
-			).First(&user).Error; userErr != nil {
-				if errors.Is(userErr, gorm.ErrRecordNotFound) {
-					return errAssignedContactUserNotFound
-				}
-				return userErr
+			if _, isMember := lookupOrgMemberUser(tx, *req.UserID, orgID, true); !isMember {
+				return errAssignedContactUserNotFound
 			}
 		}
 
@@ -2175,6 +2719,7 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 		a.Log.Error("Failed to assign contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to assign contact", nil, "")
 	}
+	a.broadcastContactUpdate(orgID, updatedContact.ID, "assignment")
 
 	return r.SendEnvelope(map[string]any{
 		"message":          "Contact assigned successfully",
@@ -2640,18 +3185,17 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 
 		if req.ClearAssignedAgent == nil || !*req.ClearAssignedAgent {
 			if req.AssignedUserID != nil {
-				var user models.User
-				if userErr := tx.Where(
-					"id = ? AND organization_id = ?",
-					*req.AssignedUserID,
-					orgID,
-				).First(&user).Error; userErr != nil {
-					if errors.Is(userErr, gorm.ErrRecordNotFound) {
-						return errAssignedContactUserNotFound
-					}
-					return userErr
+				// Same membership rule as AssignContact.
+				if _, isMember := lookupOrgMemberUser(tx, *req.AssignedUserID, orgID, true); !isMember {
+					return errAssignedContactUserNotFound
 				}
 			}
+		}
+		if req.Metadata != nil {
+			// The edit form never sees the internal manual unread mark: keep
+			// the stored one (read under this row lock) and ignore any the
+			// client sent.
+			updates["metadata"] = contactMetadataKeepingManualUnread(*req.Metadata, contact.Metadata)
 		}
 
 		result := tx.Model(&models.Contact{}).
@@ -2704,8 +3248,27 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 
 	a.logAudit(orgID, userID,
 		"contact", updatedContact.ID, models.AuditActionUpdated, &oldContact, &updatedContact)
+	if _, assignmentChanged := updates["assigned_user_id"]; assignmentChanged {
+		a.broadcastContactUpdate(orgID, updatedContact.ID, "assignment")
+	}
 
 	return r.SendEnvelope(a.buildContactResponse(&updatedContact, orgID))
+}
+
+// contactMetadataKeepingManualUnread is the metadata a contact edit writes:
+// the client's map without the internal manual unread key, plus the stored
+// mark when one is set.
+func contactMetadataKeepingManualUnread(edited map[string]any, stored models.JSONB) models.JSONB {
+	merged := make(models.JSONB, len(edited)+1)
+	for key, value := range edited {
+		if key != contactManualUnreadKey {
+			merged[key] = value
+		}
+	}
+	if manualUnread, _ := stored[contactManualUnreadKey].(bool); manualUnread {
+		merged[contactManualUnreadKey] = true
+	}
+	return merged
 }
 
 // DeleteContact soft-deletes a contact
@@ -2751,11 +3314,8 @@ func (a *App) DeleteContact(r *fastglue.Request) error {
 
 // buildContactResponse creates a ContactResponse from a Contact model
 func (a *App) buildContactResponse(contact *models.Contact, orgID uuid.UUID) ContactResponse {
-	// Count unread messages
-	var unreadCount int64
-	a.DB.Model(&models.Message{}).
-		Where("contact_id = ? AND direction = ? AND status != ?", contact.ID, models.DirectionIncoming, models.MessageStatusRead).
-		Count(&unreadCount)
+	// Unread count and assignee names use the same batched lookup as the list.
+	listState := a.loadContactListState(orgID, []models.Contact{*contact})
 
 	tags := []string{}
 	if contact.Tags != nil {
@@ -2782,17 +3342,19 @@ func (a *App) buildContactResponse(contact *models.Contact, orgID uuid.UUID) Con
 		effectiveState = FailClosedWhatsAppIdentityReviewEffectiveState("identity_review_read_failed")
 	}
 
-	return ContactResponse{
+	metadata, manualUnread := contactMetadataForResponse(contact.Metadata)
+	response := ContactResponse{
 		ID:                    contact.ID,
 		PhoneNumber:           phoneNumber,
 		Name:                  profileName,
 		ProfileName:           profileName,
 		Status:                "active",
 		Tags:                  tags,
-		Metadata:              contact.Metadata,
+		Metadata:              metadata,
 		LastMessageAt:         contact.LastMessageAt,
 		LastMessagePreview:    contact.LastMessagePreview,
-		UnreadCount:           int(unreadCount),
+		UnreadCount:           listState.unread[contact.ID],
+		ManualUnread:          manualUnread,
 		AssignedUserID:        contact.AssignedUserID,
 		WhatsAppAccount:       contact.WhatsAppAccount,
 		LastInboundAt:         contact.LastInboundAt,
@@ -2802,4 +3364,6 @@ func (a *App) buildContactResponse(contact *models.Contact, orgID uuid.UUID) Con
 		CreatedAt:             contact.CreatedAt,
 		UpdatedAt:             contact.UpdatedAt,
 	}
+	listState.applyAssignee(&response, contact.AssignedUserID)
+	return response
 }

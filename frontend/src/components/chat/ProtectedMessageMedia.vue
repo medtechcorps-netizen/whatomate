@@ -22,7 +22,8 @@ import MediaPreviewDialog, { type MediaPreviewSource } from './MediaPreviewDialo
 const props = defineProps<{
   // Workspace the transcript was requested from; every request is pinned to it.
   organizationId: string
-  message: Pick<Message, 'id' | 'message_type' | 'media_url' | 'media_mime_type' | 'media_filename' | 'content'>
+  message: Pick<Message, 'id' | 'message_type' | 'media_url' | 'media_mime_type' | 'media_filename' | 'content'> &
+    Partial<Pick<Message, 'status' | 'direction'>>
 }>()
 
 const { t } = useI18n()
@@ -44,6 +45,34 @@ const progress = ref<number | null>(null)
 let requestController: AbortController | null = null
 let releaseSlot: (() => void) | null = null
 let generation = 0
+
+// A forwarded image is listed while its message is still pending, before the
+// server has copied the media (the copy runs before the send), so its first
+// load can answer 404. When that message leaves pending, the image loads
+// again by itself: at most once per wait below, then only by Retry, and each
+// new media gets a fresh budget. Only the media is fetched again; nothing
+// here sends a message. The tries keep the failure on screen until one
+// succeeds, so Retry keeps its focus and the alert is announced once.
+//
+// This applies only to an outgoing image whose load failed while pending.
+// Other media is stored before its message exists, and incoming messages are
+// never pending. The forward marker itself is not checked: the live socket
+// copy of a new message carries no metadata or is_forwarded, so other agents'
+// screens could not see it.
+const AUTO_RELOAD_WAITS = [1_000, 5_000, 15_000]
+let autoReloadTimer: ReturnType<typeof setTimeout> | null = null
+let autoReloadsUsed = 0
+let autoReloadEpoch = 0
+// The epoch of the automatic load still running, if any. Only one runs at a
+// time: a quiet load leaves the failure on screen, so a status change while
+// it runs must not arm another.
+let autoReloadRunning: number | null = null
+// The last load failed while the message was pending; cleared by any success.
+let failedWhilePending = false
+const root = ref<HTMLElement | null>(null)
+// Whether focus was inside this bubble (on Retry) when the last successful
+// load replaced what was on screen.
+let focusInBubbleAtSwap = false
 
 const kind = computed<ChatMediaKind>(() => {
   const { message_type: type, media_mime_type: mimeType } = props.message
@@ -113,19 +142,22 @@ function releaseMedia() {
   documentPreview.value = null
 }
 
-async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<string> {
+// A quiet load leaves the failure on screen until it succeeds.
+async function loadMedia(options: { userInitiated?: boolean; quiet?: boolean } = {}): Promise<string> {
   releaseMedia()
   const requestGeneration = generation
   const organizationId = props.organizationId.trim()
   const messageId = props.message.id
   if (!organizationId || !messageId || !props.message.media_url) {
     // Fail closed: without a workspace the request would silently fall back
-    // to the login workspace.
+    // to the login workspace. Only a prop change or Retry loads again.
+    failedWhilePending = false
     status.value = 'error'
     return ''
   }
 
-  status.value = 'loading'
+  if (!options.quiet) status.value = 'loading'
+  const startedPending = props.message.status === 'pending'
   const controller = new AbortController()
   requestController = controller
   let slot: (() => void) | null = null
@@ -156,10 +188,18 @@ async function loadMedia(options: { userInitiated?: boolean } = {}): Promise<str
     if (previewType === 'image/jpeg' || previewType === 'image/png') {
       previewImageURL.value = URL.createObjectURL(new Blob([blob], { type: previewType }))
     }
+    // Any load that succeeds ends the automatic tries for this media.
+    cancelAutoReload()
+    failedWhilePending = false
+    focusInBubbleAtSwap = !!root.value?.contains(document.activeElement)
     status.value = 'ready'
     return mediaURL.value
   } catch {
-    if (requestGeneration === generation) status.value = 'error'
+    if (requestGeneration === generation) {
+      // An automatic try that fails keeps the remaining tries.
+      if (!options.quiet) failedWhilePending = startedPending
+      status.value = 'error'
+    }
     return ''
   } finally {
     slot?.()
@@ -197,7 +237,56 @@ async function playMedia() {
   }
 }
 
+function cancelAutoReload() {
+  autoReloadEpoch++
+  if (autoReloadTimer) clearTimeout(autoReloadTimer)
+  autoReloadTimer = null
+}
+
+function scheduleAutoReload() {
+  if (autoReloadTimer || autoReloadRunning === autoReloadEpoch) return
+  if (autoReloadsUsed >= AUTO_RELOAD_WAITS.length || status.value !== 'error') return
+  const epoch = autoReloadEpoch
+  autoReloadTimer = setTimeout(async () => {
+    autoReloadTimer = null
+    // Anything may have happened during the wait: a Retry, new media, a load
+    // that already succeeded.
+    if (epoch !== autoReloadEpoch || status.value !== 'error' || !failedWhilePending) return
+    autoReloadRunning = epoch
+    let url = ''
+    try {
+      url = await loadMedia({ quiet: true })
+    } finally {
+      if (autoReloadRunning === epoch) autoReloadRunning = null
+    }
+    if (!url) {
+      // Media still missing waits longer before the next try.
+      if (epoch === autoReloadEpoch) scheduleAutoReload()
+      return
+    }
+    // Focus that was on Retry when the image replaced it moves to the image,
+    // unless the agent has since moved it elsewhere.
+    await nextTick()
+    const active = document.activeElement
+    const focusLeftBubble = !!active && active !== document.body && !root.value?.contains(active)
+    if (focusInBubbleAtSwap && !focusLeftBubble && mediaURL.value === url) {
+      root.value?.querySelector<HTMLElement>('button')?.focus({ preventScroll: true })
+    }
+  }, AUTO_RELOAD_WAITS[autoReloadsUsed++])
+}
+
+const reloadsWhenSent = computed(() => props.message.message_type === 'image' && props.message.direction === 'outgoing')
+
+// The message has left pending, including a change that landed while the
+// failing load was still running.
+watch([() => props.message.status, status], ([messageStatus, mediaStatus]) => {
+  if (mediaStatus === 'error' && failedWhilePending && reloadsWhenSent.value && messageStatus !== 'pending') {
+    scheduleAutoReload()
+  }
+})
+
 function retry() {
+  cancelAutoReload()
   if (kind.value === 'document') void openDocument()
   else if (kind.value === 'video' || kind.value === 'audio') void playMedia()
   else void loadMedia({ userInitiated: true })
@@ -213,6 +302,9 @@ function handleImageError(event: Event) {
   // An image removed by a reload can still report an error for its old URL.
   const target = event.target as HTMLElement | null
   if (!mediaURL.value || target?.getAttribute('src') !== mediaURL.value) return
+  // Bytes that arrived but do not decode are left to Retry.
+  cancelAutoReload()
+  failedWhilePending = false
   releaseMedia()
   status.value = 'error'
 }
@@ -228,6 +320,9 @@ watch(
     () => props.message.message_type,
   ],
   () => {
+    cancelAutoReload()
+    autoReloadsUsed = 0
+    failedWhilePending = false
     releaseMedia()
     status.value = 'idle'
     if (loadsAutomatically.value) void loadMedia()
@@ -237,11 +332,15 @@ watch(
   { immediate: true, flush: 'sync' },
 )
 
-onBeforeUnmount(releaseMedia)
+onBeforeUnmount(() => {
+  cancelAutoReload()
+  releaseMedia()
+})
 </script>
 
 <template>
   <div
+    ref="root"
     class="mb-2"
     data-testid="chat-message-media"
     :data-media-kind="kind"
@@ -286,9 +385,12 @@ onBeforeUnmount(releaseMedia)
       <Play class="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
       <span class="text-sm">{{ kind === 'video' ? t('chat.playVideo') : t('chat.playAudio') }}</span>
     </button>
+    <!-- A status, not an alert: a failed attachment is announced politely and
+         does not interrupt what the agent is reading or typing. -->
     <div
       v-else-if="status === 'error'"
-      role="alert"
+      role="status"
+      data-testid="chat-message-media-error"
       class="flex max-w-[280px] items-center gap-2 px-3 py-3 bg-background/50 rounded-lg text-sm"
     >
       <AlertCircle class="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />

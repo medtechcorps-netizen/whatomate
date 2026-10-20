@@ -37,6 +37,8 @@ function item(
     errorMessage: null,
     convertedFrom: null,
     conversionFailed: false,
+    quotesReply: null,
+    replyRejected: false,
     ...rest,
   }
 }
@@ -257,5 +259,45 @@ describe('MediaSendDialog', () => {
     expect(wrapper.get('[data-testid="composer-media-unconfirmed"]').text()).toContain('chat.composer.unconfirmed')
     // It is not offered for an automatic resend.
     expect(wrapper.find('[data-testid="composer-media-retry"]').exists()).toBe(false)
+  })
+
+  it('shows what the first file will quote when sending as a reply', () => {
+    const plain = mountDialog({ items: [item('a.png', 'image/png')] })
+    expect(plain.find('[data-testid="composer-media-reply"]').exists()).toBe(false)
+    const reply = mountDialog({ replyPreview: 'Can you send the <b>results</b>?', items: [item('a.png', 'image/png')] })
+    const quote = reply.get('[data-testid="composer-media-reply"]')
+    expect(quote.text()).toContain('chat.composer.replyQuote')
+    expect(quote.text()).toContain('Can you send the <b>results</b>?')
+    expect(quote.find('b').exists()).toBe(false)
+  })
+
+  it('labels the file that quotes the reply', () => {
+    const wrapper = mountDialog({
+      items: [item('a.png', 'image/png', { quotesReply: 'incoming-1' }), item('b.png', 'image/png')],
+    })
+    const rows = wrapper.findAll('[data-testid="composer-media-item"]')
+    expect(rows[0].get('[data-testid="composer-media-quotes"]').text()).toContain('chat.composer.quotesReply')
+    expect(rows[1].find('[data-testid="composer-media-quotes"]').exists()).toBe(false)
+  })
+
+  it('explains a refused reply and offers to send the file without the quote', async () => {
+    const refused = item('a.png', 'image/png', {
+      status: 'failed',
+      quotesReply: 'incoming-1',
+      replyRejected: true,
+      errorMessage: 'Reply message not found for this contact',
+    })
+    const wrapper = mountDialog({ items: [refused] })
+    const block = wrapper.get('[data-testid="composer-media-reply-rejected"]')
+    expect(block.text()).toContain('chat.composer.replyRejected')
+    expect(wrapper.find('[data-testid="composer-media-quotes"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="composer-media-send-without-quote"]').trigger('click')
+    expect(wrapper.emitted('send-without-quote')).toEqual([[refused.id]])
+  })
+
+  it('disables Send without quote while a conversion is running', () => {
+    const refused = item('a.png', 'image/png', { status: 'failed', quotesReply: 'Q1', replyRejected: true })
+    const wrapper = mountDialog({ items: [refused, item('c.webp', 'image/webp', { status: 'converting' })] })
+    expect(wrapper.get('[data-testid="composer-media-send-without-quote"]').attributes('disabled')).toBeDefined()
   })
 })

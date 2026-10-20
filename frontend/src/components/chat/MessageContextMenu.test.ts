@@ -62,13 +62,13 @@ function buildTranscript() {
   document.body.appendChild(container)
 }
 
-function mountMenu(listeners: Record<string, unknown> = {}) {
+function mountMenu(extra: Record<string, unknown> = {}) {
   const wrapper = mount(MessageContextMenu, {
     props: {
       container,
       messages: MESSAGES,
       quickReactions: ['👍', '🙏'],
-      ...listeners,
+      ...extra,
     },
     attachTo: document.body,
   })
@@ -278,5 +278,29 @@ describe('MessageContextMenu', () => {
     wrapper.unmount()
     mounted.pop()
     expect(rightClick('[data-testid="text-1"]').defaultPrevented).toBe(false)
+  })
+
+  it('offers Forward only with permission and for forwardable messages', async () => {
+    mountMenu()
+    rightClick('[data-testid="text-1"]')
+    await flushPromises()
+    expect(menuItem('chat.forward.action')).toBeUndefined()
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await settle()
+    while (mounted.length) mounted.pop()?.unmount()
+
+    const wrapper = mountMenu({ canForward: true })
+    rightClick('[data-testid="text-1"]')
+    await flushPromises()
+    menuItem('chat.forward.action')!.click()
+    // Forward opens a dialog, so it also waits until the menu has closed.
+    expect(wrapper.emitted('forward')).toBeUndefined()
+    await settle()
+    expect(wrapper.emitted('forward')?.[0]?.[0]).toMatchObject({ id: 'm-1' })
+
+    // m-2 is a text message without text: nothing to forward.
+    rightClick('[data-testid="text-2"]')
+    await flushPromises()
+    expect(menuItem('chat.forward.action')).toBeUndefined()
   })
 })

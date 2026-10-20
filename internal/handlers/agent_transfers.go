@@ -1238,7 +1238,28 @@ func (a *App) hasActiveAgentTransfer(orgID, contactID uuid.UUID) bool {
 
 // WebSocket broadcast helpers
 
+// broadcastCreatedTransferContactUpdate sends the identifier-only
+// contact_update for a new transfer, bound to the transaction that committed
+// it. broadcastTransferCreated runs only after saveAndFinalizeTransfer has
+// committed the transfer. In an inbound continuation that commit is its own
+// WithCommittedTenantApp transaction, independent of the continuation's outer
+// transaction, so the hint is sent now: queued on the outer transaction it
+// would be lost if that transaction rolled back or was retried. Anywhere else
+// the receiver's own transaction wrote the transfer, and the hint waits for
+// that commit. A transfer that already existed is never announced again.
+func (a *App) broadcastCreatedTransferContactUpdate(transfer *models.AgentTransfer) {
+	if a == nil || transfer == nil {
+		return
+	}
+	if a.inboundContinuation != nil {
+		a.rootApp().broadcastContactUpdate(transfer.OrganizationID, transfer.ContactID, "transfer")
+		return
+	}
+	a.broadcastContactUpdate(transfer.OrganizationID, transfer.ContactID, "transfer")
+}
+
 func (a *App) broadcastTransferCreated(transfer *models.AgentTransfer, contact *models.Contact) {
+	a.broadcastCreatedTransferContactUpdate(transfer)
 	if a.WSHub == nil {
 		return
 	}
@@ -1275,6 +1296,7 @@ func (a *App) broadcastTransferCreated(transfer *models.AgentTransfer, contact *
 }
 
 func (a *App) broadcastTransferResumed(transfer *models.AgentTransfer) {
+	a.broadcastContactUpdate(transfer.OrganizationID, transfer.ContactID, "transfer")
 	if a.WSHub == nil {
 		return
 	}
@@ -1299,6 +1321,7 @@ func (a *App) broadcastTransferResumed(transfer *models.AgentTransfer) {
 }
 
 func (a *App) broadcastTransferAssigned(transfer *models.AgentTransfer) {
+	a.broadcastContactUpdate(transfer.OrganizationID, transfer.ContactID, "transfer")
 	if a.WSHub == nil {
 		return
 	}

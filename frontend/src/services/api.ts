@@ -1749,6 +1749,11 @@ export const contactsService = {
     page?: number;
     limit?: number;
     tags?: string;
+    // Inbox filters. unread is team-shared read state (incoming messages not
+    // yet read, or a manual "Mark as unread"); assigned=me also counts an
+    // active transfer to the current user.
+    unread?: "true";
+    assigned?: "me" | "unassigned";
   }, signal?: AbortSignal) => api.get("/contacts", { params, signal }),
   get: (id: string) => api.get(`/contacts/${id}`),
   create: (data: any) => api.post("/contacts", data),
@@ -1814,6 +1819,29 @@ export const contactsService = {
       { headers: { "X-Organization-ID": explicitOrganizationId } },
     );
   },
+  // Manual inbox actions share the mark-read endpoint. "read" resolves the
+  // latest incoming message on the server; "unread" sets a team-shared flag
+  // and never sends anything to WhatsApp. The automatic markRead body above is
+  // deliberately left unchanged.
+  // People a contact can be assigned to, for callers without users:read:
+  // the organization's members (organizations:read), membership-aware like
+  // the server's assignee check.
+  assignableMembers: (signal?: AbortSignal) =>
+    api.get<{
+      members: Array<{
+        user_id: string;
+        full_name?: string | null;
+        email?: string | null;
+        is_active?: boolean | null;
+        role_name?: string | null;
+      }>;
+      total: number;
+    }>("/organizations/members", { params: { page: 1, limit: 100 }, signal }),
+  markManualReadState: (id: string, mark: "read" | "unread") =>
+    api.post<{ status: string; cursor_synced: boolean; manual_unread: boolean }>(
+      `/contacts/${encodeURIComponent(id)}/mark-read`,
+      { mark },
+    ),
 };
 
 // Generic Import/Export Service
@@ -1932,6 +1960,9 @@ export const messagesService = {
         first_screen?: string;
         header?: string;
       };
+      // Re-send a stored message of this organization to contactId. The
+      // server derives type and content; type/content are ignored.
+      forward_of_message_id?: string;
     },
   ) => api.post(`/contacts/${contactId}/messages`, data),
   sendTemplate: (
