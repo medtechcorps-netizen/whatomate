@@ -510,6 +510,7 @@ test.describe('Logout during a token refresh', () => {
     playwright,
     baseURL,
   }) => {
+    const episode = await observeLogoutEpisode(context, baseURL)
     const newContext = () => playwright.request.newContext({ baseURL })
     await loginAsAdmin(page)
     const originalRefresh = await cookieValue(context, 'whm_refresh')
@@ -535,16 +536,19 @@ test.describe('Logout during a token refresh', () => {
     expect(await cookieValue(context, 'whm_refresh')).toBe(originalRefresh)
     expect(held.cookies().whm_refresh).toBeTruthy()
 
+    episode.markLogoutIntent()
     await logout(page)
     await expect(page).toHaveURL(/\/login/)
     // The logout aborts the other tab's refresh at once (its late Set-Cookie
     // can no longer land), so the revoke and the logout go right out, while
     // the refresh answer is still held.
     await expect.poll(() => order.includes('refresh failed'), { timeout: 5_000 }).toBe(true)
-    await expect
-      .poll(() => order.filter((kind) => kind === 'revoke' || kind === 'logout'), { timeout: 10_000 })
-      .toEqual(['revoke', 'logout'])
+    // Count logical completion: an extra clearing attempt needs positive
+    // interrupted/unacknowledged pending ownership evidence, never just a
+    // permissive duplicate count. Settle A completely before starting B.
+    await episode.settled(page)
 
+    episode.markBeforeB()
     await signInHere(page, TEST_USERS.manager)
     const sessionB = await cookieValue(context, 'whm_refresh')
     // The held answer comes too late: nothing of it is delivered.
@@ -562,6 +566,7 @@ test.describe('Logout during a token refresh', () => {
     expect(me.status()).toBe(200)
     expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
     await expectRefreshRejected(newContext, [originalRefresh, held.cookies().whm_refresh])
+    episode.assertNoLateClear()
   })
 
   test('an SSO sign-in started during a queued logout is never revoked by it', async ({
@@ -1826,4 +1831,224 @@ test.describe('Logout recovery response controls', () => {
       }
     })
   }
+})
+
+// A clearing episode is acknowledged by removal of the pending boolean,
+// not merely by receiving a 200. Only this original cross-tab case uses
+// these read-only witnesses; the paired controls above remain unchanged.
+type EpisodeEvent = {
+  seq: number
+  at_ms: number
+  action: string
+  tab?: number
+  epoch?: number
+  pending?: boolean
+  id?: number
+  kind?: 'revoke' | 'logout'
+  status?: number
+  failure?: string
+}
+const logoutEpisodes = new WeakMap<BrowserContext, Awaited<ReturnType<typeof observeLogoutEpisode>>>()
+
+async function observeLogoutEpisode(context: BrowserContext, baseURL: string | undefined) {
+  const origin = new URL(baseURL!).origin
+  const started = Date.now()
+  const events: EpisodeEvent[] = []
+  const errors: string[] = []
+  const pages = new Map<Page, number>()
+  const epochs = new Map<Page, number>()
+  const requests = new Map<import('@playwright/test').Request, EpisodeEvent>()
+  const detach: Array<() => void> = []
+  let bytes = 0
+  let overflow = false
+  let closed = false
+  let beforeB: number | undefined
+  let logoutIntent: number | undefined
+  const error = (code: string) => {
+    if (errors.length < 16) errors.push(code)
+    else overflow = true
+  }
+  const add = (event: Omit<EpisodeEvent, 'seq' | 'at_ms'>) => {
+    const value = { seq: events.length, at_ms: Date.now() - started, ...event }
+    const size = Buffer.byteLength(JSON.stringify(value))
+    if (closed) return
+    if (events.length >= 256 || bytes + size > 48 * 1024) { overflow = true; return }
+    bytes += size
+    events.push(value)
+  }
+  const register = (page: Page) => {
+    if (pages.has(page)) return
+    if (pages.size >= 8) { overflow = true; return }
+    pages.set(page, pages.size + 1)
+    const close = () => add({ action: 'page-close', tab: pages.get(page) })
+    page.on('close', close)
+    detach.push(() => page.off('close', close))
+  }
+  context.on('page', register)
+  detach.push(() => context.off('page', register))
+  for (const page of context.pages()) register(page)
+  await context.exposeBinding('__r3LogoutEpisodeWitness', ({ page, frame }, value: unknown) => {
+    if (closed || frame !== page.mainFrame()) return
+    if (!value || typeof value !== 'object') { error('witness-shape'); return }
+    const row = value as Record<string, unknown>
+    if (!['document', 'storage'].includes(String(row.action)) ||
+        typeof row.epoch !== 'number' || !Number.isFinite(row.epoch) ||
+        typeof row.pending !== 'boolean') { error('witness-fields'); return }
+    register(page)
+    if (row.action === 'document') epochs.set(page, row.epoch)
+    // A delayed message from an old document cannot establish ownership.
+    if (epochs.get(page) !== row.epoch) return
+    add({ action: row.action === 'document' ? 'document-pending' : 'storage-pending',
+      tab: pages.get(page), epoch: row.epoch, pending: row.pending })
+  })
+  await context.addInitScript(({ expectedOrigin }) => {
+    if (window !== window.top || location.origin !== expectedOrigin) return
+    const witness = (action: 'document' | 'storage') => {
+      const target = window as unknown as {
+        __r3LogoutEpisodeWitness: (value: { action: string; epoch: number; pending: boolean }) => Promise<void>
+      }
+      void target.__r3LogoutEpisodeWitness({
+        action, epoch: performance.timeOrigin,
+        pending: localStorage.getItem('whm_logout_pending') !== null,
+      })
+    }
+    witness('document')
+    window.addEventListener('storage', (event) => {
+      if (event.key === 'whm_logout_pending') witness('storage')
+    })
+  }, { expectedOrigin: origin })
+  const sent = (request: import('@playwright/test').Request) => {
+    let page: Page
+    try { page = request.frame().page() } catch { return }
+    register(page)
+    if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+      add({ action: 'document-navigation', tab: pages.get(page), epoch: epochs.get(page) })
+    }
+    const url = new URL(request.url())
+    if (url.origin !== origin || request.method() !== 'POST') return
+    let kind: 'revoke' | 'logout'
+    if (url.pathname === '/api/auth/logout') kind = 'logout'
+    else if (url.pathname === '/api/auth/refresh') {
+      try { if (request.postDataJSON()?.revoke !== true) return } catch { return }
+      kind = 'revoke'
+    } else return
+    if (requests.size >= 16) { overflow = true; return }
+    const entry: EpisodeEvent = { seq: events.length, at_ms: Date.now() - started,
+      action: 'request-start', id: requests.size + 1, kind,
+      tab: pages.get(page), epoch: epochs.get(page) }
+    requests.set(request, entry)
+    add(entry)
+  }
+  const response = (response: import('@playwright/test').Response) => {
+    const entry = requests.get(response.request())
+    if (entry) add({ action: 'response', id: entry.id, status: response.status() })
+  }
+  const finished = (request: import('@playwright/test').Request) => {
+    const entry = requests.get(request)
+    if (entry) add({ action: 'request-finished', id: entry.id })
+  }
+  const failed = (request: import('@playwright/test').Request) => {
+    const entry = requests.get(request)
+    if (entry) {
+      const failure = request.failure()?.errorText ?? ''
+      add({ action: 'request-failed', id: entry.id,
+        failure: /^net::ERR_[A-Z_]+$/.test(failure) ? failure : 'other-network-error' })
+    }
+  }
+  context.on('request', sent); context.on('response', response)
+  context.on('requestfinished', finished); context.on('requestfailed', failed)
+  detach.push(() => {
+    context.off('request', sent); context.off('response', response)
+    context.off('requestfinished', finished); context.off('requestfailed', failed)
+  })
+  const starts = (kind: 'revoke' | 'logout') => events.filter(e => e.action === 'request-start' && e.kind === kind)
+  const outcome = (id: number | undefined, action: string) => events.find(e => e.id === id && e.action === action)
+  const validate = () => {
+    expect(overflow).toBe(false)
+    expect(errors).toEqual([])
+    expect(logoutIntent).toBeDefined()
+    const revokes = starts('revoke')
+    const logouts = starts('logout')
+    expect(revokes).toHaveLength(1)
+    expect(logouts.length === 1 || logouts.length === 2).toBe(true)
+    const revoke = revokes[0]!
+    expect(revoke.seq).toBeGreaterThan(logoutIntent!)
+    expect(outcome(revoke.id, 'response')?.status).toBe(200)
+    expect(outcome(revoke.id, 'request-finished')).toBeDefined()
+    expect(outcome(revoke.id, 'response')!.seq).toBeLessThan(logouts[0]!.seq)
+    const final = logouts.at(-1)!
+    expect(typeof final.epoch).toBe('number')
+    expect(outcome(final.id, 'response')?.status).toBe(200)
+    expect(outcome(final.id, 'request-finished')).toBeDefined()
+    expect(outcome(final.id, 'request-failed')).toBeUndefined()
+    if (logouts.length === 2) {
+      const first = logouts[0]!
+      const retry = logouts[1]!
+      expect(typeof first.epoch).toBe('number')
+      expect(typeof retry.epoch).toBe('number')
+      // The recovering document can belong to another tab already alive.
+      const pendingWitness = events.filter(e => ['document-pending', 'storage-pending'].includes(e.action) &&
+        e.tab === retry.tab && e.epoch === retry.epoch && e.seq > logoutIntent! && e.seq < retry.seq).at(-1)
+      expect(pendingWitness?.pending).toBe(true)
+      const interrupted = outcome(first.id, 'request-failed')
+      const replied = outcome(first.id, 'response')
+      const replaced = events.some(e => e.action === 'document-navigation' && e.tab === first.tab &&
+        e.epoch === first.epoch && e.seq > first.seq && e.seq < retry.seq)
+      expect(Boolean(interrupted && interrupted.seq < retry.seq) ||
+        Boolean(replied?.status === 200 && replied.seq < retry.seq && replaced &&
+          pendingWitness?.action === 'document-pending' && pendingWitness.seq > replied.seq)).toBe(true)
+      // An explicit acknowledgment anywhere in the shared context forbids
+      // another clearing attempt. Missing causal witnesses never pass.
+      expect(events.some(e => ['document-pending', 'storage-pending', 'settlement-pending'].includes(e.action) &&
+        e.pending === false && e.seq > first.seq && e.seq < retry.seq)).toBe(false)
+      expect(events.some(e => e.id === first.id && ['response', 'request-finished'].includes(e.action) && e.seq > retry.seq)).toBe(false)
+    }
+  }
+  const api = {
+    markLogoutIntent() { logoutIntent = events.length; add({ action: 'logout-intent' }) },
+    async settled(page: Page) {
+      await expect.poll(async () => {
+        try {
+          const state = await page.evaluate(() => ({
+            epoch: performance.timeOrigin, pending: localStorage.getItem('whm_logout_pending') !== null,
+          }))
+          add({ action: 'settlement-pending', tab: pages.get(page), ...state })
+          const last = starts('logout').at(-1)
+          return !state.pending && !!last && outcome(last.id, 'response')?.status === 200 &&
+            !!outcome(last.id, 'request-finished')
+        } catch (error) {
+          if (error instanceof Error && /Execution context was destroyed, most likely because of a navigation/.test(error.message)) return false
+          throw error
+        }
+      }, { timeout: 10_000 }).toBe(true)
+      validate()
+    },
+    markBeforeB() { validate(); beforeB = events.length; add({ action: 'B-intent' }) },
+    assertNoLateClear() {
+      expect(beforeB).toBeDefined()
+      expect(events.slice(beforeB!).some(e => ['request-start', 'response', 'request-finished'].includes(e.action))).toBe(false)
+      validate()
+    },
+    finish() {
+      closed = true
+      for (const fn of detach) fn()
+      return { schema_version: 1, events, errors: errors.slice(0, 16), overflow: overflow || errors.length > 16,
+        before_b_observed: beforeB !== undefined }
+    },
+  }
+  logoutEpisodes.set(context, api)
+  return api
+}
+
+test.afterEach(async ({ context }, testInfo) => {
+  const episode = logoutEpisodes.get(context)
+  if (!episode) return
+  logoutEpisodes.delete(context)
+  const observation = episode.finish()
+  await testInfo.attach('auth-clearing-episode', {
+    contentType: 'application/json',
+    body: Buffer.from(JSON.stringify({ test_title: testInfo.title, ...observation })),
+  })
+  expect(observation.overflow).toBe(false)
+  expect(observation.errors).toEqual([])
 })
