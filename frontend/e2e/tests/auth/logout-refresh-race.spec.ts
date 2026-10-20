@@ -728,6 +728,15 @@ test.describe('Logout during a token refresh', () => {
     await startGoogleSso(page)
     await page.waitForURL(/__mock_idp/)
 
+    // Proactive refresh runs only in a visible, authenticated app tab.
+    // Returning focus is a real browser action; the event below does not
+    // override document visibility or wait for the application to mount.
+    await other.bringToFront()
+    const authenticatedNavigation = other.getByRole('navigation', { name: 'Main navigation', exact: true })
+    await expect(authenticatedNavigation).toBeVisible()
+    await expect(authenticatedNavigation.getByRole('button').filter({ hasText: TEST_USERS.admin.email })).toBeVisible()
+    await expect.poll(() => other.evaluate(() => document.visibilityState)).toBe('visible')
+
     // Meanwhile the open tab's session needs a refresh: nothing holds it back.
     await startProactiveRefresh(other)
     await expect.poll(() => refreshes()).toBe(1)
