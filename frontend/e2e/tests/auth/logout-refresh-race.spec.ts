@@ -1895,7 +1895,13 @@ async function observeLogoutEpisode(context: BrowserContext, baseURL: string | u
         typeof row.epoch !== 'number' || !Number.isFinite(row.epoch) ||
         typeof row.pending !== 'boolean') { error('witness-fields'); return }
     register(page)
-    if (row.action === 'document') epochs.set(page, row.epoch)
+    if (row.action === 'document') {
+      // Only a newer document may advance ownership. An equal callback is
+      // redundant, and an older one cannot overwrite the current witness.
+      const currentEpoch = epochs.get(page)
+      if (currentEpoch !== undefined && row.epoch <= currentEpoch) return
+      epochs.set(page, row.epoch)
+    }
     // A delayed message from an old document cannot establish ownership.
     if (epochs.get(page) !== row.epoch) return
     add({ action: row.action === 'document' ? 'document-pending' : 'storage-pending',
