@@ -175,11 +175,22 @@ func (a *App) UpdateConversationNote(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "content is required", nil, "")
 	}
 
+	previousContent := note.Content
 	note.Content = req.Content
 	if err := a.DB.Save(note).Error; err != nil {
 		a.Log.Error("Failed to update conversation note", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError,
 			"Failed to update note", nil, "")
+	}
+
+	// Audit the edit without copying note text (it may hold patient details
+	// that a contact erasure must not leave behind in the audit trail).
+	if previousContent != note.Content {
+		a.logAudit(orgID, userID, "conversation_note", note.ID, models.AuditActionUpdated,
+			map[string]any{"contact_id": note.ContactID, "content_length": len(previousContent)},
+			map[string]any{"contact_id": note.ContactID, "content_length": len(note.Content)},
+			map[string]any{"field": "content", "old_value": "********", "new_value": "********"},
+		)
 	}
 
 	// Load the creator relation for the response
@@ -234,6 +245,11 @@ func (a *App) DeleteConversationNote(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError,
 			"Failed to delete note", nil, "")
 	}
+
+	// As for edits, the audit entry records the deletion but not the text.
+	a.logAudit(orgID, userID, "conversation_note", noteID, models.AuditActionDeleted,
+		map[string]any{"contact_id": contactID, "content_length": len(note.Content)}, nil,
+	)
 
 	// Broadcast via WebSocket
 	if a.WSHub != nil {

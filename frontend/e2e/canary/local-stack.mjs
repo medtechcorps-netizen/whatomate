@@ -2,7 +2,7 @@
 // production configuration. All generated credentials stay in RUNNER_TEMP.
 import { randomBytes } from 'node:crypto'
 import { copyFileSync, mkdirSync, mkdtempSync, openSync, readFileSync } from 'node:fs'
-import { isAbsolute, join, resolve } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
@@ -158,7 +158,7 @@ async function start() {
     launch('rereply', ['server', '-config', join(directory, 'server.toml')], {})]
   write('processes.json', JSON.stringify(pids))
   for (let attempt = 0; attempt < 120; attempt++) {
-    try { if ((await fetch(values.origin + '/ready', { signal: AbortSignal.timeout(1500), redirect: 'error' })).ok) { console.log('Local RLS backend and Graph stub started'); return } } catch {}
+    try { if ((await fetch(values.origin + '/ready', { signal: AbortSignal.timeout(1500), redirect: 'error' })).ok) { console.log('Local RLS backend and Graph stub started'); return } } catch { /* Retry within the existing bounded readiness loop. */ }
     await new Promise(resolve => setTimeout(resolve, 1000))
   }
   throw new Error('Local backend did not become ready; inspect private local logs')

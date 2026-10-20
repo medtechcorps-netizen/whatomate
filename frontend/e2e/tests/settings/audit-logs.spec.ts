@@ -38,8 +38,18 @@ async function updateWebhookViaUI(page: Page, name: string, newUrl: string): Pro
 
   const urlInput = page.getByPlaceholder('https://example.com/webhook')
   await urlInput.fill(newUrl)
-  await page.waitForTimeout(200)
-  await page.getByRole('button', { name: /^(Save|Update)$/i }).first().click()
+  const webhookId = new URL(page.url()).pathname.split('/').pop()
+  expect(webhookId).toMatch(/^[a-f0-9-]{36}$/)
+  // networkidle may already be satisfied before Save starts its request.
+  // The update response is sent only after this webhook's audit insert.
+  const [updateResponse] = await Promise.all([
+    page.waitForResponse(response =>
+      new URL(response.url()).pathname === `/api/webhooks/${webhookId}` &&
+      response.request().method() === 'PUT'),
+    page.getByRole('button', { name: /^(Save|Update)$/i }).first().click(),
+  ])
+  expect(updateResponse.ok()).toBe(true)
+  expect(await updateResponse.finished()).toBeNull()
   await page.waitForLoadState('networkidle')
 }
 

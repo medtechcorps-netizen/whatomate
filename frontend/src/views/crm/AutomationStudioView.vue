@@ -3,6 +3,7 @@ import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, ref, watch } f
 import { useRoute, useRouter } from 'vue-router'
 import {
   MarkerType,
+  useNodesInitialized,
   useVueFlow,
   type Connection,
   type EdgeMouseEvent,
@@ -165,12 +166,38 @@ const {
   setEdges,
   onConnect,
   fitView,
+  viewportHelper,
+  viewportRef,
 } = useVueFlow({
   defaultEdgeOptions: {
     type: 'smoothstep',
     animated: false,
     markerEnd: MarkerType.ArrowClosed,
   },
+})
+
+const nodesInitialized = useNodesInitialized()
+const graphGeneration = ref(0)
+const pendingInitialFit = ref<number | null>(null)
+const canvasElement = ref<HTMLElement | null>(null)
+let fittingGeneration: number | null = null
+let disposed = false
+
+function isCurrentGraphLoad(generation: number) {
+  return !disposed && generation === graphGeneration.value
+}
+
+function cancelInitialFit() {
+  pendingInitialFit.value = null
+}
+
+const readyForInitialFit = computed(() => {
+  const generation = pendingInitialFit.value
+  const viewport = viewportRef.value
+  return generation !== null && isCurrentGraphLoad(generation)
+    && !loading.value && !loadError.value && activeTab.value === 'builder'
+    && nodesInitialized.value && viewportHelper.value.viewportInitialized
+    && !!viewport?.isConnected && !!canvasElement.value?.contains(viewport)
 })
 
 const selectedNode = computed<PolicyNode | null>(() => {
@@ -321,7 +348,23 @@ function fitCanvas() {
   return fitView({ padding: 0.22 })
 }
 
+watch(readyForInitialFit, async (ready) => {
+  const generation = pendingInitialFit.value
+  if (!ready || generation === null || fittingGeneration === generation) return
+  fittingGeneration = generation
+  try {
+    const fitted = await fitCanvas()
+    if (fitted && isCurrentGraphLoad(generation) && pendingInitialFit.value === generation) {
+      pendingInitialFit.value = null
+    }
+  } finally {
+    if (fittingGeneration === generation) fittingGeneration = null
+  }
+}, { flush: 'post' })
+
 function loadGraph(graph: AutomationPolicyGraph) {
+  // Same-ID reloads must not reuse dimensions measured for the previous canvas.
+  setNodes([])
   setNodes(
     (graph?.nodes ?? []).map((node) => ({
       id: node.id,
@@ -361,7 +404,7 @@ function loadGraph(graph: AutomationPolicyGraph) {
   )
   selectedNodeId.value = null
   selectedEdgeId.value = null
-  nextTick(() => window.setTimeout(fitCanvas, 80))
+  pendingInitialFit.value = graphGeneration.value
 }
 
 function graphPayload(): AutomationPolicyGraph {
@@ -428,6 +471,8 @@ async function loadCatalog() {
 }
 
 async function loadPolicy() {
+  const generation = ++graphGeneration.value
+  cancelInitialFit()
   loading.value = true
   loadError.value = ''
   initialized.value = false
@@ -435,11 +480,15 @@ async function loadPolicy() {
   executions.value = []
   runHistoryDenied.value = false
   try {
+    // Retire the previous keyed canvas and its observer before replacing the graph.
+    await nextTick()
+    if (!isCurrentGraphLoad(generation)) return
     if (isNew.value) {
       const sourceId = String(route.query.source ?? '')
       const template = getAutomationTemplate(route.query.template)
       if (sourceId) {
         const response = await automationPolicyService.get(sourceId)
+        if (!isCurrentGraphLoad(generation)) return
         const source = unwrapPolicy(response)
         name.value = `Copy of ${source.name}`
         description.value = source.description ?? ''
@@ -456,6 +505,7 @@ async function loadPolicy() {
       policy.value = null
     } else {
       const response = await automationPolicyService.get(routePolicyId.value)
+      if (!isCurrentGraphLoad(generation)) return
       policy.value = unwrapPolicy(response)
       name.value = policy.value.name
       description.value = policy.value.description ?? ''
@@ -465,11 +515,14 @@ async function loadPolicy() {
     previewResult.value = null
     previewFingerprint.value = ''
     await nextTick()
+    if (!isCurrentGraphLoad(generation)) return
     initialized.value = true
   } catch (error) {
-    loadError.value = getErrorMessage(error, 'The automation policy could not be loaded.')
+    if (isCurrentGraphLoad(generation)) {
+      loadError.value = getErrorMessage(error, 'The automation policy could not be loaded.')
+    }
   } finally {
-    loading.value = false
+    if (isCurrentGraphLoad(generation)) loading.value = false
   }
 }
 
@@ -1147,6 +1200,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  disposed = true
+  cancelInitialFit()
   window.clearTimeout(resizeTimer)
   window.removeEventListener('resize', refitAfterResize)
 })
@@ -1365,7 +1420,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <div v-else-if="activeTab === 'builder'" class="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] xl:grid-cols-[232px_minmax(0,1fr)_342px] xl:grid-rows-1">
+    <div v-else-if="activeTab === 'builder'" class="grid min-h-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] xl:grid-cols-[232px_minmax(0,1fr)_342px] xl:grid-rows-1">
       <aside data-testid="automation-palette" class="border-b border-white/[0.08] bg-[#0c0f10] p-3 light:border-gray-200 light:bg-white xl:border-b-0 xl:border-r xl:p-4" aria-label="Automation step palette">
         <div class="hidden xl:block">
           <p class="text-[9px] font-bold uppercase tracking-[0.22em] text-white/30 light:text-gray-500">Step palette</p>
@@ -1419,7 +1474,7 @@ onBeforeUnmount(() => {
         </div>
       </aside>
 
-      <section data-testid="automation-canvas" class="relative min-h-0 overflow-hidden bg-[#090c0e] light:bg-[#f0f3ef]" aria-label="Automation policy canvas">
+      <section ref="canvasElement" data-testid="automation-canvas" class="relative min-h-0 overflow-hidden bg-[#090c0e] light:bg-[#f0f3ef]" aria-label="Automation policy canvas">
         <div class="absolute left-4 top-4 z-10 flex items-center gap-2 rounded-xl border border-white/[0.08] bg-[#0b0e10]/90 px-3 py-2 text-[10px] text-white/35 shadow-xl backdrop-blur light:border-gray-200 light:bg-white/90 light:text-gray-600">
           <Sparkles class="h-3.5 w-3.5 text-lime-200 light:text-lime-800" />
           {{ readOnly ? 'View-only policy graph' : 'Drag steps · connect left to right' }}
@@ -1435,6 +1490,7 @@ onBeforeUnmount(() => {
           Remove connection
         </Button>
         <FlowCanvas
+          :key="graphGeneration"
           :nodes="nodes"
           :edges="edges"
           :node-types="nodeTypes"
@@ -1444,6 +1500,9 @@ onBeforeUnmount(() => {
           :delete-enabled="!readOnly"
           edge-type="smoothstep"
           controls-position="bottom-left"
+          @pointerdown.capture="cancelInitialFit"
+          @wheel.capture="cancelInitialFit"
+          @keydown.capture="cancelInitialFit"
           @node-click="onNodeClick"
           @pane-click="onPaneClick"
           @edge-click="onEdgeClick"

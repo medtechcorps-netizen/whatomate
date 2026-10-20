@@ -136,7 +136,10 @@
     "ssoMissingTokens": "Callback SSO inválido. Faltan tokens.",
     "ssoLoginSuccess": "Inicio de sesión SSO exitoso",
     "ssoLoginFailed": "Error al completar el inicio de sesión SSO",
-    "returnToLogin": "Volver al inicio de sesión"
+    "ssoLinkUsed": "Este enlace de inicio de sesión ya se usó o ha caducado. Vuelva a iniciar sesión.",
+    "ssoInterrupted": "El inicio de sesión se interrumpió antes de terminar. Vuelva a iniciar sesión.",
+    "returnToLogin": "Volver al inicio de sesión",
+    "accountMayExist": "Es posible que su cuenta se haya creado. Inicie sesión."
   },
   "resources": {
     "account": "cuenta",
@@ -1099,7 +1102,8 @@
     "notFound": "El recurso solicitado no fue encontrado.",
     "validation": "Verifique sus datos e intente de nuevo.",
     "serverError": "Error del servidor. Por favor intente de nuevo más tarde.",
-    "timeout": "La solicitud ha expirado. Por favor intente de nuevo."
+    "timeout": "La solicitud ha expirado. Por favor intente de nuevo.",
+    "unsupportedBrowser": "Este navegador no puede mantener las sesiones seguras entre pestañas. Actualice su navegador (o use HTTPS)."
   },
   "validation": {
     "required": "Este campo es obligatorio",

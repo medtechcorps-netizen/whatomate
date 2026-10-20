@@ -1,25 +1,66 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
-import { api } from '@/services/api'
+import {
+  exchangeSsoCode,
+  keepSsoCode,
+  ssoExchangeInterrupted,
+  unsentSsoCode,
+  SESSION_BUSY_CODE,
+  SESSION_UNSUPPORTED_CODE,
+} from '@/services/api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Loader2, AlertCircle, CheckCircle } from 'lucide-vue-next'
 import { toast } from 'vue-sonner'
 
 const { t } = useI18n()
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
 
 const status = ref<'loading' | 'success' | 'error'>('loading')
 const errorMessage = ref('')
 
+const homeFor = (user: { role?: { name?: string } } | null | undefined) =>
+  user?.role?.name === 'agent' ? '/analytics/agents' : '/'
+
 onMounted(async () => {
+  // The SSO redirect set no cookie: it handed over a one-time code, bound to
+  // this browser. Take it off the URL (it is single-use; kept in this tab
+  // until its exchange is sent, so a reload while it waits retries it), then
+  // exchange it for the session, ordered like a password sign-in.
+  const fromUrl = typeof route.query.code === 'string' ? route.query.code : ''
+  if (fromUrl) {
+    keepSsoCode(fromUrl)
+    // Off the URL before the exchange is sent (history, Referer).
+    await router.replace({ query: { ...route.query, code: undefined } }).catch(() => undefined)
+  }
+  const code = fromUrl || unsentSsoCode()
+  if (!code) {
+    // A reload while the exchange was out: its answer was never seen here,
+    // so neither the session from before nor a "used link" can be assumed.
+    if (ssoExchangeInterrupted()) {
+      status.value = 'error'
+      errorMessage.value = t('auth.ssoInterrupted')
+      return
+    }
+    // Back after a sign-in, or a reload once it finished: a live session
+    // goes on into the app; otherwise the link is spent.
+    if (authStore.isAuthenticated || authStore.restoreSession()) {
+      void router.replace(homeFor(authStore.user))
+      return
+    }
+    status.value = 'error'
+    errorMessage.value = t('auth.ssoLinkUsed')
+    return
+  }
   try {
-    // Cookies were set by the SSO redirect — call /me to get the user object
-    const response = await api.get('/me')
-    const user = response.data.data
+    // The answer is a sign-in's ({expires_in, user}): its user is applied at
+    // once, as a password sign-in does, with no request in between.
+    const response = await exchangeSsoCode(code)
+    const user = response.data.data.user
 
     // Set auth in store (only user — tokens are in httpOnly cookies)
     authStore.setAuth({ user })
@@ -29,15 +70,22 @@ onMounted(async () => {
 
     // Redirect based on role
     setTimeout(() => {
-      if (user.role?.name === 'agent') {
-        router.push('/analytics/agents')
-      } else {
-        router.push('/')
-      }
+      router.push(homeFor(user))
     }, 1000)
   } catch (error: any) {
     status.value = 'error'
-    errorMessage.value = error.response?.data?.message || t('auth.ssoLoginFailed')
+    if (error?.code === SESSION_UNSUPPORTED_CODE) {
+      errorMessage.value = t('errors.unsupportedBrowser')
+    } else if (
+      error?.code === SESSION_BUSY_CODE ||
+      error?.code === 'ERR_CANCELED' ||
+      error?.code === 'ECONNABORTED' ||
+      error?.code === 'ETIMEDOUT'
+    ) {
+      errorMessage.value = t('errors.timeout')
+    } else {
+      errorMessage.value = error.response?.data?.message || t('auth.ssoLoginFailed')
+    }
   }
 })
 </script>

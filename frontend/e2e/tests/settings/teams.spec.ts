@@ -1,9 +1,21 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type APIRequestContext } from '@playwright/test'
 import { TablePage } from '../../pages'
-import { loginAsAdmin, createTeamFixture, navigateToFirstItem, expectMetadataVisible, expectActivityLogVisible, expectDeleteFromForm, ApiHelper } from '../../helpers'
+import { loginAsAdmin, createTeamFixture, expectActivityLogVisible, ApiHelper } from '../../helpers'
 import { createTestScope, SUPER_ADMIN } from '../../framework'
 
 const scope = createTestScope('teams')
+
+async function seedAdminTeam(request: APIRequestContext, suffix: string) {
+  const api = new ApiHelper(request)
+  await api.loginAsAdmin()
+  const name = scope.name(suffix)
+  const response = await api.post('/api/teams', { name, description: 'owned E2E team' })
+  expect(response.ok(), `seed team: ${await response.text()}`).toBe(true)
+  const team = (await response.json()).data.team
+  expect(team.id).toMatch(/^[a-f0-9-]{36}$/)
+  expect(team.name).toBe(name)
+  return { api, team }
+}
 
 test.describe('Teams - List View', () => {
   let tablePage: TablePage
@@ -36,25 +48,53 @@ test.describe('Teams - List View', () => {
     await expect(page.locator('input').first()).toBeVisible()
   })
 
-  test('should load detail page from list', async ({ page }) => {
-    const href = await navigateToFirstItem(page)
-    if (href) {
-      expect(page.url()).toMatch(/\/settings\/teams\/[a-f0-9-]+/)
-      await expect(page.getByText('Details')).toBeVisible()
-    }
+  test('should load detail page from list', async ({ page, request }) => {
+    const { team } = await seedAdminTeam(request, 'list-detail')
+    await page.goto('/settings/teams')
+    const [searchResponse] = await Promise.all([
+      page.waitForResponse(response => {
+        const url = new URL(response.url())
+        return response.request().method() === 'GET' && url.pathname === '/api/teams' &&
+          url.searchParams.get('search') === team.name && url.searchParams.get('page') === '1'
+      }),
+      tablePage.searchInput.fill(team.name),
+    ])
+    expect(searchResponse.ok()).toBe(true)
+    const link = page.locator(`tbody a[href="/settings/teams/${team.id}"]`)
+      .and(page.getByRole('link', { name: team.name, exact: true }))
+    await expect(link).toBeVisible()
+    await link.click()
+    await expect(page).toHaveURL(new RegExp(`/settings/teams/${team.id}$`))
+    await expect(page.getByRole('heading', { name: 'Details', exact: true })).toBeVisible()
   })
 
-  test('should delete team from list', async ({ page }) => {
-    const row = page.locator('tbody tr').first()
-    if (await row.isVisible({ timeout: 3000 }).catch(() => false)) {
-      const deleteButton = row.locator('button').filter({ has: page.locator('svg.text-destructive') })
-      test.skip(!(await deleteButton.isVisible({ timeout: 1000 }).catch(() => false)), 'No deletable team available')
-      await deleteButton.click()
-      const dialog = page.locator('[role="alertdialog"]')
-      await expect(dialog).toBeVisible({ timeout: 3000 })
-      // Cancel to not actually delete
-      await dialog.getByRole('button', { name: /Cancel/i }).click()
-    }
+  test('should delete team from list', async ({ page, request }) => {
+    const { api, team } = await seedAdminTeam(request, 'delete-list')
+    await page.goto('/settings/teams')
+    const [searchResponse] = await Promise.all([
+      page.waitForResponse(response => {
+        const url = new URL(response.url())
+        return response.request().method() === 'GET' && url.pathname === '/api/teams' &&
+          url.searchParams.get('search') === team.name && url.searchParams.get('page') === '1'
+      }),
+      tablePage.searchInput.fill(team.name),
+    ])
+    expect(searchResponse.ok()).toBe(true)
+    const row = page.locator('tbody tr').filter({
+      has: page.locator(`a[href="/settings/teams/${team.id}"]`),
+    })
+    await expect(row).toBeVisible()
+    const deleteButton = row.locator('button').filter({ has: page.locator('svg.text-destructive') })
+    await expect(deleteButton).toBeVisible()
+    await deleteButton.click()
+    const dialog = page.locator('[role="alertdialog"]')
+    await expect(dialog).toBeVisible({ timeout: 3000 })
+    await expect(dialog.getByRole('heading', { name: 'Delete Team', exact: true })).toBeVisible()
+    await expect(dialog).toContainText('Active transfers will remain but will no longer be associated with this team.')
+    // This case exercises cancellation; the detail case below deletes its own team.
+    await dialog.getByRole('button', { name: /Cancel/i }).click()
+    await expect(dialog).not.toBeVisible()
+    expect((await api.get(`/api/teams/${team.id}`)).ok()).toBe(true)
   })
 })
 
@@ -101,52 +141,57 @@ test.describe('Teams - Detail Page CRUD', () => {
     }
   })
 
-  test('should edit existing team', async ({ page }) => {
-    await page.goto('/settings/teams')
+  test('should edit existing team', async ({ page, request }) => {
+    const { team } = await seedAdminTeam(request, 'edit')
+    await page.goto(`/settings/teams/${team.id}`)
     await page.waitForLoadState('networkidle')
-
-    const href = await navigateToFirstItem(page)
-    if (!href) { test.skip(true, 'No teams exist'); return }
-
     const input = page.locator('input').first()
-    if (await input.isDisabled()) { test.skip(true, 'No write permission'); return }
-
-    const original = await input.inputValue()
-    await input.fill(original + ' edited')
-    await page.waitForTimeout(300)
-
-    const saveBtn = page.getByRole('button', { name: /Save/i })
-    if (await saveBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await saveBtn.click({ force: true })
-      await page.waitForTimeout(2000)
-
-      // Revert
-      await input.fill(original)
-      await page.waitForTimeout(300)
-      const revertBtn = page.getByRole('button', { name: /Save/i })
-      if (await revertBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await revertBtn.click({ force: true })
-      }
+    await expect(input).toBeEnabled()
+    await expect(input).toHaveValue(team.name)
+    for (const name of [team.name + ' edited', team.name]) {
+      await input.fill(name)
+      const saveBtn = page.getByRole('button', { name: /Save/i })
+      await expect(saveBtn).toBeVisible()
+      const [response] = await Promise.all([
+        page.waitForResponse(response =>
+          new URL(response.url()).pathname === `/api/teams/${team.id}` &&
+          response.request().method() === 'PUT'),
+        saveBtn.click(),
+      ])
+      expect(response.ok()).toBe(true)
+      expect(await response.finished()).toBeNull()
+      await page.reload()
+      await expect(input).toHaveValue(name)
     }
   })
 
-  test('should delete from detail page', async ({ page }) => {
-    await page.goto('/settings/teams')
+  test('should delete from detail page', async ({ page, request }) => {
+    const { api, team } = await seedAdminTeam(request, 'delete-detail')
+    await page.goto(`/settings/teams/${team.id}`)
     await page.waitForLoadState('networkidle')
-
-    const href = await navigateToFirstItem(page)
-    if (!href) { test.skip(true, 'No teams exist'); return }
-
-    await expectDeleteFromForm(page, '/settings/teams')
+    await expect(page.locator('input').first()).toHaveValue(team.name)
+    const deleteButton = page.getByRole('button', { name: /Delete/i }).first()
+    await expect(deleteButton).toBeVisible()
+    await deleteButton.click()
+    const dialog = page.locator('[role="alertdialog"]')
+    await expect(dialog).toBeVisible()
+    const [response] = await Promise.all([
+      page.waitForResponse(response =>
+        new URL(response.url()).pathname === `/api/teams/${team.id}` &&
+        response.request().method() === 'DELETE'),
+      dialog.getByRole('button', { name: /Delete/i }).click(),
+    ])
+    expect(response.ok()).toBe(true)
+    await expect(page).toHaveURL(/\/settings\/teams$/)
+    expect((await api.get(`/api/teams/${team.id}`)).status()).toBe(404)
   })
 
-  test('should show metadata', async ({ page }) => {
-    await page.goto('/settings/teams')
+  test('should show metadata', async ({ page, request }) => {
+    const { team } = await seedAdminTeam(request, 'metadata')
+    await page.goto(`/settings/teams/${team.id}`)
     await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expectMetadataVisible(page)
-    }
+    await expect(page.locator('input').first()).toHaveValue(team.name)
+    await expect(page.getByRole('heading', { name: 'Metadata', exact: true })).toBeVisible({ timeout: 15000 })
   })
 
   test('should show activity log', async ({ page, request }) => {
@@ -203,13 +248,12 @@ test.describe('Teams - Table Sorting', () => {
 })
 
 test.describe('Team Members', () => {
-  test('should show members section on detail page', async ({ page }) => {
+  test('should show members section on detail page', async ({ page, request }) => {
     await loginAsAdmin(page)
-    await page.goto('/settings/teams')
+    const { team } = await seedAdminTeam(request, 'members')
+    await page.goto(`/settings/teams/${team.id}`)
     await page.waitForLoadState('networkidle')
-
-    if (await navigateToFirstItem(page)) {
-      await expect(page.getByRole('heading', { name: /Members/ })).toBeVisible({ timeout: 5000 })
-    }
+    await expect(page.locator('input').first()).toHaveValue(team.name)
+    await expect(page.getByRole('heading', { name: /Members/ })).toBeVisible({ timeout: 5000 })
   })
 })

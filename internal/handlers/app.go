@@ -315,6 +315,11 @@ func (a *App) ReadyCheck(r *fastglue.Request) error {
 	})
 }
 
+// isRedisNil tells a missing key apart from a Redis failure.
+func isRedisNil(err error) bool {
+	return errors.Is(err, redis.Nil)
+}
+
 // GetEmbeddedSignupConfig returns public configuration values for the embedded signup flow
 func (a *App) GetEmbeddedSignupConfig(r *fastglue.Request) error {
 	type EmbeddedSignupConfig struct {

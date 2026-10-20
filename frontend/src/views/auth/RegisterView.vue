@@ -3,6 +3,12 @@ import { ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
+import {
+  sentBeforeSessionChange,
+  sessionsSupported,
+  SESSION_BUSY_CODE,
+  SESSION_UNSUPPORTED_CODE,
+} from '@/services/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -44,6 +50,12 @@ const handleRegister = async () => {
     toast.error(t('auth.passwordTooShort'))
     return
   }
+  // Without Web Locks no registration is sent: say so before a sign-in
+  // attempt clears the stored identity.
+  if (!sessionsSupported()) {
+    toast.error(t('errors.unsupportedBrowser'))
+    return
+  }
 
   isLoading.value = true
 
@@ -57,7 +69,29 @@ const handleRegister = async () => {
     toast.success(t('auth.registrationSuccess'))
     router.push('/')
   } catch (error: any) {
-    const message = error.response?.data?.message || t('auth.registrationFailed')
+    if (sentBeforeSessionChange(error)) {
+      // The server got the registration (the invitation is used, the account
+      // exists), but a session change in another tab undid what it issued
+      // here: sign in with the new account instead.
+      toast.info(t('auth.accountMayExist'))
+      router.push({ path: '/login', query: { email: email.value } })
+      return
+    }
+    let message: string
+    if (error?.code === SESSION_UNSUPPORTED_CODE) {
+      message = t('errors.unsupportedBrowser')
+    } else if (
+      // Refused while an earlier session change holds the lock, or no answer
+      // in time: try again, not a failed registration.
+      error?.code === SESSION_BUSY_CODE ||
+      error?.code === 'ERR_CANCELED' ||
+      error?.code === 'ECONNABORTED' ||
+      error?.code === 'ETIMEDOUT'
+    ) {
+      message = t('errors.timeout')
+    } else {
+      message = error.response?.data?.message || t('auth.registrationFailed')
+    }
     toast.error(message)
   } finally {
     isLoading.value = false

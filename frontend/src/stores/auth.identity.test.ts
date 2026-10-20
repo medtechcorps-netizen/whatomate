@@ -115,6 +115,23 @@ describe('auth store browser identity isolation', () => {
     expect(store.user?.full_name).toBe(user.full_name)
   })
 
+  it('loads entitlements again once the session reconnects after an outage', async () => {
+    localStorage.setItem('user', JSON.stringify(user))
+    const { useAuthStore } = await import('./auth')
+    const store = useAuthStore()
+    expect(store.restoreSession()).toBe(true)
+    mocks.get.mockRejectedValueOnce(new Error('outage'))
+    await store.ensureProductEntitlements()
+    expect(store.hasProductEntitlement('omnichannel.enabled')).toBe(false)
+
+    mocks.get.mockResolvedValueOnce({
+      data: { data: { mode: 'licensed', entitlements: { 'omnichannel.enabled': true } } },
+    })
+    window.dispatchEvent(new CustomEvent('whm:auth-session', { detail: { state: 'reconnected' } }))
+    await vi.waitFor(() => expect(store.hasProductEntitlement('omnichannel.enabled')).toBe(true))
+    expect(mocks.get).toHaveBeenCalledTimes(2)
+  })
+
   it('keeps new-identity entitlements when an old request resolves last', async () => {
     const oldResponse = deferred<{ data: { data: Record<string, unknown> } }>()
     const newResponse = deferred<{ data: { data: Record<string, unknown> } }>()

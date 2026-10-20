@@ -174,7 +174,21 @@
     "ssoMissingTokens": "Invalid SSO callback. Missing tokens.",
     "ssoLoginSuccess": "SSO login successful",
     "ssoLoginFailed": "Failed to complete SSO login",
-    "returnToLogin": "Return to login"
+    "ssoLinkUsed": "This sign-in link was already used or has expired. Please start the sign-in again.",
+    "ssoInterrupted": "The sign-in was interrupted before it finished. Please start the sign-in again.",
+    "returnToLogin": "Return to login",
+    "accountMayExist": "Your account may have been created. Please sign in."
+  },
+  "sessionSecurity": {
+    "reconnecting": "Reconnecting…",
+    "reconnectFailed": "Can't reach the server right now",
+    "reconnectFailedDesc": "You're still signed in. We'll try again with your next action."
+  },
+  "conversationNotes": {
+    "editNote": "Edit note",
+    "deleteNote": "Delete note",
+    "edited": "(edited)",
+    "editedAt": "Edited {time}"
   },
   "resources": {
     "account": "account",
@@ -348,6 +362,14 @@
     "reply": "Reply",
     "replyingTo": "Replying to",
     "cancelReply": "Cancel reply",
+    "messageActions": {
+      "react": "React",
+      "reactWith": "React with {emoji}",
+      "copyText": "Copy text",
+      "copied": "Message text copied",
+      "copyFailed": "Could not copy the message text",
+      "originalNotLoaded": "The original message isn't loaded. Scroll up to load older messages."
+    },
     "selectConversation": "Select a conversation",
     "chooseContact": "Choose a contact to start chatting",
     "unreadMessage": "unread message",
@@ -1260,7 +1282,8 @@
     "notFound": "The requested resource was not found.",
     "validation": "Please check your input and try again.",
     "serverError": "Server error. Please try again later.",
-    "timeout": "Request timed out. Please try again."
+    "timeout": "Request timed out. Please try again.",
+    "unsupportedBrowser": "This browser can't keep sessions safe across tabs. Please update your browser (or use HTTPS)."
   },
   "validation": {
     "required": "This field is required",
