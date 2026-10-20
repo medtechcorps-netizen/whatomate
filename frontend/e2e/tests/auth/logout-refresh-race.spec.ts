@@ -1518,7 +1518,7 @@ test.beforeEach(async ({ context }, testInfo) => {
   for (const tab of context.pages()) registerPage(tab)
 })
 
-test.afterEach(async ({}, testInfo) => {
+test.afterEach(async ({ context }, testInfo) => {
   if (testInfo.title !== AUTH_LIFECYCLE_TITLE) return
   const state = authLifecycleStates.get(testInfo)
   if (!state) {
@@ -1532,7 +1532,7 @@ test.afterEach(async ({}, testInfo) => {
     return
   }
   for (const detach of state.detach) detach()
-  state.add({ action: 'test-end', status: testInfo.status ?? 'unknown' })
+  state.add({ action: 'test-end', status: testInfo.status ?? 'unknown', open_tabs: context.pages().length })
   authLifecycleStates.delete(testInfo)
   // Event byte/count caps above keep this below the runner's 64-KiB cap.
   await testInfo.attach('auth-cross-tab-lifecycle', {
