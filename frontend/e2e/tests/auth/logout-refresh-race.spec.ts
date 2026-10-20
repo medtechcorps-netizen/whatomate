@@ -1401,3 +1401,145 @@ test.describe('Logout during a token refresh', () => {
     expect((await me.json()).data.email).toBe(TEST_USERS.admin.email)
   })
 })
+
+
+// Bounded, read-only diagnostics for the inherited cross-tab logout oracle.
+// Keep the original test body intact: this observes request lifecycle only.
+const AUTH_LIFECYCLE_TITLE =
+  "another tab's refresh in flight is aborted by the logout, and a new sign-in survives"
+type AuthLifecycleEvent = Record<string, string | number>
+type AuthLifecycleState = {
+  events: AuthLifecycleEvent[]
+  overflow: boolean
+  errors: string[]
+  detach: Array<() => void>
+  add: (event: AuthLifecycleEvent) => void
+}
+const authLifecycleStates = new WeakMap<import('@playwright/test').TestInfo, AuthLifecycleState>()
+
+test.beforeEach(async ({ context }, testInfo) => {
+  if (testInfo.title !== AUTH_LIFECYCLE_TITLE) return
+  const started = performance.now()
+  let eventBytes = 0
+  const state: AuthLifecycleState = {
+    events: [],
+    overflow: false,
+    errors: [],
+    detach: [],
+    add(event) {
+      const row = { at_ms: Math.round(performance.now() - started), ...event }
+      const bytes = Buffer.byteLength(JSON.stringify(row), 'utf8') + 1
+      if (state.events.length >= 256 || eventBytes + bytes > 48 * 1024) {
+        state.overflow = true
+        return
+      }
+      eventBytes += bytes
+      state.events.push(row)
+    },
+  }
+  authLifecycleStates.set(testInfo, state)
+  const tabs = new Map<Page, number>()
+  const requests = new WeakMap<import('@playwright/test').Request, { id: number; tab: number; method: string; path: string; kind: string }>()
+  let nextRequest = 0
+  const error = (code: string) => {
+    if (state.errors.length < 16) state.errors.push(code)
+    else state.overflow = true
+  }
+  const navigation = (url: string) => {
+    try {
+      const path = new URL(url).pathname
+      return ['/', '/login', '/profile', '/__lane_a_blank'].includes(path) ? path : 'other'
+    } catch {
+      return 'unparsed'
+    }
+  }
+  const registerPage = (tab: Page) => {
+    if (tabs.has(tab)) return
+    const id = tabs.size + 1
+    tabs.set(tab, id)
+    state.add({ action: 'page-open', tab: id, navigation: navigation(tab.url()) })
+    const moved = (frame: import('@playwright/test').Frame) => {
+      if (frame === tab.mainFrame()) state.add({ action: 'navigation', tab: id, navigation: navigation(frame.url()) })
+    }
+    const closed = () => state.add({ action: 'page-close', tab: id })
+    const crashed = () => state.add({ action: 'page-crash', tab: id })
+    tab.on('framenavigated', moved)
+    tab.on('close', closed)
+    tab.on('crash', crashed)
+    state.detach.push(() => {
+      tab.off('framenavigated', moved)
+      tab.off('close', closed)
+      tab.off('crash', crashed)
+    })
+  }
+  const sent = (request: import('@playwright/test').Request) => {
+    try {
+      const path = new URL(request.url()).pathname
+      if (!['/api/auth/refresh', '/api/auth/logout', '/api/auth/login', '/api/me'].includes(path)) return
+      const tab = request.frame().page()
+      registerPage(tab)
+      const kind = path === '/api/auth/refresh'
+        ? ((request.postData() ?? '').includes('"revoke"') ? 'revoke' : 'refresh')
+        : path === '/api/auth/logout' ? 'logout' : path === '/api/auth/login' ? 'login' : 'me'
+      const row = { id: ++nextRequest, tab: tabs.get(tab)!, method: request.method(), path, kind }
+      requests.set(request, row)
+      state.add({ action: 'request-start', ...row })
+    } catch {
+      error('request-observer-error')
+    }
+  }
+  const response = (answer: import('@playwright/test').Response) => {
+    const row = requests.get(answer.request())
+    if (row) state.add({ action: 'response', ...row, status: answer.status() })
+  }
+  const finished = (request: import('@playwright/test').Request) => {
+    const row = requests.get(request)
+    if (row) state.add({ action: 'request-finished', ...row })
+  }
+  const failed = (request: import('@playwright/test').Request) => {
+    const row = requests.get(request)
+    if (!row) return
+    const raw = request.failure()?.errorText ?? ''
+    const failure = /^net::ERR_[A-Z_]+$/.test(raw) ? raw : 'other-network-error'
+    state.add({ action: 'request-failed', ...row, failure })
+  }
+  context.on('page', registerPage)
+  context.on('request', sent)
+  context.on('response', response)
+  context.on('requestfinished', finished)
+  context.on('requestfailed', failed)
+  state.detach.push(() => {
+    context.off('page', registerPage)
+    context.off('request', sent)
+    context.off('response', response)
+    context.off('requestfinished', finished)
+    context.off('requestfailed', failed)
+  })
+  for (const tab of context.pages()) registerPage(tab)
+})
+
+test.afterEach(async ({}, testInfo) => {
+  if (testInfo.title !== AUTH_LIFECYCLE_TITLE) return
+  const state = authLifecycleStates.get(testInfo)
+  if (!state) {
+    await testInfo.attach('auth-cross-tab-lifecycle', {
+      contentType: 'application/json',
+      body: Buffer.from(JSON.stringify({
+        schema_version: 1, test_title: testInfo.title, events: [],
+        overflow: false, errors: ['missing-beforeEach-capture'],
+      })),
+    })
+    return
+  }
+  for (const detach of state.detach) detach()
+  state.add({ action: 'test-end', status: testInfo.status ?? 'unknown' })
+  authLifecycleStates.delete(testInfo)
+  // Event byte/count caps above keep this below the runner's 64-KiB cap.
+  await testInfo.attach('auth-cross-tab-lifecycle', {
+    contentType: 'application/json',
+    body: Buffer.from(JSON.stringify({
+      schema_version: 1, test_title: testInfo.title,
+      events: state.events, overflow: state.overflow, errors: state.errors,
+    })),
+  })
+})
