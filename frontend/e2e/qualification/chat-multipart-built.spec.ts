@@ -18,7 +18,7 @@ declare global {
 type Receiver = Awaited<ReturnType<typeof multipartReceiver>>
 type App = { page: Page; context: BrowserContext; receiver: Receiver }
 
-async function syntheticApi(page: Page) {
+async function syntheticApi(page: Page, receiver: Receiver) {
   await page.addInitScript(({ user, org }) => {
     if (!localStorage.getItem('user')) localStorage.setItem('user', JSON.stringify(user))
     if (!localStorage.getItem('selected_organization_id')) localStorage.setItem('selected_organization_id', org)
@@ -58,7 +58,15 @@ async function syntheticApi(page: Page) {
     }
   }, { user, org })
   await page.route('**/api/**', route => route.fulfill({ json: { data: {} } }))
-  await page.route(/\/api\/messages\/media$/, route => route.continue())
+  await page.route(/\/api\/messages\/media$/, route => {
+    // Page routes precede context routes: enforce the receiver boundary here
+    // too, including when a misbound build contains a different VITE_API_URL.
+    if (route.request().url() === `${receiver.origin}/api/messages/media` && route.request().method() === 'POST') {
+      return route.continue()
+    }
+    receiver.faults.push('non-fixture-media-request')
+    return route.abort('blockedbyclient')
+  })
   await page.route(/\/api\/me(?:\?.*)?$/, route => route.fulfill({ json: { data: user } }))
   await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, route =>
     route.fulfill({ json: { data: { mode: 'licensed', entitlements: {} } } }))
@@ -98,7 +106,7 @@ const test = base.extend<{ app: App }>({
         return route.abort('blockedbyclient')
       })
       page = await context.newPage()
-      await syntheticApi(page)
+      await syntheticApi(page, receiver)
       const response = await page.goto(`${receiver.origin}/chat/${contact}`)
       expect(response?.status()).toBe(200)
       expect(response?.headers()['content-security-policy']).toContain("default-src 'self'")
