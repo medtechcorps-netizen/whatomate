@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/services/api', () => ({
   organizationsService: { list: vi.fn(async () => ({ data: { data: { organizations: [] } } })), addMember: vi.fn(), createInvitation: vi.fn(), create: vi.fn() },
   usersService: { listMyOrganizations: mocks.listMyOrganizations },
+  sessionsSupported: vi.fn(() => true),
+  SESSION_BUSY_CODE: 'ERR_SESSION_BUSY',
+  SESSION_UNSUPPORTED_CODE: 'ERR_SESSION_UNSUPPORTED',
 }))
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
