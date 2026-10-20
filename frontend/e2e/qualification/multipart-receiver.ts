@@ -21,12 +21,15 @@ export type Upload = {
   responseStatus: number | null
   lossBeforeHeaders: boolean | null
   responseBytesWrittenAtLoss: number | null
+  replyTo: string | null
 }
 
 // A test-owned receiver, not the media handler or a provider simulator. The
 // browser sends real multipart bytes over loopback; only acceptance/responses
 // are synthetic. Static app bytes and security headers pass through unchanged.
-export async function multipartReceiver(upstreamValue: string) {
+export async function multipartReceiver(upstreamValue: string, allowedReplyIds: readonly string[] = []) {
+  if (allowedReplyIds.length > 2 || new Set(allowedReplyIds).size !== allowedReplyIds.length ||
+      allowedReplyIds.some(id => !/^[a-f0-9-]{36}$/.test(id))) throw new Error('reply-fixture-ids')
   const upstream = new URL(upstreamValue)
   if (upstream.protocol !== 'http:' || upstream.hostname !== '127.0.0.1' ||
       !upstream.port || upstream.pathname !== '/' || upstream.search || upstream.hash ||
@@ -64,7 +67,7 @@ export async function multipartReceiver(upstreamValue: string) {
         connectionRequestOrdinal: connection.requests, organization: '', contact: '', kind: '',
         filename: '', fileBytes: 0, fileSha256: '', bodyBytes: 0, bodyComplete: false,
         responseClosed: false, closedBeforeResponseEnd: false, responseStatus: null,
-        lossBeforeHeaders: null, responseBytesWrittenAtLoss: null }
+        lossBeforeHeaders: null, responseBytesWrittenAtLoss: null, replyTo: null }
       uploads.push(record)
       replies.set(record.ordinal, res)
       res.on('close', () => {
@@ -89,7 +92,14 @@ export async function multipartReceiver(upstreamValue: string) {
             body: new Uint8Array(Buffer.concat(chunks)),
           }).formData()
           const keys = [...parsed.keys()].sort()
-          if (JSON.stringify(keys) !== JSON.stringify(['contact_id', 'file', 'type', 'whatsapp_account'])) {
+          const expectedKeys = ['contact_id', 'file', 'type', 'whatsapp_account']
+          if (parsed.has('reply_to_message_id')) {
+            const reply = parsed.get('reply_to_message_id')
+            if (typeof reply !== 'string' || !allowedReplyIds.includes(reply)) throw new Error('multipart-reply')
+            record.replyTo = reply
+            expectedKeys.push('reply_to_message_id')
+          }
+          if (JSON.stringify(keys) !== JSON.stringify(expectedKeys.sort())) {
             throw new Error('multipart-fields')
           }
           const file = parsed.get('file')
