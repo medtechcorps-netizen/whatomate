@@ -39,7 +39,7 @@ _EXPERIMENT_MIN = 720
 _CLEANUP = 180
 _MAX_CONTEXT = 64 * runtime.MIB
 _WEB_RECIPE = 'docker/release/web.Dockerfile'
-_WEB_RECIPE_SHA = 'bc081fef7a7b90f268b672dd9da10e3b36146e32faab59d1659838847ec806fa'
+_WEB_RECIPE_SHA = '1c6cfc1ecc769d62e7cb098e944b5d71ceaeec795f9e72e893131341a5b63f1b'
 _IGNORE_SHA = 'b77c48c1111912668497b028767ac88974d905cfbeb3d669847020d87cd879c6'
 _PLUGIN_SHA = 'e56147d0d19281573362a9a0ec89a20eacdce4b8d2b25402167299fcdfa1fc67'
 _LINUX_PLUGIN_SHA = '48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778'
@@ -49,7 +49,7 @@ _SOURCE_URL = 'https://github.com/' + common.REPOSITORY
 _RECIPES = {
     'graph': ('docker/staging/graph-stub.Dockerfile',stack.GRAPH_RECIPE_SHA256),
     'controller': ('release/compat/controller.Dockerfile','5dc4fb16e685d6569ac184431a50743617320bef47ca638b15912ef0b04ef812'),
-    'fixture': ('release/compat/fixture.Dockerfile','947cf1674e35d8e6f77f1da9c7b1dd45b282bff34e77600e52225cfba95f7895'),
+    'fixture': ('release/compat/fixture.Dockerfile','a66a468a7779e2c2683cbae796e69c1e8c340a09607fcd351288cbc8d4d824c0'),
     'candidate': (_WEB_RECIPE,_WEB_RECIPE_SHA),
 }
 _GRAPH_IGNORE_SHA = '1fec754b49fe8ab21d076cd9b26f97e33f83ca8584a99a344176869caadbd060'

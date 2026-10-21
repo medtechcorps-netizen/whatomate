@@ -159,6 +159,53 @@ class SourceTests(unittest.TestCase):
                 m._role_inputs({**blobs,'release/staging/graphstub/new.go':b'new'})
 
 
+    @staticmethod
+    def current_recipe_blobs():
+        root=Path(__file__).resolve().parents[2]
+        paths={'.dockerignore','go.mod','go.sum',
+               'release/compat/controller.py','release/compat/sweep.py','release/compat/proof.py'}
+        paths.update(recipe for recipe,_ in m._RECIPES.values())
+        paths.add(m._RECIPES['graph'][0]+'.dockerignore')
+        paths.update(path.relative_to(root).as_posix()
+                     for path in (root/'release/staging/graphstub').rglob('*.go')
+                     if not path.name.endswith('_test.go'))
+        return {path:(root/path).read_bytes() for path in sorted(paths)}
+
+    def test_current_source_recipe_pins_admit_all_four_roles(self):
+        blobs=self.current_recipe_blobs()
+        self.assertEqual({role:recipe for role,(recipe,_) in m._RECIPES.items()}, {
+            'graph':'docker/staging/graph-stub.Dockerfile',
+            'controller':'release/compat/controller.Dockerfile',
+            'fixture':'release/compat/fixture.Dockerfile',
+            'candidate':'docker/release/web.Dockerfile'})
+        roles=m._role_inputs(blobs)
+        self.assertEqual(set(roles),set(m._RECIPES))
+        for role,(recipe,digest) in m._RECIPES.items():
+            self.assertEqual(hashlib.sha256(blobs[recipe]).hexdigest(),digest)
+            self.assertEqual(roles[role][recipe],blobs[recipe])
+
+    def test_current_source_recipe_single_byte_changes_are_rejected(self):
+        blobs=self.current_recipe_blobs()
+        m._role_inputs(blobs)
+        for role,(recipe,_) in m._RECIPES.items():
+            with self.subTest(role=role):
+                data=blobs[recipe]
+                self.assertTrue(data)
+                changed={**blobs,recipe:bytes([data[0]^1])+data[1:]}
+                with self.assertRaisesRegex(m.proof.EvidenceError,'^admission-recipe-unsupported$'):
+                    m._role_inputs(changed)
+
+    def test_current_source_recipe_missing_files_are_rejected(self):
+        blobs=self.current_recipe_blobs()
+        m._role_inputs(blobs)
+        for role,(recipe,_) in m._RECIPES.items():
+            with self.subTest(role=role):
+                missing=dict(blobs)
+                del missing[recipe]
+                with self.assertRaisesRegex(m.proof.EvidenceError,'^admission-recipe-unsupported$'):
+                    m._role_inputs(missing)
+
+
 class BuildTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
