@@ -55,6 +55,7 @@ func TestRealtimeSubscriberDiscardsMalformedAndFansOutTenantHints(t *testing.T) 
 	rdb := testutil.SetupTestRedis(t)
 	if rdb == nil {
 		t.Skip("TEST_REDIS_URL not set")
+		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
