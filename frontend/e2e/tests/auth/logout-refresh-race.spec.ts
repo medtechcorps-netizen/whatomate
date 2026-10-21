@@ -738,6 +738,11 @@ test.describe('Logout during a token refresh', () => {
       await startGoogleSso(page)
       await page.waitForURL(/__mock_idp/)
 
+      // Redirect chains bypass the destination route; load the non-app provider fixture directly.
+      await page.goto('/__mock_idp', { waitUntil: 'domcontentloaded' })
+      await expect(page.locator('body')).toHaveText('Identity provider')
+      await expect(page.getByText('Identity provider', { exact: true })).toBeVisible()
+
       // Proactive refresh runs only in a visible, authenticated app tab.
       // Returning focus is a real browser action; the event below does not
       // override document visibility or wait for the application to mount.
