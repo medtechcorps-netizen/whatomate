@@ -3,7 +3,7 @@
 # (release/staging/graphstub/placement_test.go). The stub uses the standard
 # library only, so the build needs go.mod, go.sum and its own sources, and
 # graph-stub.Dockerfile.dockerignore limits the BuildKit context to exactly those.
-FROM --platform=linux/amd64 docker.io/library/golang:1.26.9-alpine@sha256:cdfd4fe2da6b225d8b40c6b7a105736e548e83ff56d5d8f9394446eeb5eb84e0 AS builder
+FROM --platform=linux/amd64 docker.io/library/golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64

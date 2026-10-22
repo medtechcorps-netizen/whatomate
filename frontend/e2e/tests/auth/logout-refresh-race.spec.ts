@@ -7,6 +7,7 @@ import {
   type Page,
 } from '@playwright/test'
 import { ApiHelper, loginAsAdmin, logout, TEST_USERS, type TestUser } from '../../helpers'
+import { createLongStayObserver } from '../../helpers/long-stay-observer'
 import {
   createTestScope,
   createUserWithPermissions,
@@ -707,50 +708,80 @@ test.describe('Logout during a token refresh', () => {
     context,
     playwright,
     baseURL,
-  }) => {
-    const newContext = () => playwright.request.newContext({ baseURL })
-    await loginAsAdmin(page)
-    const other = await context.newPage()
-    await other.goto('/', { waitUntil: 'domcontentloaded' })
-    const refreshes = countRefreshes(other)
-    const order: string[] = []
-    const exchange = await answerExchange(page, newContext, TEST_USERS.manager, order)
+  }, testInfo) => {
+    const observation = createLongStayObserver(context, page)
+    let originalFailed = false
+    let observedOther: Page | undefined
+    try {
+      await observation.install(baseURL)
+      const newContext = () => playwright.request.newContext({ baseURL })
+      await loginAsAdmin(page)
+      const other = await context.newPage()
+      observation.other(other)
+      observedOther = other
+      await other.goto('/', { waitUntil: 'domcontentloaded' })
+      const refreshes = countRefreshes(other)
+      observation.mark('counter-installed')
+      observation.snapshot(other, 'counter-installed')
+      const order: string[] = []
+      const exchange = await answerExchange(page, newContext, TEST_USERS.manager, order)
 
-    // This tab leaves for the identity provider (a page without the app).
-    await page.goto('/login', { waitUntil: 'domcontentloaded' })
-    await offerGoogleSso(page)
-    await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, (route) =>
-      route.fulfill({ status: 302, headers: { location: '/__mock_idp' } }),
-    )
-    await page.route('**/__mock_idp', (route) =>
-      route.fulfill({ contentType: 'text/html', body: '<html><body>Identity provider</body></html>' }),
-    )
-    await startGoogleSso(page)
-    await page.waitForURL(/__mock_idp/)
+      // This tab leaves for the identity provider (a page without the app).
+      await page.goto('/login', { waitUntil: 'domcontentloaded' })
+      await offerGoogleSso(page)
+      await page.route(/\/api\/auth\/sso\/google\/init(?:\?.*)?$/, (route) =>
+        route.fulfill({ status: 302, headers: { location: '/__mock_idp' } }),
+      )
+      await page.route('**/__mock_idp', (route) =>
+        route.fulfill({ contentType: 'text/html', body: '<html><body>Identity provider</body></html>' }),
+      )
+      await startGoogleSso(page)
+      await page.waitForURL(/__mock_idp/)
 
-    // Proactive refresh runs only in a visible, authenticated app tab.
-    // Returning focus is a real browser action; the event below does not
-    // override document visibility or wait for the application to mount.
-    await other.bringToFront()
-    const authenticatedNavigation = other.getByRole('navigation', { name: 'Main navigation', exact: true })
-    await expect(authenticatedNavigation).toBeVisible()
-    await expect(authenticatedNavigation.getByRole('button').filter({ hasText: TEST_USERS.admin.email })).toBeVisible()
-    await expect.poll(() => other.evaluate(() => document.visibilityState)).toBe('visible')
+      // Redirect chains bypass the destination route; load the non-app provider fixture directly.
+      await page.goto('/__mock_idp', { waitUntil: 'domcontentloaded' })
+      await expect(page.locator('body')).toHaveText('Identity provider')
+      await expect(page.getByText('Identity provider', { exact: true })).toBeVisible()
 
-    // Meanwhile the open tab's session needs a refresh: nothing holds it back.
-    await startProactiveRefresh(other)
-    await expect.poll(() => refreshes()).toBe(1)
-    expect((await page.request.get('/api/me')).status()).toBe(200)
+      // Proactive refresh runs only in a visible, authenticated app tab.
+      // Returning focus is a real browser action; the event below does not
+      // override document visibility or wait for the application to mount.
+      await other.bringToFront()
+      const authenticatedNavigation = other.getByRole('navigation', { name: 'Main navigation', exact: true })
+      await expect(authenticatedNavigation).toBeVisible()
+      await expect(authenticatedNavigation.getByRole('button').filter({ hasText: TEST_USERS.admin.email })).toBeVisible()
+      await expect.poll(() => other.evaluate(() => document.visibilityState)).toBe('visible')
 
-    // The provider sends the browser back, minutes later, with the code.
-    await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
-    await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 30_000 })
+      // Meanwhile the open tab's session needs a refresh: nothing holds it back.
+      observation.mark('ready-before-wake')
+      observation.snapshot(other, 'ready-before-wake')
+      await startProactiveRefresh(other)
+      observation.mark('wake-returned')
+      observation.snapshot(other, 'wake-returned')
+      await expect.poll(() => refreshes()).toBe(1)
+      observation.mark('poll-passed')
+      observation.snapshot(other, 'poll-passed')
+      expect((await page.request.get('/api/me')).status()).toBe(200)
 
-    for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
-      expect(await cookieValue(context, name)).toBe(exchange.cookies()[name])
+      // The provider sends the browser back, minutes later, with the code.
+      await page.goto('/auth/sso/callback?code=e2e-code-b', { waitUntil: 'domcontentloaded' })
+      await page.waitForURL((url) => !url.pathname.includes('/auth/sso/callback'), { timeout: 30_000 })
+
+      for (const name of ['whm_access', 'whm_refresh', 'whm_csrf']) {
+        expect(await cookieValue(context, name)).toBe(exchange.cookies()[name])
+      }
+      const me = await page.request.get('/api/me')
+      expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
+      observation.mark('case-passed')
+      observation.snapshot(other, 'case-passed')
+    } catch (error) {
+      originalFailed = true
+      observation.mark('case-failed')
+      if (observedOther) observation.snapshot(observedOther, 'case-failed')
+      throw error
+    } finally {
+      await observation.attach(testInfo, originalFailed)
     }
-    const me = await page.request.get('/api/me')
-    expect((await me.json()).data.email).toBe(TEST_USERS.manager.email)
   })
 
   test('an SSO exchange cut off by a reload: every reload says so, and the session from before is never resumed', async ({
