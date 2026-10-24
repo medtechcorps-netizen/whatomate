@@ -1,0 +1,495 @@
+import type { RouteRecordRaw } from 'vue-router'
+
+// The app's routes. The router uses them; the API client reads their meta
+// (which pages need no session) without importing the router and its
+// stores. Every view is loaded lazily, so importing this loads none.
+export const routes: RouteRecordRaw[] = [
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/views/auth/LoginView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/register',
+    name: 'register',
+    component: () => import('@/views/auth/RegisterView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/auth/sso/callback',
+    name: 'sso-callback',
+    component: () => import('@/views/auth/SSOCallbackView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/about',
+    alias: '/integrations',
+    name: 'about',
+    component: () => import('@/views/public/AboutView.vue'),
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/privacy',
+    name: 'privacy-policy',
+    component: () => import('@/views/legal/LegalDocumentView.vue'),
+    props: { documentKey: 'privacy' },
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/terms',
+    name: 'terms-of-service',
+    component: () => import('@/views/legal/LegalDocumentView.vue'),
+    props: { documentKey: 'terms' },
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/data-deletion',
+    name: 'data-deletion',
+    component: () => import('@/views/legal/LegalDocumentView.vue'),
+    props: { documentKey: 'data-deletion' },
+    meta: { requiresAuth: false }
+  },
+  {
+    path: '/',
+    component: () => import('@/components/layout/AppLayout.vue'),
+    meta: { requiresAuth: true },
+    children: [
+      {
+        path: '',
+        name: 'dashboard',
+        component: () => import('@/views/dashboard/DashboardView.vue'),
+        meta: { permission: 'analytics' }
+      },
+      {
+        path: 'chat/:contactId?',
+        name: 'chat-conversation',
+        component: () => import('@/views/chat/ChatView.vue'),
+        props: true,
+        meta: { permission: 'chat', stableKey: true }
+      },
+      {
+        path: 'launchpad',
+        name: 'launchpad',
+        component: () => import('@/views/launchpad/LaunchpadView.vue'),
+        meta: { permission: 'onboarding' }
+      },
+      {
+        path: 'inbox',
+        name: 'omnichannel-inbox',
+        component: () => import('@/views/channels/ChannelsView.vue'),
+        meta: {
+          permission: 'conversations',
+          permissions: ['conversations', 'channel_accounts'],
+          entitlement: 'omnichannel.enabled'
+        }
+      },
+      {
+        path: 'crm/pipeline',
+        name: 'crm-pipeline',
+        component: () => import('@/views/crm/PipelineView.vue'),
+        meta: {
+          permission: 'crm.leads',
+          permissions: ['crm.leads', 'crm.pipelines'],
+          entitlement: 'crm.enabled'
+        }
+      },
+      {
+        path: 'crm/tasks',
+        name: 'crm-tasks',
+        component: () => import('@/views/crm/TasksView.vue'),
+        meta: { permission: 'tasks', entitlement: 'crm.enabled' }
+      },
+      {
+        path: 'crm/insights',
+        name: 'crm-insights',
+        component: () => import('@/views/crm/InsightsView.vue'),
+        meta: {
+          anyPermissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'],
+          entitlement: 'crm.enabled'
+        }
+      },
+      {
+        path: 'today',
+        name: 'today',
+        component: () => import('@/views/today/TodayView.vue'),
+        meta: {
+          anyPermissions: ['crm.leads', 'tasks', 'bookings', 'packages', 'payments'],
+          entitlement: 'crm.enabled'
+        }
+      },
+      {
+        path: 'crm/automations',
+        name: 'crm-automations',
+        component: () => import('@/views/crm/AutomationPoliciesView.vue'),
+        meta: {
+          permission: 'crm.automations',
+          entitlement: 'crm.enabled'
+        }
+      },
+      {
+        path: 'crm/automations/new',
+        name: 'crm-automation-new',
+        component: () => import('@/views/crm/AutomationStudioView.vue'),
+        meta: {
+          permission: 'crm.automations',
+          entitlement: 'crm.enabled'
+        }
+      },
+      {
+        path: 'crm/automations/:id',
+        name: 'crm-automation-studio',
+        component: () => import('@/views/crm/AutomationStudioView.vue'),
+        meta: {
+          permission: 'crm.automations',
+          entitlement: 'crm.enabled',
+          stableKey: true
+        }
+      },
+      {
+        path: 'calendar',
+        name: 'booking-calendar',
+        component: () => import('@/views/booking/CalendarView.vue'),
+        meta: {
+          permission: 'bookings',
+          permissions: ['bookings', 'booking.settings'],
+          entitlement: 'bookings.enabled'
+        }
+      },
+      {
+        path: 'commerce',
+        name: 'commerce',
+        component: () => import('@/views/commerce/CommerceView.vue'),
+        meta: {
+          anyPermissions: ['packages', 'payments'],
+          entitlement: 'commerce.enabled'
+        }
+      },
+      {
+        path: 'copilot',
+        name: 'copilot',
+        component: () => import('@/views/copilot/CopilotView.vue'),
+        meta: {
+          permission: 'copilot',
+          entitlement: 'copilot.enabled'
+        }
+      },
+      {
+        path: 'profile',
+        name: 'profile',
+        component: () => import('@/views/profile/ProfileView.vue')
+        // All roles can access profile
+      },
+      {
+        path: 'resellers',
+        name: 'resellers',
+        component: () => import('@/views/resellers/ResellerPortalView.vue'),
+        meta: { permission: 'resellers' }
+      },
+      {
+        path: 'upgrade-workspace',
+        name: 'workspace-upgrade',
+        component: () => import('@/views/billing/WorkspaceUpgradeView.vue'),
+        meta: { permission: 'billing' }
+      },
+      {
+        path: 'templates',
+        name: 'templates',
+        component: () => import('@/views/settings/TemplatesView.vue'),
+        meta: { permission: 'templates' }
+      },
+      {
+        path: 'templates/:id',
+        name: 'template-detail',
+        component: () => import('@/views/settings/TemplateDetailView.vue'),
+        meta: { permission: 'templates' }
+      },
+      {
+        path: 'flows',
+        name: 'flows',
+        component: () => import('@/views/settings/FlowsView.vue'),
+        meta: { permission: 'flows.whatsapp' }
+      },
+      {
+        path: 'campaigns',
+        name: 'campaigns',
+        component: () => import('@/views/settings/CampaignsView.vue'),
+        meta: { permission: 'campaigns' }
+      },
+      {
+        path: 'campaigns/:id',
+        name: 'campaign-detail',
+        component: () => import('@/views/settings/CampaignDetailView.vue'),
+        meta: { permission: 'campaigns' }
+      },
+      {
+        path: 'chatbot',
+        name: 'chatbot',
+        component: () => import('@/views/chatbot/ChatbotView.vue'),
+        meta: { permission: 'settings.chatbot' }
+      },
+      {
+        path: 'chatbot/settings',
+        redirect: '/settings/chatbot'
+      },
+      {
+        path: 'chatbot/keywords',
+        name: 'chatbot-keywords',
+        component: () => import('@/views/chatbot/KeywordsView.vue'),
+        meta: { permission: 'chatbot.keywords' }
+      },
+      {
+        path: 'chatbot/keywords/:id',
+        name: 'keyword-detail',
+        component: () => import('@/views/chatbot/KeywordDetailView.vue'),
+        meta: { permission: 'chatbot.keywords' }
+      },
+      {
+        path: 'chatbot/flows',
+        name: 'chatbot-flows',
+        component: () => import('@/views/chatbot/ChatbotFlowsView.vue'),
+        meta: { permission: 'flows.chatbot' }
+      },
+      {
+        path: 'chatbot/flows/new',
+        name: 'chatbot-flow-new',
+        component: () => import('@/views/chatbot/ChatbotFlowBuilderView.vue'),
+        meta: { permission: 'flows.chatbot' }
+      },
+      {
+        path: 'chatbot/flows/:id/edit',
+        name: 'chatbot-flow-edit',
+        component: () => import('@/views/chatbot/ChatbotFlowBuilderView.vue'),
+        meta: { permission: 'flows.chatbot' }
+      },
+      {
+        path: 'chatbot/ai',
+        name: 'chatbot-ai',
+        component: () => import('@/views/chatbot/AIContextsView.vue'),
+        meta: { permission: 'chatbot.ai' }
+      },
+      {
+        path: 'chatbot/ai/:id',
+        name: 'ai-context-detail',
+        component: () => import('@/views/chatbot/AIContextDetailView.vue'),
+        meta: { permission: 'chatbot.ai' }
+      },
+      {
+        path: 'chatbot/transfers',
+        name: 'chatbot-transfers',
+        component: () => import('@/views/chatbot/AgentTransfersView.vue'),
+        meta: { permission: 'transfers' }
+      },
+      {
+        path: 'analytics/agents',
+        name: 'agent-analytics',
+        component: () => import('@/views/analytics/AgentAnalyticsView.vue'),
+        meta: { permission: 'analytics.agents' }
+      },
+      {
+        path: 'analytics/meta-insights',
+        name: 'meta-insights',
+        component: () => import('@/views/analytics/MetaInsightsView.vue'),
+        meta: { permission: 'analytics' }
+      },
+      {
+        path: 'analytics/search-visibility',
+        name: 'search-visibility',
+        component: () => import('@/views/analytics/SearchVisibilityView.vue'),
+        meta: { permission: 'analytics' }
+      },
+      {
+        path: 'settings',
+        name: 'settings',
+        component: () => import('@/views/settings/SettingsView.vue'),
+        meta: { permission: 'settings.general' }
+      },
+      {
+        path: 'settings/integrations',
+        name: 'settings-integrations',
+        component: () => import('@/views/settings/IntegrationsView.vue'),
+        meta: { permission: 'settings.integrations' }
+      },
+      {
+        path: 'settings/chatbot',
+        name: 'chatbot-settings',
+        component: () => import('@/views/settings/ChatbotSettingsView.vue'),
+        meta: { permission: 'settings.chatbot' }
+      },
+      {
+        path: 'settings/accounts',
+        name: 'accounts',
+        component: () => import('@/views/settings/AccountsView.vue'),
+        meta: { permission: 'accounts' }
+      },
+      {
+        path: 'settings/accounts/:id',
+        name: 'account-detail',
+        component: () => import('@/views/settings/AccountDetailView.vue'),
+        meta: { permission: 'accounts' }
+      },
+      {
+        path: 'settings/canned-responses',
+        name: 'canned-responses',
+        component: () => import('@/views/settings/CannedResponsesView.vue'),
+        meta: { permission: 'canned_responses' }
+      },
+      {
+        path: 'settings/canned-responses/:id',
+        name: 'canned-response-detail',
+        component: () => import('@/views/settings/CannedResponseDetailView.vue'),
+        // stableKey reuses the component instance when :id flips from "new"
+        // to the new UUID after create, so the locally-set response (and the
+        // resulting Save-button reactivity) survives the route change.
+        meta: { permission: 'canned_responses', stableKey: true }
+      },
+      {
+        path: 'settings/contacts',
+        name: 'contacts',
+        component: () => import('@/views/settings/ContactsView.vue'),
+        meta: { permission: 'contacts' }
+      },
+      {
+        path: 'settings/contacts/:id',
+        name: 'contact-detail',
+        component: () => import('@/views/settings/ContactDetailView.vue'),
+        meta: { permission: 'contacts' }
+      },
+      {
+        path: 'settings/tags',
+        name: 'tags',
+        component: () => import('@/views/settings/TagsView.vue'),
+        meta: { permission: 'tags' }
+      },
+      {
+        path: 'settings/users',
+        name: 'users',
+        component: () => import('@/views/settings/UsersView.vue'),
+        meta: { permission: 'users' }
+      },
+      {
+        path: 'settings/users/:id',
+        name: 'user-detail',
+        component: () => import('@/views/settings/UserDetailView.vue'),
+        meta: { permission: 'users' }
+      },
+      {
+        path: 'settings/roles',
+        name: 'roles',
+        component: () => import('@/views/settings/RolesView.vue'),
+        meta: { permission: 'roles' }
+      },
+      {
+        path: 'settings/roles/:id',
+        name: 'role-detail',
+        component: () => import('@/views/settings/RoleDetailView.vue'),
+        meta: { permission: 'roles' }
+      },
+      {
+        path: 'settings/teams',
+        name: 'teams',
+        component: () => import('@/views/settings/TeamsView.vue'),
+        meta: { permission: 'teams' }
+      },
+      {
+        path: 'settings/teams/:id',
+        name: 'team-detail',
+        component: () => import('@/views/settings/TeamDetailView.vue'),
+        meta: { permission: 'teams' }
+      },
+      {
+        path: 'settings/api-keys',
+        name: 'api-keys',
+        component: () => import('@/views/settings/APIKeysView.vue'),
+        meta: { permission: 'api_keys' }
+      },
+      {
+        path: 'settings/api-keys/:id',
+        name: 'api-key-detail',
+        component: () => import('@/views/settings/APIKeyDetailView.vue'),
+        meta: { permission: 'api_keys' }
+      },
+      {
+        path: 'settings/webhooks',
+        name: 'webhooks',
+        component: () => import('@/views/settings/WebhooksView.vue'),
+        meta: { permission: 'webhooks' }
+      },
+      {
+        path: 'settings/webhooks/:id',
+        name: 'webhook-detail',
+        component: () => import('@/views/settings/WebhookDetailView.vue'),
+        meta: { permission: 'webhooks' }
+      },
+      {
+        path: 'settings/sso',
+        name: 'sso-settings',
+        component: () => import('@/views/settings/SSOSettingsView.vue'),
+        meta: { permission: 'settings.sso' }
+      },
+      {
+        path: 'settings/privacy',
+        name: 'privacy-center',
+        component: () => import('@/views/settings/TrustCenterView.vue'),
+        meta: { anyPermissions: ['privacy.settings', 'privacy.requests'] }
+      },
+      {
+        path: 'settings/support',
+        name: 'support-center',
+        component: () => import('@/views/settings/TrustCenterView.vue'),
+        meta: { permission: 'support' }
+      },
+      {
+        path: 'settings/custom-actions',
+        name: 'custom-actions',
+        component: () => import('@/views/settings/CustomActionsView.vue'),
+        meta: { permission: 'custom_actions' }
+      },
+      {
+        path: 'settings/audit-logs',
+        name: 'audit-logs',
+        component: () => import('@/views/settings/AuditLogsView.vue'),
+        meta: { permission: 'audit_logs' }
+      },
+      {
+        path: 'settings/audit-logs/:id',
+        name: 'audit-log-detail',
+        component: () => import('@/views/settings/AuditLogDetailView.vue'),
+        meta: { permission: 'audit_logs' }
+      },
+      {
+        path: 'calling',
+        redirect: '/calling/logs'
+      },
+      {
+        path: 'calling/logs',
+        name: 'call-logs',
+        component: () => import('@/views/calling/CallLogsView.vue'),
+        meta: { permission: 'call_logs' }
+      },
+      {
+        path: 'calling/ivr-flows',
+        name: 'ivr-flows',
+        component: () => import('@/views/calling/IVRFlowsView.vue'),
+        meta: { permission: 'ivr_flows' }
+      },
+      {
+        path: 'calling/ivr-flows/:id/edit',
+        name: 'ivr-flow-editor',
+        component: () => import('@/views/calling/IVRFlowEditorView.vue'),
+        meta: { permission: 'ivr_flows' }
+      },
+      {
+        path: 'calling/transfers',
+        name: 'call-transfers',
+        component: () => import('@/views/calling/CallTransfersView.vue'),
+        meta: { permission: 'call_transfers' }
+      }
+    ]
+  },
+  {
+    path: '/:pathMatch(.*)*',
+    name: 'not-found',
+    component: () => import('@/views/NotFoundView.vue')
+  }
+]

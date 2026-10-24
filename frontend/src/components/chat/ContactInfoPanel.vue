@@ -25,6 +25,7 @@ import {
 import { X, ChevronDown, Phone, User, Plus, Check, Tags, Loader2 } from 'lucide-vue-next'
 import { TagBadge } from '@/components/ui/tag-badge'
 import MetadataSection from '@/components/chat/MetadataSection.vue'
+import ContactNameSource from '@/components/chat/ContactNameSource.vue'
 import { getInitials, getAvatarGradient, formatLabel } from '@/lib/utils'
 import { getTagColorClass } from '@/lib/constants'
 import { useTagsStore } from '@/stores/tags'
@@ -300,6 +301,7 @@ async function updateContactTags(tags: string[]) {
           <h4 class="font-medium" data-testid="contact-display-name">
             {{ displayName }}
           </h4>
+          <ContactNameSource :contact="contact" :display-name="displayName" />
           <div
             v-if="contactAddress.kind === 'phone'"
             class="flex items-center gap-1 text-sm text-muted-foreground mt-1"

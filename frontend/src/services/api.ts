@@ -12,6 +12,17 @@ import {
   clearBrowserOrganizationIdentity,
   readSelectedOrganizationId,
 } from "@/lib/browserIdentity";
+import { clearSignOutReason, recordSignOutReason } from "@/lib/sessionSignout";
+import { registerTabSession } from "@/lib/tabSession";
+import {
+  announceSessionEnding,
+  clearLastActivity,
+  currentPolicyIdentity,
+  isIdleSessionStale,
+  readSessionIdlePolicy,
+  recordActivity,
+  rememberSessionIdlePolicy,
+} from "@/lib/sessionActivity";
 
 // Get base path from server-injected config or fallback
 const basePath = ((window as any).__BASE_PATH__ ?? "").replace(/\/$/, "");
@@ -135,6 +146,8 @@ export const SESSION_UNSUPPORTED_CODE = "ERR_SESSION_UNSUPPORTED";
 const RECONNECT_TOAST_ID = "whm-session-reconnect";
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
+import { createRouterMatcher, START_LOCATION, type RouterMatcher } from "vue-router";
+import { routes } from "@/router/routes";
 import { AUTH_SESSION_EVENT } from "@/lib/authSessionEvent";
 
 export { AUTH_SESSION_EVENT };
@@ -160,6 +173,10 @@ type AuthAwareRequestConfig = InternalAxiosRequestConfig & {
   // An SSO callback page's code exchange (POST /auth/refresh): issues a
   // session like a sign-in.
   _ssoExchange?: boolean;
+  // A 401 is returned as is: no refresh, never a sign-out.
+  skipAuthRefresh?: boolean;
+  // The logical session and identity a GET /me was sent under.
+  _sessionScope?: string;
 };
 
 // Login/refresh responses whose Set-Cookie starts a new auth epoch.
@@ -182,11 +199,20 @@ let refreshAbort: AbortController | null = null;
 // land on that session. (Every session now begins under the lock, after any
 // logout queued before it, so this is defensive.)
 let logoutRequests: AbortController | null = null;
-// The ended marker of the logout this tab started (it navigates by itself).
-let endedHere: string | null = null;
+// The logical session this document shows: set when it restores or
+// establishes an identity, cleared when it ends or leaves. A tab acts only on
+// ends of this session, and never sends this session's work under another.
+let tabSession: string | null = null;
 // The pending logout this tab is responsible for: one it started, took over
 // from a closing tab or resumed on load (kept when its lock wait was deferred).
 let ownedLogout: string | null = null;
+// Set the moment a session starts to end (sign-out, expiry, idle end): from
+// then on no API request goes out and no 401 triggers a refresh that could
+// race the revoke. A new sign-in clears it.
+let sessionEnding = false;
+// A key earlier builds kept (the CSRF value of their last session); nothing
+// reads it any more, and a logout clears it.
+const SESSION_CSRF_KEY = "whm_session_csrf";
 let refreshInFlight: Promise<void> | null = null;
 let proactiveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -227,7 +253,7 @@ function readSessionMarker(): string | null {
   }
 }
 
-function writeSessionMarker(marker: string): string {
+function setSessionMarker(marker: string): string {
   memorySessionMarker = marker;
   writeStoredValue(SESSION_MARKER_KEY, marker);
   return marker;
@@ -250,9 +276,9 @@ export function readSessionId(): string {
 // not got through is moot: the jar now holds the new session's cookies.
 function beginSessionMarker(): string {
   writeStoredValue(LOGOUT_PENDING_KEY, null);
-  const marker = writeSessionMarker(
-    Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
-  );
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  tabSession = id;
+  const marker = setSessionMarker(id);
   writeStoredValue(SESSION_BEGUN_KEY, JSON.stringify({ marker, csrf: getCookie("whm_csrf") }));
   return marker;
 }
@@ -274,9 +300,85 @@ function noteBegunCsrf(marker: string | null) {
   }
 }
 
-function endSessionMarker(): string {
-  return writeSessionMarker(ENDED_MARKER_PREFIX + readSessionId());
+// endSessionMarker ends the logical session `expected` (an id) and returns its
+// ended marker. It returns null, and writes nothing, when the browser has
+// moved on to another session: that one is not this end's to end.
+function endSessionMarker(expected: string): string | null {
+  const current = readSessionMarker() ?? "";
+  const ended = ENDED_MARKER_PREFIX + expected;
+  if (current === ended) return ended;
+  if (current !== expected) return null;
+  return setSessionMarker(ended);
 }
+
+function sessionIdOf(marker: string | null): string {
+  const value = marker ?? "";
+  return isEndedMarker(value) ? value.slice(ENDED_MARKER_PREFIX.length) : value;
+}
+
+/** The logical session this tab shows, or null when it shows none. */
+export function readTabSession(): string | null {
+  return tabSession;
+}
+
+/**
+ * Whether this tab shows the browser's current, live session. Only then may
+ * it end that session or touch the shared state; otherwise it leaves locally.
+ */
+export function isTabSessionCurrent(): boolean {
+  const marker = readSessionMarker();
+  return tabSession !== null && !isEndedMarker(marker) && sessionIdOf(marker) === tabSession;
+}
+
+/**
+ * Records that this tab now shows the browser's current session (the store
+ * restored or applied an identity, say after a sign-in elsewhere and a Back
+ * navigation). Returns false, adopting nothing, when that session has ended,
+ * or when this tab still shows another session (a newer sign-in replaced it):
+ * then the identity at hand is not this tab's to show, and the tab leaves.
+ */
+export function adoptTabSession(): boolean {
+  const marker = readSessionMarker();
+  if (isEndedMarker(marker)) {
+    tabSession = null;
+    return false;
+  }
+  if (tabSession !== null && tabSession !== sessionIdOf(marker)) {
+    leaveReplacedSession();
+    return false;
+  }
+  tabSession = sessionIdOf(marker);
+  return true;
+}
+
+/** The session this tab shows when it is the browser's current one, else null. */
+export function currentTabSession(): string | null {
+  return isTabSessionCurrent() ? tabSession : null;
+}
+
+/**
+ * Whether the shared state still belongs to `session` (a session this tab
+ * showed as current): the browser is still in it, or has just ended it. Once
+ * another session began (in any tab), that one owns it.
+ */
+export function sharedStateBelongsTo(session: string | null): boolean {
+  if (session === null) return false;
+  const marker = readSessionMarker() ?? "";
+  return marker === session || marker === ENDED_MARKER_PREFIX + session;
+}
+
+/** Whether the browser's session has ended (no newer one began since). */
+export function browserSessionEnded(): boolean {
+  return isEndedMarker(readSessionMarker());
+}
+
+registerTabSession({
+  adopt: adoptTabSession,
+  isCurrent: isTabSessionCurrent,
+  current: currentTabSession,
+  owns: sharedStateBelongsTo,
+  ended: browserSessionEnded,
+});
 
 type PendingLogout = { marker: string; csrf: string | null };
 
@@ -427,6 +529,24 @@ function recordSessionExpiry(expiresInSeconds: unknown) {
 function onSessionIssued(expiresInSeconds: unknown) {
   advanceAuthEpoch();
   recordSessionExpiry(expiresInSeconds);
+}
+
+/**
+ * Marks this tab's session as ending: no further API request or refresh. It
+ * fires SESSION_ENDING_EVENT once per end (the only place it is fired), so
+ * views drop unsaved-work guards before the identity is cleared.
+ */
+export function markSessionEnding() {
+  if (sessionEnding) return;
+  sessionEnding = true;
+  announceSessionEnding();
+}
+
+// The session and identity a /me response must still belong to when it
+// arrives: one answered after a logout, a new login or an org switch is not
+// applied.
+function sessionScope(): string {
+  return `${readSessionId()}|${currentPolicyIdentity()}`;
 }
 
 function delay(ms: number, signal?: AbortSignal) {
@@ -585,16 +705,21 @@ function storedIdentity(): string {
 // refreshWithRetry refreshes once, retrying transient failures (network,
 // timeout, 5xx, 429) with backoff. It throws the last error when the refresh
 // is definitively rejected or every retry failed.
+function sessionEndingError(config?: InternalAxiosRequestConfig) {
+  return new AxiosError("The session is ending", AxiosError.ERR_CANCELED, config);
+}
+
 async function refreshWithRetry(
   requestEpoch: number,
   marker: string | null,
 ): Promise<void> {
   for (let attempt = 0; ; attempt++) {
-    // The session changed (a logout, or a new sign-in) while this refresh was
-    // queued or backing off: it must not touch the new state.
-    if (readSessionMarker() !== marker || isEndedMarker(marker)) {
+    // The session changed (a logout, or a new sign-in), or an end started in
+    // this tab, while this refresh was queued or backing off: it must not
+    // touch the new state, and nothing may extend an ending session.
+    if (sessionEnding || readSessionMarker() !== marker || isEndedMarker(marker)) {
       if (attempt > 0) showReconnectToast("dismiss");
-      throw sessionChangedError();
+      throw sessionEnding ? sessionEndingError() : sessionChangedError();
     }
     let response;
     try {
@@ -658,6 +783,7 @@ async function refreshAcrossTabs(
   marker: string | null,
 ): Promise<void> {
   const run = async () => {
+    if (sessionEnding) throw sessionEndingError();
     if (readSessionMarker() !== marker) throw sessionChangedError();
     if (readAuthEpoch() > requestEpoch) return;
     await refreshWithRetry(requestEpoch, marker);
@@ -690,6 +816,8 @@ function ensureFreshSession(
   requestEpoch: number,
   requestMarker: string | null = readSessionMarker(),
 ): Promise<void> {
+  // An ending session (this tab) is never extended either.
+  if (sessionEnding) return Promise.reject(sessionEndingError());
   const marker = readSessionMarker();
   if (marker !== requestMarker || isEndedMarker(marker)) {
     return Promise.reject(sessionChangedError());
@@ -718,13 +846,51 @@ export function sentBeforeSessionChange(error: unknown): boolean {
   return config?._issueMarker !== undefined;
 }
 
-// onSessionChanged handles refresh work refused because the session changed or
-// ended: never an expiry or a replay. A tab still showing a session that
-// another tab ended leaves it, as a rejected refresh would have.
+// onSessionChanged is called when refresh work is refused because the
+// session changed or ended (never an expiry or a replay), and whenever
+// another tab changes the session marker. A tab still showing a session that
+// has ended, or that another sign-in has replaced, leaves it, on a public page
+// too (the SSO callback page after its exchange, say). This does not depend
+// on the shared stored identity, which the ending tab has cleared.
 function onSessionChanged() {
+  if (tabSession === null) return;
   const marker = readSessionMarker();
-  if (isEndedMarker(marker) && marker !== endedHere && !isOnLoginPage()) {
-    expireSession();
+  if (marker === ENDED_MARKER_PREFIX + tabSession) {
+    leaveEndedSession();
+  } else if (sessionIdOf(marker) !== tabSession) {
+    leaveReplacedSession();
+  }
+}
+
+// leaveEndedSession signs this tab out of its session, which ended in another
+// tab: no request, and no new reason for the login page.
+function leaveEndedSession() {
+  const showed = tabSession;
+  tabSession = null;
+  markSessionEnding();
+  clearSessionTiming();
+  showReconnectToast("dismiss");
+  clearStoredIdentity();
+  leaveForLogin(showed);
+}
+
+// leaveReplacedSession takes this tab off a session that a newer sign-in has
+// replaced. The browser-wide state now belongs to that newer session, so this
+// writes nothing shared and announces nothing: it only stops this tab's
+// requests and leaves for the login page.
+function leaveReplacedSession() {
+  const showed = tabSession;
+  tabSession = null;
+  markSessionEnding();
+  leaveForLogin(showed);
+}
+
+// leaveForLogin sends a tab that has just left a session to the login page.
+// Only a public page that showed no session (signing in, an invitation, the
+// SSO callback before its exchange) stays where it is.
+function leaveForLogin(showed: string | null) {
+  if (showed !== null || !isOnPublicPage()) {
+    window.location.href = basePath + "/login";
   }
 }
 
@@ -1165,14 +1331,6 @@ function releaseSessionLock(config: unknown) {
   }
 }
 
-function isOnLoginPage(): boolean {
-  try {
-    return window.location.pathname.replace(/\/+$/, "").endsWith("/login");
-  } catch {
-    return false;
-  }
-}
-
 function isUnsupported(error: unknown): boolean {
   return axios.isAxiosError(error) && error.code === SESSION_UNSUPPORTED_CODE;
 }
@@ -1181,23 +1339,65 @@ function isUnsupported(error: unknown): boolean {
 // Locks once it would need a refresh (which may not run there): logged out
 // cookie-neutral (the refresh chain revoked; the cookie clearing stays pending
 // for a page that holds the lock), and the user is sent to the login page,
-// which says why a sign-in is refused. Once: a second refresh need (another
-// 401, the proactive timer) finds the session already ended and only leaves.
+// which says why a sign-in is refused. Once: a second refresh need finds this
+// tab showing no session (startServerLogout then ends nothing) and only leaves.
 function endUnsupportedSession() {
-  if (!isEndedMarker(readSessionMarker())) void api.post("/auth/logout", {}).catch(() => undefined);
-  expireSession();
+  const shown = tabSession;
+  if (startServerLogout(storedIdentity(), shown)) clearLastActivity();
+  // Then this tab leaves, as on any end: its own session, just ended, or a
+  // newer one that replaced it (whose shared state it leaves alone).
+  tabSession = shown;
+  onSessionChanged();
+}
+
+let routeMatcher: RouterMatcher | null = null;
+
+// A page that needs no session: one the router marks requiresAuth: false
+// (signing in, registering from an invitation, the SSO callback, the legal
+// pages, ...). It is not bound to the stored session at load, so it is never
+// sent away when that one ends; once it shows a session of its own (a sign-in
+// or exchange done there), it leaves it like any page.
+function isOnPublicPage(): boolean {
+  try {
+    const pathname = window.location.pathname;
+    const path =
+      (basePath && pathname.startsWith(basePath) ? pathname.slice(basePath.length) : pathname) || "/";
+    routeMatcher ??= createRouterMatcher(routes, {});
+    return routeMatcher.resolve({ path }, START_LOCATION).meta.requiresAuth === false;
+  } catch {
+    return false;
+  }
 }
 
 // expireSession ends the session after a definitive refresh rejection: clear
 // the browser identity and send the user to the login page.
-function expireSession() {
-  // Idempotent: a session already ended elsewhere keeps the same marker, so a
-  // logout still in progress for it is not cancelled.
-  endSessionMarker();
+function expireSession(expectedMarker: string | null) {
+  // Only the session the failing refresh belonged to ends here. If the
+  // browser has moved on (or it already ended), this tab just leaves.
+  if (readSessionMarker() !== expectedMarker || isEndedMarker(expectedMarker)) {
+    onSessionChanged();
+    return;
+  }
+  tabSession = null;
+  markSessionEnding();
+  endSessionMarker(sessionIdOf(expectedMarker));
+  if (hasStoredUser()) {
+    // Explained on the login page ("Your session expired").
+    recordSignOutReason({ reason: "expired" });
+  }
   clearSessionTiming();
+  clearLastActivity();
   showReconnectToast("dismiss");
   emitAuthSessionState("expired");
 
+  clearStoredIdentity();
+  if (!isOnPublicPage()) {
+    window.location.href = basePath + "/login";
+  }
+}
+
+// clearStoredIdentity removes the signed-in identity from browser storage.
+function clearStoredIdentity() {
   clearBrowserOrganizationIdentity();
   for (const key of [
     "user",
@@ -1220,15 +1420,125 @@ function expireSession() {
       }
     }
   }
-  if (!isOnLoginPage()) {
+}
+
+// startServerLogout ends the logical session now. Its server side follows in
+// the background (finishLogout: revoke, then /auth/logout, ordered on the
+// lock), and a pending record keeps it until it has got through.
+function startServerLogout(identity: string, expected: string | null): boolean {
+  tabSession = null;
+  const ended = expected === null ? null : endSessionMarker(expected);
+  if (ended === null) {
+    // This tab shows no session, or the browser has moved on to another one:
+    // nothing of ours to end, and the shared state is not ours to clear.
+    if (proactiveRefreshTimer !== null) {
+      clearTimeout(proactiveRefreshTimer);
+      proactiveRefreshTimer = null;
+    }
+    return false;
+  }
+  clearSessionTiming();
+  // (A key earlier builds kept; nothing reads it any more.)
+  writeStoredValue(SESSION_CSRF_KEY, null);
+  ownedLogout = ended;
+  writeStoredValue(
+    LOGOUT_PENDING_KEY,
+    JSON.stringify({ marker: ended, csrf: getCookie("whm_csrf") }),
+  );
+  pendingLogoutMarker = ended;
+  pendingLogout = finishLogout(ended, identity, readPendingLogout()?.marker === ended);
+  return true;
+}
+
+/**
+ * Ends the server session without waiting for it, ordered like a logout. The
+ * caller clears the identity and leaves for the login page at once, so a slow
+ * or hung backend never keeps patient data on screen. If the page goes away
+ * first, an open tab takes the logout over (or the last tab sends it), and
+ * the next sign-in or page load finishes whatever is still pending.
+ */
+export function endSessionInBackground() {
+  sessionEnding = true;
+  startServerLogout(storedIdentity(), tabSession);
+}
+
+// endIdleSession ends a session left idle past the organization's policy:
+// the server session in the background, the identity at once. It runs
+// before any refresh could extend such a session, and before the app renders
+// on load (leave=false: the router then opens the login page).
+function endIdleSession(leave: boolean) {
+  // A tab that no longer shows the current session (another sign-in replaced
+  // it) only leaves: the clock, the identity and the session are not its own.
+  if (!isTabSessionCurrent()) {
+    leaveReplacedSession();
+    return;
+  }
+  markSessionEnding();
+  recordSignOutReason({ reason: "idle", minutes: readSessionIdlePolicy() });
+  clearLastActivity();
+  endSessionInBackground();
+  clearStoredIdentity();
+  if (leave && !isOnPublicPage()) {
     window.location.href = basePath + "/login";
+  }
+}
+
+// idleSessionEnded ends the session if it is idle past the policy (say, a
+// laptop that slept through the deadline) and reports whether it did.
+function idleSessionEnded(): boolean {
+  if (!hasStoredUser() || !isIdleSessionStale()) return false;
+  endIdleSession(true);
+  return true;
+}
+
+/**
+ * Re-reads the organization's inactivity policy (it rides on GET /me). A
+ * failure keeps the last-known policy and never refreshes or ends the session.
+ */
+export async function checkSessionIdlePolicy(): Promise<void> {
+  const config: AxiosRequestConfig & { skipAuthRefresh: boolean } = {
+    skipAuthRefresh: true,
+  };
+  try {
+    await api.get("/me", config);
+  } catch {
+    // Keep the last-known policy.
+  }
+}
+
+/**
+ * Refreshes the session now, e.g. for "Stay signed in". It shares the
+ * cross-tab lock and retry policy of the 401 path, and a definitive rejection
+ * ends the session.
+ */
+export async function keepSessionAlive(): Promise<void> {
+  // "Stay signed in" or a delayed check never extends an ending session, or
+  // one that ended in another tab (a tab still showing it leaves it).
+  const marker = readSessionMarker();
+  try {
+    await ensureFreshSession(readAuthEpoch(), marker);
+  } catch (refreshError) {
+    if (isSessionChange(refreshError)) {
+      onSessionChanged();
+    } else if (isDefinitiveRefreshFailure(refreshError)) {
+      expireSession(marker);
+    }
+    throw refreshError;
   }
 }
 
 async function runProactiveRefresh() {
   proactiveRefreshTimer = null;
   // Hidden tabs wait for visibilitychange; a visible tab keeps the session warm.
-  if (document.visibilityState === "hidden" || !hasStoredUser()) return;
+  if (document.visibilityState === "hidden") return;
+  // No identity stored any more (an end in another tab clears it): a tab
+  // still showing that session leaves it.
+  if (!hasStoredUser()) {
+    onSessionChanged();
+    return;
+  }
+  // Never extend a session that is ending, or already idle past the policy.
+  if (sessionEnding || idleSessionEnded()) return;
   const expiresAt = readStoredNumber(AUTH_EXPIRES_AT_KEY);
   if (!expiresAt) return;
   if (expiresAt - Date.now() > PROACTIVE_REFRESH_LEAD_MS) {
@@ -1236,13 +1546,14 @@ async function runProactiveRefresh() {
     scheduleProactiveRefresh();
     return;
   }
+  const marker = readSessionMarker();
   try {
-    await ensureFreshSession(readAuthEpoch());
+    await ensureFreshSession(readAuthEpoch(), marker);
   } catch (refreshError) {
     if (isSessionChange(refreshError)) {
       onSessionChanged();
     } else if (isDefinitiveRefreshFailure(refreshError)) {
-      expireSession();
+      expireSession(marker);
     } else if (isUnsupported(refreshError)) {
       endUnsupportedSession();
     }
@@ -1324,6 +1635,9 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     // Another tab's session change: this tab's refresh in flight is stale, and
     // its late Set-Cookie must not land after that change.
     if (event.key === SESSION_MARKER_KEY) refreshAbort?.abort();
+    // Another tab ended this tab's session (say, a menu sign-out) or began a
+    // new one: leave at once, without waiting for a 401.
+    if (event.key === SESSION_MARKER_KEY) onSessionChanged();
   });
   onWindow("pagehide", sendLogoutOnPageHide);
   onWindow("pageshow", (event) => {
@@ -1331,6 +1645,16 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     if (event.persisted) {
       announceTab("hello");
       startTabHeartbeat();
+      // The restored page may still show a session that ended or was replaced
+      // meanwhile, or one it already left (every leave sets sessionEnding, and
+      // a reload starts clear): reload it, so it opens on what the browser
+      // holds now. A public page shows no session: it stays (say, a form).
+      if (
+        !isOnPublicPage() &&
+        (sessionEnding || (tabSession !== null && !isTabSessionCurrent()))
+      ) {
+        window.location.reload();
+      }
     }
   });
   startTabPresence();
@@ -1351,14 +1675,45 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     locksUnusable = true;
   }
 
-  if (pendingLogoutApplies() && webLocks()) {
+  const pendingAtLoad = pendingLogoutApplies();
+  if (pendingAtLoad) {
     // A logout that never got through (the tab closed first, or it failed):
-    // finish it now, ordered like any other. A page without Web Locks leaves
-    // it to one that holds the lock (it could only revoke again).
-    const pending = pendingLogoutApplies()!;
-    ownedLogout = pending.marker;
-    pendingLogoutMarker = pending.marker;
-    pendingLogout = finishLogout(pending.marker, undefined, true);
+    // finish it now, ordered like any other, while the jar is still the
+    // ended session's (its CSRF value, or none: then only /auth/logout goes
+    // out). Anything else in the jar is not that session's: drop the record.
+    // A page without Web Locks leaves it to one that holds the lock (it
+    // could only revoke again).
+    const csrf = getCookie("whm_csrf");
+    if (csrf !== null && csrf !== pendingAtLoad.csrf) {
+      writeStoredValue(LOGOUT_PENDING_KEY, null);
+    } else if (webLocks()) {
+      ownedLogout = pendingAtLoad.marker;
+      pendingLogoutMarker = pendingAtLoad.marker;
+      pendingLogout = finishLogout(pendingAtLoad.marker, undefined, true);
+    }
+  }
+
+  // An identity stored under an ended session belongs to that session (its
+  // tab never got to clear it): drop it, so the app opens on the login page.
+  if (isEndedMarker(readSessionMarker()) && hasStoredUser()) {
+    clearLastActivity();
+    clearStoredIdentity();
+  }
+  // A restored identity shows the current session; a public page shows none
+  // (say, an invitation being accepted while another account is stored).
+  if (hasStoredUser() && !isEndedMarker(readSessionMarker()) && !isOnPublicPage()) {
+    tabSession = readSessionId();
+  }
+
+  // A session left idle past the organization's policy (a tab reopened the
+  // next morning, a reload or restored session on a shared PC) ends here,
+  // before the router or any view renders: with the identity gone, the app
+  // opens on the login page, which explains why.
+  if (hasStoredUser() && isIdleSessionStale()) {
+    // A public page (an SSO callback page too: its exchange then goes after
+    // this logout) ends it as the browser's, and stays where it is.
+    if (isOnPublicPage()) tabSession = readSessionId();
+    endIdleSession(false);
   }
 }
 
@@ -1368,23 +1723,27 @@ api.interceptors.request.use(
     // Stamp the auth epoch and logical session the request is sent under.
     (config as AuthAwareRequestConfig)._authEpoch = readAuthEpoch();
     (config as AuthAwareRequestConfig)._sessionMarker = readSessionMarker();
+    // A tab still showing a session that a newer sign-in replaced never
+    // sends that session's work with the newer session's cookies.
+    if (
+      tabSession !== null &&
+      readSessionId() !== tabSession &&
+      !isSessionlessAuthEndpoint(config.url)
+    ) {
+      leaveReplacedSession();
+      return Promise.reject(sessionChangedError(config));
+    }
+    // While a session ends nothing may use its cookies, except signing in.
+    if (sessionEnding && !isSessionlessAuthEndpoint(config.url)) {
+      return Promise.reject(sessionEndingError(config));
+    }
     const path = requestPath(config.url);
     if (path === "/auth/logout") {
       // The user leaves at once: this request answers immediately. The
       // server-side logout (revoke, then /auth/logout) runs in the background,
       // ordered after any refresh in flight, and every refresh queued or
       // backing off for this session stops (the marker changed).
-      const identity = storedIdentity();
-      clearSessionTiming();
-      const ended = endSessionMarker();
-      endedHere = ended;
-      ownedLogout = ended;
-      writeStoredValue(
-        LOGOUT_PENDING_KEY,
-        JSON.stringify({ marker: ended, csrf: getCookie("whm_csrf") }),
-      );
-      pendingLogoutMarker = ended;
-      pendingLogout = finishLogout(ended, identity, readPendingLogout()?.marker === ended);
+      if (startServerLogout(storedIdentity(), tabSession)) clearLastActivity();
       config.adapter = async (requestConfig) => ({
         data: { data: { status: "logged_out" } },
         status: 200,
@@ -1415,6 +1774,9 @@ api.interceptors.request.use(
     );
     if (organizationId) {
       config.headers.set("X-Organization-ID", organizationId);
+    }
+    if (path === "/me") {
+      (config as AuthAwareRequestConfig)._sessionScope = sessionScope();
     }
     if (isSessionIssuing(config as AuthAwareRequestConfig, path)) {
       // A sign-in or org switch waits (bounded; the caller shows its normal
@@ -1505,35 +1867,57 @@ api.interceptors.response.use(
   async (response: AxiosResponse) => {
     const config = response.config as AuthAwareRequestConfig | undefined;
     const path = requestPath(config?.url);
-    if (!isSessionIssuing(config, path)) return response;
-    // The exchange's answer is seen here: a reload from now on need not guess.
-    if (config?._ssoExchange) clearSsoExchangeSent();
-    try {
-      if (readSessionMarker() !== config?._issueMarker) {
-        // The session ended while this was in flight: what it just issued
-        // must not outlive that end. Revoke it and clear the jar (the lock is
-        // still held), and report no sign-in.
-        await endIssuedSession();
-        throw sessionChangedError(config);
-      }
-      if (path === "/auth/switch-org") {
-        // Same session, new cookies: keep its begun record current.
-        noteBegunCsrf(readSessionMarker());
-      } else {
-        beginSessionMarker();
-        if (config?._ssoExchange) {
-          // The SSO account's identity and organization are not the ones a
-          // previous session stored (a password sign-in clears them before
-          // it is sent; the callback page has nothing to clear until now).
-          // The callback page applies the answer's user next, as a sign-in
-          // does, with no request in between.
-          clearBrowserOrganizationIdentity();
-          writeStoredValue("user", null);
+    const issued = isSessionIssuing(config, path);
+    if (issued) {
+      // The exchange's answer is seen here: a reload from now on need not guess.
+      if (config?._ssoExchange) clearSsoExchangeSent();
+      try {
+        if (readSessionMarker() !== config?._issueMarker) {
+          // The session ended while this was in flight: what it just issued
+          // must not outlive that end. Revoke it and clear the jar (the lock
+          // is still held), and report no sign-in.
+          await endIssuedSession();
+          throw sessionChangedError(config);
         }
+        if (path === "/auth/switch-org") {
+          // Same session, new cookies: keep its begun record current.
+          noteBegunCsrf(readSessionMarker());
+        } else {
+          beginSessionMarker();
+          if (config?._ssoExchange) {
+            // The SSO account's identity and organization are not the ones a
+            // previous session stored (a password sign-in clears them before
+            // it is sent; the callback page has nothing to clear until now).
+            // The callback page applies the answer's user next, as a sign-in
+            // does, with no request in between.
+            clearBrowserOrganizationIdentity();
+            writeStoredValue("user", null);
+          }
+        }
+        sessionEnding = false;
+        onSessionIssued(response.data?.data?.expires_in);
+      } finally {
+        releaseSessionLock(config);
       }
-      onSessionIssued(response.data?.data?.expires_in);
-    } finally {
-      releaseSessionLock(config);
+    }
+    // The inactivity policy rides on GET /me. It applies only if the session
+    // and identity the request was sent under are still current, and it is
+    // cached for the user and organization the response names.
+    if (path === "/me") {
+      const me = response.data?.data;
+      const scope = config?._sessionScope;
+      if (me?.id && scope === sessionScope()) {
+        rememberSessionIdlePolicy(
+          response.headers?.["x-session-idle-minutes"],
+          `${me.id}|${me.organization_id ?? ""}`,
+        );
+      }
+    }
+    // A sign-in (password, registration, or an SSO code exchange) starts the
+    // inactivity clock and retires the "why you were signed out" banner.
+    if (issued && path !== "/auth/switch-org") {
+      clearSignOutReason();
+      recordActivity();
     }
     return response;
   },
@@ -1564,8 +1948,19 @@ api.interceptors.response.use(
       error.response?.status !== 401 ||
       !originalRequest ||
       originalRequest._retry ||
+      originalRequest.skipAuthRefresh ||
       isSessionlessAuthEndpoint(originalRequest.url)
     ) {
+      return Promise.reject(error);
+    }
+
+    // No refresh may race the revoke of a session that is ending.
+    if (sessionEnding) {
+      return Promise.reject(error);
+    }
+
+    // A session idle past the policy ends rather than refreshing.
+    if (idleSessionEnded()) {
       return Promise.reject(error);
     }
 
@@ -1580,7 +1975,7 @@ api.interceptors.response.use(
       if (isSessionChange(refreshError)) {
         onSessionChanged();
       } else if (isDefinitiveRefreshFailure(refreshError)) {
-        expireSession();
+        expireSession(requestMarker);
       } else if (isUnsupported(refreshError)) {
         endUnsupportedSession();
       }

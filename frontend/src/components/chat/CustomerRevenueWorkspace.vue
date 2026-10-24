@@ -526,6 +526,10 @@ const detailContact = computed<Contact>(() => ({
   assigned_user_id: contactRecord.value?.assigned_user_id,
   whatsapp_account: props.contact?.whatsapp_account,
   marketing_opt_out: contactRecord.value?.marketing_opt_out,
+  name_source: contactRecord.value?.name_source,
+  wa_profile_name: contactRecord.value?.wa_profile_name,
+  wa_business_saved_name: contactRecord.value?.wa_business_saved_name,
+  wa_business_saved_name_removed: contactRecord.value?.wa_business_saved_name_removed,
   identity_review_ai_state: contactRecord.value?.identity_review_ai_state ?? {
     known: false,
     ai_allowed: false,

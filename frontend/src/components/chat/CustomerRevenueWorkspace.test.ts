@@ -1005,3 +1005,25 @@ describe('ContactInfoPanel name and address', () => {
     )
   })
 })
+
+describe('CustomerRevenueWorkspace contact name source', () => {
+  it('passes the display-name provenance to the contact details panel', async () => {
+    mocks.getWorkspace.mockResolvedValue(workspaceResponse({}, {
+      profile_name: 'Ali (Clinic)',
+      name_source: 'wa_business',
+      wa_profile_name: 'Ali WA',
+      wa_business_saved_name: 'Ali (Clinic)',
+      wa_business_saved_name_removed: true,
+    }))
+    const wrapper = mountWorkspace()
+    await flushPromises()
+
+    expect(wrapper.findComponent(ContactInfoPanel).props('contact')).toMatchObject({
+      profile_name: 'Ali (Clinic)',
+      name_source: 'wa_business',
+      wa_profile_name: 'Ali WA',
+      wa_business_saved_name: 'Ali (Clinic)',
+      wa_business_saved_name_removed: true,
+    })
+  })
+})

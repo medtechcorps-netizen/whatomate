@@ -2276,5 +2276,25 @@
     "callFailed": "विफल",
     "permissionSent": "अनुरोध भेजा",
     "permissionSentDesc": "WhatsApp पर स्वीकार करना होगा।"
+  },
+  "sessionSecurity": {
+    "reconnecting": "फिर से कनेक्ट हो रहा है…",
+    "reconnectFailed": "अभी सर्वर तक नहीं पहुँच पा रहे हैं",
+    "reconnectFailedDesc": "आप अभी भी साइन इन हैं। आपकी अगली कार्रवाई पर हम फिर से कोशिश करेंगे।",
+    "idleWarningTitle": "क्या आप अभी भी यहाँ हैं?",
+    "idleWarningBody": "निष्क्रियता के कारण {time} में आपको साइन आउट कर दिया जाएगा।",
+    "staySignedIn": "साइन इन रहें",
+    "signOut": "साइन आउट",
+    "signedOutIdle": "{duration} की निष्क्रियता के बाद आपको साइन आउट कर दिया गया।",
+    "sessionExpired": "आपका सत्र समाप्त हो गया है। कृपया फिर से साइन इन करें।",
+    "durationMinutes": "{count} मिनट",
+    "durationHour": "1 घंटा",
+    "durationHours": "{count} घंटे",
+    "idleSettingTitle": "निष्क्रियता के बाद साइन आउट",
+    "idleSettingDesc": "सदस्यों को साइन आउट होने से दो मिनट पहले चेतावनी दी जाती है। किसी भी खुले टैब में की गई गतिविधि गिनी जाती है।",
+    "idleSettingOff": "बंद",
+    "idleSettingSave": "साइन-आउट सेटिंग सहेजें",
+    "idleSettingSaved": "निष्क्रियता साइन-आउट अपडेट किया गया",
+    "idleSettingSaveFailed": "निष्क्रियता साइन-आउट अपडेट नहीं किया जा सका"
   }
 }

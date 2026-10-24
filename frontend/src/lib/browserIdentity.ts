@@ -25,6 +25,18 @@ export function setSelectedOrganizationId(organizationId: string) {
   }
 }
 
+// This tab stops using the selected organization without touching the stored
+// one (it belongs to a newer session in another tab).
+export function suppressBrowserOrganizationIdentity() {
+  selectedOrganizationIdentityCleared = true
+}
+
+// This tab follows the browser's session again (it adopted it): it uses the
+// stored selection again.
+export function resumeBrowserOrganizationIdentity() {
+  selectedOrganizationIdentityCleared = false
+}
+
 export function clearBrowserOrganizationIdentity() {
   selectedOrganizationIdentityCleared = true
   try {

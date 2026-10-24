@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/select";
 import { PageHeader, AuditLogPanel } from "@/components/shared";
 import LanguageSwitcher from "@/components/LanguageSwitcher.vue";
+import SessionIdleSetting from "@/components/settings/SessionIdleSetting.vue";
 import { toast } from "vue-sonner";
 import {
   Settings,
@@ -76,6 +77,9 @@ const generalSettings = ref({
   mask_phone_numbers: false,
 });
 
+// "Sign out after inactivity" (minutes, 0 = off), loaded with the settings.
+const sessionIdleMinutes = ref(240);
+
 // Notification Settings
 const notificationSettings = ref({
   email_notifications: true,
@@ -130,6 +134,7 @@ onMounted(async () => {
         date_format: orgData.settings?.date_format || "YYYY-MM-DD",
         mask_phone_numbers: orgData.settings?.mask_phone_numbers || false,
       };
+      sessionIdleMinutes.value = orgData.settings?.session_idle_timeout_minutes ?? 240;
       callingSettings.value = {
         calling_enabled: orgData.settings?.calling_enabled || false,
         max_call_duration: orgData.settings?.max_call_duration || 300,
@@ -471,6 +476,13 @@ function togglePlayAudio(type: "hold_music" | "ringback") {
                 </div>
               </div>
             </div>
+
+            <SessionIdleSetting
+              v-if="canWriteGeneral"
+              class="mt-6"
+              :initial-minutes="isLoading ? null : sessionIdleMinutes"
+              @saved="generalLogKey++"
+            />
 
             <RouterLink
               v-if="canReadIntegrations"

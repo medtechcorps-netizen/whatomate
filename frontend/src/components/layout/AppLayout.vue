@@ -24,6 +24,7 @@ import { authService } from '@/services/api'
 import OrganizationSwitcher from './OrganizationSwitcher.vue'
 import UserMenu from './UserMenu.vue'
 import ActiveCallPanel from '@/components/calling/ActiveCallPanel.vue'
+import SessionIdleWarning from './SessionIdleWarning.vue'
 import { ScrollToTop } from '@/components/shared'
 import { MORE_TOOLS_STORAGE_KEY, navigationSections, type NavSection } from './navigation'
 import ReReplyLogo from '@/components/brand/ReReplyLogo.vue'
@@ -352,11 +353,13 @@ const handleLogout = async () => {
   // Stop reconnect attempts before revoking the session. Otherwise a token
   // request already in flight can reopen the socket while logout completes.
   wsService.disconnect()
-  await authStore.logout()
+  const own = await authStore.logout()
   // Clear every cached workspace identity only after the logout request has
   // used the current tenant. A different account must never inherit names,
-  // memberships, pending reply keys, or the old org header.
-  organizationsStore.resetForIdentityChange()
+  // memberships, pending reply keys, or the old org header. A tab whose
+  // session was replaced clears its own copy only: the stored selection is
+  // the newer session's.
+  organizationsStore.resetForIdentityChange(own)
   omnichannelUnreadStore.resetForIdentityChange()
   router.push('/login')
 }
@@ -680,6 +683,7 @@ onBeforeUnmount(() => {
       </RouterView>
       <ActiveCallPanel />
       <ScrollToTop />
+      <SessionIdleWarning v-if="authStore.isAuthenticated" />
     </main>
   </div>
 </template>

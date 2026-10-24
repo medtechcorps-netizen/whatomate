@@ -44,10 +44,21 @@ export interface Contact {
   transfer_agent_name?: string
   whatsapp_account?: string
   marketing_opt_out?: boolean
+  // Where profile_name came from: a manual CRM edit, the name saved in the
+  // WhatsApp Business app, or the customer's own WhatsApp profile.
+  name_source?: ContactNameSource
+  // The customer's latest WhatsApp profile name or username.
+  wa_profile_name?: string
+  wa_business_saved_name?: string
+  // The contact was removed from the WhatsApp Business app's contacts; its
+  // last saved name is kept.
+  wa_business_saved_name_removed?: boolean
   identity_review_ai_state: ContactIdentityReviewEffectiveState
   created_at: string
   updated_at: string
 }
+
+export type ContactNameSource = 'manual' | 'wa_business' | 'wa_profile'
 
 // Chat list views. 'all' is the default list the release canary reads.
 export type ContactListFilter = 'all' | 'unread' | 'mine' | 'unassigned'

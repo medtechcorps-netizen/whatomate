@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
 import {
   exchangeSsoCode,
+  isTabSessionCurrent,
   keepSsoCode,
   ssoExchangeInterrupted,
   unsentSsoCode,
@@ -25,6 +26,13 @@ const errorMessage = ref('')
 
 const homeFor = (user: { role?: { name?: string } } | null | undefined) =>
   user?.role?.name === 'agent' ? '/analytics/agents' : '/'
+
+// The session this page signed in was replaced (another tab signed in): it
+// is not this tab's to enter.
+const toLogin = () => {
+  const basePath = ((window as any).__BASE_PATH__ ?? '').replace(/\/$/, '')
+  window.location.assign(basePath + '/login')
+}
 
 onMounted(async () => {
   // The SSO redirect set no cookie: it handed over a one-time code, bound to
@@ -47,8 +55,8 @@ onMounted(async () => {
       return
     }
     // Back after a sign-in, or a reload once it finished: a live session
-    // goes on into the app; otherwise the link is spent.
-    if (authStore.isAuthenticated || authStore.restoreSession()) {
+    // this tab shows goes on into the app; otherwise the link is spent.
+    if ((authStore.isAuthenticated && isTabSessionCurrent()) || authStore.restoreSession()) {
       void router.replace(homeFor(authStore.user))
       return
     }
@@ -62,14 +70,19 @@ onMounted(async () => {
     const response = await exchangeSsoCode(code)
     const user = response.data.data.user
 
-    // Set auth in store (only user — tokens are in httpOnly cookies)
+    // Set auth in store (only user — tokens are in httpOnly cookies). The
+    // tab shows the session its exchange just began: nothing ran in between.
     authStore.setAuth({ user })
 
     status.value = 'success'
     toast.success(t('auth.ssoLoginSuccess'))
 
-    // Redirect based on role
+    // Redirect based on role, unless the session was replaced meanwhile.
     setTimeout(() => {
+      if (!isTabSessionCurrent()) {
+        toLogin()
+        return
+      }
       router.push(homeFor(user))
     }, 1000)
   } catch (error: any) {

@@ -3,7 +3,14 @@ import { ref, computed } from 'vue'
 import { api } from '@/services/api'
 import { AUTH_SESSION_EVENT } from '@/lib/authSessionEvent'
 import {
+  adoptTabSession,
+  browserSessionEnded,
+  currentTabSession,
+  sharedStateBelongsTo,
+} from '@/lib/tabSession'
+import {
   clearBrowserOrganizationIdentity,
+  resumeBrowserOrganizationIdentity,
   setSelectedOrganizationId,
 } from '@/lib/browserIdentity'
 
@@ -94,7 +101,10 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  function applyAuth(authData: { user: User }, clearBreak = true) {
+  function applyAuth(authData: { user: User }, clearBreak = true): boolean {
+    // This tab now shows the browser's current session. A tab that still
+    // shows a replaced one never takes on this identity (it leaves).
+    if (!adoptTabSession()) return false
     identityGeneration++
     userRequestGeneration++
     user.value = authData.user
@@ -104,6 +114,7 @@ export const useAuthStore = defineStore('auth', () => {
       safeRemoveLocalStorage('break_started_at')
     }
     safeSetLocalStorage('user', JSON.stringify(authData.user))
+    return true
   }
 
   function setAuth(authData: { user: User }) {
@@ -166,6 +177,18 @@ export const useAuthStore = defineStore('auth', () => {
           clearAuth()
           return false
         }
+        // An identity stored under an ended session is not shown again. A tab
+        // that still shows a replaced session shows none (the stored identity
+        // is the newer session's, and stays).
+        if (!adoptTabSession()) {
+          if (browserSessionEnded()) clearAuth()
+          else clearAuthLocally()
+          return false
+        }
+        // This tab shows the browser's session again: its organization
+        // selection applies here again (an earlier local sign-out set it
+        // aside).
+        resumeBrowserOrganizationIdentity()
         authenticationRequestGeneration++
         applyAuth({ user: parsed }, false)
         return true
@@ -238,14 +261,35 @@ export const useAuthStore = defineStore('auth', () => {
     setSelectedOrganizationId(organizationId)
   }
 
-  async function logout(): Promise<void> {
+  // Forgets the identity in this tab only: the shared state belongs to a newer
+  // session that this tab no longer shows.
+  function clearAuthLocally() {
+    authenticationRequestGeneration++
+    identityGeneration++
+    userRequestGeneration++
+    user.value = null
+    breakStartedAt.value = null
+    resetProductEntitlements()
+  }
+
+  // Resolves whether the shared identity was cleared (this tab's session was
+  // the browser's, and still is or has just ended), or only this tab's.
+  async function logout(): Promise<boolean> {
+    // Only a tab that shows the current session clears the shared identity,
+    // and only if no newer session began (in any tab) while the logout went
+    // through: that one owns the shared state by then.
+    const session = currentTabSession()
+    let own = false
     try {
       await api.post('/auth/logout', {})
     } catch {
       // Ignore logout errors
     } finally {
-      clearAuth()
+      own = sharedStateBelongsTo(session)
+      if (own) clearAuth()
+      else clearAuthLocally()
     }
+    return own
   }
 
   function setAvailability(available: boolean, breakStart?: string | null) {

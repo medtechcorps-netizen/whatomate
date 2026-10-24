@@ -567,6 +567,15 @@ func (a *App) ImportData(r *fastglue.Request) error {
 					// Update existing record
 					delete(recordMap, "organization_id")
 					delete(recordMap, config.UniqueColumn)
+					if name, ok := recordMap["profile_name"].(string); ok {
+						if _, isContact := existing.(*models.Contact); isContact {
+							// An imported name that changes the contact's name is a
+							// manual name. The UPDATE compares against the stored name
+							// and merges only this key, so concurrent metadata writes
+							// are kept.
+							recordMap["metadata"] = manualContactNameMetadataUpdate(name)
+						}
+					}
 					if len(recordMap) > 0 {
 						if err := importRecordWrite(a.DB, orgID, config.Model, func(tx *gorm.DB) error {
 							return tx.Model(existing).Updates(recordMap).Error
@@ -597,6 +606,12 @@ func (a *App) ImportData(r *fastglue.Request) error {
 
 		// Create new record using model type
 		recordMap["id"] = uuid.New()
+		if _, isContact := config.Model.(*models.Contact); isContact {
+			if name, ok := recordMap["profile_name"].(string); ok && strings.TrimSpace(name) != "" {
+				// An imported name is a manual name.
+				recordMap["metadata"] = importedContactNameMetadata()
+			}
+		}
 
 		// Create instance of the model type and populate it via reflection
 		modelType := reflect.TypeOf(config.Model).Elem()

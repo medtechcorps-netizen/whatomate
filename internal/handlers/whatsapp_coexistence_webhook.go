@@ -106,6 +106,13 @@ type coexistenceContactIdentity struct {
 	Username     string
 	ProfileName  string
 	FallbackKey  string
+	// SavedName is the name the business saved for this contact in its
+	// WhatsApp Business app (smb_app_state_sync) and SavedNameAt Meta's time
+	// for that event (zero when it gave none). Only a contact created for the
+	// identity takes it at creation;
+	// the state-sync handler applies it to an existing contact itself.
+	SavedName   string
+	SavedNameAt time.Time
 }
 
 type whatsAppAdmissionWinnerKind string
@@ -611,8 +618,16 @@ func (a *App) updateCoexistenceContactIdentity(
 		"metadata":          metadata,
 		"whats_app_account": account.Name,
 	}
-	if profileName := identity.displayName(); profileName != "" {
-		updates["profile_name"] = profileName
+	// identity names are the customer's own profile name or username. They are
+	// recorded as such and rename the contact only while no manual CRM name or
+	// WhatsApp Business saved name owns the display name. Every caller passes
+	// the canonical row it holds locked, so metadata is that row's current state.
+	if displayName, _ := contactutil.ApplyContactProfileName(
+		contact.ProfileName,
+		metadata,
+		identity.displayName(),
+	); displayName != contact.ProfileName {
+		updates["profile_name"] = displayName
 	}
 	primaryUserID := identity.primaryUserID()
 	canReplaceUserID := contact.BSUID == "" || contact.BSUID == primaryUserID ||
@@ -651,14 +666,21 @@ func (a *App) noteCoexistenceContactReconciliation(
 	metadata["coexistence_phone_unavailable"] = false
 	// The real-phone contact becomes the BSUID lookup target. Keep the old row
 	// and its CRM history intact, but prevent ambiguous future BSUID resolution.
-	return a.DB.Model(&models.Contact{}).Where(
+	if err := a.DB.Model(&models.Contact{}).Where(
 		"organization_id = ? AND id = ?",
 		account.OrganizationID,
 		placeholder.ID,
 	).Updates(map[string]any{
 		"bs_uid":   "",
 		"metadata": metadata,
-	}).Error
+	}).Error; err != nil {
+		return err
+	}
+	// Keep the caller's copy equal to the row, so a later clone-and-write of
+	// placeholder.Metadata cannot drop the reconciliation note.
+	placeholder.BSUID = ""
+	placeholder.Metadata = metadata
+	return nil
 }
 
 func (a *App) noteCoexistencePhoneConflict(
@@ -673,11 +695,18 @@ func (a *App) noteCoexistencePhoneConflict(
 	if phoneOwner != nil {
 		metadata["coexistence_phone_owner_contact_id"] = phoneOwner.ID.String()
 	}
-	return a.DB.Model(&models.Contact{}).Where(
+	if err := a.DB.Model(&models.Contact{}).Where(
 		"organization_id = ? AND id = ?",
 		account.OrganizationID,
 		contact.ID,
-	).Update("metadata", metadata).Error
+	).Update("metadata", metadata).Error; err != nil {
+		return err
+	}
+	// getOrCreateCoexistenceContact returns this contact, and callers such as
+	// the state-sync add clone contact.Metadata and write it back. Keep the
+	// in-memory copy equal to the row so that write keeps the conflict note.
+	contact.Metadata = metadata
+	return nil
 }
 
 // getOrCreateCoexistenceContact accepts both legacy phone identities and the
@@ -790,7 +819,14 @@ func (a *App) getOrCreateCoexistenceContact(
 	if phoneUnavailable {
 		phone = coexistenceIdentityPlaceholder(identity)
 	}
-	contact, created, err := a.getOrCreateInboundContact(account, phone, identity.displayName(), "")
+	contact, created, err := a.getOrCreateInboundContactWithSavedName(
+		account,
+		phone,
+		identity.displayName(),
+		"",
+		identity.SavedName,
+		identity.SavedNameAt,
+	)
 	if err != nil {
 		return nil, false, err
 	}
@@ -831,41 +867,69 @@ func (a *App) persistContactStateSyncBeforeAck(
 				scoped.Log.Warn("Ignoring unsupported smb_app_state_sync item", "type", item.Type)
 				continue
 			}
+			// full_name/first_name is the name the business saved in its
+			// WhatsApp Business app, not the customer's profile name, so it is
+			// kept out of the identity and applied as the saved name below.
 			identity := coexistenceContactIdentity{
 				Phone:        item.Contact.PhoneNumber,
 				UserID:       item.Contact.UserID,
 				ParentUserID: item.Contact.ParentUserID,
 				Username:     item.Contact.Username,
-				ProfileName:  item.Contact.FullName,
 				FallbackKey:  item.Metadata.Timestamp,
 			}
-			if identity.ProfileName == "" {
-				identity.ProfileName = item.Contact.FirstName
+			savedName := strings.TrimSpace(item.Contact.FullName)
+			if savedName == "" {
+				savedName = strings.TrimSpace(item.Contact.FirstName)
 			}
+			// Only Meta's own event time may order address-book events. A
+			// missing or invalid one is zero: the event still applies, never
+			// counts as stale and never records its own (server) time. An
+			// untimed add that clears a removal keeps the latest known event
+			// time (a Meta time, or the cap that replaced a future one) as the
+			// saved-name watermark (applyCoexistenceSavedContactName).
+			eventAt := coexistenceAddressBookEventTime(item.Metadata.Timestamp, time.Now())
 			if identity.Phone == "" && identity.primaryUserID() == "" && strings.TrimSpace(identity.Username) == "" {
 				scoped.Log.Warn("Ignoring contact state sync item without an addressable identity")
 				continue
 			}
 			switch strings.ToLower(strings.TrimSpace(item.Action)) {
 			case "add":
+				// A contact this entry creates is created with the saved name.
+				identity.SavedName = savedName
+				identity.SavedNameAt = eventAt
 				contact, _, err := scoped.getOrCreateCoexistenceContact(account, identity)
 				if err != nil {
 					return fmt.Errorf("upsert synced coexistence contact: %w", err)
 				}
+				syncedAt := eventAt
 				contactMetadata := cloneMessageMetadata(contact.Metadata)
-				contactMetadata["coexistence_app_contact"] = true
-				contactMetadata["coexistence_app_contact_synced_at"] = coexistenceMessageTime(
-					item.Metadata.Timestamp,
-					time.Now().UTC(),
-				).Format(time.RFC3339)
+				// A redelivered or reordered add older than the last applied add
+				// or removal must not make a removed contact an app contact again.
+				if !coexistenceAppContactEventIsStale(contactMetadata, syncedAt) {
+					contactMetadata["coexistence_app_contact"] = true
+					if !syncedAt.IsZero() {
+						contactMetadata["coexistence_app_contact_synced_at"] = syncedAt.Format(time.RFC3339)
+					}
+				}
+				contactUpdates := map[string]any{
+					"whats_app_account": account.Name,
+					"metadata":          contactMetadata,
+				}
+				// contact is the canonical row getOrCreateCoexistenceContact
+				// holds locked, so the saved name is decided on its current state.
+				if displayName := applyCoexistenceSavedContactName(
+					contact.ProfileName,
+					contactMetadata,
+					savedName,
+					syncedAt,
+				); displayName != contact.ProfileName {
+					contactUpdates["profile_name"] = displayName
+				}
 				if err := scoped.DB.Model(&models.Contact{}).Where(
 					"organization_id = ? AND id = ?",
 					account.OrganizationID,
 					contact.ID,
-				).Updates(map[string]any{
-					"whats_app_account": account.Name,
-					"metadata":          contactMetadata,
-				}).Error; err != nil {
+				).Updates(contactUpdates).Error; err != nil {
 					return fmt.Errorf("bind synced contact to account: %w", err)
 				}
 			case "remove":
@@ -879,12 +943,18 @@ func (a *App) persistContactStateSyncBeforeAck(
 				// An address-book removal is not a CRM deletion. Preserve the
 				// canonical Contact and all messages, assignments, CRM data, and
 				// audit history; only record that it is no longer an app contact.
+				removedAt := eventAt
 				contactMetadata := cloneMessageMetadata(contact.Metadata)
-				contactMetadata["coexistence_app_contact"] = false
-				contactMetadata["coexistence_app_contact_removed_at"] = coexistenceMessageTime(
-					item.Metadata.Timestamp,
-					time.Now().UTC(),
-				).Format(time.RFC3339)
+				// Likewise an older removal must not undo a newer add.
+				if !coexistenceAppContactEventIsStale(contactMetadata, removedAt) {
+					contactMetadata["coexistence_app_contact"] = false
+					if !removedAt.IsZero() {
+						contactMetadata["coexistence_app_contact_removed_at"] = removedAt.Format(time.RFC3339)
+					}
+				}
+				// The last saved name stays the display name; it is only marked
+				// as no longer saved in the WhatsApp Business app.
+				markCoexistenceSavedContactNameRemoved(contactMetadata, removedAt)
 				if err := scoped.DB.Model(&models.Contact{}).Where(
 					"organization_id = ? AND id = ?",
 					account.OrganizationID,
@@ -902,6 +972,145 @@ func (a *App) persistContactStateSyncBeforeAck(
 		// repair) the one-time contact request state.
 		return nil
 	})
+}
+
+// coexistenceSavedContactNameEventIsStale reports whether an address-book
+// event at `at` predates the last add/edit or removal already recorded in
+// metadata. Meta may redeliver or reorder smb_app_state_sync events, and an
+// older event must not undo a newer one. Events in the same second apply in
+// arrival order.
+func coexistenceSavedContactNameEventIsStale(metadata models.JSONB, at time.Time) bool {
+	return coexistenceAddressBookEventIsStale(
+		metadata,
+		at,
+		contactutil.ContactWABusinessSavedNameAtKey,
+		contactutil.ContactWABusinessSavedNameRemovedAtKey,
+	)
+}
+
+// coexistenceAppContactEventIsStale applies the same rule to the
+// coexistence_app_contact flag: an add or remove older than the last applied
+// add (coexistence_app_contact_synced_at) or removal
+// (coexistence_app_contact_removed_at) leaves the flag and both times alone.
+func coexistenceAppContactEventIsStale(metadata models.JSONB, at time.Time) bool {
+	return coexistenceAddressBookEventIsStale(
+		metadata,
+		at,
+		"coexistence_app_contact_synced_at",
+		"coexistence_app_contact_removed_at",
+	)
+}
+
+// coexistenceAddressBookEventIsStale reports whether `at` is before any of the
+// RFC 3339 event times stored in metadata under keys. A missing or unparsable
+// stored time never makes an event stale, and an event without a Meta time
+// (zero `at`) is never stale.
+func coexistenceAddressBookEventIsStale(metadata models.JSONB, at time.Time, keys ...string) bool {
+	if at.IsZero() {
+		return false
+	}
+	for _, key := range keys {
+		value, _ := metadata[key].(string)
+		if value == "" {
+			continue
+		}
+		if applied, err := time.Parse(time.RFC3339, value); err == nil && at.Before(applied) {
+			return true
+		}
+	}
+	return false
+}
+
+// latestCoexistenceAddressBookTime returns the latest of `at` and the RFC 3339
+// event times stored in metadata under keys, or zero when there is none. A
+// missing, empty or unparsable stored time is ignored.
+func latestCoexistenceAddressBookTime(metadata models.JSONB, at time.Time, keys ...string) time.Time {
+	latest := at
+	for _, key := range keys {
+		value, _ := metadata[key].(string)
+		if value == "" {
+			continue
+		}
+		if known, err := time.Parse(time.RFC3339, value); err == nil && known.After(latest) {
+			latest = known
+		}
+	}
+	return latest
+}
+
+// applyCoexistenceSavedContactName records name, the contact name the business
+// saved in its WhatsApp Business app at `at`, in metadata (a copy the caller
+// writes back) and returns the display name to store. The saved name renames
+// the contact unless a manual CRM name owns the display name. An add without a
+// name, or one older than the last recorded address-book event, changes
+// nothing. A zero `at` (no Meta time) always applies and records no time of
+// its own; the saved-name time keeps the latest event time already recorded
+// (a Meta time, or the now + 5 min cap that replaced a future one), so
+// clearing a removal carries that removal's time forward.
+func applyCoexistenceSavedContactName(displayName string, metadata models.JSONB, name string, at time.Time) string {
+	name = strings.TrimSpace(name)
+	if name == "" || metadata == nil || coexistenceSavedContactNameEventIsStale(metadata, at) {
+		return displayName
+	}
+	metadata[contactutil.ContactWABusinessSavedNameKey] = name
+	// The saved-name time is the saved name's ordering watermark: the latest
+	// recorded event time (a Meta time, or the cap that replaced a future one)
+	// this state is known not to predate. Clearing the removal
+	// mark must not lower it, so an add without a Meta time (which arrived
+	// after that removal) carries the removal's time forward. A timed add is
+	// never older than either time here, so it simply records its own.
+	if watermark := latestCoexistenceAddressBookTime(
+		metadata,
+		at,
+		contactutil.ContactWABusinessSavedNameAtKey,
+		contactutil.ContactWABusinessSavedNameRemovedAtKey,
+	); !watermark.IsZero() {
+		metadata[contactutil.ContactWABusinessSavedNameAtKey] = watermark.UTC().Format(time.RFC3339)
+	}
+	delete(metadata, contactutil.ContactWABusinessSavedNameRemovedAtKey)
+	if contactutil.ContactNameSource(metadata) == contactutil.ContactNameSourceManual {
+		return displayName
+	}
+	metadata[contactutil.ContactNameSourceKey] = contactutil.ContactNameSourceWABusiness
+	return name
+}
+
+// markCoexistenceSavedContactNameRemoved records that the contact was removed
+// from the WhatsApp Business app's address book at `at`. The last saved name
+// is kept, and stays the display name if it was one, so the CRM does not
+// rename a customer the team knows; a later add or edit clears the mark. The
+// mark is the key's presence; its value is Meta's event time, or empty for a
+// removal without one, so that removal orders nothing.
+func markCoexistenceSavedContactNameRemoved(metadata models.JSONB, at time.Time) {
+	if metadata == nil || coexistenceSavedContactNameEventIsStale(metadata, at) {
+		return
+	}
+	if at.IsZero() {
+		if _, marked := metadata[contactutil.ContactWABusinessSavedNameRemovedAtKey]; !marked {
+			metadata[contactutil.ContactWABusinessSavedNameRemovedAtKey] = ""
+		}
+		return
+	}
+	metadata[contactutil.ContactWABusinessSavedNameRemovedAtKey] = at.UTC().Format(time.RFC3339)
+}
+
+// coexistenceAddressBookEventTime returns the time Meta gave an
+// smb_app_state_sync event, or zero when the timestamp is missing or invalid.
+// A time more than five minutes ahead of now is replaced by now + 5 min, a
+// server-derived value that is then recorded and ordered like a Meta time,
+// including as a carried saved-name watermark. A bad future timestamp
+// therefore makes later events stale only while their Meta times fall before
+// that capped value; events timed after it apply.
+func coexistenceAddressBookEventTime(timestamp string, now time.Time) time.Time {
+	seconds, err := strconv.ParseInt(strings.TrimSpace(timestamp), 10, 64)
+	if err != nil || seconds <= 0 {
+		return time.Time{}
+	}
+	at := time.Unix(seconds, 0).UTC()
+	if limit := now.UTC().Add(5 * time.Minute).Truncate(time.Second); at.After(limit) {
+		return limit
+	}
+	return at
 }
 
 func coexistenceEchoDirection(_ CoexistenceMessage) models.Direction {
