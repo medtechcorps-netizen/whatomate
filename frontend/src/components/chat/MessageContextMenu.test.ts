@@ -109,6 +109,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.useRealTimers()
+  vi.restoreAllMocks()
   // Close an open menu first so reka-ui's dismissable-layer stack is unwound.
   document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
   await flushPromises()
@@ -219,15 +220,16 @@ describe('MessageContextMenu', () => {
     vi.useFakeTimers()
     mountMenu()
     const bubble = container.querySelector<HTMLElement>('#message-m-1 .chat-bubble')!
-    const callout = () => bubble.style.getPropertyValue('-webkit-touch-callout') || (bubble.style as any).webkitTouchCallout || ''
+    const setProperty = vi.spyOn(bubble.style, 'setProperty')
+    const removeProperty = vi.spyOn(bubble.style, 'removeProperty')
     pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch', clientX: 10, clientY: 10 })
-    expect(callout()).toBe('none')
+    expect(setProperty).toHaveBeenCalledWith('-webkit-touch-callout', 'none')
     // Partial selection (an IC or phone number) must stay possible on touch.
     expect(bubble.style.userSelect).toBe('')
     await vi.advanceTimersByTimeAsync(600)
     expect(menu()).not.toBeNull()
     pointer('pointerup', '[data-testid="text-1"]', { pointerType: 'touch', clientX: 10, clientY: 10 })
-    expect(callout()).toBe('')
+    expect(removeProperty).toHaveBeenCalledWith('-webkit-touch-callout')
   })
 
   it('lets a selection that starts during the press win over the menu', async () => {

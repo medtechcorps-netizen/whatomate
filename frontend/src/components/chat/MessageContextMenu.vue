@@ -123,7 +123,7 @@ let longPressTimer = 0
 let pressOrigin: { x: number; y: number } | null = null
 let suppressed: { bubble: HTMLElement; callout: string } | null = null
 
-type CalloutStyle = CSSStyleDeclaration & { webkitTouchCallout?: string }
+const TOUCH_CALLOUT_PROPERTY = '-webkit-touch-callout'
 
 /**
  * Stop only the native callout on the pressed bubble. Text selection stays
@@ -132,14 +132,18 @@ type CalloutStyle = CSSStyleDeclaration & { webkitTouchCallout?: string }
  */
 function suppressNativeGesture(bubble: HTMLElement) {
   restoreNativeGesture()
-  const style = bubble.style as CalloutStyle
-  suppressed = { bubble, callout: style.webkitTouchCallout ?? '' }
-  style.webkitTouchCallout = 'none'
+  const callout = bubble.style.getPropertyValue(TOUCH_CALLOUT_PROPERTY)
+  suppressed = { bubble, callout }
+  bubble.style.setProperty(TOUCH_CALLOUT_PROPERTY, 'none')
 }
 
 function restoreNativeGesture() {
   if (!suppressed) return
-  ;(suppressed.bubble.style as CalloutStyle).webkitTouchCallout = suppressed.callout
+  if (suppressed.callout) {
+    suppressed.bubble.style.setProperty(TOUCH_CALLOUT_PROPERTY, suppressed.callout)
+  } else {
+    suppressed.bubble.style.removeProperty(TOUCH_CALLOUT_PROPERTY)
+  }
   suppressed = null
 }
 
