@@ -99,7 +99,7 @@ describe('AppLayout logout identity isolation', () => {
 
   it('disconnects first and clears the selected organization only after logout completes', async () => {
     const logoutRequest = deferred()
-    mocks.logout.mockReturnValueOnce(logoutRequest.promise)
+    mocks.logout.mockReturnValueOnce(logoutRequest.promise.then(() => true))
     wrapper = shallowMount(AppLayout, {
       global: {
         mocks: { $t: (key: string) => key },
@@ -123,7 +123,31 @@ describe('AppLayout logout identity isolation', () => {
     await flushPromises()
 
     expect(mocks.resetOrganizations).toHaveBeenCalledTimes(1)
+    expect(mocks.resetOrganizations).toHaveBeenCalledWith(true)
     expect(mocks.resetOmnichannelUnread).toHaveBeenCalledTimes(1)
+    expect(mocks.routerPush).toHaveBeenCalledWith('/login')
+  })
+
+  it("a tab whose session was replaced clears only its own organizations, not the newer session's selection", async () => {
+    mocks.logout.mockResolvedValueOnce(false)
+    wrapper = shallowMount(AppLayout, {
+      global: {
+        mocks: { $t: (key: string) => key },
+        stubs: {
+          UserMenu: {
+            emits: ['logout'],
+            template: '<button data-testid="logout" @click="$emit(\'logout\')">Logout</button>',
+          },
+          Transition: { template: '<div><slot /></div>' },
+        },
+      },
+    })
+
+    await wrapper.get('[data-testid="logout"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.resetOrganizations).toHaveBeenCalledTimes(1)
+    expect(mocks.resetOrganizations).toHaveBeenCalledWith(false)
     expect(mocks.routerPush).toHaveBeenCalledWith('/login')
   })
 })

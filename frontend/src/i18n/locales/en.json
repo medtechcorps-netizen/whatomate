@@ -182,7 +182,22 @@
   "sessionSecurity": {
     "reconnecting": "Reconnecting…",
     "reconnectFailed": "Can't reach the server right now",
-    "reconnectFailedDesc": "You're still signed in. We'll try again with your next action."
+    "reconnectFailedDesc": "You're still signed in. We'll try again with your next action.",
+    "idleWarningTitle": "Are you still there?",
+    "idleWarningBody": "You'll be signed out in {time} due to inactivity.",
+    "staySignedIn": "Stay signed in",
+    "signOut": "Sign out",
+    "signedOutIdle": "You were signed out after {duration} of inactivity.",
+    "sessionExpired": "Your session expired. Please sign in again.",
+    "durationMinutes": "{count} minutes",
+    "durationHour": "1 hour",
+    "durationHours": "{count} hours",
+    "idleSettingTitle": "Sign out after inactivity",
+    "idleSettingDesc": "Members are warned two minutes before they are signed out. Activity in any open tab counts.",
+    "idleSettingOff": "Off",
+    "idleSettingSave": "Save sign-out setting",
+    "idleSettingSaved": "Inactivity sign-out updated",
+    "idleSettingSaveFailed": "Couldn't update the inactivity sign-out"
   },
   "conversationNotes": {
     "editNote": "Edit note",
@@ -679,7 +694,15 @@
     "searchTags": "Search tags...",
     "noTagsFound": "No tags found",
     "whatsappAccount": "WhatsApp Account",
-    "selectAccount": "Select account..."
+    "selectAccount": "Select account...",
+    "nameSource": {
+      "whatsappProfile": "WhatsApp profile: {name}",
+      "savedInWhatsAppBusiness": "Saved in WhatsApp Business",
+      "savedInWhatsAppBusinessHint": "This name comes from the contact saved in your WhatsApp Business app.",
+      "removedFromWhatsAppBusiness": "Removed from WhatsApp Business contacts",
+      "removedFromWhatsAppBusinessHint": "This is the last name saved in your WhatsApp Business app. The contact has since been removed there.",
+      "clearHint": "Clear the name to use the WhatsApp Business saved name, or else the customer's WhatsApp profile name."
+    }
   },
   "importExport": {
     "title": "Import/Export {resource}",

@@ -1033,6 +1033,12 @@ func (a *App) MergeContact(r *fastglue.Request) error {
 		target.MarketingOptOut = target.MarketingOptOut || source.MarketingOptOut
 		target.Tags = customerWorkspaceMergeTags(target.Tags, source.Tags)
 		target.Metadata = customerWorkspaceMergeMetadata(target.Metadata, source.Metadata)
+		// The display-name provenance belongs to whichever contact's name is kept.
+		nameOwner := oldTarget.Metadata
+		if target.ProfileName != oldTarget.ProfileName {
+			nameOwner = source.Metadata
+		}
+		keepContactNameProvenance(target.Metadata, nameOwner)
 		target.LastMessageAt = customerWorkspaceLatestTime(target.LastMessageAt, source.LastMessageAt)
 		target.LastInboundAt = customerWorkspaceLatestTime(target.LastInboundAt, source.LastInboundAt)
 		if source.LastMessageAt != nil &&

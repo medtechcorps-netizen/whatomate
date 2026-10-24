@@ -3855,6 +3855,18 @@ func (a *App) getOrCreateInboundContact(
 	account *models.WhatsAppAccount,
 	phoneNumber, profileName, bsuid string,
 ) (*models.Contact, bool, error) {
+	return a.getOrCreateInboundContactWithSavedName(account, phoneNumber, profileName, bsuid, "", time.Time{})
+}
+
+// getOrCreateInboundContactWithSavedName is getOrCreateInboundContact for a
+// WhatsApp Business address-book entry: a contact it creates is named by
+// savedName (the name saved at savedAt) before its creation is recorded, so
+// the "Contact created" activity and webhook carry that name.
+func (a *App) getOrCreateInboundContactWithSavedName(
+	account *models.WhatsAppAccount,
+	phoneNumber, profileName, bsuid, savedName string,
+	savedAt time.Time,
+) (*models.Contact, bool, error) {
 	if account == nil {
 		return nil, false, errors.New("WhatsApp account is required")
 	}
@@ -3867,11 +3879,13 @@ func (a *App) getOrCreateInboundContact(
 			if err := database.LockOrganizationPolicyScope(tx, account.OrganizationID); err != nil {
 				return err
 			}
+			// The name is applied below, on the canonical row this transaction
+			// locks, so its precedence check reads the row it writes.
 			contact, created, createErr := contactutil.GetOrCreateContact(
 				tx,
 				account.OrganizationID,
 				phoneNumber,
-				profileName,
+				"",
 			)
 			if createErr != nil {
 				return createErr
@@ -3885,12 +3899,26 @@ func (a *App) getOrCreateInboundContact(
 			if resolveErr != nil {
 				return resolveErr
 			}
-			if profileName != "" && canonical.ProfileName != profileName {
-				if updateErr := tx.Model(canonical).
-					Update("profile_name", profileName).Error; updateErr != nil {
+			// profileName is the sender's own WhatsApp profile name. It is always
+			// recorded, but it renames the contact only when no manual CRM name or
+			// WhatsApp Business saved name owns the display name.
+			nameUpdates := contactutil.ObserveContactProfileName(canonical, profileName)
+			if created && strings.TrimSpace(savedName) != "" {
+				metadata := contactutil.CloneContactMetadata(canonical.Metadata)
+				canonical.ProfileName = applyCoexistenceSavedContactName(canonical.ProfileName, metadata, savedName, savedAt)
+				canonical.Metadata = metadata
+				if nameUpdates == nil {
+					nameUpdates = map[string]any{}
+				}
+				nameUpdates["profile_name"] = canonical.ProfileName
+				nameUpdates["metadata"] = metadata
+			}
+			if nameUpdates != nil {
+				if updateErr := tx.Model(&models.Contact{}).
+					Where("organization_id = ? AND id = ?", account.OrganizationID, canonical.ID).
+					Updates(nameUpdates).Error; updateErr != nil {
 					return updateErr
 				}
-				canonical.ProfileName = profileName
 			}
 			if created {
 				if _, activityErr := recordCustomerActivity(

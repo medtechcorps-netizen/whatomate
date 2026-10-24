@@ -51,8 +51,14 @@ type ContactResponse struct {
 	ServiceWindowOpen     bool                                 `json:"service_window_open"`
 	MarketingOptOut       bool                                 `json:"marketing_opt_out"`
 	IdentityReviewAIState WhatsAppIdentityReviewEffectiveState `json:"identity_review_ai_state"`
-	CreatedAt             time.Time                            `json:"created_at"`
-	UpdatedAt             time.Time                            `json:"updated_at"`
+	// Display-name provenance (contacts.metadata, see contactutil). The keys
+	// are stripped from Metadata so a contact edit cannot echo them back.
+	NameSource                 string    `json:"name_source,omitempty"`
+	WAProfileName              string    `json:"wa_profile_name,omitempty"`
+	WABusinessSavedName        string    `json:"wa_business_saved_name,omitempty"`
+	WABusinessSavedNameRemoved bool      `json:"wa_business_saved_name_removed,omitempty"`
+	CreatedAt                  time.Time `json:"created_at"`
+	UpdatedAt                  time.Time `json:"updated_at"`
 }
 
 // MessageResponse represents a message for the frontend
@@ -717,6 +723,7 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 			CreatedAt:             c.CreatedAt,
 			UpdatedAt:             c.UpdatedAt,
 		}
+		applyContactNameFields(&response[i], c.Metadata, shouldMask)
 		listState.applyAssignee(&response[i], c.AssignedUserID)
 	}
 
@@ -736,20 +743,180 @@ const contactStateQueryTimeout = 5 * time.Second
 
 // contactMetadataForResponse returns the metadata to expose for a contact and
 // whether a team member marked it unread by hand. The stored map is never
-// mutated; a copy is made only when the internal flag is present.
+// mutated; a copy is made only when an internal key is present. Display-name
+// provenance keys are internal too; responses carry them as dedicated fields
+// (applyContactNameFields).
 func contactMetadataForResponse(metadata models.JSONB) (any, bool) {
 	value, present := metadata[contactManualUnreadKey]
-	if !present {
+	internal := present
+	for _, key := range contactNameMetadataKeys() {
+		if _, ok := metadata[key]; ok {
+			internal = true
+		}
+	}
+	if !internal {
 		return metadata, false
 	}
 	visible := make(models.JSONB, len(metadata))
 	for key, item := range metadata {
-		if key != contactManualUnreadKey {
+		if key != contactManualUnreadKey && !isContactNameMetadataKey(key) {
 			visible[key] = item
 		}
 	}
 	manualUnread, _ := value.(bool)
 	return visible, manualUnread
+}
+
+// contactNameMetadataKeys lists the server-owned contacts.metadata keys that
+// record where the display name came from.
+func contactNameMetadataKeys() []string {
+	return []string{
+		contactutil.ContactNameSourceKey,
+		contactutil.ContactWAProfileNameKey,
+		contactutil.ContactWABusinessSavedNameKey,
+		contactutil.ContactWABusinessSavedNameAtKey,
+		contactutil.ContactWABusinessSavedNameRemovedAtKey,
+	}
+}
+
+func isContactNameMetadataKey(key string) bool {
+	for _, nameKey := range contactNameMetadataKeys() {
+		if key == nameKey {
+			return true
+		}
+	}
+	return false
+}
+
+// applyContactNameFields copies display-name provenance onto a response. Names
+// are masked like profile_name when the organization masks phone numbers.
+func applyContactNameFields(response *ContactResponse, metadata models.JSONB, shouldMask bool) {
+	response.NameSource = contactutil.ContactNameSource(metadata)
+	response.WAProfileName, _ = metadata[contactutil.ContactWAProfileNameKey].(string)
+	response.WABusinessSavedName, _ = metadata[contactutil.ContactWABusinessSavedNameKey].(string)
+	// The removal mark is the key's presence; its value may be empty when
+	// Meta gave the removal no time.
+	_, response.WABusinessSavedNameRemoved = metadata[contactutil.ContactWABusinessSavedNameRemovedAtKey]
+	if shouldMask {
+		response.WAProfileName = utils.MaskIfPhoneNumber(response.WAProfileName)
+		response.WABusinessSavedName = utils.MaskIfPhoneNumber(response.WABusinessSavedName)
+	}
+}
+
+// contactMetadataForEdit returns the metadata a contact edit writes: the
+// submitted metadata (or, when none was submitted, the stored metadata) with
+// every server-owned key taken from the stored row. The edit form never sees
+// the manual unread mark or the display-name provenance, so a client value for
+// either is ignored and the stored one kept.
+func contactMetadataForEdit(stored models.JSONB, submitted map[string]any) models.JSONB {
+	if submitted == nil {
+		return contactutil.CloneContactMetadata(stored)
+	}
+	metadata := contactMetadataKeepingManualUnread(submitted, stored)
+	for _, key := range contactNameMetadataKeys() {
+		delete(metadata, key)
+		if value, ok := stored[key]; ok {
+			metadata[key] = value
+		}
+	}
+	return metadata
+}
+
+// applyContactEditName sets the profile_name and metadata updates of a contact
+// edit from the row the caller holds locked. A changed name becomes the manual
+// name; clearing it falls back to the WhatsApp Business saved name, then the
+// WhatsApp profile name (contactutil.ApplyManualContactName). When the
+// organization masks phone numbers, a submitted name equal to the masked form
+// of the stored one is the form echoing what it was shown, not a rename.
+func applyContactEditName(
+	locked *models.Contact,
+	profileName *string,
+	submitted *map[string]any,
+	updates map[string]any,
+	maskedNames bool,
+) {
+	if profileName != nil && maskedNames {
+		if masked := utils.MaskIfPhoneNumber(locked.ProfileName); masked != locked.ProfileName &&
+			strings.TrimSpace(*profileName) == masked {
+			// Keep the stored name; the edit may carry nothing else.
+			profileName = nil
+			updates["profile_name"] = locked.ProfileName
+		}
+	}
+	var submittedMetadata map[string]any
+	if submitted != nil {
+		submittedMetadata = *submitted
+		if submittedMetadata == nil {
+			submittedMetadata = map[string]any{}
+		}
+	}
+	metadata := contactMetadataForEdit(locked.Metadata, submittedMetadata)
+	metadataChanged := submitted != nil
+	if profileName != nil {
+		displayName, changed := contactutil.ApplyManualContactName(locked.ProfileName, metadata, *profileName)
+		updates["profile_name"] = displayName
+		metadataChanged = metadataChanged || changed
+	}
+	if metadataChanged {
+		updates["metadata"] = metadata
+	} else {
+		delete(updates, "metadata")
+	}
+}
+
+// importedContactNameMetadata is the metadata of a contact created by an
+// import row with a name: an imported name is a manual name.
+func importedContactNameMetadata() models.JSONB {
+	return models.JSONB{contactutil.ContactNameSourceKey: contactutil.ContactNameSourceManual}
+}
+
+// manualContactNameMetadataUpdate is the metadata update for a write that sets
+// profile_name to an explicit name without holding the row lock (an import row
+// or a contact restore). A name that differs from the stored one is a manual
+// name. The UPDATE compares against the stored name and merges only the source
+// key, so it needs no prior read and keeps concurrent metadata writes.
+func manualContactNameMetadataUpdate(name string) clause.Expr {
+	return gorm.Expr(
+		"CASE WHEN profile_name IS DISTINCT FROM ? THEN "+
+			"COALESCE(CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata END, '{}'::jsonb) || "+
+			"jsonb_build_object(?::text, ?::text) ELSE metadata END",
+		name,
+		contactutil.ContactNameSourceKey,
+		contactutil.ContactNameSourceManual,
+	)
+}
+
+// restoredContactMetadataUpdate is the metadata update for restoring a
+// soft-deleted contact with submitted metadata, made without holding the row
+// lock. The submitted map loses every server-owned key; the UPDATE then adds
+// back the stored display-name keys and a set manual unread mark from the row
+// it writes, and marks name (when given and different) as a manual name.
+func restoredContactMetadataUpdate(submitted map[string]any, name string) clause.Expr {
+	sql := "?::jsonb || jsonb_strip_nulls(jsonb_build_object("
+	args := []any{contactMetadataForEdit(nil, submitted)}
+	for _, key := range contactNameMetadataKeys() {
+		sql += "?::text, metadata->?, "
+		args = append(args, key, key)
+	}
+	sql += "?::text, CASE WHEN metadata->? = 'true'::jsonb THEN 'true'::jsonb END))"
+	args = append(args, contactManualUnreadKey, contactManualUnreadKey)
+	if name != "" {
+		sql += " || CASE WHEN profile_name IS DISTINCT FROM ? THEN jsonb_build_object(?::text, ?::text) ELSE '{}'::jsonb END"
+		args = append(args, name, contactutil.ContactNameSourceKey, contactutil.ContactNameSourceManual)
+	}
+	return gorm.Expr(sql, args...)
+}
+
+// keepContactNameProvenance replaces the display-name keys in merged (a
+// contact merge's combined metadata) with those of owner, the metadata of the
+// contact whose name the merge kept, so the kept name keeps its own source.
+func keepContactNameProvenance(merged, owner models.JSONB) {
+	for _, key := range contactNameMetadataKeys() {
+		delete(merged, key)
+		if value, ok := owner[key]; ok {
+			merged[key] = value
+		}
+	}
 }
 
 // contactStateDB derives a deadline from the DB's own statement context, so a
@@ -3008,8 +3175,18 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 			// Restore soft-deleted contact
 			// Update fields
 			updates := map[string]any{}
-			if req.ProfileName != "" {
-				updates["profile_name"] = req.ProfileName
+			// An explicit name is a manual name, and the stored server-owned
+			// keys survive a metadata replacement. existingContact was read
+			// without a lock, so both are decided in the UPDATE itself, on the
+			// row it writes, rather than from that read.
+			restoredName := strings.TrimSpace(req.ProfileName)
+			if restoredName != "" {
+				updates["profile_name"] = restoredName
+			}
+			if req.Metadata != nil {
+				updates["metadata"] = restoredContactMetadataUpdate(req.Metadata, restoredName)
+			} else if restoredName != "" {
+				updates["metadata"] = manualContactNameMetadataUpdate(restoredName)
 			}
 			if req.WhatsAppAccount != "" {
 				updates["whats_app_account"] = req.WhatsAppAccount
@@ -3020,9 +3197,6 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 					tagsArray[i] = tag
 				}
 				updates["tags"] = tagsArray
-			}
-			if req.Metadata != nil {
-				updates["metadata"] = models.JSONB(req.Metadata)
 			}
 			updates["deleted_at"] = nil
 			activityKey := "contact-restored:" + existingContact.ID.String() + ":" + uuid.NewString()
@@ -3078,7 +3252,13 @@ func (a *App) CreateContact(r *fastglue.Request) error {
 	}
 
 	if req.Metadata != nil {
-		contact.Metadata = models.JSONB(req.Metadata)
+		contact.Metadata = contactMetadataForEdit(nil, req.Metadata)
+	}
+	// A name typed when creating the contact is a manual name.
+	if strings.TrimSpace(req.ProfileName) != "" {
+		metadata := contactutil.CloneContactMetadata(contact.Metadata)
+		contact.ProfileName, _ = contactutil.ApplyManualContactName("", metadata, req.ProfileName)
+		contact.Metadata = metadata
 	}
 
 	if err := contactSelectorWriteTransaction(a.DB, orgID, func(tx *gorm.DB) error {
@@ -3174,6 +3354,10 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "No fields to update", nil, "")
 	}
 
+	// Read before the transaction: the lookup uses its own pooled connection,
+	// which must never be taken while this request holds one.
+	maskedNames := req.ProfileName != nil && a.ShouldMaskPhoneNumbers(orgID)
+
 	var oldContact, updatedContact models.Contact
 	activityNonce := uuid.NewString()
 	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
@@ -3182,6 +3366,11 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 			return resolveErr
 		}
 		oldContact = *contact
+		// Decided on the locked row, so a webhook naming this contact either
+		// committed before (and is seen here) or waits for this edit. This is
+		// the edit's only metadata merge: it keeps the stored manual unread
+		// mark and display-name provenance whatever metadata the client sent.
+		applyContactEditName(contact, req.ProfileName, req.Metadata, updates, maskedNames)
 
 		if req.ClearAssignedAgent == nil || !*req.ClearAssignedAgent {
 			if req.AssignedUserID != nil {
@@ -3191,13 +3380,6 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 				}
 			}
 		}
-		if req.Metadata != nil {
-			// The edit form never sees the internal manual unread mark: keep
-			// the stored one (read under this row lock) and ignore any the
-			// client sent.
-			updates["metadata"] = contactMetadataKeepingManualUnread(*req.Metadata, contact.Metadata)
-		}
-
 		result := tx.Model(&models.Contact{}).
 			Where(
 				"id = ? AND organization_id = ? AND merged_into_id IS NULL AND deleted_at IS NULL",
@@ -3364,6 +3546,7 @@ func (a *App) buildContactResponse(contact *models.Contact, orgID uuid.UUID) Con
 		CreatedAt:             contact.CreatedAt,
 		UpdatedAt:             contact.UpdatedAt,
 	}
+	applyContactNameFields(&response, contact.Metadata, shouldMask)
 	listState.applyAssignee(&response, contact.AssignedUserID)
 	return response
 }

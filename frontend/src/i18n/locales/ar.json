@@ -2626,5 +2626,25 @@
     "selectOrg": "اختر المؤسسة",
     "noMatchingOrgs": "لم يتم العثور على مؤسسات",
     "allOrgs": "جميع المؤسسات"
+  },
+  "sessionSecurity": {
+    "reconnecting": "جارٍ إعادة الاتصال…",
+    "reconnectFailed": "تعذّر الوصول إلى الخادم حاليًا",
+    "reconnectFailedDesc": "ما زلت مسجّل الدخول. سنحاول مجددًا عند إجرائك التالي.",
+    "idleWarningTitle": "هل ما زلت هنا؟",
+    "idleWarningBody": "سيتم تسجيل خروجك خلال {time} بسبب عدم النشاط.",
+    "staySignedIn": "البقاء مسجّل الدخول",
+    "signOut": "تسجيل الخروج",
+    "signedOutIdle": "تم تسجيل خروجك بعد {duration} من عدم النشاط.",
+    "sessionExpired": "انتهت صلاحية جلستك. يرجى تسجيل الدخول مرة أخرى.",
+    "durationMinutes": "{count} دقيقة",
+    "durationHour": "ساعة واحدة",
+    "durationHours": "{count} ساعات",
+    "idleSettingTitle": "تسجيل الخروج بعد عدم النشاط",
+    "idleSettingDesc": "يُنبَّه الأعضاء قبل دقيقتين من تسجيل خروجهم. يُحتسب النشاط في أي علامة تبويب مفتوحة.",
+    "idleSettingOff": "معطل",
+    "idleSettingSave": "حفظ إعداد تسجيل الخروج",
+    "idleSettingSaved": "تم تحديث تسجيل الخروج بسبب عدم النشاط",
+    "idleSettingSaveFailed": "تعذّر تحديث تسجيل الخروج بسبب عدم النشاط"
   }
 }

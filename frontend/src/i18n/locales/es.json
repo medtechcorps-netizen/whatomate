@@ -2257,5 +2257,25 @@
     "callFailed": "Error al iniciar la llamada",
     "permissionSent": "Solicitud de permiso de llamada enviada",
     "permissionSentDesc": "El contacto necesita aceptar el permiso de llamada en WhatsApp antes de que pueda llamarlo. Intente de nuevo después de que acepte."
+  },
+  "sessionSecurity": {
+    "reconnecting": "Reconectando…",
+    "reconnectFailed": "No se puede conectar con el servidor en este momento",
+    "reconnectFailedDesc": "Su sesión sigue iniciada. Lo intentaremos de nuevo con su próxima acción.",
+    "idleWarningTitle": "¿Sigue ahí?",
+    "idleWarningBody": "Se cerrará su sesión en {time} por inactividad.",
+    "staySignedIn": "Mantener la sesión iniciada",
+    "signOut": "Cerrar sesión",
+    "signedOutIdle": "Se cerró su sesión tras {duration} de inactividad.",
+    "sessionExpired": "Su sesión ha expirado. Vuelva a iniciar sesión.",
+    "durationMinutes": "{count} minutos",
+    "durationHour": "1 hora",
+    "durationHours": "{count} horas",
+    "idleSettingTitle": "Cerrar sesión tras inactividad",
+    "idleSettingDesc": "Se avisa a los miembros dos minutos antes de cerrar su sesión. Cuenta la actividad en cualquier pestaña abierta.",
+    "idleSettingOff": "Desactivado",
+    "idleSettingSave": "Guardar ajuste de cierre de sesión",
+    "idleSettingSaved": "Cierre de sesión por inactividad actualizado",
+    "idleSettingSaveFailed": "No se pudo actualizar el cierre de sesión por inactividad"
   }
 }

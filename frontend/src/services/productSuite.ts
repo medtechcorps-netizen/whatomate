@@ -526,6 +526,11 @@ export interface CustomerWorkspaceContact {
   metadata?: Record<string, unknown>
   assigned_user_id?: string
   marketing_opt_out?: boolean
+  // Display-name provenance, as on Contact.
+  name_source?: 'manual' | 'wa_business' | 'wa_profile'
+  wa_profile_name?: string
+  wa_business_saved_name?: string
+  wa_business_saved_name_removed?: boolean
   identity_review_ai_state: ContactIdentityReviewEffectiveState
   created_at?: string
   updated_at?: string

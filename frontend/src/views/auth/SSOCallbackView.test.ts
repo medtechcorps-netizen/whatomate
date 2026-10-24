@@ -1,7 +1,7 @@
 /** @vitest-environment happy-dom */
 
 import { flushPromises, mount } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   exchange: vi.fn(),
@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
   interrupted: vi.fn(),
   unsent: vi.fn(),
   restoreSession: vi.fn(),
+  current: vi.fn(),
+  assign: vi.fn(),
   store: { isAuthenticated: false, user: null as null | { role?: { name: string } } },
   query: {} as Record<string, string>,
 }))
@@ -48,6 +50,7 @@ vi.mock('@/services/api', () => ({
   exchangeSsoCode: mocks.exchange,
   keepSsoCode: mocks.keep,
   ssoExchangeInterrupted: mocks.interrupted,
+  isTabSessionCurrent: mocks.current,
   unsentSsoCode: mocks.unsent,
   SESSION_BUSY_CODE: 'ERR_SESSION_BUSY',
   SESSION_UNSUPPORTED_CODE: 'ERR_SESSION_UNSUPPORTED',
@@ -58,6 +61,7 @@ import SSOCallbackView from './SSOCallbackView.vue'
 // The exchange answers like a sign-in: {expires_in, user}.
 const USER_B = { id: 'user-b', role: { name: 'admin' } }
 const answer = { data: { data: { expires_in: 900, user: USER_B } } }
+const originalLocation = window.location
 
 function mountCallback() {
   return mount(SSOCallbackView, {
@@ -80,7 +84,18 @@ describe('SSOCallbackView', () => {
     mocks.unsent.mockReset().mockReturnValue(null)
     mocks.restoreSession.mockReset().mockReturnValue(false)
     mocks.store = { isAuthenticated: false, user: null }
+    mocks.current.mockReset().mockReturnValue(true)
+    mocks.assign.mockReset()
     mocks.query = {}
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { pathname: '/auth/sso/callback', href: 'http://localhost:3000/auth/sso/callback', assign: mocks.assign },
+    })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
   })
 
   it('exchanges the one-time code (taking it off the URL) and applies the user it answers, with no /me', async () => {
@@ -188,6 +203,7 @@ describe('SSOCallbackView', () => {
     ['in this page (Back after the sign-in)', true, false],
     ['stored (a reload after the sign-in)', false, true],
   ])('without a code, a live session %s goes on into the app', async (_label, inStore, restored) => {
+    mocks.current.mockReturnValue(inStore)
     mocks.store = { isAuthenticated: inStore, user: { role: { name: 'agent' } } }
     mocks.restoreSession.mockReturnValue(restored)
     const wrapper = mountCallback()
@@ -213,5 +229,44 @@ describe('SSOCallbackView', () => {
     expect(mocks.get).not.toHaveBeenCalled()
     expect(mocks.setAuth).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain(message)
+  })
+
+  it('a store session this tab no longer shows (replaced) is not entered without a code', async () => {
+    mocks.store = { isAuthenticated: true, user: { role: { name: 'admin' } } }
+    mocks.current.mockReturnValue(false)
+    const wrapper = mountCallback()
+    await flushPromises()
+
+    expect(mocks.replace).not.toHaveBeenCalled()
+    expect(wrapper.text()).toContain('auth.ssoLinkUsed')
+  })
+
+  it('a session replaced during the success delay is not entered: the tab goes to the login page', async () => {
+    vi.useFakeTimers()
+    mocks.query = { code: 'code-b' }
+    mocks.exchange.mockResolvedValueOnce(answer)
+
+    mountCallback()
+    await flushPromises()
+    expect(mocks.assign).not.toHaveBeenCalled()
+    // Another tab signs in before the push.
+    mocks.current.mockReturnValue(false)
+    vi.advanceTimersByTime(1_000)
+
+    expect(mocks.push).not.toHaveBeenCalled()
+    expect(mocks.assign).toHaveBeenCalledWith('/login')
+  })
+
+  it('goes on into the app after the success delay while the session is still its own', async () => {
+    vi.useFakeTimers()
+    mocks.query = { code: 'code-b' }
+    mocks.exchange.mockResolvedValueOnce({ data: { data: { expires_in: 900, user: { id: 'user-b', role: { name: 'agent' } } } } })
+
+    mountCallback()
+    await flushPromises()
+    vi.advanceTimersByTime(1_000)
+
+    expect(mocks.push).toHaveBeenCalledWith('/analytics/agents')
+    expect(mocks.assign).not.toHaveBeenCalled()
   })
 })

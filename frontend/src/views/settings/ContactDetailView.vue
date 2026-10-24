@@ -14,6 +14,7 @@ import { contactAddressDisplay, contactDisplayName } from '@/lib/contactAddress'
 import { useUnsavedChangesGuard } from '@/composables/useUnsavedChangesGuard'
 import DetailPageLayout from '@/components/shared/DetailPageLayout.vue'
 import MetadataPanel from '@/components/shared/MetadataPanel.vue'
+import ContactNameSource from '@/components/chat/ContactNameSource.vue'
 import AuditLogPanel from '@/components/shared/AuditLogPanel.vue'
 import UnsavedChangesDialog from '@/components/shared/UnsavedChangesDialog.vue'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -153,9 +154,13 @@ async function save() {
   isSaving.value = true
   try {
     const payload: Record<string, any> = {
-      profile_name: form.value.profile_name,
       whatsapp_account: form.value.whatsapp_account,
       tags: form.value.tags,
+    }
+    // Only a name the user changed is a rename. Re-sending the loaded name
+    // would pin a stale (or, with phone masking, masked) name as manual.
+    if (form.value.profile_name !== (contact.value.profile_name || '')) {
+      payload.profile_name = form.value.profile_name
     }
     if (form.value.assigned_user_id) {
       payload.assigned_user_id = form.value.assigned_user_id
@@ -282,6 +287,7 @@ onMounted(async () => {
             </div>
             <div class="min-w-0">
               <p class="font-medium truncate">{{ displayName }}</p>
+              <ContactNameSource :contact="contact" :display-name="displayName" align="start" />
               <p class="text-sm text-muted-foreground truncate">{{ phoneHidden ? address.text : contact?.phone_number }}</p>
             </div>
           </div>
@@ -289,6 +295,9 @@ onMounted(async () => {
           <div class="space-y-1.5">
             <Label class="text-xs">{{ $t('contacts.profileName', 'Profile Name') }}</Label>
             <Input v-model="form.profile_name" :disabled="!canWrite" />
+            <p v-if="canWrite" class="text-xs text-muted-foreground" data-testid="contact-name-clear-hint">
+              {{ $t('contacts.nameSource.clearHint') }}
+            </p>
           </div>
 
           <div class="space-y-1.5">

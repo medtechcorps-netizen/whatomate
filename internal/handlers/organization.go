@@ -22,11 +22,34 @@ import (
 // zero value (nil), which is treated as "unset" by the audit comparator.
 func generalSettingsSnapshot(name string, settings models.JSONB) map[string]any {
 	return map[string]any{
-		"name":               name,
-		"timezone":           settings["timezone"],
-		"date_format":        settings["date_format"],
-		"mask_phone_numbers": settings["mask_phone_numbers"],
+		"name":                         name,
+		"timezone":                     settings["timezone"],
+		"date_format":                  settings["date_format"],
+		"mask_phone_numbers":           settings["mask_phone_numbers"],
+		"session_idle_timeout_minutes": settings["session_idle_timeout_minutes"],
 	}
+}
+
+// validSessionIdleTimeoutMinutes reports whether minutes is one of the
+// offered "Sign out after inactivity" choices; 0 turns the policy off.
+func validSessionIdleTimeoutMinutes(minutes int) bool {
+	switch minutes {
+	case 0, 30, 60, 120, 240, 480:
+		return true
+	}
+	return false
+}
+
+// sessionIdleTimeoutMinutes reads the organization's inactivity sign-out
+// policy, falling back to the 4 hour default when it is unset or invalid.
+func sessionIdleTimeoutMinutes(settings models.JSONB) int {
+	if settings != nil {
+		if v, ok := settings["session_idle_timeout_minutes"].(float64); ok &&
+			v == float64(int(v)) && validSessionIdleTimeoutMinutes(int(v)) {
+			return int(v)
+		}
+	}
+	return 240
 }
 
 // callingSettingsSnapshot extracts the fields shown on the Calling tab into a
@@ -109,9 +132,10 @@ func (a *App) GetOrganizationSettings(r *fastglue.Request) error {
 	}
 
 	responseSettings := map[string]any{
-		"mask_phone_numbers": settings.MaskPhoneNumbers,
-		"timezone":           settings.Timezone,
-		"date_format":        settings.DateFormat,
+		"mask_phone_numbers":           settings.MaskPhoneNumbers,
+		"timezone":                     settings.Timezone,
+		"date_format":                  settings.DateFormat,
+		"session_idle_timeout_minutes": sessionIdleTimeoutMinutes(org.Settings),
 	}
 	if a.HasPermission(
 		userID,
@@ -152,6 +176,8 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		MetaConfigID        *string `json:"meta_config_id"`
 		MetaAppSecret       *string `json:"meta_app_secret"`
 		ClearMetaAppSecret  *bool   `json:"clear_meta_app_secret"`
+		// Minutes of inactivity before members are signed out (0 = off).
+		SessionIdleTimeoutMinutes *int `json:"session_idle_timeout_minutes"`
 	}
 
 	if err := json.Unmarshal(r.RequestCtx.PostBody(), &req); err != nil {
@@ -159,7 +185,7 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 	}
 
 	generalFieldsTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil ||
-		req.DateFormat != nil || req.Name != nil
+		req.DateFormat != nil || req.Name != nil || req.SessionIdleTimeoutMinutes != nil
 	metaAppCredsTouched := req.MetaAppID != nil || req.MetaConfigID != nil ||
 		req.MetaAppSecret != nil || req.ClearMetaAppSecret != nil
 	callingTouched := req.CallingEnabled != nil || req.MaxCallDuration != nil ||
@@ -198,9 +224,18 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 	if !generalFieldsTouched && !metaAppCredsTouched && !callingTouched {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "No settings fields provided", nil, "")
 	}
+	if req.SessionIdleTimeoutMinutes != nil && !validSessionIdleTimeoutMinutes(*req.SessionIdleTimeoutMinutes) {
+		return r.SendErrorEnvelope(
+			fasthttp.StatusBadRequest,
+			"session_idle_timeout_minutes must be one of 0, 30, 60, 120, 240 or 480",
+			nil,
+			"",
+		)
+	}
 
 	// Track which tabs received updates so we only audit the relevant ones.
-	generalTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil || req.DateFormat != nil || (req.Name != nil && *req.Name != "")
+	generalTouched := req.MaskPhoneNumbers != nil || req.Timezone != nil || req.DateFormat != nil || (req.Name != nil && *req.Name != "") ||
+		req.SessionIdleTimeoutMinutes != nil
 
 	// Organization.Settings is shared by General, Calling and Integration
 	// Center. Serialize every read-modify-write on the organization row so an
@@ -226,6 +261,9 @@ func (a *App) UpdateOrganizationSettings(r *fastglue.Request) error {
 		}
 		if req.DateFormat != nil {
 			org.Settings["date_format"] = *req.DateFormat
+		}
+		if req.SessionIdleTimeoutMinutes != nil {
+			org.Settings["session_idle_timeout_minutes"] = *req.SessionIdleTimeoutMinutes
 		}
 		if req.CallingEnabled != nil {
 			org.Settings["calling_enabled"] = *req.CallingEnabled

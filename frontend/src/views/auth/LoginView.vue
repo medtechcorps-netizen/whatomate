@@ -18,6 +18,7 @@ import { Separator } from '@/components/ui/separator'
 import { toast } from 'vue-sonner'
 import { ArrowRight, Building2, CheckCircle2, Loader2, Search } from 'lucide-vue-next'
 import ReReplyLogo from '@/components/brand/ReReplyLogo.vue'
+import { formatIdleDuration, readSignOutReason } from '@/lib/sessionSignout'
 
 const { t } = useI18n()
 
@@ -40,6 +41,15 @@ const hasDiscoveredSSO = ref(false)
 // Without Web Locks no sign-in can start here, and a session from before ends
 // at its first refresh need and lands here: say why up front.
 const browserUnsupported = ref(!sessionsSupported())
+
+// Why the previous session ended (inactivity or an expired session).
+const signOutReason = readSignOutReason()
+const sessionBanner =
+  signOutReason?.reason === 'idle'
+    ? t('sessionSecurity.signedOutIdle', { duration: formatIdleDuration(signOutReason.minutes, t) })
+    : signOutReason?.reason === 'expired'
+      ? t('sessionSecurity.sessionExpired')
+      : ''
 
 // SSO provider icons (using simple SVG paths)
 const providerIcons: Record<string, string> = {
@@ -234,6 +244,14 @@ const initiateSSO = async (provider: string) => {
               class="mb-5 rounded-xl border border-red-400/30 bg-red-500/[0.08] px-4 py-3 text-sm leading-5 text-red-100 light:border-red-600/25 light:bg-red-50 light:text-red-800"
             >
               {{ $t('errors.unsupportedBrowser') }}
+            </div>
+            <div
+              v-if="sessionBanner"
+              role="status"
+              data-testid="login-session-banner"
+              class="mb-5 rounded-xl border border-[#cbd49a]/25 bg-[#cbd49a]/[0.08] px-4 py-3 text-sm leading-5 text-[#e7ebc8] light:border-[#697046]/25 light:bg-[#697046]/[0.06] light:text-[#3f4429]"
+            >
+              {{ sessionBanner }}
             </div>
             <form @submit.prevent="handleLogin">
               <div class="space-y-5">

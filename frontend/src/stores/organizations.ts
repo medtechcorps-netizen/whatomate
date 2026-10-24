@@ -6,6 +6,7 @@ import {
   clearBrowserOrganizationIdentity,
   readSelectedOrganizationId,
   setSelectedOrganizationId,
+  suppressBrowserOrganizationIdentity,
 } from '@/lib/browserIdentity'
 
 export const useOrganizationsStore = defineStore('organizations', () => {
@@ -116,7 +117,9 @@ export const useOrganizationsStore = defineStore('organizations', () => {
     }
   }
 
-  function resetForIdentityChange() {
+  // shared=false: only this tab drops its organizations (the stored selection
+  // belongs to a newer session in another tab and stays).
+  function resetForIdentityChange(shared = true) {
     identityGeneration++
     organizationsLoadGeneration++
     myOrganizationsLoadGeneration++
@@ -130,7 +133,8 @@ export const useOrganizationsStore = defineStore('organizations', () => {
     loading.value = false
     error.value = null
     organizationSwitchHolds.value = []
-    clearBrowserOrganizationIdentity()
+    if (shared) clearBrowserOrganizationIdentity()
+    else suppressBrowserOrganizationIdentity()
   }
 
   function blockOrganizationSwitch(owner: string, message: string) {

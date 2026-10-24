@@ -3,6 +3,7 @@ import { messagesService } from '@/services/api'
 import { getErrorMessage } from '@/lib/api-utils'
 import { convertImageToJpeg } from '@/lib/chatImageConversion'
 import { SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
+import { SESSION_ENDING_EVENT } from '@/lib/sessionActivity'
 import {
   MAX_CAPTION_LENGTH,
   MAX_CHAT_ATTACHMENTS,
@@ -239,7 +240,7 @@ let batchSequence = 0
  * Dispatched on window by the auth layer, synchronously, before it clears
  * the session and navigates (sign-out, signed out elsewhere, expiry).
  */
-export const SESSION_ENDING_EVENT = 'rereply:session-ending'
+export { SESSION_ENDING_EVENT }
 
 /**
  * Pacing bound. The server holds the contact row lock across Meta's media
