@@ -1,4 +1,4 @@
-"""CI source eligibility for one paired H1 bootstrap closure refresh.
+"""CI source eligibility for paired generated bootstrap closure refreshes.
 
 Disposable Git histories prove the finite source shape and rejection paths.
 Synthetic digests do not prove generated Go hashes or exact compatibility;
@@ -105,6 +105,20 @@ class H1BootstrapClosureCISourceTests(unittest.TestCase):
             **(extra or {}),
         })
 
+    def hash_only(self):
+        rows, migration = copy.deepcopy(self.rows), copy.deepcopy(self.migration)
+        self.target(rows)["closure_sha256"] = fixture.J
+        migration["closure_sha256"] = fixture.J
+        return rows, migration
+
+    def hash_only_head(self, rows=None, migration=None, extra=None):
+        default_rows, default_migration = self.hash_only()
+        return self.repo.commit({
+            sc.REGISTRY: wire(default_rows if rows is None else rows),
+            sc.MIGRATION_PATH: wire(default_migration if migration is None else migration),
+            **(extra or {}),
+        })
+
     def check(self, head, base=None):
         return sc.check_ci_source(self.repo.root, self.base if base is None else base, head)
 
@@ -133,6 +147,81 @@ class H1BootstrapClosureCISourceTests(unittest.TestCase):
         self.assertEqual((policy.kind, policy.dormant, policy.reasons), ("none", False, ()))
         self.assertEqual(policy.requirements, ("compat-required", "generated-migration-closure-ci"))
         self.assertEqual(policy.migration_changes, ("generated migration closure changed",))
+
+    def test_hash_only_generated_refresh_is_ci_only_and_preserves_closure_inventory(self):
+        rows, migration = self.hash_only()
+        self.assertEqual(self.target(rows)["closure_files"], self.target(self.rows)["closure_files"])
+        self.assertEqual(migration["closure_files"], self.migration["closure_files"])
+        head = self.hash_only_head(rows, migration)
+        with ExitStack() as stack:
+            for name in ("_ci_seed_removal", "_pr18_observer_transition", "_pr18_managed_owner_local",
+                         "_pr18_managed_replication_local", "_pr18_planner_public_owner_local",
+                         "_pr18_verification_repair_local", "_pr18_run_metadata_local"):
+                stack.enter_context(mock.patch.object(sc, name, side_effect=AssertionError("unrelated admission route")))
+            self.assertEqual(self.check(head), ())
+        self.assertEqual(sc.check(self.repo.root, self.base, head), ("migration-path-changed:closure",))
+        with self.assertRaises(sc.SchemaChangeBlocked):
+            sc.guard(self.repo.root, self.base, head)
+        policy = sc.classify_v2(self.repo.root, self.base, head)
+        self.assertEqual((policy.kind, policy.dormant, policy.reasons), ("none", False, ()))
+        self.assertEqual(policy.requirements, ("compat-required", "generated-migration-closure-ci"))
+        self.assertEqual(policy.migration_changes, ("generated migration closure changed",))
+
+    def test_hash_only_refresh_refuses_any_non_hash_step_change_or_second_row(self):
+        changes = {
+            "rev": 2, "func": "database.OtherBackfill", "kind": "seed-reconciler",
+            "baseline": False, "idempotent": True, "n1_safe": True,
+            "requires_gates": ["synthetic_gate"], "parent": "FixtureSeed00",
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                self.repo.checkout(self.base)
+                rows, migration = self.hash_only()
+                self.target(rows)[field] = value
+                self.refused(self.hash_only_head(rows, migration))
+        for mutation in ("seed-hash", "second-baseline-hash", "target-and-seed-hash", "target-list"):
+            with self.subTest(mutation=mutation):
+                self.repo.checkout(self.base)
+                rows, migration = copy.deepcopy(self.rows), copy.deepcopy(self.migration)
+                if mutation == "seed-hash":
+                    rows[0]["closure_sha256"] = fixture.J
+                elif mutation == "second-baseline-hash":
+                    rows[-1]["closure_sha256"] = fixture.J
+                elif mutation == "target-list":
+                    rows, migration = self.hash_only()
+                    self.target(rows)["closure_files"].append("internal/handlers/unrelated.go")
+                    self.target(rows)["closure_files"].sort()
+                else:
+                    rows, migration = self.hash_only()
+                    rows[0]["closure_sha256"] = "d" * 64
+                migration["closure_sha256"] = fixture.J
+                self.refused(self.hash_only_head(rows, migration,
+                                                 {"internal/handlers/unrelated.go": "package handlers\n"}))
+
+    def test_hash_only_refresh_refuses_migration_list_drift_and_nonatomic_history(self):
+        for mutation in ("roots", "version", "file-list"):
+            with self.subTest(mutation=mutation):
+                self.repo.checkout(self.base)
+                rows, migration = self.hash_only()
+                if mutation == "roots":
+                    migration["roots"] = migration["roots"][:-1]
+                elif mutation == "version":
+                    migration["version"] = 2
+                else:
+                    migration["closure_files"].append("internal/handlers/unrelated.go")
+                    migration["closure_files"].sort()
+                self.refused(self.hash_only_head(rows, migration,
+                                                 {"internal/handlers/unrelated.go": "package handlers\n"}))
+        self.repo.checkout(self.base)
+        rows, migration = self.hash_only()
+        self.repo.commit({sc.REGISTRY: wire(rows)})
+        self.refused(self.hash_only_head(rows, migration))
+        self.repo.checkout(self.base)
+        rows, migration = self.hash_only()
+        self.hash_only_head(rows, migration)
+        self.repo.commit({sc.REGISTRY: self.files[sc.REGISTRY],
+                          sc.MIGRATION_PATH: self.files[sc.MIGRATION_PATH]})
+        self.refused(self.hash_only_head())
 
     def test_product_predecessors_and_repeated_paired_states_are_allowed(self):
         self.repo.commit({ADDITIONS[0]: "package handlers\n", "README.md": "product before refresh\n"})

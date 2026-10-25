@@ -2696,7 +2696,7 @@ _CI_H1_ACTIVE = (CATALOG, HISTORY, GLOBALS, GOLDEN + "production-v0.json",
                  "internal/dbcatalog/shape/production-v0.sql", SEEDS)
 
 
-def _ci_h1_registry_bytes(rows: list[dict]) -> bytes:
+def _ci_registry_bytes(rows: list[dict]) -> bytes:
     # _registry has already constrained every string to its ASCII grammar.
     # Reproduce the Go registry generator's field order and indentation; an
     # unrelated formatting/key-order edit is not a closure-only refresh.
@@ -2711,14 +2711,47 @@ def _ci_h1_registry_bytes(rows: list[dict]) -> bytes:
     return (json.dumps(ordered, ensure_ascii=True, indent=2) + "\n").encode("ascii")
 
 
+def _ci_paired_metadata_history(repo: _Repository, base: str, head: str,
+                                old_pair: tuple[bytes, bytes],
+                                new_pair: tuple[bytes, bytes]) -> None:
+    """Require one atomic first-parent transition between paired metadata states."""
+    active = {path: repo.blob(base, path) for path in _CI_H1_ACTIVE}
+    _valid(all(type(raw) is bytes and 0 < len(raw) <= MAX_ARTIFACT_BYTES for raw in active.values()))
+    raw_history = _git(repo.root, ["rev-list", "--first-parent", "--reverse", f"{base}..{head}"])
+    _valid(len(raw_history) <= MAX_HISTORY_COMMITS * 41)
+    commits = raw_history.splitlines()
+    _valid(raw_history == b"\n".join(commits) + b"\n"
+           and 0 < len(commits) <= MAX_HISTORY_COMMITS and len(set(commits)) == len(commits)
+           and all(re.fullmatch(rb"[0-9a-f]{40}", value) is not None for value in commits)
+           and commits[-1] == head.encode("ascii") and base.encode("ascii") not in commits)
+    transitioned = False
+    previous = base.encode("ascii")
+    for raw_revision in commits:
+        revision = raw_revision.decode("ascii")
+        # Verify the actual first-parent link as well as the listing shape.
+        # A truncated prefix/middle must not omit an intermediate bad state.
+        parent = _git(repo.root, ["rev-parse", "--verify", revision + "^1"])
+        _valid(parent == previous + b"\n")
+        previous = raw_revision
+        pair = (repo.blob(revision, REGISTRY), repo.blob(revision, MIGRATION_PATH))
+        if pair == old_pair:
+            _valid(not transitioned)
+        else:
+            _valid(pair == new_pair)
+            transitioned = True
+        for path, before in active.items():
+            _valid(repo.blob(revision, path) == before)
+    _valid(transitioned)
+
+
 def _ci_h1_bootstrap_closure(repo: _Repository, base: str, head: str,
                              old_migration: dict, new_migration: dict) -> None:
     """Validate one paired bootstrap metadata refresh, never its computed hash."""
     old_rows = repo.document(base, REGISTRY, _registry)
     new_rows = repo.document(head, REGISTRY, _registry)
     old_registry, new_registry = repo.blob(base, REGISTRY), repo.blob(head, REGISTRY)
-    _valid(old_registry == _ci_h1_registry_bytes(old_rows)
-           and new_registry == _ci_h1_registry_bytes(new_rows)
+    _valid(old_registry == _ci_registry_bytes(old_rows)
+           and new_registry == _ci_registry_bytes(new_rows)
            and old_registry != new_registry and len(old_rows) == len(new_rows))
     _valid([row["id"] for row in old_rows] == [row["id"] for row in new_rows])
     expected_identity = {
@@ -2750,35 +2783,48 @@ def _ci_h1_bootstrap_closure(repo: _Repository, base: str, head: str,
         raw = repo.blob(head, path)
         _valid(type(raw) is bytes and 0 < len(raw) <= MAX_ARTIFACT_BYTES)
 
-    active = {path: repo.blob(base, path) for path in _CI_H1_ACTIVE}
-    _valid(all(type(raw) is bytes and 0 < len(raw) <= MAX_ARTIFACT_BYTES for raw in active.values()))
     old_pair = (old_registry, repo.blob(base, MIGRATION_PATH))
     new_pair = (new_registry, repo.blob(head, MIGRATION_PATH))
-    raw_history = _git(repo.root, ["rev-list", "--first-parent", "--reverse", f"{base}..{head}"])
-    _valid(len(raw_history) <= MAX_HISTORY_COMMITS * 41)
-    commits = raw_history.splitlines()
-    _valid(raw_history == b"\n".join(commits) + b"\n"
-           and 0 < len(commits) <= MAX_HISTORY_COMMITS and len(set(commits)) == len(commits)
-           and all(re.fullmatch(rb"[0-9a-f]{40}", value) is not None for value in commits)
-           and commits[-1] == head.encode("ascii") and base.encode("ascii") not in commits)
-    transitioned = False
-    previous = base.encode("ascii")
-    for raw_revision in commits:
-        revision = raw_revision.decode("ascii")
-        # Verify the actual first-parent link as well as the listing shape.
-        # A truncated prefix/middle must not omit an intermediate bad state.
-        parent = _git(repo.root, ["rev-parse", "--verify", revision + "^1"])
-        _valid(parent == previous + b"\n")
-        previous = raw_revision
-        pair = (repo.blob(revision, REGISTRY), repo.blob(revision, MIGRATION_PATH))
-        if pair == old_pair:
-            _valid(not transitioned)
-        else:
-            _valid(pair == new_pair)
-            transitioned = True
-        for path, before in active.items():
-            _valid(repo.blob(revision, path) == before)
-    _valid(transitioned)
+    _ci_paired_metadata_history(repo, base, head, old_pair, new_pair)
+
+
+def _ci_generated_closure_hash_refresh(repo: _Repository, base: str, head: str,
+                                       old_migration: dict, new_migration: dict) -> None:
+    """Validate one hash-only refresh of the protected handler baseline closure."""
+    old_rows = repo.document(base, REGISTRY, _registry)
+    new_rows = repo.document(head, REGISTRY, _registry)
+    old_registry, new_registry = repo.blob(base, REGISTRY), repo.blob(head, REGISTRY)
+    _valid(old_registry == _ci_registry_bytes(old_rows)
+           and new_registry == _ci_registry_bytes(new_rows)
+           and old_registry != new_registry and len(old_rows) == len(new_rows))
+    _valid([row["id"] for row in old_rows] == [row["id"] for row in new_rows])
+    changed = [(before, after) for before, after in zip(old_rows, new_rows) if before != after]
+    _valid(len(changed) == 1)
+    before, after = changed[0]
+    expected_identity = {
+        "id": _CI_H1_BASELINE_ID, "rev": 1,
+        "func": "github.com/shridarpatil/whatomate/internal/handlers.BackfillChatbotFlowGraph",
+        "kind": "baseline-pre-ledger", "baseline": True, "idempotent": False,
+        "n1_safe": False, "requires_gates": [],
+    }
+    _valid({key: value for key, value in before.items()
+            if key not in ("closure_files", "closure_sha256")} == expected_identity
+           and {key: value for key, value in after.items()
+                if key not in ("closure_files", "closure_sha256")} == expected_identity
+           and before["closure_files"] == after["closure_files"]
+           and before["closure_sha256"] != after["closure_sha256"])
+    _valid(old_migration["version"] == new_migration["version"] == 1
+           and old_migration["roots"] == new_migration["roots"] == MIGRATION_ROOTS
+           and old_migration["closure_files"] == new_migration["closure_files"]
+           and old_migration["closure_sha256"] != new_migration["closure_sha256"])
+    for revision, document in ((base, old_migration), (head, new_migration)):
+        ordered = {key: document[key] for key in ("version", "roots", "closure_files", "closure_sha256")}
+        canonical = (json.dumps(ordered, ensure_ascii=True, indent=2) + "\n").encode("ascii")
+        _valid(repo.blob(revision, MIGRATION_PATH) == canonical)
+
+    old_pair = (old_registry, repo.blob(base, MIGRATION_PATH))
+    new_pair = (new_registry, repo.blob(head, MIGRATION_PATH))
+    _ci_paired_metadata_history(repo, base, head, old_pair, new_pair)
 
 
 def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
@@ -2907,7 +2953,10 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
                    and 0 < len(before) <= MAX_ARTIFACT_BYTES
                    and 0 < len(after) <= MAX_ARTIFACT_BYTES)
             if path == REGISTRY and before != after:
-                _ci_h1_bootstrap_closure(repo, base, head, old, new)
+                if old["closure_files"] == new["closure_files"]:
+                    _ci_generated_closure_hash_refresh(repo, base, head, old, new)
+                else:
+                    _ci_h1_bootstrap_closure(repo, base, head, old, new)
             else:
                 _valid(before == after)
         changes = changed_paths(repo.root, base, head)
