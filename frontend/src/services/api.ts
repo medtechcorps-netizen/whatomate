@@ -3631,6 +3631,8 @@ export const outgoingCallsService = {
     }),
   getICEServers: () =>
     api.get<{
+      expires_at?: string;
+      ice_transport_policy?: "all" | "relay";
       ice_servers: Array<{
         urls: string[];
         username?: string;

@@ -325,18 +325,43 @@ func (s ICEServerConfig) ResolveCredentials(now time.Time) (username, credential
 }
 
 type CallingConfig struct {
-	MaxCallDuration     int               `koanf:"max_call_duration"`
-	AudioDir            string            `koanf:"audio_dir"`
-	HoldMusicFile       string            `koanf:"hold_music_file"`
-	TransferTimeoutSecs int               `koanf:"transfer_timeout_secs"`
-	PerAgentTimeoutSecs int               `koanf:"per_agent_timeout_secs"`
-	RingbackFile        string            `koanf:"ringback_file"`
-	UDPPortMin          uint16            `koanf:"udp_port_min"` // WebRTC UDP port range start (default: 10000)
-	UDPPortMax          uint16            `koanf:"udp_port_max"` // WebRTC UDP port range end (default: 10100)
-	PublicIP            string            `koanf:"public_ip"`    // Public IP for NAT mapping (required on AWS/cloud)
-	RelayOnly           bool              `koanf:"relay_only"`   // Force all media through TURN relay (no direct UDP)
-	ICEServers          []ICEServerConfig `koanf:"ice_servers"`
-	RecordingEnabled    bool              `koanf:"recording_enabled"` // Enable call recording to S3
+	MaxCallDuration     int                  `koanf:"max_call_duration"`
+	AudioDir            string               `koanf:"audio_dir"`
+	HoldMusicFile       string               `koanf:"hold_music_file"`
+	TransferTimeoutSecs int                  `koanf:"transfer_timeout_secs"`
+	PerAgentTimeoutSecs int                  `koanf:"per_agent_timeout_secs"`
+	RingbackFile        string               `koanf:"ringback_file"`
+	UDPPortMin          uint16               `koanf:"udp_port_min"` // WebRTC UDP port range start (default: 10000)
+	UDPPortMax          uint16               `koanf:"udp_port_max"` // WebRTC UDP port range end (default: 10100)
+	PublicIP            string               `koanf:"public_ip"`    // Public IP for NAT mapping (required on AWS/cloud)
+	RelayOnly           bool                 `koanf:"relay_only"`   // Force all media through TURN relay (no direct UDP)
+	ICEServers          []ICEServerConfig    `koanf:"ice_servers"`
+	CloudflareTURN      CloudflareTURNConfig `koanf:"cloudflare_turn"`
+	RecordingEnabled    bool                 `koanf:"recording_enabled"` // Enable call recording to S3
+}
+
+// CloudflareTURNConfig is deployment-owned. The long-lived API token must never
+// be serialized into a public config response or supplied to a WebRTC client.
+type CloudflareTURNConfig struct {
+	KeyID    string `koanf:"key_id"`
+	APIToken string `koanf:"api_token" json:"-"`
+}
+
+func (c CloudflareTURNConfig) Configured() bool {
+	return c.KeyID != "" || c.APIToken != ""
+}
+
+func (c CloudflareTURNConfig) Validate() error {
+	if !c.Configured() {
+		return nil
+	}
+	if !regexp.MustCompile(`^[a-f0-9]{32}$`).MatchString(c.KeyID) {
+		return errors.New("calling Cloudflare TURN key_id must be a 32-character lowercase hexadecimal identifier")
+	}
+	if len(c.APIToken) < 16 || len(c.APIToken) > 4096 || !regexp.MustCompile(`^[A-Za-z0-9._~+/=-]+$`).MatchString(c.APIToken) {
+		return errors.New("calling Cloudflare TURN api_token must be a bounded token without whitespace")
+	}
+	return nil
 }
 
 type AppConfig struct {
@@ -514,6 +539,12 @@ func Load(configPath string) (*Config, error) {
 	}
 	if err := validateWhatsAppConfig(cfg.WhatsApp, cfg.App.Environment); err != nil {
 		return nil, err
+	}
+	if err := cfg.Calling.CloudflareTURN.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.Calling.CloudflareTURN.Configured() && len(cfg.Calling.ICEServers) != 0 {
+		return nil, errors.New("calling Cloudflare TURN and static ice_servers must not be configured together")
 	}
 
 	return &cfg, nil

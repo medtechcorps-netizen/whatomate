@@ -186,25 +186,37 @@ export const useCallingStore = defineStore('calling', () => {
     }
   }
 
-  // ICE server config (fetched from backend)
-  let cachedICEServers: RTCIceServer[] | null = null
-
-  async function getICEServers(): Promise<RTCIceServer[]> {
-    if (cachedICEServers) return cachedICEServers
+  // Resolve again for every new peer. The backend owns short-lived credential
+  // freshness; a browser tab must not retain a bundle indefinitely.
+  async function getICEConfiguration(): Promise<RTCConfiguration> {
     const identity = identityGeneration
-    try {
-      const response = await outgoingCallsService.getICEServers()
-      const data = response.data as any
-      const servers = data.data?.ice_servers ?? data.ice_servers ?? []
-      const mappedServers = servers.map((s: any) => ({
+    const response = await outgoingCallsService.getICEServers()
+    if (identity !== identityGeneration) throw new Error('Calling identity changed')
+    const envelope = response.data as any
+    const data = envelope.data ?? envelope
+    if (!Array.isArray(data.ice_servers)) throw new Error('Calling relay configuration is unavailable')
+    if (data.expires_at) {
+      const expiresAt = Date.parse(data.expires_at)
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        throw new Error('Calling relay credentials have expired. Please retry.')
+      }
+    }
+    return {
+      iceServers: data.ice_servers.map((s: any) => ({
         urls: s.urls,
         ...(s.username && { username: s.username, credential: s.credential }),
-      }))
-      if (identity === identityGeneration) cachedICEServers = mappedServers
-      return mappedServers
-    } catch {
-      if (identity === identityGeneration) cachedICEServers = []
-      return []
+      })),
+      iceTransportPolicy: data.ice_transport_policy === 'relay' ? 'relay' : 'all',
+    }
+  }
+
+  async function getICEForStream(stream: MediaStream): Promise<RTCConfiguration> {
+    try {
+      return await getICEConfiguration()
+    } catch (error) {
+      stream.getTracks().forEach(track => track.stop())
+      if (localStream.value === stream) localStream.value = null
+      throw error
     }
   }
 
@@ -244,13 +256,26 @@ export const useCallingStore = defineStore('calling', () => {
     }
   }
 
+  let pendingTransferAccept: symbol | null = null
+
   async function acceptTransfer(id: string) {
+    if (pendingTransferAccept) throw new Error('A call setup is already in progress')
+    const attempt = Symbol('transfer-accept')
+    pendingTransferAccept = attempt
+    try {
+      await connectTransfer(id)
+    } finally {
+      // Reset may have allowed a new identity's attempt to start meanwhile.
+      if (pendingTransferAccept === attempt) pendingTransferAccept = null
+    }
+  }
+
+  async function connectTransfer(id: string) {
     const identity = identityGeneration
     // Snapshot the transfer before the API call — the server broadcasts
     // call_transfer_connected immediately which removes it from waitingTransfers
     // via the WebSocket handler before this function completes.
     const transfer = waitingTransfers.value.find(t => t.id === id)
-    waitingTransfers.value = waitingTransfers.value.filter(t => t.id !== id)
 
     // Get microphone access
     let stream: MediaStream
@@ -264,9 +289,12 @@ export const useCallingStore = defineStore('calling', () => {
     localStream.value = stream
 
     // Create RTCPeerConnection with configured ICE servers
-    const iceServers = await getICEServers()
+    const iceConfiguration = await getICEForStream(stream)
     assertCallIdentity(identity, stream)
-    const pc = new RTCPeerConnection({ iceServers })
+    // Keep a still-waiting transfer visible when microphone or relay setup
+    // fails, so the same identity can retry it.
+    waitingTransfers.value = waitingTransfers.value.filter(t => t.id !== id)
+    const pc = new RTCPeerConnection(iceConfiguration)
     peerConnection.value = pc
 
     // Add local audio track
@@ -362,9 +390,9 @@ export const useCallingStore = defineStore('calling', () => {
     localStream.value = stream
 
     // Create RTCPeerConnection with configured ICE servers
-    const iceServers = await getICEServers()
+    const iceConfiguration = await getICEForStream(stream)
     assertCallIdentity(identity, stream)
-    const pc = new RTCPeerConnection({ iceServers })
+    const pc = new RTCPeerConnection(iceConfiguration)
     peerConnection.value = pc
 
     // Add local audio track
@@ -563,7 +591,7 @@ export const useCallingStore = defineStore('calling', () => {
     currentIVRFlow.value = null
     waitingTransfers.value = []
     callPermissions.clear()
-    cachedICEServers = null
+    pendingTransferAccept = null
     isTransferring.value = false
   }
 
