@@ -1644,6 +1644,26 @@ func (a *App) resolveEffectiveMetaAppCredsScoped(account *models.WhatsAppAccount
 		return appID, appSecret, configID, nil
 	}
 
+	legacyAppID := strings.TrimSpace(account.AppID)
+	if (legacyAppID != "" || strings.TrimSpace(account.AppSecret) != "") &&
+		(legacyAppID == "" || legacyAppID != strings.TrimSpace(appID)) {
+		var organization models.Organization
+		if err := a.DB.Select("settings").Where("id = ?", account.OrganizationID).First(&organization).Error; err != nil {
+			return "", "", "", err
+		}
+		if !metaWorkspaceAppManaged(&organization) {
+			// Newly configured platform defaults must not replace an existing
+			// account's unrelated Meta app. Keep legacy credentials together;
+			// borrowing a missing ID, secret, or Config ID could bind two apps.
+			// Matching app IDs still use central-first resolution for rotation.
+			legacySecret, err := a.decryptLegacyMetaAccountSecret(account.AppSecret)
+			if err != nil {
+				return "", "", "", err
+			}
+			return legacyAppID, legacySecret, "", nil
+		}
+	}
+
 	if strings.TrimSpace(appID) == "" {
 		appID = strings.TrimSpace(account.AppID)
 	}
