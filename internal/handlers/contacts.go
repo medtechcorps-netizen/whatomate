@@ -2435,6 +2435,14 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 	ctx := context.Background()
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
+		if cleanupErr := a.cleanupRejectedMessageMedia(orgID, mediaPath); cleanupErr != nil {
+			a.Log.Error(
+				"Failed to clean unreferenced rejected media",
+				"error", cleanupErr,
+				"media_path", mediaPath,
+				"org_id", orgID,
+			)
+		}
 		a.Log.Error("Failed to send message", "error", err)
 		if errors.Is(err, errOutgoingContactNotFound) ||
 			errors.Is(err, errOutgoingContactAccessRevoked) {

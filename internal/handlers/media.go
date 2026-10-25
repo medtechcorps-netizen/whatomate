@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -338,6 +339,48 @@ func (a *App) deleteTenantMedia(ctx context.Context, orgID uuid.UUID, key string
 		return err
 	}
 	return nil
+}
+
+const rejectedMessageMediaCleanupTimeout = 5 * time.Second
+
+// cleanupRejectedMessageMedia removes a just-saved outgoing media object only
+// after a fresh tenant read proves that no committed message references it.
+// This closes the validation-failure orphan path without deleting media from a
+// pending or failed message that was durably persisted.
+func (a *App) cleanupRejectedMessageMedia(orgID uuid.UUID, mediaPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), rejectedMessageMediaCleanupTimeout)
+	defer cancel()
+	return a.deleteUnreferencedMessageMedia(ctx, orgID, mediaPath)
+}
+
+func (a *App) deleteUnreferencedMessageMedia(
+	ctx context.Context,
+	orgID uuid.UUID,
+	mediaPath string,
+) error {
+	if a == nil || orgID == uuid.Nil || strings.TrimSpace(mediaPath) == "" {
+		return errors.New("message media cleanup identity is incomplete")
+	}
+	var unreferenced bool
+	if err := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
+		var references int64
+		if err := scoped.DB.WithContext(ctx).Unscoped().Model(&models.Message{}).
+			Where("organization_id = ? AND media_url = ?", orgID, mediaPath).
+			Count(&references).Error; err != nil {
+			return err
+		}
+		unreferenced = references == 0
+		return nil
+	}); err != nil {
+		return err
+	}
+	if !unreferenced {
+		return nil
+	}
+	// The randomized key is private to this rejected request. Perform the
+	// object delete after the reference-read transaction commits so no tenant
+	// database transaction is held across object-store I/O.
+	return a.deleteTenantMedia(ctx, orgID, mediaPath)
 }
 
 func (a *App) downloadAndSaveMedia(
