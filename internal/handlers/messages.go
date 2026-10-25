@@ -2608,6 +2608,16 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 	ctx := context.Background()
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
+		if headerMediaPath != "" {
+			if cleanupErr := a.cleanupRejectedMessageMedia(orgID, headerMediaPath); cleanupErr != nil {
+				a.Log.Error(
+					"Failed to clean unreferenced rejected template media",
+					"error", cleanupErr,
+					"media_path", headerMediaPath,
+					"org_id", orgID,
+				)
+			}
+		}
 		var consentErr *OutgoingConsentError
 		if errors.As(err, &consentErr) {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, consentErr.Error(), nil, "")
