@@ -1365,7 +1365,27 @@ func (a *App) broadcastTransferAssigned(transfer *models.AgentTransfer) {
 // With a callback, an already-active transfer only completes the session; nothing
 // is created, cut off, reassigned, re-SLA'd or announced, and
 // errActiveAgentTransferExists is returned AFTER that commit.
+//
+// An optional keyword arbiter is the transaction-only keyword branch decision.
+// It runs after the organization and canonical-contact locks and before any
+// transfer, cutoff or session write. A decline commits only its message phase;
+// a handover updates the terminal phase and proceeds with transfer/cutoff in the
+// same transaction.
+type inboundKeywordTransferArbiter func(*gorm.DB, uuid.UUID) (inboundKeywordTransferDecision, error)
+
 func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *models.WhatsAppAccount, contact *models.Contact, settings *models.ChatbotSettings, endChatbotSession bool, completeOwnedSession func(*gorm.DB) error) error {
+	return a.saveAndFinalizeTransferWithArbiter(
+		transfer,
+		account,
+		contact,
+		settings,
+		endChatbotSession,
+		completeOwnedSession,
+		nil,
+	)
+}
+
+func (a *App) saveAndFinalizeTransferWithArbiter(transfer *models.AgentTransfer, account *models.WhatsAppAccount, contact *models.Contact, settings *models.ChatbotSettings, endChatbotSession bool, completeOwnedSession func(*gorm.DB) error, keywordArbiter inboundKeywordTransferArbiter) error {
 	// Set SLA deadlines
 	if settings != nil {
 		a.SetSLADeadlines(transfer, settings)
@@ -1381,12 +1401,17 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	var savedTransfer models.AgentTransfer
 	var canonicalContact models.Contact
 	existingProven := false
+	keywordDeclined := false
 	// H1, nested handover only: one wall-clock budget for the organization fence, shared
 	// by every canonical-write attempt; it starts once the handover's own connection is held.
 	var fenceDeadline time.Time
 
 	write := func(tx *gorm.DB) error {
 		existingProven = false
+		keywordDeclined = false
+		keywordDecision := inboundKeywordTransferDecision{
+			Kind: inboundKeywordTransferCreate,
+		}
 		nested := a.inboundContinuation != nil
 		if nested {
 			// Bound each fence statement as well as their combined wall-clock time.
@@ -1452,6 +1477,24 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 		candidate := baseTransfer
 		candidate.ContactID = canonical.ID
 		candidate.PhoneNumber = canonical.PhoneNumber
+		if keywordArbiter != nil {
+			var arbitrationErr error
+			keywordDecision, arbitrationErr = keywordArbiter(tx, canonical.ID)
+			if arbitrationErr != nil {
+				return arbitrationErr
+			}
+			switch keywordDecision.Kind {
+			case inboundKeywordTransferCreate:
+			case inboundKeywordTransferExisting:
+				existingProven = true
+				return nil
+			case inboundKeywordTransferDecline:
+				keywordDeclined = true
+				return nil
+			default:
+				return errors.New("keyword transfer arbitration returned an unsupported decision")
+			}
+		}
 		if err := createActiveAgentTransferTx(tx, &candidate); err != nil {
 			if completeOwnedSession == nil || !errors.Is(err, errActiveAgentTransferExists) {
 				return err
@@ -1540,6 +1583,9 @@ func (a *App) saveAndFinalizeTransfer(transfer *models.AgentTransfer, account *m
 	}
 	if err != nil {
 		return err
+	}
+	if keywordDeclined {
+		return nil
 	}
 	if existingProven {
 		return errActiveAgentTransferExists // committed; nothing new to publish
@@ -1655,6 +1701,18 @@ func (a *App) createTransferToQueue(account *models.WhatsAppAccount, contact *mo
 // error is an intentional business-hours decline whose configured reply succeeded.
 // Preserve actual errors so only genuine bounded waits qualify for a refund.
 func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact *models.Contact) (bool, error) {
+	return a.createTransferFromKeywordWithDecision(account, contact, false)
+}
+
+// createTransferFromKeywordWithPhase is the phase-aware keyword route. Its
+// active-transfer lookup remains advisory: every outcome reaches the canonical
+// transaction so the durable body/decline/handover phase can arbitrate under
+// the same organization and canonical-contact locks as transfer and cutoff.
+func (a *App) createTransferFromKeywordWithPhase(account *models.WhatsAppAccount, contact *models.Contact) (bool, error) {
+	return a.createTransferFromKeywordWithDecision(account, contact, true)
+}
+
+func (a *App) createTransferFromKeywordWithDecision(account *models.WhatsAppAccount, contact *models.Contact, phaseAware bool) (bool, error) {
 	var active int64
 	if err := a.DB.Model(&models.AgentTransfer{}).
 		Where("organization_id = ? AND contact_id = ? AND status = ?", account.OrganizationID, contact.ID, models.TransferStatusActive).
@@ -1662,8 +1720,11 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 		return false, err
 	}
 	if active > 0 {
-		a.Log.Info("Contact already has active transfer, skipping keyword transfer", "contact_id", contact.ID)
-		return true, nil
+		if !phaseAware {
+			a.Log.Info("Contact already has active transfer, skipping keyword transfer", "contact_id", contact.ID)
+			return true, nil
+		}
+		a.Log.Info("Contact already has active transfer; proving keyword phase under canonical locks", "contact_id", contact.ID)
 	}
 
 	settings, err := a.getChatbotSettingsCached(account.OrganizationID, account.Name)
@@ -1671,16 +1732,23 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 		return false, err
 	}
 
-	// Check business hours - if outside hours, send out of hours message instead of transfer
+	var requestedDecline *string
+	// Check business hours. The legacy helper keeps its existing send/return
+	// behavior; the phase-aware helper records the exact decline and arbitrates
+	// it atomically with transfer creation.
 	if settings != nil && settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
 		if !a.isWithinBusinessHours(settings.BusinessHours.Hours) {
 			a.Log.Info("Outside business hours, sending out of hours message instead of transfer", "contact_id", contact.ID)
-			if settings.BusinessHours.OutOfHoursMessage != "" {
-				if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
-					return false, err
+			if !phaseAware {
+				if settings.BusinessHours.OutOfHoursMessage != "" {
+					if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
+						return false, err
+					}
 				}
+				return false, nil
 			}
-			return false, nil
+			reply := settings.BusinessHours.OutOfHoursMessage
+			requestedDecline = &reply
 		}
 	}
 
@@ -1705,13 +1773,38 @@ func (a *App) createTransferFromKeyword(account *models.WhatsAppAccount, contact
 		TransferredAt:   time.Now(),
 	}
 
-	if err := a.saveAndFinalizeTransfer(&transfer, account, contact, settings, true, nil); err != nil {
+	var finalDecision inboundKeywordTransferDecision
+	var arbiter inboundKeywordTransferArbiter
+	if phaseAware {
+		arbiter = func(tx *gorm.DB, canonicalContactID uuid.UUID) (inboundKeywordTransferDecision, error) {
+			decision, err := a.decideInboundKeywordTransferTx(
+				tx,
+				account,
+				canonicalContactID,
+				requestedDecline,
+			)
+			if err == nil {
+				finalDecision = decision
+			}
+			return decision, err
+		}
+	}
+	if err := a.saveAndFinalizeTransferWithArbiter(&transfer, account, contact, settings, true, nil, arbiter); err != nil {
 		if errors.Is(err, errActiveAgentTransferExists) {
 			a.Log.Debug("Concurrent active transfer already exists, skipping keyword transfer", "contact_id", contact.ID)
 			return true, nil
 		}
 		a.Log.Error("Failed to create keyword-triggered transfer", "error", err, "contact_id", contact.ID)
 		return false, keywordTransferHandoverError(err, a.inboundContinuation != nil)
+	}
+	if phaseAware && finalDecision.Kind == inboundKeywordTransferDecline {
+		if finalDecision.Decline != "" {
+			if err := a.sendAndSaveTextMessage(account, contact, finalDecision.Decline); err != nil {
+				a.Log.Error("Failed to send keyword out-of-hours response", "error", err, "contact_id", contact.ID)
+				return false, err
+			}
+		}
+		return false, nil
 	}
 
 	var agentIDStr string
