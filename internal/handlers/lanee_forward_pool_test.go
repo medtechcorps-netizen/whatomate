@@ -518,7 +518,12 @@ func TestLaneEForwardProviderMarkerPoolSaturation(t *testing.T) {
 				assert.Equal(t, forwardDispatchQueued, visible.ForwardDispatch)
 			}
 			assert.Equal(t, len(callbacks), ran, "every captured callback ran once")
-			assert.Greater(t, f.pool.Stats().WaitDuration, baseline.WaitDuration)
+			// WaitCount is the portable fact. Windows can report a sub-resolution
+			// two-connection contention interval as a zero WaitDuration even after
+			// beginAndWait observed the waiter and the pool advanced WaitCount.
+			stats := f.pool.Stats()
+			assert.Greater(t, stats.WaitCount, baseline.WaitCount)
+			assert.GreaterOrEqual(t, stats.WaitDuration, baseline.WaitDuration)
 			beforeCalls := len(f.w.capture.snapshot())
 			claimed, err := f.app.claimForwardProviderPhase(f.w.org.ID, m.ID)
 			require.NoError(t, err)
