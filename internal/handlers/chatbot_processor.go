@@ -931,8 +931,11 @@ func (a *App) continuePersistedIncomingMessage(
 		return fmt.Errorf("clear inbound chatbot tracking: %w", err)
 	}
 
-	// Check for active agent transfer - skip chatbot processing if transferred
-	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) {
+	// A durable keyword phase must still reach its terminal handover/decline
+	// decision under canonical locks. Messages without a phase preserve the
+	// existing active-transfer shortcut.
+	if a.hasActiveAgentTransfer(account.OrganizationID, contact.ID) &&
+		!inboundKeywordProgressDeclared(work.Persisted.Metadata) {
 		a.Log.Info("Contact has active agent transfer, skipping chatbot processing",
 			"contact_id", contact.ID,
 			"phone_number", contact.PhoneNumber)
@@ -962,6 +965,14 @@ func (a *App) continueIncomingWithContact(ctx context.Context, work *persistedIn
 	if err != nil {
 		a.Log.Error("Failed to load chatbot settings", "error", err, "account", account.Name, "org_id", account.OrganizationID)
 		return fmt.Errorf("load inbound continuation chatbot settings: %w", err)
+	}
+	if settings == nil {
+		return errors.New("load inbound continuation chatbot settings: settings are unavailable")
+	}
+	// Resume the exact selected keyword branch before mutable disabled/hours
+	// branches and before matching today's rules again.
+	if inboundKeywordProgressDeclared(work.Persisted.Metadata) {
+		return a.runInboundKeywordProgress(account, contact, settings, nil)
 	}
 	if !settings.IsEnabled {
 		a.Log.Debug("Chatbot not enabled for this account, creating transfer for agent queue", "account", account.Name, "settings_id", settings.ID)
@@ -997,6 +1008,28 @@ func (a *App) continueIncomingWithContact(ctx context.Context, work *persistedIn
 		if !a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
 			// If automated responses are not allowed outside hours, send out-of-hours message and stop
 			if !settings.BusinessHours.AllowAutomatedOutside {
+				// Select a transfer keyword before consuming the generic OOH reply,
+				// so ordinal zero is durably the initial decline rather than an
+				// ambiguous transfer body.
+				if messageText != "" && !isNativeBookingConfirmation(messageText) {
+					response, matched := a.matchKeywordRules(
+						account.OrganizationID,
+						account.Name,
+						messageText,
+					)
+					if matched && response != nil &&
+						response.ResponseType == models.ResponseTypeTransfer {
+						return a.runInboundKeywordProgress(
+							account,
+							contact,
+							settings,
+							&inboundKeywordProgress{
+								Stage:   inboundKeywordStageDeclined,
+								Decline: settings.BusinessHours.OutOfHoursMessage,
+							},
+						)
+					}
+				}
 				a.Log.Info("Outside business hours, sending out of hours message")
 				if settings.BusinessHours.OutOfHoursMessage != "" {
 					if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
@@ -1064,35 +1097,22 @@ func (a *App) continueIncomingWithContact(ctx context.Context, work *persistedIn
 	}
 	if keywordMatched && keywordResponse.ResponseType == models.ResponseTypeTransfer {
 		a.Log.Info("Transfer keyword matched", "response", keywordResponse.Body)
-		// Check business hours - if outside hours, send out of hours message instead
+		initial := &inboundKeywordProgress{
+			Stage: inboundKeywordStageBody,
+			Body:  keywordResponse.Body,
+		}
+		// Preserve the existing keyword-specific hours decision and commit the
+		// selected outcome before any reply claim. A body that first passed this
+		// check still receives the helper's existing second hours check.
 		if settings.BusinessHours.Enabled && len(settings.BusinessHours.Hours) > 0 {
 			if !a.incomingWithinBusinessHours(settings.BusinessHours.Hours) {
-				a.Log.Info("Outside business hours, sending out of hours message instead of transfer")
-				if settings.BusinessHours.OutOfHoursMessage != "" {
-					if err := a.sendAndSaveTextMessage(account, contact, settings.BusinessHours.OutOfHoursMessage); err != nil {
-						a.Log.Error("Failed to send out of hours message", "error", err, "contact", contact.PhoneNumber)
-						return fmt.Errorf(
-							"send transfer out-of-hours response: %w",
-							err,
-						)
-					}
+				initial = &inboundKeywordProgress{
+					Stage:   inboundKeywordStageDeclined,
+					Decline: settings.BusinessHours.OutOfHoursMessage,
 				}
-				return nil
 			}
 		}
-		// Within business hours - send transfer message and create transfer
-		if keywordResponse.Body != "" {
-			if err := a.sendAndSaveTextMessage(account, contact, keywordResponse.Body); err != nil {
-				a.Log.Error("Failed to send transfer message", "error", err, "contact", contact.PhoneNumber)
-				return fmt.Errorf("send transfer response: %w", err)
-			}
-		}
-		// Existing handover and intentional business-hours decline both consume this
-		// inbound. Preserve real failures; the ledger replays the accepted body on retry.
-		if _, err := a.createTransferFromKeyword(account, contact); err != nil {
-			return fmt.Errorf("create keyword transfer: %w", err)
-		}
-		return nil
+		return a.runInboundKeywordProgress(account, contact, settings, initial)
 	}
 
 	// Check if user is in an active flow. After Phase 4.2 every flow has

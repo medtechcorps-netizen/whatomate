@@ -72,6 +72,8 @@ type inboundContinuationExecution struct {
 	ownershipCtx context.Context
 	jobID        uuid.UUID
 	workerID     string
+	lease        time.Duration
+	leaseNow     func() time.Time
 	// Bound only during one physical guard; the callback reuses that existing
 	// READ COMMITTED transaction after the independent action claim commits.
 	attemptOwnershipCheck func() error
@@ -580,6 +582,7 @@ func (p *InboundContinuationProcessor) processClaimed(
 			OrganizationID: work.OrganizationID, ContactID: work.Contact.ID,
 			MessageID: work.Persisted.ID, WAMID: work.Message.ID,
 			ownershipCtx: ownershipCtx, jobID: job.ID, workerID: p.workerID,
+			lease: p.lease, leaseNow: p.now,
 		}
 		alreadyCompleted := false
 		scopeErr = executionApp.WithTenantApp(organizationID, func(scoped *App) error {
@@ -618,6 +621,8 @@ func (p *InboundContinuationProcessor) processClaimed(
 					ownershipCtx:   ownershipCtx,
 					jobID:          job.ID,
 					workerID:       p.workerID,
+					lease:          p.lease,
+					leaseNow:       p.now,
 				}
 				alreadyCompleted, checkpointErr := executionApp.
 					inboundContinuationAlreadyCompleted(work.Persisted.ID)
@@ -2097,6 +2102,505 @@ func (a *App) markInboundContinuationCompleted(messageID uuid.UUID) error {
 			Where("id = ? AND organization_id = ?", messageID, organizationID).
 			Update("metadata", metadata).Error
 	})
+}
+
+const (
+	inboundKeywordProgressKey          = "inbound_keyword_progress"
+	inboundKeywordStageBody            = "body"
+	inboundKeywordStageBodyDeclined    = "body_declined"
+	inboundKeywordStageDeclined        = "declined"
+	inboundKeywordStageHandover        = "handover"
+	inboundKeywordProgressVersion      = 1
+	inboundKeywordDefaultDecisionLease = 5 * time.Minute
+)
+
+// inboundKeywordProgress is a durable message-local branch decision, not a new
+// provider action identity. It freezes the exact selected bodies before mutable
+// keyword, hours and chatbot settings can change the meaning of ordinal zero.
+type inboundKeywordProgress struct {
+	Version   int       `json:"version"`
+	MessageID uuid.UUID `json:"message_id"`
+	ContactID uuid.UUID `json:"contact_id"`
+	AccountID uuid.UUID `json:"account_id"`
+	Account   string    `json:"account"`
+	PhoneID   string    `json:"phone_id"`
+	Stage     string    `json:"stage"`
+	Body      string    `json:"body"`
+	Decline   string    `json:"decline"`
+}
+
+type inboundKeywordTransferDecisionKind int
+
+const (
+	inboundKeywordTransferCreate inboundKeywordTransferDecisionKind = iota
+	inboundKeywordTransferExisting
+	inboundKeywordTransferDecline
+)
+
+type inboundKeywordTransferDecision struct {
+	Kind    inboundKeywordTransferDecisionKind
+	Decline string
+}
+
+func inboundKeywordProgressDeclared(metadata models.JSONB) bool {
+	_, exists := metadata[inboundKeywordProgressKey]
+	return exists
+}
+
+func readInboundKeywordProgress(metadata models.JSONB) (*inboundKeywordProgress, error) {
+	raw, exists := metadata[inboundKeywordProgressKey]
+	if !exists {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, &inboundContinuationManualReviewError{
+			Reason: "keyword progress checkpoint is not decodable",
+		}
+	}
+	var progress inboundKeywordProgress
+	if err := json.Unmarshal(encoded, &progress); err != nil {
+		return nil, &inboundContinuationManualReviewError{
+			Reason: "keyword progress checkpoint is invalid",
+		}
+	}
+	validStage := progress.Stage == inboundKeywordStageBody ||
+		progress.Stage == inboundKeywordStageBodyDeclined ||
+		progress.Stage == inboundKeywordStageDeclined ||
+		progress.Stage == inboundKeywordStageHandover
+	if progress.Version != inboundKeywordProgressVersion ||
+		progress.MessageID == uuid.Nil || progress.ContactID == uuid.Nil ||
+		progress.AccountID == uuid.Nil || strings.TrimSpace(progress.Account) == "" ||
+		strings.TrimSpace(progress.PhoneID) == "" || !validStage ||
+		(progress.Stage == inboundKeywordStageBody && progress.Decline != "") ||
+		(progress.Stage == inboundKeywordStageDeclined && progress.Body != "") ||
+		(progress.Stage == inboundKeywordStageHandover && progress.Decline != "") {
+		return nil, &inboundContinuationManualReviewError{
+			Reason: "keyword progress checkpoint has an invalid stage or binding",
+		}
+	}
+	return &progress, nil
+}
+
+func (a *App) requireInboundKeywordExecution(
+	account *models.WhatsAppAccount,
+	contact *models.Contact,
+) error {
+	execution := a.inboundContinuation
+	if execution == nil || account == nil || contact == nil ||
+		execution.OrganizationID == uuid.Nil || execution.MessageID == uuid.Nil ||
+		execution.ContactID != contact.ID || execution.OrganizationID != account.OrganizationID ||
+		a.inboundContinuationOrganizationID() != account.OrganizationID ||
+		execution.jobID == uuid.Nil || strings.TrimSpace(execution.workerID) == "" ||
+		strings.TrimSpace(execution.WAMID) == "" ||
+		(execution.actionScope != "" && execution.actionScope != "continuation") {
+		return &inboundContinuationManualReviewError{
+			Reason: "keyword progress execution identity is not proven",
+		}
+	}
+	return nil
+}
+
+func (a *App) requireInboundKeywordLeaseTx(tx *gorm.DB) error {
+	execution := a.inboundContinuation
+	if execution == nil || tx == nil || execution.jobID == uuid.Nil ||
+		execution.OrganizationID == uuid.Nil || strings.TrimSpace(execution.workerID) == "" {
+		return &inboundContinuationManualReviewError{
+			Reason: "keyword decision has no durable continuation lease identity",
+		}
+	}
+	var job models.ScheduledJob
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(
+			"id = ? AND organization_id = ? AND kind = ? AND status = ? AND locked_by = ?",
+			execution.jobID,
+			execution.OrganizationID,
+			inboundContinuationJobKind,
+			models.ScheduledJobStatusProcessing,
+			execution.workerID,
+		).
+		First(&job).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errors.New("inbound continuation keyword decision lost its worker lease")
+		}
+		return err
+	}
+	lease := execution.lease
+	if lease <= 0 {
+		lease = inboundKeywordDefaultDecisionLease
+	}
+	now := time.Now().UTC()
+	if execution.leaseNow != nil {
+		now = execution.leaseNow().UTC()
+	}
+	if job.LockedAt == nil || job.LockedAt.Before(now.Add(-lease)) {
+		return errors.New("inbound continuation keyword decision lease is stale")
+	}
+	return nil
+}
+
+func (a *App) loadInboundKeywordMessageTx(
+	tx *gorm.DB,
+	account *models.WhatsAppAccount,
+) (*models.Message, error) {
+	execution := a.inboundContinuation
+	if tx == nil || account == nil || execution == nil {
+		return nil, errors.New("keyword progress message load requires a transaction")
+	}
+	var message models.Message
+	if err := tx.Clauses(clause.Locking{Strength: "NO KEY UPDATE"}).
+		Where(
+			"id = ? AND organization_id = ? AND direction = ?",
+			execution.MessageID,
+			account.OrganizationID,
+			models.DirectionIncoming,
+		).
+		First(&message).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, &inboundContinuationManualReviewError{
+				Reason: "keyword progress inbound message is missing",
+			}
+		}
+		return nil, err
+	}
+	if message.ContactID != execution.ContactID ||
+		message.WhatsAppAccount != account.Name ||
+		message.WhatsAppMessageID != execution.WAMID {
+		return nil, &inboundContinuationManualReviewError{
+			Reason: "keyword progress message binding changed",
+		}
+	}
+	return &message, nil
+}
+
+func writeInboundKeywordProgressTx(
+	tx *gorm.DB,
+	message *models.Message,
+	progress *inboundKeywordProgress,
+) error {
+	if tx == nil || message == nil || progress == nil {
+		return errors.New("keyword progress update requires a message and transaction")
+	}
+	encoded, err := json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	var checkpoint models.JSONB
+	if err := json.Unmarshal(encoded, &checkpoint); err != nil {
+		return err
+	}
+	metadata := cloneInboundContinuationJSONB(message.Metadata)
+	metadata[inboundKeywordProgressKey] = checkpoint
+	update := tx.Model(&models.Message{}).
+		Where(
+			"id = ? AND organization_id = ? AND direction = ?",
+			message.ID,
+			message.OrganizationID,
+			models.DirectionIncoming,
+		).
+		Update("metadata", metadata)
+	if update.Error != nil {
+		return update.Error
+	}
+	if update.RowsAffected != 1 {
+		return errors.New("keyword progress inbound message disappeared")
+	}
+	message.Metadata = metadata
+	return nil
+}
+
+// keywordProgress commits the selected branch before the first relevant
+// provider claim. This short transaction owns only the inbound Message row and
+// releases it before any send. A later canonical transfer transaction performs
+// the handover-versus-decline arbitration atomically with transfer and cutoff.
+func (a *App) keywordProgress(
+	account *models.WhatsAppAccount,
+	contact *models.Contact,
+	initial *inboundKeywordProgress,
+) (*inboundKeywordProgress, error) {
+	if err := a.requireInboundKeywordExecution(account, contact); err != nil {
+		return nil, err
+	}
+	execution := a.inboundContinuation
+	var result *inboundKeywordProgress
+	waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := a.withIndependentInboundContinuationAction(
+		waitCtx,
+		account.OrganizationID,
+		func(tx *gorm.DB) error {
+			if err := tx.Exec("SET LOCAL lock_timeout = '3s'").Error; err != nil {
+				return err
+			}
+			if err := tx.Exec("SET LOCAL statement_timeout = '10s'").Error; err != nil {
+				return err
+			}
+			message, err := a.loadInboundKeywordMessageTx(tx, account)
+			if err != nil {
+				return err
+			}
+			if completed, _ := message.Metadata["inbound_continuation_completed"].(bool); completed {
+				return &inboundContinuationPolicyStop{Reason: "inbound already completed"}
+			}
+			if incomingMessageAutomaticAISuppressed(message) {
+				return &inboundContinuationPolicyStop{Reason: "inbound automatic reply suppressed"}
+			}
+			if err := a.requireInboundKeywordLeaseTx(tx); err != nil {
+				return err
+			}
+
+			progress, err := readInboundKeywordProgress(message.Metadata)
+			if err != nil {
+				return err
+			}
+			if progress == nil {
+				if initial == nil || execution.actionIndex != 0 {
+					return &inboundContinuationManualReviewError{
+						Reason: "keyword progress is missing before replay",
+					}
+				}
+				// Existing action rows prove a visible effect but not whether
+				// ordinal zero was the selected transfer body or an initial OOH
+				// reply. Do not relabel or resend an unfinished legacy row.
+				var prior []models.ScheduledJob
+				if err := tx.Select("id").
+					Where(
+						"organization_id = ? AND kind = ? AND aggregate_id = ?",
+						account.OrganizationID,
+						inboundContinuationActionJobKind,
+						execution.MessageID,
+					).
+					Limit(1).
+					Find(&prior).Error; err != nil {
+					return err
+				}
+				if len(prior) != 0 {
+					return &inboundContinuationManualReviewError{
+						Reason: "unfinished legacy keyword actions require reconciliation",
+					}
+				}
+				copy := *initial
+				copy.Version = inboundKeywordProgressVersion
+				copy.MessageID = execution.MessageID
+				copy.ContactID = contact.ID
+				copy.AccountID = account.ID
+				copy.Account = account.Name
+				copy.PhoneID = account.PhoneID
+				if _, err := readInboundKeywordProgress(models.JSONB{
+					inboundKeywordProgressKey: inboundKeywordProgressToJSONB(&copy),
+				}); err != nil {
+					return err
+				}
+				progress = &copy
+				if err := writeInboundKeywordProgressTx(tx, message, progress); err != nil {
+					return err
+				}
+			}
+			if progress.MessageID != execution.MessageID ||
+				progress.ContactID != execution.ContactID ||
+				progress.AccountID != account.ID ||
+				progress.Account != account.Name ||
+				progress.PhoneID != account.PhoneID {
+				return &inboundContinuationManualReviewError{
+					Reason: "keyword progress account or contact binding changed",
+				}
+			}
+			result = progress
+			return nil
+		},
+	)
+	return result, err
+}
+
+func inboundKeywordProgressToJSONB(progress *inboundKeywordProgress) models.JSONB {
+	if progress == nil {
+		return nil
+	}
+	return models.JSONB{
+		"version":    progress.Version,
+		"message_id": progress.MessageID.String(),
+		"contact_id": progress.ContactID.String(),
+		"account_id": progress.AccountID.String(),
+		"account":    progress.Account,
+		"phone_id":   progress.PhoneID,
+		"stage":      progress.Stage,
+		"body":       progress.Body,
+		"decline":    progress.Decline,
+	}
+}
+
+// decideInboundKeywordTransferTx is the transaction-only arbitration callback
+// used by saveAndFinalizeTransfer. It must not open another connection, call a
+// provider/ledger helper or queue post-commit work.
+func (a *App) decideInboundKeywordTransferTx(
+	tx *gorm.DB,
+	account *models.WhatsAppAccount,
+	canonicalContactID uuid.UUID,
+	requestedDecline *string,
+) (inboundKeywordTransferDecision, error) {
+	execution := a.inboundContinuation
+	if execution == nil {
+		return inboundKeywordTransferDecision{}, &inboundContinuationManualReviewError{
+			Reason: "keyword transfer has no durable execution identity",
+		}
+	}
+	if err := a.requireInboundKeywordExecution(account, &models.Contact{
+		BaseModel: models.BaseModel{ID: execution.ContactID},
+	}); err != nil {
+		return inboundKeywordTransferDecision{}, err
+	}
+	message, err := a.loadInboundKeywordMessageTx(tx, account)
+	if err != nil {
+		return inboundKeywordTransferDecision{}, err
+	}
+	if message.ContactID != canonicalContactID {
+		return inboundKeywordTransferDecision{}, &inboundContinuationManualReviewError{
+			Reason: "keyword progress contact became a different canonical contact",
+		}
+	}
+	if completed, _ := message.Metadata["inbound_continuation_completed"].(bool); completed {
+		return inboundKeywordTransferDecision{}, &inboundContinuationPolicyStop{
+			Reason: "inbound already completed",
+		}
+	}
+	if incomingMessageAutomaticAISuppressed(message) {
+		return inboundKeywordTransferDecision{}, &inboundContinuationPolicyStop{
+			Reason: "inbound automatic reply suppressed",
+		}
+	}
+	if err := a.requireInboundKeywordLeaseTx(tx); err != nil {
+		return inboundKeywordTransferDecision{}, err
+	}
+	progress, err := readInboundKeywordProgress(message.Metadata)
+	if err != nil {
+		return inboundKeywordTransferDecision{}, err
+	}
+	if progress == nil {
+		return inboundKeywordTransferDecision{}, &inboundContinuationManualReviewError{
+			Reason: "keyword transfer has no durable branch checkpoint",
+		}
+	}
+	if progress.MessageID != a.inboundContinuation.MessageID ||
+		progress.ContactID != canonicalContactID ||
+		progress.AccountID != account.ID ||
+		progress.Account != account.Name ||
+		progress.PhoneID != account.PhoneID {
+		return inboundKeywordTransferDecision{}, &inboundContinuationManualReviewError{
+			Reason: "keyword transfer checkpoint binding changed",
+		}
+	}
+
+	switch progress.Stage {
+	case inboundKeywordStageBodyDeclined, inboundKeywordStageDeclined:
+		return inboundKeywordTransferDecision{
+			Kind:    inboundKeywordTransferDecline,
+			Decline: progress.Decline,
+		}, nil
+	case inboundKeywordStageHandover:
+		return inboundKeywordTransferDecision{Kind: inboundKeywordTransferExisting}, nil
+	}
+
+	var active int64
+	if err := tx.Model(&models.AgentTransfer{}).
+		Where(
+			"organization_id = ? AND contact_id = ? AND status = ?",
+			account.OrganizationID,
+			canonicalContactID,
+			models.TransferStatusActive,
+		).
+		Count(&active).Error; err != nil {
+		return inboundKeywordTransferDecision{}, err
+	}
+	if active > 0 {
+		progress.Stage = inboundKeywordStageHandover
+		progress.Decline = ""
+		if err := writeInboundKeywordProgressTx(tx, message, progress); err != nil {
+			return inboundKeywordTransferDecision{}, err
+		}
+		return inboundKeywordTransferDecision{Kind: inboundKeywordTransferExisting}, nil
+	}
+	if requestedDecline != nil {
+		progress.Stage = inboundKeywordStageBodyDeclined
+		progress.Decline = *requestedDecline
+		if err := writeInboundKeywordProgressTx(tx, message, progress); err != nil {
+			return inboundKeywordTransferDecision{}, err
+		}
+		return inboundKeywordTransferDecision{
+			Kind:    inboundKeywordTransferDecline,
+			Decline: *requestedDecline,
+		}, nil
+	}
+
+	progress.Stage = inboundKeywordStageHandover
+	progress.Decline = ""
+	if err := writeInboundKeywordProgressTx(tx, message, progress); err != nil {
+		return inboundKeywordTransferDecision{}, err
+	}
+	return inboundKeywordTransferDecision{Kind: inboundKeywordTransferCreate}, nil
+}
+
+func (a *App) runInboundKeywordProgress(
+	account *models.WhatsAppAccount,
+	contact *models.Contact,
+	settings *models.ChatbotSettings,
+	initial *inboundKeywordProgress,
+) error {
+	progress, err := a.keywordProgress(account, contact, initial)
+	if err != nil {
+		return err
+	}
+	if progress == nil {
+		return errors.New("keyword progress checkpoint was not returned")
+	}
+	if progress.Stage == inboundKeywordStageHandover {
+		return nil
+	}
+	if settings == nil {
+		return &inboundContinuationManualReviewError{
+			Reason: "keyword progress has no current chatbot settings",
+		}
+	}
+	if !settings.IsEnabled {
+		return &inboundContinuationManualReviewError{
+			Reason: "chatbot disabled during unfinished keyword progress",
+		}
+	}
+
+	if progress.Body != "" {
+		if err := a.sendAndSaveTextMessage(account, contact, progress.Body); err != nil {
+			if progress.Stage == inboundKeywordStageBody &&
+				inboundContinuationStoppedByPolicy(err) {
+				// An active or newly suppressed contact can stop the body at the
+				// physical guard. Still reach the canonical phase callback: an
+				// existing handover becomes terminal without another transfer,
+				// cutoff, provider call or duplicate notification.
+				if _, transferErr := a.createTransferFromKeywordWithPhase(account, contact); transferErr != nil {
+					return fmt.Errorf("create keyword transfer after policy stop: %w", transferErr)
+				}
+				return nil
+			}
+			return fmt.Errorf("send transfer response: %w", err)
+		}
+	}
+	switch progress.Stage {
+	case inboundKeywordStageDeclined, inboundKeywordStageBodyDeclined:
+		if progress.Decline != "" {
+			if err := a.sendAndSaveTextMessage(account, contact, progress.Decline); err != nil {
+				return fmt.Errorf("send out-of-hours response: %w", err)
+			}
+		}
+		return nil
+	case inboundKeywordStageBody:
+		_, err := a.createTransferFromKeywordWithPhase(account, contact)
+		if err != nil {
+			return fmt.Errorf("create keyword transfer: %w", err)
+		}
+		return nil
+	default:
+		return &inboundContinuationManualReviewError{
+			Reason: "keyword progress reached an unsupported stage",
+		}
+	}
 }
 
 func (a *App) inboundContinuationOrganizationID() uuid.UUID {

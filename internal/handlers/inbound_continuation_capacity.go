@@ -266,7 +266,8 @@ func (a *App) prepareIncomingContinuation(ctx context.Context, work *persistedIn
 		return nil, fmt.Errorf("clear inbound chatbot tracking: %w", err)
 	}
 	if err := read(func(scoped *App) error {
-		if scoped.hasActiveAgentTransfer(account.OrganizationID, prepared.contact.ID) {
+		if scoped.hasActiveAgentTransfer(account.OrganizationID, prepared.contact.ID) &&
+			!inboundKeywordProgressDeclared(work.Persisted.Metadata) {
 			prepared.done = true
 			return nil
 		}
