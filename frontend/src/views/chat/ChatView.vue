@@ -733,9 +733,21 @@ function toggleConversationAI() {
 // managers) they come from the organization member list.
 const {
   users: assignableUsers,
+  search: assignSearchQuery,
+  loading: assignableUsersLoading,
+  failed: assignableUsersFailed,
+  hasMore: hasMoreAssignableUsers,
   load: loadAssignableUsers,
+  loadMore: loadMoreAssignableUsers,
+  ensureLoaded: ensureAssignableUsersLoaded,
   nameOf: assignableUserName,
 } = useAssignableUsers()
+
+// Assignment may be granted after mount. Opening the picker initializes it
+// without fetching a directory while the caller lacks assignment authority.
+watch(isAssignDialogOpen, open => {
+  if (open && canAssignContacts.value) void ensureAssignableUsersLoaded()
+})
 
 // Icon mapping for custom actions
 const actionIconMap: Record<string, any> = {
@@ -840,19 +852,6 @@ async function executeCustomAction(action: CustomAction) {
     executingActionId.value = null
   }
 }
-
-// Search state for assignment dialog
-const assignSearchQuery = ref('')
-
-// Filtered users for assignment dialog
-const filteredAssignableUsers = computed(() => {
-  const query = assignSearchQuery.value.toLowerCase().trim()
-  if (!query) return assignableUsers.value
-  return assignableUsers.value.filter(u =>
-    u.full_name.toLowerCase().includes(query) ||
-    u.email.toLowerCase().includes(query)
-  )
-})
 
 // Fetch contacts on mount (WebSocket is connected in AppLayout)
 onMounted(async () => {
@@ -3397,6 +3396,7 @@ watch(contactId, () => chatAttachments.reset())
             <Search class="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
             <Input
               v-model="assignSearchQuery"
+              :aria-label="$t('chat.searchUsers')"
               :placeholder="$t('chat.searchUsers') + '...'"
               class="pl-9 h-9"
             />
@@ -3414,7 +3414,7 @@ watch(contactId, () => chatAttachments.reset())
           <ScrollArea class="max-h-[280px]">
             <div class="space-y-1">
               <Button
-                v-for="user in filteredAssignableUsers"
+                v-for="user in assignableUsers"
                 :key="user.id"
                 :variant="contactsStore.currentContact?.assigned_user_id === user.id ? 'secondary' : 'ghost'"
                 class="w-full justify-start"
@@ -3430,11 +3430,22 @@ watch(contactId, () => chatAttachments.reset())
                   {{ user.role_name }}
                 </Badge>
               </Button>
-              <p v-if="filteredAssignableUsers.length === 0" class="text-sm text-muted-foreground text-center py-4">
+              <p v-if="!assignableUsersLoading && !assignableUsersFailed && !hasMoreAssignableUsers && assignableUsers.length === 0" class="text-sm text-muted-foreground text-center py-4" role="status">
                 {{ $t('chat.noUsersFound') }}
               </p>
             </div>
           </ScrollArea>
+          <p v-if="assignableUsersLoading" class="text-sm text-muted-foreground text-center" role="status">
+            {{ $t('common.loading') }}
+          </p>
+          <div v-else-if="assignableUsersFailed" class="space-y-2">
+            <p class="text-sm text-destructive" role="alert">{{ $t('chat.assignUsersLoadFailed') }}</p>
+            <Button variant="outline" class="w-full" @click="loadAssignableUsers()">{{ $t('common.retry') }}</Button>
+          </div>
+          <div v-else-if="hasMoreAssignableUsers" class="space-y-2">
+            <p class="text-sm text-muted-foreground" role="status">{{ $t('chat.assignUsersMore') }}</p>
+            <Button variant="outline" class="w-full" @click="loadMoreAssignableUsers()">{{ $t('chat.loadMore') }}</Button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>

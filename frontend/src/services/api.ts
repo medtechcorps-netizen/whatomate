@@ -1999,7 +1999,11 @@ export const usersService = {
     limit?: number;
     role_id?: string;
     online_only?: boolean;
-  }, signal?: AbortSignal) => api.get("/users", { params, signal }),
+  }, signal?: AbortSignal, organizationId?: string) => api.get("/users", {
+    params,
+    signal,
+    ...(organizationId ? { headers: { "X-Organization-ID": organizationId } } : {}),
+  }),
   get: (id: string) => api.get(`/users/${id}`),
   create: (data: {
     email: string;
@@ -2221,7 +2225,7 @@ export const contactsService = {
   // People a contact can be assigned to, for callers without users:read:
   // the organization's members (organizations:read), membership-aware like
   // the server's assignee check.
-  assignableMembers: (signal?: AbortSignal) =>
+  assignableMembers: (params: { page: number; limit: number; search?: string }, signal: AbortSignal, organizationId: string) =>
     api.get<{
       members: Array<{
         user_id: string;
@@ -2231,7 +2235,9 @@ export const contactsService = {
         role_name?: string | null;
       }>;
       total: number;
-    }>("/organizations/members", { params: { page: 1, limit: 100 }, signal }),
+      page: number;
+      limit: number;
+    }>("/organizations/members", { params, signal, headers: { "X-Organization-ID": organizationId } }),
   markManualReadState: (id: string, mark: "read" | "unread") =>
     api.post<{ status: string; cursor_synced: boolean; manual_unread: boolean }>(
       `/contacts/${encodeURIComponent(id)}/mark-read`,
