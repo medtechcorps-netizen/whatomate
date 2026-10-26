@@ -2088,8 +2088,160 @@ func (a *App) broadcastReactionUpdate(orgID uuid.UUID, messageID, contactID uuid
 	})
 }
 
+const assignmentAudienceTimeout = 5 * time.Second
+const assignmentAudienceLimit = 1024
+
+func contactRoleCanRead(role *models.CustomRole) bool {
+	if role == nil {
+		return false
+	}
+	for _, permission := range role.Permissions {
+		if permission.Resource == models.ResourceContacts && permission.Action == models.ActionRead {
+			return true
+		}
+	}
+	return false
+}
+
+// contactReaderAuthority keeps a failed membership/role read distinct from a
+// confirmed denial. It uses the caller's connection and deadline, never cached
+// permission grants or an independent pooled checkout.
+func (a *App) contactReaderAuthority(userID, orgID uuid.UUID) (bool, error) {
+	var user models.User
+	if err := a.DB.Where("id = ? AND is_active = ?", userID, true).First(&user).Error; err != nil {
+		return false, err
+	}
+	if err := a.applyOrganizationMembershipDB(a.DB, &user, orgID, false); err != nil {
+		return false, err
+	}
+	if user.IsSuperAdmin {
+		return true, nil
+	}
+	if user.Role == nil {
+		return false, nil
+	}
+	if err := a.loadRolePermissions(user.Role); err != nil {
+		return false, err
+	}
+	return contactRoleCanRead(user.Role), nil
+}
+
+// assignmentHintAudience uses fresh authority on the caller's bounded tenant
+// connection. The former assignee receives only an invalidation, never a read
+// grant. The HTTP refetch remains authoritative after this observation.
+func (a *App) assignmentHintAudience(orgID, contactID, previousAssigneeID uuid.UUID, connected []uuid.UUID) ([]uuid.UUID, error) {
+	if len(connected) > assignmentAudienceLimit {
+		return nil, fmt.Errorf("assignment audience exceeds connected-user bound")
+	}
+	if len(connected) == 0 {
+		return nil, nil
+	}
+	var contact models.Contact
+	if err := a.DB.Where("id = ? AND organization_id = ? AND merged_into_id IS NULL", contactID, orgID).First(&contact).Error; err != nil {
+		return nil, err
+	}
+	var users []models.User
+	if err := a.DB.Where("id IN ? AND is_active = ?", connected, true).Find(&users).Error; err != nil {
+		return nil, err
+	}
+	var transferAgents []uuid.UUID
+	if err := a.DB.Model(&models.AgentTransfer{}).Distinct("agent_id").
+		Where("organization_id = ? AND contact_id = ? AND status = ? AND agent_id IN ?", orgID, contactID, models.TransferStatusActive, connected).
+		Pluck("agent_id", &transferAgents).Error; err != nil {
+		return nil, err
+	}
+	assigned := make(map[uuid.UUID]bool, len(transferAgents)+1)
+	for _, id := range transferAgents {
+		assigned[id] = true
+	}
+	if contact.AssignedUserID != nil {
+		assigned[*contact.AssignedUserID] = true
+	}
+	roles := make(map[uuid.UUID]*models.CustomRole)
+	valid := make([]models.User, 0, len(users))
+	for i := range users {
+		if err := a.DB.Statement.Context.Err(); err != nil {
+			return nil, err
+		}
+		user := users[i]
+		if err := a.applyOrganizationMembershipDB(a.DB, &user, orgID, false); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, database.ErrPlatformComplianceTenant) {
+				continue
+			}
+			return nil, err
+		}
+		valid = append(valid, user)
+		if user.Role != nil {
+			roles[user.Role.ID] = user.Role
+		}
+	}
+	roleList := make([]*models.CustomRole, 0, len(roles))
+	for _, role := range roles {
+		roleList = append(roleList, role)
+	}
+	if err := a.loadRolePermissions(roleList...); err != nil {
+		return nil, err
+	}
+	readRoles := make(map[uuid.UUID]bool, len(roles))
+	for id, role := range roles {
+		readRoles[id] = contactRoleCanRead(role)
+	}
+	var recipients []uuid.UUID
+	for _, user := range valid {
+		canRead := user.IsSuperAdmin || assigned[user.ID] || (user.RoleID != nil && readRoles[*user.RoleID])
+		if canRead || user.ID == previousAssigneeID {
+			recipients = append(recipients, user.ID)
+		}
+	}
+	return recipients, nil
+}
+
+// broadcastAssignmentUpdate resolves the local audience only after commit.
+// A failed/oversized audience drops this optional hint completely; the already
+// committed mutation must not become a retryable write failure. Replica fanout
+// and other contact-update kinds retain their separate existing contracts.
+func (a *App) broadcastAssignmentUpdate(orgID, contactID, previousAssigneeID uuid.UUID) {
+	if a == nil || orgID == uuid.Nil || contactID == uuid.Nil {
+		return
+	}
+	a.afterTenantCommit(func() {
+		root := a.rootApp()
+		if root == nil || root.WSHub == nil || root.DB == nil {
+			return
+		}
+		connected, complete := root.WSHub.OnlineUserIDsWithinLimit(orgID, assignmentAudienceLimit)
+		if !complete {
+			root.Log.Warn("Assignment hint omitted: connected-user audience exceeds bound", "organization_id", orgID)
+			return
+		}
+		if len(connected) == 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), assignmentAudienceTimeout)
+		defer cancel()
+		var recipients []uuid.UUID
+		err := database.WithTenantReadCommitted(root.DB.WithContext(ctx), orgID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+				return err
+			}
+			scoped := root.scopedApp(tx, orgID)
+			var err error
+			recipients, err = scoped.assignmentHintAudience(orgID, contactID, previousAssigneeID, connected)
+			return err
+		})
+		if err != nil || ctx.Err() != nil {
+			root.Log.Warn("Assignment hint omitted: audience unavailable", "error", err, "organization_id", orgID)
+			return
+		}
+		root.WSHub.BroadcastToUsers(orgID, recipients, websocket.WSMessage{
+			Type:    websocket.TypeContactUpdate,
+			Payload: map[string]any{"contact_id": contactID.String(), "kind": "assignment"},
+		})
+	})
+}
+
 // broadcastContactUpdate tells connected clients that a contact's inbox state
-// (assignment, transfer agent or manual read state) changed. It reaches every
+// (transfer agent or manual read state) changed. It reaches every
 // socket of the organization, including agents limited to their own chats, so
 // the payload is only the contact ID and the kind of change; clients refetch
 // the canonical row through their own scoped API. It is queued until the

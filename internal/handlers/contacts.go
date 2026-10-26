@@ -1146,20 +1146,48 @@ func (a *App) GetContact(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	// A fallback to the token's default org is not proof that this contact is
+	// absent from the explicitly selected workspace. Never let that ambiguity
+	// become an authoritative cache invalidation in the caller.
+	if raw := strings.TrimSpace(string(r.RequestCtx.Request.Header.Peek("X-Organization-ID"))); raw != "" {
+		explicitOrg, parseErr := uuid.Parse(raw)
+		if parseErr != nil || explicitOrg == uuid.Nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid organization selection", nil, "")
+		}
+		if explicitOrg != orgID {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact access is temporarily unavailable", nil, "")
+		}
+	}
+	if a.hasTenantScope() && a.tenantOrgID != orgID {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact access is temporarily unavailable", nil, "")
+	}
 	contactID, err := parsePathUUID(r, "id", "contact")
 	if err != nil {
 		return nil
 	}
 
+	readDB, cancel := contactStateDB(a.DB)
+	defer cancel()
+	reader := a.scopedApp(readDB, orgID)
+	canReadAll, err := reader.contactReaderAuthority(userID, orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
+		a.Log.Error("Contact authority unavailable", "error", err, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact access is temporarily unavailable", nil, "")
+	}
 	var contact models.Contact
-	query := a.DB.Where("id = ? AND organization_id = ?", contactID, orgID)
-
-	// Users without contacts:read permission can only access their assigned contacts
-	// or contacts with an active chat transfer to them
-	query = a.scopeAssignedContact(query, userID, orgID)
-
+	query := readDB.Where("id = ? AND organization_id = ?", contactID, orgID)
+	if !canReadAll {
+		query = reader.whereContactAssignedTo(query, userID, orgID)
+	}
 	if err := query.First(&contact).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
+		a.Log.Error("Contact read unavailable", "error", err, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact is temporarily unavailable", nil, "")
 	}
 
 	response := a.buildContactResponse(&contact, orgID)
@@ -2825,11 +2853,15 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 	}
 
 	var updatedContact models.Contact
+	var previousAssigneeID uuid.UUID
 	activityNonce := uuid.NewString()
 	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
 		if resolveErr != nil {
 			return resolveErr
+		}
+		if contact.AssignedUserID != nil {
+			previousAssigneeID = *contact.AssignedUserID
 		}
 
 		// Validate the assignee in the same transaction as the update. This
@@ -2894,7 +2926,7 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 		a.Log.Error("Failed to assign contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to assign contact", nil, "")
 	}
-	a.broadcastContactUpdate(orgID, updatedContact.ID, "assignment")
+	a.broadcastAssignmentUpdate(orgID, updatedContact.ID, previousAssigneeID)
 
 	return r.SendEnvelope(map[string]any{
 		"message":          "Contact assigned successfully",
@@ -3439,7 +3471,11 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 	a.logAudit(orgID, userID,
 		"contact", updatedContact.ID, models.AuditActionUpdated, &oldContact, &updatedContact)
 	if _, assignmentChanged := updates["assigned_user_id"]; assignmentChanged {
-		a.broadcastContactUpdate(orgID, updatedContact.ID, "assignment")
+		var previousAssigneeID uuid.UUID
+		if oldContact.AssignedUserID != nil {
+			previousAssigneeID = *oldContact.AssignedUserID
+		}
+		a.broadcastAssignmentUpdate(orgID, updatedContact.ID, previousAssigneeID)
 	}
 
 	return r.SendEnvelope(a.buildContactResponse(&updatedContact, orgID))
