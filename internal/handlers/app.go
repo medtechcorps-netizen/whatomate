@@ -228,6 +228,127 @@ func (a *App) HealthCheck(r *fastglue.Request) error {
 	})
 }
 
+const (
+	databasePoolSampleInterval     = time.Second
+	databasePoolSummaryInterval    = time.Minute
+	databasePoolTransitionInterval = 15 * time.Second
+)
+
+// These are process-local, sampled counters, not a database health verdict.
+// Keeping the observer on the root pool avoids tenant queries or acquiring a
+// connection precisely when all connections are occupied.
+type databasePoolSample struct {
+	maxOpen, open, inUse, idle int
+	waitCount                  int64
+	waitDuration               time.Duration
+}
+
+type databasePoolDiagnosticsState struct {
+	initialized                  bool
+	previous, reported           databasePoolSample
+	lastReport, lastTransition   time.Time
+	saturated, reportedSaturated bool
+}
+
+func (s *databasePoolDiagnosticsState) observe(now time.Time, sample databasePoolSample, log logf.Logger) {
+	atCapacity := sample.maxOpen > 0 && sample.inUse >= sample.maxOpen
+	waitsInSample := int64(0)
+	if s.initialized && sample.waitCount >= s.previous.waitCount {
+		waitsInSample = sample.waitCount - s.previous.waitCount
+	}
+	// Once observed, retain the episode while the pool remains full; WaitCount
+	// only advances when a new waiter joins, not for every second it waits.
+	s.saturated = atCapacity && (s.saturated || waitsInSample > 0)
+	s.previous = sample
+	reason := ""
+	switch {
+	case !s.initialized:
+		reason = "startup"
+		s.reported = sample
+	case s.saturated != s.reportedSaturated &&
+		(s.lastTransition.IsZero() || now.Sub(s.lastTransition) >= databasePoolTransitionInterval):
+		if s.saturated {
+			reason = "saturated"
+		} else {
+			reason = "recovered"
+		}
+		s.lastTransition = now
+	case now.Sub(s.lastReport) >= databasePoolSummaryInterval:
+		reason = "periodic"
+	}
+	s.initialized = true
+	if reason == "" {
+		return
+	}
+	waitCountDelta := sample.waitCount - s.reported.waitCount
+	if waitCountDelta < 0 {
+		waitCountDelta = 0
+	}
+	waitDurationDelta := sample.waitDuration - s.reported.waitDuration
+	if waitDurationDelta < 0 {
+		waitDurationDelta = 0
+	}
+	fields := []any{
+		"reason", reason, "max_open", sample.maxOpen, "open", sample.open,
+		"in_use", sample.inUse, "idle", sample.idle,
+		"wait_count", sample.waitCount, "wait_duration", sample.waitDuration.String(),
+		"wait_count_delta", waitCountDelta, "wait_duration_delta", waitDurationDelta.String(),
+		"waits_in_sample", waitsInSample, "at_capacity", atCapacity, "saturated", s.saturated,
+	}
+	s.lastReport, s.reported, s.reportedSaturated = now, sample, s.saturated
+	if s.saturated {
+		log.Warn("Database pool diagnostics", fields...)
+	} else {
+		log.Info("Database pool diagnostics", fields...)
+	}
+}
+
+// RunDatabasePoolDiagnostics observes without SQL, ping, or readiness changes.
+// The command owns cancellation and joins this loop under its shared shutdown
+// deadline. A synchronous blocked log writer is not interruptible; its loop
+// remains honestly pending if that deadline expires. No per-record goroutines
+// or unbounded logging queue are created.
+func (a *App) RunDatabasePoolDiagnostics(ctx context.Context) {
+	ticker := time.NewTicker(databasePoolSampleInterval)
+	defer ticker.Stop()
+	a.runDatabasePoolDiagnostics(ctx, time.Now(), ticker.C)
+}
+
+func (a *App) runDatabasePoolDiagnostics(ctx context.Context, started time.Time, ticks <-chan time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	root := a.rootApp()
+	pool, err := root.DB.DB()
+	if err != nil {
+		// No raw connection error/DSN and no shutdown trigger: diagnostics are
+		// observational and do not introduce a restart watchdog.
+		root.Log.Warn("Database pool diagnostics unavailable")
+		return
+	}
+	var state databasePoolDiagnosticsState
+	sample := func(now time.Time) {
+		stats := pool.Stats()
+		state.observe(now, databasePoolSample{
+			maxOpen: stats.MaxOpenConnections, open: stats.OpenConnections,
+			inUse: stats.InUse, idle: stats.Idle,
+			waitCount: stats.WaitCount, waitDuration: stats.WaitDuration,
+		}, root.Log)
+	}
+	sample(started)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now, open := <-ticks:
+			if !open || ctx.Err() != nil {
+				return
+			}
+			sample(now)
+		}
+	}
+}
+
 // ReadyCheck returns server readiness status
 func (a *App) ReadyCheck(r *fastglue.Request) error {
 	// Check database connection

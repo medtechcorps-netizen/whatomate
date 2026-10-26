@@ -87,7 +87,7 @@ func (w *Worker) ProcessThreadsCredentialRefreshBatch(ctx context.Context, limit
 		limit = defaultThreadsCredentialRefreshBatchSize
 	}
 	refreshBefore := time.Now().UTC().Add(defaultThreadsCredentialRefreshWindow)
-	organizationIDs, err := w.listReadyThreadsCredentialOrganizations(limit, refreshBefore)
+	organizationIDs, err := w.intakeContext(ctx).listReadyThreadsCredentialOrganizations(limit, refreshBefore)
 	if err != nil {
 		return 0, err
 	}
@@ -186,7 +186,7 @@ func (w *Worker) refreshThreadsCredentialWithProvider(
 	if refresh == nil {
 		return false, errors.New("threads credential refresh provider is required")
 	}
-	claim, processed, err := w.claimThreadsCredentialRefresh(orgID, refreshBefore, time.Now().UTC())
+	claim, processed, err := w.intakeContext(ctx).claimThreadsCredentialRefresh(orgID, refreshBefore, time.Now().UTC())
 	if err != nil || claim == nil {
 		return processed, err
 	}

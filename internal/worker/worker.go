@@ -105,11 +105,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.publishHeartbeat(ctx); err != nil {
 		return fmt.Errorf("publish initial worker heartbeat: %w", err)
 	}
-	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
-	defer stopHeartbeat()
-	go w.maintainHeartbeat(heartbeatCtx)
-
-	err := w.Consumer.Consume(ctx, w)
+	err := consumeWithHeartbeat(ctx, func(consumeCtx context.Context) error {
+		return w.Consumer.Consume(consumeCtx, w)
+	}, w.maintainHeartbeat)
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("consumer error: %w", err)
 	}
@@ -1358,4 +1356,24 @@ func (w *Worker) Close() error {
 		return w.Consumer.Close()
 	}
 	return nil
+}
+
+// intakeContext scopes only discovery/claim statements. Provider attempts and
+// accepted-result finalizers stay on the original Worker and retain their
+// existing cancellation/commit-ambiguity policy. This view is never shared.
+func (w *Worker) intakeContext(ctx context.Context) *Worker {
+	copy := *w
+	copy.DB = w.DB.WithContext(ctx)
+	return &copy
+}
+
+// consumeWithHeartbeat joins the heartbeat before reporting the message loop
+// finished. A stuck heartbeat remains a pending loop at the command's absolute
+// deadline; cancellation alone is not reported as a successful join.
+func consumeWithHeartbeat(ctx context.Context, consume func(context.Context) error, heartbeat func(context.Context)) error {
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); heartbeat(heartbeatCtx) }()
+	defer func() { cancel(); <-done }()
+	return consume(ctx)
 }
