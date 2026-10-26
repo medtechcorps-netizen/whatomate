@@ -17,6 +17,7 @@ import (
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
+	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -248,6 +249,20 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	}
 
 	organizationID := req.Account.OrganizationID
+	var forwardLease *forwardWorkLease
+	forwardHandedOff := false
+	if req.forwardedFrom != nil && opts.Async {
+		var admissionErr error
+		forwardLease, admissionErr = a.reserveForward()
+		if admissionErr != nil {
+			return nil, admissionErr
+		}
+		defer func() {
+			if !forwardHandedOff {
+				forwardLease.release()
+			}
+		}()
+	}
 	requestedContactID := req.Contact.ID
 	preview := a.getMessagePreview(req)
 	var (
@@ -583,9 +598,22 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	if opts.Async {
 		root := a.rootApp()
 		startAsyncDelivery = func() {
+			if forwardLease != nil && !forwardLease.start() {
+				if forwardLease.state.Load() != 3 {
+					// Duplicate callbacks cannot cancel an already running worker.
+					return
+				}
+				// An outer transaction outlived its reservation. No provider work
+				// has started; settle safely instead of starting an unbounded worker.
+				if err := root.settleOutgoingFailureBeforeProvider(msg, req, opts, forwardServerBusyError()); err != nil {
+					root.Log.Error("Failed to settle expired forward reservation", "error", err, "message_id", msg.ID)
+				}
+				return
+			}
 			root.wg.Add(1)
 			go func() {
 				defer root.wg.Done()
+				defer forwardLease.release()
 				// No transaction is open here: the request has committed and the
 				// provider transaction starts in deliverOutgoingMessage.
 				if req.forwardMedia != nil {
@@ -775,6 +803,7 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		a.UpdateContactChatbotMessage(req.Contact.ID)
 	}
 	if startAsyncDelivery != nil {
+		forwardHandedOff = true
 		a.afterTenantCommit(startAsyncDelivery)
 	}
 
@@ -2035,6 +2064,7 @@ func (a *App) broadcastNewMessageInCurrentScope(orgID uuid.UUID, msg *models.Mes
 		"created_at":       msg.CreatedAt,
 		"updated_at":       msg.UpdatedAt,
 		"is_reply":         msg.IsReply,
+		"is_forwarded":     messageIsForwarded(msg.Metadata),
 	}
 
 	// Add interactive data
@@ -2949,10 +2979,18 @@ func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
 	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
 	defer cancelStorage()
 	limit := forwardMediaSizeLimit(req.Type)
-	if size, known := a.forwardSourceSize(storageCtx, plan); known && size > limit {
+	size, known, sizeErr := a.forwardSourceSize(storageCtx, plan)
+	if sizeErr != nil {
+		a.Log.Warn("Forward attachment size lookup failed; download refused", "organization_id", plan.OrganizationID)
+		return errors.New("Not sent: the attachment size could not be checked. Try forwarding it again later.") //nolint:staticcheck
+	}
+	if known && size > limit {
 		return forwardTooLargeError(limit)
 	}
-	data, _, err := a.loadTenantMedia(storageCtx, plan.OrganizationID, plan.SourceKey)
+	data, _, err := a.loadTenantMediaWithLimit(storageCtx, plan.OrganizationID, plan.SourceKey, limit)
+	if errors.Is(err, storage.ErrObjectTooLarge) {
+		return forwardTooLargeError(limit)
+	}
 	if err != nil || len(data) == 0 {
 		a.Log.Error("Failed to read media to forward",
 			"error", err, "organization_id", plan.OrganizationID)
@@ -3130,6 +3168,9 @@ func (a *App) forwardMessage(
 
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
+		if errors.Is(err, errForwardCapacity) {
+			return forwardNotAcceptedRefusal().send(r)
+		}
 		var refused *forwardTargetRefusedError
 		if errors.As(err, &refused) {
 			return refused.refusal.send(r)
@@ -3335,20 +3376,20 @@ func forwardTooLargeError(limit int64) error {
 // forwardSourceSize reads an object-store attachment's size from a listing,
 // without downloading it. Local development storage reports unknown; its
 // bytes are size-checked right after the read instead.
-func (a *App) forwardSourceSize(ctx context.Context, plan *forwardMediaCopy) (int64, bool) {
+func (a *App) forwardSourceSize(ctx context.Context, plan *forwardMediaCopy) (int64, bool, error) {
 	if a.ObjectStore == nil || !isTenantObjectKey(plan.OrganizationID, plan.SourceKey) {
-		return 0, false
+		return 0, false, nil
 	}
 	objects, err := a.ObjectStore.ListPrefix(ctx, plan.SourceKey)
 	if err != nil {
-		return 0, false
+		return 0, false, err
 	}
 	for _, object := range objects {
 		if object.Key == plan.SourceKey {
-			return object.Size, true
+			return object.Size, true, nil
 		}
 	}
-	return 0, false
+	return 0, false, storage.ErrObjectNotFound
 }
 
 // ---- Forward capacity contract and dispatch phases -------------------------

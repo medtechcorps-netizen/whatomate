@@ -181,12 +181,14 @@ func TestLaneEForwardChecksObjectSizeBeforeDownloading(t *testing.T) {
 	assert.Contains(t, err.Error(), "larger than WhatsApp allows (16 MB)")
 	assert.Zero(t, store.gets, "an oversized object is never downloaded")
 
-	size, known := app.forwardSourceSize(context.Background(), &forwardMediaCopy{OrganizationID: orgID, SourceKey: docKey})
+	size, known, err := app.forwardSourceSize(context.Background(), &forwardMediaCopy{OrganizationID: orgID, SourceKey: docKey})
+	require.NoError(t, err)
 	assert.True(t, known)
 	assert.Equal(t, int64(99<<20), size)
 	assert.LessOrEqual(t, size, forwardMediaSizeLimit(models.MessageTypeDocument))
 
-	_, known = app.forwardSourceSize(context.Background(), &forwardMediaCopy{OrganizationID: uuid.New(), SourceKey: docKey})
+	_, known, err = app.forwardSourceSize(context.Background(), &forwardMediaCopy{OrganizationID: uuid.New(), SourceKey: docKey})
+	require.NoError(t, err)
 	assert.False(t, known, "another tenant's key is never listed")
 	assert.Equal(t, int64(5<<20), forwardMediaSizeLimit(models.MessageTypeImage))
 	assert.Equal(t, int64(16<<20), forwardMediaSizeLimit(models.MessageTypeAudio))

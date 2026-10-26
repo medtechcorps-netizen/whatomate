@@ -503,13 +503,14 @@ func buildCopilotContext(contact *models.Contact, messages []models.Message, con
 	builder.WriteString("- Flag urgent health or safety concerns for immediate human escalation.\n")
 	builder.WriteString("- Never claim an appointment, payment, refund, or message was completed.\n")
 	builder.WriteString("- A human agent must review every output before acting.\n\n")
+	builder.WriteString("- Failed, queued, or unconfirmed business messages are attempts only. Never assume the customer received or acted on them.\n\n")
 	builder.WriteString("CONTACT\nName: ")
 	builder.WriteString(truncateRunes(strings.TrimSpace(contact.ProfileName), 255))
 	builder.WriteString("\n\nRECENT CONVERSATION\n")
 	for i := range messages {
 		role := "Customer"
 		if messages[i].Direction == models.DirectionOutgoing {
-			role = "Business"
+			role = copilotOutgoingRole(messages[i])
 		}
 		builder.WriteString(role)
 		builder.WriteString(": ")
@@ -536,6 +537,24 @@ func buildCopilotContext(contact *models.Contact, messages []models.Message, con
 		builder.WriteString("[No approved knowledge sources]\n")
 	}
 	return builder.String()
+}
+
+func copilotOutgoingRole(message models.Message) string {
+	switch message.Status {
+	case models.MessageStatusSent:
+		return "Business [sent; delivery not confirmed]"
+	case models.MessageStatusDelivered:
+		return "Business [delivered]"
+	case models.MessageStatusRead:
+		return "Business [read]"
+	case models.MessageStatusFailed:
+		return "Business attempt [failed; do not assume delivery]"
+	default:
+		if message.Metadata[forwardDispatchMetadataKey] == forwardDispatchQueued {
+			return "Business attempt [queued; not yet confirmed sent]"
+		}
+		return "Business attempt [unconfirmed; may not have been sent]"
+	}
 }
 
 func buildCopilotTaskPrompt(task models.CopilotTaskType, request runCopilotRequest) string {

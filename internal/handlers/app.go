@@ -55,6 +55,8 @@ type App struct {
 	ObjectStore storage.ObjectStore
 	// wg tracks background goroutines for graceful shutdown
 	wg sync.WaitGroup
+	// Forward reservations and workers share this root-owned, bounded admission.
+	forwardAdmission forwardAdmission
 	// root points from a request-scoped clone back to the long-lived App.
 	// tenantOrgID is non-zero only when DB is bound to an RLS transaction.
 	root        *App

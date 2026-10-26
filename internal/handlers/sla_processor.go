@@ -773,8 +773,8 @@ func slaAutoCloseNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) 
 // slaWarningNoticeStillCurrent: the transfer is still waiting for an agent at
 // or past the escalation that triggered the warning, and no agent has replied
 // to the customer since that escalation. A reply is an outgoing message from
-// a user, sent after the escalation, that is not a template and did not fail
-// (a failed text never reached the customer). Caveat: API-key requests carry
+// a user, confirmed sent after the escalation, that is not a template.
+// Pending and uncertain attempts do not establish a reply. Caveat: API-key requests carry
 // the key owner's user id and are not marked on the stored message, so a text
 // or media message an integration sends through an API key also counts as a
 // reply; the template exclusion covers the usual integration notifications.
@@ -790,12 +790,12 @@ func slaWarningNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) (b
 	var replies int64
 	if err := tx.Model(&models.Message{}).Where(
 		"organization_id = ? AND contact_id = ? AND direction = ? AND sent_by_user_id IS NOT NULL"+
-			" AND message_type <> ? AND status <> ? AND created_at > ?",
+			" AND message_type <> ? AND status IN ? AND created_at > ?",
 		transfer.OrganizationID,
 		transfer.ContactID,
 		models.DirectionOutgoing,
 		models.MessageTypeTemplate,
-		models.MessageStatusFailed,
+		[]models.MessageStatus{models.MessageStatusSent, models.MessageStatusDelivered, models.MessageStatusRead},
 		*current.SLA.EscalatedAt,
 	).Count(&replies).Error; err != nil {
 		return false, err

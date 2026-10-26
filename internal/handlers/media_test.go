@@ -46,6 +46,14 @@ func (s *memoryObjectStore) Get(_ context.Context, key string) ([]byte, string, 
 	return object.data, object.contentType, nil
 }
 
+func (s *memoryObjectStore) GetLimited(ctx context.Context, key string, maxBytes int64) ([]byte, string, error) {
+	data, contentType, err := s.Get(ctx, key)
+	if err == nil && int64(len(data)) > maxBytes {
+		return nil, "", storage.ErrObjectTooLarge
+	}
+	return data, contentType, err
+}
+
 func (s *memoryObjectStore) Delete(_ context.Context, key string) error {
 	delete(s.objects, key)
 	return nil

@@ -569,6 +569,28 @@ describe('WebSocketService realtime reliability', () => {
     }
   })
 
+  it('carries the forwarded chip to a second agent without a POST response or reload', async () => {
+    mocks.contactsStore.currentContact = { id: 'contact-1' }
+    service = await loadService()
+    await service.connect(async () => 'second-agent-token')
+    const socket = FakeWebSocket.instances[0]
+    socket.open()
+    const { isForwardedMessage } = await import('@/components/chat/messageForward')
+    for (const flag of [true, false, 'true', undefined]) {
+      mocks.contactsStore.addMessage.mockClear()
+      socket.receive({ type: 'new_message', payload: {
+        id: 'forward-1', contact_id: 'contact-1', direction: 'outgoing',
+        message_type: 'text', status: 'pending', is_forwarded: flag,
+        metadata: { forwarded_from: { secret: 'must not be copied' } },
+      } })
+      const mapped = mocks.contactsStore.addMessage.mock.calls[0][0]
+      expect(isForwardedMessage(mapped)).toBe(flag === true)
+      expect(mapped.metadata).toBeUndefined()
+      expect(mapped.is_forwarded).toBe(typeof flag === 'boolean' ? flag : undefined)
+    }
+    expect(mocks.contactsStore.fetchMessages).not.toHaveBeenCalled()
+  })
+
   it('lets a new identity refresh while an old generation refresh is still pending', async () => {
     service = await loadService()
     const oldTenantRefresh = deferred<void>()

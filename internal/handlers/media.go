@@ -91,6 +91,10 @@ func (a *App) saveTenantMedia(
 // path. This dual-read behavior keeps existing disk media available while new
 // uploads move to object storage.
 func (a *App) loadTenantMedia(ctx context.Context, orgID uuid.UUID, key string) ([]byte, string, error) {
+	return a.loadTenantMediaWithLimit(ctx, orgID, key, 0)
+}
+
+func (a *App) loadTenantMediaWithLimit(ctx context.Context, orgID uuid.UUID, key string, maxBytes int64) ([]byte, string, error) {
 	normalized := path.Clean(strings.ReplaceAll(key, "\\", "/"))
 	if strings.HasPrefix(normalized, "organizations/") {
 		if !isTenantObjectKey(orgID, normalized) {
@@ -98,6 +102,13 @@ func (a *App) loadTenantMedia(ctx context.Context, orgID uuid.UUID, key string) 
 		}
 		if a.ObjectStore == nil {
 			return nil, "", errors.New("object storage is not initialized")
+		}
+		if maxBytes > 0 {
+			bounded, ok := a.ObjectStore.(storage.BoundedObjectReader)
+			if !ok {
+				return nil, "", errors.New("object storage does not support bounded reads")
+			}
+			return bounded.GetLimited(ctx, normalized, maxBytes)
 		}
 		return a.ObjectStore.Get(ctx, normalized)
 	}
@@ -118,6 +129,18 @@ func (a *App) loadTenantMedia(ctx context.Context, orgID uuid.UUID, key string) 
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, "", errInvalidStoredMediaKey
+	}
+	if maxBytes > 0 {
+		if info.Size() > maxBytes {
+			return nil, "", storage.ErrObjectTooLarge
+		}
+		file, openErr := os.Open(fullPath)
+		if openErr != nil {
+			return nil, "", openErr
+		}
+		defer file.Close() //nolint:errcheck
+		data, readErr := storage.ReadLimited(ctx, file, maxBytes)
+		return data, "", readErr
 	}
 
 	data, err := os.ReadFile(fullPath)
