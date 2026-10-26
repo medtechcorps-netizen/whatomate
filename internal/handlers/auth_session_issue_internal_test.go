@@ -13,6 +13,7 @@ import (
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
 
 type sessionIssueStoreHook struct {
@@ -53,8 +54,9 @@ func TestRefreshTokenIssuerFailsClosedWithoutPersistence(t *testing.T) {
 				t.Cleanup(func() { _ = app.Redis.Close() })
 			}
 			token, err := app.generateRefreshToken(user)
-			assert.Empty(t, token)
-			require.ErrorIs(t, err, errRefreshTokenStoreUnavailable)
+			assert.Empty(t, token.token)
+			assert.True(t, token.storeUnavailable)
+			require.Error(t, err)
 			if tc.cause != nil {
 				assert.ErrorIs(t, err, tc.cause)
 			}
@@ -70,7 +72,7 @@ func TestRefreshTokenIssuerConcurrentFailuresReturnNoCredential(t *testing.T) {
 	app := &App{Redis: client, Config: &config.Config{JWT: config.JWTConfig{Secret: testutil.TestJWTSecret, RefreshExpiryDays: 1}}}
 	user := &models.User{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: uuid.New()}
 	type result struct {
-		token string
+		token refreshTokenIssueResult
 		err   error
 	}
 	results := make(chan result, 12)
@@ -79,8 +81,38 @@ func TestRefreshTokenIssuerConcurrentFailuresReturnNoCredential(t *testing.T) {
 	}
 	for i := 0; i < 12; i++ {
 		got := <-results
-		assert.Empty(t, got.token)
-		assert.ErrorIs(t, got.err, errRefreshTokenStoreUnavailable)
+		assert.Empty(t, got.token.token)
+		assert.True(t, got.token.storeUnavailable)
+		assert.ErrorIs(t, got.err, context.DeadlineExceeded)
 	}
 	assert.Equal(t, 12, hook.writes)
+}
+
+func TestRefreshTokenIssuerSuccessfulPersistenceHasNoFailureClassification(t *testing.T) {
+	hook := &sessionIssueStoreHook{}
+	client := redis.NewClient(&redis.Options{Addr: "unused.invalid:6379", MaxRetries: -1})
+	client.AddHook(hook)
+	t.Cleanup(func() { _ = client.Close() })
+	app := &App{Redis: client, Config: &config.Config{JWT: config.JWTConfig{Secret: testutil.TestJWTSecret, RefreshExpiryDays: 1}}}
+	user := &models.User{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: uuid.New()}
+	issue, err := app.generateRefreshToken(user)
+	require.NoError(t, err)
+	assert.NotEmpty(t, issue.token, "successful issuance cannot return an empty credential")
+	assert.False(t, issue.storeUnavailable)
+	assert.Equal(t, 1, hook.writes)
+}
+
+func TestRefreshTokenIssuerErrorResponseUsesExplicitStorageClassification(t *testing.T) {
+	for _, tc := range []struct {
+		unavailable bool
+		status      int
+	}{
+		{true, fasthttp.StatusServiceUnavailable},
+		{false, fasthttp.StatusInternalServerError},
+	} {
+		req := testutil.NewJSONRequest(t, map[string]any{})
+		require.NoError(t, sendRefreshTokenIssueError(req, refreshTokenIssueResult{storeUnavailable: tc.unavailable}))
+		assert.Equal(t, tc.status, testutil.GetResponseStatusCode(req))
+		assert.Empty(t, req.RequestCtx.Response.Header.Peek("Set-Cookie"))
+	}
 }

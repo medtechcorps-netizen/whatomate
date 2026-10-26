@@ -1474,7 +1474,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 			Redis: rdb, Log: lo, Max: cfg.RateLimit.RefreshMaxAttempts,
 			Window:    time.Duration(cfg.RateLimit.WindowSeconds) * time.Second,
 			KeyPrefix: "refresh", TrustProxy: cfg.RateLimit.TrustProxy,
-		}, cfg.JWT.Secret)
+		}, handlers.SessionTerminationClassifier(cfg.JWT.Secret))
 		g.Before(func(r *fastglue.Request) *fastglue.Request {
 			path := string(r.RequestCtx.Path())
 			if len(path) > 4 && path[:4] == "/api" {

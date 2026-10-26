@@ -1,4 +1,4 @@
-package middleware
+package handlers
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
@@ -29,10 +30,10 @@ func terminationJSONRequest(body string) *fastglue.Request {
 
 func terminationTestToken(t *testing.T, userID uuid.UUID, subject string, expires time.Time, secret string) string {
 	t.Helper()
-	claims := JWTClaims{UserID: userID, OrganizationID: uuid.New(), RegisteredClaims: jwt.RegisteredClaims{
+	claims := middleware.JWTClaims{UserID: userID, OrganizationID: uuid.New(), RegisteredClaims: jwt.RegisteredClaims{
 		Subject: subject, ExpiresAt: jwt.NewNumericDate(expires),
 	}}
-	if subject == JWTSubjectRefresh {
+	if subject == middleware.JWTSubjectRefresh {
 		claims.ID = uuid.NewString()
 	}
 	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
@@ -53,7 +54,7 @@ func terminationTestRequest(t *testing.T, token string) *fastglue.Request {
 
 func TestSessionTerminationClassificationKeepsCredentialAndInputBoundaries(t *testing.T) {
 	userID := uuid.New()
-	token := terminationTestToken(t, userID, JWTSubjectRefresh, time.Now().Add(time.Hour), terminationTestSecret)
+	token := terminationTestToken(t, userID, middleware.JWTSubjectRefresh, time.Now().Add(time.Hour), terminationTestSecret)
 	for _, tc := range []struct {
 		name    string
 		change  func(*fastglue.Request)
@@ -61,7 +62,7 @@ func TestSessionTerminationClassificationKeepsCredentialAndInputBoundaries(t *te
 	}{
 		{"valid refresh without access", func(*fastglue.Request) {}, true},
 		{"valid refresh with expired access", func(r *fastglue.Request) {
-			r.RequestCtx.Request.Header.SetCookie("whm_access", terminationTestToken(t, userID, JWTSubjectAccess, time.Now().Add(-time.Hour), terminationTestSecret))
+			r.RequestCtx.Request.Header.SetCookie("whm_access", terminationTestToken(t, userID, middleware.JWTSubjectAccess, time.Now().Add(-time.Hour), terminationTestSecret))
 		}, true},
 		{"csrf missing", func(r *fastglue.Request) { r.RequestCtx.Request.Header.Del("X-CSRF-Token") }, false},
 		{"csrf mismatch", func(r *fastglue.Request) { r.RequestCtx.Request.Header.Set("X-CSRF-Token", "different") }, false},
@@ -80,13 +81,13 @@ func TestSessionTerminationClassificationKeepsCredentialAndInputBoundaries(t *te
 		{"wrong method", func(r *fastglue.Request) { r.RequestCtx.Request.Header.SetMethod(fasthttp.MethodGet) }, false},
 		{"wrong path", func(r *fastglue.Request) { r.RequestCtx.Request.SetRequestURI("/api/auth/switch-org") }, false},
 		{"forged credential", func(r *fastglue.Request) {
-			r.RequestCtx.Request.Header.SetCookie("whm_refresh", terminationTestToken(t, userID, JWTSubjectRefresh, time.Now().Add(time.Hour), "wrong-secret"))
+			r.RequestCtx.Request.Header.SetCookie("whm_refresh", terminationTestToken(t, userID, middleware.JWTSubjectRefresh, time.Now().Add(time.Hour), "wrong-secret"))
 		}, false},
 		{"expired refresh", func(r *fastglue.Request) {
-			r.RequestCtx.Request.Header.SetCookie("whm_refresh", terminationTestToken(t, userID, JWTSubjectRefresh, time.Now().Add(-time.Hour), terminationTestSecret))
+			r.RequestCtx.Request.Header.SetCookie("whm_refresh", terminationTestToken(t, userID, middleware.JWTSubjectRefresh, time.Now().Add(-time.Hour), terminationTestSecret))
 		}, false},
 		{"access credential cannot revoke", func(r *fastglue.Request) {
-			r.RequestCtx.Request.Header.SetCookie("whm_refresh", terminationTestToken(t, userID, JWTSubjectAccess, time.Now().Add(time.Hour), terminationTestSecret))
+			r.RequestCtx.Request.Header.SetCookie("whm_refresh", terminationTestToken(t, userID, middleware.JWTSubjectAccess, time.Now().Add(time.Hour), terminationTestSecret))
 		}, false},
 		{"bad cookie overrides good body", func(r *fastglue.Request) {
 			r.RequestCtx.Request.Header.SetCookie("whm_refresh", "forged")
@@ -103,7 +104,10 @@ func TestSessionTerminationClassificationKeepsCredentialAndInputBoundaries(t *te
 			} else {
 				assert.Equal(t, uuid.Nil, got)
 			}
-			assert.Nil(t, req.RequestCtx.UserValue(ContextKeyUserID))
+			assert.Nil(t, req.RequestCtx.UserValue(middleware.ContextKeyUserID))
+			classifiedUser, cleanup := SessionTerminationClassifier(terminationTestSecret)(req)
+			assert.Equal(t, got, classifiedUser)
+			assert.False(t, cleanup, "refresh/revoke requests never enter cookie-only cleanup")
 		})
 	}
 }
@@ -121,11 +125,11 @@ func TestAPISessionRateLimitConcurrentUsersHaveIndependentBoundedQuotas(t *testi
 	defer cancel()
 	require.NoError(t, client.Ping(ctx).Err())
 	prefix := "termination-" + uuid.NewString()
-	opts := RateLimitOpts{Redis: client, Log: logf.New(logf.Opts{Level: logf.ErrorLevel}), Max: 2, Window: time.Minute, KeyPrefix: prefix}
+	opts := middleware.RateLimitOpts{Redis: client, Log: logf.New(logf.Opts{Level: logf.ErrorLevel}), Max: 2, Window: time.Minute, KeyPrefix: prefix}
 	apiOpts := opts
 	apiOpts.KeyPrefix += "-api"
 	apiOpts.Max = 1
-	limit := APISessionRateLimit(apiOpts, opts, terminationTestSecret)
+	limit := middleware.APISessionRateLimit(apiOpts, opts, SessionTerminationClassifier(terminationTestSecret))
 
 	// Fill the same unauthenticated IP's global bucket before any revocation.
 	ordinary := terminationJSONRequest("{}")
@@ -141,7 +145,7 @@ func TestAPISessionRateLimitConcurrentUsersHaveIndependentBoundedQuotas(t *testi
 	}
 	results := make(chan result, 20)
 	for user := 0; user < 2; user++ {
-		token := terminationTestToken(t, uuid.New(), JWTSubjectRefresh, time.Now().Add(time.Hour), terminationTestSecret)
+		token := terminationTestToken(t, uuid.New(), middleware.JWTSubjectRefresh, time.Now().Add(time.Hour), terminationTestSecret)
 		for i := 0; i < 10; i++ {
 			req := terminationTestRequest(t, token)
 			go func(user int) { results <- result{user, limit(req) != nil} }(user)
@@ -162,7 +166,7 @@ func TestAPISessionRateLimitConcurrentUsersHaveIndependentBoundedQuotas(t *testi
 		cleanupOpts.Max = 1
 		cleanupAPI := apiOpts
 		cleanupAPI.TrustProxy = true
-		cleanup := APISessionRateLimit(cleanupAPI, cleanupOpts, terminationTestSecret)
+		cleanup := middleware.APISessionRateLimit(cleanupAPI, cleanupOpts, SessionTerminationClassifier(terminationTestSecret))
 		userID := uuid.New()
 		makeCleanup := func(access, forwarded string) *fastglue.Request {
 			req := terminationTestRequest(t, "")
@@ -174,7 +178,7 @@ func TestAPISessionRateLimitConcurrentUsersHaveIndependentBoundedQuotas(t *testi
 		}
 		forgedIP := "u:" + userID.String()
 		require.NotNil(t, cleanup(makeCleanup("unsigned", forgedIP)))
-		access := terminationTestToken(t, userID, JWTSubjectAccess, time.Now().Add(time.Hour), terminationTestSecret)
+		access := terminationTestToken(t, userID, middleware.JWTSubjectAccess, time.Now().Add(time.Hour), terminationTestSecret)
 		require.NotNil(t, cleanup(makeCleanup(access, "192.0.2.1")), "anonymous proxy text must not exhaust the signed user's cleanup quota")
 		assert.Nil(t, cleanup(makeCleanup(access, "192.0.2.1")), "the signed user retains an independent finite quota")
 		assert.Nil(t, cleanup(makeCleanup("unsigned", forgedIP)), "anonymous cleanup also retains a finite quota")
@@ -186,11 +190,27 @@ func TestSessionTerminationExpiredLogoutCannotChooseUserQuota(t *testing.T) {
 		req := terminationTestRequest(t, "")
 		req.RequestCtx.Request.SetRequestURI("/api/auth/logout")
 		req.RequestCtx.Request.SetBodyString("{\"user_id\":\"" + uuid.NewString() + "\"}")
-		req.RequestCtx.Request.Header.SetCookie("whm_access", terminationTestToken(t, uuid.New(), JWTSubjectAccess, time.Now().Add(-time.Hour), secret))
+		req.RequestCtx.Request.Header.SetCookie("whm_access", terminationTestToken(t, uuid.New(), middleware.JWTSubjectAccess, time.Now().Add(-time.Hour), secret))
 		_, _, valid := sessionTerminationCredential(req)
 		require.True(t, valid, "bounded CSRF-bound cookie cleanup is still permitted")
 		userID, ok := sessionTerminationUser(req, terminationTestSecret)
 		assert.False(t, ok)
 		assert.Equal(t, uuid.Nil, userID, "no expired or unsigned claims may select a user quota")
+		classifiedUser, cleanup := SessionTerminationClassifier(terminationTestSecret)(req)
+		assert.Equal(t, uuid.Nil, classifiedUser)
+		assert.True(t, cleanup, "valid credential-free CSRF cleanup remains bounded anonymously")
+	}
+}
+
+func TestAPISessionRateLimitMissingClassifierFailsClosed(t *testing.T) {
+	// Nil Redis makes any accidental fallback into the ordinary quotas fail;
+	// the missing trusted proof provider must refuse before touching a quota.
+	limit := middleware.APISessionRateLimit(middleware.RateLimitOpts{}, middleware.RateLimitOpts{}, nil)
+	for _, path := range []string{"/api/auth/logout", "/api/auth/refresh", "/api/contacts"} {
+		req := terminationJSONRequest(`{}`)
+		req.RequestCtx.Request.SetRequestURI(path)
+		require.Nil(t, limit(req))
+		assert.Equal(t, fasthttp.StatusServiceUnavailable, req.RequestCtx.Response.StatusCode())
+		assert.Empty(t, req.RequestCtx.Response.Header.Peek("Set-Cookie"))
 	}
 }

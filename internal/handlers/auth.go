@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -115,10 +114,10 @@ func (a *App) issueLoginSession(r *fastglue.Request, user *models.User) error {
 	refreshToken, err := a.generateRefreshToken(user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return sendRefreshTokenIssueError(r, err)
+		return sendRefreshTokenIssueError(r, refreshToken)
 	}
 
-	a.setAuthCookies(r, accessToken, refreshToken)
+	a.setAuthCookies(r, accessToken, refreshToken.token)
 
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -201,10 +200,10 @@ func (a *App) Register(r *fastglue.Request) error {
 		refreshToken, err := a.generateRefreshToken(&existingUser)
 		if err != nil {
 			a.Log.Error("Failed to generate refresh token", "error", err)
-			return sendRefreshTokenIssueError(r, err)
+			return sendRefreshTokenIssueError(r, refreshToken)
 		}
 
-		a.setAuthCookies(r, accessToken, refreshToken)
+		a.setAuthCookies(r, accessToken, refreshToken.token)
 
 		return r.SendEnvelope(CookieAuthResponse{
 			ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -272,10 +271,10 @@ func (a *App) Register(r *fastglue.Request) error {
 	refreshToken, err := a.generateRefreshToken(&user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return sendRefreshTokenIssueError(r, err)
+		return sendRefreshTokenIssueError(r, refreshToken)
 	}
 
-	a.setAuthCookies(r, accessToken, refreshToken)
+	a.setAuthCookies(r, accessToken, refreshToken.token)
 
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -754,10 +753,16 @@ func (a *App) generateAccessToken(user *models.User) (string, error) {
 	return token.SignedString([]byte(a.Config.JWT.Secret))
 }
 
-var errRefreshTokenStoreUnavailable = errors.New("refresh token store unavailable")
+// refreshTokenIssueResult is an internal issuance outcome, never a response payload.
+// The storage classification is separate from the wrapped error cause and adds
+// no eagerly initialized sentinel or error-interface implementation.
+type refreshTokenIssueResult struct {
+	token            string
+	storeUnavailable bool
+}
 
-func sendRefreshTokenIssueError(r *fastglue.Request, err error) error {
-	if errors.Is(err, errRefreshTokenStoreUnavailable) {
+func sendRefreshTokenIssueError(r *fastglue.Request, issue refreshTokenIssueResult) error {
+	if issue.storeUnavailable {
 		// Registration may already have saved the account and membership, and
 		// an SSO exchange has consumed its one-time grant. Start a new sign-in;
 		// do not report success or clear any session the browser already holds.
@@ -766,9 +771,9 @@ func sendRefreshTokenIssueError(r *fastglue.Request, err error) error {
 	return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
 }
 
-func (a *App) generateRefreshToken(user *models.User) (string, error) {
+func (a *App) generateRefreshToken(user *models.User) (refreshTokenIssueResult, error) {
 	if a.Redis == nil {
-		return "", errRefreshTokenStoreUnavailable
+		return refreshTokenIssueResult{storeUnavailable: true}, fmt.Errorf("refresh token store unavailable")
 	}
 	jti := uuid.New().String()
 	expiry := time.Duration(a.Config.JWT.RefreshExpiryDays) * 24 * time.Hour
@@ -791,17 +796,21 @@ func (a *App) generateRefreshToken(user *models.User) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(a.Config.JWT.Secret))
 	if err != nil {
-		return "", err
+		return refreshTokenIssueResult{}, err
+	}
+
+	if signed == "" {
+		return refreshTokenIssueResult{}, fmt.Errorf("refresh token signing returned an empty credential")
 	}
 
 	// Store JTI in Redis so it can be revoked
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := a.Redis.Set(ctx, refreshTokenKey(jti), user.ID.String(), expiry).Err(); err != nil {
-		return "", fmt.Errorf("%w: %w", errRefreshTokenStoreUnavailable, err)
+		return refreshTokenIssueResult{storeUnavailable: true}, fmt.Errorf("refresh token store unavailable: %w", err)
 	}
 
-	return signed, nil
+	return refreshTokenIssueResult{token: signed}, nil
 }
 
 // refreshTokenKey returns the Redis key for a refresh token JTI.
@@ -880,10 +889,10 @@ func (a *App) SwitchOrg(r *fastglue.Request) error {
 	refreshToken, err := a.generateRefreshToken(&user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return sendRefreshTokenIssueError(r, err)
+		return sendRefreshTokenIssueError(r, refreshToken)
 	}
 
-	a.setAuthCookies(r, accessToken, refreshToken)
+	a.setAuthCookies(r, accessToken, refreshToken.token)
 
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -999,4 +1008,38 @@ func (a *App) GetWSToken(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(map[string]string{"token": signed})
+}
+
+// SessionTerminationClassifier provides the fixed session proof used by API quotas.
+// Only a verified UUID and credential-free cleanup eligibility leave this layer;
+// raw cookies/tokens and unsigned identity fields never choose a quota key.
+func SessionTerminationClassifier(secret string) func(*fastglue.Request) (uuid.UUID, bool) {
+	return func(r *fastglue.Request) (uuid.UUID, bool) {
+		_, accessOnly, valid := sessionTerminationCredential(r)
+		if !valid {
+			return uuid.Nil, false
+		}
+		userID, _ := sessionTerminationUser(r, secret)
+		return userID, accessOnly
+	}
+}
+
+func sessionTerminationUser(r *fastglue.Request, secret string) (uuid.UUID, bool) {
+	credential, accessCredential, ok := sessionTerminationCredential(r)
+	if !ok {
+		return uuid.Nil, false
+	}
+	token, err := jwt.ParseWithClaims(credential, &middleware.JWTClaims{}, func(*jwt.Token) (any, error) {
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
+	if err != nil || !token.Valid {
+		return uuid.Nil, false
+	}
+	claims, ok := token.Claims.(*middleware.JWTClaims)
+	if !ok || claims.UserID == uuid.Nil || claims.OrganizationID == uuid.Nil ||
+		(accessCredential && !middleware.IsAccessJWTClaims(claims)) ||
+		(!accessCredential && !middleware.IsRefreshJWTClaims(claims)) {
+		return uuid.Nil, false
+	}
+	return claims.UserID, true
 }
