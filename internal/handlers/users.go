@@ -646,17 +646,22 @@ func (a *App) GetCurrentUser(r *fastglue.Request) error {
 	if err := a.DB.Where("id = ?", userID).
 		Preload("Role").
 		First(&user).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "User not found", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusNotFound, "User not found")
 	}
 
 	// Use org from JWT context (may differ from DB after org switch)
 	orgID, _ := r.RequestCtx.UserValue("organization_id").(uuid.UUID)
 	if orgID != uuid.Nil {
 		if err := a.applyOrganizationMembership(&user, orgID, false); err != nil {
-			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Organization access is no longer available", nil, "")
+			return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Organization access is no longer available")
 		}
+	} else {
+		isResellerAdmin, err := access.IsResellerAdminChecked(a.DB, user.ID)
+		if err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Organization access is no longer available")
+		}
+		user.IsResellerAdmin = isResellerAdmin
 	}
-	user.IsResellerAdmin = access.IsResellerAdmin(a.DB, user.ID)
 
 	// Every member's browser enforces the organization's "sign out after
 	// inactivity" policy. It rides on this response, which the app already
@@ -674,20 +679,21 @@ func (a *App) GetCurrentUser(r *fastglue.Request) error {
 	// Load permissions from cache
 	if user.Role != nil && user.RoleID != nil {
 		cachedPerms, err := a.GetRolePermissionsCached(*user.RoleID)
-		if err == nil {
-			// Convert cached permission strings back to Permission objects
-			permissions := make([]models.Permission, 0, len(cachedPerms))
-			for _, p := range cachedPerms {
-				parts := splitPermission(p)
-				if len(parts) == 2 {
-					permissions = append(permissions, models.Permission{
-						Resource: parts[0],
-						Action:   parts[1],
-					})
-				}
-			}
-			user.Role.Permissions = permissions
+		if err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Role is no longer available")
 		}
+		// Convert cached permission strings back to Permission objects
+		permissions := make([]models.Permission, 0, len(cachedPerms))
+		for _, p := range cachedPerms {
+			parts := splitPermission(p)
+			if len(parts) == 2 {
+				permissions = append(permissions, models.Permission{
+					Resource: parts[0],
+					Action:   parts[1],
+				})
+			}
+		}
+		user.Role.Permissions = permissions
 	}
 
 	return r.SendEnvelope(userToResponse(user))
@@ -892,7 +898,7 @@ func (a *App) ListMyOrganizations(r *fastglue.Request) error {
 		Preload("Role").
 		Find(&userOrgs).Error; err != nil {
 		a.Log.Error("Failed to list user organizations", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list organizations", nil, "")
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Organization access check temporarily unavailable", nil, "")
 	}
 
 	response := make([]MyOrganizationResponse, 0, len(userOrgs))
@@ -902,7 +908,11 @@ func (a *App) ListMyOrganizations(r *fastglue.Request) error {
 		if uo.Organization == nil {
 			continue
 		}
-		if !access.ResellerDerivedMembershipActive(a.DB, &uo) {
+		active, err := access.ResellerDerivedMembershipActiveChecked(a.DB, &uo)
+		if err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Organization access is no longer available")
+		}
+		if !active {
 			continue
 		}
 		item := MyOrganizationResponse{

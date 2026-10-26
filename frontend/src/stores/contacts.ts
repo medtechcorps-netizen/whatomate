@@ -146,6 +146,9 @@ export const useContactsStore = defineStore('contacts', () => {
   const listFilter = ref<ContactListFilter>('all')
   let contactUpdateRefreshHandle: ReturnType<typeof setTimeout> | null = null
   const pendingContactUpdates = new Set<string>()
+  const pendingAssignmentUpdates = new Set<string>()
+  let contactSelectionGeneration = 0
+  let selectedAssignmentGeneration = 0
   const activeOrganizationScope = computed(
     () => organizationsStore.selectedOrgId || authStore.organizationId || '',
   )
@@ -218,6 +221,7 @@ export const useContactsStore = defineStore('contacts', () => {
 
   function resetForIdentityChange() {
     identityGeneration++
+    contactSelectionGeneration++
     contactLoadGeneration++
     moreContactsLoadGeneration++
     messageLoadGeneration++
@@ -260,6 +264,7 @@ export const useContactsStore = defineStore('contacts', () => {
       contactUpdateRefreshHandle = null
     }
     pendingContactUpdates.clear()
+    pendingAssignmentUpdates.clear()
     messageRefreshQueued = false
   }
 
@@ -678,6 +683,7 @@ export const useContactsStore = defineStore('contacts', () => {
 
   function setCurrentContact(contact: Contact | null) {
     if (currentContact.value?.id !== contact?.id) {
+      contactSelectionGeneration++
       // Invalidate a slower message request for the previous contact before it
       // can replace the active conversation's messages.
       messageLoadGeneration++
@@ -775,23 +781,75 @@ export const useContactsStore = defineStore('contacts', () => {
   // move rows in or out of the active filter. Bursts coalesce into one fetch.
   // The list refresh also refreshes the open chat when it is listed; a chat
   // pinned outside the filtered list is re-read on its own when it changed.
-  function scheduleContactsRefresh(contactId?: string) {
+  function scheduleContactsRefresh(contactId?: string, kind?: string) {
     if (contactId) pendingContactUpdates.add(contactId)
+    if (contactId && kind === 'assignment') {
+      pendingAssignmentUpdates.add(contactId)
+      if (currentContact.value?.id === contactId) selectedAssignmentGeneration++
+    }
     if (contactUpdateRefreshHandle !== null) return
     const identity = identityGeneration
+    const organizationScope = activeOrganizationScope.value
+    const userId = authStore.user?.id
     contactUpdateRefreshHandle = setTimeout(async () => {
       contactUpdateRefreshHandle = null
       const changed = new Set(pendingContactUpdates)
+      const assignments = new Set(pendingAssignmentUpdates)
       pendingContactUpdates.clear()
-      if (identity !== identityGeneration) return
+      pendingAssignmentUpdates.clear()
+      const selection = contactSelectionGeneration
+      const assignment = selectedAssignmentGeneration
+      if (identity !== identityGeneration || organizationScope !== activeOrganizationScope.value || userId !== authStore.user?.id) return
       await fetchContacts()
       const open = currentContact.value
       if (
         identity !== identityGeneration ||
+        organizationScope !== activeOrganizationScope.value ||
+        userId !== authStore.user?.id ||
+        selection !== contactSelectionGeneration ||
         !open ||
-        !changed.has(open.id) ||
-        contacts.value.some(contact => contact.id === open.id)
+        !changed.has(open.id)
       ) return
+      if (assignments.has(open.id)) {
+        // The event grants no access. Revalidate even if an older list page
+        // still contained this row; only a current scoped refusal clears it.
+        if (!organizationScope || !userId) return
+        const isCurrent = () => identity === identityGeneration &&
+          organizationScope === activeOrganizationScope.value && userId === authStore.user?.id &&
+          selection === contactSelectionGeneration && assignment === selectedAssignmentGeneration &&
+          currentContact.value?.id === open.id
+        try {
+          const response = await contactsService.get(open.id, organizationScope)
+          if (!isCurrent()) return
+          const fresh = response.data.data || response.data
+          Object.assign(currentContact.value!, {
+            unread_count: fresh.unread_count,
+            manual_unread: fresh.manual_unread,
+            assigned_user_id: fresh.assigned_user_id,
+            assigned_user_name: fresh.assigned_user_name,
+            transfer_agent_id: fresh.transfer_agent_id,
+            transfer_agent_name: fresh.transfer_agent_name,
+          })
+        } catch (error) {
+          const status = (error as { response?: { status?: number } })?.response?.status
+          if (!isCurrent() || (status !== 403 && status !== 404)) return
+          contactLoadGeneration++
+          moreContactsLoadGeneration++
+          contactLoadAbortController?.abort()
+          contactLoadAbortController = null
+          moreContactsLoadAbortController?.abort()
+          moreContactsLoadAbortController = null
+          isLoading.value = false
+          isLoadingMoreContacts.value = false
+          const before = contacts.value.length
+          contacts.value = contacts.value.filter(contact => contact.id !== open.id)
+          contactsTotal.value = Math.max(0, contactsTotal.value - (before - contacts.value.length))
+          setCurrentContact(null)
+          clearMessages()
+        }
+        return
+      }
+      if (contacts.value.some(contact => contact.id === open.id)) return
       const fresh = await fetchContact(open.id)
       if (!fresh || currentContact.value !== open) return
       Object.assign(open, {

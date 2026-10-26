@@ -29,6 +29,22 @@ import (
 	"gorm.io/gorm"
 )
 
+// organizationAccessDenied distinguishes established absence from unavailable
+// authority evidence. Query failures must not revoke or issue a session.
+func organizationAccessDenied(err error) bool {
+	return errors.Is(err, gorm.ErrRecordNotFound) ||
+		errors.Is(err, database.ErrPlatformComplianceTenant) ||
+		errors.Is(err, database.ErrPlatformComplianceMarkerInvalid) ||
+		errors.Is(err, database.ErrMissingTenant)
+}
+
+func sendOrganizationAccessError(r *fastglue.Request, err error, deniedStatus int, deniedMessage string) error {
+	if organizationAccessDenied(err) {
+		return r.SendErrorEnvelope(deniedStatus, deniedMessage, nil, "")
+	}
+	return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Organization access check temporarily unavailable", nil, "")
+}
+
 // App holds all dependencies for handlers
 type App struct {
 	Config            *config.Config

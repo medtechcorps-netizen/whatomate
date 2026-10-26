@@ -542,10 +542,10 @@ func (a *App) CallbackSSO(r *fastglue.Request) error {
 // membership there refuses the sign-in even when the user's own organization
 // membership is active (a password login would succeed through that one).
 // A bad code answers 401. A fault of the code store, or of loading the user or
-// their membership row in the SSO's organization, answers 503, as a refresh
-// does; a fault inside the reseller check counts as no active membership
-// (401, as for a login), and a fault inside issueLoginSession answers as it
-// does for a password login.
+// their membership or reseller authority in the SSO's organization, answers
+// 503, as a refresh does. A fault inside issueLoginSession answers as it does
+// for a password login. These failures issue no session; the one-time grant
+// and its binding have already been spent before the authority checks.
 // Only a JSON body is accepted: the refresh route is CSRF-exempt, and a
 // cross-site form can send a form body but not a JSON one.
 func (a *App) exchangeSSOSession(r *fastglue.Request, code string) error {

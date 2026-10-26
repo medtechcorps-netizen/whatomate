@@ -261,6 +261,27 @@ func (h *Hub) OnlineUserIDs(orgID uuid.UUID) []uuid.UUID {
 	return ids
 }
 
+// OnlineUserIDsWithinLimit copies a complete connected-user set or refuses it.
+// It never returns a truncated audience that a caller could mistake for complete.
+func (h *Hub) OnlineUserIDsWithinLimit(orgID uuid.UUID, limit int) ([]uuid.UUID, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if limit <= 0 {
+		return nil, false
+	}
+	var ids []uuid.UUID
+	for userID, clients := range h.clients[orgID] {
+		if len(clients) == 0 {
+			continue
+		}
+		if len(ids) == limit {
+			return nil, false
+		}
+		ids = append(ids, userID)
+	}
+	return ids, true
+}
+
 // FilterOnlineUsers returns only the user IDs that have active WebSocket connections.
 func (h *Hub) FilterOnlineUsers(orgID uuid.UUID, userIDs []uuid.UUID) []uuid.UUID {
 	h.mu.RLock()

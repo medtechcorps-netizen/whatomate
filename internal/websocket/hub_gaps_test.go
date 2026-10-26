@@ -11,6 +11,23 @@ import (
 
 // --- IsUserOnline ---
 
+func TestHubConnectedAudienceBoundNeverReturnsPartialUsers(t *testing.T) {
+	hub := newTestHub(t)
+	orgID, otherOrg := uuid.New(), uuid.New()
+	first, second := uuid.New(), uuid.New()
+	hub.Register(newTestClient(hub, first, orgID))
+	hub.Register(newTestClient(hub, first, orgID))
+	hub.Register(newTestClient(hub, second, orgID))
+	hub.Register(newTestClient(hub, uuid.New(), otherOrg))
+	waitForClientCount(t, hub, 4)
+	ids, complete := hub.OnlineUserIDsWithinLimit(orgID, 2)
+	assert.True(t, complete)
+	assert.ElementsMatch(t, []uuid.UUID{first, second}, ids)
+	ids, complete = hub.OnlineUserIDsWithinLimit(orgID, 1)
+	assert.False(t, complete)
+	assert.Nil(t, ids)
+}
+
 func TestHub_IsUserOnline_ReturnsTrueForRegisteredUser(t *testing.T) {
 	hub := newTestHub(t)
 	orgID := uuid.New()
