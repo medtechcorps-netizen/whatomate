@@ -113,6 +113,7 @@ import { useInfiniteScroll } from '@/composables/useInfiniteScroll'
 import { useAssignableUsers } from '@/composables/useAssignableUsers'
 import CannedResponsePicker from '@/components/chat/CannedResponsePicker.vue'
 import ChatListFilters from '@/components/chat/ChatListFilters.vue'
+import ChatExportDialog from '@/components/chat/ChatExportDialog.vue'
 import ChatRowActionsMenu from '@/components/chat/ChatRowActionsMenu.vue'
 import ContactAssigneeBadge from '@/components/chat/ContactAssigneeBadge.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
@@ -2357,6 +2358,15 @@ watch(contactId, () => chatAttachments.reset())
               class="pl-8 h-8 text-sm bg-white/[0.04] border-white/[0.1] text-white placeholder:text-white/40 light:bg-gray-50 light:border-gray-200 light:text-gray-900 light:placeholder:text-gray-400"
             />
           </div>
+          <ChatExportDialog
+            :initial-account="selectedAccount"
+            :filters="{
+              search: normalizeContactSearch(contactsStore.searchQuery),
+              tags: contactsStore.selectedTags,
+              unread: contactsStore.listFilter === 'unread',
+              assigned: contactsStore.listFilter === 'mine' ? 'me' : contactsStore.listFilter === 'unassigned' ? 'unassigned' : '',
+            }"
+          />
           <!-- Add Contact -->
           <Tooltip v-if="canWriteContacts">
             <TooltipTrigger as-child>
