@@ -1,6 +1,8 @@
 import { createPinia, setActivePinia } from 'pinia'
+import { nextTick } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Contact } from './contacts'
+import { useContactsStore, type Contact } from './contacts'
+import { useOrganizationsStore } from './organizations'
 
 const mocks = vi.hoisted(() => ({
   getContact: vi.fn(),
@@ -55,20 +57,157 @@ function listResponse(contacts: Contact[], total = contacts.length) {
 }
 
 async function loadStore() {
-  const { useContactsStore } = await import('./contacts')
   return useContactsStore()
 }
 
 describe('contacts store inbox filters and read state', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
-    vi.clearAllMocks()
+    vi.resetAllMocks()
     mocks.readSelectedOrganizationId.mockReturnValue(null)
     mocks.listContacts.mockResolvedValue(listResponse([]))
   })
 
   afterEach(() => {
     vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('keeps cached chats and selection on a failed refresh, then explicitly retries the same request', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const store = await loadStore()
+    const cached = laneDContact('cached')
+    mocks.listContacts.mockResolvedValueOnce(listResponse([cached], 3))
+    await store.fetchContacts()
+    store.setCurrentContact(cached)
+    mocks.listContacts.mockRejectedValueOnce(new Error('503'))
+    await store.fetchContacts({ search: 'Ali', tags: 'vip', unread: 'true' })
+    expect(store.contactListError).toBe('refresh')
+    expect(store.isLoading).toBe(false)
+    expect(store.contacts.map(c => c.id)).toEqual(['cached'])
+    expect(store.currentContact?.id).toBe('cached')
+    expect(store.contactsTotal).toBe(3)
+    await store.loadMoreContacts()
+    expect(mocks.listContacts).toHaveBeenCalledTimes(2)
+
+    mocks.listContacts.mockResolvedValueOnce(listResponse([laneDContact('recovered')]))
+    await store.retryContactList()
+    expect(mocks.listContacts.mock.calls[2][0]).toMatchObject({ search: 'Ali', tags: 'vip', unread: 'true', page: 1 })
+    expect(store.contactListError).toBeNull()
+    expect(store.contacts.map(c => c.id)).toEqual(['recovered'])
+    expect(store.currentContact?.id).toBe('cached')
+    await store.retryContactList()
+    expect(mocks.listContacts).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not spin on a failed next page and retries that page once without dropping cached rows', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const store = await loadStore()
+    store.selectedTags = ['vip']
+    mocks.listContacts.mockResolvedValueOnce(listResponse([laneDContact('one')], 3))
+    await store.fetchContacts()
+    mocks.listContacts.mockRejectedValueOnce(new Error('503'))
+    await store.loadMoreContacts()
+    expect(store.contactListError).toBe('more')
+    expect(store.isLoadingMoreContacts).toBe(false)
+    await store.loadMoreContacts()
+    await store.loadMoreContacts()
+    expect(mocks.listContacts).toHaveBeenCalledTimes(2)
+    expect(store.contacts.map(c => c.id)).toEqual(['one'])
+
+    let resolve!: (value: ReturnType<typeof listResponse>) => void
+    mocks.listContacts.mockImplementationOnce(() => new Promise(r => { resolve = r }))
+    const retry = store.retryContactList()
+    await store.retryContactList()
+    expect(mocks.listContacts).toHaveBeenCalledTimes(3)
+    expect(mocks.listContacts.mock.calls[2][0]).toMatchObject({ page: 2, tags: 'vip' })
+    resolve(listResponse([laneDContact('one'), laneDContact('two')], 3))
+    await retry
+    expect(store.contacts.map(c => c.id)).toEqual(['one', 'two'])
+    expect(store.contactListError).toBeNull()
+    expect(store.isLoadingMoreContacts).toBe(false)
+  })
+
+  it.each(['refresh', 'more'] as const)('ignores a late %s failure after a newer list succeeds', async phase => {
+    const store = await loadStore()
+    mocks.listContacts.mockResolvedValueOnce(listResponse([laneDContact('one')], 3))
+    await store.fetchContacts()
+    let reject!: (reason: unknown) => void
+    mocks.listContacts.mockImplementationOnce(() => new Promise((_r, r) => { reject = r }))
+    const old = phase === 'more' ? store.loadMoreContacts() : store.fetchContacts()
+    mocks.listContacts.mockResolvedValueOnce(listResponse([laneDContact('new')]))
+    await store.fetchContacts()
+    reject(new Error('late 503'))
+    await old
+    expect(store.contactListError).toBeNull()
+    expect(store.contacts.map(c => c.id)).toEqual(['new'])
+    expect(store.isLoading).toBe(false)
+    expect(store.isLoadingMoreContacts).toBe(false)
+  })
+
+  it('clears retry state on identity changes and refuses late errors from the previous organization', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const store = await loadStore()
+    const organizations = useOrganizationsStore()
+    organizations.selectedOrgId = 'org-a'
+    await nextTick()
+    mocks.listContacts.mockRejectedValueOnce(new Error('503'))
+    await store.fetchContacts({ tags: 'previous-org-only' })
+    expect(store.contactListError).toBe('refresh')
+    organizations.selectedOrgId = 'org-b'
+    await nextTick()
+    expect(store.contactListError).toBeNull()
+    await store.retryContactList()
+    expect(mocks.listContacts).toHaveBeenCalledTimes(1)
+
+    let reject!: (reason: unknown) => void
+    mocks.listContacts.mockImplementationOnce(() => new Promise((_r, r) => { reject = r }))
+    const old = store.fetchContacts()
+    organizations.selectedOrgId = 'org-c'
+    await nextTick()
+    mocks.listContacts.mockResolvedValueOnce(listResponse([laneDContact('org-c')]))
+    await store.fetchContacts()
+    reject(new Error('old organization failed'))
+    await old
+    expect(store.contactListError).toBeNull()
+    expect(store.contacts.map(c => c.id)).toEqual(['org-c'])
+    expect(mocks.listContacts.mock.calls[2][0].tags).toBeUndefined()
+  })
+
+  it('does not show an error for an aborted request', async () => {
+    const store = await loadStore()
+    mocks.listContacts.mockRejectedValueOnce(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+    await store.fetchContacts()
+    expect(store.contactListError).toBeNull()
+    expect(store.isLoading).toBe(false)
+  })
+
+  it.each(['refresh', 'more'] as const)('retries page one of the new search when %s failed before the debounce fires', async phase => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const store = await loadStore()
+    mocks.listContacts.mockResolvedValueOnce(listResponse([laneDContact('old-query')], 3))
+    store.searchQuery = 'old'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(300)
+    expect(store.contacts.map(c => c.id)).toEqual(['old-query'])
+    mocks.listContacts.mockRejectedValueOnce(new Error('503'))
+    if (phase === 'more') await store.loadMoreContacts()
+    else await store.fetchContacts({ search: 'old' })
+    expect(store.contactListError).toBe(phase)
+
+    store.searchQuery = 'new'
+    await nextTick()
+    mocks.listContacts.mockResolvedValueOnce(listResponse([laneDContact('new-query')]))
+    await store.retryContactList()
+    expect(mocks.listContacts).toHaveBeenCalledTimes(3)
+    expect(mocks.listContacts.mock.calls[2][0]).toMatchObject({ search: 'new', page: 1 })
+    expect(store.contacts.map(c => c.id)).toEqual(['new-query'])
+    expect(store.contactListError).toBeNull()
+    // The manual retry consumed the pending search; it does not cause a
+    // duplicate fetch when the original debounce deadline arrives.
+    await vi.advanceTimersByTimeAsync(300)
+    expect(mocks.listContacts).toHaveBeenCalledTimes(3)
   })
 
   it('keeps the default list request free of filter parameters', async () => {
