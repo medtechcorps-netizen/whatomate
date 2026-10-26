@@ -13,6 +13,7 @@ import {
 import PageHeader from '@/components/shared/PageHeader.vue'
 import ContactPicker from '@/components/shared/ContactPicker.vue'
 import ResourceAvailabilityPanel from '@/components/booking/ResourceAvailabilityPanel.vue'
+import PeopleScheduleComposer from '@/components/booking/PeopleScheduleComposer.vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -66,14 +67,10 @@ const lifecycleTarget = ref<LifecycleTarget | null>(null)
 const lifecycleOpen = ref(false)
 const lifecycleError = ref('')
 let lifecycleReturnFocus: HTMLElement | null = null
-const newEvent = reactive({
-  service_id: '',
-  resource_id: '',
-  date: '',
-  start_time: '09:00',
-  capacity: 1,
-  location: '',
-})
+const composerMode = ref<'person' | 'schedule'>('schedule')
+const composerOrganization = ref('')
+const composerBusy = ref(false)
+const composerSession = ref(0)
 const bookingDraft = reactive({
   contact_id: '',
   quantity: 1,
@@ -117,15 +114,6 @@ const canConfirmLifecycle = computed(() =>
 )
 const canReadContacts = computed(() => authStore.hasPermission('contacts', 'read'))
 const canCreateAttendees = computed(() => canWriteBookings.value && canReadContacts.value)
-const activeServices = computed(() => services.value.filter((service) => service.is_active))
-const eligibleEventResources = computed(() => {
-  const service = activeServices.value.find((item) => item.id === newEvent.service_id)
-  const allowed = new Set(service?.resource_ids ?? [])
-  return resources.value.filter(
-    (resource) => resource.is_active && (allowed.size === 0 || allowed.has(resource.id)),
-  )
-})
-
 const weekDays = computed(() =>
   Array.from({ length: 7 }, (_, index) => {
     const value = new Date(cursor.value)
@@ -166,9 +154,15 @@ function eventsForDay(day: Date) {
     .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime())
 }
 
+function eventTimezone(event: BookingEvent) {
+  return event.resource?.timezone ||
+    resources.value.find((resource) => resource.id === event.resource_id)?.timezone ||
+    Intl.DateTimeFormat().resolvedOptions().timeZone
+}
+
 function eventDateKey(event: BookingEvent) {
   const formatter = new Intl.DateTimeFormat('en-CA', {
-    timeZone: event.resource?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+    timeZone: eventTimezone(event),
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -180,12 +174,6 @@ function eventDateKey(event: BookingEvent) {
       .map((part) => [part.type, part.value]),
   )
   return `${parts.year}-${parts.month}-${parts.day}`
-}
-
-function syncEventResource() {
-  if (!eligibleEventResources.value.some((resource) => resource.id === newEvent.resource_id)) {
-    newEvent.resource_id = eligibleEventResources.value[0]?.id ?? ''
-  }
 }
 
 function isToday(day: Date) {
@@ -214,14 +202,9 @@ async function load() {
       selectedEvent.value = events.value.find((event) => event.id === selectedEvent.value?.id) ?? null
     }
 
-    if (!newEvent.service_id || !activeServices.value.some((service) => service.id === newEvent.service_id)) {
-      newEvent.service_id = activeServices.value[0]?.id ?? ''
-    }
-    syncEventResource()
     if (!serviceDraft.id && !serviceDraft.resource_ids.length && resources.value[0]?.id) {
       serviceDraft.resource_ids = [resources.value[0].id]
     }
-    if (!newEvent.date) newEvent.date = isoDate(new Date())
   } catch (error) {
     if (isCurrent(organization) && generation === loadGeneration) {
       toast.error('Calendar could not be loaded', getErrorMessage(error))
@@ -258,9 +241,10 @@ function resetResourceDraft() {
 }
 
 function toggleSetup() {
-  if (saving.value || !canWriteBookingSettings.value) return
+  if (saving.value || composerBusy.value || !canWriteBookingSettings.value) return
   showSetup.value = !showSetup.value
   if (showSetup.value) {
+    showCreate.value = false
     draftOrganization = currentOrganization()
     setupError.value = ''
     resetResourceDraft()
@@ -269,7 +253,7 @@ function toggleSetup() {
 }
 
 async function editResource(resource: BookingResource) {
-  if (saving.value || !canWriteBookingSettings.value || !isCurrent(catalogueOrganization)) return
+  if (saving.value || composerBusy.value || !canWriteBookingSettings.value || !isCurrent(catalogueOrganization)) return
   showSetup.value = true
   draftOrganization = currentOrganization()
   setupError.value = ''
@@ -299,11 +283,10 @@ function putCatalogue(kind: 'service' | 'resource', item: CatalogueRecord) {
   } else {
     resources.value = [...resources.value.filter((value) => value.id !== item.id), item as BookingResource]
   }
-  syncEventResource()
 }
 
 async function saveResource() {
-  if (saving.value || !validDraftContext()) return
+  if (saving.value || composerBusy.value || !validDraftContext()) return
   if (!resourceDraft.name.trim() || !resourceDraft.timezone.trim()) {
     toast.warning('Resource name and timezone are required')
     return
@@ -364,7 +347,7 @@ function resetServiceDraft() {
 }
 
 async function editService(service: BookingService) {
-  if (saving.value || !canWriteBookingSettings.value || !isCurrent(catalogueOrganization)) return
+  if (saving.value || composerBusy.value || !canWriteBookingSettings.value || !isCurrent(catalogueOrganization)) return
   showSetup.value = true
   draftOrganization = currentOrganization()
   setupError.value = ''
@@ -388,7 +371,7 @@ async function editService(service: BookingService) {
 }
 
 async function saveService() {
-  if (saving.value || !validDraftContext()) return
+  if (saving.value || composerBusy.value || !validDraftContext()) return
   const priceMinor = Math.round(Number(serviceDraft.price) * 100)
   if (
     !serviceDraft.name.trim() ||
@@ -445,7 +428,7 @@ function requestLifecycle(
   action: LifecycleTarget['action'],
   event: Event,
 ) {
-  if (saving.value || !isCurrent(catalogueOrganization)) return
+  if (saving.value || composerBusy.value || !isCurrent(catalogueOrganization)) return
   if (
     action === 'delete' ? !canDeleteBookingSettings.value || record.is_active : !canWriteBookingSettings.value
   )
@@ -476,7 +459,7 @@ function restoreLifecycleFocus(event: Event) {
 
 async function confirmLifecycle() {
   const target = lifecycleTarget.value
-  if (saving.value || !target || !canConfirmLifecycle.value) return
+  if (saving.value || composerBusy.value || !target || !canConfirmLifecycle.value) return
   if (!target.organization || !isCurrent(target.organization)) {
     lifecycleError.value = 'Your organization changed. Close and refresh before making changes.'
     return
@@ -520,7 +503,6 @@ async function confirmLifecycle() {
       if (target.kind === 'service' && serviceDraft.id === target.record.id) resetServiceDraft()
       if (target.kind === 'resource' && resourceDraft.id === target.record.id) resetResourceDraft()
     }
-    syncEventResource()
     lifecycleOpen.value = false
     toast.success(
       target.action === 'delete' ? 'Unused booking record deleted' : 'Booking availability updated',
@@ -547,6 +529,7 @@ watch(
     selectedEvent.value = null
     showSetup.value = false
     showCreate.value = false
+    composerBusy.value = false
     lifecycleOpen.value = false
     resetResourceDraft()
     resetServiceDraft()
@@ -654,42 +637,31 @@ function customerLabel(booking: Booking) {
   return booking.contact?.profile_name || booking.contact?.phone_number || 'Customer'
 }
 
-async function createEvent() {
-  const service = services.value.find((item) => item.id === newEvent.service_id)
-  const resource = eligibleEventResources.value.find((item) => item.id === newEvent.resource_id)
-  if (!service || !resource || !newEvent.date || !newEvent.start_time) {
-    toast.warning('Service, resource, date and start time are required')
-    return
-  }
-  const localStartsAt = `${newEvent.date}T${newEvent.start_time}`
-  const wallClock = new Date(`${localStartsAt}:00Z`)
-  const localEndsAt = new Date(wallClock.getTime() + service.duration_minutes * 60_000)
-    .toISOString()
-    .slice(0, 16)
+function openComposer(mode: 'person' | 'schedule') {
+  if (saving.value || composerBusy.value || loading.value || !isCurrent(catalogueOrganization)) return
+  if (mode === 'person' ? !canWriteBookingSettings.value : !canWriteBookings.value) return
+  composerMode.value = mode
+  ++composerSession.value
+  showSetup.value = false
+  closeSelectedEvent()
+  composerOrganization.value = currentOrganization()
+  showCreate.value = true
+}
 
-  saving.value = true
-  try {
-    await bookingService.createEvent({
-      service_id: service.id,
-      resource_id: resource.id,
-      local_starts_at: localStartsAt,
-      local_ends_at: localEndsAt,
-      timezone: resource.timezone,
-      capacity: Number(newEvent.capacity) || service.default_capacity,
-      status: 'scheduled',
-      location: newEvent.location,
-    })
-    showCreate.value = false
-    toast.success('Schedule added')
-    await load()
-  } catch (error) {
-    toast.error('Schedule was not created', getErrorMessage(error))
-  } finally {
-    saving.value = false
+async function scheduleCreated(event: BookingEvent) {
+  if (!isCurrent(composerOrganization.value)) return
+  if (Number.isFinite(Date.parse(event.starts_at))) {
+    // The acknowledged schedule may belong to a different week from the open calendar.
+    const [year, month, day] = eventDateKey(event).split('-').map(Number)
+    cursor.value = startOfWeek(new Date(year!, month! - 1, day!))
   }
+  showCreate.value = false
+  toast.success('Schedule added')
+  await load()
 }
 
 async function shiftWeek(amount: number) {
+  if (saving.value || composerBusy.value || showCreate.value) return
   const next = new Date(cursor.value)
   next.setDate(next.getDate() + amount * 7)
   cursor.value = next
@@ -697,6 +669,7 @@ async function shiftWeek(amount: number) {
 }
 
 async function goToday() {
+  if (saving.value || composerBusy.value || showCreate.value) return
   cursor.value = startOfWeek(new Date())
   await load()
 }
@@ -713,7 +686,7 @@ function eventDateTimeLabel(event: BookingEvent) {
   return new Intl.DateTimeFormat('en-MY', {
     dateStyle: 'medium',
     timeStyle: 'short',
-    timeZone: event.resource?.timezone,
+    timeZone: eventTimezone(event),
   }).format(new Date(event.starts_at))
 }
 
@@ -734,7 +707,7 @@ onMounted(load)
   <div class="flex h-full min-w-0 flex-col overflow-y-auto bg-[#08090a] light:bg-[#f6f4ef]">
     <PageHeader
       title="Bookings & classes"
-      description="Appointments, resources and capacity across the week."
+      description="Your people, appointments and classes across the week."
       :icon="CalendarDays"
       icon-gradient="bg-gradient-to-br from-fuchsia-500 to-violet-700 shadow-fuchsia-500/20"
     >
@@ -743,8 +716,8 @@ onMounted(load)
           id="booking-refresh"
           class="min-h-[44px]"
           variant="outline"
-          :aria-disabled="saving || loading"
-          @click="!saving && !loading && load()"
+          :aria-disabled="saving || composerBusy || loading || showCreate"
+          @click="!saving && !composerBusy && !loading && !showCreate && load()"
         >
           Refresh calendar
         </Button>
@@ -752,16 +725,26 @@ onMounted(load)
           v-if="canWriteBookingSettings"
           class="min-h-[44px]"
           variant="outline"
-          :disabled="saving"
+          :disabled="saving || composerBusy"
           @click="toggleSetup"
         >
-          Service setup
+          Advanced setup
+        </Button>
+        <Button
+          v-if="canWriteBookingSettings"
+          class="min-h-[44px]"
+          variant="outline"
+          :disabled="saving || composerBusy || loading"
+          @click="openComposer('person')"
+        >
+          <Plus class="mr-2 h-4 w-4" />
+          Add doctor / instructor / staff
         </Button>
         <Button
           v-if="canWriteBookings"
-          class="bg-fuchsia-400 text-black hover:bg-fuchsia-300"
-          :disabled="saving || !activeServices.length || !eligibleEventResources.length"
-          @click="showCreate = !showCreate"
+          class="min-h-[44px] bg-fuchsia-400 text-black hover:bg-fuchsia-300"
+          :disabled="saving || composerBusy || loading"
+          @click="openComposer('schedule')"
         >
           <Plus class="mr-2 h-4 w-4" />
           Add schedule
@@ -786,7 +769,7 @@ onMounted(load)
         class="grid gap-3 rounded-2xl border border-white/[0.08] bg-black/15 p-4 md:grid-cols-2 light:border-gray-200 light:bg-white"
         @submit.prevent="saveResource"
       >
-        <fieldset :disabled="saving" class="contents">
+        <fieldset :disabled="saving || composerBusy" class="contents">
           <div class="flex items-start justify-between gap-3 md:col-span-2">
             <div>
               <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-300">
@@ -796,7 +779,7 @@ onMounted(load)
                 {{
                   resourceDraft.id
                     ? 'Edit details without changing active status.'
-                    : 'Add a practitioner, instructor, room, or equipment.'
+                    : 'Manage doctors, instructors, staff, rooms and equipment.'
                 }}
               </p>
             </div>
@@ -805,7 +788,7 @@ onMounted(load)
               type="button"
               class="min-h-[44px]"
               variant="outline"
-              :disabled="saving"
+              :disabled="saving || composerBusy"
               @click="resetResourceDraft"
             >
               Cancel resource edit
@@ -829,6 +812,7 @@ onMounted(load)
             >
               <option value="practitioner">Practitioner</option>
               <option value="instructor">Instructor</option>
+              <option value="staff">Staff</option>
               <option value="room">Room</option>
               <option value="equipment">Equipment</option>
             </select>
@@ -846,7 +830,7 @@ onMounted(load)
             >Resource location
             <Input v-model="resourceDraft.location" maxlength="255" placeholder="Location (optional)" />
           </label>
-          <Button type="submit" class="min-h-[44px] md:col-span-2" variant="outline" :disabled="saving">
+          <Button type="submit" class="min-h-[44px] md:col-span-2" variant="outline" :disabled="saving || composerBusy">
             <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
             {{ resourceDraft.id ? 'Save resource' : 'Add resource' }}
           </Button>
@@ -858,7 +842,7 @@ onMounted(load)
         class="grid gap-3 rounded-2xl border border-white/[0.08] bg-black/15 p-4 md:grid-cols-2 light:border-gray-200 light:bg-white"
         @submit.prevent="saveService"
       >
-        <fieldset :disabled="saving" class="contents">
+        <fieldset :disabled="saving || composerBusy" class="contents">
           <div class="flex items-start justify-between gap-3 md:col-span-2">
             <div>
               <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-cyan-300">
@@ -877,7 +861,7 @@ onMounted(load)
               type="button"
               class="min-h-[44px]"
               variant="outline"
-              :disabled="saving"
+              :disabled="saving || composerBusy"
               @click="resetServiceDraft"
               >Cancel service edit</Button
             >
@@ -972,7 +956,7 @@ onMounted(load)
           <Button
             type="submit"
             class="min-h-[44px] bg-cyan-400 text-black hover:bg-cyan-300 md:col-span-2"
-            :disabled="saving"
+            :disabled="saving || composerBusy"
           >
             <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
             {{ serviceDraft.id ? 'Save service' : 'Create service' }}
@@ -983,38 +967,21 @@ onMounted(load)
       <ResourceAvailabilityPanel :resources="resources" />
     </section>
 
-    <div
+    <PeopleScheduleComposer
       v-if="showCreate"
-      class="grid gap-3 border-b border-fuchsia-400/20 bg-fuchsia-400/[0.04] px-5 py-4 md:grid-cols-2 xl:grid-cols-[1fr_1fr_.7fr_.55fr_.55fr_1fr_auto]"
-    >
-      <select
-        v-model="newEvent.service_id"
-        class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
-        @change="syncEventResource"
-      >
-        <option value="" disabled>Service</option>
-        <option v-for="service in activeServices" :key="service.id" :value="service.id">
-          {{ service.name }}
-        </option>
-      </select>
-      <select
-        v-model="newEvent.resource_id"
-        class="h-10 rounded-md border border-white/10 bg-[#0d0f10] px-3 text-sm text-white light:border-gray-200 light:bg-white light:text-gray-900"
-      >
-        <option value="" disabled>Resource</option>
-        <option v-for="resource in eligibleEventResources" :key="resource.id" :value="resource.id">
-          {{ resource.name }} · {{ resource.timezone }}
-        </option>
-      </select>
-      <Input v-model="newEvent.date" type="date" />
-      <Input v-model="newEvent.start_time" type="time" />
-      <Input v-model="newEvent.capacity" type="number" min="1" />
-      <Input v-model="newEvent.location" placeholder="Location" />
-      <Button :disabled="saving" class="bg-fuchsia-400 text-black hover:bg-fuchsia-300" @click="createEvent">
-        <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
-        Save
-      </Button>
-    </div>
+      :key="composerOrganization + ':' + composerMode + ':' + composerSession"
+      :organization="composerOrganization"
+      :resources="resources"
+      :services="services"
+      :initial-mode="composerMode"
+      :can-manage="canWriteBookingSettings"
+      :can-schedule="canWriteBookings"
+      @close="showCreate = false"
+      @busy="composerBusy = $event"
+      @resource-created="putCatalogue('resource', $event)"
+      @service-created="putCatalogue('service', $event)"
+      @scheduled="scheduleCreated"
+    />
 
     <section v-if="selectedEvent" class="border-b border-violet-300/15 bg-violet-300/[0.035] px-5 py-4">
       <div class="flex flex-wrap items-start justify-between gap-4">
@@ -1129,11 +1096,11 @@ onMounted(load)
       class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-white/[0.08] px-5 py-3 light:border-gray-200"
     >
       <div class="flex flex-wrap items-center gap-2">
-        <Button aria-label="Previous week" variant="outline" size="icon" @click="shiftWeek(-1)"
+        <Button aria-label="Previous week" :disabled="saving || composerBusy || showCreate" variant="outline" size="icon" @click="shiftWeek(-1)"
           ><ChevronLeft class="h-4 w-4"
         /></Button>
-        <Button variant="outline" size="sm" @click="goToday">Today</Button>
-        <Button aria-label="Next week" variant="outline" size="icon" @click="shiftWeek(1)"
+        <Button variant="outline" size="sm" :disabled="saving || composerBusy || showCreate" @click="goToday">Today</Button>
+        <Button aria-label="Next week" :disabled="saving || composerBusy || showCreate" variant="outline" size="icon" @click="shiftWeek(1)"
           ><ChevronRight class="h-4 w-4"
         /></Button>
         <p class="ml-2 text-sm font-semibold text-white light:text-gray-900">
@@ -1197,7 +1164,7 @@ onMounted(load)
                     data-testid="calendar-event-time"
                     class="text-[10px] font-semibold uppercase tracking-wider opacity-70 light:opacity-100"
                   >
-                    {{ timeLabel(event.starts_at, event.resource?.timezone) }}
+                    {{ timeLabel(event.starts_at, eventTimezone(event)) }}
                   </span>
                   <Badge variant="outline" class="h-5 border-current/20 px-1.5 text-[9px]">
                     {{ event.booked_quantity ?? 0 }}/{{ event.capacity }}
@@ -1273,7 +1240,7 @@ onMounted(load)
                 type="button"
                 variant="outline"
                 class="min-h-[44px]"
-                :disabled="saving"
+                :disabled="saving || composerBusy"
                 :aria-label="'Edit service ' + service.name"
                 @click="editService(service)"
                 >Edit</Button
@@ -1283,7 +1250,7 @@ onMounted(load)
                 type="button"
                 variant="outline"
                 class="min-h-[44px]"
-                :disabled="saving"
+                :disabled="saving || composerBusy"
                 :aria-label="(service.is_active ? 'Deactivate' : 'Reactivate') + ' service ' + service.name"
                 @click="
                   requestLifecycle(
@@ -1301,7 +1268,7 @@ onMounted(load)
                 type="button"
                 variant="outline"
                 class="min-h-[44px] text-destructive"
-                :disabled="saving"
+                :disabled="saving || composerBusy"
                 :aria-label="'Delete service ' + service.name"
                 @click="requestLifecycle('service', service, 'delete', $event)"
                 >Delete</Button
@@ -1350,7 +1317,7 @@ onMounted(load)
                 type="button"
                 variant="outline"
                 class="min-h-[44px]"
-                :disabled="saving"
+                :disabled="saving || composerBusy"
                 :aria-label="'Edit resource ' + resource.name"
                 @click="editResource(resource)"
                 >Edit</Button
@@ -1360,7 +1327,7 @@ onMounted(load)
                 type="button"
                 variant="outline"
                 class="min-h-[44px]"
-                :disabled="saving"
+                :disabled="saving || composerBusy"
                 :aria-label="
                   (resource.is_active ? 'Deactivate' : 'Reactivate') + ' resource ' + resource.name
                 "
@@ -1380,7 +1347,7 @@ onMounted(load)
                 type="button"
                 variant="outline"
                 class="min-h-[44px] text-destructive"
-                :disabled="saving"
+                :disabled="saving || composerBusy"
                 :aria-label="'Delete resource ' + resource.name"
                 @click="requestLifecycle('resource', resource, 'delete', $event)"
                 >Delete</Button
@@ -1426,7 +1393,7 @@ onMounted(load)
           before trying again.
         </p>
         <AlertDialogFooter>
-          <AlertDialogCancel :disabled="saving">Keep as is</AlertDialogCancel>
+          <AlertDialogCancel :disabled="saving || composerBusy">Keep as is</AlertDialogCancel>
           <Button :disabled="saving || !canConfirmLifecycle" @click.prevent="confirmLifecycle">
             <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
             {{

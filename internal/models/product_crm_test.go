@@ -155,6 +155,7 @@ func TestProductCRMConstants(t *testing.T) {
 		{"follow-up urgent", string(models.FollowUpTaskPriorityUrgent), "urgent"},
 		{"booking service class", string(models.BookingServiceKindClass), "class"},
 		{"booking resource practitioner", string(models.BookingResourceKindPractitioner), "practitioner"},
+		{"booking resource staff", string(models.BookingResourceKindStaff), "staff"},
 		{"booking event cancelled", string(models.BookingEventStatusCancelled), "cancelled"},
 		{"booking checked in", string(models.BookingStatusCheckedIn), "checked_in"},
 		{"booking no-show", string(models.BookingStatusNoShow), "no_show"},

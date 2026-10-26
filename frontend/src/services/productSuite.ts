@@ -339,7 +339,7 @@ export interface BookingResource {
   id: string
   user_id?: string
   name: string
-  kind: 'practitioner' | 'room' | 'equipment' | 'instructor'
+  kind: 'practitioner' | 'room' | 'equipment' | 'instructor' | 'staff'
   timezone: string
   location?: string
   is_active: boolean
@@ -954,7 +954,8 @@ export const bookingService = {
       local_ends_at?: string
       timezone?: string
     },
-  ) => api.post('/booking/events', data),
+    organizationId?: string,
+  ) => api.post('/booking/events', data, bookingOrganization(organizationId)),
   bookings: (params?: Record<string, string | number>) => api.get('/bookings', { params }),
   allBookings: (params?: Record<string, string | number>) =>
     fetchAllPages<Booking>('bookings', (page, limit) =>
