@@ -105,11 +105,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.publishHeartbeat(ctx); err != nil {
 		return fmt.Errorf("publish initial worker heartbeat: %w", err)
 	}
-	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
-	defer stopHeartbeat()
-	go w.maintainHeartbeat(heartbeatCtx)
-
-	err := w.Consumer.Consume(ctx, w)
+	err := consumeWithHeartbeat(ctx, func(consumeCtx context.Context) error {
+		return w.Consumer.Consume(consumeCtx, w)
+	}, w.maintainHeartbeat)
 	if err != nil && ctx.Err() == nil {
 		return fmt.Errorf("consumer error: %w", err)
 	}
