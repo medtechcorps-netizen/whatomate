@@ -13,15 +13,17 @@ import { useCallingStore } from '@/stores/calling'
 import { recordSignOutReason } from '@/lib/sessionSignout'
 import { SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
 import {
-  LAST_ACTIVITY_KEY,
   SESSION_CHANNEL_NAME,
   SESSION_IDLE_POLICY_KEY,
   SESSION_POLICY_EVENT,
   SIGNED_OUT_BROADCAST_KEY,
   clearLastActivity,
   currentPolicyIdentity,
+  currentSessionActivityScope,
   readLastActivity,
   readSessionIdlePolicy,
+  recordActivity,
+  rememberSessionActivity,
 } from '@/lib/sessionActivity'
 
 export {
@@ -36,7 +38,7 @@ export {
  *
  * Real interaction (pointer, keyboard, touch, a tab becoming visible) or an
  * active call counts as activity, in any tab: the last-activity time is
- * shared through localStorage. Loading or reloading the app is not activity;
+ * shared through storage and session-scoped notices. Loading the app is not activity;
  * a session already idle past the policy ends before the app renders (see
  * services/api.ts). Two minutes before the deadline every tab shows a
  * warning; from then on only "Stay signed in" keeps the session. At the
@@ -84,6 +86,7 @@ export function useSessionIdle() {
 
   let localLastActivity = 0
   let lastSharedAt = 0
+  let lastBroadcastAt = 0
   let signingOut = false
   let tickTimer: ReturnType<typeof setInterval> | null = null
   let policyTimer: ReturnType<typeof setInterval> | null = null
@@ -106,14 +109,21 @@ export function useSessionIdle() {
   }
 
   function shareActivity(at: number) {
-    // Once the session is ending nothing may restart its clock.
-    if (signingOut) return
+    // An ending or replaced tab cannot restart any browser session's clock.
+    if (signingOut || !authStore.isAuthenticated || !isTabSessionCurrent()) return
     localLastActivity = Math.max(localLastActivity, at)
     lastSharedAt = at
+    recordActivity(localLastActivity)
+    const scope = currentSessionActivityScope()
+    const now = Date.now()
+    // Page-hide/unmount flushes still persist promptly, but cannot turn rapid
+    // visibility changes into an unbounded stream of cross-tab notices.
+    if (!channel || !scope || now - lastBroadcastAt < ACTIVITY_SHARE_INTERVAL_MS) return
+    lastBroadcastAt = now
     try {
-      localStorage.setItem(LAST_ACTIVITY_KEY, String(Math.max(localLastActivity, readLastActivity())))
+      channel.postMessage({ type: 'activity', ...scope, at: localLastActivity })
     } catch {
-      // This tab still tracks its own activity.
+      // Storage and this tab's scoped memory remain independent fallbacks.
     }
   }
 
@@ -351,6 +361,12 @@ export function useSessionIdle() {
         channel.onmessage = (event: MessageEvent) => {
           if (event.data?.type === 'signed-out') {
             onSignedOutElsewhere(event.data.reason, event.data.session)
+          } else if (event.data?.type === 'activity' && isActive() && isTabSessionCurrent() &&
+                     event.data.session === readTabSession() &&
+                     rememberSessionActivity(event.data.at, event.data.session, event.data.identity)) {
+            // Memory only: do not persist, refresh, or rebroadcast a received
+            // notice. The API client reads this same scoped clock.
+            tick()
           }
         }
       } catch {

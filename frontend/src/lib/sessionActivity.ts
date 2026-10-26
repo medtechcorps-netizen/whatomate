@@ -1,3 +1,5 @@
+import { currentTabSession } from './tabSession'
+
 // Shared state for the organization policy "Sign out after inactivity".
 //
 // The last-activity time and the last-known policy live in localStorage, so
@@ -127,18 +129,72 @@ export function rememberSessionIdlePolicy(value: unknown, identity: string) {
   }
 }
 
-/** The shared last-activity time (ms), or 0 when none is recorded. */
+type ScopedActivity = { session: string; identity: string; at: number }
+
+// This document's clock is shared by the view and the API client's idle checks.
+// A denied storage write must not leave the refresh path on an older clock.
+// It never survives a page load or a user/logical-session replacement. The
+// same user's organization switch keeps the existing clock, as storage does.
+let memoryActivity: ScopedActivity | null = null
+
+function activityIdentityPart(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 &&
+    value.trim() === value && !value.includes('|')
+}
+
+/** Complete browser identity for activity only; policy-cache parsing is unchanged. */
+export function currentSessionActivityScope(): { session: string; identity: string } | null {
+  const session = currentTabSession()
+  if (typeof session !== 'string' || session.trim() === '') return null
+  try {
+    const user = JSON.parse(localStorage.getItem('user') || 'null')
+    if (!activityIdentityPart(user?.id) || !activityIdentityPart(user?.organization_id)) return null
+    return { session, identity: `${user.id}|${user.organization_id}` }
+  } catch {
+    return null
+  }
+}
+
+function scopedMemoryActivity(): number {
+  const scope = currentSessionActivityScope()
+  if (!scope || !memoryActivity || memoryActivity.session !== scope.session ||
+      memoryActivity.identity.split('|', 1)[0] !== scope.identity.split('|', 1)[0] ||
+      memoryActivity.at > Date.now()) {
+    memoryActivity = null
+  } else {
+    // Changing an active policy must not reset or discard accepted activity.
+    // Only retag the existing clock; incoming notices still need the exact
+    // current policy identity below, so a notice labelled with the old
+    // organization cannot advance it.
+    memoryActivity.identity = scope.identity
+  }
+  return memoryActivity?.at ?? 0
+}
+
+/** Accept a clock only for the current, live logical session and policy identity. */
+export function rememberSessionActivity(at: unknown, session: unknown, identity: unknown): boolean {
+  const scope = currentSessionActivityScope()
+  if (!scope || session !== scope.session || identity !== scope.identity ||
+      typeof at !== 'number' || !Number.isSafeInteger(at) || at <= 0 || at > Date.now()) return false
+  memoryActivity = { ...scope, at: Math.max(at, scopedMemoryActivity()) }
+  return true
+}
+
+/** The latest activity known to this tab, or 0 when none is recorded. */
 export function readLastActivity(): number {
   const value = readNumber(LAST_ACTIVITY_KEY)
-  return value && value > 0 ? value : 0
+  return Math.max(value && value > 0 ? value : 0, scopedMemoryActivity())
 }
 
 export function recordActivity(at = Date.now()) {
+  const scope = currentSessionActivityScope()
+  if (scope) rememberSessionActivity(at, scope.session, scope.identity)
   write(LAST_ACTIVITY_KEY, String(Math.max(at, readLastActivity())))
 }
 
 /** Forgets the clock when a session ends, so the next one starts fresh. */
 export function clearLastActivity() {
+  memoryActivity = null
   write(LAST_ACTIVITY_KEY, null)
 }
 
