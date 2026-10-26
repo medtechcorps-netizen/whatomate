@@ -660,7 +660,7 @@ describe('useChatAttachments stop', () => {
     expect(attachments.items.value.map(item => item.status)).toEqual(['sent', 'ready'])
   })
 
-  it('does nothing without a running batch or once the batch is detached', async () => {
+  it('does nothing without a batch and can stop a detached running batch', async () => {
     const { attachments, calls } = setup()
     attachments.stop()
     attachments.stage([file('a.png', 'image/png')])
@@ -668,8 +668,7 @@ describe('useChatAttachments stop', () => {
     await settle()
     attachments.reset()
     attachments.stop()
-    expect(calls[0].signal.aborted).toBe(false)
-    calls[0].result.resolve({ id: 'm1' })
+    expect(calls[0].signal.aborted).toBe(true)
     await done
   })
 })

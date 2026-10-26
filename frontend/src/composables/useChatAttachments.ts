@@ -1,9 +1,10 @@
-import { computed, effectScope, getCurrentScope, markRaw, onScopeDispose, ref, watch } from 'vue'
+import { computed, effectScope, getCurrentInstance, getCurrentScope, markRaw, nextTick, onScopeDispose, ref, shallowRef, watch, type ShallowRef } from 'vue'
 import { messagesService } from '@/services/api'
 import { getErrorMessage } from '@/lib/api-utils'
 import { convertImageToJpeg } from '@/lib/chatImageConversion'
 import { SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
 import { SESSION_ENDING_EVENT } from '@/lib/sessionActivity'
+import { currentTabSession } from '@/lib/tabSession'
 import {
   MAX_CAPTION_LENGTH,
   MAX_CHAT_ATTACHMENTS,
@@ -166,14 +167,14 @@ export interface UseChatAttachmentsOptions {
 }
 
 /**
- * Logical session marker kept by the auth layer (lane A); it changes only on
- * login, registration, logout or expiry. Absent on builds without it: the
- * batch then relies on the user/workspace checks and fails closed on change.
+ * Logical session marker kept by the auth layer; stable across token refresh.
+ * Use the current tab's authority, including its storage-denied memory path,
+ * rather than adopting a newer shared marker from another login.
  */
 export const LOGICAL_SESSION_STORAGE_KEY = 'whm_session_id'
 
 export function readLogicalSessionMarker(): string | null {
-  return readStorage(LOGICAL_SESSION_STORAGE_KEY)
+  return currentTabSession()
 }
 
 /** Where the auth store persists the signed-in user (on every login and switch-org). */
@@ -343,6 +344,7 @@ interface ActiveBatch {
   detached: boolean
   /** Ends a pacing wait early (Stop). */
   wake: (() => void) | null
+  terminate: () => void
 }
 
 /**
@@ -353,7 +355,7 @@ interface ActiveBatch {
  * confirmed for, even if the agent leaves the chat, and finishes with a
  * report (onBatchFinished). Only Stop ends it early.
  */
-export function useChatAttachments(options: UseChatAttachmentsOptions) {
+function createChatAttachments(options: UseChatAttachmentsOptions) {
   const send = options.send ?? defaultSend
   const convertImage = options.convertImage ?? ((file: File) => convertImageToJpeg(file))
   const settleTimeoutMs = options.settleTimeoutMs ?? MEDIA_SETTLE_TIMEOUT_MS
@@ -397,6 +399,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
   const isStopping = ref(false)
   /** The patient the in-flight batch goes to. */
   const sendingTo = ref('')
+  const recipientName = ref('')
+  const recipientContactId = ref('')
   let target: ChatAttachmentTarget | null = null
   let activeBatch: ActiveBatch | null = null
   let sequence = 0
@@ -430,6 +434,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     items.value = []
     isOpen.value = false
     target = null
+    recipientName.value = ''
+    recipientContactId.value = ''
   }
 
   function stage(files: Iterable<File> | ArrayLike<File>): StageResult {
@@ -442,6 +448,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     // Never mix files staged for one patient into another patient's batch.
     if (target && (target.contactId !== current.contactId || !target.isActive())) reset()
     target = current
+    recipientName.value = current.label ?? ''
+    recipientContactId.value = current.contactId
 
     const accepted = list.slice(0, remainingSlots.value)
     for (const file of accepted) {
@@ -573,6 +581,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
       stopRequested: false,
       detached: false,
       wake: null,
+      terminate: () => {},
     }
     activeBatch = batch
     isSending.value = true
@@ -653,6 +662,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
       terminate()
       reset()
     }
+    batch.terminate = onSessionEnding
     // Another tab switched workspace or signed in/out: localStorage changed.
     const onStorage = () => {
       if (!batch.terminated && !sessionIsCurrent(batch)) onSessionEnding()
@@ -678,6 +688,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         current => {
           if (!current) onSessionEnding()
         },
+        { flush: 'sync' },
       )
     })
 
@@ -796,10 +807,12 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
       } catch {
         // Nothing to release.
       }
-      activeBatch = null
-      isSending.value = false
-      isStopping.value = false
-      sendingTo.value = ''
+      if (activeBatch === batch) {
+        activeBatch = null
+        isSending.value = false
+        isStopping.value = false
+        sendingTo.value = ''
+      }
     }
 
     const named = (status: StagedAttachmentStatus) =>
@@ -824,9 +837,9 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     if (batch.terminated) return null
     options.onBatchFinished?.(summary)
     // Done when nothing is left to send, retry, convert or check; invalid
-    // files were shown as skipped. A detached batch leaves the (new) staging alone.
+    // files were shown as skipped. Never reset a newer running batch.
     const open: StagedAttachmentStatus[] = ['ready', 'failed', 'converting', 'unconfirmed']
-    if (!batch.detached && !items.value.some(item => open.includes(item.status))) {
+    if (!activeBatch && !items.value.some(item => open.includes(item.status))) {
       reset()
     }
     return summary
@@ -862,7 +875,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
    */
   function stop() {
     const batch = activeBatch
-    if (!batch || batch.detached || batch.stopRequested) return
+    if (!batch || batch.stopRequested) return
     batch.stopRequested = true
     isStopping.value = true
     if (!batch.uploadComplete) batch.controller?.abort()
@@ -891,6 +904,8 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     isSending,
     isStopping,
     sendingTo,
+    recipientName,
+    recipientContactId,
     sendableCount,
     failedCount,
     invalidCount,
@@ -910,6 +925,238 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     stop,
     close,
     reset,
+    /** A view can leave without dropping the running batch's progress or Stop control. */
+    detach: () => {
+      if (activeBatch) {
+        activeBatch.detached = true
+        isOpen.value = false
+      } else reset()
+    },
+    terminate: () => {
+      activeBatch?.terminate()
+      reset()
+    },
+  }
+}
+
+interface AttachmentIdentity {
+  user: string
+  workspace: string
+  session: string
+}
+
+function attachmentIdentity(options: UseChatAttachmentsOptions): AttachmentIdentity | null {
+  const session = options.session
+  if (!session?.isAuthenticated()) return null
+  const user = session.userId()
+  const workspace = session.workspace?.()
+  const logicalSession = session.logicalSession?.()
+  if ((typeof user !== 'string' && typeof user !== 'number') || !String(user).trim()
+    || typeof workspace !== 'string' || !workspace.trim()
+    || typeof logicalSession !== 'string' || !logicalSession.trim() || logicalSession.startsWith('ended:')) return null
+  return { user: String(user), workspace, session: logicalSession }
+}
+
+function sameAttachmentIdentity(left: AttachmentIdentity | null, right: AttachmentIdentity | null): boolean {
+  return !!left && !!right && left.user === right.user && left.workspace === right.workspace && left.session === right.session
+}
+
+type AttachmentController = ReturnType<typeof createChatAttachments>
+interface AttachmentView { options: UseChatAttachmentsOptions; disposed: boolean; target?: ChatAttachmentTarget | null }
+interface AttachmentOwner {
+  identity: AttachmentIdentity
+  controller: AttachmentController
+  scope: ReturnType<typeof effectScope>
+  pending: Promise<BatchSummary | null> | null
+}
+interface AttachmentRegistry {
+  owner: ShallowRef<AttachmentOwner | null>
+  views: Set<AttachmentView>
+  summary: { identity: AttachmentIdentity; value: BatchSummary } | null
+}
+// One owner per Vue application, never one per ChatView or per mount. Files and
+// the original request stay with that owner until settlement; views only observe.
+const attachmentRegistries = new WeakMap<object, AttachmentRegistry>()
+
+export function useChatAttachments(options: UseChatAttachmentsOptions) {
+  const app = getCurrentInstance()?.appContext.app
+  // Non-component consumers retain their explicitly owned effect-scope lifetime.
+  if (!app) return createChatAttachments(options)
+  let registry = attachmentRegistries.get(app)
+  if (!registry) {
+    registry = { owner: shallowRef<AttachmentOwner | null>(null), views: new Set(), summary: null }
+    attachmentRegistries.set(app, registry)
+  }
+  const shared = registry
+  const view: AttachmentView = { options, disposed: false }
+  shared.views.add(view)
+  const belongs = (owner: AttachmentOwner) => !view.disposed && sameAttachmentIdentity(attachmentIdentity(options), owner.identity)
+  const liveView = (owner: AttachmentOwner, contactId?: string): AttachmentView | undefined =>
+    [...shared.views].reverse().find(candidate => {
+      if (candidate.disposed || !sameAttachmentIdentity(attachmentIdentity(candidate.options), owner.identity)) return false
+      const target = candidate.options.resolveTarget()
+      return !contactId || (target?.contactId === contactId && target.isActive()
+        && candidate.target?.contactId === contactId && candidate.target.isActive())
+    })
+  function disposeOwner(owner: AttachmentOwner) {
+    if (owner.controller.isSending.value) return
+    owner.scope.stop()
+    if (shared.owner.value === owner) shared.owner.value = null
+  }
+  function controllerForStage(): AttachmentOwner | null {
+    const current = shared.owner.value
+    if (current?.controller.isSending.value) return null
+    if (current && belongs(current)) return current
+    if (current) disposeOwner(current)
+    const identity = attachmentIdentity(options)
+    if (view.disposed || !identity) return null
+    const scope = effectScope(true)
+    let owner: AttachmentOwner
+    let contactId: string | undefined
+    const controller = scope.run(() => createChatAttachments({
+      ...options,
+      resolveTarget: () => {
+        const candidate = liveView(owner)
+        const target = candidate?.options.resolveTarget()
+        if (!target) return null
+        candidate!.target = target
+        contactId = target.contactId
+        // The contact is immutable. A remount supplies a fresh view-generation
+        // check instead of retaining callbacks into the disposed component.
+        return { ...target, isActive: () => !!liveView(owner, target.contactId) }
+      },
+      getWhatsAppAccount: () => liveView(owner, contactId)?.options.getWhatsAppAccount?.(),
+      replyTo: target => liveView(owner, target.contactId)?.options.replyTo?.(target),
+      onSent: message => liveView(owner, contactId)?.options.onSent?.(message),
+      onReplySent: (reply, target) => {
+        const candidate = liveView(owner, target.contactId)
+        const currentTarget = candidate?.options.resolveTarget()
+        if (currentTarget) candidate?.options.onReplySent?.(reply, currentTarget)
+      },
+      onReplyRejected: (reply, target) => {
+        const candidate = liveView(owner, target.contactId)
+        const currentTarget = candidate?.options.resolveTarget()
+        if (currentTarget) candidate?.options.onReplyRejected?.(reply, currentTarget)
+      },
+      onBatchFinished: summary => {
+        const candidate = liveView(owner)
+        if (candidate) candidate.options.onBatchFinished?.(summary)
+        else shared.summary = { identity: owner.identity, value: summary }
+      },
+    }))!
+    owner = { identity, controller, scope, pending: null }
+    shared.owner.value = owner
+    return owner
+  }
+  function visibleController(): AttachmentController | null {
+    const owner = shared.owner.value
+    return owner && belongs(owner) ? owner.controller : null
+  }
+  function run(method: 'sendAll' | 'retryFailed' | 'sendWithoutQuote', id?: string): Promise<BatchSummary | null> {
+    const owner = shared.owner.value
+    if (!owner || !belongs(owner) || owner.pending || owner.controller.isSending.value
+      || !liveView(owner, owner.controller.recipientContactId.value)) return Promise.resolve(null)
+    const request = method === 'sendWithoutQuote' ? owner.controller.sendWithoutQuote(id!) : owner.controller[method]()
+    owner.pending = request
+    // Keep the actual promise even with no mounted view. An old completion can
+    // only release its own owner, and cannot clear a later batch or its hold.
+    void request.finally(() => {
+      if (owner.pending === request) owner.pending = null
+      if (!liveView(owner) && !owner.controller.isSending.value) disposeOwner(owner)
+    }).catch(() => {})
+    return request
+  }
+  const checkIdentity = () => {
+    if (shared.summary && !sameAttachmentIdentity(attachmentIdentity(options), shared.summary.identity)) shared.summary = null
+    const owner = shared.owner.value
+    if (owner && !belongs(owner)) {
+      owner.controller.terminate()
+      if (!owner.controller.isSending.value) disposeOwner(owner)
+    }
+  }
+  watch(() => attachmentIdentity(options), checkIdentity, { flush: 'sync' })
+  if (typeof window !== 'undefined') window.addEventListener('storage', checkIdentity)
+  let stopInitialTargetWatch: (() => void) | undefined
+  const existing = shared.owner.value
+  if (existing) {
+    if (belongs(existing)) {
+      if (existing.controller.isSending.value) existing.controller.isOpen.value = true
+      // ChatView references later setup declarations and loads its contact
+      // asynchronously. Capture only this remount's first active selection,
+      // then stop: an A-to-B-to-A selection must not refresh the old fence.
+      void nextTick(() => {
+        if (view.disposed || !belongs(existing) || shared.owner.value !== existing) return
+        stopInitialTargetWatch = watch(() => options.resolveTarget(), target => {
+          if (!belongs(existing) || shared.owner.value !== existing) {
+            stopInitialTargetWatch?.()
+          } else if (target?.isActive()) {
+            view.target = target
+            stopInitialTargetWatch?.()
+          }
+        }, { immediate: true, flush: 'sync' })
+        if (view.target) stopInitialTargetWatch()
+      })
+    }
+    else checkIdentity()
+  }
+  // At most one report is retained, with no File or object URL. The next live
+  // view in the same login/workspace receives it once, after setup completes.
+  const pendingSummary = shared.summary
+  if (pendingSummary) {
+    void nextTick(() => {
+      if (view.disposed || shared.summary !== pendingSummary) return
+      shared.summary = null
+      if (sameAttachmentIdentity(attachmentIdentity(options), pendingSummary.identity)) options.onBatchFinished?.(pendingSummary.value)
+    })
+  }
+  onScopeDispose(() => {
+    view.disposed = true
+    stopInitialTargetWatch?.()
+    shared.views.delete(view)
+    if (typeof window !== 'undefined') window.removeEventListener('storage', checkIdentity)
+    const owner = shared.owner.value
+    if (!owner || liveView(owner)) return
+    if (owner.controller.isSending.value) owner.controller.detach()
+    else disposeOwner(owner)
+  })
+  const emptyItems: StagedAttachment[] = []
+  return {
+    items: computed(() => visibleController()?.items.value ?? emptyItems),
+    isOpen: computed({ get: () => visibleController()?.isOpen.value ?? false, set: value => {
+      const controller = visibleController()
+      if (controller) controller.isOpen.value = value
+    } }),
+    // A terminated request may still be settling. Keep global admission busy,
+    // but never expose another identity's patient, files or progress.
+    isSending: computed(() => shared.owner.value?.controller.isSending.value ?? false),
+    isStopping: computed(() => visibleController()?.isStopping.value ?? false),
+    sendingTo: computed(() => visibleController()?.sendingTo.value ?? ''),
+    recipientName: computed(() => visibleController()?.recipientName.value ?? ''),
+    recipientContactId: computed(() => visibleController()?.recipientContactId.value ?? ''),
+    sendableCount: computed(() => visibleController()?.sendableCount.value ?? 0),
+    failedCount: computed(() => visibleController()?.failedCount.value ?? 0),
+    invalidCount: computed(() => visibleController()?.invalidCount.value ?? 0),
+    sentCount: computed(() => visibleController()?.sentCount.value ?? 0),
+    convertingCount: computed(() => visibleController()?.convertingCount.value ?? 0),
+    remainingSlots: computed(() => visibleController()?.remainingSlots.value ?? MAX_CHAT_ATTACHMENTS),
+    maxFiles: MAX_CHAT_ATTACHMENTS,
+    stage: (files: Iterable<File> | ArrayLike<File>): StageResult => {
+      const list = Array.from(files as ArrayLike<File>).filter(Boolean)
+      if (shared.owner.value?.controller.isSending.value) return { added: 0, overflow: list.length, refused: 'busy' }
+      const owner = controllerForStage()
+      return owner?.controller.stage(list) ?? { added: 0, overflow: list.length, refused: 'no-conversation' }
+    },
+    remove: (id: string) => visibleController()?.remove(id),
+    setCaption: (id: string, caption: string) => visibleController()?.setCaption(id, caption),
+    sendAsDocument: (id: string) => visibleController()?.sendAsDocument(id),
+    convertToJpeg: (id: string) => visibleController()?.convertToJpeg(id) ?? Promise.resolve(false),
+    convertAllToJpeg: () => visibleController()?.convertAllToJpeg() ?? Promise.resolve(),
+    sendAll: () => run('sendAll'),
+    retryFailed: () => run('retryFailed'),
+    sendWithoutQuote: (id: string) => run('sendWithoutQuote', id),
+    stop: () => visibleController()?.stop(),
+    close: () => visibleController()?.close(),
+    reset: () => visibleController()?.detach(),
   }
 }
 
