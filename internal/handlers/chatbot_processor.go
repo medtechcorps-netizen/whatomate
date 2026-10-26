@@ -27,6 +27,514 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// Media inventory deliberately has no App, provider, ORM or worker handle.
+// These DTOs are separate from private snapshot rows: raw payloads, identities,
+// filenames, URLs and error text cannot accidentally enter either output.
+type mediaInventoryEntry struct {
+	database.MediaInventoryCandidate
+	Class       string                   `json:"class"`
+	Reason      string                   `json:"reason"`
+	TimeUnknown bool                     `json:"message_ingestion_unknown,omitempty"`
+	HoldID      string                   `json:"hold_id,omitempty"`
+	Revision    string                   `json:"revision,omitempty"`
+	Generation  uint64                   `json:"generation,omitempty"`
+	Reference   string                   `json:"stored_reference_kind,omitempty"`
+	Jobs        []mediaInventoryJobEntry `json:"jobs,omitempty"`
+}
+
+type mediaInventoryJobEntry struct {
+	ID          uuid.UUID `json:"id"`
+	Status      string    `json:"status"`
+	Version     int64     `json:"version"`
+	Attempts    int       `json:"attempts"`
+	MaxAttempts int       `json:"max_attempts"`
+}
+
+type mediaInventoryView struct {
+	ctx              context.Context
+	account          models.WhatsAppAccount
+	rows             map[string]database.MediaInventoryRow
+	jobs             []models.ScheduledJob
+	source           database.MediaInventorySnapshot
+	jobRecords       int
+	outputIncomplete bool
+}
+
+// ClassifyMediaInventory labels evidence within a bounded snapshot; no class
+// authorizes replay. In particular a continuation has no historical credential
+// generation/cycle, and a database URL says nothing about object existence.
+func ClassifyMediaInventory(ctx context.Context, snapshot database.MediaInventorySnapshot, version, buildTime string) ([]byte, []byte, error) {
+	if ctx == nil || ctx.Err() != nil {
+		return nil, nil, errors.New("media inventory unavailable")
+	}
+	org, orgErr := uuid.Parse(snapshot.Scope.OrganizationID)
+	account, accountErr := uuid.Parse(snapshot.Scope.AccountID)
+	if orgErr != nil || accountErr != nil || org == uuid.Nil || account == uuid.Nil || snapshot.Scope.Limit < 1 || snapshot.Scope.Limit > 500 ||
+		len(snapshot.Candidates) > snapshot.Scope.Limit || len(snapshot.Rows) > 24*snapshot.Scope.Limit+64 || len(version) > 128 || len(buildTime) > 128 {
+		return nil, nil, errors.New("media inventory unavailable")
+	}
+	view := mediaInventoryView{ctx: ctx, rows: make(map[string]database.MediaInventoryRow), source: snapshot}
+	totalBytes := 0
+	for _, row := range snapshot.Rows {
+		if ctx.Err() != nil {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		if !slices.Contains([]string{"account", "message", "job", "activity", "contact", "event", "conversation", "channel", "identity", "hold", "member", "state"}, row.Kind) {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		key := row.Kind + ":" + row.ID
+		var identity struct {
+			ID             string    `json:"id"`
+			OrganizationID uuid.UUID `json:"organization_id"`
+			HoldID         uuid.UUID `json:"hold_id"`
+			ContactID      uuid.UUID `json:"contact_id"`
+		}
+		if len(row.Data) == 0 || len(row.Data) > 65536 || json.Unmarshal(row.Data, &identity) != nil || identity.OrganizationID != org {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		if row.Kind == "member" {
+			identity.ID = identity.HoldID.String() + ":" + identity.ContactID.String()
+		}
+		if identity.ID != row.ID {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		if _, exists := view.rows[key]; exists {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		totalBytes += len(row.Data)
+		if totalBytes > 8*1024*1024 {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		view.rows[key] = row
+		if row.Kind == "job" {
+			var job models.ScheduledJob
+			if json.Unmarshal(row.Data, &job) != nil {
+				return nil, nil, errors.New("media inventory unavailable")
+			}
+			view.jobs = append(view.jobs, job)
+		}
+	}
+	if json.Unmarshal(view.rows["account:"+account.String()].Data, &view.account) != nil || view.account.ID != account {
+		return nil, nil, errors.New("media inventory unavailable")
+	}
+	counts, reasons := make(map[string]int), make(map[string]int)
+	for _, class := range []string{"ordinary_blank_url_exact_continuation_proof", "ordinary_blank_url_unproven_or_conflicting", "coex_message_failed_exhausted", "coex_other_job_state", "held_stage_current_generation", "held_stage_stale_or_unproven", "stored_reference_present_existence_unverified"} {
+		counts[class] = 0
+	}
+	unknownIngestion := 0
+	entries := make([]mediaInventoryEntry, 0, len(snapshot.Candidates))
+	seen := make(map[string]bool)
+	for _, candidate := range snapshot.Candidates {
+		if ctx.Err() != nil {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		id, err := uuid.Parse(candidate.ID)
+		key := candidate.Kind + ":" + candidate.ID
+		if err != nil || id == uuid.Nil || seen[key] || candidate.Arrival.Before(snapshot.Scope.From) || !candidate.Arrival.Before(snapshot.Scope.To) {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		seen[key] = true
+		entry := mediaInventoryEntry{MediaInventoryCandidate: candidate}
+		switch candidate.Kind {
+		case "message":
+			view.message(&entry)
+		case "event":
+			view.event(&entry)
+		case "job":
+			entry.Class, entry.Reason = "coex_other_job_state", "orphan_or_invalid_aggregate"
+			var orphan models.ScheduledJob
+			if view.read("job", candidate.ID, &orphan) {
+				view.recordJobs(&entry, []models.ScheduledJob{orphan})
+				if orphan.Kind == inboundContinuationJobKind {
+					entry.Class = "ordinary_blank_url_unproven_or_conflicting"
+				}
+			}
+		default:
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		if ctx.Err() != nil || view.outputIncomplete {
+			return nil, nil, errors.New("media inventory unavailable")
+		}
+		counts[entry.Class]++
+		reasons[entry.Reason]++
+		if entry.TimeUnknown {
+			unknownIngestion++
+		}
+		entries = append(entries, entry)
+	}
+	slices.SortFunc(entries, func(a, b mediaInventoryEntry) int { return strings.Compare(a.Kind+":"+a.ID, b.Kind+":"+b.ID) })
+	public := struct {
+		Version             int            `json:"version"`
+		Purpose             string         `json:"purpose"`
+		InventoryOnly       bool           `json:"inventory_only"`
+		ApplyAuthorized     bool           `json:"apply_authorized"`
+		CandidateCount      int            `json:"candidate_count"`
+		UnknownIngestion    int            `json:"message_ingestion_unknown_count"`
+		Counts              map[string]int `json:"counts"`
+		Reasons             map[string]int `json:"reasons"`
+		Completeness        string         `json:"completeness"`
+		HistoricalAuthority string         `json:"historical_token_and_cycle_proof"`
+		AttemptTimeline     string         `json:"failure_attempt_timeline"`
+		ObjectExistence     string         `json:"object_existence"`
+	}{1, "media_inventory", true, false, len(entries), unknownIngestion, counts, reasons, "defined_account_arrival_cohort_only",
+		"unknown", "not_retained", "unverified"}
+	private := struct {
+		Version         int                          `json:"version"`
+		SourceVersion   string                       `json:"source_version"`
+		SourceBuildTime string                       `json:"source_build_time"`
+		InventoryOnly   bool                         `json:"inventory_only"`
+		ApplyAuthorized bool                         `json:"apply_authorized"`
+		Scope           database.MediaInventoryScope `json:"scope"`
+		ObservedAt      time.Time                    `json:"observed_at"`
+		Entries         []mediaInventoryEntry        `json:"entries"`
+	}{1, version, buildTime, true, false, snapshot.Scope, snapshot.ObservedAt, entries}
+	if ctx.Err() != nil {
+		return nil, nil, errors.New("media inventory unavailable")
+	}
+	publicJSON, publicErr := json.Marshal(public)
+	privateJSON, privateErr := json.Marshal(private)
+	if publicErr != nil || privateErr != nil || len(publicJSON) > 65536 || len(privateJSON) > 2*1024*1024 || ctx.Err() != nil {
+		return nil, nil, errors.New("media inventory unavailable")
+	}
+	return publicJSON, privateJSON, nil
+}
+
+func (v *mediaInventoryView) read(kind, id string, value any) bool {
+	row, ok := v.rows[kind+":"+id]
+	return v.ctx.Err() == nil && ok && !row.Deleted && json.Unmarshal(row.Data, value) == nil
+}
+
+func (v *mediaInventoryView) accountUsable(coex bool) bool {
+	return !v.rows["account:"+v.account.ID.String()].Deleted && strings.TrimSpace(v.account.Status) == "active" &&
+		(!coex || v.account.IsSMB) && (v.account.AccessTokenExpiresAt == nil || v.account.AccessTokenExpiresAt.After(v.source.ObservedAt))
+}
+
+func (v *mediaInventoryView) jobsFor(kind, id, wamid string) []models.ScheduledJob {
+	result := []models.ScheduledJob{}
+	keys, seen := make(map[string]bool), make(map[uuid.UUID]bool)
+	for _, job := range v.jobs {
+		if v.ctx.Err() != nil {
+			return nil
+		}
+		match := job.AggregateID != nil && job.AggregateID.String() == id
+		match = match || coexistenceMediaPayloadString(job.Payload, "message_id") == id || coexistenceMediaPayloadString(job.Payload, "event_id") == id
+		if wamid != "" {
+			if kind == inboundContinuationJobKind {
+				expectedKey := "inbound-message-continuation:" + uuid.NewSHA1(v.account.ID, []byte(strings.TrimSpace(wamid))).String()
+				match = match || job.IdempotencyKey == expectedKey
+			}
+			match = match || coexistenceMediaPayloadString(job.Payload, "wamid") == wamid
+			if raw, ok := job.Payload["message"].(map[string]any); ok {
+				match = match || raw["id"] == wamid
+			}
+		}
+		if match && (job.Kind == kind || (kind == inboundContinuationJobKind && strings.HasPrefix(job.IdempotencyKey, "inbound-message-continuation:"))) {
+			result = append(result, job)
+			keys[job.IdempotencyKey], seen[job.ID] = true, true
+		}
+	}
+	// The observer closes every observed proof key before classification. A
+	// duplicate that rewrites kind, aggregate and payload still contradicts it.
+	for _, job := range v.jobs {
+		if v.ctx.Err() != nil {
+			return nil
+		}
+		if keys[job.IdempotencyKey] && !seen[job.ID] {
+			result = append(result, job)
+			seen[job.ID] = true
+		}
+	}
+	return result
+}
+
+func (v *mediaInventoryView) recordJobs(entry *mediaInventoryEntry, jobs []models.ScheduledJob) {
+	if len(jobs) > 8*v.source.Scope.Limit+16-v.jobRecords {
+		v.outputIncomplete = true
+		return
+	}
+	v.jobRecords += len(jobs)
+	for _, job := range jobs {
+		if v.ctx.Err() != nil {
+			return
+		}
+		status := string(job.Status)
+		switch status {
+		case "pending", "processing", "completed", "failed", "cancelled":
+		default:
+			status = "unknown"
+		}
+		entry.Jobs = append(entry.Jobs, mediaInventoryJobEntry{job.ID, status, job.Version, job.Attempts, job.MaxAttempts})
+	}
+	slices.SortFunc(entry.Jobs, func(a, b mediaInventoryJobEntry) int { return strings.Compare(a.ID.String(), b.ID.String()) })
+}
+
+func (v *mediaInventoryView) message(entry *mediaInventoryEntry) {
+	entry.Class, entry.Reason = "ordinary_blank_url_unproven_or_conflicting", "missing_deleted_or_unsupported_message"
+	var message models.Message
+	if !v.read("message", entry.ID, &message) || !slices.Contains([]string{"image", "document", "video", "audio", "sticker"}, string(message.MessageType)) {
+		return
+	}
+	entry.TimeUnknown = message.IngestedAt == nil
+	if strings.TrimSpace(message.MediaURL) != "" {
+		entry.Class, entry.Reason = "stored_reference_present_existence_unverified", "no_object_observation"
+		entry.Reference = mediaInventoryReference(v.account.OrganizationID, message.MediaURL)
+		return
+	}
+	for _, row := range v.rows {
+		if v.ctx.Err() != nil {
+			return
+		}
+		if row.Kind == "message" {
+			var other models.Message
+			if json.Unmarshal(row.Data, &other) != nil || (other.WhatsAppMessageID == message.WhatsAppMessageID && other.ID != message.ID) {
+				entry.Reason = "competing_message_owner"
+				return
+			}
+		}
+	}
+	coex := v.jobsFor(coexistenceMediaHydrationJobKind, entry.ID, message.WhatsAppMessageID)
+	if len(coex) > 0 || coexistenceMediaMetadataString(message.Metadata, coexistenceMediaProviderIDMetadataKey) != "" {
+		v.recordJobs(entry, coex)
+		entry.Class, entry.Reason = "coex_other_job_state", "missing_or_ambiguous_jobs"
+		if len(coex) != 1 {
+			return
+		}
+		job := coex[0]
+		mediaID, revision, supported := coexistenceMediaRevision(&message)
+		entry.Revision = revision
+		if !supported || !v.coexJob(job, message.ID, message.WhatsAppMessageID, mediaID, revision, 0) {
+			entry.Reason = "stale_revision_or_invalid_proof"
+			return
+		}
+		entry.Reason = v.coexState(job)
+		if entry.Reason == "failed_exhausted" {
+			entry.Class = "coex_message_failed_exhausted"
+		}
+		return
+	}
+	jobs := v.jobsFor(inboundContinuationJobKind, entry.ID, message.WhatsAppMessageID)
+	v.recordJobs(entry, jobs)
+	entry.Reason = "missing_or_ambiguous_continuation"
+	if len(jobs) != 1 || v.rows["job:"+jobs[0].ID.String()].Deleted {
+		return
+	}
+	inbound, err := validateInboundContinuationJobProof(&jobs[0], &v.account, message.ID, message.WhatsAppMessageID)
+	if v.ctx.Err() != nil {
+		return
+	}
+	mediaID, _ := coexistenceMediaIdentity(inbound)
+	if err != nil || message.Direction != models.DirectionIncoming || inbound.Type != string(message.MessageType) || mediaID == "" {
+		entry.Reason = "invalid_continuation_proof"
+		return
+	}
+	if !v.accountUsable(false) {
+		entry.Reason = "account_unusable"
+		return
+	}
+	for _, key := range []string{incomingIdentityReviewHoldIDKey, incomingIdentityReviewReasonKey, incomingIdentityReviewRouteModeKey, incomingIdentityReviewSelectorDigestKey} {
+		if _, found := message.Metadata[key]; found {
+			entry.Reason = "complex_identity_route_unproven"
+			return
+		}
+	}
+	var contact models.Contact
+	normalizedPhone := normalizeIdentityReviewPhone(inbound.From)
+	if !v.read("contact", message.ContactID.String(), &contact) || contact.MergedIntoID != nil ||
+		normalizedPhone == "" || normalizedPhone != normalizeIdentityReviewPhone(contact.PhoneNumber) ||
+		(strings.TrimSpace(inbound.FromUserID) != "" && strings.TrimSpace(inbound.FromUserID) != contact.BSUID) || strings.TrimSpace(inbound.FromParentUserID) != "" {
+		entry.Reason = "contact_identity_unproven"
+		return
+	}
+	activityKey := "message-incoming:" + uuid.NewSHA1(v.account.ID, []byte(strings.TrimSpace(message.WhatsAppMessageID))).String()
+	for _, row := range v.rows {
+		if v.ctx.Err() != nil {
+			return
+		}
+		switch row.Kind {
+		case "message":
+			var other models.Message
+			if json.Unmarshal(row.Data, &other) != nil || (other.WhatsAppMessageID == message.WhatsAppMessageID && other.ID != message.ID) {
+				entry.Reason = "competing_message_owner"
+				return
+			}
+		case "activity":
+			var activity models.CustomerActivityEvent
+			if json.Unmarshal(row.Data, &activity) != nil {
+				entry.Reason = "conflicting_activity"
+				return
+			}
+			if activity.IdempotencyKey != activityKey && (activity.SourceObjectID == nil || *activity.SourceObjectID != message.ID) {
+				continue
+			}
+			if activity.IdempotencyKey != activityKey || activity.SourceObjectType != "message" || activity.SourceObjectID == nil || *activity.SourceObjectID != message.ID ||
+				activity.EventType != models.CustomerActivityMessageIncoming || activity.Category != models.CustomerActivityCategoryMessage || activity.ContactID != message.ContactID {
+				entry.Reason = "conflicting_activity"
+				return
+			}
+		}
+	}
+	if message.InboxConversationID != nil {
+		var conversation models.InboxConversation
+		var shadow models.ChannelAccount
+		var identity models.ContactIdentity
+		if !v.read("conversation", message.InboxConversationID.String(), &conversation) || conversation.ContactID != contact.ID ||
+			conversation.Channel != models.ChannelWhatsApp || conversation.ContactIdentityID == nil || conversation.ExternalConversationID != "legacy-contact:"+contact.ID.String() ||
+			!v.read("channel", conversation.ChannelAccountID.String(), &shadow) || !v.read("identity", conversation.ContactIdentityID.String(), &identity) {
+			entry.Reason = "projection_unproven"
+			return
+		}
+		bound, err := channelapi.LegacyMetaWhatsAppAccountID(&shadow)
+		if err != nil || bound != v.account.ID || identity.ContactID != contact.ID || identity.ChannelAccountID != shadow.ID ||
+			identity.Channel != models.ChannelWhatsApp || identity.ExternalID != conversation.ExternalConversationID {
+			entry.Reason = "projection_unproven"
+			return
+		}
+	}
+	entry.Class, entry.Reason = "ordinary_blank_url_exact_continuation_proof", "durable_provenance_only"
+}
+
+func (v *mediaInventoryView) coexJob(job models.ScheduledJob, id uuid.UUID, wamid, mediaID, revision string, generation uint64) bool {
+	if v.ctx.Err() != nil {
+		return false
+	}
+	account, err := coexistenceMediaPayloadUUID(job.Payload, "account_id")
+	if err != nil || account != v.account.ID || v.rows["job:"+job.ID.String()].Deleted || validateCoexistenceMediaJobIdentity(&job, v.account.OrganizationID) != nil ||
+		job.AggregateID == nil || *job.AggregateID != id || coexistenceMediaPayloadString(job.Payload, "wamid") != wamid ||
+		coexistenceMediaPayloadString(job.Payload, "phone_number_id") != strings.TrimSpace(v.account.PhoneID) ||
+		coexistenceMediaPayloadString(job.Payload, "media_id") != mediaID || coexistenceMediaPayloadString(job.Payload, "media_revision") != revision {
+		return false
+	}
+	if generation == 0 {
+		return job.AggregateType == coexistenceMediaMessageAggregate
+	}
+	jobGeneration, ok := coexistenceMediaPayloadUint64(job.Payload, "media_generation")
+	return job.AggregateType == coexistenceMediaReviewAggregate && ok && jobGeneration == generation
+}
+
+func (v *mediaInventoryView) coexState(job models.ScheduledJob) string {
+	if cleanup, _ := job.Payload["cleanup_only"].(bool); cleanup {
+		return "cleanup_only"
+	}
+	if !v.accountUsable(true) {
+		return "account_unusable"
+	}
+	max := job.MaxAttempts
+	if max <= 0 {
+		max = defaultCoexistenceMediaMaxAttempts
+	}
+	switch job.Status {
+	case models.ScheduledJobStatusFailed:
+		if job.Attempts >= max {
+			return "failed_exhausted"
+		}
+		return "failed_below_cap"
+	case models.ScheduledJobStatusPending, models.ScheduledJobStatusProcessing:
+		return "work_pending_or_processing"
+	case models.ScheduledJobStatusCompleted, models.ScheduledJobStatusCancelled:
+		return "other_terminal_state"
+	default:
+		return "unknown_job_state"
+	}
+}
+
+func (v *mediaInventoryView) event(entry *mediaInventoryEntry) {
+	entry.Class, entry.Reason = "held_stage_stale_or_unproven", "invalid_or_missing_event"
+	var event models.InboundEvent
+	if !v.read("event", entry.ID, &event) || !event.SignatureValid || event.ReviewHoldID == nil ||
+		event.Status != models.InboundEventStatusPending {
+		return
+	}
+	entry.HoldID = event.ReviewHoldID.String()
+	mediaID, revision, _, generation, supported := coexistenceStagedMediaRevision(&event)
+	if !supported {
+		return
+	}
+	entry.Revision, entry.Generation = revision, generation
+	jobs := v.jobsFor(coexistenceMediaHydrationJobKind, entry.ID, event.ProviderEventID)
+	v.recordJobs(entry, jobs)
+	if len(jobs) != 1 || !v.coexJob(jobs[0], event.ID, event.ProviderEventID, mediaID, revision, generation) || !v.accountUsable(true) {
+		entry.Reason = "staged_job_or_account_unproven"
+		return
+	}
+	if cleanup, _ := jobs[0].Payload["cleanup_only"].(bool); cleanup {
+		entry.Reason = "cleanup_only"
+		return
+	}
+	var hold models.WhatsAppIdentityReviewHold
+	var channel models.ChannelAccount
+	if !v.read("hold", entry.HoldID, &hold) || hold.WhatsAppAccountID != v.account.ID || hold.ProtocolVersion != models.WhatsAppIdentityReviewProtocolVersion ||
+		hold.Disposition != models.WhatsAppIdentityReviewDispositionOpen || hold.OnboardingCycle == 0 || !v.read("channel", event.ChannelAccountID.String(), &channel) {
+		entry.Reason = "hold_or_channel_unproven"
+		return
+	}
+	bound, err := channelapi.LegacyMetaWhatsAppAccountID(&channel)
+	if err != nil || bound != v.account.ID {
+		entry.Reason = "hold_or_channel_unproven"
+		return
+	}
+	states := 0
+	members := []WhatsAppIdentityReviewCandidate{}
+	for _, row := range v.rows {
+		if v.ctx.Err() != nil {
+			return
+		}
+		switch row.Kind {
+		case "event":
+			var other models.InboundEvent
+			if json.Unmarshal(row.Data, &other) != nil || (other.ID != event.ID && other.ChannelAccountID == event.ChannelAccountID && other.ProviderEventID == event.ProviderEventID) {
+				entry.Reason = "competing_staged_event"
+				return
+			}
+		case "state":
+			var state struct {
+				AccountID uuid.UUID `json:"whatsapp_account_id"`
+				Cycle     uint64    `json:"onboarding_cycle"`
+				Lifecycle string    `json:"lifecycle_status"`
+			}
+			if json.Unmarshal(row.Data, &state) != nil || state.AccountID != v.account.ID || state.Cycle != hold.OnboardingCycle || state.Lifecycle != "connected" {
+				entry.Reason = "stale_or_unknown_cycle"
+				return
+			}
+			states++
+		case "member":
+			var member models.WhatsAppIdentityReviewMember
+			if json.Unmarshal(row.Data, &member) != nil {
+				entry.Reason = "hold_members_unproven"
+				return
+			}
+			if member.HoldID == hold.ID {
+				if !member.SelectorReasons.Valid() || member.ContactID == uuid.Nil {
+					entry.Reason = "hold_members_unproven"
+					return
+				}
+				members = append(members, WhatsAppIdentityReviewCandidate{ContactID: member.ContactID, SelectorReasons: member.SelectorReasons})
+			}
+		}
+	}
+	slices.SortFunc(members, func(a, b WhatsAppIdentityReviewCandidate) int {
+		return strings.Compare(a.ContactID.String(), b.ContactID.String())
+	})
+	if states != 1 || uint32(len(members)) != hold.MemberCount || identityReviewMemberDigest(members) != hold.MemberDigest {
+		entry.Reason = "cycle_or_members_unproven"
+		return
+	}
+	entry.Class, entry.Reason = "held_stage_current_generation", "held_copy_only_no_routing_authority"
+	if reference := coexistenceMediaPayloadString(event.Payload, "media_url"); reference != "" {
+		entry.Reference = mediaInventoryReference(v.account.OrganizationID, reference)
+	}
+}
+
+func mediaInventoryReference(org uuid.UUID, reference string) string {
+	if isTenantObjectKey(org, reference) {
+		return "tenant_key_syntax_existence_unverified"
+	}
+	if !strings.ContainsAny(reference, ":\\\x00") && !strings.HasPrefix(reference, "/") && !strings.Contains(reference, "..") &&
+		(strings.HasPrefix(reference, "images/") || strings.HasPrefix(reference, "videos/") || strings.HasPrefix(reference, "audio/") || strings.HasPrefix(reference, "documents/")) {
+		return "legacy_local_syntax_existence_unverified"
+	}
+	return "unsupported_reference_syntax_existence_unverified"
+}
+
 func redactURLForLog(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil {

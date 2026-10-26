@@ -43,6 +43,68 @@ var (
 	BuildTime = "unknown"
 )
 
+func classifyMediaInventory(ctx context.Context, snapshot database.MediaInventorySnapshot) ([]byte, []byte, error) {
+	return handlers.ClassifyMediaInventory(ctx, snapshot, Version, BuildTime)
+}
+
+func mediaInventoryPrivatePathValid(path string) bool {
+	// This owner diagnostic runs in the Linux application image. Do not pretend
+	// Unix mode bits establish a private Windows ACL or accept relative paths.
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") || strings.ContainsAny(path, "\\\x00\r\n") || strings.HasSuffix(path, "/") || len(path) > 4096 {
+		return false
+	}
+	for _, part := range strings.Split(path[1:], "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return strings.LastIndex(path, "/") > 0
+}
+
+func writeMediaInventoryPrivate(ctx context.Context, path string, raw []byte, deadline time.Time) error {
+	if !mediaInventoryPrivatePathValid(path) || len(raw) == 0 || len(raw) > 2*1024*1024 || ctx.Err() != nil || !time.Now().Before(deadline) {
+		return errors.New("private inventory unavailable")
+	}
+	separator := strings.LastIndex(path, "/")
+	parent, name := path[:separator], path[separator+1:]
+	// Refuse symlink ancestors. The final root handle and SameFile check fence
+	// replacement of the validated private directory before exclusive creation.
+	current := ""
+	for _, part := range strings.Split(parent[1:], "/") {
+		current += "/" + part
+		info, err := os.Lstat(current)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("private inventory unavailable")
+		}
+	}
+	info, err := os.Lstat(parent)
+	if err != nil || info.Mode().Perm()&0077 != 0 {
+		return errors.New("private inventory unavailable")
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		return errors.New("private inventory unavailable")
+	}
+	defer root.Close()
+	opened, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, opened) || opened.Mode().Perm()&0077 != 0 {
+		return errors.New("private inventory unavailable")
+	}
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return errors.New("private inventory unavailable")
+	}
+	// An interrupted write is retained as private evidence; never overwrite,
+	// delete or retry it, and never publish a complete public report for it.
+	written, writeErr := file.Write(raw)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || written != len(raw) || syncErr != nil || closeErr != nil || ctx.Err() != nil || !time.Now().Before(deadline) {
+		return errors.New("private inventory unavailable")
+	}
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()

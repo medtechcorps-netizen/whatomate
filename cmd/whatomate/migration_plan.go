@@ -204,6 +204,118 @@ func captureSeedDiagnostic(ctx context.Context, d planDeadline, cfg *pgx.ConnCon
 	return report, nil
 }
 
+func validateMediaInventoryArguments(raw []string, args catalogSnapshotArgs) error {
+	seen := make(map[string]bool)
+	for _, arg := range raw {
+		if !strings.HasPrefix(arg, "-") {
+			continue
+		}
+		key := strings.SplitN(strings.TrimLeft(arg, "-"), "=", 2)[0]
+		if seen[key] {
+			return errors.New("invalid arguments")
+		}
+		seen[key] = true
+	}
+	for _, value := range []string{args.organizationID, args.accountID} {
+		id, err := uuid.Parse(value)
+		if err != nil || id == uuid.Nil || value != id.String() {
+			return errors.New("invalid arguments")
+		}
+	}
+	from, fromErr := time.Parse(time.RFC3339Nano, args.from)
+	to, toErr := time.Parse(time.RFC3339Nano, args.to)
+	if fromErr != nil || toErr != nil || !from.Before(to) || to.Sub(from) > 7*24*time.Hour ||
+		to.After(time.Now()) || args.mediaLimit < 1 || args.mediaLimit > 500 || !mediaInventoryPrivatePathValid(args.privateManifest) {
+		return errors.New("invalid arguments")
+	}
+	return nil
+}
+
+func collectMediaInventory(parent context.Context, cfg config.DatabaseConfig, args catalogSnapshotArgs) ([]byte, error) {
+	if !args.mediaInventory || args.mode != "json" || args.seedCounts || args.seedDiff || args.listUnknown || validateMediaInventoryArguments(nil, args) != nil {
+		return nil, errors.New("media inventory arguments unavailable")
+	}
+	d, ok := newPlanDeadline(parent, time.Now())
+	if !ok {
+		return nil, errors.New("media inventory deadline")
+	}
+	ctx, cancel := context.WithDeadline(parent, d.workAt)
+	defer cancel()
+	dsn, err := catalogRuntimeDSN(cfg)
+	if err != nil {
+		return nil, errors.New("media inventory configuration unavailable")
+	}
+	parsed, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("media inventory configuration unavailable")
+	}
+	observer, err := seedDiagnosticConfig(parsed, d, ctx)
+	if err != nil {
+		return nil, errors.New("media inventory configuration unavailable")
+	}
+	observer.RuntimeParams["application_name"] = database.MediaInventoryApplication
+	from, _ := time.Parse(time.RFC3339Nano, args.from)
+	to, _ := time.Parse(time.RFC3339Nano, args.to)
+	snapshot, err := captureMediaInventory(ctx, d, observer, database.MediaInventoryScope{
+		OrganizationID: args.organizationID, AccountID: args.accountID, From: from.UTC(), To: to.UTC(), Limit: args.mediaLimit,
+	})
+	if err != nil || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, errors.New("media inventory unavailable")
+	}
+	public, private, err := classifyMediaInventory(ctx, snapshot)
+	if err != nil || len(public) > 64*1024 || len(private) > 2*1024*1024 || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, errors.New("media inventory output unavailable")
+	}
+	var completed map[string]any
+	if json.Unmarshal(public, &completed) != nil {
+		return nil, errors.New("media inventory output unavailable")
+	}
+	completed["complete_visibility"] = true
+	completed["session_before_after_match"] = true
+	completed["session_disposed"] = true
+	public, err = json.Marshal(completed)
+	if err != nil || len(public) > 64*1024 {
+		return nil, errors.New("media inventory output unavailable")
+	}
+	// The database session is already rolled back, physically closed and cleaned
+	// up. No public success is emitted unless the private file is durably closed.
+	if err := writeMediaInventoryPrivate(parent, args.privateManifest, private, d.finalAt); err != nil {
+		return nil, errors.New("media inventory output unavailable")
+	}
+	return append(public, '\n'), nil
+}
+
+func captureMediaInventory(ctx context.Context, d planDeadline, cfg *pgx.ConnConfig, scope database.MediaInventoryScope) (snapshot database.MediaInventorySnapshot, err error) {
+	conn, tx, openErr := openPlanSession(ctx, cfg)
+	defer func() {
+		if !disposePlanSession(d, conn, tx, false).complete() {
+			snapshot, err = database.MediaInventorySnapshot{}, errors.New("media inventory cleanup unavailable")
+		}
+	}()
+	if openErr != nil {
+		return snapshot, errors.New("media inventory connection unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return snapshot, errors.New("media inventory session unavailable")
+	}
+	before, err := readPlanSelf(ctx, tx, database.MediaInventoryApplication, cfg.User, false)
+	if err != nil || before.superuser || before.database != cfg.Database {
+		return snapshot, errors.New("media inventory session unavailable")
+	}
+	snapshot, err = database.ObserveMediaInventory(ctx, tx, scope)
+	if err != nil {
+		return database.MediaInventorySnapshot{}, errors.New("media inventory observation unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return database.MediaInventorySnapshot{}, errors.New("media inventory session unavailable")
+	}
+	after, err := readPlanSelf(ctx, tx, database.MediaInventoryApplication, cfg.User, false)
+	if err != nil || !samePlanSelf(before, after) || !d.alive(ctx) {
+		return database.MediaInventorySnapshot{}, errors.New("media inventory session unavailable")
+	}
+	return snapshot, nil
+}
+
 func migrationPlanMarker(id uuid.UUID) string {
 	if id == uuid.Nil || id.Version() != 4 || id.Variant() != uuid.RFC4122 {
 		return ""

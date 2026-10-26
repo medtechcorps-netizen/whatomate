@@ -26,6 +26,12 @@ const catalogSnapshotUsage = `Usage: rereply catalog-snapshot [options]
   -mode string    compare, json, sha256 or nullable-v2-baseline (default "compare")
   -seed-counts    Include global seed counts and key hashes, never seed values
   -seed-diff      Diagnose compiled permission gaps and reseller counts (-mode json only)
+  -media-inventory  Read-only arrival inventory (-mode json only; no recovery)
+  -organization-id  Exact organization UUID (inventory only)
+  -account-id       Exact WhatsApp account UUID (inventory only)
+  -from / -to       RFC3339 arrival window [from,to), at most 7 days
+  -limit            Combined inventory candidates, 1..500 (default 100)
+  -private-manifest New absolute file in a private POSIX directory (inventory only)
   -list-unknown   Show unknown public identifiers for the owner's console only
 
 Uses the runtime database connection in a bounded read-only transaction.
@@ -34,11 +40,14 @@ Keep -list-unknown output private; review identifiers individually before sharin
 `
 
 type catalogSnapshotArgs struct {
-	configPath  string
-	mode        string
-	seedCounts  bool
-	seedDiff    bool
-	listUnknown bool
+	configPath                                           string
+	mode                                                 string
+	seedCounts                                           bool
+	seedDiff                                             bool
+	listUnknown                                          bool
+	mediaInventory                                       bool
+	organizationID, accountID, from, to, privateManifest string
+	mediaLimit                                           int
 }
 
 type catalogSnapshotCollector func(context.Context, config.DatabaseConfig, catalogSnapshotArgs) ([]byte, error)
@@ -53,6 +62,13 @@ func parseCatalogSnapshotArgs(args []string) (catalogSnapshotArgs, error) {
 	flags.BoolVar(&parsed.seedCounts, "seed-counts", false, "global seed counts")
 	flags.BoolVar(&parsed.seedDiff, "seed-diff", false, "bounded public seed diagnosis")
 	flags.BoolVar(&parsed.listUnknown, "list-unknown", false, "owner-only identifiers")
+	flags.BoolVar(&parsed.mediaInventory, "media-inventory", false, "read-only media inventory")
+	flags.StringVar(&parsed.organizationID, "organization-id", "", "exact organization UUID")
+	flags.StringVar(&parsed.accountID, "account-id", "", "exact account UUID")
+	flags.StringVar(&parsed.from, "from", "", "inclusive arrival timestamp")
+	flags.StringVar(&parsed.to, "to", "", "exclusive arrival timestamp")
+	flags.StringVar(&parsed.privateManifest, "private-manifest", "", "exclusive private output path")
+	flags.IntVar(&parsed.mediaLimit, "limit", 100, "combined candidate row bound")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return parsed, flag.ErrHelp
@@ -60,6 +76,20 @@ func parseCatalogSnapshotArgs(args []string) (catalogSnapshotArgs, error) {
 		return parsed, errors.New("invalid arguments")
 	}
 	if parsed.seedDiff && (parsed.mode != "json" || parsed.seedCounts || parsed.listUnknown) {
+		return parsed, errors.New("invalid arguments")
+	}
+	scopeFlag := false
+	flags.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "organization-id", "account-id", "from", "to", "private-manifest", "limit":
+			scopeFlag = true
+		}
+	})
+	if parsed.mediaInventory {
+		if parsed.mode != "json" || parsed.seedDiff || parsed.seedCounts || parsed.listUnknown || validateMediaInventoryArguments(args, parsed) != nil {
+			return parsed, errors.New("invalid arguments")
+		}
+	} else if scopeFlag {
 		return parsed, errors.New("invalid arguments")
 	}
 	if flags.NArg() != 0 || (parsed.mode != "compare" && parsed.mode != "json" && parsed.mode != "sha256") {
@@ -138,6 +168,9 @@ func catalogRuntimeDSN(cfg config.DatabaseConfig) (string, error) {
 }
 
 func collectCatalogSnapshot(ctx context.Context, cfg config.DatabaseConfig, args catalogSnapshotArgs) ([]byte, error) {
+	if args.mediaInventory {
+		return collectMediaInventory(ctx, cfg, args)
+	}
 	if args.seedDiff {
 		if args.mode != "json" || args.seedCounts || args.listUnknown {
 			return nil, errors.New("invalid arguments")
