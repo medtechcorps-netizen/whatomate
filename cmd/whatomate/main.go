@@ -61,7 +61,7 @@ func mediaInventoryPrivatePathValid(path string) bool {
 	return strings.LastIndex(path, "/") > 0
 }
 
-func writeMediaInventoryPrivate(ctx context.Context, path string, raw []byte, deadline time.Time) error {
+func writeMediaInventoryPrivate(ctx context.Context, path string, raw []byte, deadline time.Time) (resultErr error) {
 	if !mediaInventoryPrivatePathValid(path) || len(raw) == 0 || len(raw) > 2*1024*1024 || ctx.Err() != nil || !time.Now().Before(deadline) {
 		return errors.New("private inventory unavailable")
 	}
@@ -85,7 +85,12 @@ func writeMediaInventoryPrivate(ctx context.Context, path string, raw []byte, de
 	if err != nil {
 		return errors.New("private inventory unavailable")
 	}
-	defer root.Close()
+	defer func() {
+		closeErr := root.Close()
+		if closeErr != nil || ctx.Err() != nil || !time.Now().Before(deadline) {
+			resultErr = errors.New("private inventory unavailable")
+		}
+	}()
 	opened, err := root.Stat(".")
 	if err != nil || !os.SameFile(info, opened) || opened.Mode().Perm()&0077 != 0 {
 		return errors.New("private inventory unavailable")
