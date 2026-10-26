@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -114,7 +115,7 @@ func (a *App) issueLoginSession(r *fastglue.Request, user *models.User) error {
 	refreshToken, err := a.generateRefreshToken(user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		return sendRefreshTokenIssueError(r, err)
 	}
 
 	a.setAuthCookies(r, accessToken, refreshToken)
@@ -200,7 +201,7 @@ func (a *App) Register(r *fastglue.Request) error {
 		refreshToken, err := a.generateRefreshToken(&existingUser)
 		if err != nil {
 			a.Log.Error("Failed to generate refresh token", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+			return sendRefreshTokenIssueError(r, err)
 		}
 
 		a.setAuthCookies(r, accessToken, refreshToken)
@@ -271,7 +272,7 @@ func (a *App) Register(r *fastglue.Request) error {
 	refreshToken, err := a.generateRefreshToken(&user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		return sendRefreshTokenIssueError(r, err)
 	}
 
 	a.setAuthCookies(r, accessToken, refreshToken)
@@ -753,7 +754,22 @@ func (a *App) generateAccessToken(user *models.User) (string, error) {
 	return token.SignedString([]byte(a.Config.JWT.Secret))
 }
 
+var errRefreshTokenStoreUnavailable = errors.New("refresh token store unavailable")
+
+func sendRefreshTokenIssueError(r *fastglue.Request, err error) error {
+	if errors.Is(err, errRefreshTokenStoreUnavailable) {
+		// Registration may already have saved the account and membership, and
+		// an SSO exchange has consumed its one-time grant. Start a new sign-in;
+		// do not report success or clear any session the browser already holds.
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Sign-in is temporarily unavailable, please try signing in again", nil, "")
+	}
+	return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+}
+
 func (a *App) generateRefreshToken(user *models.User) (string, error) {
+	if a.Redis == nil {
+		return "", errRefreshTokenStoreUnavailable
+	}
 	jti := uuid.New().String()
 	expiry := time.Duration(a.Config.JWT.RefreshExpiryDays) * 24 * time.Hour
 
@@ -782,7 +798,7 @@ func (a *App) generateRefreshToken(user *models.User) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := a.Redis.Set(ctx, refreshTokenKey(jti), user.ID.String(), expiry).Err(); err != nil {
-		a.Log.Error("Failed to store refresh token in Redis", "error", err)
+		return "", fmt.Errorf("%w: %w", errRefreshTokenStoreUnavailable, err)
 	}
 
 	return signed, nil
@@ -864,7 +880,7 @@ func (a *App) SwitchOrg(r *fastglue.Request) error {
 	refreshToken, err := a.generateRefreshToken(&user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		return sendRefreshTokenIssueError(r, err)
 	}
 
 	a.setAuthCookies(r, accessToken, refreshToken)
