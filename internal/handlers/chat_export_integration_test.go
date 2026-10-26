@@ -241,11 +241,20 @@ func TestChatExportPostgresBridgeDedupAndMismatchExclusion(t *testing.T) {
 	wrongConversation := f.conversation(t, wrongContact, "meta_legacy")
 	mismatch := f.message(t, f.contact, f.account.Name, at)
 	require.NoError(t, f.app.DB.Model(&mismatch).Update("inbox_conversation_id", wrongConversation.ID).Error)
-	foreignOrg := testutil.CreateTestOrganization(t, f.app.DB)
-	foreignContact := testutil.CreateTestContact(t, f.app.DB, foreignOrg.ID)
-	foreignConversation := f.conversation(t, foreignContact, "meta_legacy")
-	foreignLink := f.message(t, f.contact, f.account.Name, at)
+	// Incoming cross-organization links are rejected by the ingestion trigger.
+	// Keep the foreign bridge valid so tenant exclusion is tested against a
+	// persisted row rather than bypassing that database invariant.
+	foreign := newChatExportFixture(t)
+	foreignConversation := foreign.conversation(t, foreign.contact, "meta_legacy")
+	foreignLink := foreign.message(t, foreign.contact, foreign.account.Name, at)
 	require.NoError(t, f.app.DB.Model(&foreignLink).Update("inbox_conversation_id", foreignConversation.ID).Error)
+	// A rejected cross-org relink must also leave the valid local bridge intact.
+	err := f.app.DB.Model(&legacy).Update("inbox_conversation_id", foreignConversation.ID).Error
+	require.ErrorContains(t, err, "SQLSTATE 23503")
+	var persistedLegacy models.Message
+	require.NoError(t, f.app.DB.First(&persistedLegacy, "id = ?", legacy.ID).Error)
+	require.NotNil(t, persistedLegacy.InboxConversationID)
+	require.Equal(t, bridge.ID, *persistedLegacy.InboxConversationID)
 	wrongAccount := testutil.CreateTestWhatsAppAccount(t, f.app.DB, f.org.ID)
 	wrongAccountLink := f.message(t, f.contact, wrongAccount.Name, at)
 	require.NoError(t, f.app.DB.Model(&wrongAccountLink).Update("inbox_conversation_id", bridge.ID).Error)
