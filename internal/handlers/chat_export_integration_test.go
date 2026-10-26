@@ -210,7 +210,7 @@ func TestChatExportPostgresFreshRevocationBeforeResponse(t *testing.T) {
 
 func (f chatExportFixture) conversation(t *testing.T, contact *models.Contact, provider string) models.InboxConversation {
 	t.Helper()
-	account := models.ChannelAccount{OrganizationID: contact.OrganizationID, Channel: models.ChannelWhatsApp, Provider: provider, Name: "Synthetic inbox", ExternalAccountID: uuid.NewString(), Status: models.ChannelAccountStatusActive}
+	account := models.ChannelAccount{OrganizationID: contact.OrganizationID, Channel: models.ChannelWhatsApp, Provider: provider, Name: "Synthetic inbox " + uuid.NewString(), ExternalAccountID: uuid.NewString(), Status: models.ChannelAccountStatusActive}
 	if provider == "meta_legacy" {
 		legacy := f.account
 		if contact.OrganizationID != f.org.ID {
