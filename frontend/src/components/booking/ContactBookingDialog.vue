@@ -359,7 +359,7 @@ watch(
                 v-model="resourceFilter"
                 class="h-11 w-full rounded-lg border border-white/10 bg-[#111416] px-3 text-sm text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia-300 light:border-gray-200 light:bg-white light:text-gray-900"
               >
-                <option value="">All practitioners and resources</option>
+                <option value="">All people and resources</option>
                 <option v-for="resource in resourceOptions" :key="resource.id" :value="resource.id">
                   {{ resource.name }}{{ resource.kind ? ` · ${resource.kind}` : '' }}
                 </option>
@@ -418,7 +418,7 @@ watch(
             <CalendarClock class="h-7 w-7 text-white/25 light:text-gray-400" />
             <h3 class="mt-3 text-sm font-semibold">No available appointments</h3>
             <p class="mt-1 max-w-sm text-xs leading-5 text-white/40 light:text-gray-500">
-              {{ validSlots.length ? 'No times match these filters. Try another service or practitioner.' : 'There are no active future schedules with capacity in the next 30 days.' }}
+              {{ validSlots.length ? 'No times match these filters. Try another service or person.' : 'There are no active future schedules with capacity in the next 30 days.' }}
             </p>
             <Button v-if="validSlots.length" type="button" variant="outline" class="mt-4 h-11" @click="serviceFilter = ''; resourceFilter = ''">
               Clear filters

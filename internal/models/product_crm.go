@@ -152,6 +152,7 @@ type BookingResourceKind string
 const (
 	BookingResourceKindPractitioner BookingResourceKind = "practitioner"
 	BookingResourceKindInstructor   BookingResourceKind = "instructor"
+	BookingResourceKindStaff        BookingResourceKind = "staff"
 	BookingResourceKindRoom         BookingResourceKind = "room"
 	BookingResourceKindEquipment    BookingResourceKind = "equipment"
 )

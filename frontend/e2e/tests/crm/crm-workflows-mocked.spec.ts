@@ -745,7 +745,7 @@ test('booking setup persists recurring availability and timezone-safe time off',
   })
 
   await page.goto('/calendar')
-  await page.getByRole('button', { name: 'Service setup' }).click()
+  await page.getByRole('button', { name: 'Advanced setup' }).click()
   const manager = page.getByTestId('booking-availability-manager')
   await expect(manager).toBeVisible()
   await expect(manager).toContainText('Scheduled events must fit an active weekly window')
@@ -986,8 +986,93 @@ test('Booking read-only role has no catalogue mutation controls', async ({ page 
   await installBookingLifecycle(page, ['read'])
   await page.goto('/calendar')
   await expect(page.getByRole('complementary', { name: 'Services and resources' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Service setup', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Advanced setup', exact: true })).toHaveCount(0)
   await expect(
     page.getByRole('button', { name: /^(Edit|Delete|Reactivate|Deactivate) (service|resource) / }),
   ).toHaveCount(0)
 })
+
+
+for (const width of [390, 1280]) {
+  test('Person-first scheduling works from an empty catalogue at ' + width + 'px', async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 900 })
+    await installBaseMocks(page)
+    const resources: Record<string, unknown>[] = []
+    const services: Record<string, unknown>[] = []
+    const createdPersonId = '3ccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const createdServiceId = '3ddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    let eventBody: Record<string, unknown> | undefined
+    let createdEvent: Record<string, unknown> | undefined
+    const organizations: Array<string | undefined> = []
+    await page.route(/\/api\/booking\/resources(?:\?.*)?$/, async route => {
+      if (route.request().method() === 'POST') {
+        organizations.push(route.request().headers()['x-organization-id'])
+        const resource = { ...route.request().postDataJSON(), id: createdPersonId, version: 1 }
+        resources.push(resource)
+        await route.fulfill({ json: { data: resource } })
+      } else {
+        await route.fulfill({ json: { data: { resources, total: resources.length } } })
+      }
+    })
+    await page.route(/\/api\/booking\/services(?:\?.*)?$/, async route => {
+      if (route.request().method() === 'POST') {
+        organizations.push(route.request().headers()['x-organization-id'])
+        const service = { ...route.request().postDataJSON(), id: createdServiceId, version: 1 }
+        services.push(service)
+        await route.fulfill({ json: { data: service } })
+      } else {
+        await route.fulfill({ json: { data: { services, total: services.length } } })
+      }
+    })
+    await page.route(/\/api\/booking\/events(?:\?.*)?$/, async route => {
+      if (route.request().method() === 'POST') {
+        organizations.push(route.request().headers()['x-organization-id'])
+        eventBody = route.request().postDataJSON()
+        createdEvent = { ...eventBody, id: 'event-created', version: 1,
+          starts_at: new Date(String(eventBody!.local_starts_at) + ':00+08:00').toISOString(),
+          ends_at: new Date(String(eventBody!.local_ends_at) + ':00+08:00').toISOString(),
+          resource: resources[0], service: services[0], booked_quantity: 0 }
+        await route.fulfill({ json: { data: createdEvent } })
+      } else {
+        const query = new URL(route.request().url()).searchParams
+        const start = Date.parse(String(createdEvent?.starts_at))
+        const listed = createdEvent && Date.parse(query.get('from') || '') <= start && start <= Date.parse(query.get('to') || '') ? [createdEvent] : []
+        await route.fulfill({ json: { data: { events: listed, total: listed.length } } })
+      }
+    })
+    await page.goto('/calendar')
+    await page.getByRole('button', { name: 'Add schedule', exact: true }).click()
+    const composer = page.getByRole('region', { name: 'People and scheduling' })
+    const person = composer.getByRole('form', { name: 'Add person' })
+    await person.getByLabel('Name', { exact: true }).fill('Aina Hassan')
+    await person.getByRole('combobox', { name: 'Role', exact: true }).selectOption('staff')
+    await person.getByText('Optional details').click()
+    await person.getByLabel('Timezone', { exact: true }).fill('Asia/Kuala_Lumpur')
+    await person.getByRole('button', { name: 'Add person', exact: true }).click()
+    const offering = composer.getByRole('form', { name: 'Add service for person' })
+    await offering.getByLabel('Service name', { exact: true }).fill('New patient appointment')
+    await offering.getByLabel('Duration (minutes)', { exact: true }).fill('45')
+    await offering.getByLabel('Capacity', { exact: true }).fill('3')
+    await offering.getByRole('button', { name: 'Add service', exact: true }).click()
+    const schedule = composer.getByRole('form', { name: 'Schedule details' })
+    await schedule.getByLabel('Date', { exact: true }).fill('2026-11-02')
+    await schedule.getByLabel('Start time', { exact: true }).fill('09:15')
+    await expect(schedule.getByLabel('Capacity', { exact: true })).toHaveValue('3')
+    await expect(page.getByRole('form', { name: 'Service details', exact: true })).toHaveCount(0)
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+    await page.screenshot({ path: testInfo.outputPath('people-scheduling.png'), fullPage: true })
+    await composer.getByRole('heading', { name: 'Who is this schedule for?', exact: true }).scrollIntoViewIfNeeded()
+    await page.screenshot({ path: testInfo.outputPath('people-scheduling-top.png'), fullPage: true })
+    await schedule.getByRole('button', { name: 'Save schedule', exact: true }).click()
+    await expect(composer).toBeHidden()
+    await expect(page.getByTestId('calendar-event-card')).toContainText('New patient appointment')
+    await expect(page.getByText('2 Nov – 8 Nov 2026', { exact: true })).toBeVisible()
+    await page.screenshot({ path: testInfo.outputPath('people-schedule-saved.png'), fullPage: true })
+    expect(resources).toHaveLength(1)
+    expect(resources[0]).toMatchObject({ name: 'Aina Hassan', kind: 'staff' })
+    expect(services[0]).toMatchObject({ resource_ids: [createdPersonId] })
+    expect(eventBody).toMatchObject({ resource_id: createdPersonId, service_id: createdServiceId,
+      local_starts_at: '2026-11-02T09:15', local_ends_at: '2026-11-02T10:00', timezone: 'Asia/Kuala_Lumpur', capacity: 3 })
+    expect(organizations).toEqual([organizationId, organizationId, organizationId])
+  })
+}

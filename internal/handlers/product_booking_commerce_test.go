@@ -794,6 +794,22 @@ func assertBookingLifecycleDeleted(t *testing.T, db *gorm.DB, orgID, id uuid.UUI
 	require.Len(t, logs, 1)
 }
 
+func TestBookingStaffResourceValidation(t *testing.T) {
+	t.Parallel()
+	resource := BookingResourceRequest{
+		Name: "Reception team", Kind: models.BookingResourceKindStaff,
+		Timezone: "Asia/Kuala_Lumpur",
+	}
+	require.NoError(t, validateBookingResourceRequest(&resource, false))
+	resource.Version = 2
+	require.NoError(t, validateBookingResourceRequest(&resource, true))
+	resource.Kind = models.BookingResourceKind("unknown")
+	require.EqualError(t, validateBookingResourceRequest(&resource, false), "invalid booking resource kind")
+	resource.Kind = models.BookingResourceKindStaff
+	resource.Timezone = "Not/A_Timezone"
+	require.EqualError(t, validateBookingResourceRequest(&resource, false), "timezone must be a valid IANA timezone")
+}
+
 func TestBookingCommerceValidation(t *testing.T) {
 	t.Parallel()
 

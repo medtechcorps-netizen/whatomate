@@ -3254,6 +3254,7 @@ func validBookingResourceKind(value models.BookingResourceKind) bool {
 	switch value {
 	case models.BookingResourceKindPractitioner,
 		models.BookingResourceKindInstructor,
+		models.BookingResourceKindStaff,
 		models.BookingResourceKindRoom,
 		models.BookingResourceKindEquipment:
 		return true
