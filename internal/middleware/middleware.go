@@ -251,15 +251,10 @@ func setClaimsContext(r *fastglue.Request, claims *JWTClaims) {
 	r.RequestCtx.SetUserValue(ContextKeyIsSuperAdmin, claims.IsSuperAdmin)
 }
 
-// setAuthenticatedContext loads the current user and organization membership
+// setAuthenticatedContextChecked loads the current user and organization membership
 // from the database. JWT and API-key claims identify the principal, but the
 // database remains authoritative for active status, tenant membership, role,
 // and super-admin status.
-func setAuthenticatedContext(r *fastglue.Request, db *gorm.DB, userID, orgID uuid.UUID) bool {
-	valid, err := setAuthenticatedContextChecked(r, db, userID, orgID)
-	return err == nil && valid
-}
-
 func setAuthenticatedContextChecked(r *fastglue.Request, db *gorm.DB, userID, orgID uuid.UUID) (bool, error) {
 	if db == nil {
 		return false, gorm.ErrInvalidDB
@@ -340,12 +335,7 @@ func setAuthenticatedContextChecked(r *fastglue.Request, db *gorm.DB, userID, or
 	return true, nil
 }
 
-// validateAPIKey validates an API key and sets context values
-func validateAPIKey(r *fastglue.Request, key string, db *gorm.DB) bool {
-	valid, err := validateAPIKeyChecked(r, key, db)
-	return err == nil && valid
-}
-
+// validateAPIKeyChecked validates an API key and sets context values.
 func validateAPIKeyChecked(r *fastglue.Request, key string, db *gorm.DB) (bool, error) {
 	// API key format: whm_<32 hex chars>
 	if len(key) != 36 || key[:4] != "whm_" {
