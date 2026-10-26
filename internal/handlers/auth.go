@@ -55,7 +55,7 @@ func (a *App) Login(r *fastglue.Request) error {
 	if err := a.DB.Preload("Role").Where("email = ?", req.Email).First(&user).Error; err != nil {
 		// Run dummy bcrypt to prevent timing-based account enumeration
 		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), []byte(req.Password))
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Invalid credentials", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Invalid credentials")
 	}
 
 	// Check if user is active
@@ -81,27 +81,28 @@ func (a *App) issueLoginSession(r *fastglue.Request, user *models.User) error {
 	// organization is no longer available, login may fall back to another
 	// active membership.
 	if err := a.applyOrganizationMembership(user, user.OrganizationID, true); err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "No active organization membership", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "No active organization membership")
 	}
 
 	// Load permissions for the role that belongs to the selected organization.
 	if user.Role != nil && user.RoleID != nil {
 		cachedPerms, err := a.GetRolePermissionsCached(*user.RoleID)
-		if err == nil {
-			permissions := make([]models.Permission, 0, len(cachedPerms))
-			for _, p := range cachedPerms {
-				for i := len(p) - 1; i >= 0; i-- {
-					if p[i] == ':' {
-						permissions = append(permissions, models.Permission{
-							Resource: p[:i],
-							Action:   p[i+1:],
-						})
-						break
-					}
+		if err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Role is no longer available")
+		}
+		permissions := make([]models.Permission, 0, len(cachedPerms))
+		for _, p := range cachedPerms {
+			for i := len(p) - 1; i >= 0; i-- {
+				if p[i] == ':' {
+					permissions = append(permissions, models.Permission{
+						Resource: p[:i],
+						Action:   p[i+1:],
+					})
+					break
 				}
 			}
-			user.Role.Permissions = permissions
 		}
+		user.Role.Permissions = permissions
 	}
 
 	// Generate tokens
@@ -114,10 +115,10 @@ func (a *App) issueLoginSession(r *fastglue.Request, user *models.User) error {
 	refreshToken, err := a.generateRefreshToken(user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		return sendRefreshTokenIssueError(r, refreshToken)
 	}
 
-	a.setAuthCookies(r, accessToken, refreshToken)
+	a.setAuthCookies(r, accessToken, refreshToken.token)
 
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -200,10 +201,10 @@ func (a *App) Register(r *fastglue.Request) error {
 		refreshToken, err := a.generateRefreshToken(&existingUser)
 		if err != nil {
 			a.Log.Error("Failed to generate refresh token", "error", err)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+			return sendRefreshTokenIssueError(r, refreshToken)
 		}
 
-		a.setAuthCookies(r, accessToken, refreshToken)
+		a.setAuthCookies(r, accessToken, refreshToken.token)
 
 		return r.SendEnvelope(CookieAuthResponse{
 			ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -271,10 +272,10 @@ func (a *App) Register(r *fastglue.Request) error {
 	refreshToken, err := a.generateRefreshToken(&user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		return sendRefreshTokenIssueError(r, refreshToken)
 	}
 
-	a.setAuthCookies(r, accessToken, refreshToken)
+	a.setAuthCookies(r, accessToken, refreshToken.token)
 
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -425,32 +426,12 @@ func (a *App) RefreshToken(r *fastglue.Request) error {
 		return reject(fasthttp.StatusUnauthorized, "Account is disabled", "account_disabled", claims.UserID)
 	}
 
-	if err := a.applyOrganizationMembership(&user, claims.OrganizationID, false); err != nil {
-		if err == gorm.ErrRecordNotFound {
-			// The reseller-membership check reports a database error as "not
-			// a member". Only conclude the membership is gone while the
-			// database answers, and after a second look.
-			if a.DB.WithContext(ctx).Exec("SELECT 1").Error != nil {
-				return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
-			}
-			err = a.applyOrganizationMembership(&user, claims.OrganizationID, false)
-		}
-		// Permanent organization states end the session like a removed
-		// membership; only other (database) errors are worth retrying.
-		// The compliance-marker cases have no refresh unit test: their
-		// fixture is internal to package handlers, while the refresh tests
-		// are in handlers_test. They are checked at the gate.
-		permanent := err == gorm.ErrRecordNotFound ||
-			err == database.ErrPlatformComplianceTenant ||
-			err == database.ErrPlatformComplianceMarkerInvalid ||
-			err == database.ErrMissingTenant
-		if err != nil && !permanent {
+	if err := a.applyOrganizationMembershipDB(a.DB.WithContext(ctx), &user, claims.OrganizationID, false); err != nil {
+		if !organizationAccessDenied(err) {
 			return reject(fasthttp.StatusServiceUnavailable, "Session check unavailable", "membership_lookup_failed", claims.UserID)
 		}
-		if err != nil {
-			consume()
-			return reject(fasthttp.StatusUnauthorized, "Organization access is no longer available", "membership_revoked", claims.UserID)
-		}
+		consume()
+		return reject(fasthttp.StatusUnauthorized, "Organization access is no longer available", "membership_revoked", claims.UserID)
 	}
 
 	// Mint and register the successor before the old token is consumed. It
@@ -670,7 +651,10 @@ func (a *App) ssoOrganizationMember(user *models.User, orgID uuid.UUID) (bool, e
 		return false, nil
 	}
 	// As for a login, a super admin's membership counts whatever its source.
-	return user.IsSuperAdmin || access.ResellerDerivedMembershipActive(a.DB, &memberships[0]), nil
+	if user.IsSuperAdmin {
+		return true, nil
+	}
+	return access.ResellerDerivedMembershipActiveChecked(a.DB, &memberships[0])
 }
 
 // applyOrganizationMembership updates a user with the current organization and
@@ -678,20 +662,39 @@ func (a *App) ssoOrganizationMember(user *models.User, orgID uuid.UUID) (bool, e
 // active membership; refresh and organization switching must honor the exact
 // organization already selected.
 func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, allowFallback bool) error {
+	return a.applyOrganizationMembershipDB(a.DB, user, orgID, allowFallback)
+}
+
+// applyOrganizationMembershipDB preserves a caller's bound database context
+// through every authority lookup, including reseller and role queries.
+func (a *App) applyOrganizationMembershipDB(db *gorm.DB, user *models.User, orgID uuid.UUID, allowFallback bool) error {
 	var membership models.UserOrganization
-	membershipErr := a.DB.Where("user_id = ? AND organization_id = ?", user.ID, orgID).First(&membership).Error
-	if !user.IsSuperAdmin && membershipErr == nil && !access.ResellerDerivedMembershipActive(a.DB, &membership) {
-		membershipErr = gorm.ErrRecordNotFound
+	membershipErr := db.Where("user_id = ? AND organization_id = ?", user.ID, orgID).First(&membership).Error
+	if membershipErr != nil && membershipErr != gorm.ErrRecordNotFound {
+		return membershipErr
+	}
+	if !user.IsSuperAdmin && membershipErr == nil {
+		active, err := access.ResellerDerivedMembershipActiveChecked(db, &membership)
+		if err != nil {
+			return err
+		}
+		if !active {
+			membershipErr = gorm.ErrRecordNotFound
+		}
 	}
 	if membershipErr != nil && allowFallback && !user.IsSuperAdmin {
 		var memberships []models.UserOrganization
-		if err := a.DB.Where("user_id = ?", user.ID).
+		if err := db.Where("user_id = ?", user.ID).
 			Order("is_default DESC, created_at ASC").
 			Find(&memberships).Error; err != nil {
 			return err
 		}
 		for index := range memberships {
-			if access.ResellerDerivedMembershipActive(a.DB, &memberships[index]) {
+			active, err := access.ResellerDerivedMembershipActiveChecked(db, &memberships[index])
+			if err != nil {
+				return err
+			}
+			if active {
 				membership = memberships[index]
 				orgID = membership.OrganizationID
 				membershipErr = nil
@@ -704,7 +707,7 @@ func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, al
 		return membershipErr
 	}
 
-	compliance, err := database.IsPlatformComplianceOrganization(a.DB, orgID)
+	compliance, err := database.IsPlatformComplianceOrganization(db, orgID)
 	if err != nil {
 		return err
 	}
@@ -712,24 +715,32 @@ func (a *App) applyOrganizationMembership(user *models.User, orgID uuid.UUID, al
 		return database.ErrPlatformComplianceTenant
 	}
 
-	user.OrganizationID = orgID
-	user.IsResellerAdmin = access.IsResellerAdmin(a.DB, user.ID)
+	isResellerAdmin, err := access.IsResellerAdminChecked(db, user.ID)
+	if err != nil {
+		return err
+	}
+	roleID := user.RoleID
 	if membershipErr == nil {
-		user.RoleID = membership.RoleID
+		roleID = membership.RoleID
 	}
 
-	user.Role = nil
-	if user.RoleID != nil {
+	var selectedRole *models.CustomRole
+	if roleID != nil {
 		var role models.CustomRole
-		roleQuery := a.DB.Where("id = ?", *user.RoleID)
+		roleQuery := db.Where("id = ?", *roleID)
 		if !user.IsSuperAdmin || membershipErr == nil {
 			roleQuery = roleQuery.Where("organization_id = ?", orgID)
 		}
 		if err := roleQuery.First(&role).Error; err != nil {
 			return err
 		}
-		user.Role = &role
+		selectedRole = &role
 	}
+	// Do not publish a partially resolved identity on lookup failure.
+	user.OrganizationID = orgID
+	user.IsResellerAdmin = isResellerAdmin
+	user.RoleID = roleID
+	user.Role = selectedRole
 
 	return nil
 }
@@ -753,7 +764,28 @@ func (a *App) generateAccessToken(user *models.User) (string, error) {
 	return token.SignedString([]byte(a.Config.JWT.Secret))
 }
 
-func (a *App) generateRefreshToken(user *models.User) (string, error) {
+// refreshTokenIssueResult is an internal issuance outcome, never a response payload.
+// The storage classification is separate from the wrapped error cause and adds
+// no eagerly initialized sentinel or error-interface implementation.
+type refreshTokenIssueResult struct {
+	token            string
+	storeUnavailable bool
+}
+
+func sendRefreshTokenIssueError(r *fastglue.Request, issue refreshTokenIssueResult) error {
+	if issue.storeUnavailable {
+		// Registration may already have saved the account and membership, and
+		// an SSO exchange has consumed its one-time grant. Start a new sign-in;
+		// do not report success or clear any session the browser already holds.
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Sign-in is temporarily unavailable, please try signing in again", nil, "")
+	}
+	return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+}
+
+func (a *App) generateRefreshToken(user *models.User) (refreshTokenIssueResult, error) {
+	if a.Redis == nil {
+		return refreshTokenIssueResult{storeUnavailable: true}, fmt.Errorf("refresh token store unavailable")
+	}
 	jti := uuid.New().String()
 	expiry := time.Duration(a.Config.JWT.RefreshExpiryDays) * 24 * time.Hour
 
@@ -775,17 +807,21 @@ func (a *App) generateRefreshToken(user *models.User) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString([]byte(a.Config.JWT.Secret))
 	if err != nil {
-		return "", err
+		return refreshTokenIssueResult{}, err
+	}
+
+	if signed == "" {
+		return refreshTokenIssueResult{}, fmt.Errorf("refresh token signing returned an empty credential")
 	}
 
 	// Store JTI in Redis so it can be revoked
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := a.Redis.Set(ctx, refreshTokenKey(jti), user.ID.String(), expiry).Err(); err != nil {
-		a.Log.Error("Failed to store refresh token in Redis", "error", err)
+		return refreshTokenIssueResult{storeUnavailable: true}, fmt.Errorf("refresh token store unavailable: %w", err)
 	}
 
-	return signed, nil
+	return refreshTokenIssueResult{token: signed}, nil
 }
 
 // refreshTokenKey returns the Redis key for a refresh token JTI.
@@ -817,41 +853,38 @@ func (a *App) SwitchOrg(r *fastglue.Request) error {
 	// Verify the organization exists
 	var org models.Organization
 	if err := a.DB.Where("id = ?", req.OrganizationID).First(&org).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Organization not found", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusNotFound, "Organization not found")
 	}
 
 	// Get the user
 	var user models.User
 	if err := a.DB.Where("id = ?", userID).First(&user).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "User not found", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusNotFound, "User not found")
 	}
 
 	// Resolve the target membership from the database. Reseller-derived
 	// memberships must still be backed by an active reseller assignment.
 	if err := a.applyOrganizationMembership(&user, req.OrganizationID, false); err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You are not a member of this organization", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "You are not a member of this organization")
 	}
 
 	// Preload role with permissions for the response
-	if user.RoleID != nil {
-		var role models.CustomRole
-		if err := a.DB.Where("id = ?", *user.RoleID).First(&role).Error; err == nil {
-			user.Role = &role
-			cachedPerms, err := a.GetRolePermissionsCached(*user.RoleID)
-			if err == nil {
-				permissions := make([]models.Permission, 0, len(cachedPerms))
-				for _, p := range cachedPerms {
-					parts := splitPermission(p)
-					if len(parts) == 2 {
-						permissions = append(permissions, models.Permission{
-							Resource: parts[0],
-							Action:   parts[1],
-						})
-					}
-				}
-				user.Role.Permissions = permissions
+	if user.Role != nil && user.RoleID != nil {
+		cachedPerms, err := a.GetRolePermissionsCached(*user.RoleID)
+		if err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Role is no longer available")
+		}
+		permissions := make([]models.Permission, 0, len(cachedPerms))
+		for _, p := range cachedPerms {
+			parts := splitPermission(p)
+			if len(parts) == 2 {
+				permissions = append(permissions, models.Permission{
+					Resource: parts[0],
+					Action:   parts[1],
+				})
 			}
 		}
+		user.Role.Permissions = permissions
 	}
 
 	// Generate new tokens with the target org
@@ -864,10 +897,10 @@ func (a *App) SwitchOrg(r *fastglue.Request) error {
 	refreshToken, err := a.generateRefreshToken(&user)
 	if err != nil {
 		a.Log.Error("Failed to generate refresh token", "error", err)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to generate token", nil, "")
+		return sendRefreshTokenIssueError(r, refreshToken)
 	}
 
-	a.setAuthCookies(r, accessToken, refreshToken)
+	a.setAuthCookies(r, accessToken, refreshToken.token)
 
 	return r.SendEnvelope(CookieAuthResponse{
 		ExpiresIn: a.Config.JWT.AccessExpiryMins * 60,
@@ -957,11 +990,14 @@ func (a *App) GetWSToken(r *fastglue.Request) error {
 	// request context identifies the candidate only; current database state is
 	// authoritative for active status, membership, and purpose classification.
 	var user models.User
-	if err := a.DB.Where("id = ?", userID).First(&user).Error; err != nil || !user.IsActive {
+	if err := a.DB.Where("id = ?", userID).First(&user).Error; err != nil {
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Unauthorized")
+	}
+	if !user.IsActive {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
 	if err := a.applyOrganizationMembership(&user, orgID, false); err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Organization access is no longer available", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Organization access is no longer available")
 	}
 
 	claims := middleware.JWTClaims{
@@ -983,4 +1019,38 @@ func (a *App) GetWSToken(r *fastglue.Request) error {
 	}
 
 	return r.SendEnvelope(map[string]string{"token": signed})
+}
+
+// SessionTerminationClassifier provides the fixed session proof used by API quotas.
+// Only a verified UUID and credential-free cleanup eligibility leave this layer;
+// raw cookies/tokens and unsigned identity fields never choose a quota key.
+func SessionTerminationClassifier(secret string) func(*fastglue.Request) (uuid.UUID, bool) {
+	return func(r *fastglue.Request) (uuid.UUID, bool) {
+		_, accessOnly, valid := sessionTerminationCredential(r)
+		if !valid {
+			return uuid.Nil, false
+		}
+		userID, _ := sessionTerminationUser(r, secret)
+		return userID, accessOnly
+	}
+}
+
+func sessionTerminationUser(r *fastglue.Request, secret string) (uuid.UUID, bool) {
+	credential, accessCredential, ok := sessionTerminationCredential(r)
+	if !ok {
+		return uuid.Nil, false
+	}
+	token, err := jwt.ParseWithClaims(credential, &middleware.JWTClaims{}, func(*jwt.Token) (any, error) {
+		return []byte(secret), nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
+	if err != nil || !token.Valid {
+		return uuid.Nil, false
+	}
+	claims, ok := token.Claims.(*middleware.JWTClaims)
+	if !ok || claims.UserID == uuid.Nil || claims.OrganizationID == uuid.Nil ||
+		(accessCredential && !middleware.IsAccessJWTClaims(claims)) ||
+		(!accessCredential && !middleware.IsRefreshJWTClaims(claims)) {
+		return uuid.Nil, false
+	}
+	return claims.UserID, true
 }

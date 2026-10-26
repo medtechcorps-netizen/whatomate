@@ -114,3 +114,45 @@ func extractClientIP(r *fastglue.Request, trustProxy bool) string {
 	}
 	return host
 }
+
+// APISessionRateLimit keeps ordinary API and refresh limits, while a proven
+// session termination uses its own per-user quota. The trusted classifier is
+// fixed by server setup; client fields cannot supply quota keys or policy.
+func APISessionRateLimit(apiOpts, refreshOpts RateLimitOpts, classify func(*fastglue.Request) (uuid.UUID, bool)) fastglue.FastMiddleware {
+	apiLimit := UserAwareRateLimit(apiOpts)
+	refreshLimit := RateLimit(refreshOpts)
+	terminationOpts := refreshOpts
+	terminationOpts.KeyPrefix = refreshOpts.KeyPrefix + "_termination"
+	cleanupOpts := refreshOpts
+	cleanupOpts.KeyPrefix = refreshOpts.KeyPrefix + "_cleanup"
+	anonymousCleanupOpts := cleanupOpts
+	anonymousCleanupOpts.KeyPrefix += "_anonymous"
+	cleanupLimit := RateLimit(anonymousCleanupOpts)
+	return func(r *fastglue.Request) *fastglue.Request {
+		if classify == nil {
+			_ = r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Session authorization is unavailable", nil, "")
+			return nil
+		}
+		userID, cookieCleanup := classify(r)
+		if string(r.RequestCtx.Path()) == "/api/auth/logout" && cookieCleanup {
+			// Cookie clearing follows revocation and has its own quota. The
+			// classifier proves CSRF and the absence of a refresh credential.
+			if userID != uuid.Nil {
+				return enforce(cleanupOpts, r, fmt.Sprintf("ratelimit:%s:u:%s", cleanupOpts.KeyPrefix, userID))
+			}
+			// Expired/absent access claims select no identity. Cleanup remains
+			// independently bounded per IP, in a separate key namespace.
+			return cleanupLimit(r)
+		}
+		if userID != uuid.Nil {
+			return enforce(terminationOpts, r, fmt.Sprintf("ratelimit:%s:u:%s", terminationOpts.KeyPrefix, userID))
+		}
+		if apiLimit(r) == nil {
+			return nil
+		}
+		if string(r.RequestCtx.Method()) == fasthttp.MethodPost && string(r.RequestCtx.Path()) == "/api/auth/refresh" {
+			return refreshLimit(r)
+		}
+		return r
+	}
+}
