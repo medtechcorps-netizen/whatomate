@@ -1832,6 +1832,12 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 
 	// Generic Import/Export
 	g.POST("/api/export", tenant((*handlers.App).ExportData))
+	// Export owns its read-only snapshot, then releases it before fresh access
+	// validation. Do not wrap these in a second tenant transaction.
+	g.GET("/api/chat-exports/capabilities", app.GetChatExportCapabilities)
+	g.POST("/api/chat-exports/preview", app.PreviewChatExport)
+	g.POST("/api/chat-exports/download", app.DownloadChatExport)
+	g.POST("/api/chat-exports/{id}/cancel", app.CancelChatExport)
 	g.POST("/api/import", tenant((*handlers.App).ImportData))
 	g.GET("/api/export/{table}/config", tenant((*handlers.App).GetExportConfig))
 	g.GET("/api/import/{table}/config", tenant((*handlers.App).GetImportConfig))
