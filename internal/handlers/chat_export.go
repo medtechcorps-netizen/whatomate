@@ -130,7 +130,7 @@ func chatExportError(r *fastglue.Request, err error) error {
 	case errors.Is(err, context.DeadlineExceeded):
 		status, message, code = fasthttp.StatusRequestTimeout, "This export took too long. Choose a smaller date range or account and try again.", "chat_export_timeout"
 	}
-	return r.SendErrorEnvelope(status, message, nil, code)
+	return r.SendErrorEnvelope(status, message, nil, fastglue.ErrorType(code))
 }
 
 func parseChatExportRequest(r *fastglue.Request) (chatExportRequest, error) {
