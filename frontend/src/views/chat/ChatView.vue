@@ -581,6 +581,16 @@ async function acknowledgeVisibleChatBoundary() {
 }
 
 const contactId = computed(() => route.params.contactId as string | undefined)
+// The route can change before its messages finish loading. Invalidate any
+// pending bubble action immediately, including during an auth/org switch.
+const messageMenuScope = computed(() => JSON.stringify([
+  authStore.isAuthenticated,
+  authStore.user?.id,
+  organizationsStore.selectedOrgId || authStore.organizationId,
+  contactId.value,
+  contactsStore.currentContact?.id,
+  selectedAccount.value,
+]))
 
 // Get active transfer for current contact from the store (reactive)
 const activeTransfer = computed(() => {
@@ -3475,7 +3485,7 @@ watch(contactId, () => chatAttachments.reset())
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
     />
-    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" :can-forward="canForwardMessages" @react="sendReaction" @reply="replyToMessage" @forward="openForwardDialog" />
+    <MessageContextMenu :scope-key="messageMenuScope" :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" :can-forward="canForwardMessages" @react="sendReaction" @reply="replyToMessage" @forward="openForwardDialog" />
     <ForwardMessageDialog v-model:open="isForwardDialogOpen" :message="forwardingMessage" :preview="forwardPreview" />
   </div>
 </template>
