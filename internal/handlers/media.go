@@ -443,6 +443,18 @@ func (a *App) ServeMedia(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	// An explicitly selected workspace must never fall back to the JWT's
+	// default workspace when access changes or the header is malformed.
+	// Keep headerless requests compatible with the authenticated default.
+	if len(r.RequestCtx.Request.Header.Peek("X-Organization-ID")) != 0 {
+		selectedOrgID, err := a.requireExplicitOrganization(r)
+		if err != nil {
+			return nil
+		}
+		if selectedOrgID != orgID {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+		}
+	}
 
 	// Get the message ID from URL parameter
 	messageIDStr := r.RequestCtx.UserValue("message_id").(string)
