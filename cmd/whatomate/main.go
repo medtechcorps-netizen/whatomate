@@ -1237,17 +1237,9 @@ func runWorker(args []string) {
 	}
 	lo.Info("Connected to Redis")
 
-	// Setup context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle shutdown signals
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	// Create and run workers
-	workers := make([]*worker.Worker, *workerCount)
-	errCh := make(chan error, *workerCount*4)
+	// Construct every worker before capturing signals; initialization may block
+	// in Redis or logging, and no owned worker loops have started yet.
+	workers := make([]standaloneWorker, *workerCount)
 
 	for i := 0; i < *workerCount; i++ {
 		w, err := worker.New(cfg, db, rdb, lo)
@@ -1255,49 +1247,20 @@ func runWorker(args []string) {
 			lo.Fatal("Failed to create worker", "error", err, "worker_num", i+1)
 		}
 		workers[i] = w
-
-		go func(workerNum int) {
-			lo.Info("Worker started", "worker_num", workerNum)
-			errCh <- w.Run(ctx)
-		}(i + 1)
-		go func(workerNum int) {
-			lo.Info("Channel outbox worker started", "worker_num", workerNum)
-			errCh <- w.RunChannelOutbox(ctx)
-		}(i + 1)
-		go func(workerNum int) {
-			lo.Info("Channel AI reply worker started", "worker_num", workerNum)
-			errCh <- w.RunChannelAIReplies(ctx)
-		}(i + 1)
-		go func(workerNum int) {
-			lo.Info("Threads credential refresh worker started", "worker_num", workerNum)
-			errCh <- w.RunThreadsCredentialRefresh(ctx)
-		}(i + 1)
 	}
 
-	lo.Info("Workers started", "count", *workerCount)
-
-	// Wait for shutdown signal or error
-	select {
-	case sig := <-quit:
-		lo.Info("Received shutdown signal", "signal", sig)
-		cancel()
-	case err := <-errCh:
-		if err != nil && err != context.Canceled {
-			lo.Error("Worker error", "error", err)
-			cancel()
+	// Captured signals now go directly to the independent deadline owner.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	runStandaloneWorkers(workers, quit, serverShutdownBudget, func(result serverShutdownResult) {
+		if result.deadlineExpired || len(result.failed) > 0 {
+			lo.Warn("Worker shutdown incomplete", "deadline_expired", result.deadlineExpired,
+				"pending", result.pending, "failed", result.failed)
+		} else {
+			lo.Info("Worker loops and close calls finished")
 		}
-	}
-
-	// Cleanup
-	lo.Info("Shutting down workers...")
-	for _, w := range workers {
-		if w != nil {
-			if err := w.Close(); err != nil {
-				lo.Error("Error closing worker", "error", err)
-			}
-		}
-	}
-	lo.Info("Workers stopped")
+	})
+	// The deadline owner has returned; no blocking cleanup/logging follows.
 }
 
 // ============================================================================
@@ -2321,4 +2284,72 @@ func rlsBootstrapEmptyCommand(ctx context.Context, args []string) (returnErr err
 			return nil
 		},
 	)
+}
+
+type standaloneWorker interface {
+	Run(context.Context) error
+	RunChannelOutbox(context.Context) error
+	RunChannelAIReplies(context.Context) error
+	RunThreadsCredentialRefresh(context.Context) error
+	Close() error
+}
+
+// runStandaloneWorkers uses the same independent absolute deadline owner as
+// the server. Only actual loop returns count as joined. Close cannot tear down
+// resources used by a loop that is still settling its durable attempt.
+func runStandaloneWorkers(workers []standaloneWorker, quit <-chan os.Signal, budget time.Duration, report func(serverShutdownResult)) serverShutdownResult {
+	ctx, cancel := context.WithCancel(context.Background())
+	exits := make(chan struct{}, len(workers)*4)
+	tasks := []serverShutdownTask{{"worker stop request", func(context.Context) error { cancel(); return nil }}}
+	for i, worker := range workers {
+		loops := []struct {
+			name string
+			run  func(context.Context) error
+		}{
+			{"message loop", worker.Run},
+			{"outbox loop", worker.RunChannelOutbox},
+			{"AI reply loop", worker.RunChannelAIReplies},
+			{"Threads credential loop", worker.RunThreadsCredentialRefresh},
+		}
+		workerDone := make([]<-chan struct{}, 0, len(loops))
+		for _, loop := range loops {
+			name := fmt.Sprintf("worker %d %s", i+1, loop.name)
+			done := make(chan struct{})
+			var loopErr error
+			go func() {
+				defer close(done)
+				loopErr = loop.run(ctx)
+				exits <- struct{}{}
+			}()
+			workerDone = append(workerDone, done)
+			tasks = append(tasks, serverShutdownTask{name, func(waitCtx context.Context) error {
+				select {
+				case <-done:
+					if ctx.Err() != nil && errors.Is(loopErr, context.Canceled) {
+						return nil
+					}
+					return loopErr
+				case <-waitCtx.Done():
+					return waitCtx.Err()
+				}
+			}})
+		}
+		tasks = append(tasks, serverShutdownTask{fmt.Sprintf("worker %d close after loops", i+1), func(waitCtx context.Context) error {
+			for _, done := range workerDone {
+				select {
+				case <-done:
+				case <-waitCtx.Done():
+					return waitCtx.Err()
+				}
+			}
+			return worker.Close()
+		}})
+	}
+	// No synchronous logger/cancel/Close may precede establishing the deadline.
+	select {
+	case <-quit:
+	case <-exits:
+	}
+	deadline := time.Now().Add(budget)
+	return shutdownServer(deadline, tasks, report)
 }

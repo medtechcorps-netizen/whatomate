@@ -79,7 +79,8 @@ func (w *Worker) ProcessChannelOutboxBatch(ctx context.Context, workerID string,
 	}
 
 	now := time.Now().UTC()
-	organizationIDs, err := w.listReadyChannelOutboxOrganizations(
+	intake := w.intakeContext(ctx)
+	organizationIDs, err := intake.listReadyChannelOutboxOrganizations(
 		limit,
 		now,
 		now.Add(-defaultChannelOutboxLease),
@@ -94,7 +95,7 @@ func (w *Worker) ProcessChannelOutboxBatch(ctx context.Context, workerID string,
 		if processed >= limit || ctx.Err() != nil {
 			break
 		}
-		jobID, claimed, err := w.claimChannelOutboxJob(orgID, workerID)
+		jobID, claimed, err := intake.claimChannelOutboxJob(orgID, workerID)
 		if err != nil {
 			batchErrors = append(batchErrors, fmt.Errorf("claim tenant %s: %w", orgID, err))
 			continue
