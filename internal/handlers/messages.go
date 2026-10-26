@@ -17,7 +17,6 @@ import (
 	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/queue"
-	"github.com/shridarpatil/whatomate/internal/storage"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"github.com/shridarpatil/whatomate/internal/utils"
 	"github.com/shridarpatil/whatomate/internal/websocket"
@@ -2967,79 +2966,6 @@ func forwardMediaExtension(name string) string {
 	return strings.ToLower(name[dot:])
 }
 
-// prepareForwardedMedia runs in the delivery goroutine with no transaction or
-// pooled connection held: it copies the attachment in tenant storage and
-// uploads it to Meta, leaving only the send for the provider transaction.
-func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
-	plan := req.forwardMedia
-	if plan == nil || req.Account == nil {
-		a.Log.Error("Forwarded attachment plan is incomplete")
-		return forwardAttachmentCopyError()
-	}
-	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
-	defer cancelStorage()
-	limit := forwardMediaSizeLimit(req.Type)
-	size, known, sizeErr := a.forwardSourceSize(storageCtx, plan)
-	if sizeErr != nil {
-		a.Log.Warn("Forward attachment size lookup failed; download refused", "organization_id", plan.OrganizationID)
-		return errors.New("Not sent: the attachment size could not be checked. Try forwarding it again later.") //nolint:staticcheck
-	}
-	if known && size > limit {
-		return forwardTooLargeError(limit)
-	}
-	data, _, err := a.loadTenantMediaWithLimit(storageCtx, plan.OrganizationID, plan.SourceKey, limit)
-	if errors.Is(err, storage.ErrObjectTooLarge) {
-		return forwardTooLargeError(limit)
-	}
-	if err != nil || len(data) == 0 {
-		a.Log.Error("Failed to read media to forward",
-			"error", err, "organization_id", plan.OrganizationID)
-		return errors.New("the forwarded attachment is no longer available")
-	}
-	if int64(len(data)) > limit {
-		return forwardTooLargeError(limit)
-	}
-	key, err := a.saveTenantMedia(
-		storageCtx,
-		plan.OrganizationID,
-		plan.ObjectSubdir,
-		plan.LocalSubdir,
-		plan.ObjectName,
-		data,
-		plan.MimeType,
-	)
-	if err != nil || key != plan.DestinationKey {
-		a.Log.Error("Failed to store forwarded attachment",
-			"error", err, "organization_id", plan.OrganizationID, "key_matches_plan", key == plan.DestinationKey)
-		return forwardAttachmentCopyError()
-	}
-
-	if err := a.requireForwardAccountActive(plan.OrganizationID, req.Account.ID); err != nil {
-		return err
-	}
-	// Patient photos, videos and voice notes carry no file name; Graph needs
-	// one. The document name shown to the customer stays MediaFilename.
-	uploadName := strings.TrimSpace(req.MediaFilename)
-	if uploadName == "" {
-		uploadName = plan.ObjectName
-	}
-	// Graph matches bare media types: "audio/ogg; codecs=opus" (a stored
-	// voice note) is uploaded as "audio/ogg". The stored type is unchanged.
-	uploadType := mediaTypeEssence(plan.MimeType)
-	if uploadType == "" {
-		uploadType = plan.MimeType
-	}
-	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), forwardMediaUploadTimeout)
-	defer cancelUpload()
-	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, uploadType, uploadName)
-	if err != nil {
-		return fmt.Errorf("failed to upload media: %w", err)
-	}
-	req.MediaID = mediaID
-	req.MediaData = nil
-	return nil
-}
-
 // outgoingSessionContext is the context of a request session, so a derived deadline
 // keeps the tenant and realtime values bound to it.
 func outgoingSessionContext(db *gorm.DB) context.Context {
@@ -3371,25 +3297,6 @@ func forwardMediaSizeLimit(messageType models.MessageType) int64 {
 
 func forwardTooLargeError(limit int64) error {
 	return fmt.Errorf("this attachment is larger than WhatsApp allows (%d MB) and cannot be forwarded", limit>>20)
-}
-
-// forwardSourceSize reads an object-store attachment's size from a listing,
-// without downloading it. Local development storage reports unknown; its
-// bytes are size-checked right after the read instead.
-func (a *App) forwardSourceSize(ctx context.Context, plan *forwardMediaCopy) (int64, bool, error) {
-	if a.ObjectStore == nil || !isTenantObjectKey(plan.OrganizationID, plan.SourceKey) {
-		return 0, false, nil
-	}
-	objects, err := a.ObjectStore.ListPrefix(ctx, plan.SourceKey)
-	if err != nil {
-		return 0, false, err
-	}
-	for _, object := range objects {
-		if object.Key == plan.SourceKey {
-			return object.Size, true, nil
-		}
-	}
-	return 0, false, storage.ErrObjectNotFound
 }
 
 // ---- Forward capacity contract and dispatch phases -------------------------

@@ -18,7 +18,41 @@ import (
 // ErrObjectNotFound normalizes provider-specific missing-object responses.
 var ErrObjectNotFound = errors.New("object not found")
 
-var ErrObjectTooLarge = errors.New("object exceeds read limit")
+type objectReadLimitError string
+
+func (e objectReadLimitError) Error() string { return string(e) }
+
+// ErrObjectTooLarge identifies an object that exceeds the caller's byte limit.
+const ErrObjectTooLarge objectReadLimitError = "object exceeds read limit"
+
+// ReadLimited reads at most maxBytes+1, including when Content-Length is absent
+// or stale. The extra byte distinguishes exact-size success from truncation.
+func ReadLimited(ctx context.Context, reader io.Reader, maxBytes int64) ([]byte, error) {
+	const maxInt64 = 1<<63 - 1
+	if maxBytes <= 0 || maxBytes == maxInt64 {
+		return nil, errors.New("invalid object read limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(contextReader{ctx, reader}, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, ErrObjectTooLarge
+	}
+	return data, ctx.Err()
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
 
 // BoundedObjectReader is required for forwarding: metadata alone cannot bound
 // an object that changes between its size check and its download.
