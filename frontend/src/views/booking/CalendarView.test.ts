@@ -3,7 +3,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent, nextTick, reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { BookingResource, BookingService } from '@/services/productSuite'
+import type { BookingEvent, BookingResource, BookingService } from '@/services/productSuite'
 import CalendarView from './CalendarView.vue'
 
 const mocks = vi.hoisted(() => ({
@@ -184,6 +184,7 @@ afterEach(() => {
   wrapper?.unmount()
   wrapper = undefined
   document.body.innerHTML = ''
+  vi.useRealTimers()
 })
 
 describe('Booking catalogue lifecycle', () => {
@@ -426,5 +427,91 @@ describe('Booking catalogue lifecycle', () => {
       is_active: true,
     })
     expect(mocks.delete).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('Calendar person-first entry points', () => {
+  it.each([true, false])('shows a saved next-week schedule using its resource timezone (nested resource: %s)', async (includeResource) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-26T02:00:00Z'))
+    permissions.add('bookings:write')
+    services[0]!.is_active = true
+    resources[0]!.is_active = true
+    resources[0]!.timezone = 'Pacific/Auckland'
+    const saved: BookingEvent = {
+      id: 'next-week-event', service_id: 'service-one', resource_id: 'resource-one',
+      starts_at: '2026-11-02T01:15:00Z', ends_at: '2026-11-02T02:00:00Z',
+      capacity: 2, status: 'scheduled', version: 1, service: copy(services[0]!),
+      ...(includeResource ? { resource: copy(resources[0]!) } : {}),
+    }
+    let savedOnServer = false
+    mocks.post.mockImplementation(() => {
+      savedOnServer = true
+      return envelope(saved)
+    })
+    mocks.get.mockImplementation((url: string, options?: { params?: Record<string, string> }) => {
+      if (url !== '/booking/events') return readFixture(url)
+      const from = Date.parse(options?.params?.from || '')
+      const to = Date.parse(options?.params?.to || '')
+      const start = Date.parse(saved.starts_at)
+      const listed = savedOnServer && from <= start && start <= to ? [saved] : []
+      return envelope({ events: listed, total: listed.length })
+    })
+    await open()
+    expect(wrapper!.text()).toContain('26 Oct')
+    await button('Add schedule').trigger('click')
+    await flushPromises()
+    await wrapper!.get('[name="schedule-date"]').setValue('2026-11-02')
+    await wrapper!.get('[name="schedule-time"]').setValue('14:15')
+    await wrapper!.get('form[aria-label="Schedule details"]').trigger('submit')
+    await flushPromises()
+    expect(wrapper!.text()).toContain('2 Nov')
+    expect(wrapper!.text()).toContain('8 Nov 2026')
+    expect(wrapper!.get('[data-testid="calendar-event-card"]').text()).toContain('Consultation')
+    expect(wrapper!.get('[data-testid="calendar-event-time"]').text()).toBe(
+      new Intl.DateTimeFormat('en-MY', { hour: '2-digit', minute: '2-digit', timeZone: 'Pacific/Auckland' }).format(new Date(saved.starts_at)),
+    )
+  })
+
+  it('lets a booking writer with setup read but no setup write schedule existing people', async () => {
+    permissions.clear()
+    permissions.add('bookings:read')
+    permissions.add('bookings:write')
+    permissions.add('booking.settings:read')
+    services[0]!.is_active = true
+    resources[0]!.is_active = true
+    mocks.post.mockResolvedValue(envelope({ id: 'new-event' }))
+    await open()
+    expect(wrapper!.findAll('button').some(item => item.text().trim() === 'Advanced setup')).toBe(false)
+    await button('Add schedule').trigger('click')
+    await flushPromises()
+    expect(wrapper!.text()).toContain('Adding people or services requires booking setup permission')
+    await wrapper!.get('form[aria-label="Schedule details"]').trigger('submit')
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledTimes(1)
+    expect(mocks.post).toHaveBeenCalledWith('/booking/events', expect.objectContaining({
+      resource_id: 'resource-one', service_id: 'service-one', timezone: 'Asia/Kuala_Lumpur',
+    }), { headers: { 'X-Organization-ID': 'organization-one' } })
+  })
+
+  it('opens Add schedule on an empty catalogue without opening advanced setup', async () => {
+    services = []
+    resources = []
+    permissions.add('bookings:write')
+    wrapper = mountCalendar()
+    await flushPromises()
+    expect(button('Add schedule').attributes('disabled')).toBeUndefined()
+    await button('Add schedule').trigger('click')
+    expect(wrapper.find('form[aria-label="Add person"]').exists()).toBe(true)
+    expect(wrapper.find('form[aria-label="Service details"]').exists()).toBe(false)
+  })
+
+  it('exposes direct person creation to setup writers without booking write permission', async () => {
+    await open()
+    await button('Add doctor / instructor / staff').trigger('click')
+    expect(wrapper!.find('form[aria-label="Add person"]').exists()).toBe(true)
+    expect(wrapper!.findAll('button').some(item => item.text().trim() === 'Add schedule')).toBe(false)
+    expect(wrapper!.find('form[aria-label="Service details"]').exists()).toBe(false)
   })
 })
