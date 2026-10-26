@@ -174,9 +174,12 @@ describe('contacts store inbox filters and read state', () => {
     expect(mocks.listContacts.mock.calls[2][0].tags).toBeUndefined()
   })
 
-  it('does not show an error for an aborted request', async () => {
+  it.each([
+    ['DOM AbortError', () => new DOMException('aborted', 'AbortError')],
+    ['Axios cancellation', () => Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' })],
+  ] as const)('does not show an error for %s', async (_kind, abortError) => {
     const store = await loadStore()
-    mocks.listContacts.mockRejectedValueOnce(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+    mocks.listContacts.mockRejectedValueOnce(abortError())
     await store.fetchContacts()
     expect(store.contactListError).toBeNull()
     expect(store.isLoading).toBe(false)
