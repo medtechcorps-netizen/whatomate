@@ -2060,12 +2060,26 @@ func (a *App) processMarketingPreference(
 	if err != nil {
 		return err
 	}
+	phoneNumberID = strings.TrimSpace(phoneNumberID)
+	userPhone = normalizeCoexistencePhone(userPhone)
+	bsuid = strings.TrimSpace(bsuid)
 
 	// Find the WhatsApp account by phone_number_id
-	var account models.WhatsAppAccount
-	if err := a.DB.Where("phone_id = ?", phoneNumberID).First(&account).Error; err != nil {
+	var accounts []models.WhatsAppAccount
+	accountQuery := a.DB.Where("BTRIM(phone_id) = ?", phoneNumberID)
+	if a.hasTenantScope() {
+		accountQuery = accountQuery.Where("organization_id = ?", a.tenantOrgID)
+	}
+	if err := accountQuery.Order("id").Limit(2).Find(&accounts).Error; err != nil {
 		return fmt.Errorf("find account for marketing preference: %w", err)
 	}
+	if len(accounts) == 0 {
+		return fmt.Errorf("find account for marketing preference: %w", gorm.ErrRecordNotFound)
+	}
+	if len(accounts) != 1 {
+		return errors.New("marketing preference phone has ambiguous account ownership")
+	}
+	account := accounts[0]
 
 	if strings.TrimSpace(userPhone) == "" && strings.TrimSpace(bsuid) == "" {
 		return errors.New("marketing preference has no phone or BSUID")
@@ -2084,20 +2098,37 @@ func (a *App) processMarketingPreference(
 			return fmt.Errorf("lock marketing preference policy scope: %w", lockErr)
 		}
 
-		contact, findErr := findMarketingPreferenceContact(
+		// A cached or pre-lock account lookup cannot authorize a deleted or
+		// rebound phone. Keep the policy lock first, then pin this exact current
+		// account before reading either sender selector. Inbound consent is not
+		// an outbound send or an identity-review onboarding-cycle claim.
+		var currentAccount models.WhatsAppAccount
+		if accountErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"id = ? AND organization_id = ? AND BTRIM(phone_id) = ?",
+			account.ID, account.OrganizationID, phoneNumberID,
+		).First(&currentAccount).Error; accountErr != nil {
+			return fmt.Errorf("verify marketing preference account: %w", accountErr)
+		}
+
+		contact, enrichBSUID, findErr := resolveMarketingPreferenceContact(
 			tx,
 			account.OrganizationID,
 			userPhone,
 			bsuid,
 		)
 		if errors.Is(findErr, gorm.ErrRecordNotFound) &&
-			strings.TrimSpace(userPhone) != "" {
-			contact, _, findErr = contactutil.GetOrCreateContact(
+			userPhone != "" {
+			_, _, findErr = contactutil.GetOrCreateContact(
 				tx,
 				account.OrganizationID,
 				userPhone,
 				"",
 			)
+			if findErr == nil {
+				contact, enrichBSUID, findErr = resolveMarketingPreferenceContact(
+					tx, account.OrganizationID, userPhone, bsuid,
+				)
+			}
 		}
 		if findErr != nil {
 			return fmt.Errorf("find marketing preference contact: %w", findErr)
@@ -2118,19 +2149,22 @@ func (a *App) processMarketingPreference(
 		updates := map[string]any{
 			"marketing_opt_out": optOut,
 		}
-		if strings.TrimSpace(bsuid) != "" && canonical.BSUID != bsuid {
-			updates["bs_uid"] = strings.TrimSpace(bsuid)
+		if enrichBSUID {
+			updates["bs_uid"] = bsuid
 		}
 		if canonical.WhatsAppAccount == "" {
-			updates["whats_app_account"] = account.Name
+			updates["whats_app_account"] = currentAccount.Name
 		}
-		result := tx.Model(&models.Contact{}).
+		write := tx.Model(&models.Contact{}).
 			Where(
 				"id = ? AND organization_id = ? AND merged_into_id IS NULL AND deleted_at IS NULL",
 				canonical.ID,
 				account.OrganizationID,
-			).
-			Updates(updates)
+			)
+		if enrichBSUID {
+			write = write.Where("COALESCE(BTRIM(bs_uid), '') = ''")
+		}
+		result := write.Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -2159,51 +2193,6 @@ func (a *App) processMarketingPreference(
 		"opt_out", optOut,
 	)
 	return nil
-}
-
-func findMarketingPreferenceContact(
-	tx *gorm.DB,
-	organizationID uuid.UUID,
-	userPhone, bsuid string,
-) (*models.Contact, error) {
-	normalizedPhone := strings.TrimPrefix(strings.TrimSpace(userPhone), "+")
-	if normalizedPhone != "" {
-		var contact models.Contact
-		err := tx.Unscoped().
-			Where(
-				"organization_id = ? AND phone_number IN ?",
-				organizationID,
-				[]string{normalizedPhone, "+" + normalizedPhone},
-			).
-			Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, created_at").
-			First(&contact).Error
-		if err == nil {
-			return &contact, nil
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-	}
-
-	normalizedBSUID := strings.TrimSpace(bsuid)
-	if normalizedBSUID != "" {
-		var contact models.Contact
-		err := tx.Unscoped().
-			Where(
-				"organization_id = ? AND bs_uid = ?",
-				organizationID,
-				normalizedBSUID,
-			).
-			Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, created_at").
-			First(&contact).Error
-		if err == nil {
-			return &contact, nil
-		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-	}
-	return nil, gorm.ErrRecordNotFound
 }
 
 func marketingPreferenceOptOut(value string) (bool, error) {
