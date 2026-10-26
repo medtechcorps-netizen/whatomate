@@ -18,6 +18,48 @@ import (
 // ErrObjectNotFound normalizes provider-specific missing-object responses.
 var ErrObjectNotFound = errors.New("object not found")
 
+type objectReadLimitError string
+
+func (e objectReadLimitError) Error() string { return string(e) }
+
+// ErrObjectTooLarge identifies an object that exceeds the caller's byte limit.
+const ErrObjectTooLarge objectReadLimitError = "object exceeds read limit"
+
+// ReadLimited reads at most maxBytes+1, including when Content-Length is absent
+// or stale. The extra byte distinguishes exact-size success from truncation.
+func ReadLimited(ctx context.Context, reader io.Reader, maxBytes int64) ([]byte, error) {
+	const maxInt64 = 1<<63 - 1
+	if maxBytes <= 0 || maxBytes == maxInt64 {
+		return nil, errors.New("invalid object read limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(contextReader{ctx, reader}, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, ErrObjectTooLarge
+	}
+	return data, ctx.Err()
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+// BoundedObjectReader is required for forwarding: metadata alone cannot bound
+// an object that changes between its size check and its download.
+type BoundedObjectReader interface {
+	GetLimited(ctx context.Context, key string, maxBytes int64) ([]byte, string, error)
+}
+
 // ObjectStore is the storage boundary used by handlers for durable tenant
 // media. Implementations must preserve the supplied object key verbatim.
 type ObjectStore interface {
@@ -83,6 +125,17 @@ func (s *S3Client) Upload(ctx context.Context, key string, body io.Reader, conte
 
 // Get downloads an object and returns its data and stored content type.
 func (s *S3Client) Get(ctx context.Context, key string) ([]byte, string, error) {
+	return s.get(ctx, key, 0)
+}
+
+func (s *S3Client) GetLimited(ctx context.Context, key string, maxBytes int64) ([]byte, string, error) {
+	if maxBytes <= 0 {
+		return nil, "", errors.New("positive object read limit required")
+	}
+	return s.get(ctx, key, maxBytes)
+}
+
+func (s *S3Client) get(ctx context.Context, key string, maxBytes int64) ([]byte, string, error) {
 	result, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -96,7 +149,15 @@ func (s *S3Client) Get(ctx context.Context, key string) ([]byte, string, error) 
 	}
 	defer result.Body.Close() //nolint:errcheck
 
-	data, err := io.ReadAll(result.Body)
+	if maxBytes > 0 && aws.ToInt64(result.ContentLength) > maxBytes {
+		return nil, "", ErrObjectTooLarge
+	}
+	var data []byte
+	if maxBytes > 0 {
+		data, err = ReadLimited(ctx, result.Body, maxBytes)
+	} else {
+		data, err = io.ReadAll(result.Body)
+	}
 	if err != nil {
 		return nil, "", err
 	}

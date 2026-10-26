@@ -120,6 +120,7 @@ export interface Message {
   wamid?: string
   error_message?: string
   is_reply?: boolean
+  is_forwarded?: boolean
   reply_to_message_id?: string
   reply_to_message?: ReplyPreview
   reactions?: Reaction[]
@@ -652,7 +653,7 @@ export const useContactsStore = defineStore('contacts', () => {
     }
     // The socket copy can arrive before the send response. Keep its fields
     // (a newer status included) and only fill what it lacks, such as the
-    // CRM-only is_forwarded flag the socket payload does not carry.
+    // reply previews an older socket publisher does not carry.
     const current = messages.value[index] as unknown as Record<string, unknown>
     const late = message as unknown as Record<string, unknown>
     const missing = Object.keys(late).filter(key =>

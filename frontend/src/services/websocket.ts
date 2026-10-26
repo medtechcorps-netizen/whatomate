@@ -410,6 +410,7 @@ class WebSocketService {
         wamid: payload.wamid,
         error_message: payload.error_message,
         is_reply: payload.is_reply,
+        is_forwarded: typeof payload.is_forwarded === 'boolean' ? payload.is_forwarded : undefined,
         reply_to_message_id: payload.reply_to_message_id,
         reply_to_message: payload.reply_to_message,
         reactions: payload.reactions,
