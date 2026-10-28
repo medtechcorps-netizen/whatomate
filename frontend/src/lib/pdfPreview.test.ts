@@ -389,7 +389,8 @@ describe('documentPreviewType', () => {
 describe('openPdfPreview', () => {
   beforeEach(() => {
     mocks.getDocument.mockReset()
-    mocks.workerOptions.workerSrc = ''
+    // The cached pdf.js module lives for this file; keep its worker configuration
+    // for the same lifetime while resetting per-preview calls above.
   })
 
   it.each(invalidCatalogs)('never admits catalog repair to getDocument: %s', async (_, objects) => {
