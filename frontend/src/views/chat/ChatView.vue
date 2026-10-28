@@ -2523,11 +2523,29 @@ watch(contactId, () => chatAttachments.reset())
           </div>
 
           <!-- Loading indicator for infinite scroll -->
+          <div
+            v-if="contactsStore.contactListError"
+            role="alert"
+            data-testid="chat-contact-list-error"
+            class="mx-3 my-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-sm text-amber-200 light:border-amber-200 light:bg-amber-50 light:text-amber-900"
+          >
+            <p>{{ $t('chat.contactListUnavailable', 'Unable to load chats. Please try again.') }}</p>
+            <Button
+              size="sm"
+              variant="outline"
+              class="mt-2"
+              data-testid="chat-contact-list-retry"
+              :disabled="contactsStore.isLoading || contactsStore.isLoadingMoreContacts"
+              @click="contactsStore.retryContactList()"
+            >
+              {{ $t('common.retry') }}
+            </Button>
+          </div>
           <div v-if="contactsStore.isLoadingMoreContacts" class="p-3 text-center">
             <Loader2 class="h-5 w-5 mx-auto animate-spin text-white/40 light:text-gray-400" />
           </div>
 
-          <div v-if="contactsStore.sortedContacts.length === 0" class="p-3 text-center text-white/40 light:text-gray-500">
+          <div v-if="contactsStore.sortedContacts.length === 0 && !contactsStore.contactListError && !contactsStore.isLoading" class="p-3 text-center text-white/40 light:text-gray-500">
             <User class="h-6 w-6 mx-auto mb-1.5 opacity-50" />
             <p class="text-sm">
               {{ (contactsStore.listFilter ?? 'all') === 'all' ? $t('chat.noContacts') : $t('chat.filters.noMatches') }}

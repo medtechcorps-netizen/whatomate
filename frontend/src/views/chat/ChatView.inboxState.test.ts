@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   organizationsStore: null as { selectedOrgId: string | null } | null,
   hasPermission: vi.fn(),
   fetchContacts: vi.fn(),
+  retryContactList: vi.fn(),
   fetchMessages: vi.fn(),
   setCurrentContact: vi.fn(),
   clearMessages: vi.fn(),
@@ -104,8 +105,11 @@ vi.mock('@/stores/contacts', async () => {
     hasMoreMessages: false,
     isLoadingMessages: false,
     isLoadingMoreContacts: false,
+    isLoading: false,
+    contactListError: null,
     isLoadingOlderMessages: false,
     fetchContacts: mocks.fetchContacts,
+    retryContactList: mocks.retryContactList,
     fetchContact: vi.fn(),
     fetchMessages: mocks.fetchMessages,
     refreshCurrentMessages: vi.fn().mockResolvedValue(undefined),
@@ -288,6 +292,9 @@ describe('ChatView inbox state', () => {
       searchQuery: '',
       listFilter: 'all',
       isLoadingMessages: false,
+      isLoading: false,
+      isLoadingMoreContacts: false,
+      contactListError: null,
     })
     mocks.setCurrentContact.mockImplementation(value => {
       mocks.contactsStore!.currentContact = value
@@ -348,6 +355,30 @@ describe('ChatView inbox state', () => {
     mocks.authStore!.isAuthenticated = false
     await nextTick()
     expect(menu().props('scopeKey')).not.toBe(previous)
+  })
+
+  it('shows a manual retry beside retained chats without exposing the server error', async () => {
+    mocks.contactsStore!.contactListError = 'refresh'
+    const view = await mountSettled()
+    expect(view.findAll('[data-testid="chat-contact"]')).toHaveLength(2)
+    expect(view.get('[role="alert"]').text()).toContain('Unable to load chats')
+    await view.get('[data-testid="chat-contact-list-retry"]').trigger('click')
+    expect(mocks.retryContactList).toHaveBeenCalledTimes(1)
+    mocks.contactsStore!.isLoading = true
+    await nextTick()
+    expect(view.get('[data-testid="chat-contact-list-retry"]').attributes('disabled')).toBeDefined()
+    mocks.contactsStore!.contactListError = null
+    await nextTick()
+    expect(view.find('[data-testid="chat-contact-list-error"]').exists()).toBe(false)
+  })
+
+  it('does not describe an unavailable empty list as no contacts', async () => {
+    mocks.contactsStore!.contacts = []
+    mocks.contactsStore!.sortedContacts = []
+    mocks.contactsStore!.contactListError = 'refresh'
+    const view = await mountSettled()
+    expect(view.find('[data-testid="chat-contact-list-error"]').exists()).toBe(true)
+    expect(view.text()).not.toContain('chat.noContacts')
   })
 
   it('loads the default list and wires the filter chips to the store', async () => {
