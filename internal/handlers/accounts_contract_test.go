@@ -4151,6 +4151,31 @@ func snapshotManualAccountWrite(t *testing.T, app *App, organizationIDs []uuid.U
 	return snapshot
 }
 
+func createManualAccountWriteShadow(
+	t *testing.T,
+	db *gorm.DB,
+	account *models.WhatsAppAccount,
+) *models.ChannelAccount {
+	t.Helper()
+	shadow := &models.ChannelAccount{
+		BaseModel:         models.BaseModel{ID: uuid.New()},
+		OrganizationID:    account.OrganizationID,
+		Channel:           models.ChannelWhatsApp,
+		Provider:          channelapi.LegacyMetaProvider,
+		Name:              "WhatsApp " + account.Name + " [" + account.ID.String() + "]",
+		ExternalAccountID: "legacy-account:" + account.ID.String(),
+		Status:            models.ChannelAccountStatusActive,
+		Capabilities:      models.JSONB{"text": true, "replies": true, "service_window": true},
+		Config:            models.JSONB{"legacy_read_only": true, "outbound_enabled": false, "reply_route": "chat"},
+		Metadata: models.JSONB{
+			"legacy_account_id":   account.ID.String(),
+			"legacy_account_name": account.Name,
+		},
+	}
+	require.NoError(t, db.Create(shadow).Error)
+	return shadow
+}
+
 func testManualAccountWriteRefusal(t *testing.T, operation, failure string, rlsEnabled bool) {
 	t.Helper()
 	phoneID, wabaID := contractGraphIDs()
@@ -4162,8 +4187,8 @@ func testManualAccountWriteRefusal(t *testing.T, operation, failure string, rlsE
 	previous := createDefaultMoveAccount(t, app, org.ID, "Manual Existing Default", true)
 	target := createDefaultMoveAccount(t, app, org.ID, "Manual Update Target", false)
 	foreign := createDefaultMoveAccount(t, app, otherOrg.ID, "Manual Foreign Owner", true)
-	createLegacyRenameShadow(t, app.DB, target)
-	createLegacyRenameShadow(t, app.DB, foreign)
+	createManualAccountWriteShadow(t, app.DB, target)
+	createManualAccountWriteShadow(t, app.DB, foreign)
 	name := "Manual Requested " + uuid.NewString()
 	dropFault := func() {}
 	switch failure {
