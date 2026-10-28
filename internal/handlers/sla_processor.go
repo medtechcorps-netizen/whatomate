@@ -369,7 +369,16 @@ func (p *SLAProcessor) autoCloseExpiredTransfers(orgID uuid.UUID, settings model
 			// Check if the assigned agent has been actively responding.
 			// If so, extend the expiry deadline instead of auto-closing.
 			deadline := transfer.SLA.ExpiresAt
-			if deadline != nil && p.agentRespondedSince(transfer, deadline.Add(-time.Duration(settings.SLA.AutoCloseHours)*time.Hour)) {
+			responded := false
+			if deadline != nil {
+				var err error
+				responded, err = p.agentRespondedSince(transfer, deadline.Add(-time.Duration(settings.SLA.AutoCloseHours)*time.Hour))
+				if err != nil {
+					p.app.Log.Error("Failed to check agent activity for expiry", "error", err, "transfer_id", transfer.ID)
+					return false
+				}
+			}
+			if responded {
 				newExpiry := now.Add(time.Duration(settings.SLA.AutoCloseHours) * time.Hour)
 				if err := p.extendTransferSLA(&transfer, "expires_at", newExpiry); err != nil {
 					p.app.Log.Error("Failed to extend transfer expiry", "error", err, "transfer_id", transfer.ID)
@@ -553,8 +562,17 @@ func (p *SLAProcessor) escalateTransfers(orgID uuid.UUID, settings models.Chatbo
 			// behavior keyed off the escalation deadline minus EscalationMinutes,
 			// which meant agent silence alone triggered the warning regardless of
 			// whether the customer was actually waiting.
-			since := p.customerLastSpokeAt(transfer)
-			if p.agentRespondedSince(transfer, since) {
+			since, err := p.customerLastSpokeAt(transfer)
+			if err != nil {
+				p.app.Log.Error("Failed to check customer activity for escalation", "error", err, "transfer_id", transfer.ID)
+				return false
+			}
+			responded, err := p.agentRespondedSince(transfer, since)
+			if err != nil {
+				p.app.Log.Error("Failed to check agent activity for escalation", "error", err, "transfer_id", transfer.ID)
+				return false
+			}
+			if responded {
 				newEscalation := now.Add(time.Duration(settings.SLA.EscalationMinutes) * time.Minute)
 				if err := p.extendTransferSLA(&transfer, "sla_escalation_at", newEscalation); err != nil {
 					p.app.Log.Error("Failed to extend transfer escalation", "error", err, "transfer_id", transfer.ID)
@@ -773,8 +791,8 @@ func slaAutoCloseNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) 
 // slaWarningNoticeStillCurrent: the transfer is still waiting for an agent at
 // or past the escalation that triggered the warning, and no agent has replied
 // to the customer since that escalation. A reply is an outgoing message from
-// a user, confirmed sent after the escalation, that is not a template.
-// Pending and uncertain attempts do not establish a reply. Caveat: API-key requests carry
+// a user, confirmed sent/delivered/read after the escalation, that is not a
+// template. Pending or failed delivery does not prove a reply. Caveat: API-key requests carry
 // the key owner's user id and are not marked on the stored message, so a text
 // or media message an integration sends through an API key also counts as a
 // reply; the template exclusion covers the usual integration notifications.
@@ -788,16 +806,8 @@ func slaWarningNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) (b
 		return true, nil
 	}
 	var replies int64
-	if err := tx.Model(&models.Message{}).Where(
-		"organization_id = ? AND contact_id = ? AND direction = ? AND sent_by_user_id IS NOT NULL"+
-			" AND message_type <> ? AND status IN ? AND created_at > ?",
-		transfer.OrganizationID,
-		transfer.ContactID,
-		models.DirectionOutgoing,
-		models.MessageTypeTemplate,
-		[]models.MessageStatus{models.MessageStatusSent, models.MessageStatusDelivered, models.MessageStatusRead},
-		*current.SLA.EscalatedAt,
-	).Count(&replies).Error; err != nil {
+	if err := slaConfirmedReplies(tx, transfer, *current.SLA.EscalatedAt).
+		Where("sent_by_user_id IS NOT NULL").Count(&replies).Error; err != nil {
 		return false, err
 	}
 	return replies == 0, nil
@@ -954,33 +964,52 @@ func (p *SLAProcessor) broadcastTransferUpdate(transfer models.AgentTransfer, ws
 // haven't messaged since. Anchors the escalation window at the customer's
 // latest activity so escalation only fires when there's an outstanding
 // question.
-func (p *SLAProcessor) customerLastSpokeAt(transfer models.AgentTransfer) time.Time {
-	var t time.Time
-	p.app.DB.Model(&models.Message{}).
-		Where("contact_id = ? AND direction = ?", transfer.ContactID, models.DirectionIncoming).
-		Select("MAX(created_at)").
-		Scan(&t)
-	if t.Before(transfer.TransferredAt) {
-		return transfer.TransferredAt
+func (p *SLAProcessor) customerLastSpokeAt(transfer models.AgentTransfer) (time.Time, error) {
+	var latest struct {
+		SpokeAt *time.Time
 	}
-	return t
+	// Read failures need the same rollback/release boundary as writes: a real
+	// SQL error must not poison the surrounding organization's transaction.
+	err := p.withSLARowSavepoint(transfer.OrganizationID, func(tx *gorm.DB) error {
+		return tx.Model(&models.Message{}).
+			Where("organization_id = ? AND contact_id = ? AND direction = ?",
+				transfer.OrganizationID, transfer.ContactID, models.DirectionIncoming).
+			Select("MAX(created_at) AS spoke_at").Scan(&latest).Error
+	})
+	if err != nil {
+		return time.Time{}, err
+	}
+	if latest.SpokeAt == nil || latest.SpokeAt.Before(transfer.TransferredAt) {
+		return transfer.TransferredAt, nil
+	}
+	return *latest.SpokeAt, nil
 }
 
-// agentRespondedSince checks if the assigned agent sent an outgoing message
-// after the given timestamp. This is used to detect active agent conversations
-// so that SLA deadlines can be extended instead of firing warnings/auto-close.
-func (p *SLAProcessor) agentRespondedSince(transfer models.AgentTransfer, since time.Time) bool {
+// slaConfirmedReplies preserves contact-level/account scope and creation-time
+// semantics. Only a durable successful delivery state proves a reply. Sender
+// provenance remains a separate policy; legacy/API-key rows are not reclassified.
+func slaConfirmedReplies(tx *gorm.DB, transfer models.AgentTransfer, since time.Time) *gorm.DB {
+	return tx.Model(&models.Message{}).Where(
+		"organization_id = ? AND contact_id = ? AND direction = ? AND message_type <> ? AND status IN ? AND created_at > ?",
+		transfer.OrganizationID, transfer.ContactID, models.DirectionOutgoing,
+		models.MessageTypeTemplate,
+		[]models.MessageStatus{models.MessageStatusSent, models.MessageStatusDelivered, models.MessageStatusRead},
+		since,
+	)
+}
+
+// agentRespondedSince checks for a confirmed non-template reply by the assigned
+// agent. Query failure is unknown activity, never evidence of agent silence.
+func (p *SLAProcessor) agentRespondedSince(transfer models.AgentTransfer, since time.Time) (bool, error) {
 	if transfer.AgentID == nil {
-		return false
+		return false, nil
 	}
-
 	var count int64
-	p.app.DB.Model(&models.Message{}).
-		Where("contact_id = ? AND sent_by_user_id = ? AND direction = ? AND created_at > ?",
-			transfer.ContactID, *transfer.AgentID, models.DirectionOutgoing, since,
-		).Count(&count)
-
-	return count > 0
+	err := p.withSLARowSavepoint(transfer.OrganizationID, func(tx *gorm.DB) error {
+		return slaConfirmedReplies(tx, transfer, since).
+			Where("sent_by_user_id = ?", *transfer.AgentID).Count(&count).Error
+	})
+	return count > 0 && err == nil, err
 }
 
 // SetSLADeadlines sets SLA deadlines on a new transfer based on settings
