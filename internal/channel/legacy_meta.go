@@ -44,6 +44,353 @@ type LegacyMetaMirrorResult struct {
 	Linked           bool
 }
 
+// LegacyMergedProjectionEvidence is captured selector evidence, never a
+// capability. Every field is checked against fresh rows before it is used.
+type LegacyMergedProjectionEvidence struct {
+	OrganizationID     uuid.UUID
+	AccountID          uuid.UUID
+	MessageID          uuid.UUID
+	CanonicalContactID uuid.UUID
+	LegacyContactID    uuid.UUID
+	ConversationID     uuid.UUID
+	IdentityID         uuid.UUID
+	ParticipantID      uuid.UUID
+	WAMID              string
+	DirectBSUID        string
+	ParentBSUID        string
+}
+
+type LegacyMergedProjection struct {
+	Conversation models.InboxConversation
+	Identity     models.ContactIdentity
+	Participant  models.ConversationParticipant
+}
+
+// Limit proof metadata before decoding it. A marker is a refusal, not an empty
+// identity. The full contact/message bodies are not required by this proof.
+const legacyMergedMetadataSQL = `CASE WHEN octet_length(COALESCE(metadata, '{}'::jsonb)::text) <= 65536 THEN metadata ELSE '{"legacy_proof_oversize":true}'::jsonb END AS metadata`
+
+func legacyMergedProofContext(db *gorm.DB) error {
+	if db == nil || db.Statement == nil || db.Statement.Context == nil {
+		return errors.New("legacy merged proof requires caller context")
+	}
+	if err := db.Statement.Context.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := db.Statement.Context.Deadline(); !ok || deadline.After(time.Now().Add(5*time.Second)) {
+		return errors.New("legacy merged proof requires bounded scope")
+	}
+	return nil
+}
+
+func legacyMergedBSUID(value string) bool {
+	if value != strings.TrimSpace(value) || len(value) > 150 {
+		return false
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) < 2 || len(parts) > 4 || len(parts[0]) != 2 {
+		return false
+	}
+	for _, ch := range parts[0] {
+		if ch < 'A' || ch > 'Z' {
+			return false
+		}
+	}
+	for _, part := range parts[1:] {
+		if len(part) < 1 || len(part) > 128 {
+			return false
+		}
+		for _, ch := range part {
+			if !(ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func legacyMergedAllowed(value, direct, parent string) bool {
+	return value == direct || parent != "" && value == parent
+}
+
+func legacyMergedMetadataSafe(metadata models.JSONB, direct, parent string) bool {
+	for _, key := range []string{"legacy_proof_oversize", "coexistence_conflicting_user_id", "coexistence_phone_conflict", "coexistence_reconciled_contact_id"} {
+		if _, exists := metadata[key]; exists {
+			return false
+		}
+	}
+	for _, key := range []string{"coexistence_user_id", "coexistence_parent_user_id"} {
+		if raw, present := metadata[key]; present {
+			value, ok := raw.(string)
+			if !ok {
+				return false
+			}
+			value = strings.TrimSpace(value)
+			if value != "" && (key == "coexistence_parent_user_id" && value != parent || !legacyMergedAllowed(value, direct, parent)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func legacyMergedContactQuery(db *gorm.DB) *gorm.DB {
+	return db.Unscoped().Select("id, organization_id, phone_number, bs_uid, merged_into_id, merged_at, merged_by_id, deleted_at, " + legacyMergedMetadataSQL)
+}
+
+// ProveLegacyMergedAlias corroborates one historical sender and its complete
+// current family. It neither learns a selector nor authorizes a new message.
+func ProveLegacyMergedAlias(db *gorm.DB, organizationID, canonicalID uuid.UUID, direct, parent string) (uuid.UUID, error) {
+	if err := legacyMergedProofContext(db); err != nil {
+		return uuid.Nil, err
+	}
+	if organizationID == uuid.Nil || canonicalID == uuid.Nil || !legacyMergedBSUID(direct) || parent != "" && !legacyMergedBSUID(parent) {
+		return uuid.Nil, nil
+	}
+	var roots []models.Contact
+	if err := legacyMergedContactQuery(db).Where("organization_id = ? AND id = ?", organizationID, canonicalID).Limit(2).Find(&roots).Error; err != nil {
+		return uuid.Nil, err
+	}
+	if len(roots) != 1 || roots[0].DeletedAt.Valid || roots[0].MergedIntoID != nil {
+		return uuid.Nil, nil
+	}
+	var aliases []models.Contact
+	if err := legacyMergedContactQuery(db).Where("organization_id = ? AND phone_number = ? AND COALESCE(bs_uid, '') = ''", organizationID, direct).Limit(2).Find(&aliases).Error; err != nil {
+		return uuid.Nil, err
+	}
+	if len(aliases) != 1 || !aliases[0].DeletedAt.Valid || aliases[0].MergedIntoID == nil {
+		return uuid.Nil, nil
+	}
+	var phoneHolders []uuid.UUID
+	if err := db.Unscoped().Model(&models.Contact{}).Where("organization_id = ? AND BTRIM(phone_number) IN ?", organizationID, []string{direct, "+" + direct}).Limit(2).Pluck("id", &phoneHolders).Error; err != nil {
+		return uuid.Nil, err
+	}
+	if len(phoneHolders) != 1 || phoneHolders[0] != aliases[0].ID {
+		return uuid.Nil, nil
+	}
+	family := map[uuid.UUID]models.Contact{canonicalID: roots[0]}
+	ids, frontier := []uuid.UUID{canonicalID}, []uuid.UUID{canonicalID}
+	for depth := 1; len(frontier) != 0; depth++ {
+		if err := legacyMergedProofContext(db); err != nil {
+			return uuid.Nil, err
+		}
+		var children []models.Contact
+		if err := legacyMergedContactQuery(db).Where("organization_id = ? AND merged_into_id IN ?", organizationID, frontier).Order("id").Limit(65 - len(family)).Find(&children).Error; err != nil {
+			return uuid.Nil, err
+		}
+		if len(children) == 0 {
+			break
+		}
+		if depth >= 16 || len(children) > 64-len(family) {
+			return uuid.Nil, errors.New("legacy WhatsApp message family exceeds proof bound")
+		}
+		frontier = nil
+		for _, child := range children {
+			if _, exists := family[child.ID]; exists {
+				return uuid.Nil, errors.New("legacy WhatsApp message family contains a cycle")
+			}
+			family[child.ID] = child
+			ids = append(ids, child.ID)
+			frontier = append(frontier, child.ID)
+		}
+	}
+	if _, exists := family[aliases[0].ID]; !exists {
+		return uuid.Nil, nil
+	}
+	for _, member := range family {
+		if !legacyMergedMetadataSafe(member.Metadata, direct, parent) {
+			return uuid.Nil, nil
+		}
+		if value := strings.TrimSpace(member.BSUID); value != "" && !legacyMergedAllowed(value, direct, parent) {
+			return uuid.Nil, nil
+		}
+		if value := strings.TrimPrefix(strings.TrimSpace(member.PhoneNumber), "+"); legacyMergedBSUID(value) && !legacyMergedAllowed(value, direct, parent) {
+			return uuid.Nil, nil
+		}
+	}
+	allowed := []string{direct}
+	if parent != "" && parent != direct {
+		allowed = append(allowed, parent)
+	}
+	var holders []uuid.UUID
+	if err := db.Unscoped().Model(&models.Contact{}).Where("organization_id = ? AND BTRIM(bs_uid) IN ?", organizationID, allowed).Limit(65).Pluck("id", &holders).Error; err != nil {
+		return uuid.Nil, err
+	}
+	if len(holders) > 64 {
+		return uuid.Nil, errors.New("legacy WhatsApp holder proof bound")
+	}
+	for _, id := range holders {
+		if _, exists := family[id]; !exists {
+			return uuid.Nil, nil
+		}
+	}
+	var decisions []uuid.UUID
+	if err := db.Model(&models.WhatsAppIdentityReviewHold{}).Where("organization_id = ? AND disposition = ? AND direct_primary_bsuid NOT IN ? AND decision_target_contact_id IN ?", organizationID, models.WhatsAppIdentityReviewDispositionFutureRouting, allowed, ids).Limit(1).Pluck("id", &decisions).Error; err != nil {
+		return uuid.Nil, err
+	}
+	if len(decisions) != 0 {
+		return uuid.Nil, nil
+	}
+	var holds []uuid.UUID
+	if err := db.Table("whatsapp_identity_review_members AS member").Joins("JOIN whatsapp_identity_review_holds AS hold ON hold.organization_id = member.organization_id AND hold.id = member.hold_id").Where("member.organization_id = ? AND member.contact_id IN ? AND hold.disposition = ?", organizationID, ids, models.WhatsAppIdentityReviewDispositionOpen).Limit(1).Pluck("hold.id", &holds).Error; err != nil {
+		return uuid.Nil, err
+	}
+	if len(holds) != 0 {
+		return uuid.Nil, nil
+	}
+	if err := legacyMergedHistory(db, organizationID, aliases[0].ID, canonicalID, family); err != nil {
+		return uuid.Nil, err
+	}
+	if err := legacyMergedProofContext(db); err != nil {
+		return uuid.Nil, err
+	}
+	return aliases[0].ID, nil
+}
+
+func legacyMergedHistory(db *gorm.DB, organizationID, sourceID, targetID uuid.UUID, family map[uuid.UUID]models.Contact) error {
+	var guarded bool
+	if err := db.Raw(`SELECT count(*) = 1 FROM pg_trigger WHERE tgrelid = to_regclass('customer_activity_events') AND tgname = 'trg_customer_activity_events_append_only' AND NOT tgisinternal AND tgenabled IN ('O','A') AND tgtype = 27 AND tgfoid = to_regprocedure('rereply_reject_customer_activity_mutation()')`).Scan(&guarded).Error; err != nil {
+		return err
+	}
+	if !guarded {
+		return errors.New("legacy merged activity guard is unavailable")
+	}
+	seen := map[uuid.UUID]bool{}
+	for current, depth := sourceID, 0; ; depth++ {
+		if err := legacyMergedProofContext(db); err != nil {
+			return err
+		}
+		if current == targetID {
+			return nil
+		}
+		if depth >= 15 || seen[current] {
+			return errors.New("legacy merged history exceeds proof bound or cycles")
+		}
+		seen[current] = true
+		contact, exists := family[current]
+		if !exists || !contact.DeletedAt.Valid || contact.MergedIntoID == nil || contact.MergedAt == nil || contact.MergedByID == nil || *contact.MergedByID == uuid.Nil {
+			return errors.New("legacy merged history lacks retained source")
+		}
+		var events []models.CustomerActivityEvent
+		if err := db.Select("id, organization_id, contact_id, event_type, category, actor_type, actor_user_id, source_object_type, source_object_id, occurred_at, idempotency_key, "+legacyMergedMetadataSQL).
+			Where(`organization_id = ? AND (source_object_id = ? OR metadata->>'source_contact_id' = ?) AND (event_type = ? OR idempotency_key LIKE 'contact-merge:%' OR (jsonb_exists(metadata, 'source_contact_id') AND jsonb_exists(metadata, 'target_contact_id')))`, organizationID, current, current.String(), models.CustomerActivityContactMerged).
+			Order("id").Limit(2).Find(&events).Error; err != nil {
+			return err
+		}
+		if len(events) != 1 {
+			return errors.New("legacy merged history is missing or ambiguous")
+		}
+		event := events[0]
+		if event.EventType != models.CustomerActivityContactMerged || event.Category != models.CustomerActivityCategoryContact || event.SourceObjectType != "contact" || event.SourceObjectID == nil || *event.SourceObjectID != current || event.ContactID == uuid.Nil || event.ActorType != models.CustomerActivityActorUser || event.ActorUserID == nil || *event.ActorUserID != *contact.MergedByID || !event.OccurredAt.UTC().Truncate(time.Microsecond).Equal(contact.MergedAt.UTC().Truncate(time.Microsecond)) || !strings.HasPrefix(event.IdempotencyKey, "contact-merge:") || strings.TrimSpace(strings.TrimPrefix(event.IdempotencyKey, "contact-merge:")) == "" {
+			return errors.New("legacy merged history contradicts retained source")
+		}
+		source, sourceOK := event.Metadata["source_contact_id"].(string)
+		target, targetOK := event.Metadata["target_contact_id"].(string)
+		if !sourceOK || !targetOK || source != current.String() || target != event.ContactID.String() {
+			return errors.New("legacy merged history metadata mismatch")
+		}
+		if _, exists := family[event.ContactID]; !exists {
+			return errors.New("legacy merged history leaves canonical family")
+		}
+		current = event.ContactID
+	}
+}
+
+func legacyMergedReadError(err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("%w: historical projection dependency is missing", ErrLegacyMetaBridgeConflict)
+	}
+	return err
+}
+
+// ValidateLegacyMergedProjection reads a pre-existing linked projection. It
+// never creates links or treats the supplied evidence as authority.
+func ValidateLegacyMergedProjection(db *gorm.DB, accountRef LegacyMetaAccountRef, message *models.Message, evidence *LegacyMergedProjectionEvidence) (*LegacyMergedProjection, error) {
+	if err := legacyMergedProofContext(db); err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	if message == nil || evidence == nil || message.OrganizationID != accountRef.OrganizationID || evidence.CanonicalContactID == uuid.Nil || accountRef.ID == uuid.Nil || accountRef.OrganizationID == uuid.Nil || evidence.OrganizationID != accountRef.OrganizationID || evidence.AccountID != accountRef.ID || evidence.MessageID != message.ID || evidence.CanonicalContactID != message.ContactID || evidence.WAMID == "" || evidence.WAMID != message.WhatsAppMessageID || message.Direction != models.DirectionOutgoing || message.InboxConversationID == nil || evidence.LegacyContactID == uuid.Nil {
+		return nil, errors.New("legacy merged projection input mismatch")
+	}
+	var native models.WhatsAppAccount
+	if err := db.Select("id, organization_id").Where("organization_id = ? AND id = ?", accountRef.OrganizationID, accountRef.ID).First(&native).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	var messages []models.Message
+	if err := db.Unscoped().Select("id, organization_id, contact_id, whats_app_message_id, direction, inbox_conversation_id, deleted_at").Where("organization_id = ? AND BTRIM(whats_app_message_id) = ?", accountRef.OrganizationID, evidence.WAMID).Limit(2).Find(&messages).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	if len(messages) != 1 || messages[0].DeletedAt.Valid || messages[0].ID != message.ID || messages[0].ContactID != evidence.CanonicalContactID || messages[0].Direction != models.DirectionOutgoing || messages[0].WhatsAppMessageID != evidence.WAMID || messages[0].InboxConversationID == nil || *messages[0].InboxConversationID != *message.InboxConversationID {
+		return nil, errors.New("legacy merged message changed or is ambiguous")
+	}
+	legacyID, err := ProveLegacyMergedAlias(db, accountRef.OrganizationID, evidence.CanonicalContactID, evidence.DirectBSUID, evidence.ParentBSUID)
+	if err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	if legacyID == uuid.Nil || legacyID != evidence.LegacyContactID {
+		return nil, errors.New("legacy merged sender proof changed")
+	}
+	var conversation models.InboxConversation
+	if err := db.Select("id, organization_id, channel_account_id, contact_id, contact_identity_id, channel, external_conversation_id, last_message_at, last_inbound_at, last_outbound_at, service_window_ends_at, deleted_at, "+legacyMergedMetadataSQL).Where("organization_id = ? AND id = ?", accountRef.OrganizationID, *message.InboxConversationID).First(&conversation).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	key := "legacy-contact:" + legacyID.String()
+	if conversation.ContactID != evidence.CanonicalContactID || conversation.Channel != models.ChannelWhatsApp || conversation.ContactIdentityID == nil || conversation.ExternalConversationID != key || conversation.Metadata["legacy_contact_id"] != legacyID.String() {
+		return nil, errors.New("legacy merged conversation proof mismatch")
+	}
+	var shadow models.ChannelAccount
+	if err := db.Select("id, organization_id, channel, provider, external_account_id, "+legacyMergedMetadataSQL).Where("organization_id = ? AND id = ?", accountRef.OrganizationID, conversation.ChannelAccountID).First(&shadow).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	boundID, err := LegacyMetaWhatsAppAccountID(&shadow)
+	if err != nil || boundID != accountRef.ID {
+		return nil, errors.New("legacy merged channel account proof mismatch")
+	}
+	var shadowIDs []uuid.UUID
+	if err := db.Unscoped().Model(&models.ChannelAccount{}).Where("organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?", accountRef.OrganizationID, models.ChannelWhatsApp, LegacyMetaProvider, legacyMetaIDPrefix+"account:"+accountRef.ID.String()).Limit(2).Pluck("id", &shadowIDs).Error; err != nil {
+		return nil, err
+	}
+	if len(shadowIDs) != 1 || shadowIDs[0] != shadow.ID {
+		return nil, errors.New("legacy merged channel account is ambiguous")
+	}
+	var identities []models.ContactIdentity
+	if err := db.Unscoped().Select("id, organization_id, channel_account_id, contact_id, channel, external_id, deleted_at, "+legacyMergedMetadataSQL).Where("organization_id = ? AND channel_account_id = ? AND external_id = ?", accountRef.OrganizationID, shadow.ID, key).Limit(2).Find(&identities).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	if len(identities) != 1 {
+		return nil, errors.New("legacy merged identity is missing or ambiguous")
+	}
+	identity := identities[0]
+	if identity.DeletedAt.Valid || identity.ID != *conversation.ContactIdentityID || identity.ContactID != evidence.CanonicalContactID || identity.Channel != models.ChannelWhatsApp || identity.Metadata["legacy_contact_id"] != legacyID.String() {
+		return nil, errors.New("legacy merged identity proof mismatch")
+	}
+	var conversations []uuid.UUID
+	if err := db.Unscoped().Model(&models.InboxConversation{}).Where("organization_id = ? AND channel_account_id = ? AND external_conversation_id = ?", accountRef.OrganizationID, shadow.ID, key).Limit(2).Pluck("id", &conversations).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	if len(conversations) != 1 || conversations[0] != conversation.ID {
+		return nil, errors.New("legacy merged conversation is ambiguous")
+	}
+	var participants []models.ConversationParticipant
+	if err := db.Unscoped().Select("id, organization_id, conversation_id, role, participant_key, external_id, contact_identity_id, deleted_at, left_at, "+legacyMergedMetadataSQL).Where("organization_id = ? AND conversation_id = ? AND (role = ? OR participant_key = ? OR external_id = ? OR contact_identity_id = ?)", accountRef.OrganizationID, conversation.ID, models.ConversationParticipantRoleCustomer, key, key, identity.ID).Limit(2).Find(&participants).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	if len(participants) != 1 {
+		return nil, errors.New("legacy merged participant is missing or ambiguous")
+	}
+	participant := participants[0]
+	if participant.DeletedAt.Valid || participant.LeftAt != nil || participant.Role != models.ConversationParticipantRoleCustomer || participant.ContactIdentityID == nil || *participant.ContactIdentityID != identity.ID || participant.ParticipantKey != key || participant.ExternalID != key || participant.Metadata["legacy_contact_id"] != legacyID.String() {
+		return nil, errors.New("legacy merged participant proof mismatch")
+	}
+	if evidence.ConversationID != uuid.Nil && evidence.ConversationID != conversation.ID || evidence.IdentityID != uuid.Nil && evidence.IdentityID != identity.ID || evidence.ParticipantID != uuid.Nil && evidence.ParticipantID != participant.ID {
+		return nil, errors.New("legacy merged projection changed during recheck")
+	}
+	if err := legacyMergedProofContext(db); err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	return &LegacyMergedProjection{Conversation: conversation, Identity: identity, Participant: participant}, nil
+}
+
 type LegacyMetaBackfillStats struct {
 	Accounts int
 	Messages int
@@ -512,6 +859,143 @@ func MirrorLegacyWhatsAppMessage(
 		return nil
 	})
 	return result, err
+}
+
+// MirrorLegacyMergedWhatsAppMessage refreshes only an existing historical
+// projection after rereading every supplied selector under the bridge fences.
+// It is separate from the ordinary backfill root, which remains unchanged.
+func MirrorLegacyMergedWhatsAppMessage(
+	db *gorm.DB,
+	accountRef LegacyMetaAccountRef,
+	messageID uuid.UUID,
+	evidence *LegacyMergedProjectionEvidence,
+) (LegacyMetaMirrorResult, error) {
+	var result LegacyMetaMirrorResult
+	if db == nil {
+		return result, errors.New("legacy Meta bridge database is required")
+	}
+	if accountRef.ID == uuid.Nil || accountRef.OrganizationID == uuid.Nil ||
+		strings.TrimSpace(accountRef.Name) == "" || messageID == uuid.Nil {
+		return result, errors.New("legacy Meta bridge account and message identifiers are required")
+	}
+	if evidence == nil {
+		return result, errors.New("legacy merged projection evidence is invalid")
+	}
+	var proofBudget LegacyMergedProjectionBudget
+	bounded, cancel, err := proofBudget.Scope(db)
+	if err != nil {
+		return result, err
+	}
+	defer cancel()
+	db = bounded
+	err = db.Transaction(func(tx *gorm.DB) error {
+		verifiedRef, err := verifiedLegacyMetaAccountRef(tx, accountRef)
+		if err != nil {
+			return err
+		}
+		accountRef = verifiedRef
+		var message models.Message
+		if err := tx.Where("id = ? AND organization_id = ?", messageID, accountRef.OrganizationID).First(&message).Error; err != nil {
+			return fmt.Errorf("load legacy WhatsApp message: %w", err)
+		}
+		if message.WhatsAppAccount != accountRef.Name {
+			return fmt.Errorf("%w: message account does not match the selected legacy account", ErrLegacyMetaBridgeConflict)
+		}
+		var contact models.Contact
+		if err := tx.Where("id = ? AND organization_id = ?", message.ContactID, accountRef.OrganizationID).First(&contact).Error; err != nil {
+			return fmt.Errorf("load legacy WhatsApp contact: %w", err)
+		}
+		account, err := lockLegacyMergedMetaAccount(tx, accountRef, &message)
+		if err != nil {
+			return err
+		}
+		projection, err := mirrorLegacyMergedProjection(tx, accountRef, account, &message, evidence)
+		if err != nil {
+			return err
+		}
+		result.ChannelAccountID = account.ID
+		result.ConversationID = projection.Conversation.ID
+		return nil
+	})
+	return result, err
+}
+
+// The historical path never enters account ensure: ordinary ensure deliberately
+// revives a retained shadow, which cannot establish historical proof. Lock only
+// the existing same-tenant shadow, then the native account in bridge order.
+func lockLegacyMergedMetaAccount(db *gorm.DB, accountRef LegacyMetaAccountRef, message *models.Message) (*models.ChannelAccount, error) {
+	if message == nil || message.InboxConversationID == nil {
+		return nil, errors.New("legacy merged mirror requires an existing link")
+	}
+	var conversation models.InboxConversation
+	if err := db.Select("id, organization_id, channel_account_id").Where("organization_id = ? AND id = ?", accountRef.OrganizationID, *message.InboxConversationID).First(&conversation).Error; err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	if err := LockLegacyMetaOrganizationAndShadow(db, accountRef.OrganizationID, conversation.ChannelAccountID); err != nil {
+		return nil, err
+	}
+	if _, err := verifiedLegacyMetaAccountRefWithLock(db, accountRef, true); err != nil {
+		return nil, legacyMergedReadError(err)
+	}
+	var shadows []models.ChannelAccount
+	if err := db.Unscoped().Select("id, organization_id, channel, provider, external_account_id, deleted_at, last_inbound_at, last_outbound_at, "+legacyMergedMetadataSQL).Where("organization_id = ? AND channel = ? AND provider = ? AND external_account_id = ?", accountRef.OrganizationID, models.ChannelWhatsApp, LegacyMetaProvider, legacyMetaIDPrefix+"account:"+accountRef.ID.String()).Limit(2).Find(&shadows).Error; err != nil {
+		return nil, err
+	}
+	if len(shadows) != 1 || shadows[0].DeletedAt.Valid || shadows[0].ID != conversation.ChannelAccountID {
+		return nil, errors.New("legacy merged shadow is missing, deleted or ambiguous")
+	}
+	boundID, err := LegacyMetaWhatsAppAccountID(&shadows[0])
+	if err != nil || boundID != accountRef.ID {
+		return nil, errors.New("legacy merged shadow binding mismatch")
+	}
+	return &shadows[0], nil
+}
+
+// The historical branch retains all projection keys. In particular it never
+// calls ensureLegacyMetaIdentity/Conversation/Participant with the new target.
+func mirrorLegacyMergedProjection(db *gorm.DB, accountRef LegacyMetaAccountRef, account *models.ChannelAccount, message *models.Message, evidence *LegacyMergedProjectionEvidence) (*LegacyMergedProjection, error) {
+	if evidence == nil || evidence.ConversationID == uuid.Nil || evidence.IdentityID == uuid.Nil || evidence.ParticipantID == uuid.Nil {
+		return nil, errors.New("legacy merged mirror cannot establish a new link")
+	}
+	projection, err := ValidateLegacyMergedProjection(db, accountRef, message, evidence)
+	if err != nil {
+		return nil, err
+	}
+	// Keep the established bridge order: identity, conversation, contact,
+	// message. No caller holding Contact/Message enters this after-commit path.
+	var identity models.ContactIdentity
+	if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).Where("organization_id = ? AND id = ?", accountRef.OrganizationID, projection.Identity.ID).First(&identity).Error; err != nil {
+		return nil, err
+	}
+	var conversation models.InboxConversation
+	if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).Where("organization_id = ? AND id = ?", accountRef.OrganizationID, projection.Conversation.ID).First(&conversation).Error; err != nil {
+		return nil, err
+	}
+	var contact models.Contact
+	if err := db.Clauses(clause.Locking{Strength: "SHARE"}).Where("organization_id = ? AND id = ?", accountRef.OrganizationID, evidence.CanonicalContactID).First(&contact).Error; err != nil {
+		return nil, err
+	}
+	var locked models.Message
+	if err := db.Clauses(clause.Locking{Strength: "UPDATE"}).Where("organization_id = ? AND id = ?", accountRef.OrganizationID, message.ID).First(&locked).Error; err != nil {
+		return nil, err
+	}
+	if locked.WhatsAppAccount != accountRef.Name {
+		return nil, errors.New("legacy merged mirror account changed")
+	}
+	verified, err := ValidateLegacyMergedProjection(db, accountRef, &locked, evidence)
+	if err != nil {
+		return nil, err
+	}
+	if verified.Conversation.ChannelAccountID != account.ID || verified.Identity.ID != identity.ID || verified.Conversation.ID != conversation.ID || verified.Participant.ID != projection.Participant.ID {
+		return nil, errors.New("legacy merged mirror projection changed")
+	}
+	if err := refreshLegacyMetaConversation(db, &verified.Conversation, account, &contact, &locked); err != nil {
+		return nil, err
+	}
+	if err := legacyMergedProofContext(db); err != nil {
+		return nil, err
+	}
+	return verified, nil
 }
 
 // MarkLegacyWhatsAppConversationRead mirrors the established contact-level read
