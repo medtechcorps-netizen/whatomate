@@ -92,6 +92,17 @@ func (a *App) ListUsers(r *fastglue.Request) error {
 	if err != nil {
 		return nil
 	}
+	// A pinned directory must never fall back to the JWT workspace if access
+	// to the selected organization was revoked while the picker was open.
+	if len(r.RequestCtx.Request.Header.Peek("X-Organization-ID")) > 0 {
+		selectedOrgID, err := a.requireExplicitOrganization(r)
+		if err != nil {
+			return nil
+		}
+		if selectedOrgID != orgID {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+		}
+	}
 
 	pg := parsePagination(r)
 	search := string(r.RequestCtx.QueryArgs().Peek("search"))
@@ -138,7 +149,7 @@ func (a *App) ListUsers(r *fastglue.Request) error {
 	countQuery.Model(&models.User{}).Count(&total)
 
 	var users []models.User
-	if err := pg.Apply(dataQuery.Order("users.created_at DESC")).
+	if err := pg.Apply(dataQuery.Order("users.created_at DESC, users.id DESC")).
 		Find(&users).Error; err != nil {
 		a.Log.Error("Failed to list users", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list users", nil, "")

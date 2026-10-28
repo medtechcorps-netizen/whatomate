@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
   markRead: vi.fn(),
   assignableMembers: vi.fn(),
   fetchUsers: vi.fn(),
+  listUsers: vi.fn(),
   refreshUnread: vi.fn(),
   toastError: vi.fn(),
   infiniteControllers: [] as Array<{
@@ -185,6 +186,7 @@ vi.mock('@/services/websocket', () => ({
   wsService: { setCurrentContact: vi.fn() },
 }))
 vi.mock('@/services/api', () => ({
+  usersService: { list: mocks.listUsers },
   effectiveAIIsAllowed: () => true,
   contactsService: {
     getSessionData: vi.fn().mockRejectedValue(new Error('not configured')),
@@ -225,11 +227,19 @@ function laneDContact(id: string, overrides: Record<string, unknown> = {}) {
   }
 }
 
-function mountChatView() {
+function mountChatView(renderDialogs = false) {
   return shallowMount(ChatViewComponent, {
     global: {
       mocks: { $t: (key: string, fallback?: string) => fallback ?? key },
       stubs: {
+        ...(renderDialogs ? {
+          Dialog: { props: ['open'], template: '<div v-if="open" data-testid="open-dialog"><slot /></div>' },
+          DialogContent: { template: '<div><slot /></div>' },
+          DialogHeader: { template: '<div><slot /></div>' },
+          DialogTitle: { template: '<h2><slot /></h2>' },
+          DialogDescription: { template: '<p><slot /></p>' },
+          Input: { props: ['modelValue'], emits: ['update:modelValue'], template: '<input :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />' },
+        } : {}),
         ScrollArea: { template: '<div><slot /></div>' },
         Transition: { template: '<div><slot /></div>' },
         Teleport: true,
@@ -282,7 +292,8 @@ describe('ChatView inbox state', () => {
     mocks.markRead.mockResolvedValue({ data: { data: { cursor_synced: true } } })
     mocks.markContactReadState.mockResolvedValue(undefined)
     mocks.fetchUsers.mockResolvedValue(undefined)
-    mocks.assignableMembers.mockResolvedValue({ data: { data: { members: [], total: 0 } } })
+    mocks.listUsers.mockResolvedValue({ data: { data: { users: [], total: 0, page: 1, limit: 100 } } })
+    mocks.assignableMembers.mockResolvedValue({ data: { data: { members: [], total: 0, page: 1, limit: 100 } } })
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
       callback(0)
       return 1
@@ -364,8 +375,85 @@ describe('ChatView inbox state', () => {
   it('keeps the users list for callers with users:read', async () => {
     grant('contacts:write', 'users:read', 'organizations:read')
     await mountSettled()
-    expect(mocks.fetchUsers).toHaveBeenCalledTimes(1)
+    expect(mocks.listUsers).toHaveBeenCalledTimes(1)
+    expect(mocks.fetchUsers).not.toHaveBeenCalled()
     expect(mocks.assignableMembers).not.toHaveBeenCalled()
+  })
+
+  async function openAssignmentDialog() {
+    wrapper = mountChatView(true)
+    await flushPromises()
+    await wrapper.get('[aria-label="chat.assignToAgent"]').trigger('click')
+    return wrapper.get('[data-testid="open-dialog"]')
+  }
+
+  it('initializes on opening Assign after permission is granted following mount', async () => {
+    wrapper = mountChatView(true)
+    await flushPromises()
+    expect(mocks.assignableMembers).not.toHaveBeenCalled()
+    expect(mocks.listUsers).not.toHaveBeenCalled()
+    mocks.assignableMembers.mockResolvedValueOnce({ data: { data: {
+      members: [{ user_id: 'newly-visible', full_name: 'Newly Visible Person', is_active: true }], total: 1, page: 1, limit: 100,
+    } } })
+    grant('contacts:write', 'organizations:read')
+    await nextTick()
+    expect(mocks.assignableMembers).not.toHaveBeenCalled()
+    await wrapper.get('[aria-label="chat.assignToAgent"]').trigger('click')
+    await flushPromises()
+    expect(mocks.assignableMembers).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="open-dialog"]').text()).toContain('Newly Visible Person')
+  })
+
+  it('keeps Load more available after a full inactive page and exposes the later active person', async () => {
+    grant('contacts:write', 'organizations:read')
+    mocks.assignableMembers.mockResolvedValueOnce({ data: { data: {
+      members: Array.from({ length: 100 }, (_, index) => ({ user_id: `inactive-${index}`, full_name: 'Inactive', is_active: false })),
+      total: 101, page: 1, limit: 100,
+    } } }).mockResolvedValueOnce({ data: { data: {
+      members: [{ user_id: 'later', full_name: 'Later Active Person', is_active: true }], total: 101, page: 2, limit: 100,
+    } } })
+    const dialog = await openAssignmentDialog()
+    expect(dialog.text()).not.toContain('chat.noUsersFound')
+    expect(dialog.get('[role="status"]').text()).toBe('chat.assignUsersMore')
+    await dialog.findAll('button').find(button => button.text() === 'chat.loadMore')!.trigger('click')
+    await flushPromises()
+    expect(dialog.text()).toContain('Later Active Person')
+    expect(dialog.text()).not.toContain('chat.loadMore')
+  })
+
+  it('shows an accessible failure and retry instead of no users when a later page fails', async () => {
+    grant('contacts:write', 'users:read')
+    mocks.listUsers.mockResolvedValueOnce({ data: { data: {
+      users: Array.from({ length: 100 }, (_, index) => ({ id: `user-${index}`, full_name: `Person ${index}`, is_active: true })),
+      total: 101, page: 1, limit: 100,
+    } } }).mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce({ data: { data: {
+      users: [{ id: 'retry', full_name: 'Retry Person', is_active: true }], total: 1, page: 1, limit: 100,
+    } } })
+    const dialog = await openAssignmentDialog()
+    await dialog.findAll('button').find(button => button.text() === 'chat.loadMore')!.trigger('click')
+    await flushPromises()
+    expect(dialog.get('[role="alert"]').text()).toBe('chat.assignUsersLoadFailed')
+    expect(dialog.text()).not.toContain('Person 0')
+    expect(dialog.text()).not.toContain('chat.noUsersFound')
+    await dialog.findAll('button').find(button => button.text() === 'common.retry')!.trigger('click')
+    await flushPromises()
+    expect(mocks.listUsers.mock.calls[2][0].page).toBe(1)
+    expect(dialog.text()).toContain('Retry Person')
+  })
+
+  it('uses the labelled search field to find a person outside the loaded directory page', async () => {
+    grant('contacts:write', 'organizations:read')
+    mocks.assignableMembers.mockResolvedValueOnce({ data: { data: { members: [], total: 0, page: 1, limit: 100 } } })
+      .mockResolvedValueOnce({ data: { data: {
+        members: [{ user_id: 'target', full_name: 'Target Person', is_active: true }], total: 1, page: 1, limit: 100,
+      } } })
+    const dialog = await openAssignmentDialog()
+    await dialog.get('input[aria-label="chat.searchUsers"]').setValue('Target')
+    expect(dialog.get('[role="status"]').text()).toBe('common.loading')
+    await vi.advanceTimersByTimeAsync(250)
+    await flushPromises()
+    expect(mocks.assignableMembers.mock.calls[1][0]).toEqual({ page: 1, limit: 100, search: 'Target' })
+    expect(dialog.text()).toContain('Target Person')
   })
 
   it('marks a row read and refreshes the navbar unread count', async () => {
