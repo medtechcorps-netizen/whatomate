@@ -230,10 +230,12 @@ type whatsAppMessageLookup struct {
 }
 
 type whatsAppMessageResolution struct {
-	Message          models.Message
-	Contact          models.Contact
-	IncomingActivity bool
-	Continuation     *models.ScheduledJob
+	Message                models.Message
+	Contact                models.Contact
+	IncomingActivity       bool
+	Continuation           *models.ScheduledJob
+	LegacyAliasMatched     bool
+	LegacyMergedProjection *channelapi.LegacyMergedProjectionEvidence
 }
 
 var errWhatsAppMessageOwnerDeleted = errors.New("WhatsApp message owner is soft-deleted")
@@ -253,6 +255,7 @@ type whatsAppMessageAuthority struct {
 	account               models.WhatsAppAccount
 	channelIDs            map[uuid.UUID]bool
 	accessTokenGeneration [sha256.Size]byte
+	legacyProofBudget     *channelapi.LegacyMergedProjectionBudget
 }
 
 // prepareWhatsAppMessageAuthority must precede state/contact/message locks.
@@ -306,7 +309,7 @@ func (a *App) prepareWhatsAppMessageAuthority(account *models.WhatsAppAccount) e
 	}
 	tokenGeneration := sha256.Sum256([]byte(current.AccessToken))
 	a.decryptAccountSecrets(&current)
-	authority := &whatsAppMessageAuthority{pool: a.DB.Statement.ConnPool, account: current, channelIDs: channelIDs, accessTokenGeneration: tokenGeneration}
+	authority := &whatsAppMessageAuthority{pool: a.DB.Statement.ConnPool, account: current, channelIDs: channelIDs, accessTokenGeneration: tokenGeneration, legacyProofBudget: &channelapi.LegacyMergedProjectionBudget{}}
 	a.DB = a.DB.WithContext(context.WithValue(a.DB.Statement.Context, whatsAppMessageAuthorityKey{}, authority))
 	*account = current
 	return nil
@@ -407,13 +410,68 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 			return nil, errors.New("WhatsApp message canonical contact mismatch")
 		}
 	}
+	var legacyEvidence *channelapi.LegacyMergedProjectionEvidence
+	historicalEligible := !reviewRouted && message.Direction == models.DirectionOutgoing && !lookup.continuationValidation && strings.TrimSpace(lookup.Identity.UserID) != ""
+	var legacyCancel func()
+	defer func() {
+		if legacyCancel != nil {
+			legacyCancel()
+		}
+	}()
+	// Identity mismatch and an old joined projection use one lazy proof path.
+	// A current target that already owns the same BSUID still needs the full
+	// historical S/T proof to corroborate its retained old projection keys.
+	proveLegacyProjection := func() error {
+		if legacyEvidence != nil {
+			return nil
+		}
+		if !historicalEligible {
+			return errors.New("WhatsApp message joined historical contact proof is missing")
+		}
+		budget := &channelapi.LegacyMergedProjectionBudget{}
+		if owner, ok := a.DB.Statement.Context.Value(whatsAppMessageAuthorityKey{}).(*whatsAppMessageAuthority); ok && owner.pool == a.DB.Statement.ConnPool && owner.account.ID == account.ID && owner.account.OrganizationID == account.OrganizationID {
+			if owner.legacyProofBudget == nil {
+				return errors.New("legacy merged proof lacks transaction budget")
+			}
+			budget = owner.legacyProofBudget
+		}
+		bounded, cancel, err := budget.Scope(a.DB)
+		if err != nil {
+			return err
+		}
+		legacyCancel = cancel
+		// Scope only this resolver; the transaction's authority retains the
+		// lazy deadline for subsequent messages and its recursive recheck.
+		a = a.scopedApp(bounded, account.OrganizationID)
+		legacyID, err := channelapi.ProveLegacyMergedAlias(a.DB, account.OrganizationID, canonical.ID,
+			strings.TrimSpace(lookup.Identity.UserID), strings.TrimSpace(lookup.Identity.ParentUserID))
+		if err != nil {
+			return err
+		}
+		if legacyID == uuid.Nil {
+			return errors.New("WhatsApp message sender user identity mismatch")
+		}
+		legacyEvidence = &channelapi.LegacyMergedProjectionEvidence{
+			OrganizationID: account.OrganizationID, AccountID: account.ID, MessageID: message.ID,
+			CanonicalContactID: canonical.ID, LegacyContactID: legacyID, WAMID: message.WhatsAppMessageID,
+			DirectBSUID: strings.TrimSpace(lookup.Identity.UserID), ParentBSUID: strings.TrimSpace(lookup.Identity.ParentUserID),
+		}
+		return nil
+	}
 	if !reviewRouted {
-		if err := a.validateWhatsAppMessageContactIdentity(account.OrganizationID, canonical, lookup.Identity); err != nil {
+		needsAlias, err := a.validateWhatsAppMessageContactIdentity(account.OrganizationID, canonical, lookup.Identity,
+			message.Direction == models.DirectionOutgoing && !lookup.continuationValidation)
+		if err != nil {
 			return nil, err
+		}
+		if needsAlias {
+			if err := proveLegacyProjection(); err != nil {
+				return nil, err
+			}
 		}
 	}
 	proven := message.ID == deterministicID
-	result := &whatsAppMessageResolution{Message: message, Contact: *canonical}
+	result := &whatsAppMessageResolution{Message: message, Contact: *canonical, LegacyAliasMatched: legacyEvidence != nil}
 	for _, activity := range activities {
 		if activity.IdempotencyKey != activityKey || activity.SourceObjectType != "message" || activity.SourceObjectID == nil || *activity.SourceObjectID != message.ID ||
 			activity.EventType != models.CustomerActivityMessageIncoming || activity.Category != models.CustomerActivityCategoryMessage || message.Direction != models.DirectionIncoming {
@@ -431,9 +489,9 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 			return nil, errors.New("conflicting WhatsApp continuation provenance")
 		}
 		if !reviewRouted {
-			if err := a.validateWhatsAppMessageContactIdentity(account.OrganizationID, canonical, coexistenceContactIdentity{
+			if _, err := a.validateWhatsAppMessageContactIdentity(account.OrganizationID, canonical, coexistenceContactIdentity{
 				Phone: inbound.From, UserID: inbound.FromUserID, ParentUserID: inbound.FromParentUserID,
-			}); err != nil {
+			}, false); err != nil {
 				return nil, err
 			}
 		} else if normalizeIdentityReviewPhone(inbound.From) != normalizeIdentityReviewPhone(lookup.Identity.Phone) ||
@@ -452,17 +510,23 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		var conversation models.InboxConversation
 		conversationQuery := a.DB.Where("id = ? AND organization_id = ?", *message.InboxConversationID, account.OrganizationID)
 		if err := conversationQuery.First(&conversation).Error; err != nil {
+			if historicalEligible && errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("WhatsApp historical projection dependency is missing")
+			}
 			return nil, err
 		}
 		if conversation.Channel != models.ChannelWhatsApp || conversation.ContactIdentityID == nil {
 			return nil, errors.New("WhatsApp message conversation provider mismatch")
 		}
 		linkedContact, err := contactutil.ResolveCanonicalContact(a.DB, account.OrganizationID, conversation.ContactID)
-		if err != nil || linkedContact.ID != canonical.ID || conversation.ExternalConversationID != "legacy-contact:"+conversation.ContactID.String() {
+		if err != nil || linkedContact.ID != canonical.ID {
 			return nil, errors.New("WhatsApp message conversation contact mismatch")
 		}
 		var shadow models.ChannelAccount
 		if err := a.DB.Where("id = ? AND organization_id = ?", conversation.ChannelAccountID, account.OrganizationID).First(&shadow).Error; err != nil {
+			if historicalEligible && errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("WhatsApp historical projection dependency is missing")
+			}
 			return nil, err
 		}
 		boundID, err := channelapi.LegacyMetaWhatsAppAccountID(&shadow)
@@ -475,11 +539,31 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		var linkedIdentity models.ContactIdentity
 		if err := a.DB.Where("id = ? AND organization_id = ? AND channel_account_id = ? AND channel = ?",
 			*conversation.ContactIdentityID, account.OrganizationID, shadow.ID, models.ChannelWhatsApp).First(&linkedIdentity).Error; err != nil {
+			if historicalEligible && errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("WhatsApp historical projection dependency is missing")
+			}
 			return nil, err
 		}
 		identityContact, err := contactutil.ResolveCanonicalContact(a.DB, account.OrganizationID, linkedIdentity.ContactID)
-		if err != nil || identityContact.ID != canonical.ID || linkedIdentity.ExternalID != "legacy-contact:"+conversation.ContactID.String() {
+		if err != nil || identityContact.ID != canonical.ID {
 			return nil, errors.New("WhatsApp message joined contact identity mismatch")
+		}
+		key := "legacy-contact:" + conversation.ContactID.String()
+		if conversation.ExternalConversationID != key || linkedIdentity.ExternalID != key {
+			if err := proveLegacyProjection(); err != nil {
+				return nil, err
+			}
+			result.LegacyAliasMatched = true
+			projection, err := channelapi.ValidateLegacyMergedProjection(a.DB, channelapi.LegacyMetaAccountRef{
+				ID: account.ID, OrganizationID: account.OrganizationID, Name: currentAccount.Name,
+			}, &message, legacyEvidence)
+			if err != nil {
+				return nil, err
+			}
+			legacyEvidence.ConversationID = projection.Conversation.ID
+			legacyEvidence.IdentityID = projection.Identity.ID
+			legacyEvidence.ParticipantID = projection.Participant.ID
+			result.LegacyMergedProjection = legacyEvidence
 		}
 		proven = true
 	}
@@ -506,6 +590,9 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		verified, err := a.resolveWhatsAppMessage(account, recheck)
 		if err != nil {
 			return nil, err
+		}
+		if result.LegacyMergedProjection != nil && (verified.LegacyMergedProjection == nil || *result.LegacyMergedProjection != *verified.LegacyMergedProjection) {
+			return nil, errors.New("WhatsApp historical projection changed during locked proof")
 		}
 		result = verified
 		if lookup.RepairProjection && result.Message.WhatsAppAccount != currentAccount.Name {
@@ -692,27 +779,27 @@ func (a *App) enrichProvenWhatsAppMessageBSUID(account *models.WhatsAppAccount, 
 // Contact identity corroborates a separately proven account/message binding; it
 // is never an account proof itself. Historical sender aliases remain legitimate
 // only when their existing merge chain reaches the same canonical contact.
-func (a *App) validateWhatsAppMessageContactIdentity(orgID uuid.UUID, canonical *models.Contact, identity coexistenceContactIdentity) error {
+func (a *App) validateWhatsAppMessageContactIdentity(orgID uuid.UUID, canonical *models.Contact, identity coexistenceContactIdentity, allowMergedLegacyAlias bool) (bool, error) {
 	if canonical == nil || canonical.OrganizationID != orgID {
-		return errors.New("WhatsApp message canonical contact is missing")
+		return false, errors.New("WhatsApp message canonical contact is missing")
 	}
 	phone := normalizeCoexistencePhone(identity.Phone)
 	if phone != "" && phone != normalizeCoexistencePhone(canonical.PhoneNumber) {
 		var aliases []models.Contact
 		if err := a.DB.Unscoped().Where("organization_id = ? AND phone_number IN ?", orgID, []string{phone, "+" + phone}).Find(&aliases).Error; err != nil {
-			return err
+			return false, err
 		}
 		// A BSUID placeholder may acquire its first real phone, but an existing
 		// phone belonging to a different canonical contact is not that proof.
 		placeholderReveal := isCoexistencePlaceholderPhone(canonical.PhoneNumber) &&
 			identity.primaryUserID() != "" && canonical.BSUID == identity.primaryUserID()
 		if len(aliases) == 0 && !placeholderReveal {
-			return errors.New("WhatsApp message sender phone mismatch")
+			return false, errors.New("WhatsApp message sender phone mismatch")
 		}
 		for _, alias := range aliases {
 			resolved, err := contactutil.ResolveCanonicalContact(a.DB, orgID, alias.ID)
 			if err != nil || resolved.ID != canonical.ID {
-				return errors.New("WhatsApp message sender phone canonical mismatch")
+				return false, errors.New("WhatsApp message sender phone canonical mismatch")
 			}
 		}
 	}
@@ -724,22 +811,41 @@ func (a *App) validateWhatsAppMessageContactIdentity(orgID uuid.UUID, canonical 
 		}
 		var aliases []models.Contact
 		if err := a.DB.Unscoped().Where("organization_id = ? AND bs_uid IN ?", orgID, identifiers).Find(&aliases).Error; err != nil {
-			return err
+			return false, err
 		}
 		matched := canonical.BSUID == userID || (parentID != "" && canonical.BSUID == parentID) ||
 			coexistenceLegacyBSUIDPhoneContact(canonical, userID)
 		for _, alias := range aliases {
 			resolved, err := contactutil.ResolveCanonicalContact(a.DB, orgID, alias.ID)
 			if err != nil || resolved.ID != canonical.ID {
-				return errors.New("WhatsApp message sender user canonical mismatch")
+				return false, errors.New("WhatsApp message sender user canonical mismatch")
 			}
 			matched = true
 		}
 		if !matched && !canEnrichProvenWhatsAppMessageBSUID(canonical, identity) {
-			return errors.New("WhatsApp message sender user identity mismatch")
+			if allowMergedLegacyAlias {
+				return true, nil
+			}
+			return false, errors.New("WhatsApp message sender user identity mismatch")
 		}
 	}
-	return nil
+	return false, nil
+}
+
+// proveMergedLegacyWhatsAppMessageAlias is the bounded read-only fixture and
+// diagnostic entry point. Production uses its transaction-owned shared budget.
+func (a *App) proveMergedLegacyWhatsAppMessageAlias(orgID uuid.UUID, canonical *models.Contact, identity coexistenceContactIdentity) (bool, error) {
+	if a == nil || canonical == nil || canonical.OrganizationID != orgID {
+		return false, errors.New("legacy merged alias scope is incomplete")
+	}
+	budget := &channelapi.LegacyMergedProjectionBudget{}
+	db, cancel, err := budget.Scope(a.DB)
+	if err != nil {
+		return false, err
+	}
+	defer cancel()
+	id, err := channelapi.ProveLegacyMergedAlias(db, orgID, canonical.ID, strings.TrimSpace(identity.UserID), strings.TrimSpace(identity.ParentUserID))
+	return id != uuid.Nil, err
 }
 
 // contactHasDialablePhone reports whether a contact can be addressed by its
