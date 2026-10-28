@@ -136,6 +136,9 @@ export const useContactsStore = defineStore('contacts', () => {
   const currentContact = ref<Contact | null>(null)
   const messages = ref<Message[]>([])
   const isLoading = ref(false)
+  const contactListError = ref<'refresh' | 'more' | null>(null)
+  let failedContactListParams: Parameters<typeof contactsService.list>[0]
+  let failedContactListQuery: string | null = null
   const isLoadingMessages = ref(false)
   const isLoadingOlderMessages = ref(false)
   const hasMoreMessages = ref(false)
@@ -247,6 +250,9 @@ export const useContactsStore = defineStore('contacts', () => {
     contactsPage.value = 1
     contactsTotal.value = 0
     isLoading.value = false
+    contactListError.value = null
+    failedContactListParams = undefined
+    failedContactListQuery = null
     isLoadingMoreContacts.value = false
     isLoadingMessages.value = false
     isLoadingOlderMessages.value = false
@@ -265,6 +271,13 @@ export const useContactsStore = defineStore('contacts', () => {
 
   // Every list refresh (realtime, catch-up poll, search, tags, read
   // acknowledgement) inherits the active filter unless a caller overrides it.
+  function contactListQuerySnapshot() {
+    return JSON.stringify([
+      normalizeContactSearch(searchQuery.value), selectedTags.value,
+      listFilter.value, contactsLimit.value,
+    ])
+  }
+
   async function fetchContacts(params?: {
     search?: string
     page?: number
@@ -276,6 +289,7 @@ export const useContactsStore = defineStore('contacts', () => {
     const loadGeneration = ++contactLoadGeneration
     const identity = identityGeneration
     const organizationScope = activeOrganizationScope.value
+    const querySnapshot = contactListQuerySnapshot()
     contactLoadAbortController?.abort()
     moreContactsLoadGeneration++
     moreContactsLoadAbortController?.abort()
@@ -284,6 +298,9 @@ export const useContactsStore = defineStore('contacts', () => {
     const controller = new AbortController()
     contactLoadAbortController = controller
     isLoading.value = true
+    contactListError.value = null
+    failedContactListParams = undefined
+    failedContactListQuery = null
     try {
       const tagsParam = selectedTags.value.length > 0 ? selectedTags.value.join(',') : undefined
       const currentSearch = normalizeContactSearch(searchQuery.value) || undefined
@@ -317,6 +334,9 @@ export const useContactsStore = defineStore('contacts', () => {
         organizationScope === activeOrganizationScope.value &&
         !isAbortError(error)
       ) {
+        contactListError.value = 'refresh'
+        failedContactListParams = params ? { ...params } : undefined
+        failedContactListQuery = querySnapshot
         console.error('Failed to fetch contacts:', error)
       }
     } finally {
@@ -328,11 +348,14 @@ export const useContactsStore = defineStore('contacts', () => {
   }
 
   async function loadMoreContacts() {
-    if (isLoading.value || isLoadingMoreContacts.value || !hasMoreContacts.value) return
+    // A failed page waits for an explicit retry, rather than another scroll
+    // observer notification repeatedly requesting the same failing page.
+    if (contactListError.value || isLoading.value || isLoadingMoreContacts.value || !hasMoreContacts.value) return
 
     const loadGeneration = ++moreContactsLoadGeneration
     const identity = identityGeneration
     const organizationScope = activeOrganizationScope.value
+    const querySnapshot = contactListQuerySnapshot()
     moreContactsLoadAbortController?.abort()
     const controller = new AbortController()
     moreContactsLoadAbortController = controller
@@ -371,6 +394,8 @@ export const useContactsStore = defineStore('contacts', () => {
         organizationScope === activeOrganizationScope.value &&
         !isAbortError(error)
       ) {
+        contactListError.value = 'more'
+        failedContactListQuery = querySnapshot
         console.error('Failed to load more contacts:', error)
       }
     } finally {
@@ -379,6 +404,28 @@ export const useContactsStore = defineStore('contacts', () => {
         if (moreContactsLoadAbortController === controller) moreContactsLoadAbortController = null
       }
     }
+  }
+
+  async function retryContactList() {
+    if (!contactListError.value || isLoading.value || isLoadingMoreContacts.value) return
+    const phase = contactListError.value
+    const params = failedContactListParams
+    const queryChanged = failedContactListQuery !== contactListQuerySnapshot()
+    contactListError.value = null
+    failedContactListParams = undefined
+    failedContactListQuery = null
+    if (queryChanged) {
+      // Search input changes before its debounced fetch starts. A retry in
+      // that window must not replay old explicit params or append a new
+      // query's page two to the previous query's cached rows.
+      searchDebounceGeneration++
+      if (searchDebounceHandle !== null) {
+        clearTimeout(searchDebounceHandle)
+        searchDebounceHandle = null
+      }
+      await fetchContacts()
+    } else if (phase === 'more') await loadMoreContacts()
+    else await fetchContacts(params)
   }
 
   async function fetchContact(id: string) {
@@ -832,6 +879,8 @@ export const useContactsStore = defineStore('contacts', () => {
     messages,
     messagesOrganizationScope,
     isLoading,
+    contactListError,
+    retryContactList,
     isLoadingMessages,
     isLoadingOlderMessages,
     hasMoreMessages,

@@ -364,6 +364,7 @@
     "conversations": "Conversations",
     "messages": "Messages",
     "noContacts": "No contacts found",
+    "contactListUnavailable": "Unable to load chats. Please try again.",
     "noMessages": "No messages yet",
     "loadMore": "Load more",
     "typeMessage": "Type a message",
