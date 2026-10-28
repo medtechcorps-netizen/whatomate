@@ -597,6 +597,7 @@ func TestApp_SwitchOrg_Success(t *testing.T) {
 	})
 	testutil.SetPathParam(req, "user_id", user.ID)
 
+	switchAttachRegisteredCredentials(t, app, req, user)
 	err := app.SwitchOrg(req)
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
@@ -631,6 +632,7 @@ func TestApp_SwitchOrg_SuperAdmin(t *testing.T) {
 	})
 	testutil.SetPathParam(req, "user_id", superAdmin.ID)
 
+	switchAttachRegisteredCredentials(t, app, req, superAdmin)
 	err := app.SwitchOrg(req)
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
@@ -650,6 +652,7 @@ func TestApp_SwitchOrg_NotMember(t *testing.T) {
 	})
 	testutil.SetPathParam(req, "user_id", user.ID)
 
+	switchAttachRegisteredCredentials(t, app, req, user)
 	err := app.SwitchOrg(req)
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(req))
@@ -667,6 +670,7 @@ func TestApp_SwitchOrg_OrgNotFound(t *testing.T) {
 	})
 	testutil.SetPathParam(req, "user_id", user.ID)
 
+	switchAttachRegisteredCredentials(t, app, req, user)
 	err := app.SwitchOrg(req)
 	require.NoError(t, err)
 	assert.Equal(t, fasthttp.StatusNotFound, testutil.GetResponseStatusCode(req))

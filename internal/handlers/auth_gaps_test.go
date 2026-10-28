@@ -60,6 +60,8 @@ func TestApp_SwitchOrg_AccessTokenCarriesUserOrgRole(t *testing.T) {
 		"organization_id": targetOrg.ID.String(),
 	})
 	testutil.SetPathParam(req, "user_id", user.ID)
+	jti := laneASeedRefreshJTI(t, app.Redis, user.ID)
+	switchAttachCredentials(t, req, user, generateRefreshTokenWithJTI(t, testutil.TestJWTSecret, user, jti, time.Hour))
 
 	require.NoError(t, app.SwitchOrg(req))
 	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))

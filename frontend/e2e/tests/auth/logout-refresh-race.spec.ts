@@ -1139,10 +1139,12 @@ test.describe('Logout during a token refresh', () => {
       await other.goto('/profile', { waitUntil: 'domcontentloaded' })
       const refreshes = countRefreshes(other)
       const switchingTabRefreshes = countRefreshes(page)
+      const oldRefresh = await cookieValue(context, 'whm_refresh')
+      expect(oldRefresh).toBeTruthy()
 
       // This tab switches to the second organization; the answer is held.
       const order: string[] = []
-      const held = await holdResponse(page, '/auth/switch-org', newContext, order, 'switch landed')
+      const held = await holdResponse(page, '/auth/refresh/switch-org', newContext, order, 'switch landed')
       await page.getByTestId('organization-switcher').click()
       await page.getByRole('option', { name: secondOrg.name }).click()
       await held.ready
@@ -1173,6 +1175,19 @@ test.describe('Logout during a token refresh', () => {
       }
       const me = await page.request.get('/api/me')
       expect((await me.json()).data.organization_id).toBe(secondOrg.id)
+      // Probe the old credential in an isolated jar: its rejection must not
+      // clear or replace the browser's successful switch cookies.
+      const replay = await newContext()
+      try {
+        const rejected = await replay.post('/api/auth/refresh', {
+          headers: { Cookie: `whm_refresh=${oldRefresh}` },
+          data: {},
+        })
+        expect(rejected.status()).toBe(401)
+      } finally {
+        await replay.dispose()
+      }
+      expect(await cookieValue(context, 'whm_refresh')).toBe(held.cookies().whm_refresh)
     })
 
     test('without Web Locks an org switch is refused, says why, and sends nothing', async ({ page, context }) => {
@@ -1187,7 +1202,7 @@ test.describe('Logout during a token refresh', () => {
       expect(await other.evaluate(() => !!navigator.locks)).toBe(false)
       const switches: string[] = []
       other.on('request', (request) => {
-        if (request.url().includes('/api/auth/switch-org')) switches.push(request.url())
+        if (request.url().includes('/api/auth/refresh/switch-org')) switches.push(request.url())
       })
       let reloaded = false
       other.on('load', () => {
@@ -1410,7 +1425,7 @@ test.describe('Logout during a token refresh', () => {
     const onArrival = await unsupportedMessages(other)
     const issuing: string[] = []
     other.on('request', (request) => {
-      if (/\/api\/auth\/(login|register|switch-org|sso\/[^/]+\/init)/.test(request.url())) issuing.push(request.url())
+      if (/\/api\/auth\/(login|register|switch-org|refresh\/switch-org|sso\/[^/]+\/init)/.test(request.url())) issuing.push(request.url())
     })
 
     // A password sign-in as B is refused before anything is sent (or cleared).
