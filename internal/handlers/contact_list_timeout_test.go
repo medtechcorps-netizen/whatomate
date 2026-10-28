@@ -63,12 +63,19 @@ func TestContactListStateDriverCancellationIsRetryable(t *testing.T) {
 					// Pin a connection so pg_locks identifies this exact request in
 					// both the outer-transaction and non-RLS paths.
 					done <- db.WithContext(requestCtx).Connection(func(conn *gorm.DB) error {
+						// Connection supplies an initialized statement. Keep its pinned
+						// connection/context, but do not leak the PID scan destination
+						// into the handler's subsequent authority and contact queries.
+						conn = conn.Session(&gorm.Session{NewDB: true})
 						var backendPID int
 						if err := conn.Raw("SELECT pg_backend_pid()").Scan(&backendPID).Error; err != nil {
 							return err
 						}
-						pid <- backendPID
 						app := &App{DB: conn, Config: &config.Config{Database: config.DatabaseConfig{RLSEnabled: rls}}, Log: testutil.NopLogger()}
+						if !app.HasPermission(reader.ID, "contacts", "read", org.ID) {
+							return fmt.Errorf("fixture reader lacks contacts:read on the pinned connection")
+						}
+						pid <- backendPID
 						return app.Tenant(func(scoped *App, r *fastglue.Request) error {
 							scoped.afterTenantCommit(func() { committed.Store(true) })
 							return scoped.ListContacts(r)
@@ -86,12 +93,19 @@ func TestContactListStateDriverCancellationIsRetryable(t *testing.T) {
 				}
 				// A SQL lock, not a fabricated callback error or a sleeping handler,
 				// keeps the actual state query in the driver until cancellation.
+				// Match its transfer projection too: the earlier contact Count can
+				// also touch this table when the fixture lacks contacts:read.
 				require.Eventually(t, func() bool {
 					observeCtx, stop := context.WithTimeout(context.Background(), time.Second)
 					defer stop()
 					var waiting bool
 					err := db.WithContext(observeCtx).Raw(`SELECT EXISTS (
-						SELECT 1 FROM pg_locks WHERE pid = ? AND relation = 'agent_transfers'::regclass AND NOT granted
+						SELECT 1 FROM pg_locks AS held
+						JOIN pg_stat_activity AS activity ON activity.pid = held.pid
+						WHERE held.pid = ? AND held.relation = 'agent_transfers'::regclass AND NOT held.granted
+						  AND activity.state = 'active'
+						  AND regexp_replace(activity.query, '[[:space:]"]', '', 'g')
+						      LIKE 'SELECTid,contact_id,agent_id,transferred_atFROMagent_transfersWHERE%'
 					)`, backendPID).Scan(&waiting).Error
 					return err == nil && waiting
 				}, 3*time.Second, 20*time.Millisecond, "request never reached the locked state query")
