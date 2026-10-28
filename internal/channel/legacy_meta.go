@@ -101,7 +101,7 @@ func legacyMergedBSUID(value string) bool {
 			return false
 		}
 		for _, ch := range part {
-			if !(ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9') {
+			if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') {
 				return false
 			}
 		}
