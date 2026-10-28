@@ -80,11 +80,14 @@ func TestAgentRespondedSince_TrueWhenMessageAfterTimestamp(t *testing.T) {
 
 	proc := NewSLAProcessor(app, time.Minute)
 	transfer := models.AgentTransfer{
-		ContactID: contact.ID,
-		AgentID:   &agent.ID,
+		OrganizationID: org.ID,
+		ContactID:      contact.ID,
+		AgentID:        &agent.ID,
 	}
 
-	assert.True(t, proc.agentRespondedSince(transfer, since))
+	responded, err := proc.agentRespondedSince(transfer, since)
+	require.NoError(t, err)
+	assert.True(t, responded)
 }
 
 func TestAgentRespondedSince_FalseWhenNoMessages(t *testing.T) {
@@ -95,11 +98,14 @@ func TestAgentRespondedSince_FalseWhenNoMessages(t *testing.T) {
 
 	proc := NewSLAProcessor(app, time.Minute)
 	transfer := models.AgentTransfer{
-		ContactID: contact.ID,
-		AgentID:   &agent.ID,
+		OrganizationID: org.ID,
+		ContactID:      contact.ID,
+		AgentID:        &agent.ID,
 	}
 
-	assert.False(t, proc.agentRespondedSince(transfer, time.Now().Add(-1*time.Hour)))
+	responded, err := proc.agentRespondedSince(transfer, time.Now().Add(-1*time.Hour))
+	require.NoError(t, err)
+	assert.False(t, responded)
 }
 
 func TestAgentRespondedSince_FalseWhenNoAgent(t *testing.T) {
@@ -111,7 +117,9 @@ func TestAgentRespondedSince_FalseWhenNoAgent(t *testing.T) {
 		AgentID:   nil,
 	}
 
-	assert.False(t, proc.agentRespondedSince(transfer, time.Now().Add(-1*time.Hour)))
+	responded, err := proc.agentRespondedSince(transfer, time.Now().Add(-1*time.Hour))
+	require.NoError(t, err)
+	assert.False(t, responded)
 }
 
 func TestAgentRespondedSince_FalseWhenMessageBeforeTimestamp(t *testing.T) {
@@ -126,12 +134,15 @@ func TestAgentRespondedSince_FalseWhenMessageBeforeTimestamp(t *testing.T) {
 
 	proc := NewSLAProcessor(app, time.Minute)
 	transfer := models.AgentTransfer{
-		ContactID: contact.ID,
-		AgentID:   &agent.ID,
+		OrganizationID: org.ID,
+		ContactID:      contact.ID,
+		AgentID:        &agent.ID,
 	}
 
 	// Check since 10 minutes ago — the message at -20m is before that
-	assert.False(t, proc.agentRespondedSince(transfer, time.Now().Add(-10*time.Minute)))
+	responded, err := proc.agentRespondedSince(transfer, time.Now().Add(-10*time.Minute))
+	require.NoError(t, err)
+	assert.False(t, responded)
 }
 
 // --- autoCloseExpiredTransfers: skipped when agent active ---
