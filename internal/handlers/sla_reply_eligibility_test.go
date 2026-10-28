@@ -19,11 +19,18 @@ import (
 
 func slaEligibilityMessage(t *testing.T, app *App, transfer *models.AgentTransfer, at time.Time, status models.MessageStatus, kind models.MessageType) *models.Message {
 	t.Helper()
+	// GORM updates pointer-valued model fields in place. Keep the message
+	// sender independent from the transfer whose deadline we are checking.
+	var senderID *uuid.UUID
+	if transfer.AgentID != nil {
+		id := *transfer.AgentID
+		senderID = &id
+	}
 	message := &models.Message{
 		BaseModel:      models.BaseModel{ID: uuid.New(), CreatedAt: at},
 		OrganizationID: transfer.OrganizationID, ContactID: transfer.ContactID,
 		WhatsAppAccount: transfer.WhatsAppAccount, Direction: models.DirectionOutgoing,
-		MessageType: kind, Status: status, SentByUserID: transfer.AgentID,
+		MessageType: kind, Status: status, SentByUserID: senderID,
 		Content: "Synthetic SLA eligibility fixture",
 	}
 	require.NoError(t, app.DB.Create(message).Error)
@@ -138,11 +145,19 @@ func TestSLAWarningAnyUserRemainsDistinctFromDeadlineAssignedAgent(t *testing.T)
 	app, org, createTransfer, _ := slaAfterCommitFixture(t)
 	agent := testutil.CreateTestUser(t, app.DB, org.ID)
 	other := testutil.CreateTestUser(t, app.DB, org.ID)
+	require.NotEqual(t, agent.ID, other.ID)
 	escalated := time.Now().UTC().Add(-time.Hour)
 	transfer := createTransfer(models.SLATracking{EscalationLevel: 1, EscalatedAt: &escalated})
 	slaEligibilityAssign(t, app, transfer, agent.ID)
 	message := slaEligibilityMessage(t, app, transfer, escalated.Add(time.Minute), models.MessageStatusPending, models.MessageTypeText)
+	require.NotNil(t, transfer.AgentID)
+	require.NotNil(t, message.SentByUserID)
+	require.True(t, transfer.AgentID != message.SentByUserID, "fixture identities must not share a mutable UUID pointer")
+	require.Equal(t, agent.ID, *transfer.AgentID)
+	require.Equal(t, agent.ID, *message.SentByUserID)
 	require.NoError(t, app.DB.Model(message).Update("sent_by_user_id", other.ID).Error)
+	require.Equal(t, agent.ID, *transfer.AgentID, "changing the message sender must preserve the selected transfer agent")
+	require.Equal(t, other.ID, *message.SentByUserID)
 	for _, tc := range []struct {
 		status  models.MessageStatus
 		kind    models.MessageType
