@@ -45,6 +45,65 @@ func sendOrganizationAccessError(r *fastglue.Request, err error, deniedStatus in
 	return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Organization access check temporarily unavailable", nil, "")
 }
 
+const forwardMaxConcurrent = 2
+
+type forwardCapacityError string
+
+func (e forwardCapacityError) Error() string { return string(e) }
+
+const errForwardCapacity forwardCapacityError = "forward capacity exhausted"
+
+// Admission includes reservations awaiting the outer tenant COMMIT. There is
+// no queue and no worker starts until that commit's callback runs. A discarded
+// callback (rollback or ambiguous commit) cannot leak capacity indefinitely.
+type forwardAdmission struct {
+	once  sync.Once
+	slots chan struct{}
+}
+
+type forwardWorkLease struct {
+	state atomic.Uint32 // 0 reserved, 1 running, 2 released, 3 expired before start
+	slots chan struct{}
+	timer *time.Timer
+}
+
+func (a *App) reserveForward() (*forwardWorkLease, error) {
+	admission := &a.rootApp().forwardAdmission
+	admission.once.Do(func() { admission.slots = make(chan struct{}, forwardMaxConcurrent) })
+	select {
+	case admission.slots <- struct{}{}:
+		lease := &forwardWorkLease{slots: admission.slots}
+		lease.timer = time.AfterFunc(forwardRequestTimeout, lease.expireReservation)
+		return lease, nil
+	default:
+		return nil, errForwardCapacity
+	}
+}
+
+func (l *forwardWorkLease) expireReservation() {
+	if l.state.CompareAndSwap(0, 3) {
+		<-l.slots
+	}
+}
+
+func (l *forwardWorkLease) start() bool {
+	if !l.state.CompareAndSwap(0, 1) {
+		return false
+	}
+	l.timer.Stop()
+	return true
+}
+
+func (l *forwardWorkLease) release() {
+	if l == nil {
+		return
+	}
+	l.timer.Stop()
+	if previous := l.state.Swap(2); previous == 0 || previous == 1 {
+		<-l.slots
+	}
+}
+
 // App holds all dependencies for handlers
 type App struct {
 	Config            *config.Config
@@ -71,6 +130,8 @@ type App struct {
 	ObjectStore storage.ObjectStore
 	// wg tracks background goroutines for graceful shutdown
 	wg sync.WaitGroup
+	// Forward reservations and workers share this root-owned, bounded admission.
+	forwardAdmission forwardAdmission
 	// root points from a request-scoped clone back to the long-lived App.
 	// tenantOrgID is non-zero only when DB is bound to an RLS transaction.
 	root        *App
