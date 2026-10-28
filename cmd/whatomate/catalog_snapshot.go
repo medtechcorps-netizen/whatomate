@@ -25,6 +25,7 @@ const catalogSnapshotUsage = `Usage: rereply catalog-snapshot [options]
   -config string  Configuration file (default "config.toml")
   -mode string    compare, json, sha256 or nullable-v2-baseline (default "compare")
   -seed-counts    Include global seed counts and key hashes, never seed values
+  -seed-diff      Diagnose compiled permission gaps and reseller counts (-mode json only)
   -list-unknown   Show unknown public identifiers for the owner's console only
 
 Uses the runtime database connection in a bounded read-only transaction.
@@ -36,6 +37,7 @@ type catalogSnapshotArgs struct {
 	configPath  string
 	mode        string
 	seedCounts  bool
+	seedDiff    bool
 	listUnknown bool
 }
 
@@ -49,11 +51,15 @@ func parseCatalogSnapshotArgs(args []string) (catalogSnapshotArgs, error) {
 	flags.StringVar(&parsed.configPath, "config", "config.toml", "configuration file")
 	flags.StringVar(&parsed.mode, "mode", "compare", "output mode")
 	flags.BoolVar(&parsed.seedCounts, "seed-counts", false, "global seed counts")
+	flags.BoolVar(&parsed.seedDiff, "seed-diff", false, "bounded public seed diagnosis")
 	flags.BoolVar(&parsed.listUnknown, "list-unknown", false, "owner-only identifiers")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return parsed, flag.ErrHelp
 		}
+		return parsed, errors.New("invalid arguments")
+	}
+	if parsed.seedDiff && (parsed.mode != "json" || parsed.seedCounts || parsed.listUnknown) {
 		return parsed, errors.New("invalid arguments")
 	}
 	if flags.NArg() != 0 || (parsed.mode != "compare" && parsed.mode != "json" && parsed.mode != "sha256") {
@@ -132,6 +138,12 @@ func catalogRuntimeDSN(cfg config.DatabaseConfig) (string, error) {
 }
 
 func collectCatalogSnapshot(ctx context.Context, cfg config.DatabaseConfig, args catalogSnapshotArgs) ([]byte, error) {
+	if args.seedDiff {
+		if args.mode != "json" || args.seedCounts || args.listUnknown {
+			return nil, errors.New("invalid arguments")
+		}
+		return collectSeedDiagnostic(ctx, cfg)
+	}
 	dsn, err := catalogRuntimeDSN(cfg)
 	if err != nil {
 		return nil, err

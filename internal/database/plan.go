@@ -548,3 +548,252 @@ func planSeedHeldOwnerSession(ctx context.Context, tx pgx.Tx, owner PlanSeedHeld
 	}
 	return nil
 }
+
+// SeedDiagnosticReport is deliberately separate from PlanSeedObservations. It
+// grants no migration admission and describes only two fixed seed predicates.
+// Its only database-derived strings are selected from compiled permission keys.
+type SeedDiagnosticReport struct {
+	Version            int                       `json:"version"`
+	Purpose            string                    `json:"purpose"`
+	DiagnosticOnly     bool                      `json:"diagnostic_only"`
+	Writes             bool                      `json:"writes"`
+	CompleteVisibility bool                      `json:"complete_visibility"`
+	Permissions        SeedDiagnosticPermissions `json:"permissions"`
+	Reseller           SeedDiagnosticReseller    `json:"reseller"`
+}
+
+type SeedDiagnosticPermission struct {
+	Resource        string `json:"resource"`
+	Action          string `json:"action"`
+	DeletedConflict bool   `json:"deleted_conflict"`
+}
+
+type SeedDiagnosticPermissions struct {
+	State         string                     `json:"state"`
+	ExpectedCount int                        `json:"expected_count"`
+	Missing       []SeedDiagnosticPermission `json:"missing"`
+}
+
+type SeedDiagnosticReseller struct {
+	State                         string `json:"state"`
+	PlatformRows                  int64  `json:"platform_row_count"`
+	PlatformInactiveOrDeleted     int64  `json:"platform_inactive_or_deleted_count"`
+	OrganizationsWithoutReseller  int64  `json:"live_organizations_without_reseller_count"`
+	MissingOwnerMembership        int64  `json:"missing_active_superadmin_owner_membership_count"`
+	InvalidOwnerMembership        int64  `json:"inactive_deleted_or_nonowner_membership_count"`
+	DuplicateOwnerMembershipGroup int64  `json:"duplicate_owner_membership_group_count"`
+}
+
+const SeedDiagnosticApplication = "rereply-seed-diagnostic"
+const seedDiagnosticPermissionLimit = 141
+
+// ObserveSeedDiagnostic requires a native database owner and complete visibility
+// even when that managed owner has BYPASSRLS, CREATEROLE or REPLICATION. This is a
+// separate read-only diagnostic admission, never the planner's held-owner path.
+// The caller owns the fixed deadline, physical-session witness and disposal.
+func ObserveSeedDiagnostic(ctx context.Context, tx pgx.Tx) (SeedDiagnosticReport, error) {
+	var result SeedDiagnosticReport
+	if err := seedDiagnosticSession(ctx, tx); err != nil {
+		return result, err
+	}
+	if err := planSeedTables(ctx, tx, "permissions", "resellers", "reseller_members", "organizations", "users"); err != nil {
+		return result, err
+	}
+	permissions, err := diagnoseSeedPermissions(ctx, tx)
+	if err != nil {
+		return result, err
+	}
+	reseller, err := diagnoseSeedReseller(ctx, tx)
+	if err != nil {
+		return result, err
+	}
+	if err := seedDiagnosticSession(ctx, tx); err != nil {
+		return result, err
+	}
+	return SeedDiagnosticReport{Version: 1, Purpose: "seed_diagnostic", DiagnosticOnly: true,
+		CompleteVisibility: true, Permissions: permissions, Reseller: reseller}, nil
+}
+
+func seedDiagnosticSession(ctx context.Context, tx pgx.Tx) error {
+	if ctx == nil || tx == nil || ctx.Err() != nil {
+		return errPlanSeedSession
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return errPlanSeedSession
+	}
+	var eligible bool
+	err := tx.QueryRow(ctx, `SELECT current_user=session_user AND NOT r.rolsuper
+ AND d.datdba=r.oid
+ AND pg_catalog.current_setting('application_name')=$1
+ AND pg_catalog.current_setting('server_version_num')::integer/10000=17
+ AND NOT pg_catalog.pg_is_in_recovery()
+ AND pg_catalog.current_setting('transaction_read_only')='on'
+ AND pg_catalog.current_setting('transaction_isolation')='repeatable read'
+ AND pg_catalog.current_setting('search_path')='pg_catalog'
+ AND pg_catalog.current_setting('server_encoding')='UTF8'
+ AND pg_catalog.current_setting('session_replication_role')='origin'
+ AND pg_catalog.current_setting('statement_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('statement_timeout')::interval <= interval '3 seconds'
+ AND pg_catalog.current_setting('lock_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('lock_timeout')::interval <= interval '1 second'
+ AND pg_catalog.current_setting('idle_in_transaction_session_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('idle_in_transaction_session_timeout')::interval <= interval '5 seconds'
+ AND (SELECT a.usename=session_user AND a.usesysid=r.oid AND a.datid=d.oid
+ FROM pg_catalog.pg_stat_activity a WHERE a.pid=pg_catalog.pg_backend_pid())
+ FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database()
+ WHERE r.rolname=current_user`, SeedDiagnosticApplication).Scan(&eligible)
+	if err != nil || !eligible || ctx.Err() != nil {
+		return errPlanSeedSession
+	}
+	return nil
+}
+
+func seedDiagnosticExpectedPermissions(source []models.Permission) ([]SeedDiagnosticPermission, error) {
+	if len(source) == 0 || len(source) > seedDiagnosticPermissionLimit {
+		return nil, errPlanSeedUnavailable
+	}
+	pairs := make([]SeedDiagnosticPermission, 0, len(source))
+	seen := make(map[string]bool, len(source))
+	for _, p := range source {
+		for _, field := range []string{p.Resource, p.Action} {
+			if field == "" || len(field) > 64 || strings.Trim(field, "abcdefghijklmnopqrstuvwxyz0123456789._-") != "" {
+				return nil, errPlanSeedUnavailable
+			}
+		}
+		key := p.Resource + ":" + p.Action
+		if seen[key] {
+			return nil, errPlanSeedUnavailable
+		}
+		seen[key] = true
+		pairs = append(pairs, SeedDiagnosticPermission{Resource: p.Resource, Action: p.Action})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Resource != pairs[j].Resource {
+			return pairs[i].Resource < pairs[j].Resource
+		}
+		return pairs[i].Action < pairs[j].Action
+	})
+	return pairs, nil
+}
+
+func seedDiagnosticPredicateState(drift bool, err error) (string, error) {
+	if errors.Is(err, errPlanSeedConflict) {
+		return "conflict", nil
+	}
+	if err != nil {
+		return "", errPlanSeedUnavailable
+	}
+	if drift {
+		return "drift", nil
+	}
+	return "clear", nil
+}
+
+func diagnoseSeedPermissions(ctx context.Context, tx pgx.Tx) (SeedDiagnosticPermissions, error) {
+	var result SeedDiagnosticPermissions
+	pairs, err := seedDiagnosticExpectedPermissions(models.DefaultPermissions())
+	if err != nil {
+		return result, err
+	}
+	raw, err := json.Marshal(pairs)
+	if err != nil {
+		return result, errPlanSeedUnavailable
+	}
+	result.ExpectedCount = len(pairs)
+	result.Missing = make([]SeedDiagnosticPermission, 0)
+	rows, err := tx.Query(ctx, `WITH expected AS (
+ SELECT * FROM pg_catalog.jsonb_to_recordset($1::jsonb) AS e(resource text,action text)
+), missing AS (SELECT e.* FROM expected e WHERE NOT EXISTS (
+ SELECT 1 FROM public.permissions p WHERE p.deleted_at IS NULL AND p.resource=e.resource AND p.action=e.action))
+ SELECT e.resource,e.action,EXISTS(SELECT 1 FROM public.permissions p
+ WHERE p.resource=e.resource AND p.action=e.action AND p.deleted_at IS NOT NULL)
+ FROM missing e ORDER BY e.resource COLLATE "C",e.action COLLATE "C" LIMIT 142`, string(raw))
+	if err != nil {
+		return result, errPlanSeedUnavailable
+	}
+	defer rows.Close()
+	allowed := make(map[string]bool, len(pairs))
+	for _, p := range pairs {
+		allowed[p.Resource+":"+p.Action] = true
+	}
+	conflict := false
+	for rows.Next() {
+		var p SeedDiagnosticPermission
+		if rows.Scan(&p.Resource, &p.Action, &p.DeletedConflict) != nil || len(result.Missing) >= seedDiagnosticPermissionLimit {
+			return SeedDiagnosticPermissions{}, errPlanSeedUnavailable
+		}
+		key := p.Resource + ":" + p.Action
+		if !allowed[key] {
+			return SeedDiagnosticPermissions{}, errPlanSeedUnavailable
+		}
+		delete(allowed, key)
+		conflict = conflict || p.DeletedConflict
+		result.Missing = append(result.Missing, p)
+	}
+	if rows.Err() != nil || ctx.Err() != nil {
+		return SeedDiagnosticPermissions{}, errPlanSeedUnavailable
+	}
+	rows.Close()
+	result.State = "clear"
+	if len(result.Missing) != 0 {
+		result.State = "drift"
+	}
+	if conflict {
+		result.State = "conflict"
+	}
+	// Keep the unchanged authoritative predicate as an independent parity check.
+	drift, predicateErr := planPermissions(ctx, tx)
+	canonical, err := seedDiagnosticPredicateState(drift, predicateErr)
+	if err != nil || canonical != result.State {
+		return SeedDiagnosticPermissions{}, errPlanSeedUnavailable
+	}
+	return result, nil
+}
+
+func diagnoseSeedReseller(ctx context.Context, tx pgx.Tx) (SeedDiagnosticReseller, error) {
+	var result SeedDiagnosticReseller
+	err := tx.QueryRow(ctx, `WITH platform AS (
+ SELECT id,deleted_at,status FROM public.resellers WHERE slug=$1
+), owner_pairs AS (
+ SELECT r.id AS reseller_id,u.id AS user_id FROM platform r CROSS JOIN public.users u
+ WHERE u.deleted_at IS NULL AND u.is_super_admin AND u.is_active
+), duplicate_groups AS (
+ SELECT m.reseller_id,m.user_id FROM public.reseller_members m
+ JOIN owner_pairs p ON p.reseller_id=m.reseller_id AND p.user_id=m.user_id
+ GROUP BY m.reseller_id,m.user_id HAVING pg_catalog.count(*)>1
+)
+ SELECT (SELECT pg_catalog.count(*) FROM platform),
+ (SELECT pg_catalog.count(*) FROM platform WHERE deleted_at IS NOT NULL OR status IS DISTINCT FROM $2),
+ (SELECT pg_catalog.count(*) FROM public.organizations WHERE deleted_at IS NULL AND reseller_id IS NULL),
+ (SELECT pg_catalog.count(*) FROM owner_pairs p WHERE NOT EXISTS (
+ SELECT 1 FROM public.reseller_members m WHERE m.reseller_id=p.reseller_id AND m.user_id=p.user_id)),
+ (SELECT pg_catalog.count(*) FROM public.reseller_members m JOIN owner_pairs p
+ ON p.reseller_id=m.reseller_id AND p.user_id=m.user_id
+ WHERE m.deleted_at IS NOT NULL OR m.role IS DISTINCT FROM $3 OR m.is_active IS DISTINCT FROM true),
+ (SELECT pg_catalog.count(*) FROM duplicate_groups)`, PlatformResellerSlug, models.ResellerStatusActive, models.ResellerRoleOwner).
+		Scan(&result.PlatformRows, &result.PlatformInactiveOrDeleted, &result.OrganizationsWithoutReseller,
+			&result.MissingOwnerMembership, &result.InvalidOwnerMembership, &result.DuplicateOwnerMembershipGroup)
+	if err != nil || ctx.Err() != nil {
+		return SeedDiagnosticReseller{}, errPlanSeedUnavailable
+	}
+	for _, count := range []int64{result.PlatformRows, result.PlatformInactiveOrDeleted, result.OrganizationsWithoutReseller,
+		result.MissingOwnerMembership, result.InvalidOwnerMembership, result.DuplicateOwnerMembershipGroup} {
+		if count < 0 {
+			return SeedDiagnosticReseller{}, errPlanSeedUnavailable
+		}
+	}
+	result.State = "clear"
+	if result.PlatformRows == 0 || result.PlatformInactiveOrDeleted != 0 || result.OrganizationsWithoutReseller != 0 ||
+		result.MissingOwnerMembership != 0 || result.InvalidOwnerMembership != 0 {
+		result.State = "drift"
+	}
+	if result.PlatformRows > 1 || result.DuplicateOwnerMembershipGroup != 0 {
+		result.State = "conflict"
+	}
+	drift, predicateErr := planPlatformReseller(ctx, tx)
+	canonical, err := seedDiagnosticPredicateState(drift, predicateErr)
+	if err != nil || canonical != result.State {
+		return SeedDiagnosticReseller{}, errPlanSeedUnavailable
+	}
+	return result, nil
+}

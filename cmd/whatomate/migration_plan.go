@@ -98,6 +98,112 @@ func parseMigrationPlanConfig(dsn string) (*pgx.ConnConfig, error) {
 	return cfg, nil
 }
 
+// This command has no migration lock or planner admission. It observes only
+// public seed keys/counts using the configured runtime connection. Its own
+// native-owner policy lives in database.ObserveSeedDiagnostic.
+func collectSeedDiagnostic(parent context.Context, cfg config.DatabaseConfig) ([]byte, error) {
+	d, ok := newPlanDeadline(parent, time.Now())
+	if !ok {
+		return nil, errors.New("seed diagnostic deadline")
+	}
+	ctx, cancel := context.WithDeadline(parent, d.workAt)
+	defer cancel()
+	dsn, err := catalogRuntimeDSN(cfg)
+	if err != nil {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	parsed, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	observer, err := seedDiagnosticConfig(parsed, d, ctx)
+	if err != nil {
+		return nil, err
+	}
+	report, err := captureSeedDiagnostic(ctx, d, observer)
+	if err != nil || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, errors.New("seed diagnostic unavailable")
+	}
+	// A complete report is published only after rollback, physical Close and
+	// asynchronous pgx cleanup have all completed inside the original budget.
+	output := struct {
+		database.SeedDiagnosticReport
+		SessionBeforeAfterMatch bool `json:"session_before_after_match"`
+		SessionDisposed         bool `json:"session_disposed"`
+	}{report, true, true}
+	raw, err := json.Marshal(output)
+	if err != nil || len(raw) > 64*1024 || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, errors.New("seed diagnostic output unavailable")
+	}
+	return append(raw, '\n'), nil
+}
+
+func seedDiagnosticConfig(parsed *pgx.ConnConfig, d planDeadline, ctx context.Context) (*pgx.ConnConfig, error) {
+	if parsed == nil || !d.alive(ctx) {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	cfg := parsed.Copy()
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = make(map[string]string)
+	}
+	// No startup SET ROLE or options-based setting override is admitted.
+	if cfg.RuntimeParams["options"] != "" || cfg.RuntimeParams["role"] != "" {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	remaining := time.Until(d.workAt)
+	if remaining < time.Millisecond {
+		return nil, errors.New("seed diagnostic deadline")
+	}
+	if cfg.ConnectTimeout <= 0 || cfg.ConnectTimeout > remaining {
+		cfg.ConnectTimeout = remaining
+	}
+	cfg.RuntimeParams["application_name"] = database.SeedDiagnosticApplication
+	cfg.RuntimeParams["search_path"] = "pg_catalog"
+	cfg.RuntimeParams["default_transaction_read_only"] = "on"
+	cfg.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+	for key, cap := range map[string]time.Duration{"statement_timeout": 3 * time.Second, "lock_timeout": time.Second, "idle_in_transaction_session_timeout": 5 * time.Second} {
+		if remaining < cap {
+			cap = remaining
+		}
+		if cap.Milliseconds() < 1 {
+			return nil, errors.New("seed diagnostic deadline")
+		}
+		cfg.RuntimeParams[key] = strconv.FormatInt(cap.Milliseconds(), 10) + "ms"
+	}
+	return cfg, nil
+}
+
+func captureSeedDiagnostic(ctx context.Context, d planDeadline, cfg *pgx.ConnConfig) (report database.SeedDiagnosticReport, err error) {
+	conn, tx, openErr := openPlanSession(ctx, cfg)
+	defer func() {
+		if !disposePlanSession(d, conn, tx, false).complete() {
+			report, err = database.SeedDiagnosticReport{}, errors.New("seed diagnostic cleanup unavailable")
+		}
+	}()
+	if openErr != nil {
+		return report, errors.New("seed diagnostic connection unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return report, errors.New("seed diagnostic session unavailable")
+	}
+	before, err := readPlanSelf(ctx, tx, database.SeedDiagnosticApplication, cfg.User, false)
+	if err != nil || before.superuser || before.database != cfg.Database {
+		return report, errors.New("seed diagnostic session unavailable")
+	}
+	report, err = database.ObserveSeedDiagnostic(ctx, tx)
+	if err != nil {
+		return database.SeedDiagnosticReport{}, errors.New("seed diagnostic observation unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return database.SeedDiagnosticReport{}, errors.New("seed diagnostic session unavailable")
+	}
+	after, err := readPlanSelf(ctx, tx, database.SeedDiagnosticApplication, cfg.User, false)
+	if err != nil || !samePlanSelf(before, after) || !d.alive(ctx) {
+		return database.SeedDiagnosticReport{}, errors.New("seed diagnostic session unavailable")
+	}
+	return report, nil
+}
+
 func migrationPlanMarker(id uuid.UUID) string {
 	if id == uuid.Nil || id.Version() != 4 || id.Variant() != uuid.RFC4122 {
 		return ""
