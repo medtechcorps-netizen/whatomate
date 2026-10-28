@@ -131,13 +131,12 @@ type stagedWhatsAppIdentityReviewItem struct {
 	MessageType     string                    `json:"message_type"`
 	MediaStatus     string                    `json:"media_status,omitempty"`
 	ReceivedAt      time.Time                 `json:"received_at"`
-	// ReadOnly is true when the receipt's hold is unsupported: no direct BSUID,
-	// no live contact matching any selector, only contacts that already belong
-	// to other WhatsApp users, a matched row that no longer resolves, or a hold
-	// created before such reviews became decidable. The hold guard lets such a
-	// hold close only when the account starts a new onboarding cycle, so no
-	// decision can resolve it.
-	ReadOnly bool `json:"read_only"`
+	// ReadOnly describes current decision availability; it never grants a
+	// permanent outcome or changes the immutable hold's Supported bit.
+	ReadOnly          bool   `json:"read_only"`
+	EligibilityKnown  bool   `json:"eligibility_known"`
+	DecisionAvailable bool   `json:"decision_available"`
+	EligibilityReason string `json:"eligibility_reason"`
 }
 
 type stagedWhatsAppIdentityReviewDetail struct {
@@ -275,91 +274,54 @@ const stagedIdentityReviewMaxHoldFilters = 50
 // a full-tenant surface because contact-free arrivals have no safe assignment
 // boundary until a reviewer resolves identity.
 func (a *App) ListStagedContactIdentityReviews(r *fastglue.Request) error {
-	orgID, _, ok := a.requireStagedIdentityReviewAccess(r)
+	orgID, userID, ok := a.stagedReviewObservationIdentity(r)
 	if !ok {
 		return nil
 	}
 	pg := parsePagination(r)
-	// Optional repeated hold_id values narrow the list to those open holds'
-	// receipts, and order=oldest lists them oldest first, so the contact review
-	// dialog can show every held copy its decision would close.
-	var holdFilters []uuid.UUID
+	var filters []uuid.UUID
 	for _, raw := range r.RequestCtx.QueryArgs().PeekMulti("hold_id") {
 		value := strings.TrimSpace(string(raw))
 		if value == "" {
 			continue
 		}
-		parsed, err := uuid.Parse(value)
-		if err != nil || parsed == uuid.Nil {
+		id, err := uuid.Parse(value)
+		if err != nil || id == uuid.Nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid identity review hold ID", nil, "")
 		}
-		holdFilters = append(holdFilters, parsed)
+		filters = append(filters, id)
 	}
-	if len(holdFilters) > stagedIdentityReviewMaxHoldFilters {
+	if len(filters) > stagedIdentityReviewMaxHoldFilters {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Too many identity review hold IDs", nil, "")
 	}
-	order := "inbound_events.received_at DESC, inbound_events.id DESC"
-	if strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("order"))) == "oldest" {
-		order = "inbound_events.received_at ASC, inbound_events.id ASC"
+	oldest := strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("order"))) == "oldest"
+	observation, err := a.observeStagedReviewSnapshot(orgID, userID, filters, uuid.Nil, pg, oldest)
+	if err != nil {
+		return a.sendStagedReviewObservationError(r, err)
 	}
-	scope := func(query *gorm.DB) *gorm.DB {
-		if len(holdFilters) > 0 {
-			return query.Where("inbound_events.review_hold_id IN ?", holdFilters)
-		}
-		return query
+	if !observation.Known {
+		return a.sendStagedReviewObservationError(r, nil)
 	}
-	// Count over the unprojected scope: GORM quotes a "table.*" projection as
-	// one identifier inside COUNT(), which PostgreSQL rejects. Each statement
-	// gets its own chain so the count cannot leak into the page query, and the
-	// order is table-qualified because the hold join also has id/created_at.
-	var total int64
-	if err := scope(a.stagedIdentityReviewEventsScope(orgID)).Count(&total).Error; err != nil {
-		a.Log.Error("Failed to count staged identity reviews", "error", err, "organization_id", orgID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
+	items := make([]stagedWhatsAppIdentityReviewItem, 0, len(observation.Events))
+	for _, copy := range observation.Events {
+		event := copy.inboundEvent(orgID)
+		item := stagedWhatsAppIdentityReviewItemFromEvent(&event)
+		item.EligibilityKnown = true
+		item.EligibilityReason = observation.ReasonByHold[item.HoldID]
+		item.DecisionAvailable = item.EligibilityReason == "actionable"
+		item.ReadOnly = !item.DecisionAvailable
+		items = append(items, item)
 	}
-	var readOnlyTotal int64
-	if err := scope(a.stagedIdentityReviewEventsScope(orgID)).Where("NOT review_holds.supported").Count(&readOnlyTotal).Error; err != nil {
-		a.Log.Error("Failed to count read-only staged identity reviews", "error", err, "organization_id", orgID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
-	}
-	var events []models.InboundEvent
-	if err := scope(a.stagedIdentityReviewEventsQuery(orgID)).
-		Order(order).
-		Offset(pg.Offset).Limit(pg.Limit).Find(&events).Error; err != nil {
-		a.Log.Error("Failed to list staged identity reviews", "error", err, "organization_id", orgID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
-	}
-	holdIDs := make([]uuid.UUID, 0, len(events))
-	for i := range events {
-		if events[i].ReviewHoldID != nil {
-			holdIDs = append(holdIDs, *events[i].ReviewHoldID)
-		}
-	}
-	supportedHolds := map[uuid.UUID]bool{}
-	if len(holdIDs) > 0 {
-		var holds []models.WhatsAppIdentityReviewHold
-		if err := a.DB.Model(&models.WhatsAppIdentityReviewHold{}).Select("id", "supported").
-			Where("organization_id = ? AND id IN ?", orgID, holdIDs).Find(&holds).Error; err != nil {
-			a.Log.Error("Failed to read staged identity-review holds", "error", err, "organization_id", orgID)
-			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list staged identity reviews", nil, "")
-		}
-		for i := range holds {
-			supportedHolds[holds[i].ID] = holds[i].Supported
-		}
-	}
-	items := make([]stagedWhatsAppIdentityReviewItem, len(events))
-	for i := range events {
-		items[i] = stagedWhatsAppIdentityReviewItemFromEvent(&events[i])
-		items[i].ReadOnly = !supportedHolds[items[i].HoldID]
-	}
-	envelope := listEnvelope("reviews", items, total, pg)
-	envelope["read_only_total"] = readOnlyTotal
-	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	envelope := listEnvelope("reviews", items, observation.Total, pg)
+	envelope["eligibility_known"] = true
+	envelope["actionable_total"] = observation.ActionableTotal
+	envelope["actionable_chain_total"] = observation.ActionableChains
+	envelope["read_only_total"] = observation.ReadOnlyTotal
 	return r.SendEnvelope(envelope)
 }
 
 func (a *App) GetStagedContactIdentityReview(r *fastglue.Request) error {
-	orgID, _, ok := a.requireStagedIdentityReviewAccess(r)
+	orgID, userID, ok := a.stagedReviewObservationIdentity(r)
 	if !ok {
 		return nil
 	}
@@ -367,30 +329,101 @@ func (a *App) GetStagedContactIdentityReview(r *fastglue.Request) error {
 	if err != nil {
 		return nil
 	}
-	event, err := a.loadStagedIdentityReviewEvent(orgID, eventID)
+	observation, err := a.observeStagedReviewSnapshot(orgID, userID, nil, eventID, Pagination{Page: 1, Limit: 1}, false)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Staged identity review not found", nil, "")
-		}
-		a.Log.Error("Failed to load staged identity review", "error", err, "organization_id", orgID, "event_id", eventID)
-		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load staged identity review", nil, "")
+		return a.sendStagedReviewObservationError(r, err)
 	}
-	snapshot, err := a.LoadWhatsAppIdentityReviewSnapshot(a.DB, orgID, *event.ReviewHoldID)
-	if err != nil {
-		a.Log.Error("Failed to verify staged identity-review hold", "error", err, "organization_id", orgID, "event_id", eventID)
-		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Staged identity review is unavailable", nil, "")
+	if observation.Known && observation.Total == 0 {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Staged identity review not found", nil, "")
 	}
+	if len(observation.Events) != 1 || observation.Events[0].ID != eventID {
+		return a.sendStagedReviewObservationError(r, nil)
+	}
+	if !observation.Known && string(r.RequestCtx.QueryArgs().Peek("eligibility")) != "current-v1" {
+		return a.sendStagedReviewObservationError(r, nil)
+	}
+	copy := observation.Events[0]
+	event := copy.inboundEvent(orgID)
 	detail := stagedWhatsAppIdentityReviewDetail{
-		stagedWhatsAppIdentityReviewItem: stagedWhatsAppIdentityReviewItemFromEvent(event),
-		Content:                          coexistenceMediaPayloadString(event.Payload, "content"),
-		MediaMimeType:                    coexistenceMediaPayloadString(event.Payload, "media_mime_type"),
-		MediaFilename:                    coexistenceMediaPayloadString(event.Payload, "media_filename"),
+		stagedWhatsAppIdentityReviewItem: stagedWhatsAppIdentityReviewItemFromEvent(&event),
+		Content:                          coexistenceMediaPayloadString(copy.Payload, "content"),
+		MediaMimeType:                    coexistenceMediaPayloadString(copy.Payload, "media_mime_type"),
+		MediaFilename:                    coexistenceMediaPayloadString(copy.Payload, "media_filename"),
 	}
-	detail.ReadOnly = !snapshot.Supported
-	detail.MediaAvailable = detail.Revision != "" && detail.MediaStatus == "ready" &&
-		coexistenceMediaPayloadString(event.Payload, "media_url") != ""
-	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	detail.MediaAvailable = detail.Revision != "" && detail.MediaStatus == "ready" && copy.MediaAvailable
+	if !observation.Known {
+		detail.EligibilityReason = "unavailable"
+		// Only the explicit new representation may retain an authorized copy
+		// without an eligibility verdict. Null is not permanent read-only.
+		return r.SendEnvelope(struct {
+			stagedWhatsAppIdentityReviewDetail
+			ReadOnly *bool `json:"read_only"`
+		}{stagedWhatsAppIdentityReviewDetail: detail})
+	}
+	detail.EligibilityKnown = true
+	detail.EligibilityReason = observation.ReasonByHold[copy.HoldID]
+	detail.DecisionAvailable = detail.EligibilityReason == "actionable"
+	detail.ReadOnly = !detail.DecisionAvailable
 	return r.SendEnvelope(detail)
+}
+
+// stagedReviewObservationIdentity extracts only authenticated context. Current
+// endpoint permissions are checked inside the one SQL snapshot, not through
+// a cached boolean that can hide a failed dependency as a permanent denial.
+func (a *App) stagedReviewObservationIdentity(r *fastglue.Request) (uuid.UUID, uuid.UUID, bool) {
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	userID, ok := r.RequestCtx.UserValue("user_id").(uuid.UUID)
+	if !ok || userID == uuid.Nil {
+		_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return uuid.Nil, uuid.Nil, false
+	}
+	var orgID uuid.UUID
+	switch value := r.RequestCtx.UserValue("organization_id").(type) {
+	case uuid.UUID:
+		orgID = value
+	case string:
+		orgID, _ = uuid.Parse(value)
+	}
+	if a.tenantOrgID != uuid.Nil {
+		orgID = a.tenantOrgID
+	}
+	if raw := strings.TrimSpace(string(r.RequestCtx.Request.Header.Peek("X-Organization-ID"))); raw != "" {
+		requested, err := uuid.Parse(raw)
+		if err != nil || requested == uuid.Nil {
+			_ = r.SendErrorEnvelope(fasthttp.StatusBadRequest, "X-Organization-ID must identify the selected organization", nil, "")
+			return uuid.Nil, uuid.Nil, false
+		}
+		if a.tenantOrgID != uuid.Nil && requested != a.tenantOrgID {
+			_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+			return uuid.Nil, uuid.Nil, false
+		}
+		orgID = requested
+	}
+	if orgID == uuid.Nil {
+		_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return uuid.Nil, uuid.Nil, false
+	}
+	return orgID, userID, true
+}
+
+func (a *App) sendStagedReviewObservationError(r *fastglue.Request, err error) error {
+	if errors.Is(err, ErrWhatsAppIdentityReviewUnauthorized) {
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	}
+	if errors.Is(err, ErrWhatsAppIdentityReviewInvalid) {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid identity review request", nil, "")
+	}
+	if err != nil {
+		a.Log.Error("Staged identity review observation unavailable", "error", err)
+	}
+	return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Current identity review availability could not be checked. Please retry.", nil, "identity_review_observation_unavailable")
+}
+
+func (copy stagedReviewObservationEvent) inboundEvent(orgID uuid.UUID) models.InboundEvent {
+	holdID := copy.HoldID
+	return models.InboundEvent{BaseModel: models.BaseModel{ID: copy.ID}, OrganizationID: orgID,
+		ReviewHoldID: &holdID, ReceivedAt: copy.ReceivedAt, Status: copy.Status,
+		Protocol: models.WhatsAppIdentityReviewInboundProtocol, EventType: models.WhatsAppIdentityReviewPendingEvent, Payload: copy.Payload}
 }
 
 func (a *App) GetStagedContactIdentityReviewMedia(r *fastglue.Request) error {
@@ -3632,3 +3665,749 @@ func (a *App) buildContactResponse(contact *models.Contact, orgID uuid.UUID) Con
 	listState.applyAssignee(&response, contact.AssignedUserID)
 	return response
 }
+
+// stagedReviewObservation is private read evidence, never a public authority or
+// a decision token. The caller may publish counts only when Known is true.
+type stagedReviewObservation struct {
+	Known            bool
+	Total            int64
+	ActionableTotal  int64
+	ActionableChains int64
+	ReadOnlyTotal    int64
+	ReasonByHold     map[uuid.UUID]string
+	Events           []stagedReviewObservationEvent
+}
+
+type stagedReviewObservationEvent struct {
+	ID             uuid.UUID                 `json:"id"`
+	HoldID         uuid.UUID                 `json:"hold_id"`
+	ReceivedAt     time.Time                 `json:"received_at"`
+	Status         models.InboundEventStatus `json:"status"`
+	Payload        models.JSONB              `json:"payload"`
+	MediaAvailable bool                      `json:"media_available"`
+	Oversized      bool                      `json:"oversized"`
+}
+
+type stagedReviewObservationHold struct {
+	ID             uuid.UUID                                `json:"id"`
+	OrganizationID uuid.UUID                                `json:"organization_id"`
+	AccountID      uuid.UUID                                `json:"whats_app_account_id"`
+	Cycle          uint64                                   `json:"onboarding_cycle"`
+	Protocol       uint16                                   `json:"protocol_version"`
+	Supported      bool                                     `json:"supported"`
+	Direct         string                                   `json:"direct_primary_bsuid"`
+	Parent         string                                   `json:"parent_bsuid"`
+	Phone          string                                   `json:"phone"`
+	Generation     uint64                                   `json:"principal_generation"`
+	SelectorDigest string                                   `json:"selector_body_digest"`
+	EventDigest    string                                   `json:"verified_event_digest"`
+	Provenance     string                                   `json:"verified_event_provenance"`
+	MemberCount    uint32                                   `json:"member_count"`
+	MemberDigest   string                                   `json:"member_digest"`
+	Version        uint64                                   `json:"version"`
+	Disposition    models.WhatsAppIdentityReviewDisposition `json:"disposition"`
+}
+
+type stagedReviewObservationUnit struct {
+	stagedReviewObservationHold
+	Weight        int64 `json:"weight"`
+	AccountExists bool  `json:"account_exists"`
+	State         *struct {
+		Cycle      uint64                             `json:"cycle"`
+		Lifecycle  models.CoexistenceLifecycleStatus  `json:"lifecycle"`
+		Onboarding models.CoexistenceOnboardingStatus `json:"onboarding"`
+	} `json:"state"`
+}
+
+type stagedReviewObservationMember struct {
+	models.WhatsAppIdentityReviewMember
+	Accessible bool `json:"accessible"`
+}
+
+type stagedReviewObservationSelector struct {
+	RawID   uuid.UUID                                   `json:"raw_id"`
+	ID      uuid.UUID                                   `json:"id"`
+	Reasons models.WhatsAppIdentityReviewSelectorReason `json:"reasons"`
+	NextID  *uuid.UUID                                  `json:"next_id"`
+	Deleted bool                                        `json:"deleted"`
+	Broken  bool                                        `json:"broken"`
+	Visited []uuid.UUID                                 `json:"visited"`
+}
+
+type stagedReviewObservationCanonical struct {
+	ID              uuid.UUID    `json:"id"`
+	BSUID           string       `json:"bs_uid"`
+	Metadata        models.JSONB `json:"metadata"`
+	ForeignFamily   bool         `json:"foreign_family"`
+	ForeignDecision bool         `json:"foreign_decision"`
+	Oversized       bool         `json:"oversized"`
+}
+
+type stagedReviewObservationFacts struct {
+	Allowed    bool  `json:"allowed"`
+	ReadAll    bool  `json:"read_all"`
+	Total      int64 `json:"total"`
+	Incomplete bool  `json:"incomplete"`
+	Units      map[uuid.UUID]stagedReviewObservationUnit
+	Holds      map[uuid.UUID][]stagedReviewObservationHold
+	Members    map[uuid.UUID][]stagedReviewObservationMember
+	Selectors  map[uuid.UUID][]stagedReviewObservationSelector
+	Canonical  map[uuid.UUID][]stagedReviewObservationCanonical
+	Events     []stagedReviewObservationEvent
+}
+
+// observeStagedReviewSnapshot owns a single caller-clipped observation budget.
+// Transaction uses the held connection/savepoint when Tenant already owns it;
+// it also supplies a real transaction for the non-RLS handler path.
+func (a *App) observeStagedReviewSnapshot(orgID, userID uuid.UUID, holds []uuid.UUID, eventID uuid.UUID, pg Pagination, oldest bool) (*stagedReviewObservation, error) {
+	if a == nil || a.DB == nil || orgID == uuid.Nil || userID == uuid.Nil ||
+		a.DB.Statement == nil || a.DB.Statement.Context == nil || len(holds) > stagedIdentityReviewMaxHoldFilters ||
+		pg.Limit < 1 || pg.Limit > 100 || pg.Offset < 0 {
+		return nil, ErrWhatsAppIdentityReviewInvalid
+	}
+	filter := make([]string, 0, len(holds))
+	for _, id := range holds {
+		if id == uuid.Nil {
+			return nil, ErrWhatsAppIdentityReviewInvalid
+		}
+		filter = append(filter, id.String())
+	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(a.DB.Statement.Context, 5*time.Second)
+	defer cancel()
+	var result *stagedReviewObservation
+	err = a.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Permission-only preflight avoids taking another workspace's policy
+		// lock for an unadmitted caller. It supplies no count/classification
+		// facts: the one final snapshot repeats the same current authority.
+		var admitted bool
+		if err := tx.Raw(stagedReviewAuthoritySQL+" SELECT allowed FROM authority", orgID, userID, string(encoded), eventID, pg.Limit, pg.Offset, oldest).Scan(&admitted).Error; err != nil {
+			return err
+		}
+		if !admitted {
+			return ErrWhatsAppIdentityReviewUnauthorized
+		}
+		if err := lockStagedReviewObservation(tx, orgID); err != nil {
+			return err
+		}
+		facts, readErr := readStagedReviewSnapshot(tx, orgID, userID, string(encoded), eventID, pg, oldest)
+		if readErr != nil {
+			return readErr
+		}
+		if !facts.Allowed {
+			return ErrWhatsAppIdentityReviewUnauthorized
+		}
+		var classifyErr error
+		result, classifyErr = classifyStagedReviewSnapshot(ctx, orgID, facts)
+		if classifyErr != nil {
+			return classifyErr
+		}
+		return ctx.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func readStagedReviewSnapshot(db *gorm.DB, orgID, userID uuid.UUID, filter string, eventID uuid.UUID, pg Pagination, oldest bool) (_ *stagedReviewObservationFacts, returnErr error) {
+	rows, err := db.Raw(stagedReviewSnapshotSQL, orgID, userID, filter, eventID, pg.Limit, pg.Offset, oldest).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("observe staged identity review: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && returnErr == nil {
+			returnErr = closeErr
+		}
+	}()
+	facts := &stagedReviewObservationFacts{
+		Units: map[uuid.UUID]stagedReviewObservationUnit{}, Holds: map[uuid.UUID][]stagedReviewObservationHold{},
+		Members: map[uuid.UUID][]stagedReviewObservationMember{}, Selectors: map[uuid.UUID][]stagedReviewObservationSelector{},
+		Canonical: map[uuid.UUID][]stagedReviewObservationCanonical{},
+	}
+	count, bytes, controls := 0, 0, 0
+	for rows.Next() {
+		if err := db.Statement.Context.Err(); err != nil {
+			return nil, err
+		}
+		var kind, body string
+		var unit uuid.UUID
+		var oversized bool
+		if err := rows.Scan(&kind, &unit, &body, &oversized); err != nil {
+			return nil, err
+		}
+		count++
+		if count > 16384 || len(body) > 65536 || bytes > 8*1024*1024-len(body) || oversized {
+			facts.Incomplete = true
+			break
+		}
+		bytes += len(body)
+		switch kind {
+		case "control":
+			controls++
+			if controls != 1 || count != 1 || unit != uuid.Nil {
+				return nil, fmt.Errorf("invalid identity observation control")
+			}
+			if err := json.Unmarshal([]byte(body), facts); err != nil {
+				return nil, err
+			}
+		case "page":
+			var item stagedReviewObservationEvent
+			if err := json.Unmarshal([]byte(body), &item); err != nil {
+				return nil, err
+			}
+			if len(facts.Events) >= pg.Limit || item.ID == uuid.Nil || item.HoldID == uuid.Nil || item.Oversized || item.Payload == nil {
+				facts.Incomplete = true
+				continue
+			}
+			facts.Events = append(facts.Events, item)
+		case "unit":
+			var item stagedReviewObservationUnit
+			if err := json.Unmarshal([]byte(body), &item); err != nil {
+				return nil, err
+			}
+			if item.ID != unit || unit == uuid.Nil || len(facts.Units) >= 256 {
+				return nil, fmt.Errorf("invalid identity observation unit")
+			}
+			if _, exists := facts.Units[unit]; exists {
+				return nil, fmt.Errorf("duplicate identity observation unit")
+			}
+			facts.Units[unit] = item
+		case "hold":
+			var item stagedReviewObservationHold
+			if err := json.Unmarshal([]byte(body), &item); err != nil {
+				return nil, err
+			}
+			facts.Holds[unit] = append(facts.Holds[unit], item)
+		case "member":
+			var item stagedReviewObservationMember
+			if err := json.Unmarshal([]byte(body), &item); err != nil {
+				return nil, err
+			}
+			facts.Members[unit] = append(facts.Members[unit], item)
+		case "selector":
+			var item stagedReviewObservationSelector
+			if err := json.Unmarshal([]byte(body), &item); err != nil {
+				return nil, err
+			}
+			facts.Selectors[unit] = append(facts.Selectors[unit], item)
+		case "canonical":
+			var item stagedReviewObservationCanonical
+			if err := json.Unmarshal([]byte(body), &item); err != nil {
+				return nil, err
+			}
+			facts.Canonical[unit] = append(facts.Canonical[unit], item)
+		default:
+			return nil, fmt.Errorf("unknown identity observation record")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if controls != 1 || facts.Total < 0 {
+		return nil, fmt.Errorf("incomplete identity observation control")
+	}
+	sort.Slice(facts.Events, func(i, j int) bool {
+		left, right := facts.Events[i], facts.Events[j]
+		less := left.ReceivedAt.Before(right.ReceivedAt)
+		if left.ReceivedAt.Equal(right.ReceivedAt) {
+			less = left.ID.String() < right.ID.String()
+		}
+		if oldest {
+			return less
+		}
+		return !less
+	})
+	seen := map[uuid.UUID]bool{}
+	for _, item := range facts.Events {
+		if seen[item.ID] {
+			return nil, fmt.Errorf("duplicate identity observation receipt")
+		}
+		seen[item.ID] = true
+	}
+	return facts, nil
+}
+
+func classifyStagedReviewSnapshot(ctx context.Context, orgID uuid.UUID, facts *stagedReviewObservationFacts) (*stagedReviewObservation, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := &stagedReviewObservation{Events: facts.Events, ReasonByHold: map[uuid.UUID]string{}}
+	// Unknown observations intentionally contain no numeric totals. A detail
+	// caller may use the separately authorized finite copy, never these counts.
+	if facts.Incomplete {
+		return result, nil
+	}
+	var weighted int64
+	for id, unit := range facts.Units {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if unit.Weight <= 0 || weighted > facts.Total-unit.Weight {
+			return &stagedReviewObservation{Events: facts.Events}, nil
+		}
+		weighted += unit.Weight
+		reason, known := classifyStagedReviewUnit(ctx, orgID, unit, facts.Holds[id], facts.Members[id], facts.Selectors[id], facts.Canonical[id], facts.ReadAll)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !known {
+			return &stagedReviewObservation{Events: facts.Events}, nil
+		}
+		for _, hold := range facts.Holds[id] {
+			if _, exists := result.ReasonByHold[hold.ID]; exists {
+				return &stagedReviewObservation{Events: facts.Events}, nil
+			}
+			result.ReasonByHold[hold.ID] = reason
+		}
+		if reason == "actionable" {
+			result.ActionableTotal += unit.Weight
+			result.ActionableChains++
+		} else {
+			result.ReadOnlyTotal += unit.Weight
+		}
+	}
+	if weighted != facts.Total {
+		return &stagedReviewObservation{Events: facts.Events}, nil
+	}
+	for _, event := range facts.Events {
+		if _, exists := result.ReasonByHold[event.HoldID]; !exists {
+			return &stagedReviewObservation{Events: facts.Events}, nil
+		}
+	}
+	result.Known = true
+	result.Total = weighted
+	return result, nil
+}
+
+func classifyStagedReviewUnit(ctx context.Context, orgID uuid.UUID, unit stagedReviewObservationUnit, holds []stagedReviewObservationHold, members []stagedReviewObservationMember, selectors []stagedReviewObservationSelector, canon []stagedReviewObservationCanonical, readAll bool) (string, bool) {
+	if unit.OrganizationID != orgID || unit.ID == uuid.Nil || len(holds) == 0 || len(holds) > 256 {
+		return "", false
+	}
+	byHold := map[uuid.UUID][]WhatsAppIdentityReviewCandidate{}
+	accessible := map[uuid.UUID]bool{}
+	for _, member := range members {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		if member.OrganizationID != orgID || member.ContactID == uuid.Nil || !member.SelectorReasons.Valid() {
+			return "", false
+		}
+		byHold[member.HoldID] = append(byHold[member.HoldID], WhatsAppIdentityReviewCandidate{ContactID: member.ContactID, SelectorReasons: member.SelectorReasons})
+		if previous, exists := accessible[member.ContactID]; exists && previous != member.Accessible {
+			return "", false
+		}
+		accessible[member.ContactID] = member.Accessible
+	}
+	union := map[uuid.UUID]models.WhatsAppIdentityReviewSelectorReason{}
+	seenHolds := map[uuid.UUID]bool{}
+	var latest *stagedReviewObservationHold
+	for index := range holds {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		hold := &holds[index]
+		if seenHolds[hold.ID] || hold.OrganizationID != orgID || hold.AccountID != unit.AccountID || hold.Cycle != unit.Cycle ||
+			hold.Supported != unit.Supported || hold.Direct != unit.Direct || hold.Disposition != models.WhatsAppIdentityReviewDispositionOpen ||
+			hold.Version != 1 || hold.Protocol != models.WhatsAppIdentityReviewProtocolVersion || hold.Generation > unit.Generation {
+			return "", false
+		}
+		seenHolds[hold.ID] = true
+		stored := byHold[hold.ID]
+		sort.Slice(stored, func(i, j int) bool { return stored[i].ContactID.String() < stored[j].ContactID.String() })
+		if uint32(len(stored)) != hold.MemberCount || identityReviewMemberDigest(stored) != hold.MemberDigest {
+			return "", false
+		}
+		seenMembers := map[uuid.UUID]bool{}
+		for _, candidate := range stored {
+			if seenMembers[candidate.ContactID] {
+				return "", false
+			}
+			seenMembers[candidate.ContactID] = true
+			union[candidate.ContactID] |= candidate.SelectorReasons
+		}
+		if hold.ID == unit.ID {
+			latest = hold
+		}
+	}
+	if latest == nil || len(union) > 256 {
+		return "", false
+	}
+	for holdID := range byHold {
+		if !seenHolds[holdID] {
+			return "", false
+		}
+	}
+	if !unit.Supported {
+		return "unsupported", true
+	}
+	if !unit.AccountExists || unit.State == nil || unit.State.Cycle != unit.Cycle {
+		return "", false
+	}
+	if unit.State.Lifecycle != models.CoexistenceLifecycleStatusConnected || unit.State.Onboarding == models.CoexistenceOnboardingStatusOffboarded {
+		return "account_unavailable", true
+	}
+	claim, err := normalizeWhatsAppIdentityReviewClaim(WhatsAppIdentityReviewClaim{OrganizationID: orgID, WhatsAppAccountID: unit.AccountID, OnboardingCycle: unit.Cycle,
+		DirectPrimaryBSUID: unit.Direct, ParentBSUID: unit.Parent, Phone: unit.Phone, SelectorBodyDigest: unit.SelectorDigest, VerifiedEventDigest: unit.EventDigest, VerifiedEventProvenance: unit.Provenance})
+	if err != nil || claim.DirectPrimaryBSUID == "" {
+		return "", false
+	}
+	if claim.DirectPrimaryBSUID != unit.Direct || claim.ParentBSUID != unit.Parent || claim.Phone != unit.Phone ||
+		claim.VerifiedEventDigest != unit.EventDigest || claim.SelectorBodyDigest != unit.SelectorDigest || claim.VerifiedEventProvenance != unit.Provenance {
+		return "", false
+	}
+	canonical := map[uuid.UUID]*models.Contact{}
+	other := map[uuid.UUID]bool{}
+	for _, row := range canon {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		if row.ID == uuid.Nil || row.Oversized || canonical[row.ID] != nil {
+			return "", false
+		}
+		contact := &models.Contact{BaseModel: models.BaseModel{ID: row.ID}, OrganizationID: orgID, BSUID: row.BSUID, Metadata: row.Metadata}
+		canonical[row.ID] = contact
+		bsuid := strings.TrimSpace(row.BSUID)
+		other[row.ID] = row.ForeignFamily || row.ForeignDecision ||
+			(bsuid != "" && !containsIdentityReviewBSUID(identityReviewClaimBSUIDs(claim), bsuid)) ||
+			coexistenceIdentityMetadataNamesAnotherUser(contact, claim.DirectPrimaryBSUID, claim.ParentBSUID)
+	}
+	if len(selectors) > 256 {
+		return "", false
+	}
+	reasons := map[uuid.UUID]models.WhatsAppIdentityReviewSelectorReason{}
+	seenRaw := map[uuid.UUID]bool{}
+	for _, selector := range selectors {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		if selector.RawID == uuid.Nil || seenRaw[selector.RawID] || selector.Broken || selector.Deleted || selector.NextID != nil ||
+			!selector.Reasons.Valid() || len(selector.Visited) == 0 || len(selector.Visited) > 16 ||
+			selector.Visited[0] != selector.RawID || selector.Visited[len(selector.Visited)-1] != selector.ID || canonical[selector.ID] == nil {
+			return "", false
+		}
+		visited := map[uuid.UUID]bool{}
+		for _, step := range selector.Visited {
+			if step == uuid.Nil || visited[step] {
+				return "", false
+			}
+			visited[step] = true
+		}
+		seenRaw[selector.RawID] = true
+		reasons[selector.ID] |= selector.Reasons
+	}
+	items := identityReviewCandidateMapSlice(reasons)
+	candidates := finalizeIdentityReviewCandidates(claim, items, canonical, other, true)
+	if len(identityReviewRoutableContactIDs(candidates)) == 0 {
+		return "no_eligible_member", true
+	}
+	if latest.MemberDigest != candidates.digest || !sameIdentityReviewCandidates(byHold[latest.ID], candidates.items) {
+		return "membership_changed", true
+	}
+	if !readAll {
+		for id := range union {
+			if !accessible[id] {
+				return "reviewer_scope", true
+			}
+		}
+	}
+	return "actionable", true
+}
+
+// The preflight and snapshot share exactly the same checked authority query.
+const stagedReviewAuthoritySQL = `WITH RECURSIVE
+request AS (
+  SELECT ?::uuid AS org, ?::uuid AS actor, ?::jsonb AS hold_filter,
+         ?::uuid AS event_id, ?::int AS page_limit, ?::bigint AS page_offset,
+         ?::boolean AS oldest
+),
+actor_membership AS MATERIALIZED (
+  SELECT m.* FROM public.user_organizations m, request q
+  WHERE m.organization_id=q.org AND m.user_id=q.actor AND m.deleted_at IS NULL
+  ORDER BY m.id LIMIT 2
+),
+actor_role AS MATERIALIZED (
+  SELECT u.id, u.is_super_admin,
+    CASE WHEN m.role_id IS NOT NULL THEN m.role_id
+         WHEN u.is_super_admin THEN u.role_id END AS role_id,
+    (u.is_super_admin OR (
+      (SELECT count(*) FROM actor_membership)=1 AND (
+        m.source IN ('', 'direct') OR (m.source='reseller' AND EXISTS (
+          SELECT 1 FROM public.reseller_members rm
+          JOIN public.resellers reseller ON reseller.id=rm.reseller_id AND reseller.deleted_at IS NULL
+          JOIN public.organizations workspace ON workspace.reseller_id=rm.reseller_id AND workspace.deleted_at IS NULL
+          WHERE rm.id=m.reseller_member_id AND rm.user_id=u.id AND workspace.id=q.org
+            AND rm.is_active AND rm.deleted_at IS NULL AND rm.role IN ('owner','admin')
+            AND reseller.status='active'
+        ))
+      )
+    )) AS membership_active
+  FROM request q JOIN public.users u ON u.id=q.actor AND u.deleted_at IS NULL AND u.is_active
+  LEFT JOIN actor_membership m ON true
+  WHERE EXISTS (SELECT 1 FROM public.organizations o WHERE o.id=q.org AND o.deleted_at IS NULL
+    AND NOT jsonb_exists(COALESCE(o.settings,'{}'::jsonb),'platform_compliance_tenant')
+    AND NOT jsonb_exists(COALESCE(o.settings,'{}'::jsonb),'meta_instagram_data_deletion_compliance_tenant')
+    AND NOT jsonb_exists(COALESCE(o.settings,'{}'::jsonb),'threads_managed_compliance_tenant'))
+  ORDER BY m.id LIMIT 2
+),
+actor_permissions AS MATERIALIZED (
+  SELECT p.resource,p.action FROM actor_role a
+  JOIN public.custom_roles role ON role.id=a.role_id AND role.deleted_at IS NULL
+  JOIN public.role_permissions rp ON rp.custom_role_id=role.id
+  JOIN public.permissions p ON p.id=rp.permission_id AND p.deleted_at IS NULL
+  WHERE (p.resource='contacts' AND p.action IN ('read','write'))
+     OR (p.resource='contacts.identity_review' AND p.action='write')
+),
+authority AS MATERIALIZED (
+  SELECT
+    (SELECT count(*) FROM actor_role)=1 AND COALESCE((SELECT bool_and(membership_active) FROM actor_role),false)
+      AND COALESCE((SELECT bool_and(a.role_id IS NULL OR EXISTS (
+        SELECT 1 FROM public.custom_roles role WHERE role.id=a.role_id AND role.deleted_at IS NULL
+      )) FROM actor_role a),false)
+      AND (COALESCE((SELECT bool_or(is_super_admin) FROM actor_role),false) OR (
+        EXISTS (SELECT 1 FROM actor_permissions WHERE resource='contacts' AND action='write')
+        AND EXISTS (SELECT 1 FROM actor_permissions WHERE resource='contacts.identity_review' AND action='write')
+      )) AS allowed,
+    COALESCE((SELECT bool_or(is_super_admin) FROM actor_role),false)
+      OR EXISTS (SELECT 1 FROM actor_permissions WHERE resource='contacts' AND action='read') AS read_all
+)`
+
+// stagedReviewSnapshotSQL captures every mutable fact in one statement snapshot.
+const stagedReviewSnapshotSQL = stagedReviewAuthoritySQL + `,
+-- This is deliberately NOT MATERIALIZED: counting does not retain receipt payloads.
+receipt_scope AS NOT MATERIALIZED (
+  SELECT e.id,e.review_hold_id,e.received_at,e.status
+  FROM request q JOIN public.inbound_events e ON e.organization_id=q.org
+  JOIN public.whatsapp_identity_review_holds h ON h.organization_id=e.organization_id AND h.id=e.review_hold_id
+  WHERE (SELECT allowed FROM authority) AND e.protocol='whatsapp_identity_review_v1'
+    AND e.event_type='review_pending' AND e.deleted_at IS NULL AND h.disposition='open'
+    AND (q.event_id='00000000-0000-0000-0000-000000000000' OR e.id=q.event_id)
+    AND (jsonb_array_length(q.hold_filter)=0 OR e.review_hold_id IN (
+      SELECT value::uuid FROM jsonb_array_elements_text(q.hold_filter)
+    ))
+),
+weights AS MATERIALIZED (
+  SELECT review_hold_id,count(*) AS weight FROM receipt_scope GROUP BY review_hold_id
+),
+unit_keys AS MATERIALIZED (
+  SELECT h.supported,h.whats_app_account_id,h.onboarding_cycle,
+         CASE WHEN h.supported THEN h.direct_primary_bsuid ELSE '' END AS direct,
+         CASE WHEN h.supported THEN '00000000-0000-0000-0000-000000000000'::uuid ELSE h.id END AS unsupported_id,
+         sum(w.weight)::bigint AS weight
+  FROM weights w JOIN public.whatsapp_identity_review_holds h ON h.id=w.review_hold_id
+  CROSS JOIN request q WHERE h.organization_id=q.org
+  GROUP BY h.supported,h.whats_app_account_id,h.onboarding_cycle,
+           CASE WHEN h.supported THEN h.direct_primary_bsuid ELSE '' END,
+           CASE WHEN h.supported THEN '00000000-0000-0000-0000-000000000000'::uuid ELSE h.id END
+  ORDER BY h.whats_app_account_id,h.onboarding_cycle,4,5 LIMIT 257
+),
+units AS MATERIALIZED (
+  SELECT k.weight,anchor.* FROM unit_keys k CROSS JOIN request q
+  CROSS JOIN LATERAL (
+    SELECT h.* FROM public.whatsapp_identity_review_holds h
+    WHERE h.organization_id=q.org AND (
+      (k.supported AND h.supported AND h.whats_app_account_id=k.whats_app_account_id
+       AND h.onboarding_cycle=k.onboarding_cycle AND h.direct_primary_bsuid=k.direct)
+      OR (NOT k.supported AND h.id=k.unsupported_id)
+    ) ORDER BY h.principal_generation DESC,h.id DESC LIMIT 1
+  ) anchor
+  WHERE (SELECT count(*) FROM unit_keys)<=256
+),
+chains AS MATERIALIZED (
+  SELECT u.id AS unit,h.* FROM units u CROSS JOIN request q
+  CROSS JOIN LATERAL (
+    SELECT h.* FROM public.whatsapp_identity_review_holds h
+    WHERE h.organization_id=q.org AND h.disposition='open' AND (
+      (u.supported AND h.supported AND h.whats_app_account_id=u.whats_app_account_id
+       AND h.onboarding_cycle=u.onboarding_cycle AND h.direct_primary_bsuid=u.direct_primary_bsuid
+       AND h.principal_generation<=u.principal_generation)
+      OR (NOT u.supported AND h.id=u.id)
+    ) ORDER BY h.principal_generation,h.id LIMIT 257
+  ) h
+),
+chain_guard AS MATERIALIZED (
+  SELECT (SELECT count(*) FROM chains)>8192
+    OR EXISTS (SELECT 1 FROM chains GROUP BY unit HAVING count(*)>256)
+    OR EXISTS (SELECT 1 FROM chains WHERE member_count>256)
+    OR COALESCE((SELECT sum(member_count) FROM chains),0)>8192 AS overflow
+),
+members AS MATERIALIZED (
+  SELECT h.unit,m.*,
+    EXISTS (
+      SELECT 1 FROM public.contacts c WHERE c.organization_id=q.org AND c.id=m.contact_id AND c.deleted_at IS NULL
+        AND (c.assigned_user_id=q.actor OR EXISTS (
+          SELECT 1 FROM public.agent_transfers t WHERE t.organization_id=q.org AND t.contact_id=c.id
+            AND t.agent_id=q.actor AND t.status='active' AND t.deleted_at IS NULL
+        ))
+    ) AS accessible
+  FROM chains h CROSS JOIN request q
+  CROSS JOIN LATERAL (
+    SELECT m.* FROM public.whatsapp_identity_review_members m
+    WHERE m.organization_id=q.org AND m.hold_id=h.id ORDER BY m.contact_id LIMIT 257
+  ) m
+  WHERE NOT (SELECT overflow FROM chain_guard)
+  LIMIT 8193
+),
+selectors AS MATERIALIZED (
+  SELECT u.id AS unit,c.id AS raw_id,c.merged_into_id,c.deleted_at,
+    ((CASE WHEN u.direct_primary_bsuid<>'' AND c.bs_uid=u.direct_primary_bsuid THEN 1 ELSE 0 END)
+     | (CASE WHEN u.parent_bsuid<>'' AND c.bs_uid=u.parent_bsuid THEN 2 ELSE 0 END)
+     | (CASE WHEN u.phone<>'' AND regexp_replace(c.phone_number,'[^0-9]','','g')=u.phone THEN 4 ELSE 0 END)) AS reasons
+  FROM units u CROSS JOIN request q CROSS JOIN LATERAL (
+    SELECT c.id,c.merged_into_id,c.deleted_at,c.bs_uid,c.phone_number FROM public.contacts c
+    WHERE c.organization_id=q.org AND (
+      (u.direct_primary_bsuid<>'' AND c.bs_uid=u.direct_primary_bsuid)
+      OR (u.parent_bsuid<>'' AND c.bs_uid=u.parent_bsuid)
+      OR (u.phone<>'' AND regexp_replace(c.phone_number,'[^0-9]','','g')=u.phone)
+    ) ORDER BY c.id LIMIT 257
+  ) c
+  WHERE u.supported AND NOT (SELECT overflow FROM chain_guard)
+),
+selector_guard AS MATERIALIZED (
+  SELECT (SELECT count(*) FROM selectors)>8192
+    OR EXISTS (SELECT 1 FROM selectors GROUP BY unit HAVING count(*)>256) AS overflow
+),
+-- Each forward edge has at most one native PK target. No fanout is possible.
+forward(unit,raw_id,reasons,id,next_id,deleted,visited,depth,broken) AS (
+  SELECT s.unit,s.raw_id,s.reasons,s.raw_id,s.merged_into_id,s.deleted_at IS NOT NULL,
+         ARRAY[s.raw_id]::uuid[],0,false FROM selectors s
+  WHERE NOT (SELECT overflow FROM selector_guard)
+  UNION ALL
+  SELECT f.unit,f.raw_id,f.reasons,c.id,c.merged_into_id,c.deleted_at IS NOT NULL,
+         f.visited || f.next_id,f.depth+1,c.id IS NULL OR f.next_id=ANY(f.visited)
+  FROM forward f CROSS JOIN request q
+  LEFT JOIN public.contacts c ON c.organization_id=q.org AND c.id=f.next_id
+  WHERE f.next_id IS NOT NULL AND f.depth<15 AND NOT f.broken
+),
+resolved AS MATERIALIZED (
+  SELECT DISTINCT ON(unit,raw_id) unit,raw_id,reasons,id,next_id,deleted,visited,depth,broken
+  FROM forward ORDER BY unit,raw_id,depth DESC
+),
+roots AS MATERIALIZED (
+  SELECT DISTINCT unit,id FROM resolved WHERE NOT broken AND next_id IS NULL AND NOT deleted
+),
+path_guard AS MATERIALIZED (
+  SELECT EXISTS (
+    SELECT 1 FROM resolved r CROSS JOIN LATERAL unnest(r.visited) p(id)
+    GROUP BY r.unit HAVING count(DISTINCT p.id)>256
+  ) AS overflow
+),
+-- One BFS state per unit. The LATERAL inner SELECT limits every expansion to
+-- remaining capacity+1 BEFORE array aggregation. Overflow states never recurse.
+family(unit,frontier,frontier_roots,ids,root_ids,depth,overflow,repeated) AS (
+  SELECT r.unit,array_agg(r.id ORDER BY r.id),array_agg(r.id ORDER BY r.id),
+         array_agg(r.id ORDER BY r.id),array_agg(r.id ORDER BY r.id),0,false,false
+  FROM roots r WHERE NOT (SELECT overflow FROM path_guard) GROUP BY r.unit
+  UNION ALL
+  SELECT f.unit,n.ids,n.roots,f.ids || n.ids,f.root_ids || n.roots,f.depth+1,
+         cardinality(f.ids)+cardinality(n.ids)>256,n.repeated
+  FROM family f CROSS JOIN request q
+  CROSS JOIN LATERAL (
+    SELECT COALESCE(array_agg(v.id ORDER BY v.id),ARRAY[]::uuid[]) AS ids,
+           COALESCE(array_agg(v.root ORDER BY v.id),ARRAY[]::uuid[]) AS roots,
+           COALESCE(bool_or(v.id=ANY(f.ids)),false) AS repeated
+    FROM (
+      SELECT c.id,front.root FROM unnest(f.frontier,f.frontier_roots) front(id,root)
+      JOIN public.contacts c ON c.organization_id=q.org AND c.merged_into_id=front.id
+      ORDER BY c.id LIMIT (257-cardinality(f.ids))
+    ) v
+  ) n
+  WHERE cardinality(f.frontier)>0 AND f.depth<16 AND NOT f.overflow AND NOT f.repeated
+),
+family_final AS MATERIALIZED (
+  SELECT DISTINCT ON(unit) * FROM family ORDER BY unit,depth DESC
+),
+family_guard AS MATERIALIZED (
+  SELECT EXISTS (SELECT 1 FROM family_final f CROSS JOIN request q
+    WHERE f.overflow OR f.repeated OR (f.depth=16 AND EXISTS (
+      SELECT 1 FROM public.contacts c WHERE c.organization_id=q.org AND c.merged_into_id=ANY(f.frontier)
+    ))) OR EXISTS (
+      SELECT 1 FROM (
+        SELECT unit,unnest(visited) AS id FROM resolved
+        UNION SELECT unit,unnest(ids) AS id FROM family_final
+      ) all_ids GROUP BY unit HAVING count(*)>256
+    ) AS overflow
+),
+canonical AS MATERIALIZED (
+  SELECT r.unit,c.id,c.bs_uid,
+    (jsonb_build_object(
+      'coexistence_user_id',CASE WHEN jsonb_typeof(c.metadata->'coexistence_user_id')='string'
+        AND octet_length((c.metadata->'coexistence_user_id')::text)<=1024 THEN c.metadata->'coexistence_user_id' ELSE 'null'::jsonb END,
+      'coexistence_parent_user_id',CASE WHEN jsonb_typeof(c.metadata->'coexistence_parent_user_id')='string'
+        AND octet_length((c.metadata->'coexistence_parent_user_id')::text)<=1024 THEN c.metadata->'coexistence_parent_user_id' ELSE 'null'::jsonb END
+     )
+     || CASE WHEN jsonb_exists(c.metadata,'coexistence_conflicting_user_id') THEN '{"coexistence_conflicting_user_id":true}'::jsonb ELSE '{}'::jsonb END
+     || CASE WHEN jsonb_exists(c.metadata,'coexistence_phone_conflict') THEN '{"coexistence_phone_conflict":true}'::jsonb ELSE '{}'::jsonb END
+     || CASE WHEN jsonb_exists(c.metadata,'coexistence_reconciled_contact_id') THEN '{"coexistence_reconciled_contact_id":true}'::jsonb ELSE '{}'::jsonb END) AS metadata,
+    ((jsonb_typeof(c.metadata->'coexistence_user_id')='string' AND octet_length((c.metadata->'coexistence_user_id')::text)>1024)
+      OR (jsonb_typeof(c.metadata->'coexistence_parent_user_id')='string' AND octet_length((c.metadata->'coexistence_parent_user_id')::text)>1024)) IS TRUE AS oversized,
+    EXISTS (
+      SELECT 1 FROM family_final f CROSS JOIN LATERAL unnest(f.ids,f.root_ids) member(id,root)
+      JOIN public.contacts alias ON alias.organization_id=q.org AND alias.id=member.id
+      WHERE f.unit=r.unit AND member.root=c.id AND member.id<>member.root AND COALESCE(btrim(alias.bs_uid),'')<>''
+        AND btrim(alias.bs_uid) NOT IN (u.direct_primary_bsuid,u.parent_bsuid)
+    ) AS foreign_family,
+    EXISTS (
+      SELECT 1 FROM public.whatsapp_identity_review_holds d WHERE d.organization_id=q.org
+        AND d.disposition='future_routing' AND d.decision_target_contact_id=c.id
+        AND d.direct_primary_bsuid NOT IN (u.direct_primary_bsuid,u.parent_bsuid)
+    ) AS foreign_decision
+  FROM roots r JOIN units u ON u.id=r.unit CROSS JOIN request q
+  JOIN public.contacts c ON c.organization_id=q.org AND c.id=r.id
+),
+page_keys AS MATERIALIZED (
+  SELECT s.* FROM receipt_scope s CROSS JOIN request q
+  ORDER BY CASE WHEN q.oldest THEN s.received_at END ASC,
+           CASE WHEN q.oldest THEN s.id END ASC,
+           CASE WHEN NOT q.oldest THEN s.received_at END DESC,
+           CASE WHEN NOT q.oldest THEN s.id END DESC
+  LIMIT (SELECT page_limit FROM request) OFFSET (SELECT page_offset FROM request)
+),
+page_data AS MATERIALIZED (
+  SELECT p.id,p.review_hold_id,p.received_at,p.status,
+    jsonb_build_object('message_type',e.payload->'message_type','media_status',e.payload->'media_status',
+      'media_id',e.payload->'media_id','media_sha256',e.payload->'media_sha256',
+      'media_mime_type',e.payload->'media_mime_type','media_filename',e.payload->'media_filename',
+      'content',e.payload->'content','media_generation',e.payload->'media_generation',
+      'media_revoked',e.payload->'media_revoked','media_revision',e.payload->'media_revision') AS payload,
+    (jsonb_typeof(e.payload->'media_url')='string' AND COALESCE(btrim(e.payload->>'media_url'),'')<>'') IS TRUE AS media_available
+  FROM page_keys p JOIN public.inbound_events e ON e.id=p.id CROSS JOIN request q WHERE e.organization_id=q.org
+),
+control AS MATERIALIZED (
+  SELECT a.allowed,a.read_all,(SELECT count(*) FROM receipt_scope) AS total,
+    (SELECT count(*) FROM unit_keys)>256 OR (SELECT count(*) FROM units)<>(SELECT count(*) FROM unit_keys)
+    OR (SELECT overflow FROM chain_guard) OR (SELECT count(*) FROM members)>8192
+    OR EXISTS (SELECT 1 FROM members GROUP BY unit HAVING count(DISTINCT contact_id)>256)
+    OR (SELECT overflow FROM selector_guard) OR (SELECT overflow FROM path_guard)
+    OR (SELECT overflow FROM family_guard) OR EXISTS (SELECT 1 FROM canonical WHERE oversized)
+    OR EXISTS (SELECT 1 FROM resolved WHERE broken OR next_id IS NOT NULL OR deleted)
+    OR EXISTS (SELECT 1 FROM page_data WHERE octet_length(payload::text)>65536) AS incomplete
+  FROM authority a
+),
+wire AS (
+  SELECT 0 AS ordinal,'control'::text AS kind,'00000000-0000-0000-0000-000000000000'::uuid AS unit,to_jsonb(c) AS body FROM control c
+  UNION ALL SELECT 1,'page','00000000-0000-0000-0000-000000000000'::uuid,
+    jsonb_build_object('id',p.id,'hold_id',p.review_hold_id,'received_at',p.received_at,'status',p.status,
+      'media_available',p.media_available,'payload',CASE WHEN octet_length(p.payload::text)<=65536 THEN p.payload ELSE NULL END,
+      'oversized',octet_length(p.payload::text)>65536) FROM page_data p
+  UNION ALL SELECT 2,'unit',u.id,to_jsonb(u) || jsonb_build_object(
+    'account_exists',EXISTS(SELECT 1 FROM public.whatsapp_accounts a,request q WHERE a.id=u.whats_app_account_id AND a.organization_id=q.org AND a.deleted_at IS NULL),
+    'state',COALESCE((SELECT jsonb_build_object('cycle',s.onboarding_cycle,'lifecycle',s.lifecycle_status,'onboarding',s.onboarding_status)
+      FROM public.whatsapp_coexistence_states s,request q WHERE s.organization_id=q.org AND s.whats_app_account_id=u.whats_app_account_id),'null'::jsonb))
+    FROM units u WHERE NOT (SELECT incomplete FROM control)
+  UNION ALL SELECT 3,'hold',h.unit,to_jsonb(h) FROM chains h WHERE NOT (SELECT incomplete FROM control)
+  UNION ALL SELECT 4,'member',m.unit,to_jsonb(m) FROM members m WHERE NOT (SELECT incomplete FROM control)
+  UNION ALL SELECT 5,'selector',r.unit,to_jsonb(r) FROM resolved r WHERE NOT (SELECT incomplete FROM control)
+  UNION ALL SELECT 6,'canonical',c.unit,to_jsonb(c) FROM canonical c WHERE NOT (SELECT incomplete FROM control)
+)
+SELECT kind,unit,
+       CASE WHEN octet_length(body::text)<=65536 THEN body::text ELSE '{}' END AS body,
+       octet_length(body::text)>65536 AS oversized
+FROM wire ORDER BY ordinal,unit LIMIT 16385
+`
