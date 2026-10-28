@@ -590,19 +590,138 @@ func TestMergedLegacyAliasPropagatesCancelledProof(t *testing.T) {
 	}
 }
 
-func TestMergedLegacyAliasLockedProofRechecksASecondHolder(t *testing.T) {
-	app, account, _, _, original, bsuid := mergedLegacyAliasFixture(t)
+func TestMergedLegacyAliasPreAdmissionCommitRefusesSecondHolder(t *testing.T) {
+	app, account, target, legacy, original, bsuid := mergedLegacyAliasFixture(t)
+	// A pre-existing unrelated contact can acquire the selector while admission
+	// has not acquired its organization fence. No trigger or lock is bypassed.
+	holder := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
+	resolved, err := app.resolveWhatsAppMessage(account, mergedLegacyAliasLookup(original, bsuid))
+	require.NoError(t, err)
+	require.NotNil(t, resolved.LegacyMergedProjection, "the unchanged fixture must initially prove the stored winner")
+	projectionBefore := loadMergedLegacyProjection(t, app.DB, account, original.ID, target.ID, legacy.ID)
+	counts := mergedLegacyProjectionCounts(t, app.DB, account.OrganizationID)
+	live := app.DB
+	pool, err := live.DB()
+	require.NoError(t, err)
+	isolated, err := gorm.Open(postgres.New(postgres.Config{Conn: pool}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	atFence, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	var discovered, reached atomic.Bool
+	require.NoError(t, isolated.Callback().Query().After("gorm:query").Register("test:merged-legacy-discovery", func(tx *gorm.DB) {
+		if tx.Error != nil || tx.RowsAffected != 1 || tx.Statement.Schema == nil || tx.Statement.Schema.Table != "whatsapp_accounts" ||
+			len(tx.Statement.Selects) != 1 || tx.Statement.Selects[0] != "organization_id" {
+			return
+		}
+		selected, ok := tx.Statement.Dest.(*models.WhatsAppAccount)
+		if !ok || selected.OrganizationID != account.OrganizationID {
+			return
+		}
+		for _, value := range tx.Statement.Vars {
+			if fmt.Sprint(value) == account.PhoneID {
+				discovered.Store(true)
+			}
+		}
+	}))
+	require.NoError(t, isolated.Callback().Raw().Before("gorm:raw").Register("test:merged-legacy-before-admission", func(tx *gorm.DB) {
+		// Exec uses the Raw callback. Pause before the actual selector advisory
+		// acquisition in LockOrganizationPolicyScope, after tenant discovery;
+		// the earlier WAMID advisory lock does not fence contact selector writes.
+		if tx.Statement.SQL.String() != "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended($1, 0))" ||
+			len(tx.Statement.Vars) != 1 || fmt.Sprint(tx.Statement.Vars[0]) != "rereply:whatsapp_identity_review_selector:v1:"+account.OrganizationID.String() ||
+			!reached.CompareAndSwap(false, true) {
+			return
+		}
+		if _, inTransaction := tx.Statement.ConnPool.(gorm.TxCommitter); !inTransaction || !discovered.Load() {
+			_ = tx.AddError(fmt.Errorf("admission barrier did not follow the actual tenant read in a transaction"))
+			return
+		}
+		close(atFence)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			_ = tx.AddError(ctx.Err())
+		}
+	}))
+	event := mergedLegacyAliasEvent(t, bsuid, original.WhatsAppMessageID, "revoke")
+	app.DB = isolated.WithContext(ctx)
+	result := make(chan error, 1)
+	joined := false
+	defer func() {
+		unblock()
+		cancel()
+		if !joined {
+			drain := time.NewTimer(2 * time.Second)
+			defer drain.Stop()
+			select {
+			case <-result:
+				joined = true
+			case <-drain.C:
+				t.Error("owned pre-admission goroutine did not stop within the bounded cancellation drain")
+			}
+		}
+		if joined {
+			app.DB = live
+		}
+	}()
+	go func() { result <- app.persistMessageEchoesBeforeAck(account.PhoneID, []CoexistenceMessage{event}, nil) }()
+	select {
+	case <-atFence:
+	case err := <-result:
+		joined = true
+		t.Fatalf("persistence ended before the pre-admission barrier: %v", err)
+	case <-ctx.Done():
+		t.Fatal("persistence never reached its pre-admission barrier")
+	}
+	require.True(t, discovered.Load(), "the request completed its real tenant lookup before the concurrent commit")
+	require.NoError(t, live.WithContext(ctx).Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", holder.ID, account.OrganizationID).Update("bs_uid", bsuid).Error)
+	var committedHolder models.Contact
+	require.NoError(t, live.WithContext(ctx).First(&committedHolder, holder.ID).Error)
+	require.Equal(t, bsuid, committedHolder.BSUID, "the independent selector write must actually commit before admission resumes")
+	unblock()
+	select {
+	case err := <-result:
+		joined = true
+		require.Error(t, err, "fresh admission proof must refuse a second holder committed before its fence")
+	case <-ctx.Done():
+		t.Fatal("admission proof failed to finish after release")
+	}
+	app.WaitForBackgroundTasks()
+	var after models.Message
+	require.NoError(t, live.First(&after, original.ID).Error)
+	assert.Equal(t, original, after, "the rejected revoke cannot mutate the stored winner")
+	projectionAfter := loadMergedLegacyProjection(t, live, account, original.ID, target.ID, legacy.ID)
+	assert.Equal(t, projectionBefore, projectionAfter, "refusal must not change any linked projection")
+	assert.Equal(t, counts, mergedLegacyProjectionCounts(t, live, account.OrganizationID), "refusal cannot create replacement rows or jobs")
+	var holderAfter models.Contact
+	require.NoError(t, live.First(&holderAfter, holder.ID).Error)
+	assert.Equal(t, committedHolder, holderAfter, "refusal cannot undo the independent committed selector")
+}
+
+func TestMergedLegacyAliasAdmissionFenceRejectsSecondHolderAndMirrorSucceeds(t *testing.T) {
+	app, account, target, legacy, original, bsuid := mergedLegacyAliasFixture(t)
+	holder := testutil.CreateTestContact(t, app.DB, account.OrganizationID)
+	var holderBefore models.Contact
+	require.NoError(t, app.DB.First(&holderBefore, holder.ID).Error)
+	require.Empty(t, holderBefore.BSUID)
+	projectionBefore := loadMergedLegacyProjection(t, app.DB, account, original.ID, target.ID, legacy.ID)
+	counts := mergedLegacyProjectionCounts(t, app.DB, account.OrganizationID)
 	live := app.DB
+	pool, err := live.DB()
+	require.NoError(t, err)
+	isolated, err := gorm.Open(postgres.New(postgres.Config{Conn: pool}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	atLock, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
-	defer unblock()
 	var reached atomic.Bool
-	name := "test:merged-legacy-lock:" + uuid.NewString()
-	event := mergedLegacyAliasEvent(t, bsuid, original.WhatsAppMessageID, "revoke")
-	require.NoError(t, app.DB.Callback().Query().Before("gorm:query").Register(name, func(tx *gorm.DB) {
+	require.NoError(t, isolated.Callback().Query().Before("gorm:query").Register("test:merged-legacy-after-admission", func(tx *gorm.DB) {
 		if tx.Statement.Schema == nil || tx.Statement.Schema.Table != "contacts" {
 			return
 		}
@@ -616,7 +735,8 @@ func TestMergedLegacyAliasLockedProofRechecksASecondHolder(t *testing.T) {
 			_ = tx.AddError(ctx.Err())
 		}
 	}))
-	app.DB = live.WithContext(ctx)
+	event := mergedLegacyAliasEvent(t, bsuid, original.WhatsAppMessageID, "revoke")
+	app.DB = isolated.WithContext(ctx)
 	result := make(chan error, 1)
 	joined := false
 	defer func() {
@@ -632,39 +752,50 @@ func TestMergedLegacyAliasLockedProofRechecksASecondHolder(t *testing.T) {
 				t.Error("owned locked-proof goroutine did not stop within the bounded cancellation drain")
 			}
 		}
-		// Callback removal and receiver restoration must follow the join, even
-		// when a fixture assertion exits the test before the normal receive.
 		if joined {
-			_ = live.Callback().Query().Remove(name)
 			app.DB = live
 		}
 	}()
-	go func() {
-		result <- app.persistMessageEchoesBeforeAck(account.PhoneID, []CoexistenceMessage{event}, nil)
-	}()
+	go func() { result <- app.persistMessageEchoesBeforeAck(account.PhoneID, []CoexistenceMessage{event}, nil) }()
 	select {
 	case <-atLock:
 	case err := <-result:
 		joined = true
-		t.Fatalf("resolver ended before locked recheck: %v", err)
+		t.Fatalf("resolver ended before the post-admission contact lock: %v", err)
 	case <-ctx.Done():
-		t.Fatal("resolver never reached the lock barrier")
+		t.Fatal("resolver never reached the contact lock barrier")
 	}
-	// Simulate an independent legacy writer that does not take the admission
-	// advisory lock. The second, locked proof must still observe its commit.
-	holder := testutil.CreateTestContact(t, live.WithContext(ctx), account.OrganizationID)
-	require.NoError(t, live.WithContext(ctx).Model(holder).Update("bs_uid", bsuid).Error)
+	// The real selector trigger cannot admit a competing selector while this
+	// transaction owns the organization fence. Keep its observed 55P03 contract.
+	writeErr := live.WithContext(ctx).Model(&models.Contact{}).
+		Where("id = ? AND organization_id = ?", holder.ID, account.OrganizationID).Update("bs_uid", bsuid).Error
+	require.Error(t, writeErr)
+	require.Equal(t, "55P03", postgresErrorCode(writeErr))
+	var holderAfter models.Contact
+	require.NoError(t, live.WithContext(ctx).First(&holderAfter, holder.ID).Error)
+	require.Equal(t, holderBefore, holderAfter, "the rejected independent transaction cannot change the selector")
 	unblock()
 	select {
 	case err := <-result:
 		joined = true
-		require.Error(t, err)
+		require.NoError(t, err, "unchanged authority and provenance must complete the revoke")
 	case <-ctx.Done():
 		t.Fatal("locked proof failed to finish after release")
 	}
+	app.WaitForBackgroundTasks()
 	var after models.Message
 	require.NoError(t, live.First(&after, original.ID).Error)
-	assert.Equal(t, original, after)
+	assert.Equal(t, "[Message deleted from WhatsApp Business App]", after.Content)
+	assert.Equal(t, true, after.Metadata[coexistenceMediaRevokedMetadataKey])
+	assert.Empty(t, after.MediaURL)
+	projectionAfter := loadMergedLegacyProjection(t, live, account, original.ID, target.ID, legacy.ID)
+	assertMergedLegacyProjectionIdentity(t, projectionBefore, projectionAfter)
+	assert.Equal(t, after.Content, projectionAfter.Conversation.LastMessagePreview, "actual post-commit mirror must succeed under unchanged facts")
+	assert.Equal(t, counts, mergedLegacyProjectionCounts(t, live, account.OrganizationID))
+	assert.Equal(t, *target, loadCoexistenceAdmissionContact(t, live, account.OrganizationID, target.ID))
+	var legacyAfter models.Contact
+	require.NoError(t, live.Unscoped().First(&legacyAfter, legacy.ID).Error)
+	assert.Equal(t, legacy, legacyAfter, "the proof cannot rewrite the retained alias")
 }
 
 func TestMergedLegacyProjectionTargetOwnedIdentityStillUsesHistoricalProof(t *testing.T) {
