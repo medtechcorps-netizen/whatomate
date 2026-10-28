@@ -136,6 +136,7 @@ func TestDatabasePoolDiagnosticsPostgresSaturationBeforeReadinessFailure(t *test
 	rdb := testutil.SetupTestRedis(t)
 	if rdb == nil {
 		t.Skip("TEST_REDIS_URL not set")
+		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

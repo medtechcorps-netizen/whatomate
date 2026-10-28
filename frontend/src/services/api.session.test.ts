@@ -26,7 +26,7 @@ const ok = (config: InternalAxiosRequestConfig, data: unknown = { data: {} }) =>
 })
 
 function httpError(status: number, config?: InternalAxiosRequestConfig) {
-  return new AxiosError(
+  return new AxiosError<{ status: string; error_type?: string }>(
     `Request failed with status code ${status}`,
     status >= 500 ? AxiosError.ERR_BAD_RESPONSE : AxiosError.ERR_BAD_REQUEST,
     config,
