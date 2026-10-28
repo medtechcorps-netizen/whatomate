@@ -14,6 +14,8 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { getErrorMessage, unwrapItemResponse } from '@/lib/api-utils'
 import { displaySafeMediaBlob, mediaDownloadName } from '@/lib/chatMedia'
+import { parseStagedReviewList, parseStagedReviewDetail, stagedReviewExplanation } from '@/lib/stagedIdentityReview'
+import { useIdentityReviewObservation, type IdentityReviewScope } from '@/composables/useIdentityReviewObservation'
 import {
   contactsService,
   effectiveAIIsAllowed,
@@ -41,11 +43,12 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:open': [value: boolean]
   resolved: [state: ContactIdentityReviewEffectiveState]
-  'staged-total': [value: number]
+  'queue-invalidated': [scope: IdentityReviewScope]
 }>()
 
 const section = ref<DialogSection>('contact')
 const state = ref<ContactIdentityReviewEffectiveState | null>(null)
+let stateScope: IdentityReviewScope | null = null
 const preview = ref<ContactIdentityReviewPreview | null>(null)
 const selectedTarget = ref('')
 const loading = ref(false)
@@ -56,6 +59,8 @@ const stagedPage = ref(1)
 const stagedTotal = ref(0)
 const stagedDetail = ref<StagedIdentityReviewDetail | null>(null)
 const stagedLoading = ref(false)
+const stagedKnown = ref(false)
+const selectedStagedItem = ref<StagedIdentityReviewItem | null>(null)
 const mediaLoading = ref(false)
 const mediaURL = ref('')
 const mediaFileName = ref('')
@@ -83,6 +88,7 @@ const unlistedOpenGenerations = ref(0)
 const stagedHoldFilter = ref<string[]>([])
 let requestGeneration = 0
 let requestController: AbortController | null = null
+let heldRequestController: AbortController | null = null
 let mediaRequestController: AbortController | null = null
 let pendingDecision: ContactIdentityReviewDecisionRequest | null = null
 let decisionInFlightToken: symbol | null = null
@@ -90,10 +96,18 @@ const stagedPageSize = 100
 
 interface DecisionAttemptContext {
   token: symbol
+  scope: IdentityReviewScope
   generation: number
   contactID: string
   targetContactID: string
   preview: ContactIdentityReviewPreview
+}
+
+interface ContactReviewRead {
+  readonly scope: IdentityReviewScope
+  readonly generation: number
+  readonly contactID: string
+  readonly state: ContactIdentityReviewEffectiveState
 }
 
 const blocked = computed(() => !effectiveAIIsAllowed(state.value))
@@ -151,6 +165,8 @@ const previewIsComplete = computed(() => {
 })
 const canDecide = computed(() => (
   props.canReview
+  && observation.canReview()
+  && observation.capture() !== null
   && previewIsComplete.value
   && preview.value?.snapshot.candidates.some(candidate => candidate.contact_id === selectedTarget.value) === true
   && routableTargets.value.has(selectedTarget.value)
@@ -188,6 +204,7 @@ function closeMediaURL() {
 }
 
 function resetProtectedState() {
+  stopHeldReads()
   decisionInFlightToken = null
   deciding.value = false
   preview.value = null
@@ -196,6 +213,8 @@ function resetProtectedState() {
   stagedPage.value = 1
   stagedTotal.value = 0
   stagedDetail.value = null
+  selectedStagedItem.value = null
+  stagedKnown.value = false
   heldCopies.value = []
   heldTotal.value = 0
   heldMessageState.value = 'idle'
@@ -226,7 +245,9 @@ async function sha256Hex(value: string): Promise<string> {
 
 function decisionContextIsCurrent(context: DecisionAttemptContext): boolean {
   return (
-    decisionInFlightToken === context.token
+    observation.current(context.scope)
+    && props.canReview && observation.canReview()
+    && decisionInFlightToken === context.token
     && deciding.value
     && props.open
     && section.value === 'contact'
@@ -289,29 +310,50 @@ async function decisionRequestFor(
   return request
 }
 
-async function loadContactReview() {
+function contactReviewReadIsCurrent(read: ContactReviewRead): boolean {
+  return observation.current(read.scope)
+    && props.open
+    && section.value === 'contact'
+    && props.contactId === read.contactID
+    && requestGeneration === read.generation
+    && stateScope === read.scope
+    && state.value === read.state
+}
+
+async function loadContactReview(): Promise<ContactReviewRead | null> {
+  const scope = observation.capture()
+  if (!scope) return null
   const contactID = props.contactId
   const generation = ++requestGeneration
+  let readState: ContactIdentityReviewEffectiveState | null = null
   requestController?.abort()
-  const controller = new AbortController()
+  const controller = observation.controller()
   requestController = controller
   resetProtectedState()
   error.value = ''
   loading.value = true
-  state.value = props.effectiveState ?? safeFallbackState()
+  stateScope = null
+  state.value = safeFallbackState()
   if (!contactID) {
     loading.value = false
-    return
+    observation.release(controller)
+    requestController = null
+    return null
   }
   try {
-    const response = await contactsService.getIdentityReviewState(contactID, controller.signal)
-    if (generation !== requestGeneration || props.contactId !== contactID) return
+    const response = await contactsService.getIdentityReviewState(contactID, { organizationId: scope.organizationId, signal: controller.signal })
+    if (!observation.current(scope) || generation !== requestGeneration || props.contactId !== contactID || controller.signal.aborted) return null
     state.value = unwrapItemResponse<ContactIdentityReviewEffectiveState>(response)
+    readState = state.value
+    stateScope = scope
 
-    if (props.canReview && !effectiveAIIsAllowed(state.value)) {
-      const previewResponse = await contactsService.previewIdentityReview(contactID, controller.signal)
-      if (generation !== requestGeneration || props.contactId !== contactID) return
+    if (props.canReview && observation.canReview() && !effectiveAIIsAllowed(state.value)) {
+      const previewResponse = await contactsService.previewIdentityReview(contactID, { organizationId: scope.organizationId, signal: controller.signal })
+      if (!observation.current(scope) || generation !== requestGeneration || props.contactId !== contactID || controller.signal.aborted) return null
       const nextPreview = unwrapItemResponse<ContactIdentityReviewPreview>(previewResponse)
+      if (!nextPreview?.snapshot || !Array.isArray(nextPreview.snapshot.candidates) || !Array.isArray(nextPreview.union_candidates)) {
+        throw new Error('The complete current candidate set could not be verified. No decision is allowed.')
+      }
       preview.value = nextPreview
       // Pre-select only a single candidate that owns this sender's WhatsApp
       // ID. A phone or parent-ID match is never chosen for the reviewer.
@@ -336,25 +378,34 @@ async function loadContactReview() {
         unlistedOpenGenerations.value = Array.isArray(nextPreview.open_hold_ids)
           ? Math.max(0, nextPreview.open_hold_ids.length - holdIDs.length)
           : 0
-        void loadHeldMessages(holdIDs, generation, contactID, controller.signal)
+        void startHeldReads(holdIDs, generation, contactID, scope)
       }
     }
   } catch (requestError) {
-    if (generation !== requestGeneration || controller.signal.aborted) return
+    if (!observation.current(scope) || generation !== requestGeneration || controller.signal.aborted) return null
+    if (errorResponse(requestError)?.status === 403) { refuseAuthority(scope); return null }
     if (isReadOnlyReviewError(requestError)) {
       // The effective state already loaded stays shown; only the decision is
       // unavailable.
       readOnlyReview.value = getErrorMessage(requestError, 'This identity review is read-only.')
-      return
+    } else {
+      // A local fallback is not a completed server reread. A server-returned
+      // known:false state, by contrast, remains valid fail-closed data.
+      readState = null
+      stateScope = null
+      state.value = safeFallbackState()
+      error.value = getErrorMessage(requestError, 'Identity review state is unavailable. AI remains blocked.')
     }
-    state.value = safeFallbackState()
-    error.value = getErrorMessage(requestError, 'Identity review state is unavailable. AI remains blocked.')
   } finally {
-    if (generation === requestGeneration) {
+    observation.release(controller)
+    if (generation === requestGeneration && observation.current(scope)) {
       loading.value = false
       if (requestController === controller) requestController = null
     }
   }
+  if (!readState) return null
+  const read: ContactReviewRead = { scope, generation, contactID, state: readState }
+  return contactReviewReadIsCurrent(read) ? read : null
 }
 
 function errorResponse(error: unknown): { status?: number; data?: { error_type?: unknown } } | undefined {
@@ -373,39 +424,63 @@ function isReadOnlyReviewError(error: unknown): boolean {
 // Every held copy a decision on this review would close, oldest first, kept
 // out of every conversation. They are context for the decision only: a
 // failure here never blocks or enables a decision.
-async function loadHeldMessages(holdIDs: string[], generation: number, contactID: string, signal: AbortSignal) {
+function stopHeldReads() {
+  if (heldRequestController) {
+    heldRequestController.abort()
+    observation.release(heldRequestController)
+    heldRequestController = null
+  }
+}
+
+async function startHeldReads(holdIDs: string[], generation: number, contactID: string, scope: IdentityReviewScope) {
+  stopHeldReads()
+  const controller = observation.controller()
+  heldRequestController = controller
+  try { await loadHeldMessages(holdIDs, generation, contactID, controller.signal, scope) }
+  finally {
+    observation.release(controller)
+    if (heldRequestController === controller) heldRequestController = null
+  }
+}
+
+async function loadHeldMessages(holdIDs: string[], generation: number, contactID: string, signal: AbortSignal, scope: IdentityReviewScope) {
+  const current = () => observation.current(scope) && generation === requestGeneration && props.contactId === contactID && props.canViewStaged && observation.canReview() && !signal.aborted
+  if (!current()) return
   heldCopies.value = []
   heldTotal.value = 0
   heldMessageState.value = 'loading'
   try {
-    const listResponse = await contactsService.listStagedIdentityReviewsForHolds(holdIDs, heldCopyLimit, signal)
-    if (generation !== requestGeneration || props.contactId !== contactID) return
-    const payload = unwrapItemResponse<{ reviews: StagedIdentityReviewItem[]; total: number }>(listResponse)
-    const wanted = new Set(holdIDs)
-    const items = Array.isArray(payload?.reviews)
-      ? payload.reviews.filter(item => wanted.has(item.hold_id)).slice(0, heldCopyLimit)
-      : []
-    if (items.length === 0) {
-      heldMessageState.value = 'none'
-      return
-    }
-    const details = await Promise.all(items.map(async item => {
-      try {
-        const detail = unwrapItemResponse<StagedIdentityReviewDetail>(
-          await contactsService.getStagedIdentityReview(item.id, signal),
-        )
-        return detail && detail.id === item.id ? detail : null
-      } catch {
-        return null
+    const response = await contactsService.listStagedIdentityReviewsForHolds(holdIDs, heldCopyLimit, { organizationId: scope.organizationId, signal })
+    if (!current()) return
+    const payload = parseStagedReviewList(unwrapItemResponse(response), 1, heldCopyLimit, holdIDs)
+    const items = payload.reviews
+    if (items.length === 0) { heldMessageState.value = 'none'; return }
+    const details: (StagedIdentityReviewDetail | null)[] = items.map(() => null)
+    let next = 0
+    // Four protected reads at most; no queued request survives its scope.
+    await Promise.all(Array.from({ length: Math.min(4, items.length) }, async () => {
+      while (current() && next < items.length) {
+        const index = next++
+        const item = items[index]!
+        try {
+          const result = await contactsService.getStagedIdentityReview(item.id, { organizationId: scope.organizationId, signal })
+          if (!current()) return
+          details[index] = parseStagedReviewDetail(unwrapItemResponse(result), item.id, item.hold_id)
+        } catch (requestError) {
+          if (!current()) return
+          if (errorResponse(requestError)?.status === 403) { refuseAuthority(scope); return }
+        }
       }
     }))
-    if (generation !== requestGeneration || props.contactId !== contactID) return
-    heldCopies.value = items.map((item, index) => ({ item, detail: details[index] }))
-    heldTotal.value = Number.isSafeInteger(payload?.total) && payload.total > items.length ? payload.total : items.length
+    if (!current()) return
+    heldCopies.value = items.map((item, index) => ({ item, detail: details[index] ?? null }))
+    heldTotal.value = payload.total
     heldMessageState.value = 'loaded'
-  } catch {
-    if (generation !== requestGeneration || signal.aborted) return
+  } catch (requestError) {
+    if (!current()) return
+    heldCopies.value = []
     heldMessageState.value = 'unavailable'
+    if (errorResponse(requestError)?.status === 403) refuseAuthority(scope)
   }
 }
 
@@ -435,10 +510,12 @@ async function decide() {
   const contactID = props.contactId
   const targetContactID = selectedTarget.value
   const currentPreview = preview.value
-  if (!contactID || !currentPreview || !canDecide.value || decisionInFlightToken) return
+  const scope = observation.capture()
+  if (!scope || !contactID || !currentPreview || !canDecide.value || decisionInFlightToken) return
 
   const context: DecisionAttemptContext = {
     token: Symbol('identity-review-decision'),
+    scope,
     generation: requestGeneration,
     contactID,
     targetContactID,
@@ -450,16 +527,20 @@ async function decide() {
   try {
     const request = await decisionRequestFor(context)
     if (!request || !decisionContextIsCurrent(context)) return
-    await contactsService.decideIdentityReview(contactID, request)
+    await contactsService.decideIdentityReview(contactID, request, { organizationId: scope.organizationId })
     if (!decisionContextIsCurrent(context)) return
+    emit('queue-invalidated', scope)
     pendingDecision = null
     decisionInFlightToken = null
     deciding.value = false
-    await loadContactReview()
-    if (state.value) emit('resolved', state.value)
+    const read = await loadContactReview()
+    if (read && observation.current(scope) && props.contactId === contactID && contactReviewReadIsCurrent(read)) {
+      emit('resolved', read.state)
+    }
   } catch (requestError) {
     if (decisionContextIsCurrent(context)) {
       const status = errorResponse(requestError)?.status
+      if (status === 403) { refuseAuthority(scope); return }
       if (status === 409 || status === 422) {
         // A definite refusal, not an ambiguous failure: never resend this
         // request ID. Re-read the review so the next choice is made against
@@ -469,15 +550,17 @@ async function decide() {
         const refusal = status === 409
           ? 'This review changed and has been reloaded; choose again.'
           : getErrorMessage(requestError, 'The review decision was refused.')
+        emit('queue-invalidated', scope)
         pendingDecision = null
         selectedTarget.value = ''
         decisionInFlightToken = null
         deciding.value = false
-        await loadContactReview()
-        if (state.value && effectiveAIIsAllowed(state.value)) {
+        const read = await loadContactReview()
+        if (!read || !observation.current(scope) || props.contactId !== contactID || !contactReviewReadIsCurrent(read)) return
+        if (effectiveAIIsAllowed(read.state)) {
           // Another reviewer resolved it meanwhile.
-          emit('resolved', state.value)
-        } else if (!readOnlyReview.value && !error.value && state.value?.known === true) {
+          emit('resolved', read.state)
+        } else if (!readOnlyReview.value && !error.value && read.state.known === true) {
           // Only claim a reload that succeeded; a failed re-read keeps its
           // own fail-closed message.
           error.value = refusal
@@ -495,57 +578,53 @@ async function decide() {
   }
 }
 
-async function loadStagedQueue(page = 1) {
-  if (!props.canViewStaged) return
+async function loadStagedQueue(page = 1, clamped = false) {
+  const scope = observation.capture()
+  if (!scope || !props.canViewStaged || !observation.canReview()) return
   const requestedPage = Number.isSafeInteger(page) && page > 0 ? page : 1
+  const filter = [...stagedHoldFilter.value]
+  stopHeldReads()
   section.value = 'staged'
   const generation = ++requestGeneration
   requestController?.abort()
-  const controller = new AbortController()
+  const controller = observation.controller()
   requestController = controller
+  const current = () => observation.current(scope) && generation === requestGeneration && section.value === 'staged' && !controller.signal.aborted
   stagedLoading.value = true
+  stagedKnown.value = false
+  staged.value = []
+  stagedTotal.value = 0
   stagedDetail.value = null
+  selectedStagedItem.value = null
   error.value = ''
   closeMediaURL()
   try {
-    const filtered = stagedHoldFilter.value.length > 0
-    const response = filtered
-      ? await contactsService.listStagedIdentityReviewsForHolds(
-        stagedHoldFilter.value, stagedPageSize, controller.signal, requestedPage,
-      )
-      : await contactsService.listStagedIdentityReviews(
-        { page: requestedPage, limit: stagedPageSize },
-        controller.signal,
-      )
-    if (generation !== requestGeneration || section.value !== 'staged') return
-    const payload = unwrapItemResponse<{
-      reviews: StagedIdentityReviewItem[]
-      total: number
-    }>(response)
-    if (
-      !payload
-      || !Array.isArray(payload.reviews)
-      || !Number.isSafeInteger(payload.total)
-      || payload.total < 0
-    ) {
-      throw new Error('The protected staged queue returned invalid pagination data.')
-    }
+    const config = { organizationId: scope.organizationId, signal: controller.signal }
+    const response = filter.length > 0
+      ? await contactsService.listStagedIdentityReviewsForHolds(filter, stagedPageSize, config, requestedPage)
+      : await contactsService.listStagedIdentityReviews({ page: requestedPage, limit: stagedPageSize }, config)
+    if (!current()) return
+    const payload = parseStagedReviewList(unwrapItemResponse(response), requestedPage, stagedPageSize, filter)
     const pageCount = Math.max(1, Math.ceil(payload.total / stagedPageSize))
     if (requestedPage > pageCount) {
-      await loadStagedQueue(pageCount)
+      if (clamped) throw new Error('The queue changed again. Retry the current page.')
+      await loadStagedQueue(pageCount, true)
       return
     }
     staged.value = payload.reviews
     stagedPage.value = requestedPage
     stagedTotal.value = payload.total
-    // The notice counts the whole queue; a review-filtered page is not that.
-    if (!filtered) emit('staged-total', payload.total)
+    stagedKnown.value = true
+    // Invalidate the complete workspace observation; never publish filtered totals.
+    if (filter.length === 0) emit('queue-invalidated', scope)
   } catch (requestError) {
-    if (generation === requestGeneration && !controller.signal.aborted) {
-      error.value = getErrorMessage(requestError, 'The protected staged queue could not be loaded.')
+    if (current()) {
+      error.value = getErrorMessage(requestError, 'Review availability could not be checked.')
+      if (errorResponse(requestError)?.status === 403) refuseAuthority(scope)
     }
   } finally {
-    if (generation === requestGeneration) {
+    observation.release(controller)
+    if (current()) {
       stagedLoading.value = false
       if (requestController === controller) requestController = null
     }
@@ -553,25 +632,31 @@ async function loadStagedQueue(page = 1) {
 }
 
 async function loadStagedDetail(item: StagedIdentityReviewItem) {
-  if (!props.canViewStaged) return
+  const scope = observation.capture()
+  if (!scope || !props.canViewStaged || !observation.canReview()) return
+  stopHeldReads()
   const generation = ++requestGeneration
   requestController?.abort()
-  const controller = new AbortController()
+  const controller = observation.controller()
   requestController = controller
+  const current = () => observation.current(scope) && generation === requestGeneration && section.value === 'staged' && !controller.signal.aborted
+  selectedStagedItem.value = { ...item }
   stagedLoading.value = true
   stagedDetail.value = null
   error.value = ''
   closeMediaURL()
   try {
-    const response = await contactsService.getStagedIdentityReview(item.id, controller.signal)
-    if (generation !== requestGeneration || section.value !== 'staged') return
-    stagedDetail.value = unwrapItemResponse<StagedIdentityReviewDetail>(response)
+    const response = await contactsService.getStagedIdentityReview(item.id, { organizationId: scope.organizationId, signal: controller.signal })
+    if (!current()) return
+    stagedDetail.value = parseStagedReviewDetail(unwrapItemResponse(response), item.id, item.hold_id)
   } catch (requestError) {
-    if (generation === requestGeneration && !controller.signal.aborted) {
-      error.value = getErrorMessage(requestError, 'The staged review could not be loaded.')
+    if (current()) {
+      error.value = getErrorMessage(requestError, 'The protected held copy could not be loaded.')
+      if (errorResponse(requestError)?.status === 403) refuseAuthority(scope)
     }
   } finally {
-    if (generation === requestGeneration) {
+    observation.release(controller)
+    if (current()) {
       stagedLoading.value = false
       if (requestController === controller) requestController = null
     }
@@ -579,11 +664,12 @@ async function loadStagedDetail(item: StagedIdentityReviewItem) {
 }
 
 async function loadStagedMedia() {
+  const scope = observation.capture()
   const detail = stagedDetail.value
-  if (!props.canViewStaged || !detail?.media_available || !detail.revision || mediaLoading.value) return
+  if (!scope || !props.canViewStaged || !observation.canReview() || !detail?.media_available || !detail.revision || mediaLoading.value) return
   const generation = requestGeneration
   mediaRequestController?.abort()
-  const controller = new AbortController()
+  const controller = observation.controller()
   mediaRequestController = controller
   mediaLoading.value = true
   error.value = ''
@@ -591,9 +677,9 @@ async function loadStagedMedia() {
     const response = await contactsService.getStagedIdentityReviewMedia(
       detail.id,
       detail.revision,
-      controller.signal,
+      { organizationId: scope.organizationId, signal: controller.signal },
     )
-    if (generation !== requestGeneration || stagedDetail.value?.id !== detail.id || controller.signal.aborted) return
+    if (!observation.current(scope) || generation !== requestGeneration || stagedDetail.value?.id !== detail.id || stagedDetail.value.revision !== detail.revision || controller.signal.aborted) return
     if (mediaURL.value) URL.revokeObjectURL(mediaURL.value)
     // Customer media: an object URL has this app's origin but not the
     // server's nosniff and attachment headers, so "Open link in new tab"
@@ -602,10 +688,12 @@ async function loadStagedMedia() {
     mediaURL.value = URL.createObjectURL(displaySafeMediaBlob(response.data, 'document'))
     mediaFileName.value = mediaDownloadName(detail.media_filename, response.data.type, 'staged-media')
   } catch (requestError) {
-    if (generation === requestGeneration && !controller.signal.aborted) {
+    if (observation.current(scope) && generation === requestGeneration && !controller.signal.aborted) {
+      if (errorResponse(requestError)?.status === 403) { refuseAuthority(scope); return }
       error.value = getErrorMessage(requestError, 'Protected staged media could not be loaded.')
     }
   } finally {
+    observation.release(controller)
     if (mediaRequestController === controller) {
       mediaRequestController = null
       mediaLoading.value = false
@@ -618,30 +706,56 @@ function showContactReview() {
   void loadContactReview()
 }
 
-watch(
-  () => [props.open, props.contactId] as const,
-  ([open]) => {
-    if (open) {
-      if (opensStaged.value) {
-        void loadStagedQueue(1)
-      } else {
-        section.value = 'contact'
-        void loadContactReview()
-      }
-    } else {
-      requestGeneration += 1
-      requestController?.abort()
-      requestController = null
-      resetProtectedState()
-    }
-  },
-  { immediate: true },
-)
+function clearScope() {
+  requestGeneration++
+  requestController?.abort()
+  requestController = null
+  resetProtectedState()
+  state.value = null
+  stateScope = null
+  error.value = ''
+  loading.value = false
+  stagedLoading.value = false
+  section.value = opensStaged.value ? 'staged' : 'contact'
+}
+
+function refuseAuthority(scope: IdentityReviewScope) {
+  if (!observation.current(scope)) return
+  observation.invalidate()
+  observation.pause()
+  error.value = 'Review access is not currently available.'
+  emit('queue-invalidated', scope)
+}
+
+async function refreshVisible() {
+  if (!props.open || deciding.value || requestController !== null || heldRequestController !== null || mediaLoading.value) return
+  if (section.value === 'staged') {
+    if (selectedStagedItem.value) await loadStagedDetail(selectedStagedItem.value)
+    else await loadStagedQueue(stagedPage.value)
+  } else if (state.value === null) await loadContactReview()
+  else if (props.canViewStaged && heldHoldIDs.value.length > 0 && props.contactId) {
+    const scope = observation.capture()
+    if (!scope) return
+    await startHeldReads([...heldHoldIDs.value], requestGeneration, props.contactId, scope)
+  }
+}
+
+const observation = useIdentityReviewObservation({
+  enabled: () => props.open,
+  query: () => [props.contactId, props.canReview, props.canViewStaged, props.initialSection],
+  clear: clearScope,
+  refresh: refreshVisible,
+})
+
+// Initial section is selected without launching a duplicate mounted request.
+section.value = opensStaged.value ? 'staged' : 'contact'
+
+function retryObservation() { void observation.refresh(true) }
 
 watch(
   () => props.effectiveState,
   value => {
-    if (value && props.open && section.value === 'contact') state.value = value
+    if (value && observation.current(stateScope) && props.open && section.value === 'contact') state.value = value
   },
 )
 
@@ -667,7 +781,7 @@ onBeforeUnmount(() => {
                 {{ contactLabel || 'Selected contact' }} · decisions affect future messages only.
               </template>
               <template v-else>
-                Messages kept out of every conversation because their sender's identity is unclear. Items marked Read-only cannot be resolved yet.
+                Messages kept out of every conversation because their sender's identity is unclear. Current review availability is checked separately from access to these held copies.
               </template>
             </DialogDescription>
           </div>
@@ -848,13 +962,14 @@ onBeforeUnmount(() => {
             <a v-if="mediaURL" :href="mediaURL" :download="mediaFileName" class="ml-3 text-xs font-medium text-sky-300 underline light:text-sky-700">Download media</a>
           </div>
           <div data-testid="staged-identity-review-guidance" class="rounded-xl border border-sky-300/15 bg-sky-300/[0.04] p-3 text-xs leading-5 text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900">
-            <template v-if="stagedDetail.read_only">
-              This held copy is read-only for now: no review decision can resolve it. That happens when no contact matches the sender, when the message carried no WhatsApp ID, when the only matching contact already belongs to a different WhatsApp user, or when the review was created before reviews could be decided. It is never moved into a conversation and stays in this list until the WhatsApp number is onboarded again. The sender's later messages may be held too, and a matching contact keeps automated replies off until then.
-            </template>
-            <template v-else>
-              This held copy is never moved into a conversation. It matches existing contacts: open the contact marked Review and use its Identity review to choose where future messages go. Read this message first: once a decision is confirmed, it leaves this list.
-            </template>
+            {{ stagedReviewExplanation(stagedDetail) }}
+            <Button v-if="!stagedDetail.eligibility_known" class="mt-2" size="sm" variant="outline" @click="retryObservation">Retry availability</Button>
           </div>
+        </div>
+        <div v-else-if="!stagedKnown || selectedStagedItem" class="space-y-3 py-8 text-center text-sm text-white/60 light:text-slate-600" role="status">
+          <p>Review availability could not be checked.</p>
+          <Button variant="outline" data-testid="staged-review-retry" @click="retryObservation">Retry</Button>
+          <Button v-if="selectedStagedItem" variant="ghost" @click="loadStagedQueue(stagedPage)">Back to queue</Button>
         </div>
         <ScrollArea v-else class="max-h-[22rem]">
           <div v-if="stagedHoldFilter.length > 0" data-testid="staged-review-filter" class="mb-2 flex items-center justify-between gap-3 rounded-xl border border-sky-300/15 bg-sky-300/[0.04] px-3 py-2 text-xs text-sky-50/70 light:border-sky-200 light:bg-sky-50 light:text-sky-900">
@@ -879,12 +994,12 @@ onBeforeUnmount(() => {
                 class="border-amber-300/30 text-amber-200 light:border-amber-300 light:text-amber-800"
                 data-testid="staged-read-only-badge"
               >
-                Read-only
+                Decision unavailable now
               </Badge>
               <Badge variant="outline">{{ item.status }}</Badge>
             </span>
           </button>
-          <div v-if="staged.length === 0" class="py-12 text-center text-sm text-white/40 light:text-slate-600">No staged reviews.</div>
+          <div v-if="stagedKnown && staged.length === 0" class="py-12 text-center text-sm text-white/40 light:text-slate-600">No staged reviews.</div>
           <div class="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3 text-xs text-white/45 light:border-slate-200 light:text-slate-600">
             <span data-testid="staged-pagination-status">
               Showing {{ stagedRangeStart }}–{{ stagedRangeEnd }} of {{ stagedTotal }} · Page {{ stagedPage }} of {{ stagedPageCount }}

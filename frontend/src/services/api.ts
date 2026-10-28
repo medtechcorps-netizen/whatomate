@@ -2193,9 +2193,11 @@ export interface StagedIdentityReviewItem {
   message_type: string;
   media_status?: string;
   received_at: string;
-  // True when no decision can resolve the receipt (its hold has no unique
-  // direct-BSUID owner); it closes only when the account is onboarded again.
-  read_only?: boolean;
+  // Current observation only; null is reserved for opted-in unknown detail.
+  read_only: boolean | null;
+  eligibility_known: boolean;
+  decision_available: boolean;
+  eligibility_reason: string;
 }
 
 export interface StagedIdentityReviewDetail extends StagedIdentityReviewItem {
@@ -2203,6 +2205,28 @@ export interface StagedIdentityReviewDetail extends StagedIdentityReviewItem {
   media_mime_type?: string;
   media_filename?: string;
   media_available: boolean;
+}
+
+export interface StagedIdentityReviewList {
+  reviews: StagedIdentityReviewItem[];
+  page: number;
+  limit: number;
+  total: number;
+  eligibility_known: true;
+  actionable_total: number;
+  actionable_chain_total: number;
+  read_only_total: number;
+}
+
+export interface IdentityReviewRequestScope {
+  organizationId: string;
+  signal?: AbortSignal;
+}
+
+function identityReviewConfig(scope: IdentityReviewRequestScope) {
+  const organizationId = scope.organizationId.trim();
+  if (!organizationId) throw new Error("A current workspace is required for identity review.");
+  return { headers: { "X-Organization-ID": organizationId }, signal: scope.signal };
 }
 
 export const contactsService = {
@@ -2228,50 +2252,37 @@ export const contactsService = {
   updateTags: (id: string, tags: string[]) =>
     api.put(`/contacts/${id}/tags`, { tags }),
   getSessionData: (id: string) => api.get(`/contacts/${id}/session-data`),
-  getIdentityReviewState: (id: string, signal?: AbortSignal) =>
+  getIdentityReviewState: (id: string, scope: IdentityReviewRequestScope) =>
     api.get<ContactIdentityReviewEffectiveState>(
-      `/contacts/${encodeURIComponent(id)}/identity-review`,
-      { signal },
+      `/contacts/${encodeURIComponent(id)}/identity-review`, identityReviewConfig(scope),
     ),
-  previewIdentityReview: (id: string, signal?: AbortSignal) =>
+  previewIdentityReview: (id: string, scope: IdentityReviewRequestScope) =>
     api.get<ContactIdentityReviewPreview>(
-      `/contacts/${encodeURIComponent(id)}/identity-review/preview`,
-      { signal },
+      `/contacts/${encodeURIComponent(id)}/identity-review/preview`, identityReviewConfig(scope),
     ),
-  decideIdentityReview: (id: string, data: ContactIdentityReviewDecisionRequest) =>
+  decideIdentityReview: (id: string, data: ContactIdentityReviewDecisionRequest, scope: IdentityReviewRequestScope) =>
     api.post<ContactIdentityReviewDecisionResult>(
-      `/contacts/${encodeURIComponent(id)}/identity-review/decisions`,
-      data,
+      `/contacts/${encodeURIComponent(id)}/identity-review/decisions`, data, identityReviewConfig(scope),
     ),
-  listStagedIdentityReviews: (
-    params?: { page?: number; limit?: number },
-    signal?: AbortSignal,
-  ) => api.get<{ reviews: StagedIdentityReviewItem[]; total: number; read_only_total?: number }>(
-    "/identity-reviews/staged",
-    { params, signal },
-  ),
+  listStagedIdentityReviews: (params: { page: number; limit: number }, scope: IdentityReviewRequestScope) =>
+    api.get<StagedIdentityReviewList>("/identity-reviews/staged", { ...identityReviewConfig(scope), params }),
   // Held copies of the given holds, oldest first. hold_id repeats once per hold.
-  listStagedIdentityReviewsForHolds: (holdIds: string[], limit: number, signal?: AbortSignal, page = 1) => {
+  listStagedIdentityReviewsForHolds: (holdIds: readonly string[], limit: number, scope: IdentityReviewRequestScope, page = 1) => {
     const params = new URLSearchParams();
     for (const holdId of holdIds) params.append("hold_id", holdId);
     params.set("order", "oldest");
     params.set("page", String(page));
     params.set("limit", String(limit));
-    return api.get<{ reviews: StagedIdentityReviewItem[]; total: number; read_only_total?: number }>(
-      "/identity-reviews/staged",
-      { params, signal },
-    );
+    return api.get<StagedIdentityReviewList>("/identity-reviews/staged", { ...identityReviewConfig(scope), params });
   },
-  getStagedIdentityReview: (id: string, signal?: AbortSignal) =>
-    api.get<StagedIdentityReviewDetail>(
-      `/identity-reviews/staged/${encodeURIComponent(id)}`,
-      { signal },
-    ),
-  getStagedIdentityReviewMedia: (id: string, revision: string, signal?: AbortSignal) =>
-    api.get<Blob>(
-      `/identity-reviews/staged/${encodeURIComponent(id)}/media/${encodeURIComponent(String(revision))}`,
-      { responseType: "blob", signal },
-    ),
+  getStagedIdentityReview: (id: string, scope: IdentityReviewRequestScope) =>
+    api.get<StagedIdentityReviewDetail>(`/identity-reviews/staged/${encodeURIComponent(id)}`, {
+      ...identityReviewConfig(scope), params: { eligibility: "current-v1" },
+    }),
+  getStagedIdentityReviewMedia: (id: string, revision: string, scope: IdentityReviewRequestScope) =>
+    api.get<Blob>(`/identity-reviews/staged/${encodeURIComponent(id)}/media/${encodeURIComponent(String(revision))}`, {
+      ...identityReviewConfig(scope), responseType: "blob",
+    }),
   markRead: (id: string, lastVisibleMessageId: string, organizationId: string) => {
     const explicitOrganizationId = organizationId.trim();
     if (!explicitOrganizationId) {

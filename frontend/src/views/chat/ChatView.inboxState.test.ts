@@ -335,6 +335,18 @@ describe('ChatView inbox state', () => {
     return wrapper
   }
 
+  it('forwards scoped review invalidation to the workspace notice without optimistic contact changes', async () => {
+    const view = await mountSettled()
+    const before = mocks.contactsStore!.currentContact
+    const fetches = mocks.fetchContacts.mock.calls.length
+    const scope = { organizationId: 'organization-1', userId: 'agent-1', session: 'captured-session', identity: mocks.authStore!.user, permissions: '[true,true,true]', key: 'contact-query', generation: 1 }
+    view.findComponent({ name: 'ContactIdentityReviewDialog' }).vm.$emit('queue-invalidated', scope)
+    await nextTick()
+    expect(view.findComponent({ name: 'StagedIdentityReviewNotice' }).props('invalidation')).toEqual(scope)
+    expect(mocks.contactsStore!.currentContact).toBe(before)
+    expect(mocks.fetchContacts).toHaveBeenCalledTimes(fetches)
+  })
+
   it('changes the message-menu scope before a requested contact loads and on auth/org changes', async () => {
     const view = await mountSettled()
     const menu = () => view.findComponent({ name: 'MessageContextMenu' })

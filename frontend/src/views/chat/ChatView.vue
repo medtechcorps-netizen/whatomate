@@ -117,6 +117,7 @@ import ChatRowActionsMenu from '@/components/chat/ChatRowActionsMenu.vue'
 import ContactAssigneeBadge from '@/components/chat/ContactAssigneeBadge.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
+import type { IdentityReviewScope } from '@/composables/useIdentityReviewObservation'
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 import MessageActions from '@/components/chat/MessageActions.vue'
 import MessageContextMenu from '@/components/chat/MessageContextMenu.vue'
@@ -2043,6 +2044,8 @@ async function resumeChatbot() {
   }
 }
 
+const identityReviewInvalidation = ref<IdentityReviewScope | null>(null)
+
 async function refreshAfterIdentityReview(state: ContactIdentityReviewEffectiveState) {
   // Apply the exact durable response immediately, then re-read the canonical
   // list so the selected record and list projection converge on server state.
@@ -2458,7 +2461,7 @@ watch(contactId, () => chatAttachments.reset())
       </div>
 
       <!-- Held messages that have no contact yet (protected staged queue) -->
-      <StagedIdentityReviewNotice :can-view="canViewStagedContactIdentity" />
+      <StagedIdentityReviewNotice :can-view="canViewStagedContactIdentity" :invalidation="identityReviewInvalidation" />
 
       <!-- Contacts -->
       <ScrollArea :ref="(el: any) => contactsScroll.scrollAreaRef.value = el" orientation="vertical" class="flex-1">
@@ -3516,6 +3519,7 @@ watch(contactId, () => chatAttachments.reset())
       :can-review="canReviewContactIdentity"
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
+      @queue-invalidated="identityReviewInvalidation = $event"
     />
     <MessageContextMenu :scope-key="messageMenuScope" :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" :can-forward="canForwardMessages" @react="sendReaction" @reply="replyToMessage" @forward="openForwardDialog" />
     <ForwardMessageDialog v-model:open="isForwardDialogOpen" :message="forwardingMessage" :preview="forwardPreview" />
