@@ -472,7 +472,7 @@ class WebSocketService {
   // unread markers and the active filter's membership come from the server.
   private handleContactUpdate(store: ReturnType<typeof useContactsStore>, payload: any) {
     if (typeof payload?.contact_id !== 'string' || payload.contact_id === '') return
-    store.scheduleContactsRefresh(payload.contact_id)
+    store.scheduleContactsRefresh(payload.contact_id, payload.kind)
   }
 
   private handleAgentTransfer(payload: any) {

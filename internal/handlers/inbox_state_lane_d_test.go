@@ -156,12 +156,16 @@ func laneDSetManualUnread(t *testing.T, db *gorm.DB, contact *models.Contact, ex
 		Update("metadata", metadata).Error)
 }
 
-func laneDHub(t *testing.T, organizationID uuid.UUID) (*appwebsocket.Hub, *appwebsocket.Client) {
+func laneDHub(t *testing.T, organizationID uuid.UUID, userIDs ...uuid.UUID) (*appwebsocket.Hub, *appwebsocket.Client) {
 	t.Helper()
 	log := testutil.NopLogger()
 	hub := appwebsocket.NewHub(log)
 	go hub.Run()
-	client := appwebsocket.NewClient(hub, nil, uuid.New(), organizationID)
+	userID := uuid.New()
+	if len(userIDs) > 0 {
+		userID = userIDs[0]
+	}
+	client := appwebsocket.NewClient(hub, nil, userID, organizationID)
 	hub.Register(client)
 	testutil.AssertEventually(t, func() bool { return hub.GetClientCount() == 1 }, 2*time.Second, "client registers")
 	return hub, client
@@ -183,7 +187,7 @@ func laneDExpectContactUpdate(t *testing.T, client *appwebsocket.Client, contact
 			}
 			assert.Equal(t, contactID.String(), envelope.Payload["contact_id"])
 			assert.Equal(t, kind, envelope.Payload["kind"])
-			assert.Len(t, envelope.Payload, 2, "the org-wide payload carries only the contact ID and kind")
+			assert.Len(t, envelope.Payload, 2, "the invalidation payload carries only the contact ID and kind")
 			return
 		case <-deadline:
 			t.Fatalf("timed out waiting for contact_update (%s)", kind)
@@ -558,7 +562,7 @@ func TestLaneDAssignContactChecksOrganizationMembership(t *testing.T) {
 	adminRole := testutil.CreateAdminRole(t, db, organization.ID)
 	admin := testutil.CreateTestUser(t, db, organization.ID, testutil.WithRoleID(&adminRole.ID))
 	contact := testutil.CreateTestContact(t, db, organization.ID)
-	hub, client := laneDHub(t, organization.ID)
+	hub, client := laneDHub(t, organization.ID, admin.ID)
 	app := &App{DB: db, Log: testutil.NopLogger(), WSHub: hub}
 
 	assign := func(userID uuid.UUID) int {
@@ -637,7 +641,7 @@ func TestLaneDInboxStateWritesHoldOnlyTheRequestConnection(t *testing.T) {
 	latest := createLegacyChatMessage(t, setupDB, organization.ID, account.Name, contact.ID, conversation.ID, uuid.New(), time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond))
 
 	oneConnection := laneDOneConnectionDB(t)
-	hub, client := laneDHub(t, organization.ID)
+	hub, client := laneDHub(t, organization.ID, reader.ID)
 	root := &App{DB: oneConnection, Log: testutil.NopLogger(), WSHub: hub}
 
 	// Mirror the Tenant wrapper: the handler runs on a request-scoped App

@@ -2154,7 +2154,9 @@ export const contactsService = {
     unread?: "true";
     assigned?: "me" | "unassigned";
   }, signal?: AbortSignal) => api.get("/contacts", { params, signal }),
-  get: (id: string) => api.get(`/contacts/${id}`),
+  get: (id: string, organizationId?: string) => api.get(`/contacts/${id}`, organizationId === undefined
+    ? undefined
+    : { headers: { "X-Organization-ID": organizationId } }),
   create: (data: any) => api.post("/contacts", data),
   update: (id: string, data: any) => api.put(`/contacts/${id}`, data),
   delete: (id: string) => api.delete(`/contacts/${id}`),
