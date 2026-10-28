@@ -57,7 +57,7 @@ func laneAInvoke(
 
 // laneARouteStack builds the production middleware chain (security headers,
 // recovery, CSRF) and routes over the test database and Redis, then signs in.
-func laneARouteStack(t *testing.T) (*fastglue.Fastglue, *redis.Client, *models.Organization, laneACookieJar) {
+func laneARouteStack(t *testing.T, configure ...func(*config.Config)) (*fastglue.Fastglue, *redis.Client, *models.Organization, laneACookieJar) {
 	t.Helper()
 	db := testutil.SetupTestDB(t)
 	rdb := testutil.SetupTestRedis(t)
@@ -80,6 +80,9 @@ func laneARouteStack(t *testing.T) (*fastglue.Fastglue, *redis.Client, *models.O
 			AccessExpiryMins:  15,
 			RefreshExpiryDays: 7,
 		},
+	}
+	for _, change := range configure {
+		change(cfg)
 	}
 	app := &handlers.App{
 		Config:     cfg,

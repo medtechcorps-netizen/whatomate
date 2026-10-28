@@ -168,7 +168,12 @@ func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 
 		// Try API key authentication first
 		if apiKey != "" && db != nil {
-			if validateAPIKey(r, apiKey, db) {
+			valid, err := validateAPIKeyChecked(r, apiKey, db)
+			if err != nil {
+				_ = r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Authentication temporarily unavailable", nil, "")
+				return nil
+			}
+			if valid {
 				return r
 			}
 			// API key was provided but invalid
@@ -218,7 +223,12 @@ func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 		}
 
 		if db != nil {
-			if !setAuthenticatedContext(r, db, claims.UserID, claims.OrganizationID) {
+			valid, err := setAuthenticatedContextChecked(r, db, claims.UserID, claims.OrganizationID)
+			if err != nil {
+				_ = r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Authentication temporarily unavailable", nil, "")
+				return nil
+			}
+			if !valid {
 				_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Organization access is no longer available", nil, "")
 				return nil
 			}
@@ -241,45 +251,77 @@ func setClaimsContext(r *fastglue.Request, claims *JWTClaims) {
 	r.RequestCtx.SetUserValue(ContextKeyIsSuperAdmin, claims.IsSuperAdmin)
 }
 
-// setAuthenticatedContext loads the current user and organization membership
+// setAuthenticatedContextChecked loads the current user and organization membership
 // from the database. JWT and API-key claims identify the principal, but the
 // database remains authoritative for active status, tenant membership, role,
 // and super-admin status.
-func setAuthenticatedContext(r *fastglue.Request, db *gorm.DB, userID, orgID uuid.UUID) bool {
+func setAuthenticatedContextChecked(r *fastglue.Request, db *gorm.DB, userID, orgID uuid.UUID) (bool, error) {
+	if db == nil {
+		return false, gorm.ErrInvalidDB
+	}
 	if userID == uuid.Nil || orgID == uuid.Nil {
-		return false
+		return false, nil
 	}
 
 	var user models.User
-	if err := db.Where("id = ?", userID).First(&user).Error; err != nil || !user.IsActive {
-		return false
+	if err := db.Where("id = ?", userID).First(&user).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	if !user.IsActive {
+		return false, nil
 	}
 
 	var org models.Organization
 	if err := db.Where("id = ?", orgID).First(&org).Error; err != nil {
-		return false
+		if err == gorm.ErrRecordNotFound {
+			return false, nil
+		}
+		return false, err
 	}
 	isPlatformCompliance, err := database.IsPlatformComplianceOrganization(db, orgID)
-	if err != nil || isPlatformCompliance {
-		return false
+	if err != nil {
+		if err == database.ErrPlatformComplianceMarkerInvalid || err == database.ErrMissingTenant {
+			return false, nil
+		}
+		return false, err
+	}
+	if isPlatformCompliance {
+		return false, nil
 	}
 
 	roleID := user.RoleID
 	var membership models.UserOrganization
 	membershipErr := db.Where("user_id = ? AND organization_id = ?", userID, orgID).First(&membership).Error
+	if membershipErr != nil && membershipErr != gorm.ErrRecordNotFound {
+		return false, membershipErr
+	}
 	if !user.IsSuperAdmin && membershipErr != nil {
-		return false
+		return false, nil
 	}
 	if membershipErr == nil {
-		if !user.IsSuperAdmin && !access.ResellerDerivedMembershipActive(db, &membership) {
-			return false
+		if !user.IsSuperAdmin {
+			active, err := access.ResellerDerivedMembershipActiveChecked(db, &membership)
+			if err != nil {
+				return false, err
+			}
+			if !active {
+				return false, nil
+			}
 		}
 		roleID = membership.RoleID
 	}
 
+	isResellerAdmin, err := access.IsResellerAdminChecked(db, user.ID)
+	if err != nil {
+		return false, err
+	}
+	// Publish authority context only after every required lookup succeeds.
 	user.OrganizationID = orgID
 	user.RoleID = roleID
-	user.IsResellerAdmin = access.IsResellerAdmin(db, user.ID)
+	user.IsResellerAdmin = isResellerAdmin
 	r.RequestCtx.SetUserValue(ContextKeyUserID, user.ID)
 	r.RequestCtx.SetUserValue(ContextKeyOrganizationID, org.ID)
 	r.RequestCtx.SetUserValue(ContextKeyEmail, user.Email)
@@ -290,14 +332,14 @@ func setAuthenticatedContext(r *fastglue.Request, db *gorm.DB, userID, orgID uui
 	r.RequestCtx.SetUserValue(ContextKeyIsResellerAdmin, user.IsResellerAdmin)
 	r.RequestCtx.SetUserValue(ContextKeyUser, &user)
 	r.RequestCtx.SetUserValue(ContextKeyOrganization, &org)
-	return true
+	return true, nil
 }
 
-// validateAPIKey validates an API key and sets context values
-func validateAPIKey(r *fastglue.Request, key string, db *gorm.DB) bool {
+// validateAPIKeyChecked validates an API key and sets context values.
+func validateAPIKeyChecked(r *fastglue.Request, key string, db *gorm.DB) (bool, error) {
 	// API key format: whm_<32 hex chars>
 	if len(key) != 36 || key[:4] != "whm_" {
-		return false
+		return false, nil
 	}
 
 	// Extract both new (16-char) and old (8-char) prefixes for backward compatibility.
@@ -308,7 +350,7 @@ func validateAPIKey(r *fastglue.Request, key string, db *gorm.DB) bool {
 	// Find API keys with matching prefix (supports both old and new prefix lengths)
 	var apiKeys []models.APIKey
 	if err := db.Preload("User").Where("(key_prefix = ? OR key_prefix = ?) AND is_active = ?", newPrefix, oldPrefix, true).Find(&apiKeys).Error; err != nil {
-		return false
+		return false, err
 	}
 
 	// Check each key with bcrypt
@@ -316,11 +358,12 @@ func validateAPIKey(r *fastglue.Request, key string, db *gorm.DB) bool {
 		if err := bcrypt.CompareHashAndPassword([]byte(apiKey.KeyHash), []byte(key)); err == nil {
 			// Key matches - check expiration
 			if apiKey.ExpiresAt != nil && time.Now().After(*apiKey.ExpiresAt) {
-				return false // Key expired
+				return false, nil // Key expired
 			}
 
-			if !setAuthenticatedContext(r, db, apiKey.UserID, apiKey.OrganizationID) {
-				return false
+			valid, err := setAuthenticatedContextChecked(r, db, apiKey.UserID, apiKey.OrganizationID)
+			if err != nil || !valid {
+				return false, err
 			}
 
 			// Update last used timestamp (async to not block request)
@@ -330,11 +373,11 @@ func validateAPIKey(r *fastglue.Request, key string, db *gorm.DB) bool {
 				now := time.Now()
 				db.WithContext(ctx).Model(&models.APIKey{}).Where("id = ?", id).Update("last_used_at", now)
 			}(apiKey.ID)
-			return true
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // OrganizationContext loads organization and user from database
