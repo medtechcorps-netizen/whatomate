@@ -36,6 +36,22 @@ import (
 // recovery owns a fresh bounded context and never invokes the provider again.
 const outgoingDeliveryRecoveryTimeout = 10 * time.Second
 
+const (
+	senderOriginMetadataKey  = "sender_origin_v1"
+	senderOriginAPIKey       = "api_key"
+	senderOriginUserJWT      = "user_jwt"
+	senderOriginUnattributed = "unattributed"
+)
+
+func normalizedSenderOrigin(origin string) string {
+	switch origin {
+	case senderOriginAPIKey, senderOriginUserJWT:
+		return origin
+	default:
+		return senderOriginUnattributed
+	}
+}
+
 // OutgoingMessageRequest contains all parameters for sending any type of message
 type OutgoingMessageRequest struct {
 	// Required
@@ -124,6 +140,10 @@ type MessageSendOptions struct {
 
 	// SentByUserID sets the user who sent the message (for agent messages)
 	SentByUserID *uuid.UUID
+
+	// senderOrigin is captured from successful auth, never a client payload.
+	// Missing internal attribution is explicit, not historical compatibility.
+	senderOrigin string
 
 	// Async if true, sends in background goroutine and returns immediately
 	// Message is persisted before send, status updated after
@@ -1783,6 +1803,13 @@ func (a *App) createOutgoingMessage(req OutgoingMessageRequest, opts MessageSend
 		msg.Metadata[forwardDispatchMetadataKey] = forwardDispatchQueued
 	}
 
+	if opts.SentByUserID != nil {
+		if msg.Metadata == nil {
+			msg.Metadata = models.JSONB{}
+		}
+		// Stamp after template/forward metadata construction and before insert.
+		msg.Metadata[senderOriginMetadataKey] = normalizedSenderOrigin(opts.senderOrigin)
+	}
 	return msg
 }
 
@@ -2785,6 +2812,7 @@ func (a *App) SendTemplateMessage(r *fastglue.Request) error {
 
 	opts := DefaultSendOptions()
 	opts.SentByUserID = &userID
+	opts.senderOrigin = requestSenderOrigin(r)
 
 	ctx := context.Background()
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
@@ -3241,6 +3269,7 @@ func (a *App) forwardMessage(
 	// delivery is only registered (startAsyncDelivery) after it returns.
 	opts := DefaultSendOptions()
 	opts.SentByUserID = &userID
+	opts.senderOrigin = requestSenderOrigin(r)
 	outcome := &forwardSendOutcome{}
 	msgReq.forwardOutcome = outcome
 
