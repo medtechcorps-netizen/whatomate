@@ -1267,13 +1267,130 @@ describe('ContactIdentityReviewDialog owns the exact decision reread completion'
     mocks.preview.mockResolvedValueOnce({ data: { data: preview } }).mockReturnValueOnce(rereadPreview.promise)
     await startDecision()
     await vi.waitFor(() => expect(mocks.preview).toHaveBeenCalledTimes(2))
+    const signal = mocks.preview.mock.calls[1]![1].signal as AbortSignal
+    const heldReads = mocks.listStagedForHold.mock.calls.length
     const newer = { ...allowed, reason: 'newer_parent_projection' }
     await wrapper!.setProps({ effectiveState: newer })
     expect(wrapper!.text()).toContain(newer.reason)
+    expect(wrapper!.text()).not.toContain('Checking durable state')
+    expect(signal.aborted).toBe(true)
+    expect(wrapper!.find('[data-testid="identity-review-decision"]').exists()).toBe(false)
     rereadPreview.resolve({ data: { data: preview } })
     await flushPromises()
     expect(wrapper!.emitted('resolved')).toBeUndefined()
     expect(wrapper!.text()).toContain(newer.reason)
+    expect(wrapper!.text()).not.toContain('Checking durable state')
+    expect(wrapper!.findAll('[data-testid="identity-review-candidate"]')).toHaveLength(0)
+    expect(wrapper!.findAll('[data-testid="identity-review-held-copy"]')).toHaveLength(0)
+    expect(mocks.listStagedForHold).toHaveBeenCalledTimes(heldReads)
+    expect(mocks.decide).toHaveBeenCalledTimes(1)
+
+    // A deliberate new read still obtains its own complete Preview; replacing
+    // the old loading owner must not strand the contact or retry a mutation.
+    await navigate('Contact review')
+    expect(mocks.getState).toHaveBeenCalledTimes(3)
+    expect(wrapper!.text()).not.toContain('Checking durable state')
+    expect(wrapper!.findAll('[data-testid="identity-review-candidate"]')).toHaveLength(2)
+    await wrapper!.findAll('input[name="identity-review-target"]')[1]!.setValue()
+    expect(wrapper!.get('[data-testid="identity-review-decision"]').attributes('disabled')).toBeUndefined()
+    expect(mocks.decide).toHaveBeenCalledTimes(1)
+    expect(wrapper!.emitted('resolved')).toBeUndefined()
+  })
+
+  it.each([
+    ['acknowledged', 'cancelled'],
+    ['acknowledged', 'unavailable'],
+    [409, 'late-success'],
+    [409, 'cancelled'],
+    [422, 'late-success'],
+    [422, 'unavailable'],
+  ] as const)('keeps a scoped parent projection after %s reread finishes with %s', async (outcome, completion) => {
+    const rereadPreview = pendingRead({ data: { data: preview } })
+    mocks.preview.mockResolvedValueOnce({ data: { data: preview } }).mockReturnValueOnce(rereadPreview.promise)
+    await startDecision(outcome)
+    await vi.waitFor(() => expect(mocks.preview).toHaveBeenCalledTimes(2))
+    const signal = mocks.preview.mock.calls[1]![1].signal as AbortSignal
+    const heldReads = mocks.listStagedForHold.mock.calls.length
+    const newer = { ...blocked, reason: 'newer_parent_requires_fresh_preview' }
+    await wrapper!.setProps({ effectiveState: newer })
+    expect(wrapper!.text()).toContain(newer.reason)
+    expect(wrapper!.text()).not.toContain('Checking durable state')
+    expect(signal.aborted).toBe(true)
+    expect(wrapper!.find('[data-testid="identity-review-decision"]').exists()).toBe(false)
+    if (completion === 'late-success') rereadPreview.resolve({ data: { data: preview } })
+    else if (completion === 'cancelled') rereadPreview.reject(new DOMException('The read was aborted.', 'AbortError'))
+    else rereadPreview.reject({ isAxiosError: true, response: { status: 503, data: { message: 'Superseded preview unavailable.' } } })
+    await flushPromises()
+    expect(wrapper!.text()).toContain(newer.reason)
+    expect(wrapper!.text()).not.toContain('Checking durable state')
+    expect(wrapper!.get('[data-testid="identity-review-effective-state"]').text()).toBe('AI blocked')
+    expect(wrapper!.find('[role="alert"]').exists()).toBe(false)
+    expect(wrapper!.findAll('[data-testid="identity-review-candidate"]')).toHaveLength(0)
+    expect(wrapper!.findAll('[data-testid="identity-review-held-copy"]')).toHaveLength(0)
+    expect(mocks.listStagedForHold).toHaveBeenCalledTimes(heldReads)
+    expect(wrapper!.emitted('resolved')).toBeUndefined()
+    expect(mocks.decide).toHaveBeenCalledTimes(1)
+  })
+
+  it('cannot clear a newer contact read loading owner when the superseded Preview finishes', async () => {
+    const oldPreview = pendingRead({ data: { data: preview } })
+    mocks.preview.mockResolvedValueOnce({ data: { data: preview } }).mockReturnValueOnce(oldPreview.promise)
+    await startDecision()
+    await vi.waitFor(() => expect(mocks.preview).toHaveBeenCalledTimes(2))
+    await wrapper!.setProps({ effectiveState: { ...allowed, reason: 'newer_parent_projection' } })
+    const fresh = { ...allowed, reason: 'explicit_new_contact_read' }
+    const freshRead = pendingRead({ data: { data: fresh } })
+    mocks.getState.mockReturnValueOnce(freshRead.promise)
+    await navigate('Contact review')
+    expect(mocks.getState).toHaveBeenCalledTimes(3)
+    const freshSignal = mocks.getState.mock.calls[2]![1].signal as AbortSignal
+    expect(wrapper!.text()).toContain('Checking durable state')
+    oldPreview.resolve({ data: { data: preview } })
+    await flushPromises()
+    expect(freshSignal.aborted).toBe(false)
+    expect(wrapper!.text()).toContain('Checking durable state')
+    expect(wrapper!.emitted('resolved')).toBeUndefined()
+    freshRead.resolve({ data: { data: fresh } })
+    await flushPromises()
+    expect(wrapper!.text()).toContain(fresh.reason)
+    expect(wrapper!.text()).not.toContain('Checking durable state')
+    expect(wrapper!.emitted('resolved')).toBeUndefined()
+    expect(mocks.decide).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not accept a parent projection before the initial contact read establishes its scope', async () => {
+    const initialRead = pendingRead({ data: { data: blocked } })
+    mocks.getState.mockReturnValueOnce(initialRead.promise)
+    wrapper = mountDialog()
+    await vi.waitFor(() => expect(mocks.getState).toHaveBeenCalledTimes(1))
+    const signal = mocks.getState.mock.calls[0]![1].signal as AbortSignal
+    const unowned = { ...allowed, reason: 'parent_without_established_contact_scope' }
+    await wrapper.setProps({ effectiveState: unowned })
+    expect(wrapper.text()).not.toContain(unowned.reason)
+    expect(wrapper.text()).toContain('Checking durable state')
+    expect(signal.aborted).toBe(false)
+    initialRead.resolve({ data: { data: blocked } })
+    await flushPromises()
+    expect(wrapper.text()).toContain(blocked.reason)
+    expect(wrapper.text()).not.toContain('Checking durable state')
+    expect(wrapper.findAll('[data-testid="identity-review-candidate"]')).toHaveLength(2)
+    expect(wrapper.emitted('resolved')).toBeUndefined()
+    expect(mocks.decide).not.toHaveBeenCalled()
+  })
+
+  it.each(['same-object', 'copied-object'] as const)('accepts feedback from its own successful resolved state without another request: %s', async feedback => {
+    mocks.getState.mockResolvedValueOnce({ data: { data: blocked } }).mockResolvedValueOnce({ data: { data: allowed } })
+    await startDecision()
+    await vi.waitFor(() => expect(wrapper!.emitted('resolved')).toEqual([[allowed]]))
+    const emitted = wrapper!.emitted('resolved')![0]![0] as typeof allowed
+    await wrapper!.setProps({ effectiveState: feedback === 'same-object' ? emitted : { ...emitted } })
+    await flushPromises()
+    expect(wrapper!.text()).toContain(allowed.reason)
+    expect(wrapper!.text()).not.toContain('Checking durable state')
+    expect(wrapper!.get('[data-testid="identity-review-effective-state"]').text()).toBe('AI allowed')
+    expect(wrapper!.emitted('resolved')).toEqual([[allowed]])
+    expect(mocks.getState).toHaveBeenCalledTimes(2)
+    expect(mocks.preview).toHaveBeenCalledTimes(1)
     expect(mocks.decide).toHaveBeenCalledTimes(1)
   })
 })

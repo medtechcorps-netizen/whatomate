@@ -223,7 +223,9 @@ describe('ContactsView phone column', () => {
     mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 1 } } })
     const view = await openList([])
     await vi.waitFor(() => expect(view.find('[data-testid="staged-identity-review-notice"]').exists()).toBe(true))
-    expect(mocks.listStaged).toHaveBeenCalledWith({ page: 1, limit: 1 }, expect.any(AbortSignal))
+    expect(mocks.listStaged).toHaveBeenCalledWith({ page: 1, limit: 1 }, {
+      organizationId: 'review-org', signal: expect.any(AbortSignal),
+    })
     expect(view.get('[data-testid="staged-identity-review-count"]').text()).toBe('1')
   })
 

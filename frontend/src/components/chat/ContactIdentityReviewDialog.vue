@@ -755,7 +755,22 @@ function retryObservation() { void observation.refresh(true) }
 watch(
   () => props.effectiveState,
   value => {
-    if (value && observation.current(stateScope) && props.open && section.value === 'contact') state.value = value
+    const scope = stateScope
+    if (!value || !observation.current(scope) || !props.open || section.value !== 'contact' || state.value === value) return
+    // A parent projection accepted for this current contact replaces the
+    // whole older read, including a pending Preview and its loading owner.
+    // It is not that read's completion and cannot supply decision authority.
+    requestGeneration++
+    if (requestController) {
+      requestController.abort()
+      observation.release(requestController)
+      requestController = null
+    }
+    resetProtectedState()
+    error.value = ''
+    loading.value = false
+    stateScope = scope
+    state.value = value
   },
 )
 
