@@ -77,6 +77,25 @@ vi.mock('@/components/shared', async () => {
 
 const Passthrough = defineComponent({ template: '<div><slot /></div>' })
 
+function stagedResponse(total: 0 | 1) {
+  return { data: { data: {
+    reviews: total === 1 ? [{
+      id: '11111111-1111-4111-8111-111111111111',
+      hold_id: '22222222-2222-4222-8222-222222222222',
+      protocol_version: 1,
+      status: 'pending',
+      message_type: 'text',
+      received_at: '2026-10-28T08:00:00Z',
+      read_only: false,
+      eligibility_known: true,
+      decision_available: true,
+      eligibility_reason: 'actionable',
+    }] : [],
+    total, page: 1, limit: 1, eligibility_known: true,
+    actionable_total: total, actionable_chain_total: total, read_only_total: 0,
+  } } }
+}
+
 function contact(overrides: Record<string, unknown>) {
   return {
     id: 'contact-1',
@@ -113,7 +132,7 @@ beforeEach(() => {
   for (const mock of Object.values(mocks)) mock.mockReset()
   mocks.hasPermission.mockReturnValue(true)
   mocks.listAccounts.mockResolvedValue({ data: { data: { accounts: [] } } })
-  mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 0, page: 1, limit: 1, eligibility_known: true, actionable_total: 0, actionable_chain_total: 0, read_only_total: 0 } } })
+  mocks.listStaged.mockResolvedValue(stagedResponse(0))
 })
 
 afterEach(() => {
@@ -220,18 +239,34 @@ describe('ContactsView phone column', () => {
   })
 
   it('shows held WhatsApp messages to identity reviewers even with no contacts', async () => {
-    mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 1 } } })
+    mocks.listStaged.mockResolvedValue(stagedResponse(1))
     const view = await openList([])
     await vi.waitFor(() => expect(view.find('[data-testid="staged-identity-review-notice"]').exists()).toBe(true))
+    await vi.waitFor(() => expect(view.get('[data-testid="staged-identity-review-count"]').text()).toBe('1'))
     expect(mocks.listStaged).toHaveBeenCalledWith({ page: 1, limit: 1 }, {
       organizationId: 'review-org', signal: expect.any(AbortSignal),
     })
     expect(view.get('[data-testid="staged-identity-review-count"]').text()).toBe('1')
+    expect(view.get('[data-testid="staged-identity-review-held-count"]').text()).toContain('1 held message')
+  })
+
+  it('keeps an incomplete protected observation unknown with retry and no numeric count', async () => {
+    mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 1 } } })
+    const view = await openList([])
+    await vi.waitFor(() => expect(view.text()).toContain('Review availability could not be checked.'))
+    expect(mocks.listStaged).toHaveBeenCalledWith({ page: 1, limit: 1 }, {
+      organizationId: 'review-org', signal: expect.any(AbortSignal),
+    })
+    expect(view.find('[data-testid="staged-identity-review-notice"]').exists()).toBe(true)
+    expect(view.find('[data-testid="staged-identity-review-count"]').exists()).toBe(false)
+    expect(view.find('[data-testid="staged-identity-review-held-count"]').exists()).toBe(false)
+    expect(view.find('[data-testid="staged-identity-review-retry"]').exists()).toBe(true)
+    expect(view.findAll('[data-testid="contact-row"]')).toHaveLength(0)
   })
 
   it('does not request the protected queue without identity-review authority', async () => {
     mocks.hasPermission.mockImplementation((resource: string) => resource !== 'contacts.identity_review')
-    mocks.listStaged.mockResolvedValue({ data: { data: { reviews: [], total: 1 } } })
+    mocks.listStaged.mockResolvedValue(stagedResponse(1))
     const view = await openList([contact({ phone_number: '+10000000006' })])
     expect(mocks.listStaged).not.toHaveBeenCalled()
     expect(view.find('[data-testid="staged-identity-review-notice"]').exists()).toBe(false)
