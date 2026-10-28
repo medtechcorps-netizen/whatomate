@@ -91,6 +91,7 @@ type MockOptions = {
   olderImages?: number;
   // An HTML document from the customer as the newest message.
   htmlDocument?: boolean;
+  pdfDocument?: Buffer;
   // Replaces the history with this many text messages, each followed by an
   // image, and ends with a reply that quotes one of the texts.
   thread?: { pairs: number; quotedText: number };
@@ -184,9 +185,9 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     direction: "incoming",
     message_type: "document",
     content: { body: "" },
-    media_url: `organizations/${selectedWorkspaceId}/messages/documents/visit-summary.html`,
-    media_mime_type: "text/html",
-    media_filename: "visit-summary.html",
+    media_url: `organizations/${selectedWorkspaceId}/messages/documents/${options.pdfDocument ? 'mrc-scan.pdf' : 'visit-summary.html'}`,
+    media_mime_type: options.pdfDocument ? "application/pdf" : "text/html",
+    media_filename: options.pdfDocument ? "mrc-scan.pdf" : "visit-summary.html",
     status: "received",
     created_at: at(textCount + 1),
     updated_at: at(textCount + 1),
@@ -203,7 +204,7 @@ async function mockApi(page: Page, options: MockOptions = {}) {
         ...Array.from({ length: olderImages }, (_, index) => imageMessage(olderImageId(index), index - olderImages)),
         ...Array.from({ length: textCount }, (_, index) => textMessage(index)),
         imageMessage(imageMessageId, textCount),
-        ...(options.htmlDocument ? [documentMessage] : []),
+        ...(options.htmlDocument || options.pdfDocument ? [documentMessage] : []),
       ];
   const servedImages = new Set([
     imageMessageId,
@@ -225,7 +226,7 @@ async function mockApi(page: Page, options: MockOptions = {}) {
     const messageId = new URL(request.url()).pathname.split("/").pop() ?? "";
     const organizationId = await request.headerValue("x-organization-id");
     mediaRequests.push({ messageId, organizationId });
-    const known = servedImages.has(messageId) || (options.htmlDocument && messageId === documentMessageId);
+    const known = servedImages.has(messageId) || ((options.htmlDocument || options.pdfDocument) && messageId === documentMessageId);
     if (!known || organizationId !== selectedWorkspaceId) {
       // Without the header the server resolves the login workspace, where
       // this message does not exist.
@@ -233,7 +234,11 @@ async function mockApi(page: Page, options: MockOptions = {}) {
       return;
     }
     if (messageId === documentMessageId) {
-      await route.fulfill({ status: 200, contentType: "text/html", body: customerHtml });
+      await route.fulfill({
+        status: 200,
+        contentType: options.pdfDocument ? "application/pdf" : "text/html",
+        body: options.pdfDocument ?? customerHtml,
+      });
       return;
     }
     inFlight++;
@@ -247,6 +252,46 @@ async function mockApi(page: Page, options: MockOptions = {}) {
 }
 
 const scroller = '[data-reka-scroll-area-viewport]:has([data-testid="chat-message-list"])';
+
+// A real, self-contained MRC-style PDF: low-resolution colour layers plus a
+// higher-resolution one-bit grayscale soft mask. All stream lengths and xref
+// offsets are exact. Its bounded counterpart must actually draw via pinned
+// pdf.js; the large mask must never be sent to that worker.
+function mrcPdf(maskSize: number) {
+  const stream = (dict: string, data: Buffer) => Buffer.concat([
+    Buffer.from("<< " + dict + " /Length " + data.length + " >>\nstream\n"),
+    data,
+    Buffer.from("\nendstream"),
+  ]);
+  const rowBytes = Math.ceil(maskSize / 8);
+  const mask = Buffer.alloc(rowBytes * maskSize);
+  mask.fill(255, 0, rowBytes * Math.floor(maskSize / 2));
+  const image = (rgb: number[]) => deflateSync(Buffer.concat(Array.from({ length: 32 * 32 }, () => Buffer.from(rgb))));
+  const objects = [
+    Buffer.from("<< /Type /Catalog /Pages 2 0 R >>"),
+    Buffer.from("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+    Buffer.from("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Bg 5 0 R /Fg 6 0 R >> >> /Contents 4 0 R >>"),
+    stream("", Buffer.from("q 200 0 0 200 0 0 cm /Bg Do /Fg Do Q")),
+    stream("/Type /XObject /Subtype /Image /Width 32 /Height 32 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode", image([255, 255, 255])),
+    stream("/Type /XObject /Subtype /Image /Width 32 /Height 32 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 7 0 R /Filter /FlateDecode", image([255, 0, 0])),
+    stream("/Type /XObject /Subtype /Image /Width " + maskSize + " /Height " + maskSize + " /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /FlateDecode", deflateSync(mask)),
+  ];
+  const parts = [Buffer.from("%PDF-1.7\n")];
+  const offsets = [0];
+  let length = parts[0].length;
+  objects.forEach((body, index) => {
+    offsets.push(length);
+    const object = Buffer.concat([Buffer.from((index + 1) + " 0 obj\n"), body, Buffer.from("\nendobj\n")]);
+    parts.push(object);
+    length += object.length;
+  });
+  parts.push(Buffer.from(
+    "xref\n0 " + (objects.length + 1) + "\n0000000000 65535 f \n" +
+    offsets.slice(1).map(offset => String(offset).padStart(10, "0") + " 00000 n \n").join("") +
+    "trailer\n<< /Size " + (objects.length + 1) + " /Root 1 0 R >>\nstartxref\n" + length + "\n%%EOF\n",
+  ));
+  return Buffer.concat(parts);
+}
 
 async function distanceFromBottom(page: Page) {
   return page.evaluate((target) => {
@@ -321,6 +366,65 @@ async function naturalWidth(page: Page) {
 }
 
 test.describe("Chat media in a non-default workspace", () => {
+  test("renders bounded MRC through the pinned PDF worker and preserves opaque download bytes", async ({ page }) => {
+    const bytes = mrcPdf(64);
+    const workers: string[] = [];
+    page.on("worker", worker => workers.push(worker.url()));
+    const { mediaRequests } = await mockApi(page, { pdfDocument: bytes });
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto("/chat/" + contactId);
+    await messageMedia(page, documentMessageId).getByRole("button", { name: "mrc-scan.pdf" }).click();
+    const preview = page.getByTestId("chat-media-preview");
+    await expect(preview).toHaveAttribute("data-preview-status", "ready");
+    const drawn = preview.getByTestId("chat-media-preview-page");
+    await expect(drawn).toHaveAttribute("data-page-state", "rendered");
+    const pixels = await drawn.locator("canvas").evaluate(element => {
+      if (!(element instanceof HTMLCanvasElement)) throw new Error("Expected PDF canvas");
+      const canvas = element;
+      const ctx = canvas.getContext("2d")!;
+      return [0.25, 0.75].map(y => Array.from(ctx.getImageData(Math.floor(canvas.width / 2), Math.floor(canvas.height * y), 1, 1).data));
+    });
+    // A blank page or omitted image cannot satisfy both colour-layer samples.
+    expect(pixels).toEqual(expect.arrayContaining([[255, 0, 0, 255], [255, 255, 255, 255]]));
+    expect(workers.some(url => url.includes("pdf.worker"))).toBe(true);
+    const href = await preview.getByTestId("chat-media-preview-download").getAttribute("href");
+    const downloaded = await page.evaluate(async url => {
+      const blob = await (await fetch(url!)).blob();
+      return { type: blob.type, bytes: Array.from(new Uint8Array(await blob.arrayBuffer())) };
+    }, href);
+    expect(downloaded).toEqual({ type: "application/octet-stream", bytes: Array.from(bytes) });
+    expect(mediaRequests.filter(request => request.messageId === documentMessageId)).toEqual([
+      { messageId: documentMessageId, organizationId: selectedWorkspaceId },
+    ]);
+  });
+
+  test("keeps a legitimate large one-bit MRC as an opaque download without a PDF worker or canvas", async ({ page }) => {
+    const bytes = mrcPdf(5000); // 25MP mask exceeds the unchanged combined 4096² cap.
+    const workers: string[] = [];
+    page.on("worker", worker => workers.push(worker.url()));
+    await mockApi(page, { pdfDocument: bytes });
+    await page.setViewportSize({ width: 1600, height: 900 });
+    await page.goto("/chat/" + contactId);
+    await messageMedia(page, documentMessageId).getByRole("button", { name: "mrc-scan.pdf" }).click();
+    const preview = page.getByTestId("chat-media-preview");
+    await expect(preview).toHaveAttribute("data-preview-status", "error");
+    await expect(preview.getByRole("alert")).toContainText("too large to preview");
+    await expect(preview.locator("canvas")).toHaveCount(0);
+    expect(workers.some(url => url.includes("pdf.worker"))).toBe(false);
+    const download = preview.getByTestId("chat-media-preview-download");
+    await expect(download).toHaveAttribute("download", "mrc-scan.pdf");
+    const href = await download.getAttribute("href");
+    const stored = await page.evaluate(async url => {
+      const blob = await (await fetch(url!)).blob();
+      return { type: blob.type, bytes: Array.from(new Uint8Array(await blob.arrayBuffer())) };
+    }, href);
+    expect(stored).toEqual({ type: "application/octet-stream", bytes: Array.from(bytes) });
+    const downloadEvent = page.waitForEvent("download");
+    await download.click();
+    expect((await downloadEvent).suggestedFilename()).toBe("mrc-scan.pdf");
+    await expect(preview.locator("iframe, object, embed")).toHaveCount(0);
+  });
+
   test("loads a customer image pinned to the selected workspace and keeps the pane at the newest message", async ({
     page,
   }) => {
