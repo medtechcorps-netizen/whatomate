@@ -684,6 +684,16 @@ jobs:
           print("frontend audit policy satisfied")
           AUDIT
 
+      - name: Typecheck frontend
+        working-directory: frontend
+        timeout-minutes: 10
+        run: npm run typecheck
+
+      - name: Lint frontend without fixes
+        working-directory: frontend
+        timeout-minutes: 10
+        run: npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --ignore-path .gitignore
+
       - name: Test frontend unit suite
         working-directory: frontend
         run: npx --no-install vitest run src
