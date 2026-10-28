@@ -365,9 +365,52 @@ async function naturalWidth(page: Page) {
     .evaluate((image) => (image instanceof HTMLImageElement && image.complete ? image.naturalWidth : 0));
 }
 
+type ObservedDownloadBlob = { url: string; type: string; size: number };
+
+async function observeDownloadBlobs(page: Page) {
+  await page.addInitScript(() => {
+    const blobs: ObservedDownloadBlob[] = [];
+    (window as unknown as { __mrcDownloadBlobs: ObservedDownloadBlob[] }).__mrcDownloadBlobs = blobs;
+    const create = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = object => {
+      const url = create(object);
+      if (object instanceof Blob) blobs.push({ url, type: object.type, size: object.size });
+      return url;
+    };
+  });
+}
+
+async function expectOpaquePdfDownload(page: Page, bytes: Uint8Array) {
+  const link = page.getByTestId("chat-media-preview").getByTestId("chat-media-preview-download");
+  await expect(link).toHaveAttribute("download", "mrc-scan.pdf");
+  const href = await link.getAttribute("href");
+  expect(href).toMatch(/^blob:/);
+  const observed = await page.evaluate(url =>
+    (window as unknown as { __mrcDownloadBlobs: ObservedDownloadBlob[] }).__mrcDownloadBlobs.find(blob => blob.url === url), href);
+  expect(observed).toEqual({ url: href, type: "application/octet-stream", size: bytes.length });
+  // CSP deliberately forbids fetch(blob:). Exercise the user's native download
+  // instead; the observer above calls the original object-URL factory unchanged.
+  const downloadEvent = page.waitForEvent("download");
+  await link.click();
+  const download = await downloadEvent;
+  expect(download.suggestedFilename()).toBe("mrc-scan.pdf");
+  const stream = await download.createReadStream();
+  expect(stream).toBeTruthy();
+  const chunks: Buffer[] = [];
+  let received = 0;
+  for await (const chunk of stream!) {
+    const data = Buffer.from(chunk);
+    received += data.length;
+    expect(received).toBeLessThanOrEqual(bytes.length);
+    chunks.push(data);
+  }
+  expect(Buffer.concat(chunks)).toEqual(Buffer.from(bytes));
+}
+
 test.describe("Chat media in a non-default workspace", () => {
   test("renders bounded MRC through the pinned PDF worker and preserves opaque download bytes", async ({ page }) => {
     const bytes = mrcPdf(64);
+    await observeDownloadBlobs(page);
     const workers: string[] = [];
     page.on("worker", worker => workers.push(worker.url()));
     const { mediaRequests } = await mockApi(page, { pdfDocument: bytes });
@@ -387,12 +430,7 @@ test.describe("Chat media in a non-default workspace", () => {
     // A blank page or omitted image cannot satisfy both colour-layer samples.
     expect(pixels).toEqual(expect.arrayContaining([[255, 0, 0, 255], [255, 255, 255, 255]]));
     expect(workers.some(url => url.includes("pdf.worker"))).toBe(true);
-    const href = await preview.getByTestId("chat-media-preview-download").getAttribute("href");
-    const downloaded = await page.evaluate(async url => {
-      const blob = await (await fetch(url!)).blob();
-      return { type: blob.type, bytes: Array.from(new Uint8Array(await blob.arrayBuffer())) };
-    }, href);
-    expect(downloaded).toEqual({ type: "application/octet-stream", bytes: Array.from(bytes) });
+    await expectOpaquePdfDownload(page, bytes);
     expect(mediaRequests.filter(request => request.messageId === documentMessageId)).toEqual([
       { messageId: documentMessageId, organizationId: selectedWorkspaceId },
     ]);
@@ -400,6 +438,7 @@ test.describe("Chat media in a non-default workspace", () => {
 
   test("keeps a legitimate large one-bit MRC as an opaque download without a PDF worker or canvas", async ({ page }) => {
     const bytes = mrcPdf(5000); // 25MP mask exceeds the unchanged combined 4096² cap.
+    await observeDownloadBlobs(page);
     const workers: string[] = [];
     page.on("worker", worker => workers.push(worker.url()));
     await mockApi(page, { pdfDocument: bytes });
@@ -411,17 +450,7 @@ test.describe("Chat media in a non-default workspace", () => {
     await expect(preview.getByRole("alert")).toContainText("too large to preview");
     await expect(preview.locator("canvas")).toHaveCount(0);
     expect(workers.some(url => url.includes("pdf.worker"))).toBe(false);
-    const download = preview.getByTestId("chat-media-preview-download");
-    await expect(download).toHaveAttribute("download", "mrc-scan.pdf");
-    const href = await download.getAttribute("href");
-    const stored = await page.evaluate(async url => {
-      const blob = await (await fetch(url!)).blob();
-      return { type: blob.type, bytes: Array.from(new Uint8Array(await blob.arrayBuffer())) };
-    }, href);
-    expect(stored).toEqual({ type: "application/octet-stream", bytes: Array.from(bytes) });
-    const downloadEvent = page.waitForEvent("download");
-    await download.click();
-    expect((await downloadEvent).suggestedFilename()).toBe("mrc-scan.pdf");
+    await expectOpaquePdfDownload(page, bytes);
     await expect(preview.locator("iframe, object, embed")).toHaveCount(0);
   });
 
