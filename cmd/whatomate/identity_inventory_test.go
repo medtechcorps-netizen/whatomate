@@ -167,6 +167,7 @@ func TestIdentityInventoryPublicReportClosedAndBounded(t *testing.T) {
 	require.NoError(t, err, "exact public decoder byte bound")
 	_, err = database.DecodeIdentityInventoryReport(append(padded, ' '))
 	require.Error(t, err)
-	private, _ := json.Marshal(database.IdentityInventoryWitness{})
-	require.JSONEq(t, "{}", string(private), "scope witness has no exportable fields")
+	private, err := json.Marshal(map[string]any{"witness": database.IdentityInventoryWitness{}})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"witness":{}}`, string(private), "scope witness has no exportable fields through a public JSON container")
 }
