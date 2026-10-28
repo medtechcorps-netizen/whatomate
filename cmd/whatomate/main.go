@@ -1335,16 +1335,16 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		g.POST("/api/auth/register", withRateLimit(app.Register, middleware.RateLimitOpts{
 			Redis: rdb, Log: lo, Max: cfg.RateLimit.RegisterMaxAttempts, Window: window, KeyPrefix: "register", TrustProxy: cfg.RateLimit.TrustProxy,
 		}))
-		g.POST("/api/auth/refresh", withRateLimit(app.RefreshToken, middleware.RateLimitOpts{
-			Redis: rdb, Log: lo, Max: cfg.RateLimit.RefreshMaxAttempts, Window: window, KeyPrefix: "refresh", TrustProxy: cfg.RateLimit.TrustProxy,
-		}))
 	} else {
 		g.POST("/api/auth/login", app.Login)
 		g.POST("/api/auth/register", app.Register)
-		g.POST("/api/auth/refresh", app.RefreshToken)
 	}
+	// Its API, refresh and revocation quotas are dispatched together below so
+	// neither shared IP bucket can prevent a valid, independently limited revoke.
+	g.POST("/api/auth/refresh", app.RefreshToken)
 	g.POST("/api/auth/logout", app.Logout)
-	g.POST("/api/auth/switch-org", app.SwitchOrg)
+	g.POST("/api/auth/switch-org", app.SwitchOrgLegacy)
+	g.POST("/api/auth/refresh/switch-org", app.SwitchOrg)
 	g.GET("/api/auth/ws-token", app.GetWSToken)
 
 	// SSO routes (public, optionally rate-limited)
@@ -1448,7 +1448,13 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		}
 		// Apply auth for all other /api routes (supports both JWT and API key)
 		if len(path) > 4 && path[:4] == "/api" {
-			return middleware.AuthWithDB(app.Config.JWT.Secret, app.DB)(r)
+			authenticated := middleware.AuthWithDB(app.Config.JWT.Secret, app.DB)(r)
+			if authenticated == nil && path == "/api/auth/refresh/switch-org" && r.RequestCtx.Response.StatusCode() == fasthttp.StatusServiceUnavailable {
+				// Admission failed before this switch handler could retire any
+				// refresh credential. Preserve the established session on 503.
+				_ = r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Authentication temporarily unavailable", nil, "switch_not_applied")
+			}
+			return authenticated
 		}
 		return r
 	})
@@ -1464,14 +1470,18 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		if apiWindow == 0 {
 			apiWindow = 60
 		}
-		apiRL := middleware.UserAwareRateLimit(middleware.RateLimitOpts{
+		apiRL := middleware.APISessionRateLimit(middleware.RateLimitOpts{
 			Redis:      rdb,
 			Log:        lo,
 			Max:        apiMax,
 			Window:     time.Duration(apiWindow) * time.Second,
 			KeyPrefix:  "api_global",
 			TrustProxy: cfg.RateLimit.TrustProxy,
-		})
+		}, middleware.RateLimitOpts{
+			Redis: rdb, Log: lo, Max: cfg.RateLimit.RefreshMaxAttempts,
+			Window:    time.Duration(cfg.RateLimit.WindowSeconds) * time.Second,
+			KeyPrefix: "refresh", TrustProxy: cfg.RateLimit.TrustProxy,
+		}, handlers.SessionTerminationClassifier(cfg.JWT.Secret))
 		g.Before(func(r *fastglue.Request) *fastglue.Request {
 			path := string(r.RequestCtx.Path())
 			if len(path) > 4 && path[:4] == "/api" {

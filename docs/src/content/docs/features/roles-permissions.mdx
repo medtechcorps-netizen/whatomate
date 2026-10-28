@@ -113,7 +113,7 @@ Users can belong to multiple organizations, each with a different role. The orga
 
 When switching organizations:
 
-1. New JWT tokens are issued scoped to the target organization via `POST /api/auth/switch-org`
+1. The browser calls `POST /api/auth/refresh/switch-org` with its refresh cookie and CSRF header; the server retires its presented refresh unit before setting the target organization's session cookies
 2. The user's role and permissions are loaded from their membership in the target organization
 3. All data views refresh to show the selected organization's data
 4. The selected organization persists across page navigation
@@ -135,7 +135,7 @@ Super admins have additional privileges:
 - Can create new organizations
 
 <Aside type="caution">
-  The `X-Organization-ID` header for direct API access is only respected for super admin users. Regular multi-org users must use the `POST /api/auth/switch-org` endpoint.
+  The browser's organization switch uses `POST /api/auth/refresh/switch-org` and requires its refresh cookie and CSRF header. An API key or organization override header alone cannot perform that session transition. Older clients using `/api/auth/switch-org` receive a reload response.
 </Aside>
 
 ## UI Behavior

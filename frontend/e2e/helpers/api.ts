@@ -121,7 +121,7 @@ export class ApiHelper {
 
   // Switch to a different organization
   async switchOrg(organizationId: string): Promise<void> {
-    const response = await this.request.post(`${BASE_URL}/api/auth/switch-org`, {
+    const response = await this.request.post(`${BASE_URL}/api/auth/refresh/switch-org`, {
       headers: this.csrfHeaders,
       data: { organization_id: organizationId }
     })

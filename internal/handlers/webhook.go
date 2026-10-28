@@ -2216,3 +2216,50 @@ func marketingPreferenceOptOut(value string) (bool, error) {
 		return false, fmt.Errorf("unsupported marketing preference %q", value)
 	}
 }
+
+// A bounded, valid JSON request and matching CSRF proof identify termination.
+// The credential is separately verified before selecting a user quota.
+func sessionTerminationCredential(r *fastglue.Request) (string, bool, bool) {
+	path := string(r.RequestCtx.Path())
+	if string(r.RequestCtx.Method()) != fasthttp.MethodPost ||
+		(path != "/api/auth/refresh" && path != "/api/auth/logout") {
+		return "", false, false
+	}
+	bodyBytes := r.RequestCtx.PostBody()
+	if len(bodyBytes) == 0 || len(bodyBytes) > 16*1024 {
+		return "", false, false
+	}
+	mediaType, _, _ := strings.Cut(string(r.RequestCtx.Request.Header.ContentType()), ";")
+	if !strings.EqualFold(strings.TrimSpace(mediaType), "application/json") {
+		return "", false, false
+	}
+	var body struct {
+		RefreshToken string `json:"refresh_token"`
+		Revoke       bool   `json:"revoke"`
+		KeepCookies  bool   `json:"keep_cookies"`
+		SSOExchange  string `json:"sso_exchange"`
+	}
+	if err := json.Unmarshal(bodyBytes, &body); err != nil ||
+		body.SSOExchange != "" || (path == "/api/auth/refresh" && !body.Revoke) {
+		return "", false, false
+	}
+	csrfCookie := r.RequestCtx.Request.Header.Cookie("whm_csrf")
+	csrfHeader := r.RequestCtx.Request.Header.Peek("X-CSRF-Token")
+	if len(csrfCookie) == 0 || subtle.ConstantTimeCompare(csrfCookie, csrfHeader) != 1 {
+		return "", false, false
+	}
+
+	// Match the handler's cookie-before-body precedence. Browser logout lacks
+	// the path-scoped refresh cookie, so a valid access cookie can identify its
+	// cookie-clearing request; it grants no other API access.
+	credential := string(r.RequestCtx.Request.Header.Cookie("whm_refresh"))
+	if credential == "" {
+		credential = body.RefreshToken
+	}
+	accessCredential := false
+	if credential == "" && path == "/api/auth/logout" {
+		credential = string(r.RequestCtx.Request.Header.Cookie("whm_access"))
+		accessCredential = true
+	}
+	return credential, accessCredential, true
+}

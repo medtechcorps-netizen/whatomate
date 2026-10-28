@@ -30,9 +30,13 @@ test.describe('SSO Settings', () => {
     // lives in (the UI is driven as that user).
     const memberships = await api.getMyOrganizations()
     const defaultOrg = memberships.find(m => m.is_default) ?? memberships[0]
-    if (defaultOrg) {
+    expect(defaultOrg, 'the fixture user must have a default organization').toBeDefined()
+    if (!defaultOrg) throw new Error('Fixture user has no organization membership')
+    const currentOrg = await api.getCurrentOrg()
+    if (currentOrg.id !== defaultOrg.organization_id) {
       await api.switchOrg(defaultOrg.organization_id)
     }
+    expect((await api.getCurrentOrg()).id).toBe(defaultOrg.organization_id)
     touchedProviders = []
   })
 
