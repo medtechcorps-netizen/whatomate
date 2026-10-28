@@ -348,6 +348,9 @@ const {
   isSending: isUploadingMedia,
   isStopping: isStoppingMedia,
 } = chatAttachments
+const mediaDialogIsCurrentContact = computed(() =>
+  !chatAttachments.recipientContactId.value || chatAttachments.recipientContactId.value === contactsStore.currentContact?.id,
+)
 // What the first file of a batch will quote, shown in the staging dialog.
 const mediaReplyPreview = computed(() => {
   const reply = contactsStore.replyingTo
@@ -3482,13 +3485,13 @@ watch(contactId, () => chatAttachments.reset())
     <MediaSendDialog
       :open="isMediaDialogOpen"
       :items="stagedAttachments"
-      :recipient-name="currentContactDisplayName"
-      :recipient-detail="currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text"
+      :recipient-name="chatAttachments.recipientName.value || currentContactDisplayName"
+      :recipient-detail="chatAttachments.recipientContactId.value === contactsStore.currentContact?.id ? (currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text) : ''"
       :sending="isUploadingMedia"
       :stopping="isStoppingMedia"
-      :reply-preview="mediaReplyPreview"
+      :reply-preview="mediaDialogIsCurrentContact ? mediaReplyPreview : ''"
       :max-files="chatAttachments.maxFiles"
-      :service-window-expired="isServiceWindowExpired"
+      :service-window-expired="mediaDialogIsCurrentContact && isServiceWindowExpired"
       @update:open="onMediaDialogOpenChange"
       @remove="chatAttachments.remove"
       @update:caption="chatAttachments.setCaption"
