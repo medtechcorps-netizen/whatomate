@@ -14,6 +14,14 @@ import ComposerFormatToolbar from '@/components/chat/ComposerFormatToolbar.vue'
 import WhatsAppText from '@/components/chat/WhatsAppText.vue'
 import ChatDropZoneOverlay from '@/components/chat/ChatDropZoneOverlay.vue'
 
+// The API client is mocked below; retain its current-tab session seam here.
+vi.mock('@/lib/tabSession', () => ({
+  currentTabSession: () => {
+    const marker = localStorage.getItem('whm_session_id')
+    return marker?.startsWith('ended:') ? null : marker
+  },
+}))
+
 const mocks = vi.hoisted(() => ({
   routeSource: { params: { contactId: 'first' as string | undefined } },
   route: null as { params: { contactId?: string } } | null,
@@ -250,6 +258,8 @@ describe('ChatView composer', () => {
   let wrapper: VueWrapper | null = null
 
   beforeEach(() => {
+    // Mounted attachment ownership is bound to a real logical login.
+    localStorage.setItem('whm_session_id', 'composer-test-session')
     vi.useFakeTimers()
     vi.clearAllMocks()
     mocks.route!.params.contactId = 'first'
@@ -589,6 +599,29 @@ describe('ChatView composer', () => {
     calls[1].resolve({ data: { data: { id: 'msg-b', status: 'sent' } } })
     await flushPromises()
     expect(mocks.realtimeListeners.size).toBe(0)
+  })
+
+  it('does not label the retained original batch with another chat\'s quote or service window', async () => {
+    wrapper = mountView()
+    await settle()
+    const calls = sendMediaDeferred()
+    await stageAndSend(['original.png'])
+    mocks.route!.params.contactId = 'second'
+    await settle()
+    mocks.contactsStore!.currentContact = { ...mocks.contactsStore!.currentContact, service_window_open: false }
+    mocks.contactsStore!.replyingTo = replyMessage('reply-b', 'second', 'Private quote from second patient')
+    await nextTick()
+    const dialog = wrapper.findComponent(MediaSendDialog)
+    expect(dialog.props('recipientName')).toBe('Patient first')
+    expect(dialog.props('recipientDetail')).toBe('')
+    expect(dialog.props('replyPreview')).toBe('')
+    expect(dialog.props('serviceWindowExpired')).toBe(false)
+    expect(dialog.props('sending')).toBe(true)
+    expect(calls[0].request.contact_id).toBe('first')
+    dialog.vm.$emit('stop')
+    await flushPromises()
+    expect(calls[0].signal.aborted).toBe(true)
+    expect(calls).toHaveLength(1)
   })
 
   it('stops a running batch from the dialog and reports what was not sent', async () => {

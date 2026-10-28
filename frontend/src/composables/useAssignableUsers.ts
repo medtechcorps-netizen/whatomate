@@ -1,8 +1,7 @@
-import { computed, ref, watch } from 'vue'
-import { contactsService } from '@/services/api'
+import { computed, onScopeDispose, ref, watch } from 'vue'
+import { contactsService, usersService } from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
-import { useUsersStore } from '@/stores/users'
 
 export interface AssignableUser {
   id: string
@@ -11,74 +10,164 @@ export interface AssignableUser {
   role_name?: string
 }
 
-// The people the chat Assign dialog offers. Assigning needs contacts:write,
-// but the user list behind it needs users:read, which default managers lack.
-// Without users:read the organization's member list (organizations:read) is
-// used instead; it is membership-aware like the server's assignee check.
+const PAGE_SIZE = 100
+const SEARCH_DELAY_MS = 250
+
+// Both authorized directories are paged. Keep the picker's results private:
+// the shared settings users store can contain another query or workspace.
 export function useAssignableUsers() {
   const authStore = useAuthStore()
-  const usersStore = useUsersStore()
   const organizationsStore = useOrganizationsStore()
-  const members = ref<AssignableUser[] | null>(null)
+  const users = ref<AssignableUser[]>([])
+  const search = ref('')
+  const loading = ref(false)
+  const failed = ref(false)
+  const hasMore = ref(false)
+  let nextPage = 1
+  let directoryTotal: number | null = null
+  let seenPeopleIds = new Set<string>()
   let loaded = false
-  let loadGeneration = 0
+  let disposed = false
+  let generation = 0
+  let controller: AbortController | null = null
+  let searchTimer: ReturnType<typeof setTimeout> | null = null
 
-  const users = computed<AssignableUser[]>(() => {
-    if (members.value) return members.value
-    return usersStore.users
-      .filter(user => user.is_active)
-      .map(user => ({
-        id: user.id,
-        full_name: user.full_name,
-        email: user.email,
-        role_name: user.role?.name,
-      }))
+  const organizationId = computed(() => organizationsStore.selectedOrgId || authStore.organizationId || '')
+  const directory = computed(() => {
+    if (!authStore.user?.id || !authStore.hasPermission('contacts', 'write')) return ''
+    if (authStore.hasPermission('users', 'read')) return 'users'
+    if (authStore.hasPermission('organizations', 'read')) return 'members'
+    return ''
   })
 
-  async function load() {
-    loaded = true
-    const generation = ++loadGeneration
-    if (authStore.hasPermission('users', 'read')) {
-      members.value = null
-      await usersStore.fetchUsers().catch(() => undefined)
-      return
-    }
-    if (!authStore.hasPermission('organizations', 'read')) {
-      members.value = []
-      return
-    }
+  function invalidate() {
+    generation++
+    controller?.abort()
+    controller = null
+    if (searchTimer !== null) clearTimeout(searchTimer)
+    searchTimer = null
+    users.value = []
+    nextPage = 1
+    directoryTotal = null
+    seenPeopleIds = new Set()
+    hasMore.value = false
+    failed.value = false
+    loading.value = false
+  }
+
+  async function fetchPage() {
+    const org = organizationId.value
+    const source = directory.value
+    if (disposed || !org || !source) return
+    const requestGeneration = generation
+    const page = nextPage
+    const params = { page, limit: PAGE_SIZE, search: search.value.trim() || undefined }
+    const requestController = new AbortController()
+    controller = requestController
+    loading.value = true
+    failed.value = false
     try {
-      const response = await contactsService.assignableMembers()
-      if (generation !== loadGeneration) return
-      const data = (response.data as any)?.data ?? response.data
-      members.value = (data?.members ?? [])
-        .filter((member: any) => member?.is_active === true && member.user_id && member.full_name)
-        .map((member: any) => ({
-          id: member.user_id,
-          full_name: member.full_name,
-          email: member.email ?? '',
-          role_name: member.role_name ?? undefined,
-        }))
+      const response = source === 'users'
+        ? await usersService.list(params, requestController.signal, org)
+        : await contactsService.assignableMembers(params, requestController.signal, org)
+      if (requestGeneration !== generation || requestController.signal.aborted) return
+      const data = response.data?.data ?? response.data
+      // A null members slice is the server's valid empty-page representation.
+      const rows = data?.[source] ?? (data?.total === 0 ? [] : undefined)
+      if (!Array.isArray(rows) || data.page !== page || data.limit !== PAGE_SIZE ||
+        !Number.isSafeInteger(data.total) || data.total < 0 || rows.length > PAGE_SIZE ||
+        (directoryTotal !== null && data.total !== directoryTotal) ||
+        rows.length !== Math.min(PAGE_SIZE, Math.max(0, data.total - (page - 1) * PAGE_SIZE))) {
+        throw new Error('Incomplete assignment directory page')
+      }
+      const people = new Map(users.value.map(user => [user.id, user]))
+      const pageIds = new Set(seenPeopleIds)
+      for (const row of rows) {
+        const id = source === 'users' ? row?.id : row?.user_id
+        if (typeof id !== 'string' || !id) continue
+        // Offset pages can shift after a concurrent insertion/removal. A
+        // duplicate would hide a missing person if merely deduplicated.
+        if (pageIds.has(id)) throw new Error('Assignment directory pages overlap')
+        pageIds.add(id)
+        if (row.is_active !== true || typeof row.full_name !== 'string' || !row.full_name.trim()) {
+          continue
+        }
+        people.set(id, {
+          id,
+          full_name: row.full_name,
+          email: typeof row.email === 'string' ? row.email : '',
+          role_name: (source === 'users' ? row.role?.name : row.role_name) ?? undefined,
+        })
+      }
+      users.value = [...people.values()]
+      directoryTotal = data.total
+      seenPeopleIds = pageIds
+      hasMore.value = page * PAGE_SIZE < data.total
+      nextPage = page + 1
     } catch {
-      if (generation === loadGeneration) members.value = []
+      if (requestGeneration !== generation || requestController.signal.aborted) return
+      // Never leave a failed partial directory looking complete. Retry starts
+      // at page one, since offset pagination may have changed in the meantime.
+      users.value = []
+      hasMore.value = false
+      nextPage = 1
+      directoryTotal = null
+      seenPeopleIds = new Set()
+      failed.value = true
+    } finally {
+      if (requestGeneration === generation) {
+        loading.value = false
+        if (controller === requestController) controller = null
+      }
     }
+  }
+
+  async function load() {
+    if (disposed) return
+    loaded = true
+    invalidate()
+    await fetchPage()
+  }
+
+  async function loadMore() {
+    if (loading.value || failed.value || !hasMore.value) return
+    await fetchPage()
+  }
+
+  async function ensureLoaded() {
+    if (!loaded) await load()
   }
 
   function nameOf(userId: string | null | undefined) {
-    if (!userId) return undefined
-    return users.value.find(user => user.id === userId)?.full_name
+    return userId ? users.value.find(user => user.id === userId)?.full_name : undefined
   }
 
-  // A workspace switch must never offer the previous organization's people.
   watch(
-    () => organizationsStore.selectedOrgId || authStore.organizationId || '',
-    (scope, previous) => {
-      if (scope === previous) return
-      loadGeneration++
-      members.value = null
-      if (loaded) void load()
+    () => [organizationId.value, authStore.user, directory.value],
+    () => {
+      invalidate()
+      if (loaded) void fetchPage()
     },
+    { flush: 'sync' },
   )
+  watch(
+    () => search.value.trim(),
+    () => {
+      invalidate()
+      if (!loaded || !organizationId.value || !directory.value) return
+      // Clear old matches immediately, including during the debounce window.
+      loading.value = true
+      searchTimer = setTimeout(() => {
+        searchTimer = null
+        void fetchPage()
+      }, SEARCH_DELAY_MS)
+    },
+    { flush: 'sync' },
+  )
+  onScopeDispose(() => {
+    disposed = true
+    invalidate()
+  })
 
-  return { users, load, nameOf }
+  return { users, search, loading, failed, hasMore, load, loadMore, ensureLoaded, nameOf }
 }

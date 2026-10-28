@@ -83,7 +83,7 @@ function rightClick(selector: string) {
 }
 
 function pointer(type: string, selector: string, init: PointerEventInit) {
-  container.querySelector(selector)!.dispatchEvent(new PointerEvent(type, { bubbles: true, ...init }))
+  container.querySelector(selector)!.dispatchEvent(new PointerEvent(type, { bubbles: true, pointerId: 1, isPrimary: true, ...init }))
 }
 
 // Menu actions run after reka's post-close focus step (a 0 ms timer).
@@ -114,6 +114,7 @@ afterEach(async () => {
   document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
   await flushPromises()
   while (mounted.length) mounted.pop()?.unmount()
+  window.getSelection()?.removeAllRanges()
   document.body.innerHTML = ''
 })
 
@@ -280,6 +281,193 @@ describe('MessageContextMenu', () => {
     wrapper.unmount()
     mounted.pop()
     expect(rightClick('[data-testid="text-1"]').defaultPrevented).toBe(false)
+  })
+
+  it.each([false, true])('gives a late native selection priority after custom open (contextmenu=%s)', async contextMenu => {
+    vi.useFakeTimers()
+    const wrapper = mountMenu()
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch' })
+    await vi.advanceTimersByTimeAsync(550)
+    expect(menu()).not.toBeNull()
+    const staleReaction = document.body.querySelector<HTMLElement>('[aria-label^="chat.messageActions.reactWith"]')!
+    const range = document.createRange()
+    range.selectNodeContents(container.querySelector('[data-testid="text-1"]')!)
+    window.getSelection()!.addRange(range)
+    if (contextMenu) expect(rightClick('[data-testid="text-1"]').defaultPrevented).toBe(false)
+    else document.dispatchEvent(new Event('selectionchange'))
+    await flushPromises()
+    expect(menu()).toBeNull()
+    expect(window.getSelection()!.toString()).toBe('First message')
+    staleReaction.click()
+    await vi.advanceTimersByTimeAsync(1200)
+    expect(wrapper.emitted('react')).toBeUndefined()
+    expect(container.querySelector<HTMLElement>('.chat-bubble')!.style.userSelect).toBe('')
+  })
+
+  it('preserves selection starting outside but intersecting the bubble', async () => {
+    mountMenu()
+    const range = document.createRange()
+    range.setStart(container, 0)
+    range.setEnd(container.querySelector('[data-testid="text-1"]')!.firstChild!, 5)
+    window.getSelection()!.addRange(range)
+    expect(rightClick('[data-testid="text-1"]').defaultPrevented).toBe(false)
+    await flushPromises()
+    expect(menu()).toBeNull()
+    expect(window.getSelection()!.isCollapsed).toBe(false)
+  })
+
+  it.each([false, true])('dismisses on the non-bubbling ancestor viewport scroll (alreadyOpen=%s)', async alreadyOpen => {
+    vi.useFakeTimers()
+    const viewport = document.createElement('div')
+    viewport.dataset.rekaScrollAreaViewport = ''
+    container.before(viewport)
+    viewport.appendChild(container)
+    const wrapper = mountMenu()
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch' })
+    if (alreadyOpen) await vi.advanceTimersByTimeAsync(550)
+    const staleReply = menuItem('chat.reply')
+    const scroll = new Event('scroll', { bubbles: false, cancelable: true })
+    viewport.scrollTop = 60
+    viewport.dispatchEvent(scroll)
+    expect(scroll.defaultPrevented).toBe(false)
+    expect(viewport.scrollTop).toBe(60)
+    await vi.advanceTimersByTimeAsync(1200)
+    expect(menu()).toBeNull()
+    staleReply?.click()
+    expect(wrapper.emitted('reply')).toBeUndefined()
+  })
+
+  it('ignores another panel scroll but closes on transcript or document scrolling', async () => {
+    mountMenu()
+    const unrelated = document.createElement('div')
+    document.body.appendChild(unrelated)
+    rightClick('[data-testid="text-1"]')
+    await flushPromises()
+    unrelated.dispatchEvent(new Event('scroll'))
+    await flushPromises()
+    expect(menu()).not.toBeNull()
+    container.dispatchEvent(new Event('scroll'))
+    await flushPromises()
+    expect(menu()).toBeNull()
+    rightClick('[data-testid="text-1"]')
+    await flushPromises()
+    document.dispatchEvent(new Event('scroll'))
+    await flushPromises()
+    expect(menu()).toBeNull()
+  })
+
+  it('deduplicates only the same touch target and lets another desktop target replace it', async () => {
+    vi.useFakeTimers()
+    const wrapper = mountMenu()
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch' })
+    await vi.advanceTimersByTimeAsync(550)
+    const duplicate = new PointerEvent('contextmenu', { bubbles: true, cancelable: true, pointerType: 'touch', pointerId: 1 })
+    container.querySelector('[data-testid="text-1"]')!.dispatchEvent(duplicate)
+    expect(duplicate.defaultPrevented).toBe(true)
+    const desktop = new PointerEvent('contextmenu', { bubbles: true, cancelable: true, pointerType: 'mouse', button: 2 })
+    container.querySelector('[data-testid="text-2"]')!.dispatchEvent(desktop)
+    await flushPromises()
+    menuItem('chat.reply')!.click()
+    await vi.advanceTimersByTimeAsync(1200)
+    expect(wrapper.emitted('reply')).toHaveLength(1)
+    expect(wrapper.emitted('reply')?.[0]?.[0]).toMatchObject({ id: 'm-2' })
+  })
+
+  it.each(['pointerup', 'pointercancel', 'second-touch'])('cancels a pending press on %s outside the transcript', async ending => {
+    vi.useFakeTimers()
+    mountMenu()
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch' })
+    document.body.dispatchEvent(new PointerEvent(ending === 'second-touch' ? 'pointerdown' : ending, {
+      bubbles: true, pointerType: 'touch', pointerId: ending === 'second-touch' ? 2 : 1, isPrimary: ending !== 'second-touch',
+    }))
+    await vi.advanceTimersByTimeAsync(600)
+    expect(menu()).toBeNull()
+    expect(container.querySelector<HTMLElement>('.chat-bubble')!.style.getPropertyValue('-webkit-touch-callout')).toBe('')
+  })
+
+  it.each(['removed-row', 'rebound-row', 'removed-message', 'scope'])('invalidates an open target on %s before any gesture effect', async change => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    const composer = document.createElement('textarea')
+    document.body.appendChild(composer)
+    const focus = vi.spyOn(composer, 'focus')
+    const wrapper = mountMenu({ composer, scopeKey: 'org-a/contact-a' })
+    rightClick('[data-testid="text-1"]')
+    await flushPromises()
+    const staleReply = menuItem('chat.reply')!
+    const staleCopy = menuItem('chat.messageActions.copyText')!
+    if (change === 'removed-row') container.querySelector('#message-m-1')!.remove()
+    else if (change === 'rebound-row') container.querySelector('#message-m-1')!.setAttribute('data-message-id', 'm-2')
+    else if (change === 'removed-message') await wrapper.setProps({ messages: MESSAGES.slice(1) })
+    else await wrapper.setProps({ scopeKey: 'org-b/contact-b' })
+    // DOM changes may precede the observer. The action fence still refuses.
+    staleReply.click()
+    staleCopy.click()
+    await settle()
+    expect(menu()).toBeNull()
+    expect(focus).not.toHaveBeenCalled()
+    expect(writeText).not.toHaveBeenCalled()
+    expect(wrapper.emitted('reply')).toBeUndefined()
+  })
+
+  it('cancels accepted queued work when scope changes before the close callback', async () => {
+    const wrapper = mountMenu({ scopeKey: 'first' })
+    rightClick('[data-testid="text-1"]')
+    await flushPromises()
+    menuItem('chat.reply')!.click()
+    await wrapper.setProps({ scopeKey: 'second' })
+    await settle()
+    expect(wrapper.emitted('reply')).toBeUndefined()
+  })
+
+  it('cannot reopen from a queued trigger after scrolling or scope invalidation', async () => {
+    const wrapper = mountMenu({ scopeKey: 'first' })
+    rightClick('[data-testid="text-1"]')
+    container.dispatchEvent(new Event('scroll'))
+    await settle()
+    expect(menu()).toBeNull()
+    rightClick('[data-testid="text-1"]')
+    await wrapper.setProps({ scopeKey: 'second' })
+    await settle()
+    expect(menu()).toBeNull()
+  })
+
+  it('invalidates a pending gesture when its original row is replaced with the same message ID', async () => {
+    vi.useFakeTimers()
+    mountMenu()
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch' })
+    const row = container.querySelector('#message-m-1')!
+    row.replaceWith(row.cloneNode(true))
+    await vi.advanceTimersByTimeAsync(600)
+    expect(menu()).toBeNull()
+  })
+
+  it('restores an existing callout declaration with its original priority after pointer cancellation', async () => {
+    vi.useFakeTimers()
+    mountMenu()
+    const bubble = container.querySelector<HTMLElement>('.chat-bubble')!
+    bubble.style.setProperty('-webkit-touch-callout', 'default', 'important')
+    const original = bubble.style.getPropertyValue('-webkit-touch-callout')
+    const priority = bubble.style.getPropertyPriority('-webkit-touch-callout')
+    pointer('pointerdown', '[data-testid="text-1"]', { pointerType: 'touch' })
+    await vi.advanceTimersByTimeAsync(550)
+    pointer('pointercancel', '[data-testid="text-1"]', { pointerType: 'touch' })
+    await flushPromises()
+    expect(menu()).toBeNull()
+    expect(bubble.style.getPropertyValue('-webkit-touch-callout')).toBe(original)
+    expect(bubble.style.getPropertyPriority('-webkit-touch-callout')).toBe(priority)
+  })
+
+  it('resolves updated message content for Copy instead of the captured object', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    const wrapper = mountMenu()
+    rightClick('[data-testid="text-1"]')
+    await flushPromises()
+    await wrapper.setProps({ messages: [message('m-1', 'Updated text'), ...MESSAGES.slice(1)] })
+    menuItem('chat.messageActions.copyText')!.click()
+    expect(writeText).toHaveBeenCalledExactlyOnceWith('Updated text')
+    await settle()
   })
 
   it('offers Forward only with permission and for forwardable messages', async () => {

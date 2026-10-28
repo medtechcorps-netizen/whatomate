@@ -163,6 +163,12 @@ jobs:
       - name: Install Playwright browsers
         run: cd frontend && npx playwright install chromium --with-deps
 
+      - name: Qualify message menu in Chromium
+        if: ${{ matrix.shard == 1 }}
+        working-directory: frontend
+        timeout-minutes: 5
+        run: npx --no-install playwright test --config=playwright.message-menu.config.ts
+
       - name: Run E2E tests
         run: cd frontend && npm run test:e2e -- --shard=${{ matrix.shard }}/4
         env:

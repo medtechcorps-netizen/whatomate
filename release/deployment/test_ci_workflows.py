@@ -504,6 +504,33 @@ def text_values(mapping: dict[str, Any]) -> dict[str, str]:
     return {key: str(value) for key, value in mapping.items()}
 
 
+def assert_frontend_source_validation(sources: dict[str, str]) -> None:
+    docs = parse(sources)
+    security = jobs(docs["test.yml"])["security"]
+    expected = (
+        {"name": "Typecheck frontend", "working-directory": "frontend", "timeout-minutes": 10,
+         "run": "npm run typecheck"},
+        {"name": "Lint frontend without fixes", "working-directory": "frontend", "timeout-minutes": 10,
+         "run": "npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --ignore-path .gitignore"},
+    )
+    for item in expected:
+        if step_named(security, item["name"]) != item:
+            raise AssertionError("frontend source validation must be unconditional, bounded and non-fixing")
+    names = [item.get("name") for item in security["steps"]]
+    if not (names.index("Audit frontend dependencies") < names.index(expected[0]["name"])
+            < names.index(expected[1]["name"]) < names.index("Test frontend unit suite")):
+        raise AssertionError("frontend validation must follow dependency installation and precede unit tests")
+    shard = jobs(docs["e2e-tests.yml"])["e2e-shard"]
+    menu = {"name": "Qualify message menu in Chromium", "if": "${{ matrix.shard == 1 }}",
+            "working-directory": "frontend", "timeout-minutes": 5,
+            "run": "npx --no-install playwright test --config=playwright.message-menu.config.ts"}
+    if step_named(shard, menu["name"]) != menu:
+        raise AssertionError("the separate menu qualification must run once on shard1 without retry or failure bypass")
+    names = [item.get("name") for item in shard["steps"]]
+    if not (names.index("Install Playwright browsers") < names.index(menu["name"]) < names.index("Run E2E tests")):
+        raise AssertionError("menu qualification must use the installed browser before the ordinary suite")
+
+
 def assert_lint_build_and_scans(sources: dict[str, str]) -> None:
     test_jobs = jobs(parse(sources)["test.yml"])
     linters = [item for item in test_jobs["lint"].get("steps", [])
@@ -1008,6 +1035,7 @@ CHECKS: tuple[tuple[str, Callable[[dict[str, str]], None]], ...] = (
     ("aggregators", assert_aggregators),
     ("braces-audit", assert_frontend_audit_policy),
     ("unconditional-jobs", assert_unconditional_jobs),
+    ("frontend-source-validation", assert_frontend_source_validation),
     ("lint-build-and-scans", assert_lint_build_and_scans),
     ("staging-bootstrap", assert_staging_bootstrap),
     ("staging-placement", assert_staging_placement),
@@ -1357,6 +1385,25 @@ NEGATIVE_CASES: dict[str, tuple[str, Callable[[], dict[str, str]]]] = {
     "run the e2e shards only on push": ("unconditional-jobs", lambda: replaced(
         "e2e-tests.yml", "    name: e2e-shard-${{ matrix.shard }}\n",
         "    name: e2e-shard-${{ matrix.shard }}\n    if: github.event_name == 'push'\n")),
+    # Frontend source and the separately configured browser qualification.
+    'drop frontend typecheck': ("frontend-source-validation", lambda: replaced(
+        'test.yml', '      - name: Typecheck frontend\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npm run typecheck\n\n', '')),
+    'skip frontend typecheck': ("frontend-source-validation", lambda: replaced(
+        'test.yml', '      - name: Typecheck frontend\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npm run typecheck\n\n', '      - name: Typecheck frontend\n        if: ${{ false }}\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npm run typecheck\n\n')),
+    'let frontend lint fix source': ("frontend-source-validation", lambda: replaced(
+        'test.yml', '      - name: Lint frontend without fixes\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --ignore-path .gitignore\n\n', '      - name: Lint frontend without fixes\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --fix --ignore-path .gitignore\n\n')),
+    'turn existing lint warnings into errors': ("frontend-source-validation", lambda: replaced(
+        'test.yml', '      - name: Lint frontend without fixes\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --ignore-path .gitignore\n\n', '      - name: Lint frontend without fixes\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --max-warnings=0 --ignore-path .gitignore\n\n')),
+    'ignore frontend lint failure': ("aggregators", lambda: replaced(
+        'test.yml', '      - name: Lint frontend without fixes\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --ignore-path .gitignore\n\n', '      - name: Lint frontend without fixes\n        continue-on-error: true\n        working-directory: frontend\n        timeout-minutes: 10\n        run: npx --no-install eslint . --ext .vue,.js,.jsx,.cjs,.mjs,.ts,.tsx,.cts,.mts --ignore-path .gitignore\n\n')),
+    'drop separate menu qualification': ("frontend-source-validation", lambda: replaced(
+        'e2e-tests.yml', '      - name: Qualify message menu in Chromium\n        if: ${{ matrix.shard == 1 }}\n        working-directory: frontend\n        timeout-minutes: 5\n        run: npx --no-install playwright test --config=playwright.message-menu.config.ts\n\n', '')),
+    'skip separate menu qualification': ("frontend-source-validation", lambda: replaced(
+        'e2e-tests.yml', '      - name: Qualify message menu in Chromium\n        if: ${{ matrix.shard == 1 }}\n        working-directory: frontend\n        timeout-minutes: 5\n        run: npx --no-install playwright test --config=playwright.message-menu.config.ts\n\n', '      - name: Qualify message menu in Chromium\n        if: ${{ matrix.shard == 0 }}\n        working-directory: frontend\n        timeout-minutes: 5\n        run: npx --no-install playwright test --config=playwright.message-menu.config.ts\n\n')),
+    'silently use default browser suite instead of menu qualification': ("frontend-source-validation", lambda: replaced(
+        'e2e-tests.yml', '      - name: Qualify message menu in Chromium\n        if: ${{ matrix.shard == 1 }}\n        working-directory: frontend\n        timeout-minutes: 5\n        run: npx --no-install playwright test --config=playwright.message-menu.config.ts\n\n', '      - name: Qualify message menu in Chromium\n        if: ${{ matrix.shard == 1 }}\n        working-directory: frontend\n        timeout-minutes: 5\n        run: npx --no-install playwright test\n\n')),
+    'retry menu qualification': ("frontend-source-validation", lambda: replaced(
+        'e2e-tests.yml', '      - name: Qualify message menu in Chromium\n        if: ${{ matrix.shard == 1 }}\n        working-directory: frontend\n        timeout-minutes: 5\n        run: npx --no-install playwright test --config=playwright.message-menu.config.ts\n\n', '      - name: Qualify message menu in Chromium\n        if: ${{ matrix.shard == 1 }}\n        working-directory: frontend\n        timeout-minutes: 5\n        run: npx --no-install playwright test --config=playwright.message-menu.config.ts --retries=1\n\n')),
     # 11. Lint, build and the security scans.
     "drop golangci-lint": ("lint-build-and-scans", lambda: replaced(
         "test.yml", "      - name: Run golangci-lint\n"

@@ -348,6 +348,9 @@ const {
   isSending: isUploadingMedia,
   isStopping: isStoppingMedia,
 } = chatAttachments
+const mediaDialogIsCurrentContact = computed(() =>
+  !chatAttachments.recipientContactId.value || chatAttachments.recipientContactId.value === contactsStore.currentContact?.id,
+)
 // What the first file of a batch will quote, shown in the staging dialog.
 const mediaReplyPreview = computed(() => {
   const reply = contactsStore.replyingTo
@@ -581,6 +584,16 @@ async function acknowledgeVisibleChatBoundary() {
 }
 
 const contactId = computed(() => route.params.contactId as string | undefined)
+// The route can change before its messages finish loading. Invalidate any
+// pending bubble action immediately, including during an auth/org switch.
+const messageMenuScope = computed(() => JSON.stringify([
+  authStore.isAuthenticated,
+  authStore.user?.id,
+  organizationsStore.selectedOrgId || authStore.organizationId,
+  contactId.value,
+  contactsStore.currentContact?.id,
+  selectedAccount.value,
+]))
 
 // Get active transfer for current contact from the store (reactive)
 const activeTransfer = computed(() => {
@@ -733,9 +746,21 @@ function toggleConversationAI() {
 // managers) they come from the organization member list.
 const {
   users: assignableUsers,
+  search: assignSearchQuery,
+  loading: assignableUsersLoading,
+  failed: assignableUsersFailed,
+  hasMore: hasMoreAssignableUsers,
   load: loadAssignableUsers,
+  loadMore: loadMoreAssignableUsers,
+  ensureLoaded: ensureAssignableUsersLoaded,
   nameOf: assignableUserName,
 } = useAssignableUsers()
+
+// Assignment may be granted after mount. Opening the picker initializes it
+// without fetching a directory while the caller lacks assignment authority.
+watch(isAssignDialogOpen, open => {
+  if (open && canAssignContacts.value) void ensureAssignableUsersLoaded()
+})
 
 // Icon mapping for custom actions
 const actionIconMap: Record<string, any> = {
@@ -840,19 +865,6 @@ async function executeCustomAction(action: CustomAction) {
     executingActionId.value = null
   }
 }
-
-// Search state for assignment dialog
-const assignSearchQuery = ref('')
-
-// Filtered users for assignment dialog
-const filteredAssignableUsers = computed(() => {
-  const query = assignSearchQuery.value.toLowerCase().trim()
-  if (!query) return assignableUsers.value
-  return assignableUsers.value.filter(u =>
-    u.full_name.toLowerCase().includes(query) ||
-    u.email.toLowerCase().includes(query)
-  )
-})
 
 // Fetch contacts on mount (WebSocket is connected in AppLayout)
 onMounted(async () => {
@@ -2514,11 +2526,29 @@ watch(contactId, () => chatAttachments.reset())
           </div>
 
           <!-- Loading indicator for infinite scroll -->
+          <div
+            v-if="contactsStore.contactListError"
+            role="alert"
+            data-testid="chat-contact-list-error"
+            class="mx-3 my-2 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-sm text-amber-200 light:border-amber-200 light:bg-amber-50 light:text-amber-900"
+          >
+            <p>{{ $t('chat.contactListUnavailable', 'Unable to load chats. Please try again.') }}</p>
+            <Button
+              size="sm"
+              variant="outline"
+              class="mt-2"
+              data-testid="chat-contact-list-retry"
+              :disabled="contactsStore.isLoading || contactsStore.isLoadingMoreContacts"
+              @click="contactsStore.retryContactList()"
+            >
+              {{ $t('common.retry') }}
+            </Button>
+          </div>
           <div v-if="contactsStore.isLoadingMoreContacts" class="p-3 text-center">
             <Loader2 class="h-5 w-5 mx-auto animate-spin text-white/40 light:text-gray-400" />
           </div>
 
-          <div v-if="contactsStore.sortedContacts.length === 0" class="p-3 text-center text-white/40 light:text-gray-500">
+          <div v-if="contactsStore.sortedContacts.length === 0 && !contactsStore.contactListError && !contactsStore.isLoading" class="p-3 text-center text-white/40 light:text-gray-500">
             <User class="h-6 w-6 mx-auto mb-1.5 opacity-50" />
             <p class="text-sm">
               {{ (contactsStore.listFilter ?? 'all') === 'all' ? $t('chat.noContacts') : $t('chat.filters.noMatches') }}
@@ -3397,6 +3427,7 @@ watch(contactId, () => chatAttachments.reset())
             <Search class="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
             <Input
               v-model="assignSearchQuery"
+              :aria-label="$t('chat.searchUsers')"
               :placeholder="$t('chat.searchUsers') + '...'"
               class="pl-9 h-9"
             />
@@ -3414,7 +3445,7 @@ watch(contactId, () => chatAttachments.reset())
           <ScrollArea class="max-h-[280px]">
             <div class="space-y-1">
               <Button
-                v-for="user in filteredAssignableUsers"
+                v-for="user in assignableUsers"
                 :key="user.id"
                 :variant="contactsStore.currentContact?.assigned_user_id === user.id ? 'secondary' : 'ghost'"
                 class="w-full justify-start"
@@ -3430,11 +3461,22 @@ watch(contactId, () => chatAttachments.reset())
                   {{ user.role_name }}
                 </Badge>
               </Button>
-              <p v-if="filteredAssignableUsers.length === 0" class="text-sm text-muted-foreground text-center py-4">
+              <p v-if="!assignableUsersLoading && !assignableUsersFailed && !hasMoreAssignableUsers && assignableUsers.length === 0" class="text-sm text-muted-foreground text-center py-4" role="status">
                 {{ $t('chat.noUsersFound') }}
               </p>
             </div>
           </ScrollArea>
+          <p v-if="assignableUsersLoading" class="text-sm text-muted-foreground text-center" role="status">
+            {{ $t('common.loading') }}
+          </p>
+          <div v-else-if="assignableUsersFailed" class="space-y-2">
+            <p class="text-sm text-destructive" role="alert">{{ $t('chat.assignUsersLoadFailed') }}</p>
+            <Button variant="outline" class="w-full" @click="loadAssignableUsers()">{{ $t('common.retry') }}</Button>
+          </div>
+          <div v-else-if="hasMoreAssignableUsers" class="space-y-2">
+            <p class="text-sm text-muted-foreground" role="status">{{ $t('chat.assignUsersMore') }}</p>
+            <Button variant="outline" class="w-full" @click="loadMoreAssignableUsers()">{{ $t('chat.loadMore') }}</Button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>
@@ -3443,13 +3485,13 @@ watch(contactId, () => chatAttachments.reset())
     <MediaSendDialog
       :open="isMediaDialogOpen"
       :items="stagedAttachments"
-      :recipient-name="currentContactDisplayName"
-      :recipient-detail="currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text"
+      :recipient-name="chatAttachments.recipientName.value || currentContactDisplayName"
+      :recipient-detail="chatAttachments.recipientContactId.value === contactsStore.currentContact?.id ? (currentContactDialablePhone ? contactsStore.currentContact?.phone_number : currentContactAddress.text) : ''"
       :sending="isUploadingMedia"
       :stopping="isStoppingMedia"
-      :reply-preview="mediaReplyPreview"
+      :reply-preview="mediaDialogIsCurrentContact ? mediaReplyPreview : ''"
       :max-files="chatAttachments.maxFiles"
-      :service-window-expired="isServiceWindowExpired"
+      :service-window-expired="mediaDialogIsCurrentContact && isServiceWindowExpired"
       @update:open="onMediaDialogOpenChange"
       @remove="chatAttachments.remove"
       @update:caption="chatAttachments.setCaption"
@@ -3475,7 +3517,7 @@ watch(contactId, () => chatAttachments.reset())
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
     />
-    <MessageContextMenu :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" :can-forward="canForwardMessages" @react="sendReaction" @reply="replyToMessage" @forward="openForwardDialog" />
+    <MessageContextMenu :scope-key="messageMenuScope" :container="messagesContentRef" :messages="contactsStore.messages" :quick-reactions="quickReactionEmojis" :composer="messageInputRef" :can-forward="canForwardMessages" @react="sendReaction" @reply="replyToMessage" @forward="openForwardDialog" />
     <ForwardMessageDialog v-model:open="isForwardDialogOpen" :message="forwardingMessage" :preview="forwardPreview" />
   </div>
 </template>

@@ -251,7 +251,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function switchOrg(organizationId: string): Promise<void> {
     const requestGeneration = ++authenticationRequestGeneration
     const identity = identityGeneration
-    const response = await api.post('/auth/switch-org', { organization_id: organizationId })
+    const response = await api.post('/auth/refresh/switch-org', { organization_id: organizationId })
     if (
       requestGeneration !== authenticationRequestGeneration ||
       identity !== identityGeneration

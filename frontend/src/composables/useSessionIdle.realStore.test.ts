@@ -20,11 +20,13 @@ const U2 = { id: 'user-2', email: 'u2@example.com', organization_id: 'org-2' }
 
 class FakeBroadcastChannel {
   static channels = new Set<FakeBroadcastChannel>()
+  static deliverActivity = true
   onmessage: ((event: MessageEvent) => void) | null = null
   constructor(public name: string) {
     FakeBroadcastChannel.channels.add(this)
   }
   postMessage(data: unknown) {
+    if (!FakeBroadcastChannel.deliverActivity && (data as { type?: unknown } | null)?.type === 'activity') return
     for (const channel of FakeBroadcastChannel.channels) {
       if (channel !== this && channel.name === this.name) channel.onmessage?.({ data } as MessageEvent)
     }
@@ -105,7 +107,8 @@ async function openTab() {
   })
   wrappers.push(mount(Harness))
   await flushPromises()
-  return { api, store, idle }
+  const activity = await import('@/lib/sessionActivity')
+  return { api, store, idle, activity }
 }
 
 // `user` signs in in another tab as a real sign-in does: a new marker (no
@@ -144,6 +147,7 @@ describe('the per-tab session with the real store and API client', () => {
     localStorage.setItem('whm_session_idle_minutes', JSON.stringify({ 'user-1|org-1': 30, 'user-2|org-2': 30 }))
     document.cookie = 'whm_csrf=csrf-1; path=/'
     FakeBroadcastChannel.channels.clear()
+    FakeBroadcastChannel.deliverActivity = true
     vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
     installWebLocks()
     posts = []
@@ -176,6 +180,64 @@ describe('the per-tab session with the real store and API client', () => {
     Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
     Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined })
     document.cookie = 'whm_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/'
+  })
+
+
+  it.each([true, false])('uses isolated tab clocks and activity delivery to prevent false idle revoke (delivery %s)', async (deliverActivity) => {
+    // Both clients will reach their proactive-refresh idle guard after the
+    // original persisted30minute deadline, so a view-only fix is insufficient.
+    localStorage.setItem('whm_auth_expires_at', String(Date.now() + 31 * MINUTE))
+    const listeners = vi.spyOn(window, 'addEventListener')
+    const active = await openTab()
+    const pointer = listeners.mock.calls.find(call => call[0] === 'pointerdown')?.[1] as EventListener
+    expect(pointer).toBeTypeOf('function')
+    const passive = await openTab()
+    expect(active.activity).not.toBe(passive.activity)
+    expect(active.activity.readLastActivity).not.toBe(passive.activity.readLastActivity)
+    FakeBroadcastChannel.deliverActivity = deliverActivity
+    const persisted = localStorage.getItem('whm_last_activity')
+    const storage = localStorage
+    const deniedWrite = vi.fn((key: string, value: string) => {
+      if (key === 'whm_last_activity') throw new Error('storage denied')
+      // Keep the independent session-ending marker writable so the negative
+      // control reaches the real revoke path instead of its ownership refusal.
+      storage.setItem(key, value)
+    })
+    vi.stubGlobal('localStorage', {
+      getItem: storage.getItem.bind(storage), setItem: deniedWrite,
+      removeItem: storage.removeItem.bind(storage), clear: storage.clear.bind(storage),
+    })
+    expect(() => localStorage.setItem('whm_last_activity', 'denial-probe')).toThrow('storage denied')
+    deniedWrite.mockClear()
+
+    await vi.advanceTimersByTimeAsync(20 * MINUTE)
+    // Dispatch to this tab's own listener, not the shared test window's other
+    // tab. Only the BroadcastChannel can carry this activity to the passive tab.
+    pointer(new Event('pointerdown'))
+    expect(active.activity.readLastActivity()).toBe(Date.now())
+    expect(passive.activity.readLastActivity()).toBe(deliverActivity ? Date.now() : Number(persisted))
+    await vi.advanceTimersByTimeAsync(11 * MINUTE)
+    await flushPromises()
+
+    if (deliverActivity) {
+      expect(localStorage.getItem('whm_last_activity')).toBe(persisted)
+      expect(active.store.isAuthenticated).toBe(true)
+      expect(passive.store.isAuthenticated).toBe(true)
+      expect(active.idle.warningOpen.value).toBe(false)
+      expect(passive.idle.warningOpen.value).toBe(false)
+      expect(posts).toContain('/auth/refresh')
+      expect(posts).not.toContain('revoke')
+      expect(posts).not.toContain('/auth/logout')
+      expect(assignedHref).toBeNull()
+    } else {
+      // Negative control: removing only activity delivery leaves this tab on
+      // the stale clock and it revokes the session at the original deadline.
+      // The API idle guard can leave before the view's own timer; mocked
+      // navigation does not unmount/clear its Pinia store. Observe the real
+      // revoke request and navigation, not a simulated page destruction.
+      expect(posts).toContain('revoke')
+      expect(assignedHref).toBe('/login')
+    }
   })
 
   it('"Sign out" in a tab whose session was replaced ends nothing and touches nothing shared', async () => {

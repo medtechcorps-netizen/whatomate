@@ -26,7 +26,7 @@ const ok = (config: InternalAxiosRequestConfig, data: unknown = { data: {} }) =>
 })
 
 function httpError(status: number, config?: InternalAxiosRequestConfig) {
-  return new AxiosError(
+  return new AxiosError<{ status: string; error_type?: string }>(
     `Request failed with status code ${status}`,
     status >= 500 ? AxiosError.ERR_BAD_RESPONSE : AxiosError.ERR_BAD_REQUEST,
     config,
@@ -801,7 +801,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const order: string[] = []
     let rotated = false
     const { api } = await loadTab(async (config) => {
-      if (config.url === '/auth/switch-org') {
+      if (config.url === '/auth/refresh/switch-org') {
         order.push('switch-org')
         return ok(config, { data: { expires_in: 900, user: {} } })
       }
@@ -819,7 +819,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     const request = api.get('/contacts')
     await vi.waitFor(() => expect(order).toEqual(['refresh']))
-    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' })
+    const switched = api.post('/auth/refresh/switch-org', { organization_id: 'org-2' })
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(order).toEqual(['refresh'])
 
@@ -864,7 +864,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const order: string[] = []
     let switchTimeout: number | undefined
     const { api, whenLogoutSettled } = await loadTab(async (config) => {
-      if (config.url === '/auth/switch-org') {
+      if (config.url === '/auth/refresh/switch-org') {
         switchTimeout = config.timeout
         // A stalled server that answers after the logout's 20 s cap.
         await new Promise((resolve) => setTimeout(resolve, 25_000))
@@ -875,7 +875,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     })
     recordPosts(order)
 
-    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).then(
+    const switched = api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).then(
       () => 'applied',
       (error: AxiosError) => error.code,
     )
@@ -905,7 +905,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       timeouts.push(config.timeout)
       return ok(config, { data: { expires_in: 900, user: {} } })
     })
-    for (const url of ['/auth/login', '/auth/register', '/auth/switch-org']) {
+    for (const url of ['/auth/login', '/auth/register', '/auth/refresh/switch-org']) {
       await api.post(url, {})
     }
     expect(timeouts).toEqual([15_000, 15_000, 15_000])
@@ -1215,7 +1215,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(localStorage.getItem('whm_logout_pending')).not.toBeNull()
     const user = localStorage.getItem('user')
 
-    await expect(other.api.post('/auth/switch-org', { organization_id: 'org-2' }))
+    await expect(other.api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }))
       .rejects.toMatchObject({ code: 'ERR_CANCELED' })
     expect(adapter).not.toHaveBeenCalled()
     expect(localStorage.getItem('user')).toBe(user)
@@ -1276,7 +1276,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const signals: AbortSignal[] = []
     const order: string[] = []
     const { api, whenLogoutSettled } = await loadTab(async (config) => {
-      if (config.url === '/auth/switch-org') {
+      if (config.url === '/auth/refresh/switch-org') {
         await gate
         return ok(config, { data: { expires_in: 900, user: {} } })
       }
@@ -1291,7 +1291,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       }
       return undefined
     })
-    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    const switched = api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
     await tick()
     // The session ends (another tab), so the late switch answer must be undone...
     localStorage.setItem('whm_session_id', 'ended:session-a')
@@ -1403,21 +1403,90 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(order).toEqual(['login (no answer)', 'revoke csrf-of-this-sign-in', 'logout csrf-of-this-sign-in'])
   })
 
-  it('a switch-org without an answer and with the CSRF cookie unchanged undoes nothing', async () => {
+  it('a switch without an answer requires scoped recovery even when its CSRF cookie is unchanged', async () => {
     installWebLocks()
     localStorage.setItem('whm_session_id', 'session-a')
     const order: string[] = []
-    const { api } = await loadTab(async (config) => {
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
       order.push('switch-org (no answer)')
       throw new AxiosError('Network Error', AxiosError.ERR_NETWORK, config)
     })
     recordPosts(order)
 
-    await api.post('/auth/switch-org', { organization_id: 'org-2' }).catch(() => undefined)
+    await api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).catch(() => undefined)
+    await whenLogoutSettled()
 
-    expect(order).toEqual(['switch-org (no answer)'])
-    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+    expect(order).toEqual(['switch-org (no answer)', 'revoke csrf-token-1', 'logout csrf-token-1'])
+    expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+    expect(localStorage.getItem('user')).toBeNull()
+    expect(assignedHref).toBe('/login')
     expect(document.cookie).toContain('whm_csrf=csrf-token-1')
+  })
+
+  for (const outcome of ['switch_not_applied', 'switch_outcome_unknown', 'proxy_failure'] as const) {
+    it(`handles switch ${outcome} without replaying issuance`, async () => {
+      localStorage.setItem('whm_session_id', 'session-a')
+      const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+        const error = httpError(503, config)
+        error.response!.data = { status: 'error', error_type: outcome }
+        throw error
+      })
+      const { api, whenLogoutSettled } = await loadTab(adapter)
+      const order: string[] = []
+      recordPosts(order)
+      await expect(api.post('/auth/refresh/switch-org', { organization_id: 'org-2' })).rejects.toBeTruthy()
+      await whenLogoutSettled()
+      expect(adapter).toHaveBeenCalledTimes(1)
+      if (outcome === 'switch_not_applied') {
+        expect(order).toEqual([])
+        expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+        expect(localStorage.getItem('user')).not.toBeNull()
+        expect(assignedHref).toBeNull()
+      } else {
+        expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+        expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+        expect(localStorage.getItem('user')).toBeNull()
+        expect(assignedHref).toBe('/login')
+      }
+    })
+  }
+
+  it('an unknown old switch response cannot end a newer logical session or its cookies', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const nextUser = JSON.stringify({ id: 'user-b', organization_id: 'org-b' })
+    const { api, whenLogoutSettled } = await loadTab(async (config) => {
+      localStorage.setItem('whm_session_id', 'session-b')
+      localStorage.setItem('user', nextUser)
+      setCookie('whm_csrf=csrf-of-b; path=/')
+      localStorage.setItem('whm_session_begun', JSON.stringify({ marker: 'session-b', csrf: 'csrf-of-b' }))
+      const error = httpError(503, config)
+      error.response!.data = { status: 'error', error_type: 'switch_outcome_unknown' }
+      throw error
+    })
+    const order: string[] = []
+    recordPosts(order)
+    await expect(api.post('/auth/refresh/switch-org', { organization_id: 'org-2' })).rejects.toBeTruthy()
+    await whenLogoutSettled()
+    expect(order).toEqual([])
+    expect(localStorage.getItem('whm_session_id')).toBe('session-b')
+    expect(localStorage.getItem('user')).toBe(nextUser)
+    expect(document.cookie).toContain('whm_csrf=csrf-of-b')
+  })
+
+  it('cancellation before the switch adapter sends nothing and preserves the session', async () => {
+    localStorage.setItem('whm_session_id', 'session-a')
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+    const { api, whenLogoutSettled } = await loadTab(adapter)
+    const abort = new AbortController()
+    abort.abort()
+    const order: string[] = []
+    recordPosts(order)
+    await expect(api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }, { signal: abort.signal })).rejects.toBeTruthy()
+    await whenLogoutSettled()
+    expect(adapter).not.toHaveBeenCalled()
+    expect(order).toEqual([])
+    expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+    expect(localStorage.getItem('user')).not.toBeNull()
   })
 
   it('a switch-org is refused, sending nothing, once another tab began a new session', async () => {
@@ -1429,7 +1498,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const order: string[] = []
     recordPosts(order)
 
-    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    const switched = api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
     await tick()
     // B signs in elsewhere while the switch waits: a live marker, B's cookies.
     localStorage.setItem('whm_session_id', 'session-b')
@@ -1516,13 +1585,13 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
   it("the begun session's CSRF record follows its org switches", async () => {
     installWebLocks()
     const { api } = await loadTab(async (config) => {
-      if (config.url === '/auth/switch-org') setCookie('whm_csrf=csrf-after-switch; path=/')
+      if (config.url === '/auth/refresh/switch-org') setCookie('whm_csrf=csrf-after-switch; path=/')
       return ok(config, { data: { expires_in: 900, user: {} } })
     })
     await api.post('/auth/login', { email: 'a@example.com', password: 'x' })
     const marker = localStorage.getItem('whm_session_id')
 
-    await api.post('/auth/switch-org', { organization_id: 'org-2' })
+    await api.post('/auth/refresh/switch-org', { organization_id: 'org-2' })
 
     expect(JSON.parse(localStorage.getItem('whm_session_begun')!)).toEqual({ marker, csrf: 'csrf-after-switch' })
   })
@@ -1548,7 +1617,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       }
     })
 
-    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    const switched = api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
     await vi.waitFor(() => expect(order).toEqual(['refresh']))
     // A tab of an older build signs in as B on the lock meanwhile, and writes
     // no begun record: only this request's own fields can tell it apart.
@@ -1605,7 +1674,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
       }
     })
 
-    const switched = switching.api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
+    const switched = switching.api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).catch((e) => e.code)
     await vi.waitFor(() => expect(order).toEqual(['refresh']))
     // B's sign-in queues on the lock during the refresh.
     const login = signingIn.api.post('/auth/login', { email: 'b@example.com', password: 'x' })
@@ -2227,7 +2296,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     })
     const order: string[] = []
     const { api, whenLogoutSettled } = await loadTab(async (config) => {
-      if (config.url === '/auth/switch-org') {
+      if (config.url === '/auth/refresh/switch-org') {
         await gate
         order.push('switch-org answered')
         return ok(config, { data: { expires_in: 900, user: {} } })
@@ -2236,7 +2305,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     })
     recordPosts(order)
 
-    const switched = api.post('/auth/switch-org', { organization_id: 'org-2' }).then(
+    const switched = api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).then(
       () => 'applied',
       (error: AxiosError) => error.code,
     )
@@ -2330,7 +2399,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     expect(sentBeforeSessionChange(error)).toBe(true)
     // Refused before it was sent: nothing reached the server.
-    const switched = await api.post('/auth/switch-org', { organization_id: 'org-2' }).catch((e) => e)
+    const switched = await api.post('/auth/refresh/switch-org', { organization_id: 'org-2' }).catch((e) => e)
     expect(sentBeforeSessionChange(switched)).toBe(false)
     expect(sentBeforeSessionChange(new Error('other'))).toBe(false)
   })
@@ -2373,7 +2442,7 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     const order: string[] = []
     recordPosts(order)
 
-    for (const url of ['/auth/login', '/auth/register', '/auth/switch-org']) {
+    for (const url of ['/auth/login', '/auth/register', '/auth/refresh/switch-org']) {
       await expect(api.post(url, { email: 'b@example.com', password: 'x' })).rejects.toMatchObject({
         code: SESSION_UNSUPPORTED_CODE,
       })
@@ -3869,4 +3938,117 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     Reflect.deleteProperty(document, 'visibilityState')
   })
+  for (const outcome of ['switch_not_applied', 'switch_outcome_unknown'] as const) {
+    it(`a remounted attachment owner follows actual switch ${outcome} without replaying an accepted upload`, async () => {
+      localStorage.setItem('whm_session_id', 'session-a')
+      localStorage.setItem('user', JSON.stringify({ id: 'user-1', organization_id: 'org-1', email: 'a@example.com' }))
+      const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+        const error = httpError(503, config)
+        error.response!.data = { status: 'error', error_type: outcome }
+        throw error
+      })
+      const { api, whenLogoutSettled } = await loadTab(adapter)
+      // Import after loadTab resets modules: API and attachment identity helpers
+      // must share the same real current-tab session, not separate mocks.
+      const { mount } = await import('@vue/test-utils')
+      const { defineComponent, h, nextTick, ref } = await import('vue')
+      const { useChatAttachments, readWorkspaceIdentity, readLogicalSessionMarker, SESSION_ENDING_EVENT } = await import('../composables/useChatAttachments')
+      const order: string[] = []
+      recordPosts(order)
+      const OriginalURL = URL
+      vi.stubGlobal('URL', class extends OriginalURL {
+        static createObjectURL = vi.fn(() => 'blob:cross-slice-upload')
+        static revokeObjectURL = vi.fn()
+      })
+      let resolveUpload!: (value: unknown) => void
+      const upload = new Promise<unknown>(resolve => { resolveUpload = resolve })
+      let uploadSignal: AbortSignal | undefined
+      const send = vi.fn<import('../composables/useChatAttachments').SendChatMedia>((_request, options) => {
+        uploadSignal = options.signal
+        // Full upload is accepted for response handling. Ignore abort so the
+        // original promise, rather than a fabricated replacement, must settle.
+        options.onUploadProgress(5, 5)
+        return upload
+      })
+      const visible = ref(true)
+      const views: Array<{ attachments: ReturnType<typeof useChatAttachments>; sent: ReturnType<typeof vi.fn>; finished: ReturnType<typeof vi.fn> }> = []
+      const Child = defineComponent({
+        setup() {
+          const sent = vi.fn(), finished = vi.fn()
+          const attachments = useChatAttachments({
+            resolveTarget: () => ({ contactId: 'contact-a', label: 'Synthetic recipient', isActive: () => true }),
+            session: {
+              userId: () => 'user-1',
+              workspace: () => readWorkspaceIdentity('org-1', 'user-1'),
+              logicalSession: readLogicalSessionMarker,
+              isAuthenticated: () => localStorage.getItem('user') !== null,
+            },
+            send, onSent: sent, onBatchFinished: finished,
+          })
+          views.push({ attachments, sent, finished })
+          return () => h('span', String(attachments.isSending.value))
+        },
+      })
+      const wrapper = mount(defineComponent({ setup: () => () => visible.value ? h(Child) : h('aside') }))
+      let request: Promise<unknown> | undefined
+      try {
+        const original = views[0]!
+        expect(original.attachments.stage([
+          new File(['first'], 'accepted.png', { type: 'image/png' }),
+          new File(['next'], 'queued.png', { type: 'image/png' }),
+        ]).added).toBe(2)
+        request = original.attachments.sendAll()
+        expect(send).toHaveBeenCalledTimes(1)
+        visible.value = false
+        await nextTick()
+        visible.value = true
+        await nextTick()
+        await nextTick()
+        const remounted = views[1]!
+        expect(remounted.attachments.isSending.value).toBe(true)
+        expect(await remounted.attachments.sendAll()).toBeNull()
+
+        // Direct API issuance models a dispatched switch outside this view's
+        // workspace-switch UI hold; no hold or auth protocol is mocked away.
+        await expect(api.post('/auth/refresh/switch-org', { organization_id: 'org-2' })).rejects.toBeTruthy()
+        await whenLogoutSettled()
+        expect(adapter).toHaveBeenCalledTimes(1)
+        if (outcome === 'switch_not_applied') {
+          expect(order).toEqual([])
+          expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+          expect(uploadSignal?.aborted).toBe(false)
+          expect(remounted.attachments.items.value).toHaveLength(2)
+          remounted.attachments.stop()
+          expect(uploadSignal?.aborted).toBe(false)
+          resolveUpload({ id: 'accepted-message', status: 'sent' })
+          expect(await request).toMatchObject({ sent: 1, notSent: 1, stopped: true })
+          expect(remounted.sent).toHaveBeenCalledTimes(1)
+          expect(remounted.finished).toHaveBeenCalledTimes(1)
+          expect(remounted.attachments.items.value.map(item => item.status)).toEqual(['sent', 'ready'])
+        } else {
+          expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+          expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+          expect(uploadSignal?.aborted).toBe(true)
+          expect(remounted.attachments.items.value).toEqual([])
+          resolveUpload({ id: 'accepted-but-old-session', status: 'sent' })
+          expect(await request).toBeNull()
+          expect(remounted.sent).not.toHaveBeenCalled()
+          expect(remounted.finished).not.toHaveBeenCalled()
+          expect(await remounted.attachments.retryFailed()).toBeNull()
+        }
+        expect(send).toHaveBeenCalledTimes(1)
+        expect(original.sent).not.toHaveBeenCalled()
+        expect(original.finished).not.toHaveBeenCalled()
+      } finally {
+        // Keep a failed assertion from leaving an app-owned pending request in
+        // the suite; no synthetic success may start the queued second file.
+        window.dispatchEvent(new CustomEvent(SESSION_ENDING_EVENT))
+        resolveUpload({ id: 'cleanup', status: 'sent' })
+        await request
+        wrapper.unmount()
+      }
+    })
+  }
+
+
 })

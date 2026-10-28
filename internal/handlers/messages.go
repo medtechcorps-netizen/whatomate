@@ -248,6 +248,20 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	}
 
 	organizationID := req.Account.OrganizationID
+	var forwardLease *forwardWorkLease
+	forwardHandedOff := false
+	if req.forwardedFrom != nil && opts.Async {
+		var admissionErr error
+		forwardLease, admissionErr = a.reserveForward()
+		if admissionErr != nil {
+			return nil, admissionErr
+		}
+		defer func() {
+			if !forwardHandedOff {
+				forwardLease.release()
+			}
+		}()
+	}
 	requestedContactID := req.Contact.ID
 	preview := a.getMessagePreview(req)
 	var (
@@ -583,9 +597,22 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 	if opts.Async {
 		root := a.rootApp()
 		startAsyncDelivery = func() {
+			if forwardLease != nil && !forwardLease.start() {
+				if forwardLease.state.Load() != 3 {
+					// Duplicate callbacks cannot cancel an already running worker.
+					return
+				}
+				// An outer transaction outlived its reservation. No provider work
+				// has started; settle safely instead of starting an unbounded worker.
+				if err := root.settleOutgoingFailureBeforeProvider(msg, req, opts, forwardServerBusyError()); err != nil {
+					root.Log.Error("Failed to settle expired forward reservation", "error", err, "message_id", msg.ID)
+				}
+				return
+			}
 			root.wg.Add(1)
 			go func() {
 				defer root.wg.Done()
+				defer forwardLease.release()
 				// No transaction is open here: the request has committed and the
 				// provider transaction starts in deliverOutgoingMessage.
 				if req.forwardMedia != nil {
@@ -775,6 +802,7 @@ func (a *App) SendOutgoingMessage(ctx context.Context, req OutgoingMessageReques
 		a.UpdateContactChatbotMessage(req.Contact.ID)
 	}
 	if startAsyncDelivery != nil {
+		forwardHandedOff = true
 		a.afterTenantCommit(startAsyncDelivery)
 	}
 
@@ -2035,6 +2063,7 @@ func (a *App) broadcastNewMessageInCurrentScope(orgID uuid.UUID, msg *models.Mes
 		"created_at":       msg.CreatedAt,
 		"updated_at":       msg.UpdatedAt,
 		"is_reply":         msg.IsReply,
+		"is_forwarded":     messageIsForwarded(msg.Metadata),
 	}
 
 	// Add interactive data
@@ -2088,8 +2117,160 @@ func (a *App) broadcastReactionUpdate(orgID uuid.UUID, messageID, contactID uuid
 	})
 }
 
+const assignmentAudienceTimeout = 5 * time.Second
+const assignmentAudienceLimit = 1024
+
+func contactRoleCanRead(role *models.CustomRole) bool {
+	if role == nil {
+		return false
+	}
+	for _, permission := range role.Permissions {
+		if permission.Resource == models.ResourceContacts && permission.Action == models.ActionRead {
+			return true
+		}
+	}
+	return false
+}
+
+// contactReaderAuthority keeps a failed membership/role read distinct from a
+// confirmed denial. It uses the caller's connection and deadline, never cached
+// permission grants or an independent pooled checkout.
+func (a *App) contactReaderAuthority(userID, orgID uuid.UUID) (bool, error) {
+	var user models.User
+	if err := a.DB.Where("id = ? AND is_active = ?", userID, true).First(&user).Error; err != nil {
+		return false, err
+	}
+	if err := a.applyOrganizationMembershipDB(a.DB, &user, orgID, false); err != nil {
+		return false, err
+	}
+	if user.IsSuperAdmin {
+		return true, nil
+	}
+	if user.Role == nil {
+		return false, nil
+	}
+	if err := a.loadRolePermissions(user.Role); err != nil {
+		return false, err
+	}
+	return contactRoleCanRead(user.Role), nil
+}
+
+// assignmentHintAudience uses fresh authority on the caller's bounded tenant
+// connection. The former assignee receives only an invalidation, never a read
+// grant. The HTTP refetch remains authoritative after this observation.
+func (a *App) assignmentHintAudience(orgID, contactID, previousAssigneeID uuid.UUID, connected []uuid.UUID) ([]uuid.UUID, error) {
+	if len(connected) > assignmentAudienceLimit {
+		return nil, fmt.Errorf("assignment audience exceeds connected-user bound")
+	}
+	if len(connected) == 0 {
+		return nil, nil
+	}
+	var contact models.Contact
+	if err := a.DB.Where("id = ? AND organization_id = ? AND merged_into_id IS NULL", contactID, orgID).First(&contact).Error; err != nil {
+		return nil, err
+	}
+	var users []models.User
+	if err := a.DB.Where("id IN ? AND is_active = ?", connected, true).Find(&users).Error; err != nil {
+		return nil, err
+	}
+	var transferAgents []uuid.UUID
+	if err := a.DB.Model(&models.AgentTransfer{}).Distinct("agent_id").
+		Where("organization_id = ? AND contact_id = ? AND status = ? AND agent_id IN ?", orgID, contactID, models.TransferStatusActive, connected).
+		Pluck("agent_id", &transferAgents).Error; err != nil {
+		return nil, err
+	}
+	assigned := make(map[uuid.UUID]bool, len(transferAgents)+1)
+	for _, id := range transferAgents {
+		assigned[id] = true
+	}
+	if contact.AssignedUserID != nil {
+		assigned[*contact.AssignedUserID] = true
+	}
+	roles := make(map[uuid.UUID]*models.CustomRole)
+	valid := make([]models.User, 0, len(users))
+	for i := range users {
+		if err := a.DB.Statement.Context.Err(); err != nil {
+			return nil, err
+		}
+		user := users[i]
+		if err := a.applyOrganizationMembershipDB(a.DB, &user, orgID, false); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, database.ErrPlatformComplianceTenant) {
+				continue
+			}
+			return nil, err
+		}
+		valid = append(valid, user)
+		if user.Role != nil {
+			roles[user.Role.ID] = user.Role
+		}
+	}
+	roleList := make([]*models.CustomRole, 0, len(roles))
+	for _, role := range roles {
+		roleList = append(roleList, role)
+	}
+	if err := a.loadRolePermissions(roleList...); err != nil {
+		return nil, err
+	}
+	readRoles := make(map[uuid.UUID]bool, len(roles))
+	for id, role := range roles {
+		readRoles[id] = contactRoleCanRead(role)
+	}
+	var recipients []uuid.UUID
+	for _, user := range valid {
+		canRead := user.IsSuperAdmin || assigned[user.ID] || (user.RoleID != nil && readRoles[*user.RoleID])
+		if canRead || user.ID == previousAssigneeID {
+			recipients = append(recipients, user.ID)
+		}
+	}
+	return recipients, nil
+}
+
+// broadcastAssignmentUpdate resolves the local audience only after commit.
+// A failed/oversized audience drops this optional hint completely; the already
+// committed mutation must not become a retryable write failure. Replica fanout
+// and other contact-update kinds retain their separate existing contracts.
+func (a *App) broadcastAssignmentUpdate(orgID, contactID, previousAssigneeID uuid.UUID) {
+	if a == nil || orgID == uuid.Nil || contactID == uuid.Nil {
+		return
+	}
+	a.afterTenantCommit(func() {
+		root := a.rootApp()
+		if root == nil || root.WSHub == nil || root.DB == nil {
+			return
+		}
+		connected, complete := root.WSHub.OnlineUserIDsWithinLimit(orgID, assignmentAudienceLimit)
+		if !complete {
+			root.Log.Warn("Assignment hint omitted: connected-user audience exceeds bound", "organization_id", orgID)
+			return
+		}
+		if len(connected) == 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), assignmentAudienceTimeout)
+		defer cancel()
+		var recipients []uuid.UUID
+		err := database.WithTenantReadCommitted(root.DB.WithContext(ctx), orgID, func(tx *gorm.DB) error {
+			if err := requireOrdinaryTenantOrganization(tx, orgID); err != nil {
+				return err
+			}
+			scoped := root.scopedApp(tx, orgID)
+			var err error
+			recipients, err = scoped.assignmentHintAudience(orgID, contactID, previousAssigneeID, connected)
+			return err
+		})
+		if err != nil || ctx.Err() != nil {
+			root.Log.Warn("Assignment hint omitted: audience unavailable", "error", err, "organization_id", orgID)
+			return
+		}
+		root.WSHub.BroadcastToUsers(orgID, recipients, websocket.WSMessage{
+			Type:    websocket.TypeContactUpdate,
+			Payload: map[string]any{"contact_id": contactID.String(), "kind": "assignment"},
+		})
+	})
+}
+
 // broadcastContactUpdate tells connected clients that a contact's inbox state
-// (assignment, transfer agent or manual read state) changed. It reaches every
+// (transfer agent or manual read state) changed. It reaches every
 // socket of the organization, including agents limited to their own chats, so
 // the payload is only the contact ID and the kind of change; clients refetch
 // the canonical row through their own scoped API. It is queued until the
@@ -2937,71 +3118,6 @@ func forwardMediaExtension(name string) string {
 	return strings.ToLower(name[dot:])
 }
 
-// prepareForwardedMedia runs in the delivery goroutine with no transaction or
-// pooled connection held: it copies the attachment in tenant storage and
-// uploads it to Meta, leaving only the send for the provider transaction.
-func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
-	plan := req.forwardMedia
-	if plan == nil || req.Account == nil {
-		a.Log.Error("Forwarded attachment plan is incomplete")
-		return forwardAttachmentCopyError()
-	}
-	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
-	defer cancelStorage()
-	limit := forwardMediaSizeLimit(req.Type)
-	if size, known := a.forwardSourceSize(storageCtx, plan); known && size > limit {
-		return forwardTooLargeError(limit)
-	}
-	data, _, err := a.loadTenantMedia(storageCtx, plan.OrganizationID, plan.SourceKey)
-	if err != nil || len(data) == 0 {
-		a.Log.Error("Failed to read media to forward",
-			"error", err, "organization_id", plan.OrganizationID)
-		return errors.New("the forwarded attachment is no longer available")
-	}
-	if int64(len(data)) > limit {
-		return forwardTooLargeError(limit)
-	}
-	key, err := a.saveTenantMedia(
-		storageCtx,
-		plan.OrganizationID,
-		plan.ObjectSubdir,
-		plan.LocalSubdir,
-		plan.ObjectName,
-		data,
-		plan.MimeType,
-	)
-	if err != nil || key != plan.DestinationKey {
-		a.Log.Error("Failed to store forwarded attachment",
-			"error", err, "organization_id", plan.OrganizationID, "key_matches_plan", key == plan.DestinationKey)
-		return forwardAttachmentCopyError()
-	}
-
-	if err := a.requireForwardAccountActive(plan.OrganizationID, req.Account.ID); err != nil {
-		return err
-	}
-	// Patient photos, videos and voice notes carry no file name; Graph needs
-	// one. The document name shown to the customer stays MediaFilename.
-	uploadName := strings.TrimSpace(req.MediaFilename)
-	if uploadName == "" {
-		uploadName = plan.ObjectName
-	}
-	// Graph matches bare media types: "audio/ogg; codecs=opus" (a stored
-	// voice note) is uploaded as "audio/ogg". The stored type is unchanged.
-	uploadType := mediaTypeEssence(plan.MimeType)
-	if uploadType == "" {
-		uploadType = plan.MimeType
-	}
-	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), forwardMediaUploadTimeout)
-	defer cancelUpload()
-	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, uploadType, uploadName)
-	if err != nil {
-		return fmt.Errorf("failed to upload media: %w", err)
-	}
-	req.MediaID = mediaID
-	req.MediaData = nil
-	return nil
-}
-
 // outgoingSessionContext is the context of a request session, so a derived deadline
 // keeps the tenant and realtime values bound to it.
 func outgoingSessionContext(db *gorm.DB) context.Context {
@@ -3130,6 +3246,9 @@ func (a *App) forwardMessage(
 
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
 	if err != nil {
+		if errors.Is(err, errForwardCapacity) {
+			return forwardNotAcceptedRefusal().send(r)
+		}
 		var refused *forwardTargetRefusedError
 		if errors.As(err, &refused) {
 			return refused.refusal.send(r)
@@ -3330,25 +3449,6 @@ func forwardMediaSizeLimit(messageType models.MessageType) int64 {
 
 func forwardTooLargeError(limit int64) error {
 	return fmt.Errorf("this attachment is larger than WhatsApp allows (%d MB) and cannot be forwarded", limit>>20)
-}
-
-// forwardSourceSize reads an object-store attachment's size from a listing,
-// without downloading it. Local development storage reports unknown; its
-// bytes are size-checked right after the read instead.
-func (a *App) forwardSourceSize(ctx context.Context, plan *forwardMediaCopy) (int64, bool) {
-	if a.ObjectStore == nil || !isTenantObjectKey(plan.OrganizationID, plan.SourceKey) {
-		return 0, false
-	}
-	objects, err := a.ObjectStore.ListPrefix(ctx, plan.SourceKey)
-	if err != nil {
-		return 0, false
-	}
-	for _, object := range objects {
-		if object.Key == plan.SourceKey {
-			return object.Size, true
-		}
-	}
-	return 0, false
 }
 
 // ---- Forward capacity contract and dispatch phases -------------------------

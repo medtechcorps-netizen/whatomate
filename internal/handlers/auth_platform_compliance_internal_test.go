@@ -91,16 +91,21 @@ func signAuthFenceTokenWithOptions(
 }
 
 func TestSwitchOrgRejectsSuperAdminPlatformComplianceOrganization(t *testing.T) {
-	app := authFenceTestApp(t)
+	app := authFenceRefreshTestApp(t)
 	home := testutil.CreateTestOrganization(t, app.DB)
 	_, target := createMetaInstagramPlatformComplianceOrganization(t, app.DB)
 	superAdmin := testutil.CreateTestUser(t, app.DB, home.ID, testutil.WithSuperAdmin())
 
 	request := testutil.NewJSONRequest(t, map[string]any{"organization_id": target.ID.String()})
 	request.RequestCtx.SetUserValue(middleware.ContextKeyUserID, superAdmin.ID)
+	request.RequestCtx.Request.Header.SetCookie(cookieAccessName, signAuthFenceToken(t, superAdmin.ID, home.ID, middleware.JWTSubjectAccess, "", jwt.SigningMethodHS256))
+	request.RequestCtx.Request.Header.SetCookie(cookieRefreshName, signAuthFenceToken(t, superAdmin.ID, home.ID, middleware.JWTSubjectRefresh, uuid.NewString(), jwt.SigningMethodHS256))
+	request.RequestCtx.Request.Header.SetCookie(cookieCSRFName, "switch-csrf")
+	request.RequestCtx.Request.Header.Set("X-CSRF-Token", "switch-csrf")
 
 	require.NoError(t, app.SwitchOrg(request))
 	assert.Equal(t, fasthttp.StatusForbidden, testutil.GetResponseStatusCode(request))
+	assert.Contains(t, string(testutil.GetResponseBody(request)), "switch_not_applied")
 	assert.Empty(t, testutil.GetResponseCookie(request, cookieAccessName))
 	assert.Empty(t, testutil.GetResponseCookie(request, cookieRefreshName))
 }

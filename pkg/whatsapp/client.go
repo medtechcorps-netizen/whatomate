@@ -456,7 +456,8 @@ type UploadMediaResponse struct {
 func (c *Client) UploadMedia(ctx context.Context, account *Account, data []byte, mimeType, filename string) (string, error) {
 	url := fmt.Sprintf("%s/%s/%s/media", c.getBaseURL(), account.APIVersion, account.PhoneID)
 
-	// Create multipart form body
+	// Only the small multipart header is buffered. The attachment remains in
+	// its existing byte slice, avoiding a second full-size media allocation.
 	body := &bytes.Buffer{}
 	boundary := "----WebKitFormBoundary7MA4YWxkTrZu0gW"
 
@@ -475,15 +476,17 @@ func (c *Client) UploadMedia(ctx context.Context, account *Account, data []byte,
 	fmt.Fprintf(body, "--%s\r\n", boundary)
 	fmt.Fprintf(body, "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", safeName)
 	fmt.Fprintf(body, "Content-Type: %s\r\n\r\n", headerValue.Replace(mimeType))
-	body.Write(data)
-	body.WriteString("\r\n")
-
-	fmt.Fprintf(body, "--%s--\r\n", boundary)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	header := body.String()
+	footer := fmt.Sprintf("\r\n--%s--\r\n", boundary)
+	newBody := func() io.ReadCloser {
+		return io.NopCloser(io.MultiReader(strings.NewReader(header), bytes.NewReader(data), strings.NewReader(footer)))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, newBody())
 	if err != nil {
 		return "", fmt.Errorf("failed to create upload request: %w", err)
 	}
+	req.ContentLength = int64(len(header)) + int64(len(data)) + int64(len(footer))
+	req.GetBody = func() (io.ReadCloser, error) { return newBody(), nil }
 
 	req.Header.Set("Authorization", "Bearer "+account.AccessToken)
 	req.Header.Set("Content-Type", fmt.Sprintf("multipart/form-data; boundary=%s", boundary))

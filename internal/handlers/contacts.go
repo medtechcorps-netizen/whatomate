@@ -650,10 +650,19 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 	query = query.Order("last_message_at DESC NULLS LAST, created_at DESC")
 
 	var total int64
-	query.Model(&models.Contact{}).Count(&total)
+	if err := query.Model(&models.Contact{}).Count(&total).Error; err != nil {
+		a.Log.Error("Failed to count contacts", "error", err)
+		if contactListContextFailure(listDB, err) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contacts are temporarily unavailable. Please retry.", nil, "contact_list_unavailable")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list contacts", nil, "")
+	}
 
 	if err := query.Offset(pg.Offset).Limit(pg.Limit).Find(&contacts).Error; err != nil {
 		a.Log.Error("Failed to list contacts", "error", err)
+		if contactListContextFailure(listDB, err) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contacts are temporarily unavailable. Please retry.", nil, "contact_list_unavailable")
+		}
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list contacts", nil, "")
 	}
 
@@ -676,7 +685,12 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 			}
 		}
 	}
-	listState := a.loadContactListState(orgID, contacts)
+	listState, stateErr := a.loadContactListStateWithError(orgID, contacts)
+	if contactListContextFailure(a.DB, stateErr) {
+		// Tenant sees the error response and rolls the request back instead of
+		// attempting a commit on a connection cancelled by the state deadline.
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contacts are temporarily unavailable. Please retry.", nil, "contact_list_unavailable")
+	}
 	response := make([]ContactResponse, len(contacts))
 	for i, c := range contacts {
 		tags := []string{}
@@ -737,8 +751,8 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 // which stores the exchange as read, does not.
 const contactManualUnreadKey = "manual_unread"
 
-// contactStateQueryTimeout bounds each supplementary contact-state statement
-// so a slow query cannot pin a pooled connection indefinitely.
+// contactStateQueryTimeout bounds the supplementary contact-state batch so a
+// slow query cannot pin a pooled connection indefinitely.
 const contactStateQueryTimeout = 5 * time.Second
 
 // contactMetadataForResponse returns the metadata to expose for a contact and
@@ -931,6 +945,17 @@ func contactStateDB(db *gorm.DB) (*gorm.DB, context.CancelFunc) {
 	return db.WithContext(ctx), cancel
 }
 
+// Only context cancellation/deadlines are retryable here. Recoverable SQL
+// errors in optional state queries retain their savepoint degradation; this
+// does not reclassify arbitrary database/connection errors or write outcomes.
+func contactListContextFailure(db *gorm.DB, err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		(db != nil && db.Statement != nil && db.Statement.Context != nil && db.Statement.Context.Err() != nil)
+}
+
 // contactListQueryTimeout bounds a filtered contact list's Count and page
 // query together.
 const contactListQueryTimeout = 10 * time.Second
@@ -1026,20 +1051,28 @@ func (s contactListState) applyAssignee(response *ContactResponse, assignedUserI
 	}
 }
 
-// loadContactListState batch-loads contactListState for one page of contacts
+// loadContactListState preserves best-effort enrichment for response builders,
+// including ones called after a write. It must not turn an already performed
+// write into a retryable response. ListContacts uses the error-returning reader.
+func (a *App) loadContactListState(orgID uuid.UUID, contacts []models.Contact) contactListState {
+	state, _ := a.loadContactListStateWithError(orgID, contacts)
+	return state
+}
+
+// loadContactListStateWithError batch-loads contactListState for one page of contacts
 // with three bounded queries instead of one query per row. They run inside one
 // savepoint on the request's own connection: an SQL error rolls back only the
 // savepoint, is logged, and leaves the rest of the state empty while the
-// request continues. A deadline or connection failure still fails the
-// request, because it breaks the connection itself.
-func (a *App) loadContactListState(orgID uuid.UUID, contacts []models.Contact) contactListState {
+// request continues. Driver cancellation is returned to the list reader so
+// it can send a retryable error before Tenant attempts to commit.
+func (a *App) loadContactListStateWithError(orgID uuid.UUID, contacts []models.Contact) (contactListState, error) {
 	state := contactListState{
 		unread:    make(map[uuid.UUID]int, len(contacts)),
 		transfers: make(map[uuid.UUID]uuid.UUID),
 		names:     make(map[uuid.UUID]string),
 	}
 	if a == nil || a.DB == nil || orgID == uuid.Nil || len(contacts) == 0 {
-		return state
+		return state, nil
 	}
 	contactIDs := make([]uuid.UUID, 0, len(contacts))
 	userIDs := make([]uuid.UUID, 0, len(contacts))
@@ -1121,8 +1154,13 @@ func (a *App) loadContactListState(orgID uuid.UUID, contacts []models.Contact) c
 	})
 	if err != nil {
 		a.Log.Error("Failed to load contact list state", "error", err, "organization_id", orgID)
+		// Drivers can wrap cancellation as a network error. Preserve the actual
+		// bounded context outcome before deferred cancel changes a healthy one.
+		if contextErr := db.Statement.Context.Err(); contextErr != nil {
+			return state, contextErr
+		}
 	}
-	return state
+	return state, err
 }
 
 // scopeAssignedContact narrows a contact query for users who lack the
@@ -1146,20 +1184,48 @@ func (a *App) GetContact(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	// A fallback to the token's default org is not proof that this contact is
+	// absent from the explicitly selected workspace. Never let that ambiguity
+	// become an authoritative cache invalidation in the caller.
+	if raw := strings.TrimSpace(string(r.RequestCtx.Request.Header.Peek("X-Organization-ID"))); raw != "" {
+		explicitOrg, parseErr := uuid.Parse(raw)
+		if parseErr != nil || explicitOrg == uuid.Nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid organization selection", nil, "")
+		}
+		if explicitOrg != orgID {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact access is temporarily unavailable", nil, "")
+		}
+	}
+	if a.hasTenantScope() && a.tenantOrgID != orgID {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact access is temporarily unavailable", nil, "")
+	}
 	contactID, err := parsePathUUID(r, "id", "contact")
 	if err != nil {
 		return nil
 	}
 
+	readDB, cancel := contactStateDB(a.DB)
+	defer cancel()
+	reader := a.scopedApp(readDB, orgID)
+	canReadAll, err := reader.contactReaderAuthority(userID, orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
+		a.Log.Error("Contact authority unavailable", "error", err, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact access is temporarily unavailable", nil, "")
+	}
 	var contact models.Contact
-	query := a.DB.Where("id = ? AND organization_id = ?", contactID, orgID)
-
-	// Users without contacts:read permission can only access their assigned contacts
-	// or contacts with an active chat transfer to them
-	query = a.scopeAssignedContact(query, userID, orgID)
-
+	query := readDB.Where("id = ? AND organization_id = ?", contactID, orgID)
+	if !canReadAll {
+		query = reader.whereContactAssignedTo(query, userID, orgID)
+	}
 	if err := query.First(&contact).Error; err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
+		}
+		a.Log.Error("Contact read unavailable", "error", err, "organization_id", orgID)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contact is temporarily unavailable", nil, "")
 	}
 
 	response := a.buildContactResponse(&contact, orgID)
@@ -2825,11 +2891,15 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 	}
 
 	var updatedContact models.Contact
+	var previousAssigneeID uuid.UUID
 	activityNonce := uuid.NewString()
 	err = canonicalContactWriteTransaction(a.DB, func(tx *gorm.DB) error {
 		contact, resolveErr := contactutil.ResolveCanonicalContactForUpdate(tx, orgID, contactID)
 		if resolveErr != nil {
 			return resolveErr
+		}
+		if contact.AssignedUserID != nil {
+			previousAssigneeID = *contact.AssignedUserID
 		}
 
 		// Validate the assignee in the same transaction as the update. This
@@ -2894,7 +2964,7 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 		a.Log.Error("Failed to assign contact", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to assign contact", nil, "")
 	}
-	a.broadcastContactUpdate(orgID, updatedContact.ID, "assignment")
+	a.broadcastAssignmentUpdate(orgID, updatedContact.ID, previousAssigneeID)
 
 	return r.SendEnvelope(map[string]any{
 		"message":          "Contact assigned successfully",
@@ -3439,7 +3509,11 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 	a.logAudit(orgID, userID,
 		"contact", updatedContact.ID, models.AuditActionUpdated, &oldContact, &updatedContact)
 	if _, assignmentChanged := updates["assigned_user_id"]; assignmentChanged {
-		a.broadcastContactUpdate(orgID, updatedContact.ID, "assignment")
+		var previousAssigneeID uuid.UUID
+		if oldContact.AssignedUserID != nil {
+			previousAssigneeID = *oldContact.AssignedUserID
+		}
+		a.broadcastAssignmentUpdate(orgID, updatedContact.ID, previousAssigneeID)
 	}
 
 	return r.SendEnvelope(a.buildContactResponse(&updatedContact, orgID))

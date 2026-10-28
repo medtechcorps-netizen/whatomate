@@ -170,6 +170,9 @@ type AuthAwareRequestConfig = InternalAxiosRequestConfig & {
   // the lock held.
   _issueMarker?: string | null;
   _issueCsrf?: string | null;
+  _switchIdentity?: string;
+  _switchDispatched?: boolean;
+  _switchAdapter?: ReturnType<typeof axios.getAdapter>;
   // An SSO callback page's code exchange (POST /auth/refresh): issues a
   // session like a sign-in.
   _ssoExchange?: boolean;
@@ -180,7 +183,12 @@ type AuthAwareRequestConfig = InternalAxiosRequestConfig & {
 };
 
 // Login/refresh responses whose Set-Cookie starts a new auth epoch.
-const SESSION_ISSUING_PATHS = ["/auth/login", "/auth/register", "/auth/switch-org"];
+const SWITCH_ORGANIZATION_PATH = "/auth/refresh/switch-org";
+const SESSION_ISSUING_PATHS = ["/auth/login", "/auth/register", SWITCH_ORGANIZATION_PATH];
+
+function isOrganizationSwitch(path: string): boolean {
+  return path === SWITCH_ORGANIZATION_PATH;
+}
 
 function isSessionIssuing(config: AuthAwareRequestConfig | undefined, path: string): boolean {
   return SESSION_ISSUING_PATHS.includes(path) || config?._ssoExchange === true;
@@ -1092,6 +1100,41 @@ function leftCookiesWithoutAnswer(config: AuthAwareRequestConfig): boolean {
   return csrf !== config._issueCsrf;
 }
 
+function switchNeedsSessionRecovery(error: AxiosError, config?: AuthAwareRequestConfig): boolean {
+  if (!config?._releaseSessionLock || !config._switchDispatched ||
+      !isOrganizationSwitch(requestPath(config.url))) return false;
+  if (!error.response) return true;
+  const body = error.response.data as { status?: unknown; error_type?: unknown } | null;
+  if (body?.status === "error") {
+    if (body.error_type === "switch_not_applied") return false;
+    if (body.error_type === "switch_outcome_unknown" ||
+        body.error_type === "switch_session_recovery_required") return true;
+  }
+  // A proxy/server failure after dispatch cannot prove that Redis did not
+  // commit. Only the explicit application not-applied result preserves it.
+  return error.response.status >= 500;
+}
+
+function endUncertainSwitchSession(config: AuthAwareRequestConfig) {
+  const marker = config._issueMarker;
+  if (marker === undefined || readSessionMarker() !== marker || isEndedMarker(marker) ||
+      storedIdentity() !== config._switchIdentity) {
+    onSessionChanged();
+    return;
+  }
+  const showed = tabSession;
+  markSessionEnding();
+  // Record the existing scoped pending logout while still holding the issuing
+  // lock, but never await its second lock acquisition here. A following login
+  // must finish this cleanup before issuing a new logical session.
+  if (!startServerLogout(config._switchIdentity ?? "", sessionIdOf(marker))) return;
+  clearLastActivity();
+  showReconnectToast("dismiss");
+  emitAuthSessionState("expired");
+  clearStoredIdentity();
+  leaveForLogin(showed);
+}
+
 /**
  * Called before the browser leaves for the identity provider. The SSO
  * callback sets no cookie: the callback page exchanges a one-time code for
@@ -1789,6 +1832,7 @@ api.interceptors.request.use(
       // A retried request (401, refresh, replay) starts afresh.
       held._issueMarker = undefined;
       held._issueCsrf = undefined;
+      held._switchDispatched = false;
       // Without Web Locks nothing keeps this tab's new session apart from
       // another tab's refresh or logout: refuse (outdated browser, or plain
       // HTTP off localhost).
@@ -1815,7 +1859,7 @@ api.interceptors.request.use(
           clearTimeout(backstop);
           release();
         };
-        if (path === "/auth/switch-org") {
+        if (isOrganizationSwitch(path)) {
           // An org switch belongs to the session it was asked in: never after
           // that session ended or another began.
           const marker = readSessionMarker();
@@ -1835,6 +1879,19 @@ api.interceptors.request.use(
         }
         held._issueMarker = readSessionMarker();
         held._issueCsrf = getCookie("whm_csrf");
+        if (isOrganizationSwitch(path)) {
+          held._switchIdentity = storedIdentity();
+          // Mark only entry into the real adapter, not cancellation while
+          // waiting for the lock. Preserve the original adapter on a 401 retry.
+          held._switchAdapter ??= axios.getAdapter(config.adapter ?? api.defaults.adapter);
+          config.adapter = async (requestConfig) => {
+            if (requestConfig.signal?.aborted) {
+              throw new AxiosError("canceled", AxiosError.ERR_CANCELED, requestConfig);
+            }
+            (requestConfig as AuthAwareRequestConfig)._switchDispatched = true;
+            return held._switchAdapter!(requestConfig);
+          };
+        }
         if (!config.timeout || config.timeout > SESSION_ISSUING_TIMEOUT_MS) {
           config.timeout = SESSION_ISSUING_TIMEOUT_MS;
         }
@@ -1879,7 +1936,7 @@ api.interceptors.response.use(
           await endIssuedSession();
           throw sessionChangedError(config);
         }
-        if (path === "/auth/switch-org") {
+        if (isOrganizationSwitch(path)) {
           // Same session, new cookies: keep its begun record current.
           noteBegunCsrf(readSessionMarker());
         } else {
@@ -1915,7 +1972,7 @@ api.interceptors.response.use(
     }
     // A sign-in (password, registration, or an SSO code exchange) starts the
     // inactivity clock and retires the "why you were signed out" banner.
-    if (issued && path !== "/auth/switch-org") {
+    if (issued && !isOrganizationSwitch(path)) {
       clearSignOutReason();
       recordActivity();
     }
@@ -1940,7 +1997,13 @@ api.interceptors.response.use(
     } finally {
       // First, so a 401 on an org switch can refresh without waiting on
       // itself; and even if the undo threw.
-      releaseSessionLock(error.config);
+      try {
+        if (switchNeedsSessionRecovery(error, issuing)) {
+          endUncertainSwitchSession(issuing!);
+        }
+      } finally {
+        releaseSessionLock(error.config);
+      }
     }
     const originalRequest = error.config as AuthAwareRequestConfig | undefined;
 
@@ -1999,7 +2062,11 @@ export const usersService = {
     limit?: number;
     role_id?: string;
     online_only?: boolean;
-  }, signal?: AbortSignal) => api.get("/users", { params, signal }),
+  }, signal?: AbortSignal, organizationId?: string) => api.get("/users", {
+    params,
+    signal,
+    ...(organizationId ? { headers: { "X-Organization-ID": organizationId } } : {}),
+  }),
   get: (id: string) => api.get(`/users/${id}`),
   create: (data: {
     email: string;
@@ -2150,7 +2217,9 @@ export const contactsService = {
     unread?: "true";
     assigned?: "me" | "unassigned";
   }, signal?: AbortSignal) => api.get("/contacts", { params, signal }),
-  get: (id: string) => api.get(`/contacts/${id}`),
+  get: (id: string, organizationId?: string) => api.get(`/contacts/${id}`, organizationId === undefined
+    ? undefined
+    : { headers: { "X-Organization-ID": organizationId } }),
   create: (data: any) => api.post("/contacts", data),
   update: (id: string, data: any) => api.put(`/contacts/${id}`, data),
   delete: (id: string) => api.delete(`/contacts/${id}`),
@@ -2221,7 +2290,7 @@ export const contactsService = {
   // People a contact can be assigned to, for callers without users:read:
   // the organization's members (organizations:read), membership-aware like
   // the server's assignee check.
-  assignableMembers: (signal?: AbortSignal) =>
+  assignableMembers: (params: { page: number; limit: number; search?: string }, signal: AbortSignal, organizationId: string) =>
     api.get<{
       members: Array<{
         user_id: string;
@@ -2231,7 +2300,9 @@ export const contactsService = {
         role_name?: string | null;
       }>;
       total: number;
-    }>("/organizations/members", { params: { page: 1, limit: 100 }, signal }),
+      page: number;
+      limit: number;
+    }>("/organizations/members", { params, signal, headers: { "X-Organization-ID": organizationId } }),
   markManualReadState: (id: string, mark: "read" | "unread") =>
     api.post<{ status: string; cursor_synced: boolean; manual_unread: boolean }>(
       `/contacts/${encodeURIComponent(id)}/mark-read`,

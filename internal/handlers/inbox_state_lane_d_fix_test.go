@@ -168,7 +168,7 @@ func TestLaneDContactEditKeepsTheStoredManualMark(t *testing.T) {
 	adminRole := testutil.CreateAdminRole(t, db, organization.ID)
 	admin := testutil.CreateTestUser(t, db, organization.ID, testutil.WithRoleID(&adminRole.ID))
 	contact := testutil.CreateTestContact(t, db, organization.ID)
-	hub, client := laneDHub(t, organization.ID)
+	hub, client := laneDHub(t, organization.ID, admin.ID)
 	app := &App{DB: db, Log: testutil.NopLogger(), WSHub: hub}
 
 	update := func(body map[string]any) (ContactResponse, int) {

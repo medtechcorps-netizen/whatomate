@@ -107,7 +107,8 @@ func (w *Worker) ProcessChannelAIReplyBatch(
 	}
 
 	now := time.Now().UTC()
-	organizationIDs, err := w.listReadyChannelAIReplyOrganizations(
+	intake := w.intakeContext(ctx)
+	organizationIDs, err := intake.listReadyChannelAIReplyOrganizations(
 		limit,
 		now,
 		now.Add(-defaultChannelAIReplyLease),
@@ -122,7 +123,7 @@ func (w *Worker) ProcessChannelAIReplyBatch(
 		if processed >= limit || ctx.Err() != nil {
 			break
 		}
-		jobID, claimed, claimErr := w.claimChannelAIReplyJob(organizationID, workerID)
+		jobID, claimed, claimErr := intake.claimChannelAIReplyJob(organizationID, workerID)
 		if claimErr != nil {
 			batchErrors = append(
 				batchErrors,

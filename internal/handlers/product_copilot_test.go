@@ -66,6 +66,7 @@ func TestBuildCopilotContextIsGroundedAndDoesNotIncludePhone(t *testing.T) {
 			Direction:   models.DirectionOutgoing,
 			MessageType: models.MessageTypeText,
 			Content:     "Let me check the schedule.",
+			Status:      models.MessageStatusSent,
 		},
 	}
 	contexts := []models.AIContext{{
@@ -79,7 +80,7 @@ func TestBuildCopilotContextIsGroundedAndDoesNotIncludePhone(t *testing.T) {
 
 	assert.Contains(t, got, "Alya")
 	assert.Contains(t, got, "Customer: Do you have")
-	assert.Contains(t, got, "Business: Let me check")
+	assert.Contains(t, got, "Business [sent; delivery not confirmed]: Let me check")
 	assert.Contains(t, got, "Studio schedule policy")
 	assert.Contains(t, got, "human agent")
 	assert.NotContains(t, got, contact.PhoneNumber)

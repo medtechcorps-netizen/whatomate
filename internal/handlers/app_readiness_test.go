@@ -17,6 +17,7 @@ func TestReadyCheckRequiresFreshWorkerHeartbeat(t *testing.T) {
 	rdb := testutil.SetupTestRedis(t)
 	if rdb == nil {
 		t.Skip("TEST_REDIS_URL not set")
+		return
 	}
 	ctx := context.Background()
 	require.NoError(t, rdb.Del(ctx, queue.WorkerHeartbeatKey).Err())

@@ -85,7 +85,7 @@ func TestLaneEMediaMessagesCarryOptionalReplyContext(t *testing.T) {
 // header early, and Graph always gets a file name.
 func TestLaneEUploadMediaSanitizesPartHeaders(t *testing.T) {
 	t.Parallel()
-	type seen struct{ name, contentType, injected string }
+	type seen struct{ name, contentType, injected, body string }
 	var mu sync.Mutex
 	var parts []seen
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -104,8 +104,10 @@ func TestLaneEUploadMediaSanitizesPartHeaders(t *testing.T) {
 				return
 			}
 			if part.FormName() == "file" {
+				data, readErr := io.ReadAll(part)
+				assert.NoError(t, readErr)
 				mu.Lock()
-				parts = append(parts, seen{part.FileName(), part.Header.Get("Content-Type"), part.Header.Get("X-Injected")})
+				parts = append(parts, seen{part.FileName(), part.Header.Get("Content-Type"), part.Header.Get("X-Injected"), string(data)})
 				mu.Unlock()
 			}
 		}
@@ -128,4 +130,6 @@ func TestLaneEUploadMediaSanitizesPartHeaders(t *testing.T) {
 	assert.Empty(t, parts[0].injected)
 	assert.Equal(t, "image/pngX-Injected: 1", parts[0].contentType)
 	assert.Equal(t, "upload", parts[1].name)
+	assert.Equal(t, "x", parts[0].body)
+	assert.Equal(t, "x", parts[1].body)
 }

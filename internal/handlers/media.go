@@ -91,6 +91,10 @@ func (a *App) saveTenantMedia(
 // path. This dual-read behavior keeps existing disk media available while new
 // uploads move to object storage.
 func (a *App) loadTenantMedia(ctx context.Context, orgID uuid.UUID, key string) ([]byte, string, error) {
+	return a.loadTenantMediaWithLimit(ctx, orgID, key, 0)
+}
+
+func (a *App) loadTenantMediaWithLimit(ctx context.Context, orgID uuid.UUID, key string, maxBytes int64) ([]byte, string, error) {
 	normalized := path.Clean(strings.ReplaceAll(key, "\\", "/"))
 	if strings.HasPrefix(normalized, "organizations/") {
 		if !isTenantObjectKey(orgID, normalized) {
@@ -98,6 +102,13 @@ func (a *App) loadTenantMedia(ctx context.Context, orgID uuid.UUID, key string) 
 		}
 		if a.ObjectStore == nil {
 			return nil, "", errors.New("object storage is not initialized")
+		}
+		if maxBytes > 0 {
+			bounded, ok := a.ObjectStore.(storage.BoundedObjectReader)
+			if !ok {
+				return nil, "", errors.New("object storage does not support bounded reads")
+			}
+			return bounded.GetLimited(ctx, normalized, maxBytes)
 		}
 		return a.ObjectStore.Get(ctx, normalized)
 	}
@@ -118,6 +129,18 @@ func (a *App) loadTenantMedia(ctx context.Context, orgID uuid.UUID, key string) 
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, "", errInvalidStoredMediaKey
+	}
+	if maxBytes > 0 {
+		if info.Size() > maxBytes {
+			return nil, "", storage.ErrObjectTooLarge
+		}
+		file, openErr := os.Open(fullPath)
+		if openErr != nil {
+			return nil, "", openErr
+		}
+		defer file.Close() //nolint:errcheck
+		data, readErr := storage.ReadLimited(ctx, file, maxBytes)
+		return data, "", readErr
 	}
 
 	data, err := os.ReadFile(fullPath)
@@ -443,6 +466,18 @@ func (a *App) ServeMedia(r *fastglue.Request) error {
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 	}
+	// An explicitly selected workspace must never fall back to the JWT's
+	// default workspace when access changes or the header is malformed.
+	// Keep headerless requests compatible with the authenticated default.
+	if len(r.RequestCtx.Request.Header.Peek("X-Organization-ID")) != 0 {
+		selectedOrgID, err := a.requireExplicitOrganization(r)
+		if err != nil {
+			return nil
+		}
+		if selectedOrgID != orgID {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+		}
+	}
 
 	// Get the message ID from URL parameter
 	messageIDStr := r.RequestCtx.UserValue("message_id").(string)
@@ -650,4 +685,96 @@ func mediaDownloadFilename(name, servedType string) string {
 		return "media" + getExtensionFromMimeType(servedType)
 	}
 	return name
+}
+
+// prepareForwardedMedia runs in the delivery goroutine with no transaction or
+// pooled connection held: it copies the attachment in tenant storage and
+// uploads it to Meta, leaving only the send for the provider transaction.
+func (a *App) prepareForwardedMedia(req *OutgoingMessageRequest) error {
+	plan := req.forwardMedia
+	if plan == nil || req.Account == nil {
+		a.Log.Error("Forwarded attachment plan is incomplete")
+		return forwardAttachmentCopyError()
+	}
+	storageCtx, cancelStorage := context.WithTimeout(context.Background(), forwardMediaCopyTimeout)
+	defer cancelStorage()
+	limit := forwardMediaSizeLimit(req.Type)
+	size, known, sizeErr := a.forwardSourceSize(storageCtx, plan)
+	if sizeErr != nil {
+		a.Log.Warn("Forward attachment size lookup failed; download refused", "organization_id", plan.OrganizationID)
+		return errors.New("Not sent: the attachment size could not be checked. Try forwarding it again later.") //nolint:staticcheck
+	}
+	if known && size > limit {
+		return forwardTooLargeError(limit)
+	}
+	data, _, err := a.loadTenantMediaWithLimit(storageCtx, plan.OrganizationID, plan.SourceKey, limit)
+	if errors.Is(err, storage.ErrObjectTooLarge) {
+		return forwardTooLargeError(limit)
+	}
+	if err != nil || len(data) == 0 {
+		a.Log.Error("Failed to read media to forward",
+			"error", err, "organization_id", plan.OrganizationID)
+		return errors.New("the forwarded attachment is no longer available")
+	}
+	if int64(len(data)) > limit {
+		return forwardTooLargeError(limit)
+	}
+	key, err := a.saveTenantMedia(
+		storageCtx,
+		plan.OrganizationID,
+		plan.ObjectSubdir,
+		plan.LocalSubdir,
+		plan.ObjectName,
+		data,
+		plan.MimeType,
+	)
+	if err != nil || key != plan.DestinationKey {
+		a.Log.Error("Failed to store forwarded attachment",
+			"error", err, "organization_id", plan.OrganizationID, "key_matches_plan", key == plan.DestinationKey)
+		return forwardAttachmentCopyError()
+	}
+
+	if err := a.requireForwardAccountActive(plan.OrganizationID, req.Account.ID); err != nil {
+		return err
+	}
+	// Patient photos, videos and voice notes carry no file name; Graph needs
+	// one. The document name shown to the customer stays MediaFilename.
+	uploadName := strings.TrimSpace(req.MediaFilename)
+	if uploadName == "" {
+		uploadName = plan.ObjectName
+	}
+	// Graph matches bare media types: "audio/ogg; codecs=opus" (a stored
+	// voice note) is uploaded as "audio/ogg". The stored type is unchanged.
+	uploadType := mediaTypeEssence(plan.MimeType)
+	if uploadType == "" {
+		uploadType = plan.MimeType
+	}
+	uploadCtx, cancelUpload := context.WithTimeout(context.Background(), forwardMediaUploadTimeout)
+	defer cancelUpload()
+	mediaID, err := a.WhatsApp.UploadMedia(uploadCtx, a.toWhatsAppAccount(req.Account), data, uploadType, uploadName)
+	if err != nil {
+		return fmt.Errorf("failed to upload media: %w", err)
+	}
+	req.MediaID = mediaID
+	req.MediaData = nil
+	return nil
+}
+
+// forwardSourceSize reads an object-store attachment's size from a listing,
+// without downloading it. Local development storage reports unknown; its
+// bytes are size-checked right after the read instead.
+func (a *App) forwardSourceSize(ctx context.Context, plan *forwardMediaCopy) (int64, bool, error) {
+	if a.ObjectStore == nil || !isTenantObjectKey(plan.OrganizationID, plan.SourceKey) {
+		return 0, false, nil
+	}
+	objects, err := a.ObjectStore.ListPrefix(ctx, plan.SourceKey)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, object := range objects {
+		if object.Key == plan.SourceKey {
+			return object.Size, true, nil
+		}
+	}
+	return 0, false, storage.ErrObjectNotFound
 }
