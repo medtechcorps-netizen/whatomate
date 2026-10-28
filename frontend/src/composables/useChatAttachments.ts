@@ -1011,7 +1011,6 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
     const identity = attachmentIdentity(options)
     if (view.disposed || !identity) return null
     const scope = effectScope(true)
-    let owner: AttachmentOwner
     let contactId: string | undefined
     const controller = scope.run(() => createChatAttachments({
       ...options,
@@ -1044,7 +1043,7 @@ export function useChatAttachments(options: UseChatAttachmentsOptions) {
         else shared.summary = { identity: owner.identity, value: summary }
       },
     }))!
-    owner = { identity, controller, scope, pending: null }
+    const owner: AttachmentOwner = { identity, controller, scope, pending: null }
     shared.owner.value = owner
     return owner
   }
