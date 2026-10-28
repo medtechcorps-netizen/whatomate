@@ -2257,6 +2257,7 @@ func (a *App) SendMessage(r *fastglue.Request) error {
 
 	opts := DefaultSendOptions()
 	opts.SentByUserID = &userID
+	opts.senderOrigin = requestSenderOrigin(r)
 
 	ctx := context.Background()
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)
@@ -2497,6 +2498,7 @@ func (a *App) SendMediaMessage(r *fastglue.Request) error {
 
 	opts := DefaultSendOptions()
 	opts.SentByUserID = &userID
+	opts.senderOrigin = requestSenderOrigin(r)
 
 	ctx := context.Background()
 	message, err := a.SendOutgoingMessage(ctx, msgReq, opts)

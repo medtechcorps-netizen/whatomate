@@ -29,6 +29,35 @@ const (
 	ContextKeyOrganization    = "organization"
 )
 
+// The marker is private request state, never a header/body claim. A distinct
+// value type prevents an arbitrary string from being accepted as provenance.
+const authenticatedMethodContextKey = "authenticated_request_method_v1"
+
+type authenticatedRequestMethod string
+
+const (
+	authenticatedMethodAPIKey  authenticatedRequestMethod = "api_key"
+	authenticatedMethodUserJWT authenticatedRequestMethod = "user_jwt"
+)
+
+// AuthenticatedRequestMethod reports the successfully admitted credential type.
+// JWT identifies an authentication method, not proof of a human operator.
+func AuthenticatedRequestMethod(r *fastglue.Request) string {
+	if r == nil || r.RequestCtx == nil {
+		return ""
+	}
+	method, ok := r.RequestCtx.UserValue(authenticatedMethodContextKey).(authenticatedRequestMethod)
+	if !ok {
+		return ""
+	}
+	switch method {
+	case authenticatedMethodAPIKey, authenticatedMethodUserJWT:
+		return string(method)
+	default:
+		return ""
+	}
+}
+
 // JWTClaims represents JWT claims
 type JWTClaims struct {
 	UserID         uuid.UUID  `json:"user_id"`
@@ -163,6 +192,8 @@ func Auth(secret string) fastglue.FastMiddleware {
 // AuthWithDB validates both JWT tokens and API keys
 func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 	return func(r *fastglue.Request) *fastglue.Request {
+		// Reused request state must not retain an earlier successful admission.
+		r.RequestCtx.SetUserValue(authenticatedMethodContextKey, nil)
 		authHeader := string(r.RequestCtx.Request.Header.Peek("Authorization"))
 		apiKey := string(r.RequestCtx.Request.Header.Peek("X-API-Key"))
 
@@ -174,6 +205,7 @@ func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 				return nil
 			}
 			if valid {
+				r.RequestCtx.SetUserValue(authenticatedMethodContextKey, authenticatedMethodAPIKey)
 				return r
 			}
 			// API key was provided but invalid
@@ -232,11 +264,13 @@ func AuthWithDB(secret string, db *gorm.DB) fastglue.FastMiddleware {
 				_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Organization access is no longer available", nil, "")
 				return nil
 			}
+			r.RequestCtx.SetUserValue(authenticatedMethodContextKey, authenticatedMethodUserJWT)
 			return r
 		}
 
 		// Legacy mode without a database cannot verify current membership.
 		setClaimsContext(r, claims)
+		r.RequestCtx.SetUserValue(authenticatedMethodContextKey, authenticatedMethodUserJWT)
 		return r
 	}
 }

@@ -709,6 +709,7 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	if outboundSubject == "" && conversation.Channel == models.ChannelEmail {
 		outboundSubject = strings.TrimSpace(conversation.Subject)
 	}
+	senderOrigin := requestSenderOrigin(r)
 	outbound := channelapi.OutboundMessage{
 		OrganizationID: orgID,
 		MessageID:      messageID,
@@ -732,7 +733,8 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 		ReplyToExternalID:   request.ReplyToExternalID,
 		ServiceWindowEndsAt: conversation.ServiceWindowEndsAt,
 		Metadata: map[string]any{
-			"sent_by_user_id": userID,
+			"sent_by_user_id":       userID,
+			senderOriginMetadataKey: senderOrigin,
 		},
 	}
 	payload, err := valueToJSONB(outbound)
@@ -753,11 +755,12 @@ func (a *App) SendInboxConversationMessage(r *fastglue.Request) error {
 	message.IsReply = request.ReplyToMessageID != nil || request.ReplyToExternalID != ""
 	message.ReplyToMessageID = request.ReplyToMessageID
 	message.Metadata = models.JSONB{
-		"channel":         conversation.Channel,
-		"provider":        conversation.ChannelAccount.Provider,
-		"idempotency_key": request.IdempotencyKey,
-		"purpose":         request.Purpose,
-		"payload_digest":  payloadDigest,
+		"channel":               conversation.Channel,
+		"provider":              conversation.ChannelAccount.Provider,
+		"idempotency_key":       request.IdempotencyKey,
+		"purpose":               request.Purpose,
+		"payload_digest":        payloadDigest,
+		senderOriginMetadataKey: senderOrigin,
 	}
 
 	parts := persistentMessageParts(orgID, conversation.ID, message.ID, request.Parts)
