@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 func TestSenderOriginConstructorNeverUsesLegacyFallbackForNewUserSend(t *testing.T) {
@@ -86,7 +87,23 @@ func TestSLAOriginMetadataCompatibilityMatrix(t *testing.T) {
 			if tc.sqlNull {
 				raw = nil
 			}
-			slaOriginSetJSON(t, app, message.ID, raw)
+			// The installed WAMID-owner trigger rejects scalar metadata updates
+			// before the SLA predicate runs. Keep that storage contract intact;
+			// inspect these otherwise valid JSON shapes through a read-only row
+			// projection below, rather than disabling or changing the trigger.
+			storageRefused := tc.name == "top_null" || tc.name == "top_string" || tc.name == "top_number"
+			if storageRefused {
+				var original, retained string
+				require.NoError(t, app.DB.Raw("SELECT COALESCE(metadata::text, 'SQL NULL') FROM messages WHERE id = ?", message.ID).Scan(&original).Error)
+				err := app.DB.Exec("UPDATE messages SET metadata = ?::jsonb WHERE id = ?", tc.raw, message.ID).Error
+				var state interface{ SQLState() string }
+				require.ErrorAs(t, err, &state)
+				require.Equal(t, "22023", state.SQLState(), "the installed trigger refuses scalar key deletion")
+				require.NoError(t, app.DB.Raw("SELECT COALESCE(metadata::text, 'SQL NULL') FROM messages WHERE id = ?", message.ID).Scan(&retained).Error)
+				require.Equal(t, original, retained, "failed scalar storage must not alter the row")
+			} else {
+				slaOriginSetJSON(t, app, message.ID, raw)
+			}
 			for _, sender := range []struct {
 				name     string
 				id       *uuid.UUID
@@ -96,6 +113,41 @@ func TestSLAOriginMetadataCompatibilityMatrix(t *testing.T) {
 			} {
 				t.Run(sender.name, func(t *testing.T) {
 					require.NoError(t, app.DB.Model(&models.Message{}).Where("id = ?", message.ID).Update("sent_by_user_id", sender.id).Error)
+					if storageRefused || tc.sqlNull {
+						// The trigger normalizes persisted SQL NULL to an empty object.
+						// Cover literal SQL NULL here too, then still exercise both real
+						// callers below on the persisted normalized-object fixture.
+						// Preserve every scope column and the real sender. Only metadata
+						// is projected; no malformed row is written or trigger bypassed.
+						projected := func(metadata any) *gorm.DB {
+							return app.DB.Table(`(SELECT id, organization_id, contact_id, direction,
+								message_type, status, created_at, deleted_at, sent_by_user_id,
+								?::jsonb AS metadata FROM public.messages WHERE id = ?) AS messages`, metadata, message.ID)
+						}
+						counts := func(metadata any) (int64, int64) {
+							var deadline, warning int64
+							require.NoError(t, slaConfirmedReplies(projected(metadata), *transfer, since).
+								Where("sent_by_user_id = ?", agent.ID).Count(&deadline).Error)
+							require.NoError(t, slaConfirmedReplies(projected(metadata), *transfer, since).
+								Where("sent_by_user_id IS NOT NULL").Count(&warning).Error)
+							return deadline, warning
+						}
+						var metadata any = tc.raw
+						if tc.sqlNull {
+							metadata = nil // SQL NULL, distinct from the JSON string "null".
+						}
+						deadline, warning := counts(metadata)
+						assert.Equal(t, sender.deadline, deadline > 0)
+						assert.Equal(t, !tc.eligible || sender.id == nil, warning == 0)
+						// A positive control on exactly the same derived row prevents
+						// an empty projection or lost scope from making rejection pass.
+						deadline, warning = counts(`{"sender_origin_v1":"user_jwt"}`)
+						assert.Equal(t, sender.id != nil && *sender.id == agent.ID, deadline > 0)
+						assert.Equal(t, sender.id != nil, warning > 0)
+						if storageRefused {
+							return
+						}
+					}
 					responded, err := NewSLAProcessor(app, time.Minute).agentRespondedSince(*transfer, since)
 					require.NoError(t, err)
 					assert.Equal(t, sender.deadline, responded)

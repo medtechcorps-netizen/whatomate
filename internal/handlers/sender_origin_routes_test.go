@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/zerodha/fastglue"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const originTestKey = "sender_origin_v1"
@@ -597,18 +599,59 @@ func TestSenderOriginLegacyConcurrentReplayKeepsFirstClaim(t *testing.T) {
 			second := legacyReplyRequestWithKey(t, f, "Concurrent synthetic reply", key)
 			originAuthenticate(t, f.app.DB, first, c, firstMethod)
 			originAuthenticate(t, f.app.DB, second, c, other)
-			// A separate GORM handle keeps the query observer off the first sender.
+			// Both senders use private callback registries over the real shared
+			// pool. The provider phase holds the shadow before any message read;
+			// observe that actual lock boundary, not an unreachable later query.
+			firstDB, _ := authorityFaultDB(t, f.app.DB, func(*gorm.DB) bool { return false }, nil)
+			secondDB, _ := authorityFaultDB(t, f.app.DB, func(*gorm.DB) bool { return false }, nil)
+			f.app.DB = firstDB
 			secondApp := newMsgTestApp(t, f.mock)
 			secondApp.Config.LegacyWhatsAppReply.Enabled = true
 			secondApp.Config.LegacyWhatsAppReply.AllowedOrganizationIDs = f.organization.ID.String()
-			secondDB, lookups := authorityFaultDB(t, f.app.DB, func(tx *gorm.DB) bool {
-				return tx.Statement.Table == "messages"
-			}, nil)
 			secondApp.DB = secondDB
+			var firstPID, secondPID atomic.Int32
+			callback := "test:origin-legacy-shadow:" + uuid.NewString()
+			observeShadow := func(db *gorm.DB, pid *atomic.Int32) {
+				require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+					locking, locked := tx.Statement.Clauses["FOR"].Expression.(clause.Locking)
+					where, scoped := tx.Statement.Clauses["WHERE"].Expression.(clause.Where)
+					if tx.Statement.Table != "channel_accounts" || !locked || locking.Strength != "UPDATE" || !scoped {
+						return
+					}
+					exactScope := false
+					for _, expression := range where.Exprs {
+						condition, ok := expression.(clause.Expr)
+						if ok && condition.SQL == "id = ? AND organization_id = ?" && len(condition.Vars) == 2 &&
+							condition.Vars[0] == f.shadow.ID && condition.Vars[1] == f.organization.ID {
+							exactScope = true
+						}
+					}
+					if !exactScope {
+						return
+					}
+					var current int32
+					// NewDB clears the pending model/clauses while retaining this
+					// transaction connection and its context. Raw uses the row
+					// callback, so it cannot recursively enter this query observer.
+					probeCtx, cancelProbe := context.WithTimeout(tx.Statement.Context, time.Second)
+					err := tx.Session(&gorm.Session{NewDB: true}).WithContext(probeCtx).
+						Raw("SELECT pg_backend_pid()").Scan(&current).Error
+					cancelProbe()
+					if err != nil {
+						tx.AddError(err)
+						return
+					}
+					pid.Store(current)
+				}))
+			}
+			observeShadow(firstDB, &firstPID)
+			observeShadow(secondDB, &secondPID)
 			entered, release := make(chan struct{}), make(chan struct{})
-			var enteredOnce, releaseOnce sync.Once
+			providerExited := make(chan struct{})
+			var enteredOnce, releaseOnce, exitedOnce sync.Once
 			unblock := func() { releaseOnce.Do(func() { close(release) }) }
 			f.mock.messageHook = func() {
+				defer exitedOnce.Do(func() { close(providerExited) })
 				enteredOnce.Do(func() { close(entered) })
 				select {
 				case <-release:
@@ -622,6 +665,7 @@ func TestSenderOriginLegacyConcurrentReplayKeepsFirstClaim(t *testing.T) {
 				if !firstJoined {
 					select {
 					case <-firstDone:
+						firstJoined = true
 					case <-time.After(20 * time.Second):
 						t.Error("first legacy reply did not join")
 					}
@@ -629,9 +673,14 @@ func TestSenderOriginLegacyConcurrentReplayKeepsFirstClaim(t *testing.T) {
 				if secondStarted && !secondJoined {
 					select {
 					case <-secondDone:
+						secondJoined = true
 					case <-time.After(20 * time.Second):
 						t.Error("replay did not join")
 					}
+				}
+				if firstJoined && (!secondStarted || secondJoined) {
+					_ = firstDB.Callback().Query().Remove(callback)
+					_ = secondDB.Callback().Query().Remove(callback)
 				}
 			}()
 			go func() { firstDone <- f.app.SendLegacyWhatsAppConversationReply(first) }()
@@ -645,8 +694,25 @@ func TestSenderOriginLegacyConcurrentReplayKeepsFirstClaim(t *testing.T) {
 			require.Equal(t, firstMethod, pending.Metadata[originTestKey])
 			secondStarted = true
 			go func() { secondDone <- secondApp.SendLegacyWhatsAppConversationReply(second) }()
-			require.Eventually(t, func() bool { return lookups.Load() > 0 }, 10*time.Second, 10*time.Millisecond,
-				"overlapping replay must reach the real message read while the first provider call is held")
+			waitCtx, cancelWait := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelWait()
+			require.Eventually(t, func() bool {
+				owner, waiter := firstPID.Load(), secondPID.Load()
+				if owner <= 0 || waiter <= 0 || owner == waiter {
+					return false
+				}
+				var queued int64
+				return f.app.DB.WithContext(waitCtx).Raw(`SELECT count(*) FROM pg_catalog.pg_stat_activity
+					WHERE datname = pg_catalog.current_database() AND pid = ?
+					  AND wait_event_type = 'Lock' AND query ILIKE '%channel_accounts%'
+					  AND ? = ANY(pg_catalog.pg_blocking_pids(pid))`, waiter, owner).Scan(&queued).Error == nil && queued == 1
+			}, 10*time.Second, 10*time.Millisecond,
+				"the exact replay backend must queue on the first sender's shadow lock")
+			select {
+			case <-providerExited:
+				t.Fatal("provider hold ended before the overlapping lock witness")
+			default:
+			}
 			unblock()
 			select {
 			case err := <-firstDone:
