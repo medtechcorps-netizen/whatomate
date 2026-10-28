@@ -131,4 +131,98 @@ describe('assignment invalidation revalidates exact current authority', () => {
     expect(store.currentContact).toBeNull()
     expect(store.isLoading).toBe(false)
   })
+  it.each([403, 404])('fences a manual list retry already in flight when assignment authority returns %s', async status => {
+    const { store, auth } = await fixture()
+    const authority = deferred()
+    const staleRetry = deferred()
+    mocks.list.mockRejectedValueOnce({ response: { status: 503 } })
+      .mockReturnValueOnce(staleRetry.promise)
+    mocks.get.mockReturnValueOnce(authority.promise)
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    store.scheduleContactsRefresh('old', 'assignment')
+    await vi.advanceTimersByTimeAsync(300)
+    expect(store.contactListError).toBe('refresh')
+    expect(store.currentContact?.id).toBe('old')
+    expect(mocks.get).toHaveBeenCalledWith('old', 'org-1')
+
+    const retry = store.retryContactList()
+    const signal = mocks.list.mock.calls[1]![1] as AbortSignal
+    expect(signal.aborted).toBe(false)
+    authority.reject({ response: { status } })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(signal.aborted).toBe(true)
+    expect(store.currentContact).toBeNull()
+    expect(store.replyingTo).toBeNull()
+    expect(store.messages).toEqual([])
+
+    // Ignore transport cancellation deliberately: the stale successful body
+    // must still lose to the generation invalidated by the authority refusal.
+    staleRetry.resolve(response({ contacts: [contact('old'), contact('unrelated')], total: 2 }))
+    await retry
+    expect(store.contacts).toEqual([])
+    expect(store.currentContact).toBeNull()
+    expect(store.messages).toEqual([])
+    expect(store.isLoading).toBe(false)
+    expect(store.contactListError).toBeNull()
+    await store.retryContactList()
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+    expect(auth.isAuthenticated).toBe(true)
+  })
+
+  it.each([403, 404])('keeps a denied selection closed when manual retry starts after the %s refusal', async status => {
+    const { store } = await fixture()
+    mocks.list.mockRejectedValueOnce({ response: { status: 503 } })
+      .mockResolvedValueOnce(response({ contacts: [contact('readable-now')], total: 1 }))
+    mocks.get.mockRejectedValueOnce({ response: { status } })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    store.scheduleContactsRefresh('old', 'assignment')
+    await vi.advanceTimersByTimeAsync(300)
+    expect(store.currentContact).toBeNull()
+    expect(store.contactListError).toBe('refresh')
+    await store.retryContactList()
+    expect(store.contacts.map(row => row.id)).toEqual(['readable-now'])
+    expect(store.currentContact).toBeNull()
+    expect(store.messages).toEqual([])
+    expect(store.replyingTo).toBeNull()
+    expect(store.contactListError).toBeNull()
+    expect(store.isLoading).toBe(false)
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+  })
+
+  it('retains the transcript and pending manual retry when assignment authority is genuinely unavailable', async () => {
+    const { store, auth } = await fixture()
+    const authority = deferred()
+    const recoveredList = deferred()
+    mocks.list.mockRejectedValueOnce({ response: { status: 503 } })
+      .mockReturnValueOnce(recoveredList.promise)
+    mocks.get.mockReturnValueOnce(authority.promise)
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    store.scheduleContactsRefresh('old', 'assignment')
+    await vi.advanceTimersByTimeAsync(300)
+    expect(store.contactListError).toBe('refresh')
+    const retry = store.retryContactList()
+    const signal = mocks.list.mock.calls[1]![1] as AbortSignal
+    authority.reject({ response: { status: 503 } })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(signal.aborted).toBe(false)
+    expect(store.currentContact?.id).toBe('old')
+    expect(store.messages.map(row => row.id)).toEqual(['retained'])
+    expect(store.replyingTo?.id).toBe('retained')
+
+    recoveredList.resolve(response({ contacts: [contact('old'), contact('unrelated')], total: 2 }))
+    await retry
+    expect(store.currentContact?.id).toBe('old')
+    expect(store.contacts.map(row => row.id)).toEqual(['old', 'unrelated'])
+    expect(store.messages.map(row => row.id)).toEqual(['retained'])
+    expect(store.replyingTo?.id).toBe('retained')
+    expect(store.contactListError).toBeNull()
+    expect(store.isLoading).toBe(false)
+    expect(auth.isAuthenticated).toBe(true)
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+  })
+
+
 })

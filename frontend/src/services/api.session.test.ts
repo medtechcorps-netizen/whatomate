@@ -3938,4 +3938,117 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
 
     Reflect.deleteProperty(document, 'visibilityState')
   })
+  for (const outcome of ['switch_not_applied', 'switch_outcome_unknown'] as const) {
+    it(`a remounted attachment owner follows actual switch ${outcome} without replaying an accepted upload`, async () => {
+      localStorage.setItem('whm_session_id', 'session-a')
+      localStorage.setItem('user', JSON.stringify({ id: 'user-1', organization_id: 'org-1', email: 'a@example.com' }))
+      const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+        const error = httpError(503, config)
+        error.response!.data = { status: 'error', error_type: outcome }
+        throw error
+      })
+      const { api, whenLogoutSettled } = await loadTab(adapter)
+      // Import after loadTab resets modules: API and attachment identity helpers
+      // must share the same real current-tab session, not separate mocks.
+      const { mount } = await import('@vue/test-utils')
+      const { defineComponent, h, nextTick, ref } = await import('vue')
+      const { useChatAttachments, readWorkspaceIdentity, readLogicalSessionMarker, SESSION_ENDING_EVENT } = await import('../composables/useChatAttachments')
+      const order: string[] = []
+      recordPosts(order)
+      const OriginalURL = URL
+      vi.stubGlobal('URL', class extends OriginalURL {
+        static createObjectURL = vi.fn(() => 'blob:cross-slice-upload')
+        static revokeObjectURL = vi.fn()
+      })
+      let resolveUpload!: (value: unknown) => void
+      const upload = new Promise<unknown>(resolve => { resolveUpload = resolve })
+      let uploadSignal: AbortSignal | undefined
+      const send = vi.fn<import('../composables/useChatAttachments').SendChatMedia>((_request, options) => {
+        uploadSignal = options.signal
+        // Full upload is accepted for response handling. Ignore abort so the
+        // original promise, rather than a fabricated replacement, must settle.
+        options.onUploadProgress(5, 5)
+        return upload
+      })
+      const visible = ref(true)
+      const views: Array<{ attachments: ReturnType<typeof useChatAttachments>; sent: ReturnType<typeof vi.fn>; finished: ReturnType<typeof vi.fn> }> = []
+      const Child = defineComponent({
+        setup() {
+          const sent = vi.fn(), finished = vi.fn()
+          const attachments = useChatAttachments({
+            resolveTarget: () => ({ contactId: 'contact-a', label: 'Synthetic recipient', isActive: () => true }),
+            session: {
+              userId: () => 'user-1',
+              workspace: () => readWorkspaceIdentity('org-1', 'user-1'),
+              logicalSession: readLogicalSessionMarker,
+              isAuthenticated: () => localStorage.getItem('user') !== null,
+            },
+            send, onSent: sent, onBatchFinished: finished,
+          })
+          views.push({ attachments, sent, finished })
+          return () => h('span', String(attachments.isSending.value))
+        },
+      })
+      const wrapper = mount(defineComponent({ setup: () => () => visible.value ? h(Child) : h('aside') }))
+      let request: Promise<unknown> | undefined
+      try {
+        const original = views[0]!
+        expect(original.attachments.stage([
+          new File(['first'], 'accepted.png', { type: 'image/png' }),
+          new File(['next'], 'queued.png', { type: 'image/png' }),
+        ]).added).toBe(2)
+        request = original.attachments.sendAll()
+        expect(send).toHaveBeenCalledTimes(1)
+        visible.value = false
+        await nextTick()
+        visible.value = true
+        await nextTick()
+        await nextTick()
+        const remounted = views[1]!
+        expect(remounted.attachments.isSending.value).toBe(true)
+        expect(await remounted.attachments.sendAll()).toBeNull()
+
+        // Direct API issuance models a dispatched switch outside this view's
+        // workspace-switch UI hold; no hold or auth protocol is mocked away.
+        await expect(api.post('/auth/refresh/switch-org', { organization_id: 'org-2' })).rejects.toBeTruthy()
+        await whenLogoutSettled()
+        expect(adapter).toHaveBeenCalledTimes(1)
+        if (outcome === 'switch_not_applied') {
+          expect(order).toEqual([])
+          expect(localStorage.getItem('whm_session_id')).toBe('session-a')
+          expect(uploadSignal?.aborted).toBe(false)
+          expect(remounted.attachments.items.value).toHaveLength(2)
+          remounted.attachments.stop()
+          expect(uploadSignal?.aborted).toBe(false)
+          resolveUpload({ id: 'accepted-message', status: 'sent' })
+          expect(await request).toMatchObject({ sent: 1, notSent: 1, stopped: true })
+          expect(remounted.sent).toHaveBeenCalledTimes(1)
+          expect(remounted.finished).toHaveBeenCalledTimes(1)
+          expect(remounted.attachments.items.value.map(item => item.status)).toEqual(['sent', 'ready'])
+        } else {
+          expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+          expect(localStorage.getItem('whm_session_id')).toBe('ended:session-a')
+          expect(uploadSignal?.aborted).toBe(true)
+          expect(remounted.attachments.items.value).toEqual([])
+          resolveUpload({ id: 'accepted-but-old-session', status: 'sent' })
+          expect(await request).toBeNull()
+          expect(remounted.sent).not.toHaveBeenCalled()
+          expect(remounted.finished).not.toHaveBeenCalled()
+          expect(await remounted.attachments.retryFailed()).toBeNull()
+        }
+        expect(send).toHaveBeenCalledTimes(1)
+        expect(original.sent).not.toHaveBeenCalled()
+        expect(original.finished).not.toHaveBeenCalled()
+      } finally {
+        // Keep a failed assertion from leaving an app-owned pending request in
+        // the suite; no synthetic success may start the queued second file.
+        window.dispatchEvent(new CustomEvent(SESSION_ENDING_EVENT))
+        resolveUpload({ id: 'cleanup', status: 'sent' })
+        await request
+        wrapper.unmount()
+      }
+    })
+  }
+
+
 })
