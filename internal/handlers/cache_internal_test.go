@@ -4,17 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/config"
 	"github.com/shridarpatil/whatomate/internal/crypto"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/whatsappaccount"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // cacheTestApp builds a minimal App configured for cache tests, with both DB
@@ -91,14 +95,14 @@ func TestGetWhatsAppAccountCached_CacheMissPopulatesCache(t *testing.T) {
 	require.NotEmpty(t, cached)
 }
 
-func TestGetWhatsAppAccountCached_CacheHitSkipsDB(t *testing.T) {
+func TestGetWhatsAppAccountCached_CacheHitRequiresLiveIdentityButRetainsCachedValues(t *testing.T) {
 	app := cacheTestApp(t)
 	org := testutil.CreateTestOrganization(t, app.DB)
 	phoneID := "phone-" + uuid.New().String()[:8]
 	acc := makeAccount(t, app, org.ID, phoneID, "real-tok", "real-secret")
 
-	// Plant a fake cache entry with a different name → if the function reads from
-	// cache, we'll see "from-cache"; if it falls through to DB we'll see acc.Name.
+	// A matching live identity still uses cached values. The probe must not
+	// silently replace the existing same-row cache freshness semantics.
 	cacheData := whatsAppAccountCache{
 		WhatsAppAccount: models.WhatsAppAccount{
 			BaseModel:      models.BaseModel{ID: acc.ID},
@@ -114,9 +118,19 @@ func TestGetWhatsAppAccountCached_CacheHitSkipsDB(t *testing.T) {
 	cacheKey := fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)
 	require.NoError(t, app.Redis.Set(context.Background(), cacheKey, data, time.Hour).Err())
 
+	private, _ := h1OpenPool(t, 1)
+	var probes atomic.Int32
+	require.NoError(t, private.Callback().Query().Before("gorm:query").Register("test:cache_hit_identity", func(tx *gorm.DB) {
+		if accountCacheIdentityQuery(tx) {
+			probes.Add(1)
+		}
+	}))
+	app.DB = private
 	got, err := app.getWhatsAppAccountCached(phoneID)
 	require.NoError(t, err)
-	assert.Equal(t, "from-cache", got.Name, "cache hit must short-circuit the DB read")
+	require.NotNil(t, got)
+	assert.EqualValues(t, 1, probes.Load(), "a valid cache hit still requires live identity")
+	assert.Equal(t, "from-cache", got.Name, "a matching live row retains cached values")
 	assert.Equal(t, "cached-tok", got.AccessToken,
 		"cached AccessToken must be restored on the WhatsAppAccount even though it has json:\"-\"")
 	assert.Equal(t, "cached-secret", got.AppSecret,
@@ -484,4 +498,303 @@ func TestInvalidateChatbotSettingsCache_DeletesAllAccountVariants(t *testing.T) 
 	exists, err := app.Redis.Exists(ctx, keyOther).Result()
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), exists, "other org's cache must not be invalidated")
+}
+
+type accountCacheMutationFault struct {
+	key     string
+	blocked atomic.Int32
+}
+
+func (h *accountCacheMutationFault) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *accountCacheMutationFault) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *accountCacheMutationFault) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if (cmd.Name() == "del" || cmd.Name() == "set") && len(cmd.Args()) > 1 && fmt.Sprint(cmd.Args()[1]) == h.key {
+			h.blocked.Add(1)
+			return fmt.Errorf("synthetic account cache mutation unavailable")
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func blockAccountCacheMutations(t *testing.T, app *App, phoneID string) *accountCacheMutationFault {
+	t.Helper()
+	// SetupTestRedis is package-shared. Give the fault a private client so it
+	// cannot poison another test or prevent cleanup through the healthy client.
+	options := *app.Redis.Options()
+	client := redis.NewClient(&options)
+	t.Cleanup(func() { _ = client.Close() })
+	hook := &accountCacheMutationFault{key: whatsappAccountCachePrefix + phoneID}
+	client.AddHook(hook)
+	app.Redis = client
+	return hook
+}
+
+func TestWhatsAppAccountCacheRejectsStaleIdentityWhenEvictionFails(t *testing.T) {
+	for _, entry := range []string{"root", "phone-tenant"} {
+		for _, sameOrg := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/same-org=%v", entry, sameOrg), func(t *testing.T) {
+				app := cacheTestApp(t)
+				priorOrg := testutil.CreateTestOrganization(t, app.DB)
+				currentOrg := priorOrg
+				if !sameOrg {
+					currentOrg = testutil.CreateTestOrganization(t, app.DB)
+				}
+				phoneID := "cache-reclaim-" + uuid.NewString()
+				prior := makeAccount(t, app, priorOrg.ID, "  "+phoneID+"  ", "prior-owner-token", "prior-secret")
+				_, err := app.getWhatsAppAccountCached(phoneID)
+				require.NoError(t, err)
+				key := whatsappAccountCachePrefix + phoneID
+				healthyRedis := app.Redis
+				stale, err := healthyRedis.Get(context.Background(), key).Result()
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = healthyRedis.Del(context.Background(), key).Err() })
+				require.NoError(t, app.DB.Delete(prior).Error)
+				current := makeAccount(t, app, currentOrg.ID, phoneID, "current-owner-token", "current-secret")
+				hook := blockAccountCacheMutations(t, app, phoneID)
+				for attempt := 0; attempt < 2; attempt++ {
+					var got *models.WhatsAppAccount
+					if entry == "root" {
+						got, err = app.getWhatsAppAccountCached("  " + phoneID + "  ")
+					} else {
+						err = app.withPhoneTenant(phoneID, func(scoped *App) error {
+							assert.False(t, scoped.hasTenantScope(), "non-RLS logical identity is not a transaction")
+							assert.Equal(t, currentOrg.ID, scoped.expectedAccountOrganizationID)
+							var lookupErr error
+							got, lookupErr = scoped.getWhatsAppAccountCached(phoneID)
+							return lookupErr
+						})
+					}
+					require.NoError(t, err)
+					require.NotNil(t, got)
+					assert.Equal(t, current.ID, got.ID)
+					assert.Equal(t, currentOrg.ID, got.OrganizationID)
+					assert.Equal(t, "current-owner-token", got.AccessToken)
+					assert.NotEqual(t, prior.ID, got.ID)
+					stillStale, readErr := healthyRedis.Get(context.Background(), key).Result()
+					require.NoError(t, readErr)
+					assert.Equal(t, stale, stillStale, "the safety proof cannot depend on successful eviction or replacement")
+				}
+				assert.GreaterOrEqual(t, hook.blocked.Load(), int32(4), "both stale eviction and cache refill fail on both reads")
+			})
+		}
+	}
+}
+
+func TestWhatsAppAccountCacheRejectsMissingOrUnavailableLiveIdentity(t *testing.T) {
+	for _, failure := range []string{"deleted", "phone-moved", "wrong-tenant", "wrong-tenant-no-redis", "database"} {
+		t.Run(failure, func(t *testing.T) {
+			app := cacheTestApp(t)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			otherOrg := testutil.CreateTestOrganization(t, app.DB)
+			phoneID := "cache-refuse-" + uuid.NewString()
+			account := makeAccount(t, app, org.ID, phoneID, "cached-secret-token", "cached-app-secret")
+			_, err := app.getWhatsAppAccountCached(phoneID)
+			require.NoError(t, err)
+			key := whatsappAccountCachePrefix + phoneID
+			healthyRedis := app.Redis
+			t.Cleanup(func() { _ = healthyRedis.Del(context.Background(), key).Err() })
+			stale, err := healthyRedis.Get(context.Background(), key).Result()
+			require.NoError(t, err)
+			var faultHits atomic.Int32
+			switch failure {
+			case "deleted":
+				require.NoError(t, app.DB.Delete(account).Error)
+			case "phone-moved":
+				require.NoError(t, app.DB.Model(account).Update("phone_id", phoneID+"-new").Error)
+			case "wrong-tenant-no-redis":
+				app.Redis = nil
+			case "database":
+				private, _ := h1OpenPool(t, 1)
+				require.NoError(t, private.Callback().Query().Before("gorm:query").Register("test:cache_identity_fault", func(tx *gorm.DB) {
+					if accountCacheIdentityQuery(tx) {
+						faultHits.Add(1)
+						// Real PostgreSQL error on this handle; the cache must not
+						// mask it. Exec has a separate statement, not a recursive query.
+						tx.AddError(tx.Session(&gorm.Session{NewDB: true}).Exec("SELECT 1 / 0").Error)
+					}
+				}))
+				app.DB = private
+			}
+			var got *models.WhatsAppAccount
+			if failure == "wrong-tenant" || failure == "wrong-tenant-no-redis" {
+				err = app.WithTenantApp(otherOrg.ID, func(scoped *App) error {
+					assert.False(t, scoped.hasTenantScope())
+					var lookupErr error
+					got, lookupErr = scoped.getWhatsAppAccountCached(phoneID)
+					return lookupErr
+				})
+			} else {
+				got, err = app.getWhatsAppAccountCached(phoneID)
+			}
+			require.Error(t, err)
+			assert.Nil(t, got, "unavailable authority must never return cached credentials")
+			if failure == "database" {
+				assert.Equal(t, "22012", postgresErrorCode(err))
+				assert.EqualValues(t, 1, faultHits.Load())
+				require.NoError(t, app.DB.Callback().Query().Remove("test:cache_identity_fault"))
+				recovered, recoveryErr := app.getWhatsAppAccountCached(phoneID)
+				require.NoError(t, recoveryErr)
+				require.NotNil(t, recovered)
+				assert.Equal(t, account.ID, recovered.ID)
+			} else {
+				assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+			}
+			stillStale, readErr := healthyRedis.Get(context.Background(), key).Result()
+			require.NoError(t, readErr)
+			assert.Equal(t, stale, stillStale)
+			require.NoError(t, app.DB.Exec("SELECT 1").Error)
+		})
+	}
+}
+
+func accountCacheIdentityQuery(tx *gorm.DB) bool {
+	return tx.Statement.Table == "whatsapp_accounts" && len(tx.Statement.Selects) == 3 &&
+		tx.Statement.Selects[0] == "id" && tx.Statement.Selects[1] == "organization_id" && tx.Statement.Selects[2] == "phone_id"
+}
+
+func TestWhatsAppAccountCachePinsDiscoveryOrganizationAcrossOwnerChange(t *testing.T) {
+	for _, sameOrg := range []bool{false, true} {
+		t.Run(fmt.Sprintf("same-org=%v", sameOrg), func(t *testing.T) {
+			app := cacheTestApp(t)
+			priorOrg := testutil.CreateTestOrganization(t, app.DB)
+			currentOrg := priorOrg
+			if !sameOrg {
+				currentOrg = testutil.CreateTestOrganization(t, app.DB)
+			}
+			phoneID := "cache-discovery-" + uuid.NewString()
+			t.Cleanup(func() { _ = app.Redis.Del(context.Background(), whatsappAccountCachePrefix+phoneID).Err() })
+			prior := makeAccount(t, app, priorOrg.ID, phoneID, "prior-token", "prior-secret")
+			_, err := app.getWhatsAppAccountCached(phoneID)
+			require.NoError(t, err)
+			var current *models.WhatsAppAccount
+			var got *models.WhatsAppAccount
+			err = app.withPhoneTenant(phoneID, func(scoped *App) error {
+				// Discovery has completed, and this callback still belongs to its
+				// original logical tenant even though non-RLS uses the root pool.
+				assert.False(t, scoped.hasTenantScope())
+				assert.Equal(t, priorOrg.ID, scoped.expectedAccountOrganizationID)
+				require.NoError(t, app.DB.Delete(prior).Error)
+				current = makeAccount(t, app, currentOrg.ID, phoneID, "new-token", "new-secret")
+				var lookupErr error
+				got, lookupErr = scoped.getWhatsAppAccountCached(phoneID)
+				return lookupErr
+			})
+			if sameOrg {
+				require.NoError(t, err)
+				require.NotNil(t, got)
+				assert.Equal(t, current.ID, got.ID)
+				assert.Equal(t, "new-token", got.AccessToken)
+			} else {
+				require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+				assert.Nil(t, got, "the old callback must not adopt the new tenant")
+			}
+			fresh, err := app.getWhatsAppAccountCached(phoneID)
+			require.NoError(t, err)
+			require.NotNil(t, fresh)
+			assert.Equal(t, current.ID, fresh.ID)
+			assert.Equal(t, currentOrg.ID, fresh.OrganizationID)
+		})
+	}
+}
+
+func TestWhatsAppAccountCacheIdentityUsesHeldSingleConnection(t *testing.T) {
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rls=%v", rlsEnabled), func(t *testing.T) {
+			app := cacheTestApp(t)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			phoneID := "cache-one-connection-" + uuid.NewString()
+			t.Cleanup(func() { _ = app.Redis.Del(context.Background(), whatsappAccountCachePrefix+phoneID).Err() })
+			account := makeAccount(t, app, org.ID, phoneID, "single-connection-token", "secret")
+			_, err := app.getWhatsAppAccountCached(phoneID)
+			require.NoError(t, err)
+			private, pool := h1OpenPool(t, 1)
+			var probes atomic.Int32
+			require.NoError(t, private.Callback().Query().Before("gorm:query").Register("test:cache_identity_probe", func(tx *gorm.DB) {
+				if accountCacheIdentityQuery(tx) {
+					probes.Add(1)
+				}
+			}))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			app.DB = private.WithContext(ctx)
+			app.Config.Database.RLSEnabled = rlsEnabled
+			waits := pool.Stats().WaitCount
+			err = app.WithCommittedTenantApp(org.ID, func(scoped *App) error {
+				assert.Equal(t, 1, pool.Stats().InUse)
+				got, lookupErr := scoped.getWhatsAppAccountCached(phoneID)
+				if lookupErr != nil {
+					return lookupErr
+				}
+				require.NotNil(t, got)
+				assert.Equal(t, account.ID, got.ID)
+				assert.Equal(t, 1, pool.Stats().InUse)
+				return nil
+			})
+			require.NoError(t, err, "an identity probe must use the held connection, never the root pool")
+			assert.EqualValues(t, 1, probes.Load())
+			assert.Equal(t, waits, pool.Stats().WaitCount)
+			assert.Zero(t, pool.Stats().InUse)
+		})
+	}
+}
+
+// Serial: installing actual runtime-role policies changes shared test schema.
+func TestWhatsAppAccountCacheRuntimeRoleRLSChecksCurrentOwner(t *testing.T) {
+	app := cacheTestApp(t)
+	admin := app.DB
+	testutil.TruncateTables(admin)
+	runtimeRole := "rereply_cache_" + uuid.NewString()[:8]
+	runtimePassword := "synthetic" + uuid.NewString()[:8]
+	require.NoError(t, admin.Exec(fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		runtimeRole, runtimePassword,
+	)).Error)
+	t.Cleanup(func() {
+		_ = database.RemoveTenantRLS(admin)
+		_ = admin.Exec("DROP OWNED BY " + runtimeRole).Error
+		_ = admin.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
+		testutil.TruncateTables(admin)
+	})
+	priorOrg := testutil.CreateTestOrganization(t, admin)
+	currentOrg := testutil.CreateTestOrganization(t, admin)
+	phoneID := "cache-runtime-" + uuid.NewString()
+	healthyRedis := app.Redis
+	t.Cleanup(func() { _ = healthyRedis.Del(context.Background(), whatsappAccountCachePrefix+phoneID).Err() })
+	prior := makeAccount(t, app, priorOrg.ID, phoneID, "prior-runtime-token", "prior-secret")
+	_, err := app.getWhatsAppAccountCached(phoneID)
+	require.NoError(t, err)
+	require.NoError(t, admin.Delete(prior).Error)
+	current := makeAccount(t, app, currentOrg.ID, phoneID, "current-runtime-token", "current-secret")
+	require.NoError(t, database.ApplyTenantRLS(admin, runtimeRole))
+	runtimeDB := openRuntimeRoleTestDB(t, runtimeRole, runtimePassword)
+	require.NoError(t, database.VerifyTenantRLS(runtimeDB, runtimeRole))
+	pool, err := runtimeDB.DB()
+	require.NoError(t, err)
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	app.DB = runtimeDB.WithContext(ctx)
+	app.Config.Database.RLSEnabled = true
+	app.Config.Database.RuntimeRole = runtimeRole
+	hook := blockAccountCacheMutations(t, app, phoneID)
+	got, err := app.getWhatsAppAccountCached(phoneID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, current.ID, got.ID)
+	assert.Equal(t, currentOrg.ID, got.OrganizationID)
+	assert.Equal(t, "current-runtime-token", got.AccessToken)
+	assert.GreaterOrEqual(t, hook.blocked.Load(), int32(2))
+	err = app.WithTenantApp(priorOrg.ID, func(scoped *App) error {
+		refused, lookupErr := scoped.getWhatsAppAccountCached(phoneID)
+		assert.Nil(t, refused)
+		return lookupErr
+	})
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	var unscoped int64
+	require.NoError(t, runtimeDB.Model(&models.WhatsAppAccount{}).Count(&unscoped).Error)
+	assert.Zero(t, unscoped, "the root runtime connection must retain no tenant setting")
 }

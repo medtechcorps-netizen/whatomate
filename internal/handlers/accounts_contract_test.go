@@ -4107,3 +4107,194 @@ func TestWhatsAppContractTestFixtureRoutesRemainExplicit(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
+
+// These exercise the real global BTRIM(phone_id) index, not an injected
+// uniqueness error. RLS=true exercises the handler's tenant-transaction path
+// using the existing test owner; runtime-role RLS remains a separate gate.
+func TestManualAccountPhoneOwnershipConflictPreservesState(t *testing.T) {
+	for _, operation := range []string{"create", "update"} {
+		for _, rlsEnabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rls=%v", operation, rlsEnabled), func(t *testing.T) {
+				testManualAccountWriteRefusal(t, operation, "phone", rlsEnabled)
+			})
+		}
+	}
+}
+
+func TestManualAccountNonPhoneWriteFailuresRemainInternalErrors(t *testing.T) {
+	for _, operation := range []string{"create", "update"} {
+		for _, failure := range []string{"name", "database"} {
+			for _, rlsEnabled := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/rls=%v", operation, failure, rlsEnabled), func(t *testing.T) {
+					testManualAccountWriteRefusal(t, operation, failure, rlsEnabled)
+				})
+			}
+		}
+	}
+}
+
+type manualAccountWriteSnapshot struct {
+	accounts []models.WhatsAppAccount
+	shadows  []models.ChannelAccount
+	audits   []models.AuditLog
+}
+
+func snapshotManualAccountWrite(t *testing.T, app *App, organizationIDs []uuid.UUID) manualAccountWriteSnapshot {
+	t.Helper()
+	var snapshot manualAccountWriteSnapshot
+	require.NoError(t, app.DB.Unscoped().Where("organization_id IN ?", organizationIDs).
+		Order("id").Find(&snapshot.accounts).Error)
+	require.NoError(t, app.DB.Unscoped().Where("organization_id IN ?", organizationIDs).
+		Order("id").Find(&snapshot.shadows).Error)
+	require.NoError(t, app.DB.Unscoped().Where("organization_id IN ?", organizationIDs).
+		Order("id").Find(&snapshot.audits).Error)
+	return snapshot
+}
+
+func testManualAccountWriteRefusal(t *testing.T, operation, failure string, rlsEnabled bool) {
+	t.Helper()
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	previous := createDefaultMoveAccount(t, app, org.ID, "Manual Existing Default", true)
+	target := createDefaultMoveAccount(t, app, org.ID, "Manual Update Target", false)
+	foreign := createDefaultMoveAccount(t, app, otherOrg.ID, "Manual Foreign Owner", true)
+	createLegacyRenameShadow(t, app.DB, target)
+	createLegacyRenameShadow(t, app.DB, foreign)
+	name := "Manual Requested " + uuid.NewString()
+	dropFault := func() {}
+	switch failure {
+	case "phone":
+		// Stored whitespace and submitted whitespace must collide at the real
+		// expression index even though the organizations and names differ.
+		require.NoError(t, app.DB.Model(&models.WhatsAppAccount{}).Where("id = ?", foreign.ID).
+			Update("phone_id", "  "+phoneID+"  ").Error)
+	case "name":
+		// A real name-index violation, with a fresh unclaimed phone, is not
+		// evidence that another organization owns the phone.
+		name = previous.Name
+	case "database":
+		dropFault = failManualAccountWrite(t, app, org.ID, phoneID)
+	default:
+		t.Fatalf("unknown manual account failure fixture %q", failure)
+	}
+	organizationIDs := []uuid.UUID{org.ID, otherOrg.ID}
+	before := snapshotManualAccountWrite(t, app, organizationIDs)
+	app.Config.Database.RLSEnabled = rlsEnabled
+	request := func(requestName string) *fastglue.Request {
+		req := testutil.NewJSONRequest(t, map[string]any{
+			"name":                requestName,
+			"phone_id":            " \t" + phoneID + "\t ",
+			"business_id":         "  " + wabaID + "  ",
+			"access_token":        "synthetic-manual-refusal-token",
+			"api_version":         "v21.0",
+			"is_default_incoming": true,
+			"is_default_outgoing": true,
+		})
+		testutil.SetAuthContext(req, org.ID, user.ID)
+		if operation == "create" {
+			require.NoError(t, app.Tenant((*App).CreateAccount)(req))
+		} else {
+			testutil.SetPathParam(req, "id", target.ID.String())
+			require.NoError(t, app.Tenant((*App).UpdateAccount)(req))
+		}
+		return req
+	}
+	req := request(name)
+	if failure == "phone" {
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "This WhatsApp phone number is already connected")
+	} else {
+		testutil.AssertErrorResponse(t, req, fasthttp.StatusInternalServerError, "Failed to "+operation+" account")
+		assert.NotContains(t, string(testutil.GetResponseBody(req)), "already connected")
+	}
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), otherOrg.ID.String())
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), foreign.Name)
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), "synthetic-manual-refusal-token")
+	after := snapshotManualAccountWrite(t, app, organizationIDs)
+	assert.Equal(t, before.accounts, after.accounts, "all rows, ciphertexts, timestamps and default flags must survive rejection unchanged")
+	assert.Equal(t, before.shadows, after.shadows, "a staged rename must roll back with the refused account write")
+	assert.Equal(t, before.audits, after.audits, "a refused write must not leave an account audit entry")
+	assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/v21.0/"+wabaID+"/phone_numbers"), "preserve validation reads before the write")
+	meta.mu.Lock()
+	mutations := make(map[string]int)
+	for key, count := range meta.hits {
+		if strings.Contains(key, " ") && !strings.HasPrefix(key, http.MethodGet+" ") {
+			mutations[key] = count
+		}
+	}
+	meta.mu.Unlock()
+	assert.Empty(t, mutations, "no synthetic provider mutation may occur before a successful committed write")
+	var healthy int
+	require.NoError(t, app.DB.Raw("SELECT 1").Scan(&healthy).Error)
+	require.Equal(t, 1, healthy, "failure must release the transaction and leave the database usable")
+	if failure == "phone" {
+		return
+	}
+
+	// Removing only the causal fault (or selecting a free name) lets the
+	// ordinary create/update path commit, subscribe and move defaults.
+	dropFault()
+	recovered := request("Manual Recovered " + uuid.NewString())
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(recovered), string(testutil.GetResponseBody(recovered)))
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("organization_id = ? AND phone_id = ?", org.ID, phoneID).First(&stored).Error)
+	if operation == "update" {
+		assert.Equal(t, target.ID, stored.ID)
+	}
+	assert.Equal(t, "active", stored.Status)
+	assert.True(t, appcrypto.IsEncrypted(stored.AccessToken))
+	incoming, outgoing := countDefaultAccounts(t, app, org.ID)
+	assert.Equal(t, []uuid.UUID{stored.ID}, incoming)
+	assert.Equal(t, []uuid.UUID{stored.ID}, outgoing)
+	assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+	var audits int64
+	require.NoError(t, app.DB.Model(&models.AuditLog{}).
+		Where("organization_id = ? AND resource_type = ? AND resource_id = ?", org.ID, "account", stored.ID).
+		Count(&audits).Error)
+	assert.Positive(t, audits, "successful recovery must retain account audit behavior")
+	foreignAfter := snapshotManualAccountWrite(t, app, []uuid.UUID{otherOrg.ID})
+	for _, account := range before.accounts {
+		if account.OrganizationID == otherOrg.ID {
+			require.Len(t, foreignAfter.accounts, 1)
+			assert.Equal(t, account, foreignAfter.accounts[0])
+		}
+	}
+}
+
+// Raise a genuine PostgreSQL write error only for this synthetic candidate.
+// Mentioning the phone index in the message must not turn SQLSTATE55000 into
+// an ownership conflict. The table and real constraints remain intact.
+func failManualAccountWrite(t *testing.T, app *App, orgID uuid.UUID, phoneID string) func() {
+	t.Helper()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	functionName := "fail_manual_account_" + suffix
+	triggerName := functionName + "_trigger"
+	dropped := false
+	drop := func() {
+		if !dropped {
+			require.NoError(t, dropLegacyTestTrigger(app.DB, "whatsapp_accounts", triggerName, functionName))
+			dropped = true
+		}
+	}
+	t.Cleanup(drop)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(`
+		CREATE FUNCTION %s() RETURNS trigger
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			IF NEW.organization_id = '%s'::uuid AND BTRIM(NEW.phone_id) = '%s' THEN
+				RAISE EXCEPTION 'synthetic unrelated write failure near uq_whatsapp_accounts_live_phone_id'
+					USING ERRCODE = '55000';
+			END IF;
+			RETURN NEW;
+		END;
+		$$`, functionName, orgID, phoneID)).Error)
+	require.NoError(t, app.DB.Exec(fmt.Sprintf(
+		"CREATE TRIGGER %s BEFORE INSERT OR UPDATE ON whatsapp_accounts FOR EACH ROW EXECUTE FUNCTION %s()",
+		triggerName, functionName,
+	)).Error)
+	return drop
+}

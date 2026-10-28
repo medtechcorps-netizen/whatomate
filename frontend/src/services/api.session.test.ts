@@ -3054,6 +3054,45 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(assignedHref).toBeNull()
   })
 
+  it.each(['me', 'policy-check'] as const)('a policy lookup 503 through %s preserves the session and prior policy without replay', async (entry) => {
+    localStorage.setItem('whm_session_id', 'policy-session')
+    setPolicy(60)
+    const userBefore = localStorage.getItem('user')
+    const policiesBefore = localStorage.getItem('whm_session_idle_minutes')
+    const calls: string[] = []
+    const policies: unknown[] = []
+    const onPolicy = (event: Event) => policies.push((event as CustomEvent).detail)
+    window.addEventListener('whm:session-policy', onPolicy)
+    let available = false
+    const tab = await loadTab(async (config) => {
+      calls.push(String(config.url))
+      if (!available) throw httpError(503, config)
+      return { ...ok(config, { data: { id: 'user-1' } }), headers: { 'x-session-idle-minutes': '30' } }
+    })
+    try {
+      if (entry === 'me') await expect(tab.api.get('/me')).rejects.toMatchObject({ response: { status: 503 } })
+      else await tab.checkSessionIdlePolicy()
+      expect(calls).toEqual(['/me'])
+      expect(postSpy).not.toHaveBeenCalled()
+      expect(localStorage.getItem('user')).toBe(userBefore)
+      expect(localStorage.getItem('whm_session_id')).toBe('policy-session')
+      expect(localStorage.getItem('whm_session_idle_minutes')).toBe(policiesBefore)
+      expect(sessionEvents).toEqual([])
+      expect(policies).toEqual([])
+      expect(assignedHref).toBeNull()
+
+      available = true
+      await tab.checkSessionIdlePolicy()
+      expect(calls).toEqual(['/me', '/me'])
+      expect(postSpy).not.toHaveBeenCalled()
+      expect(cachedPolicies()).toEqual({ 'user-1|': 30 })
+      expect(policies).toEqual([{ minutes: 30, identity: 'user-1|' }])
+      expect(localStorage.getItem('whm_session_id')).toBe('policy-session')
+    } finally {
+      window.removeEventListener('whm:session-policy', onPolicy)
+    }
+  })
+
   it('a sign-in starts the inactivity clock; logout clears it', async () => {
     const { api } = await loadTab(async (config) => ok(config, { data: { expires_in: 900, user: {} } }))
     postSpy.mockResolvedValue({ data: {}, status: 200 })

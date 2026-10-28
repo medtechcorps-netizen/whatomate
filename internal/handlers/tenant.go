@@ -170,6 +170,9 @@ func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 		afterCommitScoped:     true,
 		channelAdapterFactory: root.channelAdapterFactory,
 	}
+	// Keep logical account ownership even when the caller deliberately clears
+	// tenantOrgID for non-RLS operation. A new scope always replaces this value.
+	scoped.expectedAccountOrganizationID = organizationID
 	// Subscriber lifecycle callbacks and RealtimeSourceID are root-owned.
 	// Scoped apps resolve realtime identity through rootApp and never copy
 	// lifecycle state that can change during graceful shutdown.

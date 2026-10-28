@@ -262,6 +262,9 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 		}
 		return nil
 	}); err != nil {
+		if embeddedSignupPhoneClaimUniqueViolation(err) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "This WhatsApp phone number is already connected", nil, "")
+		}
 		a.Log.Error("Failed to create account", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
@@ -666,6 +669,9 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account Omnichannel binding changed; reload and try again", nil, "")
 	}
 	if updateErr != nil {
+		if embeddedSignupPhoneClaimUniqueViolation(updateErr) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "This WhatsApp phone number is already connected", nil, "")
+		}
 		a.Log.Error("Failed to update account", "error", updateErr)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 	}
