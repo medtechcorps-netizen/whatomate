@@ -4323,3 +4323,682 @@ func failManualAccountWrite(t *testing.T, app *App, orgID uuid.UUID, phoneID str
 	)).Error)
 	return drop
 }
+
+// These fixtures use the internal handlers test package and the real shared
+// PostgreSQL fixture. Provider calls terminate at the synthetic httptest server.
+// RLSEnabled cases exercise tenant phases as the fixture owner; they are not a
+// substitute for the existing runtime-role RLS route qualification.
+type signupGenerationBarrier struct {
+	entered     chan struct{}
+	release     chan struct{}
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+	timedOut    atomic.Bool
+}
+
+func newSignupGenerationBarrier() *signupGenerationBarrier {
+	return &signupGenerationBarrier{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *signupGenerationBarrier) block(ctx context.Context) {
+	b.enterOnce.Do(func() {
+		close(b.entered)
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+		case <-timer.C:
+			b.timedOut.Store(true)
+		}
+	})
+}
+
+func (b *signupGenerationBarrier) unblock() {
+	b.releaseOnce.Do(func() { close(b.release) })
+}
+
+// Cleanup first releases the provider, cancels this App's DB context, and joins
+// the one owned handler. It runs before the synthetic server or fixtures close.
+func startSignupGenerationExchange(t *testing.T, app *App, req *fastglue.Request, barrier *signupGenerationBarrier) func() {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	app.DB = app.DB.WithContext(ctx)
+	done := make(chan error, 1)
+	joined := false
+	t.Cleanup(func() {
+		barrier.unblock()
+		cancel()
+		if !joined {
+			select {
+			case <-done:
+				joined = true
+			case <-time.After(5 * time.Second):
+				t.Error("signup generation handler did not stop after cancellation")
+			}
+		}
+	})
+	go func() { done <- app.exchangeToken(req, 10*time.Second) }()
+	select {
+	case <-barrier.entered:
+	case err := <-done:
+		joined = true
+		t.Fatalf("signup ended before the provider barrier: %v; status=%d", err, testutil.GetResponseStatusCode(req))
+	case <-time.After(5 * time.Second):
+		t.Fatal("signup did not reach the provider barrier")
+	}
+	return func() {
+		t.Helper()
+		barrier.unblock()
+		select {
+		case err := <-done:
+			joined = true
+			require.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("signup did not finish after the provider barrier")
+		}
+		require.False(t, barrier.timedOut.Load(), "test must release its owned barrier")
+	}
+}
+
+func signupGenerationRequest(t *testing.T, orgID, userID uuid.UUID, phoneID, wabaID, mode string, supplied bool) *fastglue.Request {
+	t.Helper()
+	body := map[string]any{"code": "synthetic-generation-code", "signup_mode": mode, "waba_id": wabaID}
+	if supplied {
+		body["phone_id"] = "  " + phoneID + "  "
+	} else if mode == "coexistence" {
+		body["phone_number_hint"] = "+60123456789"
+	}
+	req := testutil.NewJSONRequest(t, body)
+	testutil.SetAuthContext(req, orgID, userID)
+	testutil.SetHeader(req, "X-Organization-ID", orgID.String())
+	return req
+}
+
+func createSignupGenerationAccount(t *testing.T, app *App, orgID uuid.UUID, phoneID, wabaID, version string, smb, deleted bool) *models.WhatsAppAccount {
+	t.Helper()
+	token, err := appcrypto.Encrypt("synthetic-generation-old-token", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	pin, err := appcrypto.Encrypt("628415", integrationTestEncryptionKey)
+	require.NoError(t, err)
+	account := &models.WhatsAppAccount{
+		BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID,
+		Name: "Generation " + uuid.NewString(), PhoneID: phoneID, BusinessID: wabaID,
+		AccessToken: token, Pin: pin, APIVersion: version, Status: "active", IsSMB: smb,
+		IsDefaultIncoming: true, IsDefaultOutgoing: true, AutoReadReceipt: true,
+	}
+	require.NoError(t, app.DB.Create(account).Error)
+	createManualAccountWriteShadow(t, app.DB, account)
+	if smb {
+		onboarded := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+		completed := onboarded.Add(time.Hour)
+		deadline := onboarded.Add(models.CoexistenceSyncWindow)
+		state := &models.WhatsAppCoexistenceState{
+			ID: uuid.New(), OrganizationID: orgID, WhatsAppAccountID: account.ID,
+			OnboardingStatus: models.CoexistenceOnboardingStatusReady, OnboardedAt: &onboarded,
+			OnboardingCycle: 3, SyncStatus: models.CoexistenceSyncStatusCompleted,
+			SyncStartedAt: &onboarded, SyncCompletedAt: &completed, SyncDeadlineAt: &deadline,
+			ContactSyncStatus: models.CoexistenceSyncStatusRequested, ContactSyncAttempts: 1,
+			ContactSyncRequestID: "synthetic-accepted-contact", ContactSyncRequestedAt: &onboarded,
+			HistoryConsent:    models.CoexistenceHistoryConsentGranted,
+			HistorySyncStatus: models.CoexistenceSyncStatusCompleted, HistorySyncAttempts: 1,
+			HistorySyncRequestID: "synthetic-accepted-history", HistoryProgressPercent: 100,
+			HistoryCompletedAt: &completed, LifecycleStatus: models.CoexistenceLifecycleStatusConnected,
+			LifecycleMetadata: models.JSONB{}, Version: 7,
+		}
+		require.NoError(t, app.DB.Create(state).Error)
+	}
+	if deleted {
+		require.NoError(t, app.DB.Delete(account).Error)
+	}
+	// Use database timestamp precision for all subsequent generation assertions.
+	require.NoError(t, app.DB.Unscoped().Where("id = ?", account.ID).First(account).Error)
+	return account
+}
+
+func signupGenerationStates(t *testing.T, app *App, orgID uuid.UUID) []models.WhatsAppCoexistenceState {
+	t.Helper()
+	var states []models.WhatsAppCoexistenceState
+	require.NoError(t, app.DB.Where("organization_id = ?", orgID).Order("id").Find(&states).Error)
+	return states
+}
+
+func assertSignupGenerationNoMutation(t *testing.T, meta *whatsappContractMeta, phoneID, wabaID string) {
+	t.Helper()
+	for _, version := range []string{"v20.0", "v21.0"} {
+		assert.Zero(t, meta.methodHits(http.MethodPost, "/"+version+"/"+phoneID+"/register"))
+		assert.Zero(t, meta.methodHits(http.MethodPost, "/"+version+"/"+wabaID+"/subscribed_apps"))
+		assert.Zero(t, meta.hit("/"+version+"/"+phoneID+"/smb_app_data"))
+	}
+}
+
+func TestEmbeddedSignupGenerationRejectsDeleteDuringSubscriptionProof(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, version string
+		supplied, rls       bool
+	}{
+		{"classic/supplied", "classic", "v21.0", true, false},
+		{"classic/discovered", "classic", "v21.0", false, true},
+		{"same-version/supplied", "coexistence", "v21.0", true, true},
+		{"same-version/discovered", "coexistence", "v21.0", false, false},
+		{"kept-version/supplied", "coexistence", "v20.0", true, false},
+		{"kept-version/discovered", "coexistence", "v20.0", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			meta.permanentToken = true
+			meta.phoneIsOnBizApp = tc.mode == "coexistence"
+			if meta.phoneIsOnBizApp {
+				meta.phonePlatformType = "SMB_CLOUD_API"
+			}
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := integrationTestUser(t, app, org.ID, "accounts:read", "accounts:write", "accounts:delete")
+			account := createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, tc.version, meta.phoneIsOnBizApp, false)
+			app.Config.Database.RLSEnabled = tc.rls
+			barrier := newSignupGenerationBarrier()
+			meta.onSubscriptionRead = func() { barrier.block(context.Background()) }
+			req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, tc.mode, tc.supplied)
+			finish := startSignupGenerationExchange(t, app, req, barrier)
+
+			deleteReq := testutil.NewJSONRequest(t, map[string]any{})
+			testutil.SetAuthContext(deleteReq, org.ID, user.ID)
+			testutil.SetHeader(deleteReq, "X-Organization-ID", org.ID.String())
+			testutil.SetPathParam(deleteReq, "id", account.ID.String())
+			require.NoError(t, app.DeleteAccount(deleteReq))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(deleteReq))
+			before := snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID})
+			states := signupGenerationStates(t, app, org.ID)
+			require.True(t, before.accounts[0].DeletedAt.Valid)
+			finish()
+
+			testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "changed")
+			assert.Equal(t, before, snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID}))
+			assert.Equal(t, states, signupGenerationStates(t, app, org.ID))
+			assert.Equal(t, 1, meta.methodHits(http.MethodGet, "/"+tc.version+"/"+wabaID+"/subscribed_apps"))
+			assertSignupGenerationNoMutation(t, meta, phoneID, wabaID)
+		})
+	}
+}
+
+func TestEmbeddedSignupGenerationRejectsChangedTombstoneOrAbsence(t *testing.T) {
+	for _, change := range []string{"deleted_at", "replacement", "restore_and_delete", "absent_then_deleted", "absent_then_live"} {
+		for _, supplied := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/supplied=%v", change, supplied), func(t *testing.T) {
+				phoneID, wabaID := contractGraphIDs()
+				meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+				app := newWhatsAppContractApp(t, meta)
+				org := testutil.CreateTestOrganization(t, app.DB)
+				user := contractWriter(t, app, org.ID)
+				var account *models.WhatsAppAccount
+				if !strings.HasPrefix(change, "absent") {
+					account = createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, true)
+				}
+				barrier := newSignupGenerationBarrier()
+				meta.onPhoneInfo = func(r *http.Request) { barrier.block(r.Context()) }
+				req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", supplied)
+				finish := startSignupGenerationExchange(t, app, req, barrier)
+				switch change {
+				case "deleted_at":
+					// Do not advance UpdatedAt: the deletion timestamp itself must be checked.
+					require.NoError(t, app.DB.Unscoped().Model(&models.WhatsAppAccount{}).Where("id = ?", account.ID).
+						UpdateColumn("deleted_at", account.DeletedAt.Time.Add(time.Second)).Error)
+				case "replacement":
+					createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, false)
+				case "restore_and_delete":
+					require.NoError(t, app.DB.Unscoped().Model(&models.WhatsAppAccount{}).Where("id = ?", account.ID).
+						UpdateColumn("deleted_at", nil).Error)
+					require.NoError(t, app.DB.Delete(&models.WhatsAppAccount{}, "id = ?", account.ID).Error)
+					// Guarantee a distinct generation even on a coarse test clock.
+					require.NoError(t, app.DB.Unscoped().Model(&models.WhatsAppAccount{}).Where("id = ?", account.ID).
+						UpdateColumn("deleted_at", account.DeletedAt.Time.Add(2*time.Second)).Error)
+				case "absent_then_deleted":
+					createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, true)
+				case "absent_then_live":
+					createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, false)
+				}
+				before := snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID})
+				finish()
+				testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "changed")
+				assert.Equal(t, before, snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID}))
+				assertSignupGenerationNoMutation(t, meta, phoneID, wabaID)
+			})
+		}
+	}
+}
+
+func TestEmbeddedSignupGenerationPreservesExactTombstoneAndActiveRefresh(t *testing.T) {
+	for _, mode := range []string{"classic", "coexistence"} {
+		for _, deleted := range []bool{false, true} {
+			for _, supplied := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/deleted=%v/supplied=%v", mode, deleted, supplied), func(t *testing.T) {
+					phoneID, wabaID := contractGraphIDs()
+					meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+					meta.permanentToken = true
+					meta.phoneIsOnBizApp = mode == "coexistence"
+					if meta.phoneIsOnBizApp {
+						meta.phonePlatformType = "SMB_CLOUD_API"
+					}
+					app := newWhatsAppContractApp(t, meta)
+					org := testutil.CreateTestOrganization(t, app.DB)
+					user := contractWriter(t, app, org.ID)
+					account := createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", meta.phoneIsOnBizApp, deleted)
+					states := signupGenerationStates(t, app, org.ID)
+					barrier := newSignupGenerationBarrier()
+					meta.onPhoneInfo = func(r *http.Request) { barrier.block(r.Context()) }
+					req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, mode, supplied)
+					finish := startSignupGenerationExchange(t, app, req, barrier)
+					finish()
+					require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
+					var stored models.WhatsAppAccount
+					require.NoError(t, app.DB.Where("id = ?", account.ID).First(&stored).Error)
+					assert.Equal(t, account.ID, stored.ID)
+					assert.Equal(t, account.Name, stored.Name)
+					assert.Equal(t, "active", stored.Status)
+					assert.False(t, stored.DeletedAt.Valid)
+					assert.Equal(t, !deleted, stored.IsDefaultIncoming)
+					assert.Equal(t, !deleted, stored.IsDefaultOutgoing)
+					assert.Equal(t, !deleted, stored.AutoReadReceipt)
+					assert.Equal(t, states, signupGenerationStates(t, app, org.ID), "accepted SMB cycle and requests are immutable")
+					if !deleted {
+						assertSignupGenerationNoMutation(t, meta, phoneID, wabaID)
+					} else {
+						wantRegister := 1
+						if meta.phoneIsOnBizApp {
+							wantRegister = 0
+						}
+						assert.Equal(t, wantRegister, meta.methodHits(http.MethodPost, "/v21.0/"+phoneID+"/register"))
+						assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+						assert.Zero(t, meta.hit("/v21.0/"+phoneID+"/smb_app_data"))
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestEmbeddedSignupGenerationSuppliedCapturePrecedesCodeExchange(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	account := createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, false)
+	barrier := newSignupGenerationBarrier()
+	original := meta.server.Config.Handler
+	meta.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/oauth/access_token") {
+			barrier.block(r.Context())
+		}
+		original.ServeHTTP(w, r)
+	})
+	req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", true)
+	finish := startSignupGenerationExchange(t, app, req, barrier)
+	require.NoError(t, app.DB.Delete(account).Error)
+	before := snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID})
+	finish()
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "changed")
+	assert.Equal(t, before, snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID}))
+	assertSignupGenerationNoMutation(t, meta, phoneID, wabaID)
+}
+
+func TestEmbeddedSignupGenerationDiscoveredCaptureStartsAfterDiscovery(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := contractWriter(t, app, org.ID)
+	account := createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, false)
+	barrier := newSignupGenerationBarrier()
+	original := meta.server.Config.Handler
+	meta.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/phone_numbers") {
+			barrier.block(r.Context())
+		}
+		original.ServeHTTP(w, r)
+	})
+	req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", false)
+	finish := startSignupGenerationExchange(t, app, req, barrier)
+	// The phone has not yet been identified: the later snapshot legitimately
+	// observes this tombstone. This explicitly bounds the feature's promise.
+	require.NoError(t, app.DB.Delete(account).Error)
+	finish()
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	var stored models.WhatsAppAccount
+	require.NoError(t, app.DB.Where("id = ?", account.ID).First(&stored).Error)
+	assert.Equal(t, account.ID, stored.ID)
+	assert.Equal(t, "active", stored.Status)
+	assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+phoneID+"/register"))
+	assert.Equal(t, 1, meta.methodHits(http.MethodPost, "/v21.0/"+wabaID+"/subscribed_apps"))
+}
+
+func TestEmbeddedSignupGenerationDatabaseFailuresRefuseAndRecover(t *testing.T) {
+	for _, failAt := range []int32{1, 2} {
+		t.Run(fmt.Sprintf("unscoped-read=%d", failAt), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, true)
+			before := snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID})
+			type faultContextKey struct{}
+			ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), faultContextKey{}, true), 15*time.Second)
+			defer cancel()
+			app.DB = app.DB.WithContext(ctx)
+			callback := "test:signup-generation:" + uuid.NewString()
+			var hits atomic.Int32
+			require.NoError(t, app.DB.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Context.Value(faultContextKey{}) != true || tx.Statement.Table != "whatsapp_accounts" || !tx.Statement.Unscoped {
+					return
+				}
+				if hits.Add(1) == failAt {
+					// A real PostgreSQL error inside this transaction, not a fabricated
+					// ErrRecordNotFound that could masquerade as an absent account.
+					tx.AddError(tx.Session(&gorm.Session{NewDB: true}).Exec("SELECT 1 / 0").Error)
+				}
+			}))
+			t.Cleanup(func() { _ = app.DB.Callback().Query().Remove(callback) })
+			req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", true)
+			req.RequestCtx.SetUserValue(faultContextKey{}, true)
+			require.NoError(t, app.exchangeToken(req, 10*time.Second))
+			require.Equal(t, failAt, hits.Load(), "the actual intended account read must encounter the PG fault")
+			require.NoError(t, app.DB.Callback().Query().Remove(callback))
+			require.Equal(t, fasthttp.StatusInternalServerError, testutil.GetResponseStatusCode(req))
+			assert.Equal(t, before, snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID}))
+			assertSignupGenerationNoMutation(t, meta, phoneID, wabaID)
+			if failAt == 1 {
+				assert.Zero(t, meta.totalHits(), "supplied-phone inspection fails before spending the code")
+			}
+			require.NoError(t, app.DB.Exec("SELECT 1").Error, "the failed phase must have rolled back")
+			fresh := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", true)
+			require.NoError(t, app.exchangeToken(fresh, 10*time.Second))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(fresh))
+		})
+	}
+}
+
+// Serial: actual RLS policies affect the shared test schema. The runtime pool
+// has one connection; pausing Meta must leave it free for the next tenant phase.
+func TestEmbeddedSignupGenerationRuntimeRoleRLSAndOneConnection(t *testing.T) {
+	phoneID, wabaID := contractGraphIDs()
+	meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+	app := newWhatsAppContractApp(t, meta)
+	adminDB := app.DB
+	testutil.TruncateTables(adminDB)
+	runtimeRole := "rereply_generation_" + uuid.NewString()[:8]
+	runtimePassword := "synthetic" + uuid.NewString()[:8]
+	require.NoError(t, adminDB.Exec(fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS",
+		runtimeRole, runtimePassword,
+	)).Error)
+	t.Cleanup(func() {
+		_ = database.RemoveTenantRLS(adminDB)
+		_ = adminDB.Exec("DROP OWNED BY " + runtimeRole).Error
+		_ = adminDB.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
+		testutil.TruncateTables(adminDB)
+	})
+	reseller := testutil.CreateTestReseller(t, adminDB)
+	org := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
+	otherOrg := testutil.CreateTestOrganizationForReseller(t, adminDB, reseller.ID)
+	user := contractWriter(t, app, org.ID)
+	account := createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, false)
+	otherPhone, otherWABA := contractGraphIDs()
+	createSignupGenerationAccount(t, app, otherOrg.ID, otherPhone, otherWABA, "v21.0", false, false)
+	require.NoError(t, database.ApplyTenantRLS(adminDB, runtimeRole))
+	runtimeDB := openRuntimeRoleTestDB(t, runtimeRole, runtimePassword)
+	require.NoError(t, database.VerifyTenantRLS(runtimeDB, runtimeRole))
+	pool, err := runtimeDB.DB()
+	require.NoError(t, err)
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	app.DB = runtimeDB
+	app.Config.Database.RLSEnabled = true
+	app.Config.Database.RuntimeRole = runtimeRole
+	barrier := newSignupGenerationBarrier()
+	meta.onPhoneInfo = func(r *http.Request) { barrier.block(r.Context()) }
+	req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", true)
+	finish := startSignupGenerationExchange(t, app, req, barrier)
+
+	// A different tenant's read on that one runtime connection is possible
+	// while the request is in Meta, but it cannot see this phone or tombstone.
+	foreign, err := app.inspectEmbeddedSignupAccountGeneration(context.Background(), otherOrg.ID, phoneID)
+	require.NoError(t, err)
+	require.True(t, foreign.inspected)
+	assert.False(t, foreign.found)
+	require.NoError(t, adminDB.Delete(account).Error)
+	observer := &App{DB: adminDB}
+	before := snapshotManualAccountWrite(t, observer, []uuid.UUID{org.ID, otherOrg.ID})
+	finish()
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusConflict, "changed")
+	assert.Equal(t, before, snapshotManualAccountWrite(t, observer, []uuid.UUID{org.ID, otherOrg.ID}))
+	assertSignupGenerationNoMutation(t, meta, phoneID, wabaID)
+	var unscoped int64
+	require.NoError(t, runtimeDB.Unscoped().Model(&models.WhatsAppAccount{}).Count(&unscoped).Error)
+	assert.Zero(t, unscoped, "the pooled runtime connection must retain no tenant setting")
+
+	// A fresh request now deliberately observes the same tombstone and can
+	// restore it through the real restricted role after the stale one refused.
+	fresh := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", true)
+	require.NoError(t, app.exchangeToken(fresh, 10*time.Second))
+	require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(fresh))
+	var restored models.WhatsAppAccount
+	require.NoError(t, adminDB.Where("id = ?", account.ID).First(&restored).Error)
+	assert.Equal(t, account.ID, restored.ID)
+	assert.Equal(t, org.ID, restored.OrganizationID)
+	assert.Equal(t, "active", restored.Status)
+}
+
+func TestEmbeddedSignupGenerationCancelledOwnersAndEarliestDeadline(t *testing.T) {
+	for _, owner := range []string{"caller", "receiver", "root"} {
+		t.Run(owner, func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, false)
+			originalDB := app.DB
+			ownerCtx, cancelOwner := context.WithDeadline(context.Background(), time.Now().Add(3*time.Second))
+			defer cancelOwner()
+			callerCtx, cancelCaller := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelCaller()
+			receiver := app
+			switch owner {
+			case "caller":
+				callerCtx = ownerCtx
+			case "receiver":
+				receiver = app.scopedApp(originalDB.WithContext(ownerCtx), org.ID)
+			case "root":
+				app.DB = originalDB.WithContext(ownerCtx)
+				// The receiver deliberately has a different, uncancelled context.
+				receiver = app.scopedApp(originalDB, org.ID)
+			}
+			callback := "test:signup-generation-deadline:" + uuid.NewString()
+			var observedDeadline atomic.Int64
+			var reads atomic.Int32
+			require.NoError(t, originalDB.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table == "whatsapp_accounts" && tx.Statement.Unscoped {
+					reads.Add(1)
+					if deadline, ok := tx.Statement.Context.Deadline(); ok {
+						observedDeadline.Store(deadline.UnixNano())
+					}
+				}
+			}))
+			t.Cleanup(func() { _ = originalDB.Callback().Query().Remove(callback) })
+			generation, err := receiver.inspectEmbeddedSignupAccountGeneration(callerCtx, org.ID, phoneID)
+			require.NoError(t, err)
+			require.True(t, generation.inspected)
+			deadline, ok := ownerCtx.Deadline()
+			require.True(t, ok)
+			require.Equal(t, deadline.UnixNano(), observedDeadline.Load(), "the earliest owner deadline reaches the actual SELECT, not only an asynchronous cancellation callback")
+			require.Equal(t, int32(1), reads.Load())
+			cancelOwner()
+			generation, err = receiver.inspectEmbeddedSignupAccountGeneration(callerCtx, org.ID, phoneID)
+			require.ErrorIs(t, err, errEmbeddedSignupAccountInspection)
+			assert.False(t, generation.inspected)
+			assert.Equal(t, int32(1), reads.Load(), "a cancelled owner refuses before any further account SELECT")
+			assert.Zero(t, meta.totalHits())
+		})
+	}
+}
+
+func TestEmbeddedSignupGenerationAcquisitionUsesCallerBudget(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		t.Run(fmt.Sprintf("held-transaction=%v", nested), func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, false)
+			pool, err := app.DB.DB()
+			require.NoError(t, err)
+			oldMax := pool.Stats().MaxOpenConnections
+			pool.SetMaxOpenConns(1)
+			t.Cleanup(func() { pool.SetMaxOpenConns(oldMax) })
+			holderCtx, cancelHolder := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancelHolder()
+			receiver := app
+			var release func()
+			if nested {
+				held := app.DB.WithContext(holderCtx).Begin()
+				require.NoError(t, held.Error)
+				receiver = app.scopedApp(held, org.ID)
+				var once sync.Once
+				release = func() { once.Do(func() { _ = held.Rollback().Error }) }
+				t.Cleanup(release)
+			} else {
+				held, acquireErr := pool.Conn(holderCtx)
+				require.NoError(t, acquireErr)
+				var once sync.Once
+				release = func() { once.Do(func() { _ = held.Close() }) }
+				t.Cleanup(release)
+			}
+			beforeWaits := pool.Stats().WaitCount
+			ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+			defer cancel()
+			done := make(chan error, 1)
+			joined := false
+			t.Cleanup(func() {
+				cancel()
+				release()
+				if !joined {
+					select {
+					case <-done:
+					case <-time.After(2 * time.Second):
+						t.Error("generation acquisition did not stop after cancellation and release")
+					}
+				}
+			})
+			go func() {
+				_, inspectErr := receiver.inspectEmbeddedSignupAccountGeneration(ctx, org.ID, phoneID)
+				done <- inspectErr
+			}()
+			require.Eventually(t, func() bool { return pool.Stats().WaitCount > beforeWaits }, 500*time.Millisecond, 10*time.Millisecond,
+				"the real max-one pool must observe a waiting acquisition")
+			select {
+			case inspectErr := <-done:
+				joined = true
+				require.ErrorIs(t, inspectErr, errEmbeddedSignupAccountInspection)
+			case <-time.After(2 * time.Second):
+				t.Fatal("generation acquisition exceeded the caller's budget")
+			}
+			require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+			require.NoError(t, holderCtx.Err(), "inspection must not cancel the held owner's context")
+			if nested {
+				require.NoError(t, receiver.DB.Exec("SELECT 1").Error, "the caller's held transaction remains usable")
+			}
+			release()
+			freshCtx, cancelFresh := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancelFresh()
+			generation, inspectErr := app.inspectEmbeddedSignupAccountGeneration(freshCtx, org.ID, phoneID)
+			require.NoError(t, inspectErr)
+			assert.True(t, generation.found)
+			assert.Zero(t, meta.totalHits())
+		})
+	}
+}
+
+func TestEmbeddedSignupGenerationBlockedReadCancellationAndPreOAuthDeadline(t *testing.T) {
+	for _, mode := range []string{"in-flight-cancel", "supplied-provider-deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			phoneID, wabaID := contractGraphIDs()
+			meta := newWhatsAppContractMeta(t, phoneID, wabaID)
+			app := newWhatsAppContractApp(t, meta)
+			org := testutil.CreateTestOrganization(t, app.DB)
+			user := contractWriter(t, app, org.ID)
+			createSignupGenerationAccount(t, app, org.ID, phoneID, wabaID, "v21.0", false, true)
+			before := snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID})
+			fixtureCtx, cancelFixture := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelFixture()
+			app.DB = app.DB.WithContext(fixtureCtx)
+			blocker := app.DB.Begin()
+			require.NoError(t, blocker.Error)
+			var blockerPID int
+			require.NoError(t, blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error)
+			require.NoError(t, blocker.Exec("LOCK TABLE whatsapp_accounts IN ACCESS EXCLUSIVE MODE").Error)
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { _ = blocker.Rollback().Error }) }
+			t.Cleanup(release)
+			ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", true)
+			done := make(chan error, 1)
+			joined := false
+			t.Cleanup(func() {
+				cancel()
+				cancelFixture()
+				release()
+				if !joined {
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Error("generation blocked read did not stop after cancellation and lock release")
+					}
+				}
+			})
+			go func() {
+				if mode == "supplied-provider-deadline" {
+					done <- app.exchangeToken(req, 2*time.Second)
+					return
+				}
+				_, inspectErr := app.inspectEmbeddedSignupAccountGeneration(ctx, org.ID, phoneID)
+				done <- inspectErr
+			}()
+			require.Eventually(t, func() bool {
+				probeCtx, cancelProbe := context.WithTimeout(fixtureCtx, 250*time.Millisecond)
+				defer cancelProbe()
+				var waiting bool
+				queryErr := app.DB.WithContext(probeCtx).Raw(`
+					SELECT EXISTS (
+						SELECT 1 FROM pg_stat_activity
+						WHERE datname = current_database() AND ? = ANY(pg_blocking_pids(pid))
+						AND query LIKE '%BTRIM(phone_id)%'
+					)`, blockerPID).Scan(&waiting).Error
+				return queryErr == nil && waiting
+			}, time.Second, 20*time.Millisecond, "the actual account SELECT must be blocked in PostgreSQL before cancellation/deadline")
+			if mode == "in-flight-cancel" {
+				cancel()
+			}
+			select {
+			case operationErr := <-done:
+				joined = true
+				if mode == "supplied-provider-deadline" {
+					require.NoError(t, operationErr)
+					testutil.AssertErrorResponse(t, req, fasthttp.StatusInternalServerError, "inspect")
+				} else {
+					require.ErrorIs(t, operationErr, errEmbeddedSignupAccountInspection)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("generation read remained blocked after its caller cancellation/deadline")
+			}
+			assert.Zero(t, meta.totalHits(), "a supplied inspection timeout must not spend the OAuth code or call Meta")
+			require.NoError(t, fixtureCtx.Err(), "the caller budget, not the fixture-wide deadline, stopped this operation")
+			release()
+			assert.Equal(t, before, snapshotManualAccountWrite(t, app, []uuid.UUID{org.ID}))
+			fresh := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, "classic", true)
+			require.NoError(t, app.exchangeToken(fresh, 3*time.Second))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(fresh))
+		})
+	}
+}
