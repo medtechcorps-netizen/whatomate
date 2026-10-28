@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 
 // A Coexistence number connected to an empty workspace used to hold its first
 // messages contact-free with no way to see them: the protected staged queue
@@ -60,9 +60,12 @@ const item = {
   message_type: "text",
   received_at: "2026-01-15T08:30:00Z",
   read_only: true,
+  eligibility_known: true,
+  decision_available: false,
+  eligibility_reason: "no_eligible_member",
 };
 
-async function mockApi(page: Page, user: typeof reviewer | typeof agent, stagedRequests: string[]) {
+async function mockApi(page: Page, user: typeof reviewer | typeof agent, stagedRequests: string[], options: { unavailable?: () => boolean; unknownDetail?: boolean; beforeList?: (route: Route) => Promise<void>; afterList?: (route: Route) => void; freshUserName?: string } = {}) {
   await page.addInitScript((mockUser) => {
     window.localStorage.setItem("user", JSON.stringify(mockUser));
     window.localStorage.setItem("color-mode", "dark");
@@ -70,7 +73,7 @@ async function mockApi(page: Page, user: typeof reviewer | typeof agent, stagedR
 
   // Fallback first: Playwright gives later routes priority.
   await page.route("**/api/**", (route) => route.fulfill({ json: { data: {} } }));
-  await page.route(/\/api\/me(?:\?.*)?$/, (route) => route.fulfill({ json: { data: user } }));
+  await page.route(/\/api\/me(?:\?.*)?$/, (route) => route.fulfill({ json: { data: options.freshUserName ? { ...user, full_name: options.freshUserName } : user } }));
   await page.route(/\/api\/product\/entitlements(?:\?.*)?$/, (route) =>
     route.fulfill({
       json: { data: { mode: "licensed", entitlements: { "omnichannel.enabled": true, "crm.enabled": true } } },
@@ -80,14 +83,26 @@ async function mockApi(page: Page, user: typeof reviewer | typeof agent, stagedR
   await page.route(/\/api\/contacts(?:\?.*)?$/, (route) =>
     route.fulfill({ json: { data: { contacts: [], total: 0 } } }),
   );
-  await page.route(/\/api\/identity-reviews\/staged(?:\?.*)?$/, (route) => {
+  await page.route(/\/api\/identity-reviews\/staged(?:\?.*)?$/, async (route) => {
     stagedRequests.push(route.request().url());
-    return route.fulfill({ json: { data: { reviews: [item], total: 1, read_only_total: 1, page: 1, limit: 100 } } });
+    expect(route.request().headers()["x-organization-id"]).toBe(organizationId);
+    try {
+      await options.beforeList?.(route);
+      if (options.unavailable?.()) return await route.fulfill({ status: 503, json: { error_type: "identity_review_observation_unavailable", message: "Review availability unavailable" } });
+      const query = new URL(route.request().url()).searchParams;
+      const pageNumber = Number(query.get("page") || "1");
+      const limit = Number(query.get("limit") || "100");
+      return await route.fulfill({ json: { data: { reviews: pageNumber === 1 ? [item] : [], total: 1, read_only_total: 1, actionable_total: 0, actionable_chain_total: 0, eligibility_known: true, page: pageNumber, limit } } });
+    } finally {
+      options.afterList?.(route);
+    }
   });
   await page.route(new RegExp(`/api/identity-reviews/staged/${stagedId}(?:\\?.*)?$`), (route) => {
     stagedRequests.push(route.request().url());
+    expect(route.request().headers()["x-organization-id"]).toBe(organizationId);
+    expect(new URL(route.request().url()).searchParams.get("eligibility")).toBe("current-v1");
     return route.fulfill({
-      json: { data: { ...item, content: "Saw your ad, how much is it?", media_available: false } },
+      json: { data: { ...item, ...(options.unknownDetail ? { eligibility_known: false, decision_available: false, eligibility_reason: "unavailable", read_only: null } : {}), content: "Saw your ad, how much is it?", media_available: false } },
     });
   });
 }
@@ -101,8 +116,8 @@ test.describe("Workspace entry point for held WhatsApp messages", () => {
 
     const notice = page.getByTestId("staged-identity-review-notice");
     await expect(notice).toBeVisible();
-    await expect(notice).toContainText("1 WhatsApp message is held for identity review");
-    await expect(notice.getByTestId("staged-identity-review-read-only")).toContainText("read-only for now");
+    await expect(notice).toContainText("1 held message");
+    await expect(notice.getByTestId("staged-identity-review-read-only")).toContainText("No reviews are available right now");
 
     await page.getByTestId("staged-identity-review-open").click();
     const dialog = page.getByRole("dialog");
@@ -114,8 +129,9 @@ test.describe("Workspace entry point for held WhatsApp messages", () => {
     await dialog.getByRole("button", { name: /2026-01-15T08:30:00Z/ }).click();
     await expect(dialog).toContainText("Saw your ad, how much is it?");
     const guidance = dialog.getByTestId("staged-identity-review-guidance");
-    await expect(guidance).toContainText("never moved into a conversation");
-    await expect(guidance).toContainText("read-only for now");
+    await expect(guidance).toContainText("No candidate can currently receive");
+    await expect(guidance).toContainText("held copy remains protected");
+    await expect(guidance).not.toContainText("onboarded again");
     expect(stagedRequests.some((url) => url.includes(`/identity-reviews/staged/${stagedId}`))).toBe(true);
 
     // Closing the dialog re-reads the count.
@@ -158,4 +174,127 @@ test.describe("Workspace entry point for held WhatsApp messages", () => {
     await expect(page.getByTestId("staged-identity-review-notice")).toHaveCount(0);
     expect(stagedRequests).toEqual([]);
   });
+});
+
+test("unknown availability remains visible and Retry obtains a current verdict", async ({ page }) => {
+  const requests: string[] = [];
+  let unavailable = true;
+  await mockApi(page, reviewer, requests, { unavailable: () => unavailable });
+  await page.goto("/chat");
+  const notice = page.getByTestId("staged-identity-review-notice");
+  await expect(notice).toContainText("could not be checked");
+  await expect(notice.getByTestId("staged-identity-review-count")).toHaveCount(0);
+  unavailable = false;
+  await page.getByTestId("staged-identity-review-retry").focus();
+  await page.keyboard.press("Enter");
+  await expect(notice.getByTestId("staged-identity-review-count")).toHaveText("0");
+  await expect(notice).toContainText("1 held message");
+  await expect(page.getByTestId("staged-identity-review-open")).toBeVisible();
+});
+
+test("current-v1 unknown detail keeps the authorized copy without actionable guidance", async ({ page }) => {
+  const requests: string[] = [];
+  await mockApi(page, reviewer, requests, { unknownDetail: true });
+  await page.goto("/chat");
+  await page.getByTestId("staged-identity-review-open").click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: /2026-01-15T08:30:00Z/ }).click();
+  await expect(dialog).toContainText("Saw your ad, how much is it?");
+  await expect(dialog.getByTestId("staged-identity-review-guidance")).toContainText("could not be checked");
+  await expect(dialog.getByTestId("staged-identity-review-guidance")).not.toContainText("choose");
+  await expect(dialog.getByTestId("identity-review-decision")).toHaveCount(0);
+  expect(requests.some(url => url.includes("eligibility=current-v1"))).toBe(true);
+});
+
+test("focus and visibility coalesce while the same count request is pending", async ({ page }) => {
+  const requests: string[] = [];
+  const freshUserName = "Current Staged Reviewer";
+  let hold = false;
+  let heldSeen = false;
+  let heldRoute: Route | undefined;
+  let release!: () => void;
+  let finished!: () => void;
+  const pending = new Promise<void>(done => { release = done; });
+  const settled = new Promise<void>(done => { finished = done; });
+  await mockApi(page, reviewer, requests, {
+    freshUserName,
+    beforeList: (route) => { if (hold) { heldSeen = true; heldRoute ??= route; return pending; } return Promise.resolve(); },
+    // Completion belongs to the captured held route, never an older startup read.
+    // Unexpected additional held routes share pending and remain releasable.
+    afterList: (route) => { if (route === heldRoute) finished(); },
+  });
+  try {
+    await page.goto("/chat");
+    // AppLayout applies GET /me to a new auth object. That legitimately
+    // replaces the startup observation; measure one stable generation only.
+    await expect(page.getByRole("button", { name: "User menu", exact: true })).toContainText(freshUserName);
+    await expect(page.getByTestId("staged-identity-review-count")).toHaveText("0");
+    const baseline = requests.length;
+    expect(baseline).toBeGreaterThan(0);
+    hold = true;
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect.poll(() => requests.length).toBe(baseline + 1);
+    expect(heldSeen).toBe(true);
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(requests).toHaveLength(baseline + 1);
+    release();
+    await settled;
+    await expect(page.getByTestId("staged-identity-review-count")).toHaveText("0");
+    expect(requests).toHaveLength(baseline + 1);
+  } finally {
+    release();
+    if (heldSeen) await settled;
+  }
+});
+
+test("a replaced stored workspace cannot publish the old in-flight count", async ({ page }) => {
+  const requests: string[] = [];
+  const freshUserName = "Current Staged Reviewer";
+  let hold = false;
+  let heldSeen = false;
+  let heldRoute: Route | undefined;
+  let release!: () => void;
+  let finished!: () => void;
+  const pending = new Promise<void>(done => { release = done; });
+  const settled = new Promise<void>(done => { finished = done; });
+  await mockApi(page, reviewer, requests, {
+    freshUserName,
+    beforeList: (route) => { if (hold) { heldSeen = true; heldRoute ??= route; return pending; } return Promise.resolve(); },
+    // Completion belongs to the captured held route, never an older startup read.
+    // Unexpected additional held routes share pending and remain releasable.
+    afterList: (route) => { if (route === heldRoute) finished(); },
+  });
+  try {
+    await page.goto("/chat");
+    await expect(page.getByRole("button", { name: "User menu", exact: true })).toContainText(freshUserName);
+    await expect(page.getByTestId("staged-identity-review-count")).toHaveText("0");
+    const baseline = requests.length;
+    expect(baseline).toBeGreaterThan(0);
+    hold = true;
+    const requestStarted = page.waitForRequest(request => new URL(request.url()).pathname === "/api/identity-reviews/staged");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    const heldRequest = await requestStarted;
+    await expect.poll(() => requests.length).toBe(baseline + 1);
+    expect(heldSeen).toBe(true);
+    const requestAborted = page.waitForEvent("requestfailed", request => request === heldRequest);
+    await page.evaluate(() => {
+      window.localStorage.setItem("selected_organization_id", "e8888888-8888-4888-8888-888888888888");
+      window.dispatchEvent(new Event("storage"));
+    });
+    await requestAborted;
+    expect(heldRequest.failure()?.errorText).toContain("ERR_ABORTED");
+    release();
+    await settled;
+    await expect(page.getByTestId("staged-identity-review-count")).toHaveCount(0);
+    await expect(page.getByTestId("staged-identity-review-notice")).not.toContainText("1 held message");
+    // Exactly the current-generation held read occurred. No request adopts
+    // the stored foreign workspace, and the cancelled copy never publishes.
+    expect(requests).toHaveLength(baseline + 1);
+  } finally {
+    release();
+    if (heldSeen) await settled;
+  }
 });
