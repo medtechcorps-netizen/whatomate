@@ -133,15 +133,19 @@ POST /api/auth/refresh
 
 ## Switch Organization
 
-Switch the current user's active organization. Returns new tokens scoped to the target organization with the user's org-specific role and permissions.
+Switch the current browser session's active organization. On success, the server sets HttpOnly access and refresh cookies scoped to the target organization and returns the user's org-specific role and permissions. It retires the presented refresh unit and its retained immediate links; independent login sessions are unchanged.
 
 <Aside type="note">
-  Non-super-admin users must be a member of the target organization. Super admins can switch to any organization.
+  Non-super-admin users must retain access to both the current and target organizations. Super admins do not require explicit membership, but platform compliance organizations remain unavailable for ordinary sessions.
 </Aside>
 
 ```bash
-POST /api/auth/switch-org
+POST /api/auth/refresh/switch-org
 ```
+
+The request must carry the session's access and refresh cookies and a matching `X-CSRF-Token` header. A valid access bearer may replace the access cookie, but it does not remove the refresh-cookie or CSRF requirements. API keys cannot authorize this transition. The old `/api/auth/switch-org` route returns `409` with `error_type: "switch_client_update_required"`; reload an older client before switching.
+
+Confirmed failures before transition use `error_type: "switch_not_applied"` and preserve the current credentials. An unknown Redis outcome uses `503` with `error_type: "switch_outcome_unknown"`; unavailable retained refresh authority uses `409` with `error_type: "switch_session_recovery_required"`. These responses set no session cookies. The current client uses scoped session recovery/sign-in instead of automatically replaying an uncertain switch. An unknown outcome does not prove that the old refresh credential survived.
 
 ### Request Body
 
@@ -171,8 +175,6 @@ POST /api/auth/switch-org
         ]
       }
     },
-    "access_token": "eyJhbGciOiJIUzI1NiIs...",
-    "refresh_token": "eyJhbGciOiJIUzI1NiIs...",
     "expires_in": 3600
   }
 }

@@ -60,8 +60,10 @@ func TestSessionIssuanceSwitchWriteFailurePreservesOldSession(t *testing.T) {
 	f.app.Redis = laneARestrictedRedis(t, admin, "set")
 	req := testutil.NewJSONRequest(t, map[string]any{"organization_id": target.ID.String()})
 	testutil.SetAuthContext(req, f.user.OrganizationID, f.user.ID)
+	switchAttachCredentials(t, req, f.user, f.token)
 	require.NoError(t, f.app.SwitchOrg(req))
 	assertSessionIssueUnavailable(t, req)
+	assert.Equal(t, "switch_not_applied", switchErrorType(t, req))
 	assert.True(t, laneAJTIExists(t, admin, f.jti))
 }
 

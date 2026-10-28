@@ -217,6 +217,7 @@ func TestAuthorityLookupFailureHandlersDoNotReturnPartialSuccess(t *testing.T) {
 			case "login":
 				err = app.Login(req)
 			case "switch":
+				switchAttachCredentials(t, req, user, "")
 				err = app.SwitchOrg(req)
 			case "me":
 				err = app.GetCurrentUser(req)
@@ -259,6 +260,7 @@ func TestAuthorityPermissionReadFailureDoesNotIssuePartialSession(t *testing.T) 
 			case "login":
 				err = app.Login(req)
 			case "switch":
+				switchAttachCredentials(t, req, user, "")
 				err = app.SwitchOrg(req)
 			case "me":
 				err = app.GetCurrentUser(req)
@@ -298,6 +300,7 @@ func TestAuthorityPrimaryLookupFailuresAreUnavailable(t *testing.T) {
 			case "login":
 				err = app.Login(req)
 			case "switch":
+				switchAttachCredentials(t, req, user, "")
 				err = app.SwitchOrg(req)
 			case "me":
 				err = app.GetCurrentUser(req)
