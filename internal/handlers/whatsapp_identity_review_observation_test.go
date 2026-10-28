@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/test/testutil"
 	"github.com/stretchr/testify/assert"
@@ -186,12 +185,22 @@ func TestStagedObservationOlderHoldFilterUsesCompleteLatestClosingChain(t *testi
 
 func TestStagedObservationReadsCurrentPermissionDespiteWarmPermissionCache(t *testing.T) {
 	f := newObservationFixture(t)
-	cache := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: cache.Addr()})
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	client := testutil.SetupTestRedis(t)
+	require.NotNil(t, client, "TEST_REDIS_URL must provide the synthetic Redis fixture")
+	cacheKey := fmt.Sprintf("%s%s:%s", userPermissionsCachePrefix, f.resolver.ID, f.account.OrganizationID)
+	// SetupTestRedis owns a shared client; clean only this fixture's unique key.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		require.NoError(t, client.Del(ctx, cacheKey).Err())
+	})
 	f.app.Redis = client
 	require.True(t, f.app.HasPermission(f.resolver.ID, models.ResourceContactsIdentityReview, models.ActionWrite, f.account.OrganizationID))
-	require.True(t, cache.Exists(fmt.Sprintf("%s%s:%s", userPermissionsCachePrefix, f.resolver.ID, f.account.OrganizationID)))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cached, err := client.Exists(ctx, cacheKey).Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, cached)
 	var membership models.UserOrganization
 	require.NoError(t, f.app.DB.Where("user_id = ? AND organization_id = ?", f.resolver.ID, f.account.OrganizationID).First(&membership).Error)
 	require.NotNil(t, membership.RoleID)
