@@ -45,94 +45,340 @@ const MAX_CANVAS_PIXELS = 3_000_000
 const MAX_OUTPUT_SCALE = 2
 
 // pdf.js leaves out any embedded image larger than this before decoding it,
-// so a hostile or huge image cannot exhaust the worker's memory. 4096x4096
+// before its ordinary decode path. Mask allocation is checked below. 4096x4096
 // still covers an A4 page scanned at 400 dpi.
 export const PDF_PREVIEW_MAX_IMAGE_PIXELS = 4096 * 4096
 
 export interface PdfImageScan {
-  // Some image is over the limit; pdf.js leaves it out of the page.
   oversized: boolean
-  // An image pdf.js will draw uses an image over the limit as its /SMask or
-  // /Mask. pdf.js checks only the drawn image's own size but decodes into a
-  // buffer as large as the image and its masks together, so a 1x1 image with
-  // a 12000x12000 soft mask would allocate over half a gigabyte. Such a file
-  // is not previewed at all.
+  // The combined image/mask draw surface exceeds the pixel budget.
   oversizedMask: boolean
+  // Safe dimensions, stream boundaries or reference identity were not proved.
+  unverifiable: boolean
 }
 
-// Each window is decoded on its own so a large file is never one huge
-// string; latin1 keeps one character per byte. A dictionary is followed at
-// most REACH characters, and windows overlap by that much on each side.
-const SCAN_WINDOW = 1 << 20
-const SCAN_REACH = 4096
-// Bounded repeats keep every pattern linear, whatever the file contains.
-const SCAN_TOKENS = /\bobj\b|\bstream\b|\/Subtype\s*\/Image\b/g
-const OBJECT_NUMBER = /(\d{1,10})\s{1,8}\d{1,5}\s{1,8}$/
-const IMAGE_WIDTH = /\/Width\s{1,8}(\d{1,10})/
-const IMAGE_HEIGHT = /\/Height\s{1,8}(\d{1,10})/
-const MASK_REFERENCE = /\/S?Mask\s{1,8}(\d{1,10})\s{1,8}\d{1,5}\s{1,8}R\b/g
+// Conservative preflight, not a PDF decoder or xref repairer. The byte cursor
+// only moves forward. Strings and stream payloads never supply object IDs.
+// Budget exhaustion falls back to download, never to an assumed safe preview.
+const MAX_SCAN_OBJECTS = 8192
+const MAX_DICTIONARY_BYTES = 64 << 10
+const MAX_SCAN_TOKENS = 1_000_000
+const MAX_VALUE_DEPTH = 32
+const MAX_TOKEN_BYTES = 128
 
-// pdf.js says nothing when it leaves an image out, and a scanned page that is
-// one large image would then look blank, so the sizes are read here first.
-// Image XObjects are streams, which never sit inside compressed object
-// streams, so their dictionaries are plain text in the file; encryption
-// covers only strings and stream data. One pass over each window finds every
-// object header, image subtype and stream keyword; only a dictionary of at
-// most SCAN_REACH characters is ever examined, so hostile input costs linear
-// time (16 MB of repeated image markers scans in well under a second).
-//
-// What this cannot see, and pdf.js still decodes: sizes given indirectly
-// (/Width 12 0 R) or with escaped names (/Wid#74h); inline images in content
-// streams; a JPEG whose own frame size differs from its dictionary; and
-// compression bombs, since pdf.js puts no limit on how far a stream inflates.
-export function scanPdfImages(bytes: Uint8Array, maxPixels = PDF_PREVIEW_MAX_IMAGE_PIXELS): PdfImageScan {
-  const decoder = new TextDecoder('latin1')
-  const oversizedObjects = new Set<number>()
-  const drawnMasks = new Set<number>()
-  let oversized = false
+class PdfScanRefusal extends Error {}
+function refuseScan(): never { throw new PdfScanRefusal() }
+interface PdfToken { kind: string; text: string; start: number }
+type PdfValue = number | string | boolean | null | PdfReference | PdfValue[] | Map<string, PdfValue>
+interface PdfReference { object: number; generation: number }
+interface ScannedImage { width: number; height: number; mask: PdfReference | null }
+const command = (token: PdfToken, text: string) => token.kind === 'word' && token.text === text
+const white = (byte: number) => byte === 0 || byte === 9 || byte === 10 || byte === 12 || byte === 13 || byte === 32
+const delimiter = (byte: number) => white(byte) || byte === 40 || byte === 41 || byte === 60 || byte === 62 || byte === 91 || byte === 93 || byte === 47 || byte === 37
+const digit = (byte: number) => byte >= 48 && byte <= 57
+const refKey = (ref: PdfReference) => ref.object + ':' + ref.generation
+const isReference = (value: PdfValue | undefined): value is PdfReference =>
+  value !== undefined && value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Map)
 
-  for (let offset = 0; offset < bytes.length; offset += SCAN_WINDOW) {
-    const from = Math.max(0, offset - SCAN_REACH)
-    const text = decoder.decode(bytes.subarray(from, Math.min(bytes.length, offset + SCAN_WINDOW + SCAN_REACH)))
-    // Images whose subtype lies in this window's own range are this window's;
-    // the overlaps only supply their headers and stream keywords.
-    const ownStart = offset - from
-    const ownEnd = ownStart + SCAN_WINDOW
-    let header = -1
-    let image = false
-    const tokens = new RegExp(SCAN_TOKENS)
-    for (let match = tokens.exec(text); match; match = tokens.exec(text)) {
-      const at = match.index
-      if (match[0] === 'obj') {
-        header = at
-        image = false
-      } else if (match[0] === 'stream') {
-        if (image && at - header <= SCAN_REACH) {
-          const dictionary = text.slice(header, at)
-          const width = IMAGE_WIDTH.exec(dictionary)
-          const height = IMAGE_HEIGHT.exec(dictionary)
-          const tooLarge = !!width && !!height && Number(width[1]) * Number(height[1]) > maxPixels
-          if (tooLarge) {
-            oversized = true
-            const number = OBJECT_NUMBER.exec(text.slice(Math.max(0, header - 32), header))
-            if (number) oversizedObjects.add(Number(number[1]))
-          } else {
-            // pdf.js drops an oversized image before reading its masks, so
-            // only the masks of images it will draw matter.
-            for (const reference of dictionary.matchAll(MASK_REFERENCE)) drawnMasks.add(Number(reference[1]))
-          }
-        }
-        header = -1
-        image = false
-      } else if (header >= 0 && at - header <= SCAN_REACH && at >= ownStart && at < ownEnd) {
-        image = true
-      }
+class PdfScanReader {
+  position = 0
+  private tokens = 0
+  private ahead: PdfToken[] = []
+  constructor(readonly bytes: Uint8Array) {}
+
+  peek(index = 0): PdfToken {
+    while (this.ahead.length <= index) this.ahead.push(this.token())
+    return this.ahead[index]!
+  }
+  next(): PdfToken { return this.ahead.shift() ?? this.token() }
+
+  private token(): PdfToken {
+    const bytes = this.bytes
+    while (this.position < bytes.length) {
+      if (white(bytes[this.position]!)) { this.position++; continue }
+      if (bytes[this.position] !== 37) break
+      while (this.position < bytes.length && bytes[this.position] !== 10 && bytes[this.position] !== 13) this.position++
     }
+    const start = this.position
+    if (++this.tokens > MAX_SCAN_TOKENS) refuseScan()
+    if (start === bytes.length) return { kind: 'eof', text: '', start }
+    const first = bytes[this.position++]!
+    const result = (kind: string, text = '') => ({ kind, text, start })
+    if (first === 40) {
+      let depth = 1
+      while (this.position < bytes.length && depth) {
+        const byte = bytes[this.position++]!
+        if (byte === 92) { if (this.position < bytes.length) this.position++; continue }
+        if (byte === 40 && ++depth > MAX_VALUE_DEPTH) refuseScan()
+        if (byte === 41) depth--
+      }
+      if (depth) refuseScan()
+      return result('opaque')
+    }
+    if (first === 60) {
+      if (bytes[this.position] === 60) { this.position++; return result('<<') }
+      while (this.position < bytes.length && bytes[this.position] !== 62) {
+        if (!white(bytes[this.position]!) && !/[0-9a-f]/i.test(String.fromCharCode(bytes[this.position]!))) refuseScan()
+        this.position++
+      }
+      if (bytes[this.position++] !== 62) refuseScan()
+      return result('opaque')
+    }
+    if (first === 62) {
+      if (bytes[this.position++] !== 62) refuseScan()
+      return result('>>')
+    }
+    if (first === 91 || first === 93) return result(String.fromCharCode(first))
+    if (first === 41) refuseScan()
+    const numeric = digit(first) || first === 43 || first === 45 || first === 46
+    let text = first === 47 ? '' : String.fromCharCode(first)
+    while (this.position < bytes.length && !delimiter(bytes[this.position]!)) {
+      const byte = bytes[this.position]!
+      // pdf.js accepts "9 0obj": the integer ends before the command.
+      if (numeric && !digit(byte) && byte !== 46) break
+      if (this.position - start >= MAX_TOKEN_BYTES) refuseScan()
+      text += String.fromCharCode(byte)
+      this.position++
+    }
+    if (first === 47) {
+      if (/#(?![0-9a-f]{2})/i.test(text)) refuseScan()
+      text = text.replace(/#([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+      return result('name', text)
+    }
+    return result(numeric ? 'number' : 'word', text)
   }
 
+  value(depth = 0): PdfValue {
+    if (depth > MAX_VALUE_DEPTH) refuseScan()
+    const token = this.next()
+    if (token.kind === 'number') {
+      const value = Number(token.text)
+      if (!Number.isFinite(value)) refuseScan()
+      if (this.peek().kind === 'number' && command(this.peek(1), 'R')) {
+        const generation = Number(this.next().text)
+        this.next()
+        if (!Number.isSafeInteger(value) || value < 0 || !Number.isSafeInteger(generation) || generation < 0) refuseScan()
+        return { object: value, generation }
+      }
+      return value
+    }
+    if (token.kind === 'name') return token.text
+    if (token.kind === 'opaque') return null
+    if (token.kind === 'word' && token.text === 'null') return null
+    if (token.kind === 'word' && (token.text === 'true' || token.text === 'false')) return token.text === 'true'
+    if (token.kind === '[') {
+      const values: PdfValue[] = []
+      while (this.peek().kind !== ']') {
+        if (this.position - token.start > MAX_DICTIONARY_BYTES) refuseScan()
+        values.push(this.value(depth + 1))
+      }
+      this.next()
+      return values
+    }
+    if (token.kind === '<<') {
+      const entries = new Map<string, PdfValue>()
+      while (this.peek().kind !== '>>') {
+        if (this.position - token.start > MAX_DICTIONARY_BYTES) refuseScan()
+        const key = this.next()
+        if (key.kind !== 'name' || entries.has(key.text)) refuseScan()
+        entries.set(key.text, this.value(depth + 1))
+      }
+      this.next()
+      if (this.position - token.start > MAX_DICTIONARY_BYTES) refuseScan()
+      return entries
+    }
+    return refuseScan()
+  }
+
+  skipStream(length: PdfValue | undefined) {
+    // Indirect/missing Length needs xref interpretation. Do not search binary
+    // data for apparent end markers that could hide later image objects.
+    if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0 || this.ahead.length) refuseScan()
+    const bytes = this.bytes
+    if (bytes[this.position] === 13) this.position++
+    if (bytes[this.position] === 10) this.position++
+    else if (bytes[this.position - 1] !== 13) refuseScan()
+    if (length > bytes.length - this.position) refuseScan()
+    this.position += length
+    if (!command(this.next(), 'endstream')) refuseScan()
+  }
+
+  finishFile() {
+    if (this.ahead.length) refuseScan()
+    while (white(this.bytes[this.position]!)) this.position++
+    for (const byte of [37, 37, 69, 79, 70]) {
+      if (this.bytes[this.position++] !== byte) refuseScan() // %%EOF
+    }
+    while (white(this.bytes[this.position]!)) this.position++
+    if (this.position !== this.bytes.length) refuseScan()
+  }
+}
+
+function scanInteger(token: PdfToken): number {
+  if (token.kind !== 'number' || !/^\d+$/.test(token.text)) return refuseScan()
+  const value = Number(token.text)
+  if (!Number.isSafeInteger(value)) return refuseScan()
+  return value
+}
+
+// Validate one ordinary table, not incremental/hybrid xrefs or a repair path.
+// pdf.js can resolve an xref into bytes inside a different stream: every active
+// offset must agree with an actual top-level header seen by our byte cursor.
+function readClassicXref(reader: PdfScanReader): { entries: Map<string, number>; root: PdfReference } {
+  const entries = new Map<string, number>()
+  const seen = new Set<number>()
+  let freeZero = false
+  while (!command(reader.peek(), 'trailer')) {
+    const first = scanInteger(reader.next())
+    const count = scanInteger(reader.next())
+    if (!count || count > MAX_SCAN_OBJECTS + 1 - seen.size || !Number.isSafeInteger(first + count)) refuseScan()
+    for (let index = 0; index < count; index++) {
+      const object = first + index
+      if (seen.has(object)) refuseScan()
+      seen.add(object)
+      const offset = scanInteger(reader.next())
+      const generation = scanInteger(reader.next())
+      const state = reader.next()
+      if (generation > 65535) refuseScan()
+      if (command(state, 'n')) {
+        if (!object || offset >= reader.bytes.length) refuseScan()
+        entries.set(refKey({ object, generation }), offset)
+      } else if (command(state, 'f')) {
+        // pdf.js repairs a subsection starting at1 with a free first entry
+        // by shifting it to0. This validator never adopts that repair.
+        if (first === 1 && index === 0) refuseScan()
+        if (object === 0 && generation === 65535) freeZero = true
+      } else refuseScan()
+    }
+  }
+  reader.next()
+  const trailer = reader.value()
+  if (!(trailer instanceof Map) || trailer.has('Prev') || trailer.has('XRefStm') || trailer.has('Encrypt')) refuseScan()
+  const size = trailer.get('Size')
+  const root = trailer.get('Root')
+  if (!freeZero || typeof size !== 'number' || !Number.isSafeInteger(size) || size <= 0 ||
+      !isReference(root) || !entries.has(refKey(root))) refuseScan()
+  for (const object of seen) if (object >= size) refuseScan()
+  return { entries, root }
+}
+
+function imageDimension(dict: Map<string, PdfValue>, full: string, short: string): number {
+  if (dict.has(full) && dict.has(short)) refuseScan()
+  const value = dict.get(short) ?? dict.get(full)
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) return refuseScan()
+  return value
+}
+
+// Image streams cannot live in compressed object streams. Retain only bounded
+// dimension/reference summaries, including masks without Subtype. Indirect
+// lengths/dimensions, ambiguous revisions and unsupported xref forms refuse
+// some valid PDFs. Every preview requires a complete matching classic xref,
+// even when no stream was observed: pdf.js raw repair can discover hidden ones.
+// Payload/dictionary size disagreement, inline images and decompression
+// expansion remain outside this preflight's guarantee.
+export function scanPdfImages(bytes: Uint8Array, maxPixels = PDF_PREVIEW_MAX_IMAGE_PIXELS): PdfImageScan {
+  let oversized = false
   let oversizedMask = false
-  for (const mask of drawnMasks) oversizedMask ||= oversizedObjects.has(mask)
-  return { oversized, oversizedMask }
+  try {
+    const reader = new PdfScanReader(bytes)
+    const objects = new Map<string, number>()
+    const dictionaries = new Map<string, PdfReference | null>()
+    const streams = new Map<string, Map<string, PdfValue>>()
+    let xref: Map<string, number> | null = null
+    let root: PdfReference | null = null
+    let xrefOffset = -1
+    let ended = false
+    while (reader.peek().kind !== 'eof') {
+      const first = reader.peek()
+      if (xref && !command(first, 'startxref')) refuseScan()
+      if (command(first, 'xref')) {
+        if (xref) refuseScan()
+        xrefOffset = reader.next().start
+        const table = readClassicXref(reader)
+        xref = table.entries
+        root = table.root
+        continue
+      }
+      if (command(first, 'startxref')) {
+        reader.next()
+        if (!xref || scanInteger(reader.next()) !== xrefOffset) refuseScan()
+        reader.finishFile()
+        ended = true
+        break
+      }
+      if (first.kind !== 'number' || reader.peek(1).kind !== 'number' || !command(reader.peek(2), 'obj')) {
+        // Trailer dictionaries/strings cannot supply object declarations.
+        if (first.kind === '<<' || first.kind === '[') reader.value()
+        else {
+          if (['obj', 'stream', 'endstream', 'endobj'].includes(first.text)) refuseScan()
+          reader.next()
+        }
+        continue
+      }
+      const object = Number(reader.next().text)
+      const generation = Number(reader.next().text)
+      reader.next()
+      if (!Number.isSafeInteger(object) || object <= 0 || !Number.isSafeInteger(generation) || generation < 0) refuseScan()
+      const key = refKey({ object, generation })
+      if (objects.has(key) || objects.size >= MAX_SCAN_OBJECTS) refuseScan()
+      objects.set(key, first.start)
+      const value = reader.value()
+      if (command(reader.peek(), 'stream')) {
+        reader.next()
+        if (!(value instanceof Map)) refuseScan()
+        reader.skipStream(value.get('Length'))
+        if (value.get('Type') === 'XRef') refuseScan()
+        const subtype = value.get('Subtype')
+        if (subtype !== undefined && typeof subtype !== 'string') refuseScan()
+        const summary = new Map<string, PdfValue>()
+        for (const name of ['Subtype', 'Width', 'W', 'Height', 'H', 'SMask', 'Mask']) {
+          const field = value.get(name)
+          if (field === undefined) continue
+          // Complex values remain invalid without retaining large subtrees.
+          summary.set(name, field instanceof Map || (Array.isArray(field) && (field.length > 32 || !field.every(item => typeof item === 'number'))) ? false : field)
+        }
+        streams.set(key, summary)
+      } else if (value instanceof Map) {
+        const pages = value.get('Pages')
+        dictionaries.set(key, isReference(pages) ? pages : null)
+      }
+      if (!command(reader.next(), 'endobj')) refuseScan()
+    }
+    if (!xref || !ended) refuseScan()
+    if (xref) {
+      if (!ended || xref.size !== objects.size) refuseScan()
+      for (const [key, offset] of objects) if (xref.get(key) !== offset) refuseScan()
+    }
+    // Pinned pdf.js re-enters raw-object repair when Root or Root.Pages is
+    // not a Dict, even with a valid table. Prove the simple indirect form;
+    // direct/unsupported catalogs fall back rather than reaching that repair.
+    const pages = root ? dictionaries.get(refKey(root)) : null
+    if (!pages || !dictionaries.has(refKey(pages))) refuseScan()
+    const image = (dict: Map<string, PdfValue>): ScannedImage => {
+      const width = imageDimension(dict, 'Width', 'W')
+      const height = imageDimension(dict, 'Height', 'H')
+      const soft = dict.get('SMask')
+      if (soft !== undefined && soft !== null && soft !== 'None' && !isReference(soft)) refuseScan()
+      const mask = soft !== undefined && soft !== null && soft !== 'None' ? soft : dict.get('Mask')
+      if (mask !== undefined && mask !== null && mask !== 'None' && !isReference(mask) && !Array.isArray(mask)) refuseScan()
+      return { width, height, mask: isReference(mask) ? mask : null }
+    }
+    for (const dict of streams.values()) {
+      if (dict.get('Subtype') !== 'Image') continue
+      const drawn = image(dict)
+      if (drawn.width > maxPixels / drawn.height) { oversized = true; continue }
+      if (!drawn.mask) continue
+      const maskDict = streams.get(refKey(drawn.mask))
+      if (!maskDict) refuseScan()
+      const mask = image(maskDict)
+      if (mask.mask) refuseScan() // Do not follow/assume harmless nested chains.
+      if (Math.max(drawn.width, mask.width) > maxPixels / Math.max(drawn.height, mask.height)) oversizedMask = true
+    }
+    return { oversized, oversizedMask, unverifiable: false }
+  } catch (error) {
+    if (!(error instanceof PdfScanRefusal)) throw error
+    return { oversized, oversizedMask, unverifiable: true }
+  }
 }
 
 export type PdfPreviewFailure = 'password' | 'invalid' | 'too-large' | 'unavailable'
@@ -227,6 +473,7 @@ export async function openPdfPreview(blob: Blob, options: { signal?: AbortSignal
 
   // Read before getDocument, which hands the bytes to the worker.
   const images = scanPdfImages(data)
+  if (images.unverifiable) throw new PdfPreviewError('unavailable')
   if (images.oversizedMask) throw new PdfPreviewError('too-large')
   const hasOversizedImages = images.oversized
   const files = runtimeFilesURL(pdfjs.version)
