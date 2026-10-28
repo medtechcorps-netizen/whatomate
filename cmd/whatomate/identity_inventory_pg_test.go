@@ -627,13 +627,16 @@ func TestIdentityInventoryPGLockCancelAndDisposal(t *testing.T) {
 					t.Error("owned blocked collector did not drain")
 				}
 			}()
+			// pg_stat_activity.query may truncate this 1490-byte visibility SQL.
+			// Match its short fixed prefix, then require the exact relation lock
+			// and this test-owned blocker below; never depend on its later tail.
 			var observedPID int32
 			until := time.Now().Add(1500 * time.Millisecond)
 			for time.Now().Before(until) {
 				var pid *int32
 				err = watch.QueryRow(parent, `SELECT a.pid FROM pg_catalog.pg_stat_activity a WHERE a.datname=$1 AND a.application_name=$2 AND a.wait_event_type='Lock'
  AND ((a.query LIKE '%h AS MATERIALIZED%' AND a.query LIKE '%FROM public.whatsapp_identity_review_holds%')
- OR a.query LIKE '%COALESCE(pg_catalog.pg_get_expr(tenant.polqual,tenant.polrelid,false)%')
+ OR a.query LIKE 'SELECT c.relkind=''r'' AND c.relpersistence=''p''%')
  AND EXISTS(SELECT 1 FROM pg_catalog.pg_locks l WHERE l.pid=a.pid AND NOT l.granted AND l.relation='public.whatsapp_identity_review_holds'::pg_catalog.regclass)
  AND $3::integer=ANY(pg_catalog.pg_blocking_pids(a.pid))`, f.database, database.IdentityInventoryApplication, blockerPID).Scan(&pid)
 				if err == nil && pid != nil {
