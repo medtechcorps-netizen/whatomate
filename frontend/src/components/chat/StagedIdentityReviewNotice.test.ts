@@ -87,6 +87,33 @@ describe('StagedIdentityReviewNotice current availability', () => {
     expect(wrapper!.text()).not.toContain('9 reviews')
     expect(wrapper!.find('[data-testid="staged-identity-review-count"]').exists()).toBe(false)
   })
+  it('retires a same-user replaced auth object and coalesces only its current observation', async () => {
+    const previous = deferred<ReturnType<typeof response>>()
+    const current = deferred<ReturnType<typeof response>>()
+    mocks.list.mockReturnValueOnce(previous.promise).mockReturnValueOnce(current.promise)
+    open()
+    expect(mocks.list).toHaveBeenCalledTimes(1)
+    const oldRequest = mocks.list.mock.calls[0]![1]
+    auth.user = { id: 'user-a' }
+    expect(oldRequest.signal.aborted).toBe(true)
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+    const newRequest = mocks.list.mock.calls[1]![1]
+    expect(newRequest.organizationId).toBe('org-a')
+    expect(newRequest.signal.aborted).toBe(false)
+    window.dispatchEvent(new Event('focus'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+    previous.resolve(response(9)); await flushPromises()
+    expect(wrapper!.find('[data-testid="staged-identity-review-count"]').exists()).toBe(false)
+    expect(wrapper!.text()).not.toContain('9 reviews')
+    window.dispatchEvent(new Event('focus')); await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+    expect(newRequest.signal.aborted).toBe(false)
+    current.resolve(response(2)); await flushPromises()
+    expect(wrapper!.get('[data-testid="staged-identity-review-count"]').text()).toBe('2')
+    expect(mocks.list).toHaveBeenCalledTimes(2)
+  })
+
   it('accepts only scoped local invalidations and never takes a filtered numeric total', async () => {
     mocks.list.mockResolvedValue(response(2)); open(); await flushPromises()
     const scope = { organizationId: 'org-a', userId: 'user-a', session: 'old-session', identity: auth.user, permissions: '[true,true,true]', generation: 1, key: 'other-query' }
