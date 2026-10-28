@@ -101,7 +101,7 @@ func TestSLAOriginMetadataCompatibilityMatrix(t *testing.T) {
 					assert.Equal(t, sender.deadline, responded)
 					warning, err := slaWarningNoticeStillCurrent(app.DB, *transfer)
 					require.NoError(t, err)
-					assert.Equal(t, !(tc.eligible && sender.id != nil), warning)
+					assert.Equal(t, !tc.eligible || sender.id == nil, warning)
 				})
 			}
 		})
