@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   routerPush: vi.fn(),
   contactsStore: null as Record<string, any> | null,
   authStore: null as Record<string, any> | null,
+  organizationsStore: null as { selectedOrgId: string | null } | null,
   hasPermission: vi.fn(),
   fetchContacts: vi.fn(),
   fetchMessages: vi.fn(),
@@ -152,9 +153,12 @@ vi.mock('@/stores/auth', async () => {
 vi.mock('@/stores/omnichannelUnread', () => ({
   useOmnichannelUnreadStore: () => ({ refresh: mocks.refreshUnread }),
 }))
-vi.mock('@/stores/organizations', () => ({
-  useOrganizationsStore: () => ({ selectedOrgId: null }),
-}))
+vi.mock('@/stores/organizations', async () => {
+  const { reactive } = await import('vue')
+  const store = reactive({ selectedOrgId: null as string | null })
+  mocks.organizationsStore = store
+  return { useOrganizationsStore: () => store }
+})
 vi.mock('@/stores/users', () => ({
   useUsersStore: () => ({ users: [], fetchUsers: mocks.fetchUsers }),
 }))
@@ -270,6 +274,8 @@ describe('ChatView inbox state', () => {
     vi.useFakeTimers()
     vi.clearAllMocks()
     mocks.infiniteControllers = []
+    mocks.organizationsStore!.selectedOrgId = null
+    Object.assign(mocks.authStore!, { isAuthenticated: true, organizationId: 'organization-1', user: { id: 'agent-1' } })
     mocks.routeSource.params.contactId = 'first'
     if (mocks.route) mocks.route.params.contactId = 'first'
     const first = laneDContact('first')
@@ -321,6 +327,28 @@ describe('ChatView inbox state', () => {
     await nextTick()
     return wrapper
   }
+
+  it('changes the message-menu scope before a requested contact loads and on auth/org changes', async () => {
+    const view = await mountSettled()
+    const menu = () => view.findComponent({ name: 'MessageContextMenu' })
+    let previous = menu().props('scopeKey')
+    mocks.fetchMessages.mockImplementation(() => new Promise(() => {}))
+    mocks.route!.params.contactId = 'second'
+    await nextTick()
+    expect(menu().props('scopeKey')).not.toBe(previous)
+    previous = menu().props('scopeKey')
+    mocks.organizationsStore!.selectedOrgId = 'organization-2'
+    await nextTick()
+    expect(menu().props('scopeKey')).not.toBe(previous)
+    previous = menu().props('scopeKey')
+    mocks.authStore!.user = { id: 'agent-2' }
+    await nextTick()
+    expect(menu().props('scopeKey')).not.toBe(previous)
+    previous = menu().props('scopeKey')
+    mocks.authStore!.isAuthenticated = false
+    await nextTick()
+    expect(menu().props('scopeKey')).not.toBe(previous)
+  })
 
   it('loads the default list and wires the filter chips to the store', async () => {
     const view = await mountSettled()
