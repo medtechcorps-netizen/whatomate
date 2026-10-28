@@ -170,6 +170,9 @@ func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 		afterCommitScoped:     true,
 		channelAdapterFactory: root.channelAdapterFactory,
 	}
+	// Keep logical account ownership even when the caller deliberately clears
+	// tenantOrgID for non-RLS operation. A new scope always replaces this value.
+	scoped.expectedAccountOrganizationID = organizationID
 	// Subscriber lifecycle callbacks and RealtimeSourceID are root-owned.
 	// Scoped apps resolve realtime identity through rootApp and never copy
 	// lifecycle state that can change during graceful shutdown.
@@ -272,6 +275,30 @@ func (a *App) WithCommittedTenantApp(organizationID uuid.UUID, fn func(*App) err
 	}
 	a.runAfterCommit(afterCommit)
 	return nil
+}
+
+// withCommittedTenantReadOnDB runs a read-only callback on the already-bound
+// database supplied by withBoundedRootConnection. The caller owns its complete
+// deadline and connection; this helper never goes back to the root pool, creates
+// an App copy, or runs provider/after-commit callbacks. Kept separate so existing
+// durable writer phases retain their current cancellation/settlement semantics.
+func (a *App) withCommittedTenantReadOnDB(db *gorm.DB, organizationID uuid.UUID, fn func(*gorm.DB) error) error {
+	if a == nil || db == nil || fn == nil {
+		return errors.New("tenant read callback and database are required")
+	}
+	if organizationID == uuid.Nil {
+		return database.ErrMissingTenant
+	}
+	phase := func(tx *gorm.DB) error {
+		if err := requireOrdinaryTenantOrganization(tx, organizationID); err != nil {
+			return err
+		}
+		return fn(tx)
+	}
+	if a.rlsEnabled() {
+		return database.WithTenant(db, organizationID, phase)
+	}
+	return db.Transaction(phase)
 }
 
 // withCommittedTenantReadCommittedApp preserves the explicit READ COMMITTED
