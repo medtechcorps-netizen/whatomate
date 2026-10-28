@@ -964,6 +964,8 @@ func runServer(args []string) {
 	startLoop := func(name string, run func()) {
 		ownedLoops = append(ownedLoops, startServerLoop(name, run))
 	}
+	poolDiagnosticsCtx, poolDiagnosticsCancel := context.WithCancel(context.Background())
+	startLoop("database pool diagnostics", func() { app.RunDatabasePoolDiagnostics(poolDiagnosticsCtx) })
 
 	// Start SLA processor (runs every minute)
 	slaProcessor := handlers.NewSLAProcessor(app, time.Minute)
@@ -1090,6 +1092,10 @@ func runServer(args []string) {
 	// listener shutdown or cancellation of another processor.
 	tasks := []serverShutdownTask{
 		{"HTTP shutdown", server.ShutdownWithContext},
+		{"database pool diagnostics stop request", func(context.Context) error {
+			poolDiagnosticsCancel()
+			return nil
+		}},
 		{"realtime subscriber stop call", func(context.Context) error {
 			app.StopRealtimeSubscriber()
 			return nil
@@ -1249,6 +1255,7 @@ func runWorker(args []string) {
 		workers[i] = w
 	}
 
+	poolDiagnostics := &handlers.App{DB: db, Log: lo}
 	// Captured signals now go directly to the independent deadline owner.
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -1259,7 +1266,7 @@ func runWorker(args []string) {
 		} else {
 			lo.Info("Worker loops and close calls finished")
 		}
-	})
+	}, standaloneBackgroundLoop{"database pool diagnostics", poolDiagnostics.RunDatabasePoolDiagnostics})
 	// The deadline owner has returned; no blocking cleanup/logging follows.
 }
 
@@ -2297,10 +2304,15 @@ type standaloneWorker interface {
 	Close() error
 }
 
+type standaloneBackgroundLoop struct {
+	name string
+	run  func(context.Context)
+}
+
 // runStandaloneWorkers uses the same independent absolute deadline owner as
 // the server. Only actual loop returns count as joined. Close cannot tear down
 // resources used by a loop that is still settling its durable attempt.
-func runStandaloneWorkers(workers []standaloneWorker, quit <-chan os.Signal, budget time.Duration, report func(serverShutdownResult)) serverShutdownResult {
+func runStandaloneWorkers(workers []standaloneWorker, quit <-chan os.Signal, budget time.Duration, report func(serverShutdownResult), background ...standaloneBackgroundLoop) serverShutdownResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	exits := make(chan struct{}, len(workers)*4)
 	tasks := []serverShutdownTask{{"worker stop request", func(context.Context) error { cancel(); return nil }}}
@@ -2348,6 +2360,11 @@ func runStandaloneWorkers(workers []standaloneWorker, quit <-chan os.Signal, bud
 			return worker.Close()
 		}})
 	}
+	for _, loop := range background {
+		tasks = append(tasks, startServerLoop(loop.name, func() { loop.run(ctx) }))
+	}
+	// Observational loop completion never sends to exits: an unavailable
+	// diagnostic must not become a process-exit/restart watchdog.
 	// No synchronous logger/cancel/Close may precede establishing the deadline.
 	select {
 	case <-quit:
