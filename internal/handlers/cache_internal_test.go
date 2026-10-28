@@ -758,8 +758,9 @@ func TestWhatsAppAccountCacheRuntimeRoleRLSChecksCurrentOwner(t *testing.T) {
 		_ = admin.Exec("DROP ROLE IF EXISTS " + runtimeRole).Error
 		testutil.TruncateTables(admin)
 	})
-	priorOrg := testutil.CreateTestOrganization(t, admin)
-	currentOrg := testutil.CreateTestOrganization(t, admin)
+	reseller := testutil.CreateTestReseller(t, admin)
+	priorOrg := testutil.CreateTestOrganizationForReseller(t, admin, reseller.ID)
+	currentOrg := testutil.CreateTestOrganizationForReseller(t, admin, reseller.ID)
 	phoneID := "cache-runtime-" + uuid.NewString()
 	healthyRedis := app.Redis
 	t.Cleanup(func() { _ = healthyRedis.Del(context.Background(), whatsappAccountCachePrefix+phoneID).Err() })

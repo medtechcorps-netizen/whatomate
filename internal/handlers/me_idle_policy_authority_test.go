@@ -96,8 +96,11 @@ func TestMeIdlePolicyInheritsCancellationAtThePolicyRead(t *testing.T) {
 		if !meIdlePolicyQuery(tx) {
 			return false
 		}
-		require.Same(t, parent, tx.Statement.Context)
+		// Tenant adds a value binding; cancellation must still reach the actual policy query.
+		require.Equal(t, parent.Done(), tx.Statement.Context.Done())
+		require.NoError(t, tx.Statement.Context.Err())
 		cancel()
+		require.ErrorIs(t, tx.Statement.Context.Err(), context.Canceled)
 		return true
 	}, nil)
 	app.DB = faulty.WithContext(parent)
