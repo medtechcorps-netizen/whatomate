@@ -27,6 +27,10 @@ vi.mock('@/services/api', () => ({
   isTabSessionCurrent: () => mocks.tabSession !== null && mocks.tabSession === mocks.sessionId,
 }))
 
+vi.mock('@/lib/tabSession', () => ({
+  currentTabSession: () => mocks.tabSession !== null && mocks.tabSession === mocks.sessionId ? mocks.tabSession : null,
+}))
+
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => mocks.currentStore,
 }))
@@ -38,6 +42,7 @@ vi.mock('@/stores/calling', () => ({
 import { SESSION_IDLE_WARNING_MS, useSessionIdle } from './useSessionIdle'
 import {
   LAST_ACTIVITY_KEY,
+  clearLastActivity,
   SESSION_ENDING_EVENT,
   SESSION_IDLE_POLICY_KEY,
   SESSION_POLICY_EVENT,
@@ -113,6 +118,7 @@ async function open(store = authStore()) {
 describe('useSessionIdle', () => {
   beforeEach(() => {
     vi.useFakeTimers({ now: new Date('2026-10-15T09:00:00Z') })
+    clearLastActivity()
     localStorage.clear()
     localStorage.setItem('user', JSON.stringify({ id: 'user-1', organization_id: 'org-1' }))
     mocks.sessionId = 'session-1'
@@ -144,9 +150,99 @@ describe('useSessionIdle', () => {
 
   afterEach(() => {
     while (wrappers.length) wrappers.pop()!.unmount()
+    vi.restoreAllMocks()
     vi.unstubAllGlobals()
     vi.useRealTimers()
     Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
+  })
+
+
+  it('shares activity when storage writes fail without rebroadcasting incoming notices', async () => {
+    policy(30)
+    localStorage.setItem(LAST_ACTIVITY_KEY, String(Date.now()))
+    const { idle, store } = await open()
+    const received: unknown[] = []
+    const other = new FakeBroadcastChannel('whm-session')
+    other.onmessage = event => received.push(event.data)
+    const storage = localStorage
+    const deniedWrite = vi.fn(() => { throw new Error('storage denied') })
+    vi.stubGlobal('localStorage', {
+      getItem: storage.getItem.bind(storage), setItem: deniedWrite,
+      removeItem: storage.removeItem.bind(storage), clear: storage.clear.bind(storage),
+    })
+    expect(() => localStorage.setItem('denial-probe', 'value')).toThrow('storage denied')
+    deniedWrite.mockClear()
+
+    await vi.advanceTimersByTimeAsync(20 * MINUTE)
+    window.dispatchEvent(new Event('pointerdown'))
+    expect(received).toEqual([{ type: 'activity', session: 'session-1', identity: IDENTITY, at: Date.now() }])
+    const writes = deniedWrite
+    writes.mockClear()
+    await vi.advanceTimersByTimeAsync(20 * MINUTE)
+    other.postMessage({ type: 'activity', session: 'session-1', identity: IDENTITY, at: Date.now() })
+    expect(writes).not.toHaveBeenCalled()
+    expect(received).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(20 * MINUTE)
+    expect(idle.warningOpen.value).toBe(false)
+    expect(store.clearAuth).not.toHaveBeenCalled()
+    expect(mocks.endSessionInBackground).not.toHaveBeenCalled()
+  })
+
+  it('bounds activity broadcasts even when lifecycle flushes happen repeatedly', async () => {
+    policy(30)
+    await open()
+    const received: unknown[] = []
+    const other = new FakeBroadcastChannel('whm-session')
+    other.onmessage = event => received.push(event.data)
+    await vi.advanceTimersByTimeAsync(5_000)
+    for (let count = 0; count < 20; count++) {
+      window.dispatchEvent(new Event('pointermove'))
+      window.dispatchEvent(new Event('pagehide'))
+      await vi.advanceTimersByTimeAsync(100)
+    }
+    expect(received).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(5_000)
+    window.dispatchEvent(new Event('pointermove'))
+    expect(received).toHaveLength(2)
+  })
+
+  it.each([
+    { id: 'user-1' },
+    { id: 'user-1', organization_id: ' ' },
+    { id: 'user-1', organization_id: {} },
+    { id: 42, organization_id: 'org-1' },
+    { id: 'user|1', organization_id: 'org-1' },
+    { id: 'user-1', organization_id: 'org|1' },
+  ])('does not broadcast an incomplete or ambiguous scope or add a logout (%j)', async user => {
+    policy(30)
+    const { store } = await open()
+    const received: unknown[] = []
+    const other = new FakeBroadcastChannel('whm-session')
+    other.onmessage = event => received.push(event.data)
+    localStorage.setItem('user', JSON.stringify(user))
+    await vi.advanceTimersByTimeAsync(5_000)
+    window.dispatchEvent(new Event('pointerdown'))
+    window.dispatchEvent(new Event('pagehide'))
+    expect(received).toEqual([])
+    expect(store.isAuthenticated).toBe(true)
+    expect(store.clearAuth).not.toHaveBeenCalled()
+    expect(mocks.endSessionInBackground).not.toHaveBeenCalled()
+    expect(assignedHref).toBeNull()
+  })
+
+  it('a replaced tab cannot persist or broadcast activity for the newer session', async () => {
+    policy(30)
+    await open()
+    const received: unknown[] = []
+    const other = new FakeBroadcastChannel('whm-session')
+    other.onmessage = event => received.push(event.data)
+    await vi.advanceTimersByTimeAsync(5_000)
+    mocks.sessionId = 'session-2'
+    const before = localStorage.getItem(LAST_ACTIVITY_KEY)
+    window.dispatchEvent(new Event('pointerdown'))
+    window.dispatchEvent(new Event('pagehide'))
+    expect(localStorage.getItem(LAST_ACTIVITY_KEY)).toBe(before)
+    expect(received).toEqual([])
   })
 
   it('warns two minutes before the timeout, then signs out at once', async () => {

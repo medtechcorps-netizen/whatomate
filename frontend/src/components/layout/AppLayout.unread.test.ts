@@ -81,6 +81,13 @@ vi.mock('@/services/websocket', () => ({
 
 vi.mock('@/services/api', () => ({
   authService: { getWSToken: vi.fn() },
+  checkSessionIdlePolicy: vi.fn().mockResolvedValue(undefined),
+  endSessionInBackground: vi.fn(),
+  keepSessionAlive: vi.fn().mockResolvedValue(undefined),
+  isTabSessionCurrent: () => true,
+  markSessionEnding: vi.fn(),
+  readSessionId: () => 'unread-layout-session',
+  readTabSession: () => 'unread-layout-session',
 }))
 
 vi.mock('@/components/brand/ReReplyLogo.vue', () => ({
@@ -132,6 +139,7 @@ describe('AppLayout Omnichannel unread marker', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.clear()
     mocks.authStore = reactive({
       isAuthenticated: false,
       user: { id: 'agent-1', is_super_admin: false },
@@ -153,6 +161,7 @@ describe('AppLayout Omnichannel unread marker', () => {
   afterEach(() => {
     wrapper?.unmount()
     wrapper = null
+    localStorage.clear()
   })
 
   it('hides every unread marker when the count is zero or unknown', async () => {
