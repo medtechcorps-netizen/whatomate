@@ -4588,8 +4588,10 @@ func TestEmbeddedSignupGenerationPreservesExactTombstoneAndActiveRefresh(t *test
 					barrier := newSignupGenerationBarrier()
 					meta.onPhoneInfo = func(r *http.Request) { barrier.block(r.Context()) }
 					req := signupGenerationRequest(t, org.ID, user.ID, phoneID, wabaID, mode, supplied)
+					refreshStarted := time.Now().UTC()
 					finish := startSignupGenerationExchange(t, app, req, barrier)
 					finish()
+					refreshCompleted := time.Now().UTC()
 					require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req), string(testutil.GetResponseBody(req)))
 					var stored models.WhatsAppAccount
 					require.NoError(t, app.DB.Where("id = ?", account.ID).First(&stored).Error)
@@ -4600,7 +4602,35 @@ func TestEmbeddedSignupGenerationPreservesExactTombstoneAndActiveRefresh(t *test
 					assert.Equal(t, !deleted, stored.IsDefaultIncoming)
 					assert.Equal(t, !deleted, stored.IsDefaultOutgoing)
 					assert.Equal(t, !deleted, stored.AutoReadReceipt)
-					assert.Equal(t, states, signupGenerationStates(t, app, org.ID), "accepted SMB cycle and requests are immutable")
+					afterStates := signupGenerationStates(t, app, org.ID)
+					if deleted && meta.phoneIsOnBizApp {
+						// Restoring this exact SMB tombstone records a credential refresh.
+						// That lifecycle audit must advance, without reopening or changing
+						// any accepted one-time sync cycle, request, consent or progress.
+						require.Len(t, states, 1)
+						require.Len(t, afterStates, 1)
+						preserved := afterStates[0]
+						require.NotNil(t, preserved.LastLifecycleEventAt)
+						require.NotNil(t, preserved.ReconnectedAt)
+						assert.Equal(t, "EMBEDDED_SIGNUP_CREDENTIAL_REFRESH", preserved.LastLifecycleEvent)
+						assert.Equal(t, states[0].Version+1, preserved.Version)
+						assert.True(t, preserved.ReconnectedAt.Equal(*preserved.LastLifecycleEventAt))
+						assert.Zero(t, preserved.LastLifecycleEventAt.Nanosecond(), "provider lifecycle fence uses second precision")
+						assert.False(t, preserved.LastLifecycleEventAt.Before(refreshStarted.Truncate(time.Second)))
+						assert.False(t, preserved.LastLifecycleEventAt.After(refreshCompleted.Truncate(time.Second)))
+						assert.False(t, preserved.UpdatedAt.Before(refreshStarted))
+						assert.False(t, preserved.UpdatedAt.After(refreshCompleted))
+						assert.False(t, preserved.UpdatedAt.Before(states[0].UpdatedAt))
+						expected := states[0]
+						expected.UpdatedAt = preserved.UpdatedAt
+						expected.LastLifecycleEvent = "EMBEDDED_SIGNUP_CREDENTIAL_REFRESH"
+						expected.LastLifecycleEventAt = preserved.LastLifecycleEventAt
+						expected.ReconnectedAt = preserved.ReconnectedAt
+						expected.Version++
+						assert.Equal(t, expected, preserved, "all other lifecycle and accepted SMB sync fields remain immutable")
+					} else {
+						assert.Equal(t, states, afterStates, "active refresh and classic restoration leave all coexistence state unchanged")
+					}
 					if !deleted {
 						assertSignupGenerationNoMutation(t, meta, phoneID, wabaID)
 					} else {
