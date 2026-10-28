@@ -515,3 +515,79 @@ describe('Calendar person-first entry points', () => {
     expect(wrapper!.find('form[aria-label="Service details"]').exists()).toBe(false)
   })
 })
+
+
+describe('Calendar weeks across resource timezones', () => {
+  it.each([true, false])('includes both distant week boundaries and excludes margin-only slots (nested resource: %s)', async (includeResource) => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 9, 28, 12))
+    resources = [
+      { ...resources[0]!, id: 'east', timezone: 'Pacific/Kiritimati' },
+      { ...resources[0]!, id: 'west', timezone: 'Etc/GMT+12' },
+    ]
+    const cases = [
+      { id: 'monday-east', resource: resources[0]!, starts_at: '2026-10-25T10:15:00Z', capacity: 2, booked_quantity: 1 },
+      { id: 'sunday-west', resource: resources[1]!, starts_at: '2026-11-02T11:45:00Z', capacity: 3, booked_quantity: 2 },
+      { id: 'previous-sunday', resource: resources[1]!, starts_at: '2026-10-26T11:45:00Z', capacity: 100, booked_quantity: 90 },
+      { id: 'next-monday', resource: resources[0]!, starts_at: '2026-11-01T10:15:00Z', capacity: 200, booked_quantity: 190 },
+    ]
+    const candidates: BookingEvent[] = cases.map((item) => ({
+      id: item.id, service_id: 'service-one', resource_id: item.resource.id,
+      starts_at: item.starts_at,
+      ends_at: new Date(Date.parse(item.starts_at) + 15 * 60_000).toISOString(),
+      capacity: item.capacity, booked_quantity: item.booked_quantity,
+      status: 'scheduled', version: 1,
+      service: { ...services[0]!, name: item.id },
+      ...(includeResource ? { resource: copy(item.resource) } : {}),
+    }))
+    // Match the real API's inclusive starts_at filters, rather than returning
+    // fixtures the old query would never receive.
+    mocks.get.mockImplementation((url: string, options?: { params?: Record<string, string> }) => {
+      if (url !== '/booking/events') return readFixture(url)
+      const from = Date.parse(options?.params?.from || '')
+      const to = Date.parse(options?.params?.to || '')
+      const listed = candidates.filter(item => from <= Date.parse(item.starts_at) && Date.parse(item.starts_at) <= to)
+      return envelope({ events: listed, total: listed.length })
+    })
+    await open()
+    const cards = wrapper!.findAll('[data-testid="calendar-event-card"]')
+    expect(cards).toHaveLength(2)
+    expect(cards[0]!.text()).toContain('monday-east')
+    expect(cards[1]!.text()).toContain('sunday-west')
+    expect(wrapper!.text()).toContain('3/5 seats booked')
+    expect(wrapper!.text()).not.toContain('previous-sunday')
+    expect(wrapper!.text()).not.toContain('next-monday')
+    await action('Next week').trigger('click')
+    await flushPromises()
+    expect(wrapper!.findAll('[data-testid="calendar-event-card"]')).toHaveLength(1)
+    expect(wrapper!.get('[data-testid="calendar-event-card"]').text()).toContain('next-monday')
+    expect(wrapper!.text()).toContain('190/200 seats booked')
+  })
+
+  it('keeps both occurrences of the repeated resource-local hour on the Sunday clock change', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 9, 28, 12))
+    resources[0]!.timezone = 'America/New_York'
+    const candidates: BookingEvent[] = ['2026-11-01T05:30:00Z', '2026-11-01T06:30:00Z'].map((start, index) => ({
+      id: `repeated-${index}`, service_id: 'service-one', resource_id: 'resource-one',
+      starts_at: start, ends_at: new Date(Date.parse(start) + 15 * 60_000).toISOString(),
+      capacity: 1, status: 'scheduled', version: 1, service: copy(services[0]!),
+    }))
+    mocks.get.mockImplementation((url: string, options?: { params?: Record<string, string> }) => {
+      if (url !== '/booking/events') return readFixture(url)
+      const from = Date.parse(options?.params?.from || '')
+      const to = Date.parse(options?.params?.to || '')
+      const listed = candidates.filter(item => from <= Date.parse(item.starts_at) && Date.parse(item.starts_at) <= to)
+      return envelope({ events: listed, total: listed.length })
+    })
+    await open()
+    expect(wrapper!.findAll('[data-testid="calendar-event-card"]')).toHaveLength(2)
+    const times = wrapper!.findAll('[data-testid="calendar-event-time"]').map(item => item.text())
+    expect(times[0]).toBe(times[1])
+    expect(wrapper!.text()).toContain('0/2 seats booked')
+    await action('Next week').trigger('click')
+    await flushPromises()
+    expect(wrapper!.findAll('[data-testid="calendar-event-card"]')).toHaveLength(0)
+    expect(wrapper!.text()).toContain('0/0 seats booked')
+  })
+})
