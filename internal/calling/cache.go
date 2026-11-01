@@ -175,10 +175,12 @@ func (m *Manager) applyOrgOverrides(s *orgCallingSettings, settings map[string]a
 		s.TransferTimeoutSecs = int(v)
 	}
 	if v, ok := settings["hold_music_file"].(string); ok && v != "" {
-		s.HoldMusicFile = m.config.AudioDir + "/" + v
+		s.holdMusicReference = v
+		s.HoldMusicFile = ""
 	}
 	if v, ok := settings["ringback_file"].(string); ok && v != "" {
-		s.RingbackFile = m.config.AudioDir + "/" + v
+		s.ringbackReference = v
+		s.RingbackFile = ""
 	}
 }
 
