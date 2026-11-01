@@ -38,6 +38,7 @@ import {
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
+import type { IdentityReviewScope } from '@/composables/useIdentityReviewObservation'
 import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
@@ -1355,6 +1356,8 @@ async function toggleConversationAI() {
     }
   }
 }
+
+const identityReviewInvalidation = ref<IdentityReviewScope | null>(null)
 
 async function refreshAfterIdentityReview(state: ContactIdentityReviewEffectiveState) {
   const conversationID = selectedConversation.value?.id
@@ -2843,7 +2846,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
           </div>
         </div>
 
-        <StagedIdentityReviewNotice :can-view="canViewStagedContactIdentity" />
+        <StagedIdentityReviewNotice :can-view="canViewStagedContactIdentity" :invalidation="identityReviewInvalidation" />
 
         <div class="flex-1 overflow-y-auto">
           <button
@@ -3215,6 +3218,7 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
       :can-review="canReviewContactIdentity"
       :can-view-staged="canViewStagedContactIdentity"
       @resolved="refreshAfterIdentityReview"
+      @queue-invalidated="identityReviewInvalidation = $event"
     />
 
     <div

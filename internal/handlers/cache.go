@@ -290,15 +290,23 @@ type whatsAppAccountCache struct {
 	Pin         string `json:"pin"`
 }
 
-// getWhatsAppAccountCached retrieves WhatsApp account by phone_id from cache or database
+// getWhatsAppAccountCached retrieves WhatsApp account by phone_id from cache or database.
+// Cached credentials are usable only after the same DB owner confirms live identity.
 func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount, error) {
 	phoneID = strings.TrimSpace(phoneID)
 	if phoneID == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
+	if a == nil || a.DB == nil {
+		return nil, gorm.ErrInvalidDB
+	}
 	if a.rlsEnabled() && !a.hasTenantScope() {
 		var account *models.WhatsAppAccount
 		err := a.withPhoneTenant(phoneID, func(scoped *App) error {
+			if a.expectedAccountOrganizationID != uuid.Nil &&
+				a.expectedAccountOrganizationID != scoped.expectedAccountOrganizationID {
+				return gorm.ErrRecordNotFound
+			}
 			var scopedErr error
 			account, scopedErr = scoped.getWhatsAppAccountCached(phoneID)
 			return scopedErr
@@ -306,23 +314,49 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 		return account, err
 	}
 
+	// Logical ownership survives non-RLS callbacks without pretending that the
+	// root pool is a tenant transaction. Existing explicit transaction scopes
+	// remain an independent constraint; a contradiction must fail closed.
+	expectedOrg := a.expectedAccountOrganizationID
+	if a.hasTenantScope() {
+		if expectedOrg != uuid.Nil && expectedOrg != a.tenantOrgID {
+			return nil, gorm.ErrRecordNotFound
+		}
+		expectedOrg = a.tenantOrgID
+	}
+	lookup := func() *gorm.DB {
+		// Use this owner's handle/context, including its held transaction. Never
+		// acquire a root connection while verifying a scoped cache hit.
+		query := a.DB.Where("BTRIM(phone_id) = BTRIM(?)", phoneID).
+			Where("deleted_at IS NULL")
+		if expectedOrg != uuid.Nil {
+			query = query.Where("organization_id = ?", expectedOrg)
+		}
+		return query
+	}
+
 	ctx := context.Background()
 	cacheKey := fmt.Sprintf("%s%s", whatsappAccountCachePrefix, phoneID)
 
-	// Try cache first when Redis is configured.
 	if a.Redis != nil {
 		cached, err := a.Redis.Get(ctx, cacheKey).Result()
 		if err == nil && cached != "" {
 			var cacheData whatsAppAccountCache
 			if err := json.Unmarshal([]byte(cached), &cacheData); err == nil {
-				cacheMatchesRequest := strings.TrimSpace(cacheData.PhoneID) == phoneID
-				if a.hasTenantScope() {
-					cacheMatchesRequest = cacheMatchesRequest &&
-						cacheData.OrganizationID == a.tenantOrgID
+				var live models.WhatsAppAccount
+				if err := lookup().Select("id", "organization_id", "phone_id").First(&live).Error; err != nil {
+					// Missing or unavailable live authority cannot be replaced by
+					// credentials in Redis, even when eviction is unavailable.
+					return nil, err
 				}
-				if !cacheMatchesRequest {
-					// A global phone key can outlive a soft-delete/reclaim. Never
-					// consume another tenant's cached credentials from a scoped app.
+				cacheMatchesLive := !cacheData.DeletedAt.Valid &&
+					cacheData.ID != uuid.Nil && cacheData.ID == live.ID &&
+					cacheData.OrganizationID != uuid.Nil && cacheData.OrganizationID == live.OrganizationID &&
+					strings.TrimSpace(cacheData.PhoneID) == phoneID && strings.TrimSpace(live.PhoneID) == phoneID
+				if !cacheMatchesLive {
+					// A global key can outlive a soft-delete/reclaim, including a
+					// replacement row in the same organization. Eviction is only
+					// best effort; the fresh DB read below owns the returned values.
 					a.Redis.Del(ctx, cacheKey)
 				} else {
 					cacheData.WhatsAppAccount.AccessToken = cacheData.AccessToken
@@ -338,13 +372,10 @@ func (a *App) getWhatsAppAccountCached(phoneID string) (*models.WhatsAppAccount,
 		}
 	}
 
-	// Cache miss - fetch from database
+	// Fetch a fresh complete row after a miss or an identity mismatch. Rebuild
+	// the query so the identity probe's selected columns cannot restrict it.
 	var account models.WhatsAppAccount
-	query := a.DB.Where("BTRIM(phone_id) = BTRIM(?)", phoneID)
-	if a.hasTenantScope() {
-		query = query.Where("organization_id = ?", a.tenantOrgID)
-	}
-	if err := query.First(&account).Error; err != nil {
+	if err := lookup().First(&account).Error; err != nil {
 		return nil, err
 	}
 	account.PhoneID = strings.TrimSpace(account.PhoneID)

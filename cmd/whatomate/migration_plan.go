@@ -98,6 +98,112 @@ func parseMigrationPlanConfig(dsn string) (*pgx.ConnConfig, error) {
 	return cfg, nil
 }
 
+// This command has no migration lock or planner admission. It observes only
+// public seed keys/counts using the configured runtime connection. Its own
+// native-owner policy lives in database.ObserveSeedDiagnostic.
+func collectSeedDiagnostic(parent context.Context, cfg config.DatabaseConfig) ([]byte, error) {
+	d, ok := newPlanDeadline(parent, time.Now())
+	if !ok {
+		return nil, errors.New("seed diagnostic deadline")
+	}
+	ctx, cancel := context.WithDeadline(parent, d.workAt)
+	defer cancel()
+	dsn, err := catalogRuntimeDSN(cfg)
+	if err != nil {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	parsed, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	observer, err := seedDiagnosticConfig(parsed, d, ctx)
+	if err != nil {
+		return nil, err
+	}
+	report, err := captureSeedDiagnostic(ctx, d, observer)
+	if err != nil || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, errors.New("seed diagnostic unavailable")
+	}
+	// A complete report is published only after rollback, physical Close and
+	// asynchronous pgx cleanup have all completed inside the original budget.
+	output := struct {
+		database.SeedDiagnosticReport
+		SessionBeforeAfterMatch bool `json:"session_before_after_match"`
+		SessionDisposed         bool `json:"session_disposed"`
+	}{report, true, true}
+	raw, err := json.Marshal(output)
+	if err != nil || len(raw) > 64*1024 || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, errors.New("seed diagnostic output unavailable")
+	}
+	return append(raw, '\n'), nil
+}
+
+func seedDiagnosticConfig(parsed *pgx.ConnConfig, d planDeadline, ctx context.Context) (*pgx.ConnConfig, error) {
+	if parsed == nil || !d.alive(ctx) {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	cfg := parsed.Copy()
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = make(map[string]string)
+	}
+	// No startup SET ROLE or options-based setting override is admitted.
+	if cfg.RuntimeParams["options"] != "" || cfg.RuntimeParams["role"] != "" {
+		return nil, errors.New("seed diagnostic configuration unavailable")
+	}
+	remaining := time.Until(d.workAt)
+	if remaining < time.Millisecond {
+		return nil, errors.New("seed diagnostic deadline")
+	}
+	if cfg.ConnectTimeout <= 0 || cfg.ConnectTimeout > remaining {
+		cfg.ConnectTimeout = remaining
+	}
+	cfg.RuntimeParams["application_name"] = database.SeedDiagnosticApplication
+	cfg.RuntimeParams["search_path"] = "pg_catalog"
+	cfg.RuntimeParams["default_transaction_read_only"] = "on"
+	cfg.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+	for key, cap := range map[string]time.Duration{"statement_timeout": 3 * time.Second, "lock_timeout": time.Second, "idle_in_transaction_session_timeout": 5 * time.Second} {
+		if remaining < cap {
+			cap = remaining
+		}
+		if cap.Milliseconds() < 1 {
+			return nil, errors.New("seed diagnostic deadline")
+		}
+		cfg.RuntimeParams[key] = strconv.FormatInt(cap.Milliseconds(), 10) + "ms"
+	}
+	return cfg, nil
+}
+
+func captureSeedDiagnostic(ctx context.Context, d planDeadline, cfg *pgx.ConnConfig) (report database.SeedDiagnosticReport, err error) {
+	conn, tx, openErr := openPlanSession(ctx, cfg)
+	defer func() {
+		if !disposePlanSession(d, conn, tx, false).complete() {
+			report, err = database.SeedDiagnosticReport{}, errors.New("seed diagnostic cleanup unavailable")
+		}
+	}()
+	if openErr != nil {
+		return report, errors.New("seed diagnostic connection unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return report, errors.New("seed diagnostic session unavailable")
+	}
+	before, err := readPlanSelf(ctx, tx, database.SeedDiagnosticApplication, cfg.User, false)
+	if err != nil || before.superuser || before.database != cfg.Database {
+		return report, errors.New("seed diagnostic session unavailable")
+	}
+	report, err = database.ObserveSeedDiagnostic(ctx, tx)
+	if err != nil {
+		return database.SeedDiagnosticReport{}, errors.New("seed diagnostic observation unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return database.SeedDiagnosticReport{}, errors.New("seed diagnostic session unavailable")
+	}
+	after, err := readPlanSelf(ctx, tx, database.SeedDiagnosticApplication, cfg.User, false)
+	if err != nil || !samePlanSelf(before, after) || !d.alive(ctx) {
+		return database.SeedDiagnosticReport{}, errors.New("seed diagnostic session unavailable")
+	}
+	return report, nil
+}
+
 func migrationPlanMarker(id uuid.UUID) string {
 	if id == uuid.Nil || id.Version() != 4 || id.Variant() != uuid.RFC4122 {
 		return ""
@@ -606,4 +712,149 @@ func publicPlanSeedID(id string) bool {
 		return true
 	}
 	return false
+}
+
+// validateIdentityInventoryArguments is deliberately separate from the older
+// catalog/seed modes. Exact UUIDs select one private invocation scope; they are
+// never echoed by the public report or error contract.
+func validateIdentityInventoryArguments(args catalogSnapshotArgs) error {
+	if !args.identityInventory || args.mode != "json" || args.seedCounts || args.seedDiff || args.listUnknown {
+		return errors.New("invalid arguments")
+	}
+	for _, value := range []string{args.organizationID, args.accountID} {
+		id, err := uuid.Parse(value)
+		if err != nil || id == uuid.Nil || id.String() != value {
+			return errors.New("invalid arguments")
+		}
+	}
+	return nil
+}
+
+// Only the new diagnostic rejects repeated flags. Existing modes retain their
+// existing parsing semantics. Values are skipped, never recorded or rendered.
+func identityInventoryUniqueFlags(args []string) bool {
+	seen := make(map[string]bool)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") || arg == "-" || arg == "--" {
+			return false
+		}
+		name, _, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if seen[name] {
+			return false
+		}
+		seen[name] = true
+		switch name {
+		case "config", "mode", "organization-id", "account-id":
+			if !hasValue {
+				i++
+				if i >= len(args) {
+					return false
+				}
+			}
+		case "identity-inventory":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func collectIdentityInventory(parent context.Context, cfg config.DatabaseConfig, args catalogSnapshotArgs) ([]byte, error) {
+	if err := validateIdentityInventoryArguments(args); err != nil {
+		return nil, err
+	}
+	d, ok := newPlanDeadline(parent, time.Now())
+	if !ok {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	ctx, cancel := context.WithDeadline(parent, d.workAt)
+	defer cancel()
+	dsn, err := catalogRuntimeDSN(cfg)
+	if err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	parsed, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	observer, err := seedDiagnosticConfig(parsed, d, ctx)
+	if err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	observer.RuntimeParams["application_name"] = database.IdentityInventoryApplication
+	raw, err := captureIdentityInventory(ctx, d, observer, database.IdentityInventoryScope{
+		OrganizationID: args.organizationID, AccountID: args.accountID,
+	})
+	if err != nil || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	return raw, nil
+}
+
+// The second transaction is sequential, on the same physical connection and
+// original deadline. A recheck in the first RR snapshot cannot see scope drift.
+// There is no callback, pooled transaction, reconnect or new work budget.
+func captureIdentityInventory(ctx context.Context, d planDeadline, cfg *pgx.ConnConfig, scope database.IdentityInventoryScope) (raw []byte, err error) {
+	conn, tx, openErr := openPlanSession(ctx, cfg)
+	defer func() {
+		if !disposePlanSession(d, conn, tx, false).complete() {
+			raw, err = nil, errors.New("identity inventory cleanup unavailable")
+		}
+		if err != nil {
+			raw = nil
+		}
+	}()
+	if openErr != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	before, err := readPlanSelf(ctx, tx, database.IdentityInventoryApplication, cfg.User, false)
+	if err != nil || before.superuser || before.database != cfg.Database {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	report, witness, err := database.ObserveIdentityInventory(ctx, tx, scope)
+	if err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	after, err := readPlanSelf(ctx, tx, database.IdentityInventoryApplication, cfg.User, false)
+	if err != nil || !samePlanSelf(before, after) || !d.alive(ctx) {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	if err = tx.Rollback(ctx); err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	tx = nil // ownership of the closed first transaction has ended.
+	tx, err = conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	if err = database.RecheckIdentityInventoryScope(ctx, tx, scope, witness); err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	if _, err = tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	fresh, err := readPlanSelf(ctx, tx, database.IdentityInventoryApplication, cfg.User, false)
+	if err != nil || !samePlanSelf(before, fresh) || !d.alive(ctx) {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	// Serialize before the work deadline. These completion flags are published
+	// only if the deferred physical rollback/Close/CleanupDone all succeed.
+	output := struct {
+		database.IdentityInventoryReport
+		FreshScopeMatch         bool `json:"fresh_scope_match"`
+		SessionBeforeAfterMatch bool `json:"session_before_after_match"`
+		SessionDisposed         bool `json:"session_disposed"`
+	}{report, true, true, true}
+	raw, err = json.Marshal(output)
+	if err != nil || len(raw)+1 > database.IdentityInventoryReportByteLimit || !d.alive(ctx) {
+		return nil, errors.New("identity inventory unavailable")
+	}
+	return append(raw, '\n'), nil
 }

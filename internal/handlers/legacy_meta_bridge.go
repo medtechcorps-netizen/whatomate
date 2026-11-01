@@ -63,12 +63,21 @@ func (a *App) requireLegacyWhatsAppMessageMirror(
 func (a *App) mirrorLegacyWhatsAppMessageAfterCommit(
 	account *models.WhatsAppAccount,
 	messageID uuid.UUID,
+	historical ...*channelapi.LegacyMergedProjectionEvidence,
 ) {
 	if a == nil || account == nil || account.OrganizationID == uuid.Nil || messageID == uuid.Nil {
 		return
 	}
 	accountCopy := *account
 	organizationID := account.OrganizationID
+	var captured *channelapi.LegacyMergedProjectionEvidence
+	if len(historical) != 0 {
+		if len(historical) != 1 || historical[0] == nil {
+			return
+		}
+		copy := *historical[0]
+		captured = &copy
+	}
 	a.afterTenantCommit(func() {
 		root := a.rootApp()
 		if root == nil {
@@ -77,8 +86,16 @@ func (a *App) mirrorLegacyWhatsAppMessageAfterCommit(
 		var err error
 		for attempt := 0; attempt < canonicalContactWriteAttempts; attempt++ {
 			err = root.WithCommittedTenantApp(organizationID, func(scoped *App) error {
+				if captured != nil {
+					return persistLegacyWhatsAppMessageMirror(scoped.DB, &accountCopy, messageID, captured)
+				}
 				return persistLegacyWhatsAppMessageMirror(scoped.DB, &accountCopy, messageID)
 			})
+			// Historical evidence is reread once under its own bounded scope. A
+			// failure cannot start another proof deadline or replay business work.
+			if captured != nil {
+				break
+			}
 			if !isRetryableCanonicalContactWrite(err) || attempt+1 == canonicalContactWriteAttempts {
 				break
 			}
@@ -90,24 +107,48 @@ func (a *App) mirrorLegacyWhatsAppMessageAfterCommit(
 	})
 }
 
+// A newly corroborated but historically unlinked message remains unlinked.
+// A linked historical message retains its exact original projection; ordinary
+// current-key messages keep the established mirror path.
+func (a *App) mirrorResolvedWhatsAppMessageAfterCommit(account *models.WhatsAppAccount, resolved *whatsAppMessageResolution) {
+	if resolved == nil {
+		return
+	}
+	if resolved.LegacyAliasMatched && resolved.Message.InboxConversationID == nil {
+		return
+	}
+	if resolved.LegacyMergedProjection != nil {
+		a.mirrorLegacyWhatsAppMessageAfterCommit(account, resolved.Message.ID, resolved.LegacyMergedProjection)
+		return
+	}
+	a.mirrorLegacyWhatsAppMessageAfterCommit(account, resolved.Message.ID)
+}
+
 func persistLegacyWhatsAppMessageMirror(
 	db *gorm.DB,
 	account *models.WhatsAppAccount,
 	messageID uuid.UUID,
+	historical ...*channelapi.LegacyMergedProjectionEvidence,
 ) error {
 	if db == nil || account == nil || messageID == uuid.Nil {
 		return nil
 	}
-	_, err := channelapi.MirrorLegacyWhatsAppMessage(
-		db,
-		channelapi.LegacyMetaAccountRef{
-			ID:             account.ID,
-			OrganizationID: account.OrganizationID,
-			Name:           account.Name,
-			Status:         account.Status,
-		},
-		messageID,
-	)
+	ref := channelapi.LegacyMetaAccountRef{
+		ID:             account.ID,
+		OrganizationID: account.OrganizationID,
+		Name:           account.Name,
+		PhoneID:        account.PhoneID,
+		BusinessID:     account.BusinessID,
+		Status:         account.Status,
+	}
+	if len(historical) != 0 {
+		if len(historical) != 1 || historical[0] == nil {
+			return errors.New("legacy merged projection evidence is invalid")
+		}
+		_, err := channelapi.MirrorLegacyMergedWhatsAppMessage(db, ref, messageID, historical[0])
+		return err
+	}
+	_, err := channelapi.MirrorLegacyWhatsAppMessage(db, ref, messageID)
 	return err
 }
 

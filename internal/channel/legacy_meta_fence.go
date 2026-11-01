@@ -117,6 +117,36 @@ var (
 	errLegacyMetaRowAvailable  = errors.New("legacy Meta row is available")
 )
 
+// LegacyMergedProjectionBudget belongs to one caller-owned transaction. It is
+// lazy so ordinary message paths acquire no new deadline. Every proof/recheck
+// shares its first deadline; cancelling a child scope never resets the budget.
+type LegacyMergedProjectionBudget struct {
+	once     sync.Once
+	deadline time.Time
+}
+
+func (budget *LegacyMergedProjectionBudget) Scope(db *gorm.DB) (*gorm.DB, func(), error) {
+	if budget == nil || db == nil || db.Statement == nil || db.Statement.Context == nil {
+		return nil, nil, errors.New("legacy merged projection requires caller context")
+	}
+	parent := db.Statement.Context
+	if err := parent.Err(); err != nil {
+		return nil, nil, err
+	}
+	budget.once.Do(func() {
+		budget.deadline = time.Now().Add(5 * time.Second)
+		if deadline, ok := parent.Deadline(); ok && deadline.Before(budget.deadline) {
+			budget.deadline = deadline
+		}
+	})
+	ctx, cancel := context.WithDeadline(parent, budget.deadline)
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return db.WithContext(ctx), cancel, nil
+}
+
 // legacyMetaPolicyFenceQueueWait bounds how long one lock acquisition queues
 // for the fence key behind a fence that is not blocked, or waits for the key,
 // summed over all its rounds. Fences normally own the key and the organization
