@@ -191,7 +191,7 @@ func TestHoldProjectionCancellationAndKnownZero(t *testing.T) {
 	if m, err := BuildHoldProjection(ctx, scope, actor, id, 97, holds, limits); !errors.Is(err, context.Canceled) || m != nil {
 		t.Fatal("cancelled build succeeded")
 	}
-	if m, err := BuildHoldProjection(nil, scope, actor, id, 97, holds, limits); err == nil || m != nil {
+	if m, err := BuildHoldProjection(nil, scope, actor, id, 97, holds, limits); err == nil || m != nil { //nolint:staticcheck // SA1012: deliberately verify nil context refuses with no projection.
 		t.Fatal("missing context")
 	}
 	m, err := BuildHoldProjection(context.Background(), scope, actor, id, 0, nil, limits)
