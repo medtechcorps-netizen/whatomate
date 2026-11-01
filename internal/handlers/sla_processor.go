@@ -792,10 +792,9 @@ func slaAutoCloseNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) 
 // or past the escalation that triggered the warning, and no agent has replied
 // to the customer since that escalation. A reply is an outgoing message from
 // a user, confirmed sent/delivered/read after the escalation, that is not a
-// template. Pending or failed delivery does not prove a reply. Caveat: API-key requests carry
-// the key owner's user id and are not marked on the stored message, so a text
-// or media message an integration sends through an API key also counts as a
-// reply; the template exclusion covers the usual integration notifications.
+// template. Pending or failed delivery does not prove a reply. New API-key or
+// unattributed sends are ineligible for SLA reply credit. Historical absent-origin rows retain
+// legacy compatibility; they are not evidence of a human authentication method.
 func slaWarningNoticeStillCurrent(tx *gorm.DB, transfer models.AgentTransfer) (bool, error) {
 	current, found, err := loadSLANoticeTransfer(tx, transfer)
 	if err != nil || !found ||
@@ -987,7 +986,9 @@ func (p *SLAProcessor) customerLastSpokeAt(transfer models.AgentTransfer) (time.
 
 // slaConfirmedReplies preserves contact-level/account scope and creation-time
 // semantics. Only a durable successful delivery state proves a reply. Sender
-// provenance remains a separate policy; legacy/API-key rows are not reclassified.
+// provenance is server-stamped for new user sends. SQL-NULL metadata or an object
+// without the origin member remains legacy-unattributed compatible; malformed or
+// explicit unknown origins do not. No historical origins are inferred or changed.
 func slaConfirmedReplies(tx *gorm.DB, transfer models.AgentTransfer, since time.Time) *gorm.DB {
 	return tx.Model(&models.Message{}).Where(
 		"organization_id = ? AND contact_id = ? AND direction = ? AND message_type <> ? AND status IN ? AND created_at > ?",
@@ -995,7 +996,11 @@ func slaConfirmedReplies(tx *gorm.DB, transfer models.AgentTransfer, since time.
 		models.MessageTypeTemplate,
 		[]models.MessageStatus{models.MessageStatusSent, models.MessageStatusDelivered, models.MessageStatusRead},
 		since,
-	)
+	).Where(`(metadata IS NULL OR (
+		jsonb_typeof(metadata) = 'object' AND (
+			NOT jsonb_exists(metadata, ?) OR metadata -> CAST(? AS text) = ?::jsonb
+		)
+	))`, senderOriginMetadataKey, senderOriginMetadataKey, `"user_jwt"`)
 }
 
 // agentRespondedSince checks for a confirmed non-template reply by the assigned

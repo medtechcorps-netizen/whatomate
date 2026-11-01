@@ -185,19 +185,30 @@ async function load() {
   const organization = currentOrganization()
   loading.value = true
   try {
-    const from = weekDays.value[0].toISOString()
-    const toDate = new Date(weekDays.value[6])
-    toDate.setHours(23, 59, 59, 999)
+    // Cards use each person's local calendar date. A browser-local UTC
+    // interval can omit Monday/Sunday slots in another timezone, so fetch a
+    // one-day margin on each side of the displayed dates and then trim by the
+    // same resource-local date used to place cards. UTC date arithmetic keeps
+    // the margin stable across daylight-saving changes in the browser.
+    const firstDate = isoDate(weekDays.value[0])
+    const lastDate = isoDate(weekDays.value[6])
+    const fromDate = new Date(`${firstDate}T00:00:00.000Z`)
+    fromDate.setUTCDate(fromDate.getUTCDate() - 1)
+    const toDate = new Date(`${lastDate}T23:59:59.999Z`)
+    toDate.setUTCDate(toDate.getUTCDate() + 1)
     const [serviceResponse, resourceResponse, eventResponse] = await Promise.all([
       bookingService.allServices(),
       bookingService.allResources(),
-      bookingService.allEvents({ from, to: toDate.toISOString() }),
+      bookingService.allEvents({ from: fromDate.toISOString(), to: toDate.toISOString() }),
     ])
     if (!isCurrent(organization) || generation !== loadGeneration) return
     catalogueOrganization = organization
     services.value = serviceResponse
     resources.value = resourceResponse
-    events.value = eventResponse
+    events.value = eventResponse.filter((event) => {
+      const date = eventDateKey(event)
+      return firstDate <= date && date <= lastDate
+    })
     if (selectedEvent.value) {
       selectedEvent.value = events.value.find((event) => event.id === selectedEvent.value?.id) ?? null
     }

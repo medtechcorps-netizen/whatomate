@@ -41,6 +41,7 @@ type LegacyWhatsAppReplyRequest struct {
 
 type legacyWhatsAppReplySnapshot struct {
 	userID            uuid.UUID
+	senderOrigin      string
 	conversationID    uuid.UUID
 	channelAccountID  uuid.UUID
 	whatsAppAccountID uuid.UUID
@@ -276,6 +277,7 @@ func (a *App) SendLegacyWhatsAppConversationReply(r *fastglue.Request) error {
 
 		snapshot = legacyWhatsAppReplySnapshot{
 			userID:            userID,
+			senderOrigin:      requestSenderOrigin(r),
 			conversationID:    conversation.ID,
 			channelAccountID:  shadow.ID,
 			whatsAppAccountID: legacyAccountID,
@@ -318,6 +320,7 @@ func (a *App) SendLegacyWhatsAppConversationReply(r *fastglue.Request) error {
 	defer cancelOperation()
 	options := DefaultSendOptions()
 	options.SentByUserID = &snapshot.userID
+	options.senderOrigin = snapshot.senderOrigin
 	// The strict route completes its durable provider settlement before the
 	// HTTP response. This avoids stranding an accepted pending Message if the
 	// replica exits between response write and goroutine scheduling.

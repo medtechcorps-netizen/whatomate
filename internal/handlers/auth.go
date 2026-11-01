@@ -17,6 +17,12 @@ import (
 	"gorm.io/gorm"
 )
 
+// requestSenderOrigin copies a closed admission result while the request is live.
+// Never read client headers/body or retain the request for a provider callback.
+func requestSenderOrigin(r *fastglue.Request) string {
+	return normalizedSenderOrigin(middleware.AuthenticatedRequestMethod(r))
+}
+
 // LoginRequest represents login credentials
 type LoginRequest struct {
 	Email    string `json:"email" validate:"required,email"`
