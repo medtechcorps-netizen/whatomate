@@ -1967,7 +1967,7 @@ func TestManagedInstagramActivationRequiresFreshHealthAndExactCredentialFences(t
 		WebhookCredentialID: fixture.webhook.ID, WebhookCredentialVersion: fixture.webhook.Version,
 	}
 	_, err := fixture.app.activateMetaInstagramAccount(
-		fixture.org.ID, fixture.user.ID, fixture.account.ID, now, evidence,
+		fixture.org.ID, fixture.user.ID, fixture.account.ID, func() time.Time { return now }, evidence,
 	)
 	require.Error(t, err, "a full-microsecond evidence mismatch must remain fail closed")
 	require.NoError(t, fixture.db.Model(&models.ChannelAccount{}).
@@ -1979,7 +1979,7 @@ func TestManagedInstagramActivationRequiresFreshHealthAndExactCredentialFences(t
 	assert.Equal(t, healthCheckedAt.Truncate(time.Microsecond), storedHealth.LastHealthCheckAt.UTC())
 	assert.True(t, channelHealthTimestampsMatch(*storedHealth.LastHealthCheckAt, healthCheckedAt))
 	activated, err := fixture.app.activateMetaInstagramAccount(
-		fixture.org.ID, fixture.user.ID, fixture.account.ID, now, evidence,
+		fixture.org.ID, fixture.user.ID, fixture.account.ID, func() time.Time { return now }, evidence,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, models.ChannelAccountStatusActive, activated.Status)
@@ -1989,7 +1989,7 @@ func TestManagedInstagramActivationRequiresFreshHealthAndExactCredentialFences(t
 	// Reusing a successful approval is impossible after the pending row has
 	// already transitioned, even with otherwise identical evidence.
 	_, err = fixture.app.activateMetaInstagramAccount(
-		fixture.org.ID, fixture.user.ID, fixture.account.ID, now, evidence,
+		fixture.org.ID, fixture.user.ID, fixture.account.ID, func() time.Time { return now }, evidence,
 	)
 	require.Error(t, err)
 }
@@ -2016,7 +2016,7 @@ func TestManagedInstagramActivationFinalLockRejectsDriftedPlatformBinding(t *tes
 		"last_error": "", "connected_at": nil,
 	}).Error)
 	_, err := fixture.app.activateMetaInstagramAccount(
-		fixture.org.ID, fixture.user.ID, fixture.account.ID, now,
+		fixture.org.ID, fixture.user.ID, fixture.account.ID, func() time.Time { return now },
 		metaInstagramSubscriptionApproval{
 			ProfileID: fixture.profileID, CheckedAt: now,
 			OAuthCredentialID: fixture.oauth.ID, OAuthCredentialVersion: fixture.oauth.Version,
@@ -2565,7 +2565,7 @@ func TestManagedInstagramAmbiguousDeauthorizationIsNonRoutableUntilExactLifecycl
 		"last_health_check_at": healthAt, "last_error": "", "last_error_at": nil,
 	}).Error)
 	_, err = fixture.app.activateMetaInstagramAccount(
-		fixture.org.ID, fixture.user.ID, fixture.account.ID, time.Now().UTC(),
+		fixture.org.ID, fixture.user.ID, fixture.account.ID, time.Now,
 		metaInstagramSubscriptionApproval{
 			ProfileID: fixture.profileID, CheckedAt: time.Now().UTC(),
 			OAuthCredentialID: fixture.oauth.ID, OAuthCredentialVersion: fixture.oauth.Version,

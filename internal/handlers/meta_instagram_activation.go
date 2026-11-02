@@ -63,7 +63,7 @@ func (a *App) ApproveMetaInstagramActivation(r *fastglue.Request) error {
 	if providerErr != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta no longer reports the required Instagram messages subscription; reconnect and test again", nil, "")
 	}
-	activated, err := a.activateMetaInstagramAccount(orgID, userID, accountID, time.Now().UTC(), evidence)
+	activated, err := a.activateMetaInstagramAccount(orgID, userID, accountID, time.Now, evidence)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Run a fresh successful health test before approving this Instagram account", nil, "")
 	}
@@ -113,9 +113,12 @@ func (a *App) freshMetaInstagramSubscriptionApproval(
 
 func (a *App) activateMetaInstagramAccount(
 	orgID, userID, accountID uuid.UUID,
-	now time.Time,
+	clock func() time.Time,
 	subscription metaInstagramSubscriptionApproval,
 ) (models.ChannelAccount, error) {
+	if clock == nil {
+		return models.ChannelAccount{}, errors.New("instagram activation clock is required")
+	}
 	var activated models.ChannelAccount
 	err := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
 		if err := lockChannelAIOrganizationScopeTx(scoped.DB, orgID); err != nil {
@@ -139,6 +142,19 @@ func (a *App) activateMetaInstagramAccount(
 			account.LastHealthCheckAt == nil || account.LastError != "" {
 			return errors.New("managed Instagram account is not ready for approval")
 		}
+		allowed, entitlementErr := scoped.HasProductEntitlement(
+			uuid.Nil, orgID, channelapi.OmnichannelEntitlementKey,
+		)
+		if entitlementErr != nil {
+			return entitlementErr
+		}
+		if !allowed {
+			return errMetaInstagramEntitlementDenied
+		}
+
+		// Organization/account locks, credential reload and entitlement queries
+		// consume approval validity. Sample after those database operations.
+		now := clock().UTC()
 		healthCheckedAt, err := time.Parse(time.RFC3339Nano, stringConfigValue(account.Metadata, "meta_health_checked_at"))
 		if err != nil || healthCheckedAt.After(now.Add(time.Minute)) ||
 			now.Sub(healthCheckedAt) > time.Duration(a.Config.MetaInstagram.HealthApprovalMaxAgeMins)*time.Minute ||
@@ -165,15 +181,6 @@ func (a *App) activateMetaInstagramAccount(
 			subscription.OAuthCredentialID != oauth.ID || subscription.OAuthCredentialVersion != oauth.Version ||
 			subscription.WebhookCredentialID != webhook.ID || subscription.WebhookCredentialVersion != webhook.Version {
 			return errors.New("managed Instagram subscription approval was superseded")
-		}
-		allowed, entitlementErr := scoped.HasProductEntitlement(
-			uuid.Nil, orgID, channelapi.OmnichannelEntitlementKey,
-		)
-		if entitlementErr != nil {
-			return entitlementErr
-		}
-		if !allowed {
-			return errMetaInstagramEntitlementDenied
 		}
 
 		oldAccount := account
