@@ -124,3 +124,55 @@ LEFT JOIN pg_catalog.pg_operator operator ON dependency.refclassid='pg_catalog.p
 LEFT JOIN pg_catalog.pg_namespace operator_namespace ON operator_namespace.oid=operator.oprnamespace
 LEFT JOIN pg_catalog.pg_type referenced_type ON dependency.refclassid='pg_catalog.pg_type'::pg_catalog.regclass AND referenced_type.oid=dependency.refobjid
 LEFT JOIN pg_catalog.pg_namespace type_namespace ON type_namespace.oid=referenced_type.typnamespace`
+
+// IdentityPrerequisiteVisibility contains only the fixed inventory relation
+// labels. A false guard means unverified visibility, never zero customer rows.
+type IdentityPrerequisiteVisibility struct {
+	Table       string `json:"table"`
+	GuardPassed bool   `json:"guard_passed"`
+}
+
+// ObserveIdentityPrerequisiteVisibility uses the same catalog-only relation,
+// policy-expression and dependency validators as the inventory. It never reads
+// relation rows, establishes an organization scope or grants inventory access.
+func ObserveIdentityPrerequisiteVisibility(ctx context.Context, tx pgx.Tx) ([]IdentityPrerequisiteVisibility, error) {
+	unavailable := errPlanSeedUnavailable
+	if ctx == nil || ctx.Err() != nil || tx == nil || tx.Conn() == nil {
+		return nil, unavailable
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, unavailable
+	}
+	var bounded bool
+	if err := tx.QueryRow(ctx, `SELECT pg_catalog.current_setting('transaction_read_only')='on'
+ AND pg_catalog.current_setting('transaction_isolation')='repeatable read'
+ AND pg_catalog.current_setting('search_path')='pg_catalog'
+ AND pg_catalog.current_setting('statement_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('statement_timeout')::interval <= interval '3 seconds'
+ AND pg_catalog.current_setting('lock_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('lock_timeout')::interval <= interval '1 second'
+ AND pg_catalog.current_setting('idle_in_transaction_session_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('idle_in_transaction_session_timeout')::interval <= interval '5 seconds'`).Scan(&bounded); err != nil || !bounded {
+		return nil, unavailable
+	}
+	tables := [...]string{"organizations", "whatsapp_accounts", "whatsapp_coexistence_states", "whatsapp_identity_review_holds", "whatsapp_identity_review_members", "inbound_events", "channel_accounts"}
+	result := make([]IdentityPrerequisiteVisibility, 0, len(tables))
+	for i, table := range tables {
+		if ctx.Err() != nil || tx.Conn().PgConn().TxStatus() != 'T' {
+			return nil, unavailable
+		}
+		var err error
+		if i == 0 {
+			err = planSeedTables(ctx, tx, table)
+		} else {
+			err = planSeedTenantTable(ctx, tx, table)
+		}
+		// A SQL error aborts the transaction. Do not disguise it as a series of
+		// independent visibility refusals or publish a partially observed report.
+		if ctx.Err() != nil || tx.Conn().PgConn().TxStatus() != 'T' {
+			return nil, unavailable
+		}
+		result = append(result, IdentityPrerequisiteVisibility{Table: table, GuardPassed: err == nil})
+	}
+	return result, nil
+}

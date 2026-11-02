@@ -718,7 +718,7 @@ func publicPlanSeedID(id string) bool {
 // catalog/seed modes. Exact UUIDs select one private invocation scope; they are
 // never echoed by the public report or error contract.
 func validateIdentityInventoryArguments(args catalogSnapshotArgs) error {
-	if !args.identityInventory || args.mode != "json" || args.seedCounts || args.seedDiff || args.listUnknown {
+	if !args.identityInventory || args.identityPrerequisites || args.mode != "json" || args.seedCounts || args.seedDiff || args.listUnknown {
 		return errors.New("invalid arguments")
 	}
 	for _, value := range []string{args.organizationID, args.accountID} {
@@ -857,4 +857,188 @@ func captureIdentityInventory(ctx context.Context, d planDeadline, cfg *pgx.Conn
 		return nil, errors.New("identity inventory unavailable")
 	}
 	return append(raw, '\n'), nil
+}
+
+const identityPrerequisiteApplication = "rereply-identity-prerequisites"
+const identityPrerequisiteByteLimit = 8192
+
+type identityPrerequisiteProfile struct {
+	SameSessionRole bool `json:"same_session_role"`
+	NonSuperuser    bool `json:"non_superuser"`
+	DatabaseOwner   bool `json:"database_owner"`
+	Postgres17      bool `json:"postgres17"`
+	PrimaryServer   bool `json:"primary_server"`
+	UTF8            bool `json:"utf8"`
+	Origin          bool `json:"origin_replication"`
+}
+
+type identityPrerequisiteReport struct {
+	Version                 int                                       `json:"version"`
+	Purpose                 string                                    `json:"purpose"`
+	Profile                 identityPrerequisiteProfile               `json:"profile"`
+	Visibility              []database.IdentityPrerequisiteVisibility `json:"visibility"`
+	ProfilePassed           bool                                      `json:"profile_passed"`
+	VisibilityPassed        bool                                      `json:"visibility_passed"`
+	FalseGuardMeaning       string                                    `json:"false_guard_meaning"`
+	InventoryAdmission      string                                    `json:"inventory_admission"`
+	AccountScopeObserved    bool                                      `json:"account_scope_observed"`
+	CustomerRowsRead        bool                                      `json:"customer_rows_read"`
+	SessionBeforeAfterMatch bool                                      `json:"session_before_after_match"`
+	SessionDisposed         bool                                      `json:"session_disposed"`
+}
+
+type identityPrerequisiteWitness struct {
+	PID, DatabaseOID, RoleOID int64
+	BackendStart              time.Time
+}
+
+func validateIdentityPrerequisiteArguments(args catalogSnapshotArgs) error {
+	if !args.identityPrerequisites || args.identityInventory || args.mode != "json" || args.seedCounts || args.seedDiff || args.listUnknown || args.organizationID != "" || args.accountID != "" {
+		return errors.New("invalid arguments")
+	}
+	return nil
+}
+
+func identityPrerequisiteUniqueFlags(args []string) bool {
+	seen := make(map[string]bool)
+	for i := 0; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-") || args[i] == "-" || args[i] == "--" {
+			return false
+		}
+		name, _, value := strings.Cut(strings.TrimLeft(args[i], "-"), "=")
+		if seen[name] {
+			return false
+		}
+		seen[name] = true
+		switch name {
+		case "config", "mode":
+			if !value {
+				i++
+				if i >= len(args) {
+					return false
+				}
+			}
+		case "identity-prerequisites":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func collectIdentityPrerequisites(parent context.Context, cfg config.DatabaseConfig, args catalogSnapshotArgs) ([]byte, error) {
+	if err := validateIdentityPrerequisiteArguments(args); err != nil {
+		return nil, err
+	}
+	unavailable := errors.New("identity prerequisites unavailable")
+	d, ok := newPlanDeadline(parent, time.Now())
+	if !ok {
+		return nil, unavailable
+	}
+	ctx, cancel := context.WithDeadline(parent, d.workAt)
+	defer cancel()
+	dsn, err := catalogRuntimeDSN(cfg)
+	if err != nil {
+		return nil, unavailable
+	}
+	parsed, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, unavailable
+	}
+	observer, err := seedDiagnosticConfig(parsed, d, ctx)
+	if err != nil {
+		return nil, unavailable
+	}
+	observer.RuntimeParams["application_name"] = identityPrerequisiteApplication
+	raw, err := captureIdentityPrerequisites(ctx, d, observer)
+	if err != nil || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+		return nil, unavailable
+	}
+	return raw, nil
+}
+
+// One physical read-only snapshot; output is released only after physical
+// rollback, Close and CleanupDone satisfy the existing original cleanup budget.
+func captureIdentityPrerequisites(ctx context.Context, d planDeadline, cfg *pgx.ConnConfig) (raw []byte, err error) {
+	unavailable := errors.New("identity prerequisites unavailable")
+	conn, tx, openErr := openPlanSession(ctx, cfg)
+	defer func() {
+		if !disposePlanSession(d, conn, tx, false).complete() {
+			raw, err = nil, unavailable
+		}
+		if err != nil {
+			raw = nil
+		}
+	}()
+	if openErr != nil {
+		return nil, unavailable
+	}
+	profile, before, err := readIdentityPrerequisiteProfile(ctx, tx, cfg)
+	if err != nil {
+		return nil, unavailable
+	}
+	visibility, err := database.ObserveIdentityPrerequisiteVisibility(ctx, tx)
+	if err != nil || len(visibility) != 7 {
+		return nil, unavailable
+	}
+	afterProfile, after, err := readIdentityPrerequisiteProfile(ctx, tx, cfg)
+	if err != nil || profile != afterProfile || before.PID != after.PID || before.DatabaseOID != after.DatabaseOID || before.RoleOID != after.RoleOID || !before.BackendStart.Equal(after.BackendStart) || !d.alive(ctx) {
+		return nil, unavailable
+	}
+	visible := true
+	for _, item := range visibility {
+		visible = visible && item.GuardPassed
+	}
+	report := identityPrerequisiteReport{
+		Version: 1, Purpose: "identity_inventory_prerequisites", Profile: profile, Visibility: visibility,
+		ProfilePassed:    profile.SameSessionRole && profile.NonSuperuser && profile.DatabaseOwner && profile.Postgres17 && profile.PrimaryServer && profile.UTF8 && profile.Origin,
+		VisibilityPassed: visible, FalseGuardMeaning: "not_verified", InventoryAdmission: "not_granted",
+		AccountScopeObserved: false, CustomerRowsRead: false, SessionBeforeAfterMatch: true, SessionDisposed: true,
+	}
+	raw, err = json.Marshal(report)
+	if err != nil || len(raw)+1 > identityPrerequisiteByteLimit || !d.alive(ctx) {
+		return nil, unavailable
+	}
+	return append(raw, '\n'), nil
+}
+
+func readIdentityPrerequisiteProfile(ctx context.Context, tx pgx.Tx, cfg *pgx.ConnConfig) (identityPrerequisiteProfile, identityPrerequisiteWitness, error) {
+	var profile identityPrerequisiteProfile
+	var witness identityPrerequisiteWitness
+	unavailable := errors.New("identity prerequisite session unavailable")
+	if ctx == nil || ctx.Err() != nil || tx == nil || tx.Conn() == nil || cfg == nil {
+		return profile, witness, unavailable
+	}
+	if _, err := tx.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
+		return profile, witness, unavailable
+	}
+	var bound bool
+	err := tx.QueryRow(ctx, `SELECT a.pid::bigint,a.datid::bigint,a.usesysid::bigint,a.backend_start,
+ current_user=session_user,NOT r.rolsuper,d.datdba=r.oid,
+ pg_catalog.current_setting('server_version_num')::integer/10000=17,
+ NOT pg_catalog.pg_is_in_recovery(),pg_catalog.current_setting('server_encoding')='UTF8',
+ pg_catalog.current_setting('session_replication_role')='origin',
+ current_user=$1 AND pg_catalog.current_database()=$2 AND a.usesysid=r.oid AND a.datid=d.oid
+ AND a.backend_type='client backend' AND a.application_name=$3
+ AND pg_catalog.current_setting('application_name')=$3
+ AND pg_catalog.current_setting('transaction_read_only')='on'
+ AND pg_catalog.current_setting('transaction_isolation')='repeatable read'
+ AND pg_catalog.current_setting('search_path')='pg_catalog'
+ AND pg_catalog.current_setting('statement_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('statement_timeout')::interval <= interval '3 seconds'
+ AND pg_catalog.current_setting('lock_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('lock_timeout')::interval <= interval '1 second'
+ AND pg_catalog.current_setting('idle_in_transaction_session_timeout')::interval > interval '0 seconds'
+ AND pg_catalog.current_setting('idle_in_transaction_session_timeout')::interval <= interval '5 seconds'
+ FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database()
+ JOIN pg_catalog.pg_stat_activity a ON a.pid=pg_catalog.pg_backend_pid()
+ WHERE r.rolname=current_user`, cfg.User, cfg.Database, identityPrerequisiteApplication).Scan(
+		&witness.PID, &witness.DatabaseOID, &witness.RoleOID, &witness.BackendStart,
+		&profile.SameSessionRole, &profile.NonSuperuser, &profile.DatabaseOwner, &profile.Postgres17,
+		&profile.PrimaryServer, &profile.UTF8, &profile.Origin, &bound,
+	)
+	if err != nil || !bound || ctx.Err() != nil || witness.PID != int64(tx.Conn().PgConn().PID()) || witness.PID <= 0 || witness.DatabaseOID <= 0 || witness.RoleOID <= 0 || witness.BackendStart.IsZero() {
+		return identityPrerequisiteProfile{}, identityPrerequisiteWitness{}, unavailable
+	}
+	return profile, witness, nil
 }

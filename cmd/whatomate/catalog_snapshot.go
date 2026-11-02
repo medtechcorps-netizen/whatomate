@@ -34,14 +34,15 @@ Keep -list-unknown output private; review identifiers individually before sharin
 `
 
 type catalogSnapshotArgs struct {
-	configPath        string
-	mode              string
-	seedCounts        bool
-	seedDiff          bool
-	listUnknown       bool
-	identityInventory bool
-	organizationID    string
-	accountID         string
+	configPath            string
+	mode                  string
+	seedCounts            bool
+	seedDiff              bool
+	listUnknown           bool
+	identityInventory     bool
+	identityPrerequisites bool
+	organizationID        string
+	accountID             string
 }
 
 type catalogSnapshotCollector func(context.Context, config.DatabaseConfig, catalogSnapshotArgs) ([]byte, error)
@@ -57,6 +58,7 @@ func parseCatalogSnapshotArgs(args []string) (catalogSnapshotArgs, error) {
 	flags.BoolVar(&parsed.seedDiff, "seed-diff", false, "bounded public seed diagnosis")
 	flags.BoolVar(&parsed.listUnknown, "list-unknown", false, "owner-only identifiers")
 	flags.BoolVar(&parsed.identityInventory, "identity-inventory", false, "bounded aggregate identity inventory")
+	flags.BoolVar(&parsed.identityPrerequisites, "identity-prerequisites", false, "catalog-only identity prerequisites")
 	flags.StringVar(&parsed.organizationID, "organization-id", "", "exact selected organization")
 	flags.StringVar(&parsed.accountID, "account-id", "", "exact selected account")
 	if err := flags.Parse(args); err != nil {
@@ -66,11 +68,24 @@ func parseCatalogSnapshotArgs(args []string) (catalogSnapshotArgs, error) {
 		return parsed, errors.New("invalid arguments")
 	}
 	identityFlags := false
+	prerequisiteFlags := false
 	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "identity-prerequisites" {
+			prerequisiteFlags = true
+		}
 		if f.Name == "identity-inventory" || f.Name == "organization-id" || f.Name == "account-id" {
 			identityFlags = true
 		}
 	})
+	if prerequisiteFlags {
+		if flags.NArg() != 0 || !identityPrerequisiteUniqueFlags(args) {
+			return parsed, errors.New("invalid arguments")
+		}
+		if err := validateIdentityPrerequisiteArguments(parsed); err != nil {
+			return parsed, err
+		}
+		return parsed, nil
+	}
 	if identityFlags {
 		if flags.NArg() != 0 || !identityInventoryUniqueFlags(args) {
 			return parsed, errors.New("invalid arguments")
@@ -159,6 +174,9 @@ func catalogRuntimeDSN(cfg config.DatabaseConfig) (string, error) {
 }
 
 func collectCatalogSnapshot(ctx context.Context, cfg config.DatabaseConfig, args catalogSnapshotArgs) ([]byte, error) {
+	if args.identityPrerequisites {
+		return collectIdentityPrerequisites(ctx, cfg, args)
+	}
 	if args.identityInventory {
 		return collectIdentityInventory(ctx, cfg, args)
 	}
