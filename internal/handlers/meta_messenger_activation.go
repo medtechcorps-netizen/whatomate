@@ -127,7 +127,7 @@ func (a *App) activateMetaMessengerAccount(
 	subscription metaMessengerSubscriptionApproval,
 ) (models.ChannelAccount, error) {
 	if clock == nil {
-		return models.ChannelAccount{}, errors.New("Messenger activation clock is required")
+		return models.ChannelAccount{}, errors.New("messenger activation clock is required")
 	}
 	var activated models.ChannelAccount
 	err := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
