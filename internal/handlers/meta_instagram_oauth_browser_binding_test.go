@@ -638,7 +638,7 @@ func TestManagedInstagramActivationCommittedEntitlementRevocationWinsFinalFence(
 				Log: fixture.app.Log,
 			}
 			_, err := requestApp.activateMetaInstagramAccount(
-				fixture.org.ID, fixture.user.ID, fixture.account.ID, now, evidence,
+				fixture.org.ID, fixture.user.ID, fixture.account.ID, func() time.Time { return now }, evidence,
 			)
 			return err
 		})

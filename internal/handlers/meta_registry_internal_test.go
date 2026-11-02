@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const metaRegistryTestEncryptionKey = "synthetic-meta-registry-encryption-key-32-bytes"
@@ -301,7 +303,7 @@ func TestManagedMessengerActivationRequiresFreshHealthAndCredentialFences(t *tes
 	}
 
 	_, err := app.activateMetaMessengerAccount(
-		organization.ID, fixture.userID, fixture.account.ID, now, subscriptionApproval,
+		organization.ID, fixture.userID, fixture.account.ID, func() time.Time { return now }, subscriptionApproval,
 	)
 	require.Error(t, err)
 	var pending models.ChannelAccount
@@ -319,7 +321,7 @@ func TestManagedMessengerActivationRequiresFreshHealthAndCredentialFences(t *tes
 		"metadata": metadata, "last_health_check_at": freshHealth.Add(-time.Microsecond),
 	}).Error)
 	_, err = app.activateMetaMessengerAccount(
-		organization.ID, fixture.userID, fixture.account.ID, now, subscriptionApproval,
+		organization.ID, fixture.userID, fixture.account.ID, func() time.Time { return now }, subscriptionApproval,
 	)
 	require.Error(t, err, "a full-microsecond evidence mismatch must remain fail closed")
 	require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).
@@ -331,7 +333,7 @@ func TestManagedMessengerActivationRequiresFreshHealthAndCredentialFences(t *tes
 	assert.Equal(t, freshHealth.Truncate(time.Microsecond), storedHealth.LastHealthCheckAt.UTC())
 	assert.True(t, channelHealthTimestampsMatch(*storedHealth.LastHealthCheckAt, freshHealth))
 	activated, err := app.activateMetaMessengerAccount(
-		organization.ID, fixture.userID, fixture.account.ID, now, subscriptionApproval,
+		organization.ID, fixture.userID, fixture.account.ID, func() time.Time { return now }, subscriptionApproval,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, models.ChannelAccountStatusActive, activated.Status)
@@ -388,7 +390,7 @@ func TestManagedMessengerProductionRejectsCarriedDevelopmentUserToken(t *testing
 		organization.ID,
 		fixture.userID,
 		fixture.account.ID,
-		now,
+		func() time.Time { return now },
 		metaMessengerSubscriptionApproval{
 			PageID: fixture.account.ExternalAccountID, CheckedAt: now,
 			OAuthCredentialID: fixture.oauth.ID, OAuthCredentialVersion: fixture.oauth.Version,
@@ -1046,5 +1048,129 @@ func metaRegistryTestApp(db *gorm.DB, organizationID uuid.UUID) *App {
 				AllowedOrganizationIDs: organizationID.String(),
 			},
 		},
+	}
+}
+
+func TestManagedMessengerActivationRechecksFreshnessAfterAccountLock(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		elapsed time.Duration
+		allowed bool
+	}{
+		{name: "expired subscription approval", elapsed: 61 * time.Second},
+		{name: "still fresh approval", elapsed: 30 * time.Second, allowed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := testutil.SetupTestDB(t)
+			organization := testutil.CreateTestOrganization(t, db)
+			fixture := createMetaRegistryFixture(t, db, organization.ID, models.ChannelMessenger, "page-activation-lock-"+uuid.NewString())
+			app := metaRegistryTestApp(db, organization.ID)
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			metadata := cloneJSONB(fixture.account.Metadata)
+			metadata["meta_subscription_state"] = "verified"
+			metadata["meta_activation_state"] = "awaiting_admin_approval"
+			metadata["meta_health_checked_at"] = now.Format(time.RFC3339Nano)
+			metadata["meta_ownership_checked_at"] = now.Format(time.RFC3339Nano)
+			metadata["meta_health_oauth_credential_id"] = fixture.oauth.ID.String()
+			metadata["meta_health_oauth_version"] = fixture.oauth.Version
+			metadata["meta_health_webhook_credential_id"] = fixture.webhook.ID.String()
+			metadata["meta_health_webhook_version"] = fixture.webhook.Version
+			config := cloneJSONB(fixture.account.Config)
+			config["outbound_enabled"] = false
+			config["ai_reply_enabled"] = false
+			require.NoError(t, db.Model(&models.ChannelAccount{}).Where("id = ?", fixture.account.ID).Updates(map[string]any{
+				"status": models.ChannelAccountStatusPending, "config": config, "metadata": metadata,
+				"last_health_check_at": now, "last_error": "",
+			}).Error)
+			approval := metaMessengerSubscriptionApproval{
+				PageID: fixture.account.ExternalAccountID, CheckedAt: now,
+				OAuthCredentialID: fixture.oauth.ID, OAuthCredentialVersion: fixture.oauth.Version,
+				WebhookCredentialID: fixture.webhook.ID, WebhookCredentialVersion: fixture.webhook.Version,
+			}
+			var clockNanos atomic.Int64
+			var clockReads atomic.Int32
+			clockNanos.Store(now.UnixNano())
+			clock := func() time.Time {
+				clockReads.Add(1)
+				return time.Unix(0, clockNanos.Load()).UTC()
+			}
+			lockTx := db.Begin()
+			require.NoError(t, lockTx.Error)
+			lockReleased := false
+			done := make(chan error, 1)
+			started, joined := false, false
+			callback := "test:activation_account_lock_" + uuid.NewString()
+			callbackRegistered := false
+			t.Cleanup(func() {
+				if !lockReleased {
+					_ = lockTx.Rollback().Error
+				}
+				if started && !joined {
+					select {
+					case <-done:
+					case <-time.After(5 * time.Second):
+						t.Error("activation did not finish after test cleanup released its lock")
+					}
+				}
+				if callbackRegistered {
+					require.NoError(t, db.Callback().Query().Remove(callback))
+				}
+			})
+			var locked models.ChannelAccount
+			require.NoError(t, lockTx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", fixture.account.ID).First(&locked).Error)
+			attempted := make(chan struct{}, 1)
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+				if tx.Statement.Table != "channel_accounts" {
+					return
+				}
+				if _, locking := tx.Statement.Clauses["FOR"]; !locking {
+					return
+				}
+				select {
+				case attempted <- struct{}{}:
+				default:
+				}
+			}))
+			callbackRegistered = true
+			started = true
+			go func() {
+				_, err := app.activateMetaMessengerAccount(organization.ID, fixture.userID, fixture.account.ID, clock, approval)
+				done <- err
+			}()
+			select {
+			case <-attempted:
+			case err := <-done:
+				joined = true
+				t.Fatalf("activation returned before the locked account was released: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("activation did not reach the account lock")
+			}
+			require.Zero(t, clockReads.Load(), "approval clock must not be sampled before the account lock")
+			clockNanos.Store(now.Add(test.elapsed).UnixNano())
+			require.NoError(t, lockTx.Commit().Error)
+			lockReleased = true
+			select {
+			case err := <-done:
+				joined = true
+				if test.allowed {
+					require.NoError(t, err)
+				} else {
+					require.ErrorContains(t, err, "subscription approval was superseded")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("activation did not finish after the account lock was released")
+			}
+			assert.EqualValues(t, 1, clockReads.Load())
+			var stored models.ChannelAccount
+			require.NoError(t, db.First(&stored, "id = ?", fixture.account.ID).Error)
+			assert.Equal(t, test.allowed, stored.Status == models.ChannelAccountStatusActive)
+			assert.Equal(t, test.allowed, boolConfigValue(stored.Config, "outbound_enabled"))
+			assert.False(t, boolConfigValue(stored.Config, "ai_reply_enabled"))
+			if !test.allowed {
+				assert.Equal(t, models.ChannelAccountStatusPending, stored.Status)
+				assert.Equal(t, "awaiting_admin_approval", stringConfigValue(stored.Metadata, "meta_activation_state"))
+				assert.Empty(t, stringConfigValue(stored.Metadata, "meta_activated_at"))
+			}
+		})
 	}
 }

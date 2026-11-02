@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, watchEffect, type Component } from 'vue'
-import { RouterLink } from 'vue-router'
+import { RouterLink, useRouter } from 'vue-router'
 import {
   ArrowLeft,
   CheckCircle2,
@@ -35,6 +35,8 @@ interface LegalDocument {
   icon: Component
   sections: LegalSection[]
 }
+
+const router = useRouter()
 
 const props = defineProps<{
   documentKey: DocumentKey
@@ -532,7 +534,7 @@ onBeforeUnmount(() => {
               <a
                 v-for="section in legalDocument.sections"
                 :key="section.id"
-                :href="`#${section.id}`"
+                :href="router.resolve({ path: `/${props.documentKey}`, hash: `#${section.id}` }).href"
                 class="group flex items-start gap-2.5 rounded-lg px-2 py-2 text-xs font-medium leading-5 text-white/38 transition hover:bg-white/[0.035] hover:text-white/75"
               >
                 <ChevronRight class="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#cbd49a]/35 transition group-hover:translate-x-0.5 group-hover:text-[#cbd49a]" />
