@@ -30,6 +30,7 @@ import { useAppToast } from '@/composables/useAppToast'
 import { useAuthStore } from '@/stores/auth'
 import { getErrorMessage, unwrapItemResponse } from '@/lib/api-utils'
 import { readSelectedOrganizationId } from '@/lib/browserIdentity'
+import { calendarInterval, occupiesCalendarDay, type CalendarInterval } from '@/lib/calendarIntervals'
 import {
   bookingService,
   type Booking,
@@ -46,6 +47,8 @@ const cursor = ref(startOfWeek(new Date()))
 const services = ref<BookingService[]>([])
 const resources = ref<BookingResource[]>([])
 const events = ref<BookingEvent[]>([])
+const intervals = ref<Map<string, CalendarInterval>>(new Map())
+const loadError = ref('')
 const selectedEvent = ref<BookingEvent | null>(null)
 const bookings = ref<Booking[]>([])
 const bookingsLoading = ref(false)
@@ -150,8 +153,8 @@ function isoDate(value: Date) {
 
 function eventsForDay(day: Date) {
   return events.value
-    .filter((event) => eventDateKey(event) === isoDate(day))
-    .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime())
+    .filter((event) => occupiesCalendarDay(intervals.value.get(event.id)!, isoDate(day)))
+    .sort((a, b) => new Date(a.starts_at).getTime() - new Date(b.starts_at).getTime() || a.id.localeCompare(b.id))
 }
 
 function eventTimezone(event: BookingEvent) {
@@ -176,6 +179,23 @@ function eventDateKey(event: BookingEvent) {
   return `${parts.year}-${parts.month}-${parts.day}`
 }
 
+function intervalLabel(event: BookingEvent, day: Date) {
+  const value = intervals.value.get(event.id)!
+  const date = isoDate(day)
+  const from = value.startDate < date ? 'Continues' : timeLabel(event.starts_at, eventTimezone(event))
+  const exactEnd = timeLabel(event.ends_at, eventTimezone(event))
+  const until = value.lastOccupiedDate > date ? 'continues'
+    : value.endDate > date ? (value.endAtMidnight && value.endDate === nextDateKey(day) ? '24:00' : `${exactEnd} next day`)
+      : exactEnd
+  return `${from} – ${until}`
+}
+
+function nextDateKey(day: Date) {
+  const next = new Date(day)
+  next.setDate(next.getDate() + 1)
+  return isoDate(next)
+}
+
 function isToday(day: Date) {
   return isoDate(day) === isoDate(new Date())
 }
@@ -184,31 +204,39 @@ async function load() {
   const generation = ++loadGeneration
   const organization = currentOrganization()
   loading.value = true
+  loadError.value = ''
+  catalogueOrganization = ''
   try {
-    // Cards use each person's local calendar date. A browser-local UTC
-    // interval can omit Monday/Sunday slots in another timezone, so fetch a
-    // one-day margin on each side of the displayed dates and then trim by the
-    // same resource-local date used to place cards. UTC date arithmetic keeps
-    // the margin stable across daylight-saving changes in the browser.
+    // Fetch intervals overlapping a conservative UTC window, not only events
+    // starting in it. One day on either side covers current resource offsets;
+    // exact resource-local day intersection determines cards and weekly totals.
+    // Offset pages are not a snapshot of concurrent calendar writes.
     const firstDate = isoDate(weekDays.value[0])
     const lastDate = isoDate(weekDays.value[6])
     const fromDate = new Date(`${firstDate}T00:00:00.000Z`)
     fromDate.setUTCDate(fromDate.getUTCDate() - 1)
-    const toDate = new Date(`${lastDate}T23:59:59.999Z`)
-    toDate.setUTCDate(toDate.getUTCDate() + 1)
+    const toDate = new Date(`${lastDate}T00:00:00.000Z`)
+    toDate.setUTCDate(toDate.getUTCDate() + 2)
     const [serviceResponse, resourceResponse, eventResponse] = await Promise.all([
       bookingService.allServices(),
       bookingService.allResources(),
-      bookingService.allEvents({ from: fromDate.toISOString(), to: toDate.toISOString() }),
+      bookingService.calendarEvents(fromDate.toISOString(), toDate.toISOString()),
     ])
     if (!isCurrent(organization) || generation !== loadGeneration) return
+    const nextIntervals = new Map<string, CalendarInterval>()
+    const days = weekDays.value.map(isoDate)
+    for (const event of eventResponse) {
+      if (!event.id || nextIntervals.has(event.id)) throw new Error('Calendar changed while loading. Refresh to load it again.')
+      const zone = event.resource?.timezone || resourceResponse.find(resource => resource.id === event.resource_id)?.timezone ||
+        Intl.DateTimeFormat().resolvedOptions().timeZone
+      nextIntervals.set(event.id, calendarInterval(event.starts_at, event.ends_at, zone))
+    }
+    const visibleEvents = eventResponse.filter(event => days.some(day => occupiesCalendarDay(nextIntervals.get(event.id)!, day)))
     catalogueOrganization = organization
     services.value = serviceResponse
     resources.value = resourceResponse
-    events.value = eventResponse.filter((event) => {
-      const date = eventDateKey(event)
-      return firstDate <= date && date <= lastDate
-    })
+    intervals.value = nextIntervals
+    events.value = visibleEvents
     if (selectedEvent.value) {
       selectedEvent.value = events.value.find((event) => event.id === selectedEvent.value?.id) ?? null
     }
@@ -218,7 +246,11 @@ async function load() {
     }
   } catch (error) {
     if (isCurrent(organization) && generation === loadGeneration) {
-      toast.error('Calendar could not be loaded', getErrorMessage(error))
+      events.value = []
+      intervals.value = new Map()
+      closeSelectedEvent()
+      loadError.value = getErrorMessage(error, 'Refresh to load this calendar week.')
+      toast.error('Calendar could not be loaded', loadError.value)
     }
   } finally {
     if (isCurrent(organization) && generation === loadGeneration) loading.value = false
@@ -536,6 +568,8 @@ watch(
     services.value = []
     resources.value = []
     events.value = []
+    intervals.value = new Map()
+    loadError.value = ''
     bookings.value = []
     selectedEvent.value = null
     showSetup.value = false
@@ -1118,7 +1152,7 @@ onMounted(load)
           {{ weekLabel }}
         </p>
       </div>
-      <div class="hidden items-center gap-5 text-xs text-white/45 light:text-gray-500 md:flex">
+      <div v-if="!loading && !loadError" class="hidden items-center gap-5 text-xs text-white/45 light:text-gray-500 md:flex">
         <span>{{ events.length }} schedules</span>
         <span>{{ weekBooked }}/{{ weekCapacity }} seats booked</span>
       </div>
@@ -1126,6 +1160,11 @@ onMounted(load)
 
     <div v-if="loading" class="flex flex-1 items-center justify-center">
       <Loader2 class="h-6 w-6 animate-spin text-fuchsia-300" />
+    </div>
+
+    <div v-else-if="loadError" role="alert" class="p-5 text-sm text-destructive">
+      This calendar week could not be loaded completely. {{ loadError }}
+      <Button type="button" variant="outline" class="ml-3" @click="load">Refresh calendar</Button>
     </div>
 
     <div v-else class="grid min-w-0 flex-1 xl:grid-cols-[minmax(0,1fr)_300px]">
@@ -1175,7 +1214,7 @@ onMounted(load)
                     data-testid="calendar-event-time"
                     class="text-[10px] font-semibold uppercase tracking-wider opacity-70 light:opacity-100"
                   >
-                    {{ timeLabel(event.starts_at, eventTimezone(event)) }}
+                    {{ intervalLabel(event, day) }}
                   </span>
                   <Badge variant="outline" class="h-5 border-current/20 px-1.5 text-[9px]">
                     {{ event.booked_quantity ?? 0 }}/{{ event.capacity }}

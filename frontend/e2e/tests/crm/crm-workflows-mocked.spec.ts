@@ -1036,7 +1036,7 @@ for (const width of [390, 1280]) {
       } else {
         const query = new URL(route.request().url()).searchParams
         const start = Date.parse(String(createdEvent?.starts_at))
-        const listed = createdEvent && Date.parse(query.get('from') || '') <= start && start <= Date.parse(query.get('to') || '') ? [createdEvent] : []
+        const listed = createdEvent && Date.parse(query.get('overlap_from') || '') < Date.parse(String(createdEvent?.ends_at)) && start < Date.parse(query.get('overlap_to') || '') ? [createdEvent] : []
         await route.fulfill({ json: { data: { events: listed, total: listed.length } } })
       }
     })

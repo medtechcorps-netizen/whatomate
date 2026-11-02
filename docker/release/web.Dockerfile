@@ -27,8 +27,8 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 FROM --platform=linux/amd64 docker.io/library/node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS piper-download
 
-# Patch Brotli from an immutable security snapshot without moving the APT snapshot.
-ADD --checksum=sha256:70b188a86d81f30d7510aab30e25d638ed5037dded6691af1533952b71ac61de https://snapshot.ubuntu.com/ubuntu/20261030T000000Z/pool/main/b/brotli/libbrotli1_1.1.0-2ubuntu0.1_amd64.deb /tmp/libbrotli-security.deb
+# Patch Brotli with checksum-pinned security package bytes; keep the APT snapshot.
+ADD --checksum=sha256:70b188a86d81f30d7510aab30e25d638ed5037dded6691af1533952b71ac61de https://archive.ubuntu.com/ubuntu/pool/main/b/brotli/libbrotli1_1.1.0-2ubuntu0.1_amd64.deb /tmp/libbrotli-security.deb
 
 ADD --checksum=sha256:a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992 https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz /tmp/piper.tar.gz
 RUN tar xf /tmp/piper.tar.gz -C /tmp && rm /tmp/piper.tar.gz

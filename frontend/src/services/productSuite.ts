@@ -943,6 +943,11 @@ export const bookingService = {
     fetchAllPages<BookingEvent>('events', (page, limit) =>
       api.get('/booking/events', { params: { ...params, page, limit } }),
     ),
+  // Half-open overlap bounds are separate from the inclusive starts-at API.
+  calendarEvents: (from: string, to: string) =>
+    fetchAllPages<BookingEvent>('events', (page, limit) =>
+      api.get('/booking/events', { params: { overlap_from: from, overlap_to: to, page, limit } }),
+    ),
   availability: (params?: BookingAvailabilityParams) => api.get('/booking/availability', { params }),
   allAvailability: (params?: Omit<BookingAvailabilityParams, 'page' | 'limit'>) =>
     fetchAllPages<BookingAvailabilitySlot>('slots', (page, limit) =>
