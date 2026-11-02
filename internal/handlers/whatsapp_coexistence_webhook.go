@@ -1769,6 +1769,9 @@ func (a *App) persistCoexistenceEdit(
 	if err != nil {
 		return fmt.Errorf("load coexistence edit target: %w", err)
 	}
+	if emit && resolved.LegacyMergedProjection != nil {
+		a.mirrorResolvedWhatsAppMessageAfterCommit(account, resolved)
+	}
 	original := resolved.Message
 	if revoked, _ := original.Metadata[coexistenceMediaRevokedMetadataKey].(bool); revoked {
 		return nil
@@ -1777,7 +1780,7 @@ func (a *App) persistCoexistenceEdit(
 	extracted := a.extractMessageContentForPersistence(event.Edit.Message)
 	metadata := cloneMessageMetadata(original.Metadata)
 	if strings.TrimSpace(event.ID) != "" && metadata["coexistence_edit_event_id"] == strings.TrimSpace(event.ID) {
-		return a.ensureProvenCoexistenceMediaJob(account, &original)
+		return a.ensureProvenCoexistenceMediaJob(account, &original, identity)
 	}
 	metadata["coexistence_source"] = source
 	metadata["coexistence_edit_event_id"] = strings.TrimSpace(event.ID)
@@ -1792,7 +1795,7 @@ func (a *App) persistCoexistenceEdit(
 	).Updates(updates).Error; err != nil {
 		return err
 	}
-	if err := a.ensureProvenCoexistenceMediaJob(account, &original); err != nil {
+	if err := a.ensureProvenCoexistenceMediaJob(account, &original, identity); err != nil {
 		return err
 	}
 	messageID := original.ID
@@ -1883,6 +1886,9 @@ func (a *App) persistCoexistenceRevoke(
 	}
 	if err != nil {
 		return fmt.Errorf("load coexistence revoke target: %w", err)
+	}
+	if emit && resolved.LegacyMergedProjection != nil {
+		a.mirrorResolvedWhatsAppMessageAfterCommit(account, resolved)
 	}
 	original := resolved.Message
 	metadata := cloneMessageMetadata(original.Metadata)
@@ -2203,7 +2209,7 @@ func (a *App) persistHistoryMediaDetail(
 		if coexistenceMessageHasStoredEdit(&existing) {
 			// History has no edit revision with which to supersede this stored
 			// edit. Keep B intact and resume only B's media hydration if needed.
-			return a.ensureProvenCoexistenceMediaJob(account, &existing)
+			return a.ensureProvenCoexistenceMediaJob(account, &existing, identity)
 		}
 		extracted := a.extractMessageContentForPersistence(detail.IncomingTextMessage)
 		metadata := cloneMessageMetadata(existing.Metadata)
@@ -2224,7 +2230,7 @@ func (a *App) persistHistoryMediaDetail(
 		).Updates(updates).Error; err != nil {
 			return err
 		}
-		return a.ensureProvenCoexistenceMediaJob(account, &existing)
+		return a.ensureProvenCoexistenceMediaJob(account, &existing, identity)
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("load history media placeholder: %w", err)
@@ -2252,11 +2258,20 @@ func (a *App) persistHistoryMediaDetail(
 // Every media enqueue revalidates the same winner after its mutation. The
 // surrounding resolver already holds canonical-contact/message locks; this
 // read must not acquire account/channel locks behind them.
-func (a *App) ensureProvenCoexistenceMediaJob(account *models.WhatsAppAccount, message *models.Message) error {
-	resolved, err := a.resolveWhatsAppMessage(account, whatsAppMessageLookup{
+func (a *App) ensureProvenCoexistenceMediaJob(account *models.WhatsAppAccount, message *models.Message, identities ...coexistenceContactIdentity) error {
+	if len(identities) > 1 {
+		return errors.New("coexistence media identity is ambiguous")
+	}
+	lookup := whatsAppMessageLookup{
 		WAMID: message.WhatsAppMessageID, MessageID: message.ID, ContactID: message.ContactID,
 		Direction: message.Direction,
-	})
+	}
+	// Only a currently signed event caller can supply its identity. It is
+	// reread through the entire resolver, never trusted as prior admission.
+	if len(identities) == 1 {
+		lookup.Identity = identities[0]
+	}
+	resolved, err := a.resolveWhatsAppMessage(account, lookup)
 	if err != nil {
 		return fmt.Errorf("revalidate coexistence media message: %w", err)
 	}
@@ -2358,7 +2373,7 @@ func (a *App) persistCoexistenceMessage(
 			return nil, false, mergeErr
 		}
 		if emit {
-			a.mirrorLegacyWhatsAppMessageAfterCommit(account, existing.ID)
+			a.mirrorResolvedWhatsAppMessageAfterCommit(account, locked)
 		}
 		return &existing, false, nil
 	}
@@ -2457,7 +2472,7 @@ func (a *App) persistCoexistenceMessage(
 			return nil, false, err
 		}
 		if emit {
-			a.mirrorLegacyWhatsAppMessageAfterCommit(account, existing.ID)
+			a.mirrorResolvedWhatsAppMessageAfterCommit(account, winner)
 		}
 		return &existing, false, nil
 	}
@@ -2566,7 +2581,7 @@ func (a *App) mergeCoexistenceMessageDetails(
 		// The original/history replay has no revision authority over a stored
 		// edit. Preserve its exact content/type/media and enqueue only that
 		// current edited media, never the replay's obsolete provider object.
-		return a.ensureProvenCoexistenceMediaJob(account, existing)
+		return a.ensureProvenCoexistenceMediaJob(account, existing, identity)
 	}
 	extracted := a.extractMessageContentForPersistence(message.IncomingTextMessage)
 	mergedMetadata := cloneMessageMetadata(existing.Metadata)
@@ -2602,7 +2617,7 @@ func (a *App) mergeCoexistenceMessageDetails(
 	).Updates(updates).Error; err != nil {
 		return err
 	}
-	return a.ensureProvenCoexistenceMediaJob(account, existing)
+	return a.ensureProvenCoexistenceMediaJob(account, existing, identity)
 }
 
 func coexistenceHistoryThreadIdentity(thread CoexistenceHistoryThread) coexistenceContactIdentity {

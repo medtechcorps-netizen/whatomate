@@ -262,6 +262,9 @@ func (a *App) CreateAccount(r *fastglue.Request) error {
 		}
 		return nil
 	}); err != nil {
+		if embeddedSignupPhoneClaimUniqueViolation(err) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "This WhatsApp phone number is already connected", nil, "")
+		}
 		a.Log.Error("Failed to create account", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to create account", nil, "")
 	}
@@ -666,6 +669,9 @@ func (a *App) UpdateAccount(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account Omnichannel binding changed; reload and try again", nil, "")
 	}
 	if updateErr != nil {
+		if embeddedSignupPhoneClaimUniqueViolation(updateErr) {
+			return r.SendErrorEnvelope(fasthttp.StatusConflict, "This WhatsApp phone number is already connected", nil, "")
+		}
 		a.Log.Error("Failed to update account", "error", updateErr)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to update account", nil, "")
 	}
@@ -1849,6 +1855,19 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Meta Embedded Signup is unavailable", nil, "")
 	}
 
+	// A supplied phone is inspected before the one-time code is exchanged. A
+	// discovered phone is inspected in discoverWABAAndPhone as soon as its ID is
+	// known. Neither snapshot is refreshed after provider validation: deletion
+	// or replacement during that validation must invalidate the eventual claim.
+	var generation embeddedSignupAccountGeneration
+	if strings.TrimSpace(req.PhoneID) != "" {
+		generation, err = a.inspectEmbeddedSignupAccountGeneration(providerCtx, orgID, req.PhoneID)
+		if err != nil {
+			a.Log.Error("Failed to inspect existing WhatsApp account generation", "organization_id", orgID)
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to inspect the existing WhatsApp account", nil, "")
+		}
+	}
+
 	// Provider read-only phase: exchange, validate the issuing app/scopes, and
 	// prove the exact WABA/phone relationship before claiming anything.
 	a.Log.Info("Exchanging code for access token")
@@ -1878,6 +1897,7 @@ func (a *App) exchangeToken(r *fastglue.Request, providerBudget time.Duration) e
 		phoneNumberHint,
 		req.Name,
 		metaSnapshot,
+		generation,
 	)
 	discoveryCancel()
 	if errors.Is(err, errEmbeddedSignupAccountInspection) {
@@ -2318,6 +2338,107 @@ func lockMetaIntegrationContract(db *gorm.DB, orgID uuid.UUID) error {
 	return err
 }
 
+// embeddedSignupAccountGeneration is a request-local observed-field witness,
+// never a lease or a durable monotonic generation. It cannot detect an ABA
+// sequence that returns every compared value to its original value.
+// The account copy retains only server-read values and is never serialized or
+// logged. Missing is an inspected state, distinct from an uninitialized witness.
+type embeddedSignupAccountGeneration struct {
+	inspected      bool
+	organizationID uuid.UUID
+	phoneID        string
+	found          bool
+	account        models.WhatsAppAccount
+}
+
+// One cap covers acquisition, tenant admission, SELECT and read-only COMMIT;
+// it is clipped by the caller and both receiver/root DB owner deadlines.
+const embeddedSignupAccountInspectionBudget = 5 * time.Second
+
+func (a *App) inspectEmbeddedSignupAccountGeneration(ctx context.Context, orgID uuid.UUID, phoneID string) (embeddedSignupAccountGeneration, error) {
+	generation := embeddedSignupAccountGeneration{organizationID: orgID, phoneID: strings.TrimSpace(phoneID)}
+	if generation.phoneID == "" {
+		return embeddedSignupAccountGeneration{}, &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageAccountLookup}
+	}
+	if ctx == nil || a == nil || a.DB == nil || a.DB.Statement == nil {
+		return embeddedSignupAccountGeneration{}, &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageTenantScope}
+	}
+	root := a.rootApp()
+	if root == nil || root.DB == nil || root.DB.Statement == nil {
+		return embeddedSignupAccountGeneration{}, &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageTenantScope}
+	}
+	ownerContexts := []context.Context{ctx, a.DB.Statement.Context, root.DB.Statement.Context}
+	deadline := time.Now().Add(embeddedSignupAccountInspectionBudget)
+	for _, ownerCtx := range ownerContexts {
+		if ownerCtx == nil {
+			continue
+		}
+		if ownerCtx.Err() != nil {
+			return embeddedSignupAccountGeneration{}, &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageTenantScope}
+		}
+		if ownerDeadline, ok := ownerCtx.Deadline(); ok && ownerDeadline.Before(deadline) {
+			deadline = ownerDeadline
+		}
+	}
+	queryCtx, cancelQuery := context.WithDeadline(ctx, deadline)
+	defer cancelQuery()
+	for _, ownerCtx := range ownerContexts[1:] {
+		if ownerCtx != nil {
+			// Preserve independent owner cancellation without mutating its DB or
+			// cancelling the transaction/connection the caller may already hold.
+			stop := context.AfterFunc(ownerCtx, cancelQuery)
+			defer stop()
+		}
+	}
+	err := a.withBoundedRootConnection(queryCtx, 0, func(db *gorm.DB) error {
+		return a.withCommittedTenantReadOnDB(db, orgID, func(tx *gorm.DB) error {
+			err := tx.Unscoped().
+				Where("organization_id = ? AND BTRIM(phone_id) = BTRIM(?)", orgID, generation.phoneID).
+				Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, updated_at DESC, created_at DESC, id DESC").
+				First(&generation.account).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			if err != nil {
+				return &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageAccountLookup}
+			}
+			generation.found = true
+			return nil
+		})
+	})
+	if err != nil {
+		var inspectionErr *embeddedSignupAccountInspectionError
+		if !errors.As(err, &inspectionErr) {
+			inspectionErr = &embeddedSignupAccountInspectionError{stage: embeddedSignupInspectionStageTenantScope}
+		}
+		return embeddedSignupAccountGeneration{}, inspectionErr
+	}
+	generation.inspected = true
+	return generation, nil
+}
+
+func (g embeddedSignupAccountGeneration) matches(orgID uuid.UUID, phoneID string, account *models.WhatsAppAccount, missing bool) bool {
+	if !g.inspected || g.organizationID != orgID || g.phoneID != strings.TrimSpace(phoneID) {
+		return false
+	}
+	if missing {
+		return !g.found
+	}
+	if !g.found || account == nil {
+		return false
+	}
+	prior := &g.account
+	return account.ID == prior.ID && account.OrganizationID == prior.OrganizationID &&
+		account.CreatedAt.Equal(prior.CreatedAt) && account.UpdatedAt.Equal(prior.UpdatedAt) &&
+		account.DeletedAt.Valid == prior.DeletedAt.Valid &&
+		(!prior.DeletedAt.Valid || account.DeletedAt.Time.Equal(prior.DeletedAt.Time)) &&
+		account.Name == prior.Name && account.PhoneID == prior.PhoneID && account.BusinessID == prior.BusinessID &&
+		account.APIVersion == prior.APIVersion && account.AppID == prior.AppID && account.AppSecret == prior.AppSecret &&
+		account.Status == prior.Status && account.IsSMB == prior.IsSMB &&
+		account.AccessToken == prior.AccessToken && account.Pin == prior.Pin &&
+		sameMetaTokenExpiry(account.AccessTokenExpiresAt, prior.AccessTokenExpiresAt)
+}
+
 // embeddedSignupActiveRefreshCandidate performs only a local read. The caller
 // must separately prove the currently configured app is already subscribed to
 // the WABA before the final locked refresh claim can replace credentials.
@@ -2399,6 +2520,12 @@ func (a *App) claimEmbeddedSignupAccount(
 			Where("organization_id = ? AND BTRIM(phone_id) = BTRIM(?)", orgID, phoneID).
 			Order("CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END, updated_at DESC, created_at DESC, id DESC").
 			First(&account).Error
+		if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			return lookupErr
+		}
+		if !accountVersion.generation.matches(orgID, phoneID, &account, errors.Is(lookupErr, gorm.ErrRecordNotFound)) {
+			return errEmbeddedSignupClaimSuperseded
+		}
 		if accountVersion.accountID != uuid.Nil {
 			if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
 				return lookupErr
@@ -2736,6 +2863,8 @@ type embeddedSignupAccountVersion struct {
 	accountID  uuid.UUID
 	updatedAt  time.Time
 	isSMB      bool
+	// Captured independently of whether the stored API version is kept.
+	generation embeddedSignupAccountGeneration
 }
 
 // embeddedSignupKeptAPIVersionPattern is the Graph API version shape the
@@ -2841,6 +2970,7 @@ func (a *App) discoverWABAAndPhone(
 	signupMode string,
 	accessToken, phoneID, wabaID, phoneNumberHint, name string,
 	metaSnapshot embeddedSignupMetaSnapshot,
+	generation embeddedSignupAccountGeneration,
 ) (string, string, string, *time.Time, *whatsapp.PhoneNumberInfo, embeddedSignupAccountVersion, error) {
 	a.Log.Info("Validating embedded signup token via debug_token")
 
@@ -2926,6 +3056,18 @@ func (a *App) discoverWABAAndPhone(
 			"matched_phone_number_hint", phoneNumberHint != "")
 	}
 
+	// When Meta omitted the phone ID, the protection starts here, after its
+	// discovery GETs and before the account-scoped validation GETs. It does not
+	// claim to cover changes before this phone could be identified.
+	if !generation.inspected {
+		generation, err = a.inspectEmbeddedSignupAccountGeneration(ctx, orgID, phoneID)
+		if err != nil {
+			return "", "", "", nil, nil, embeddedSignupAccountVersion{}, err
+		}
+	}
+	if generation.organizationID != orgID || generation.phoneID != phoneID {
+		return "", "", "", nil, nil, embeddedSignupAccountVersion{}, errEmbeddedSignupClaimSuperseded
+	}
 	accountVersion, err := a.embeddedSignupAccountAPIVersion(orgID, signupMode, phoneID, wabaID, metaSnapshot)
 	if err != nil {
 		// Always an *embeddedSignupAccountInspectionError, which matches
@@ -2955,6 +3097,7 @@ func (a *App) discoverWABAAndPhone(
 		IsOnBizApp:         validation.IsOnBizApp,
 		PlatformType:       validation.PlatformType,
 	}
+	accountVersion.generation = generation
 	return phoneID, wabaID, name, tokenExpiresAt, phoneInfo, accountVersion, nil
 }
 

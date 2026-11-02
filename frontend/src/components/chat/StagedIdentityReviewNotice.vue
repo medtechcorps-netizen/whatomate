@@ -1,150 +1,88 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { ref, watch } from 'vue'
 import { ShieldAlert } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { unwrapItemResponse } from '@/lib/api-utils'
-import { contactsService } from '@/services/api'
+import { parseStagedReviewList } from '@/lib/stagedIdentityReview'
+import { useIdentityReviewObservation, type IdentityReviewScope } from '@/composables/useIdentityReviewObservation'
+import { contactsService, type StagedIdentityReviewList } from '@/services/api'
 import ContactIdentityReviewDialog from './ContactIdentityReviewDialog.vue'
 
-// Workspace-level entry point to the protected staged identity-review queue.
-// Held WhatsApp messages have no contact or conversation, so without this
-// notice an empty workspace showed nothing at all. It reads only the existing
-// protected list endpoint (contacts:write + contacts.identity_review:write);
-// viewers without that authority never request it and see nothing.
 const props = withDefaults(defineProps<{
   canView: boolean
   refreshIntervalMs?: number
-}>(), {
-  refreshIntervalMs: 60_000,
+  invalidation?: IdentityReviewScope | null
+}>(), { refreshIntervalMs: 60_000, invalidation: null })
+
+const aggregate = ref<StagedIdentityReviewList | null>(null)
+const status = ref<'loading' | 'ready' | 'unavailable' | 'forbidden'>('loading')
+const dialogOpen = ref(false)
+const dialogMounted = ref(false)
+const observation = useIdentityReviewObservation({
+  enabled: () => props.canView,
+  requireReview: true,
+  query: () => props.canView,
+  intervalMs: () => props.refreshIntervalMs,
+  clear: () => {
+    aggregate.value = null
+    status.value = 'loading'
+    dialogOpen.value = false
+    dialogMounted.value = false
+  },
+  refresh,
 })
 
-const total = ref(0)
-// Held messages that no decision can resolve (their hold is unsupported), so
-// they stay as read-only records until the account is onboarded again. Saying
-// so keeps a count that cannot reach zero from looking stuck.
-const readOnlyTotal = ref(0)
-const dialogOpen = ref(false)
-// Mounted on first use only: no hidden dialog per view, and it then stays
-// mounted so its close transition and request cancellation run normally.
-const dialogMounted = ref(false)
-let controller: AbortController | null = null
-let generation = 0
-let timer: ReturnType<typeof setInterval> | null = null
-
 async function refresh() {
-  if (!props.canView) {
-    total.value = 0
-    readOnlyTotal.value = 0
-    return
-  }
-  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-  const current = ++generation
-  controller?.abort()
-  const request = new AbortController()
-  controller = request
+  const scope = observation.capture()
+  if (!scope) return
+  const request = observation.controller()
+  aggregate.value = null
+  status.value = 'loading'
   try {
-    const response = await contactsService.listStagedIdentityReviews({ page: 1, limit: 1 }, request.signal)
-    if (current !== generation) return
-    const payload = unwrapItemResponse<{ total: number; read_only_total?: number }>(response)
-    total.value = payload && Number.isSafeInteger(payload.total) && payload.total > 0 ? payload.total : 0
-    const readOnly = payload?.read_only_total
-    readOnlyTotal.value = typeof readOnly === 'number' && Number.isSafeInteger(readOnly) && readOnly > 0
-      ? Math.min(readOnly, total.value)
-      : 0
-  } catch {
-    // A failed count must never surface protected data or block the page;
-    // the next refresh tries again.
-  } finally {
-    if (controller === request) controller = null
-  }
-}
-
-function onVisibilityChange() {
-  if (document.visibilityState === 'visible') void refresh()
-}
-
-function startTimer() {
-  stopTimer()
-  if (props.canView && props.refreshIntervalMs > 0) {
-    timer = setInterval(() => { void refresh() }, props.refreshIntervalMs)
-  }
-}
-
-function stopTimer() {
-  if (timer) clearInterval(timer)
-  timer = null
+    const response = await contactsService.listStagedIdentityReviews({ page: 1, limit: 1 }, { organizationId: scope.organizationId, signal: request.signal })
+    if (!observation.current(scope) || request.signal.aborted) return
+    aggregate.value = parseStagedReviewList(unwrapItemResponse(response), 1, 1)
+    status.value = 'ready'
+  } catch (error) {
+    if (!observation.current(scope) || request.signal.aborted) return
+    const code = (error as { response?: { status?: number } })?.response?.status
+    status.value = code === 403 ? 'forbidden' : 'unavailable'
+    if (code === 403) observation.pause()
+  } finally { observation.release(request) }
 }
 
 function openQueue() {
+  if (!observation.capture() || status.value === 'forbidden') return
   dialogMounted.value = true
   dialogOpen.value = true
 }
 
-function onStagedTotal(value: number) {
-  if (Number.isSafeInteger(value) && value >= 0) {
-    total.value = value
-    readOnlyTotal.value = Math.min(readOnlyTotal.value, value)
-  }
+function invalidate(scope: IdentityReviewScope) {
+  if (observation.belongs(scope)) void observation.refresh(true)
 }
 
-watch(() => props.canView, () => {
-  void refresh()
-  startTimer()
-})
-
-watch(dialogOpen, open => {
-  if (!open) void refresh()
-})
-
-onMounted(() => {
-  void refresh()
-  startTimer()
-  document.addEventListener('visibilitychange', onVisibilityChange)
-})
-
-onBeforeUnmount(() => {
-  generation += 1
-  controller?.abort()
-  stopTimer()
-  document.removeEventListener('visibilitychange', onVisibilityChange)
-})
+watch(() => props.invalidation, value => { if (value) invalidate(value) }, { flush: 'sync' })
+watch(dialogOpen, open => { if (!open && props.canView) void observation.refresh(true) })
 </script>
 
 <template>
-  <div v-if="canView && total > 0" class="border-b border-amber-300/15 bg-amber-300/[0.06] px-3 py-2 light:border-amber-200 light:bg-amber-50">
-    <div class="flex items-center gap-2" data-testid="staged-identity-review-notice">
+  <div v-if="canView && observation.canReview() && (status !== 'ready' || (aggregate?.total ?? 0) > 0)" class="border-b border-amber-300/15 bg-amber-300/[0.06] px-3 py-2 light:border-amber-200 light:bg-amber-50">
+    <div class="flex flex-wrap items-center gap-2" data-testid="staged-identity-review-notice">
       <ShieldAlert class="h-4 w-4 shrink-0 text-amber-300 light:text-amber-700" />
-      <p class="min-w-0 flex-1 text-xs leading-5 text-amber-50/85 light:text-amber-900">
-        <span class="font-semibold" data-testid="staged-identity-review-count">{{ total }}</span>
-        {{ total === 1 ? 'WhatsApp message is' : 'WhatsApp messages are' }} held for identity review<template v-if="readOnlyTotal > 0">
-          <span
-            class="text-amber-50/60 light:text-amber-800/80"
-            title="No review decision can resolve these held messages. They stay readable here until the WhatsApp number is onboarded again, and their senders' later messages may be held too."
-            data-testid="staged-identity-review-read-only"
-          >
-            · {{ readOnlyTotal === total ? (total === 1 ? 'read-only for now' : 'all read-only for now') : `${readOnlyTotal} read-only for now` }}
-          </span>
+      <p class="min-w-0 flex-1 text-xs leading-5 text-amber-50/85 light:text-amber-900" role="status" aria-live="polite">
+        <template v-if="status === 'ready' && aggregate">
+          <span class="font-semibold" data-testid="staged-identity-review-count">{{ aggregate.actionable_chain_total }}</span>
+          {{ aggregate.actionable_chain_total === 1 ? 'review available' : 'reviews available' }}
+          <span data-testid="staged-identity-review-held-count"> · {{ aggregate.total }} held {{ aggregate.total === 1 ? 'message' : 'messages' }}</span>
+          <span v-if="aggregate.actionable_chain_total === 0" data-testid="staged-identity-review-read-only"> · No reviews are available right now. Held messages remain readable.</span>
         </template>
+        <template v-else-if="status === 'loading'">Checking review availability…</template>
+        <template v-else-if="status === 'forbidden'">Review access is not currently available.</template>
+        <template v-else>Review availability could not be checked.</template>
       </p>
-      <Button
-        size="sm"
-        variant="outline"
-        class="h-7 shrink-0 px-2 text-xs"
-        data-testid="staged-identity-review-open"
-        @click="openQueue"
-      >
-        Review
-      </Button>
+      <Button v-if="status === 'unavailable' || status === 'forbidden'" size="sm" variant="outline" class="h-7 shrink-0 px-2 text-xs" data-testid="staged-identity-review-retry" @click="observation.refresh(true)">Retry</Button>
+      <Button v-if="status !== 'forbidden'" size="sm" variant="outline" class="h-7 shrink-0 px-2 text-xs" data-testid="staged-identity-review-open" @click="openQueue">View held messages</Button>
     </div>
   </div>
-  <!-- Outside the notice's v-if so an emptied queue never unmounts an open dialog. -->
-  <ContactIdentityReviewDialog
-    v-if="canView && dialogMounted"
-    v-model:open="dialogOpen"
-    :contact-id="null"
-    :can-review="canView"
-    :can-view-staged="canView"
-    initial-section="staged"
-    @staged-total="onStagedTotal"
-  />
+  <ContactIdentityReviewDialog v-if="canView && observation.canReview() && dialogMounted" v-model:open="dialogOpen" :contact-id="null" :can-review="canView" :can-view-staged="canView" initial-section="staged" @queue-invalidated="invalidate" />
 </template>

@@ -1007,12 +1007,9 @@ func enumerateWhatsAppIdentityReviewCandidates(
 		canonicalContacts[canonical.ID] = canonical
 	}
 	items := identityReviewCandidateMapSlice(reasons)
-	directOwners := make([]uuid.UUID, 0, len(items))
 	selectorOnly := make([]uuid.UUID, 0, len(items))
 	for _, item := range items {
-		if item.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID) {
-			directOwners = append(directOwners, item.ContactID)
-		} else if canonicalContacts[item.ContactID] != nil {
+		if !item.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID) && canonicalContacts[item.ContactID] != nil {
 			selectorOnly = append(selectorOnly, item.ContactID)
 		}
 	}
@@ -1020,31 +1017,7 @@ func enumerateWhatsAppIdentityReviewCandidates(
 	if err != nil {
 		return identityReviewCandidateSet{}, err
 	}
-	// A direct-BSUID owner (possibly through a merge alias) is the principal's
-	// own contact. Any other member is routable only while nothing ties its
-	// canonical family to a different WhatsApp user.
-	routable := make(map[uuid.UUID]bool, len(items))
-	for _, item := range items {
-		routable[item.ContactID] = item.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID) ||
-			(canonicalContacts[item.ContactID] != nil && !otherUsers[item.ContactID])
-	}
-	// The authenticated direct BSUID is the routing principal even before any
-	// contact owns it, so a phone or parent match is still a decidable review.
-	// It needs at least one member a decision may name; otherwise (an empty
-	// set, or only contacts of other WhatsApp users) it stays read-only.
-	anyRoutable := false
-	for _, item := range items {
-		anyRoutable = anyRoutable || routable[item.ContactID]
-	}
-	if !anyRoutable {
-		supported = false
-	}
-	return identityReviewCandidateSet{
-		items: items, digest: identityReviewMemberDigest(items), supported: supported,
-		directPrimaryOwners: directOwners,
-		multipleOwners:      identityReviewHasMultipleOwners(items),
-		routable:            routable,
-	}, nil
+	return finalizeIdentityReviewCandidates(claim, items, canonicalContacts, otherUsers, supported), nil
 }
 
 // identityReviewMembersOfOtherUsers marks the canonical contacts whose family
@@ -1604,4 +1577,35 @@ func resolveMarketingPreferenceContact(
 		return nil, false, errMarketingPreferenceIdentityConflict
 	}
 	return canonical, true, nil
+}
+
+// finalizeIdentityReviewCandidates is the shared pure decision policy. Both
+// existing admission/Preview reads and the bounded observation feed it complete
+// facts. Direct owners retain precedence over selector-only foreign-user facts.
+func finalizeIdentityReviewCandidates(
+	claim WhatsAppIdentityReviewClaim,
+	items []WhatsAppIdentityReviewCandidate,
+	canonicalContacts map[uuid.UUID]*models.Contact,
+	otherUsers map[uuid.UUID]bool,
+	supported bool,
+) identityReviewCandidateSet {
+	directOwners := make([]uuid.UUID, 0, len(items))
+	routable := make(map[uuid.UUID]bool, len(items))
+	anyRoutable := false
+	for _, item := range items {
+		direct := item.SelectorReasons.Has(models.WhatsAppIdentityReviewSelectorPrimaryBSUID)
+		if direct {
+			directOwners = append(directOwners, item.ContactID)
+		}
+		routable[item.ContactID] = direct || (canonicalContacts[item.ContactID] != nil && !otherUsers[item.ContactID])
+		anyRoutable = anyRoutable || routable[item.ContactID]
+	}
+	return identityReviewCandidateSet{
+		items: items, digest: identityReviewMemberDigest(items), supported: supported && claim.DirectPrimaryBSUID != "" && anyRoutable,
+		directPrimaryOwners: directOwners, multipleOwners: identityReviewHasMultipleOwners(items), routable: routable,
+	}
+}
+
+func lockStagedReviewObservation(tx *gorm.DB, orgID uuid.UUID) error {
+	return database.LockOrganizationPolicyScope(tx, orgID)
 }

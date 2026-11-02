@@ -679,12 +679,13 @@ func (a *App) GetCurrentUser(r *fastglue.Request) error {
 	// loads, as a header so the user payload is unchanged.
 	if user.OrganizationID != uuid.Nil {
 		var org models.Organization
-		if err := a.DB.Select("id", "settings").Where("id = ?", user.OrganizationID).First(&org).Error; err == nil {
-			r.RequestCtx.Response.Header.SetBytesV(
-				"X-Session-Idle-Minutes",
-				fasthttp.AppendUint(nil, sessionIdleTimeoutMinutes(org.Settings)),
-			)
+		if err := a.DB.Select("id", "settings").Where("id = ?", user.OrganizationID).First(&org).Error; err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Organization access is no longer available")
 		}
+		r.RequestCtx.Response.Header.SetBytesV(
+			"X-Session-Idle-Minutes",
+			fasthttp.AppendUint(nil, sessionIdleTimeoutMinutes(org.Settings)),
+		)
 	}
 
 	// Load permissions from cache

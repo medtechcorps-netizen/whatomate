@@ -25,7 +25,7 @@ const canWriteContacts = authStore.hasPermission('contacts', 'write')
 const canImportContacts = authStore.hasPermission('contacts', 'import')
 const canExportContacts = authStore.hasPermission('contacts', 'export')
 // Same authority the protected staged queue endpoints enforce.
-const canViewStagedIdentityReviews = canWriteContacts && authStore.hasPermission('contacts.identity_review', 'write')
+const canViewStagedIdentityReviews = computed(() => authStore.hasPermission('contacts', 'write') && authStore.hasPermission('contacts.identity_review', 'write'))
 
 // Import/Export dialog state
 const isImportExportOpen = ref(false)

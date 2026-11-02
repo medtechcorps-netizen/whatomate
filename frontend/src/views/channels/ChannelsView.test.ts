@@ -54,7 +54,7 @@ vi.mock('@/components/chat/ContactIdentityReviewDialog.vue', () => ({
   default: {
     name: 'ContactIdentityReviewDialog',
     props: ['open', 'contactId', 'effectiveState', 'canReview', 'canViewStaged'],
-    emits: ['update:open', 'resolved'],
+    emits: ['update:open', 'resolved', 'queue-invalidated'],
     template: '<div data-testid="identity-review-dialog-stub" :data-open="String(open)" />',
   },
 }))
@@ -64,7 +64,7 @@ vi.mock('@/components/chat/ContactIdentityReviewDialog.vue', () => ({
 vi.mock('@/components/chat/StagedIdentityReviewNotice.vue', () => ({
   default: {
     name: 'StagedIdentityReviewNotice',
-    props: ['canView'],
+    props: ['canView', 'invalidation'],
     template: '<div data-testid="staged-identity-review-notice-stub" :data-can-view="String(canView)" />',
   },
 }))
@@ -1296,6 +1296,17 @@ describe('ChannelsView messaging behavior', () => {
 
     expect(view.text()).toContain('AI status unavailable')
     expect(view.find('[data-testid="channel-identity-review"]').exists()).toBe(false)
+  })
+
+  it('forwards local review invalidation without projecting a decision into the conversation', async () => {
+    setInbox()
+    const view = await mountAndSelectConversation()
+    const before = (view.vm as any).selectedConversation.identity_review_ai_state
+    const scope = { organizationId: 'organization-1', userId: 'agent-1', session: 'captured-session', identity: {}, permissions: '[true,true,true]', key: 'conversation-query', generation: 1 }
+    view.findComponent({ name: 'ContactIdentityReviewDialog' }).vm.$emit('queue-invalidated', scope)
+    await nextTick()
+    expect(view.findComponent({ name: 'StagedIdentityReviewNotice' }).props('invalidation')).toEqual(scope)
+    expect((view.vm as any).selectedConversation.identity_review_ai_state).toBe(before)
   })
 
   it('withholds identity-review affordances without the dedicated review permission', async () => {
