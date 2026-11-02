@@ -1640,7 +1640,7 @@ func TestMetaMessengerApprovalRechecksExactMessagesSubscription(t *testing.T) {
 	require.NoError(t, err)
 	activated, err := app.activateMetaMessengerAccount(
 		organization.ID, fixture.userID, fixture.account.ID,
-		time.Now().UTC(), evidence,
+		time.Now, evidence,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, models.ChannelAccountStatusActive, activated.Status)

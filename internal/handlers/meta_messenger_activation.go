@@ -64,8 +64,7 @@ func (a *App) ApproveMetaMessengerActivation(r *fastglue.Request) error {
 	if subscriptionErr != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Meta no longer reports the required Page messages subscription; reconnect and test again", nil, "")
 	}
-	now = time.Now().UTC()
-	activated, err := a.activateMetaMessengerAccount(orgID, userID, accountID, now, evidence)
+	activated, err := a.activateMetaMessengerAccount(orgID, userID, accountID, time.Now, evidence)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusConflict, "Run a fresh successful health test before approving this Messenger account", nil, "")
 	}
@@ -124,9 +123,12 @@ func (a *App) freshMetaMessengerSubscriptionApproval(
 }
 
 func (a *App) activateMetaMessengerAccount(
-	orgID, userID, accountID uuid.UUID, now time.Time,
+	orgID, userID, accountID uuid.UUID, clock func() time.Time,
 	subscription metaMessengerSubscriptionApproval,
 ) (models.ChannelAccount, error) {
+	if clock == nil {
+		return models.ChannelAccount{}, errors.New("Messenger activation clock is required")
+	}
 	var activated models.ChannelAccount
 	err := a.WithCommittedTenantApp(orgID, func(scoped *App) error {
 		var account models.ChannelAccount
@@ -137,6 +139,9 @@ func (a *App) activateMetaMessengerAccount(
 			First(&account).Error; err != nil {
 			return err
 		}
+		// Pool and row-lock waits consume approval and credential validity.
+		// Sample only after the account lock and credential reload complete.
+		now := clock().UTC()
 		if account.Status != models.ChannelAccountStatusPending ||
 			!metaRegistryControlPlaneConfig(account.Config) ||
 			!metaMessengerAuthorizationTokenAllowed(a.Config, account.Metadata) ||

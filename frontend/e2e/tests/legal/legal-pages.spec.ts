@@ -36,6 +36,19 @@ for (const legalPage of legalPages) {
     await expect(page.locator('main')).toContainText(legalEntity)
     await expect(page.locator('main')).not.toContainText(legacyLegalEntity)
   })
+
+  test(`${legalPage.heading} section navigation stays within the document`, async ({ page }) => {
+    await page.goto(legalPage.path)
+    const sectionLink = page.getByRole('navigation', { name: 'Document sections' }).getByRole('link').first()
+    const target = new URL(await sectionLink.evaluate(link => (link as HTMLAnchorElement).href))
+    expect(target.pathname).toBe(new URL(page.url()).pathname)
+    expect(target.hash).not.toBe('')
+
+    await sectionLink.click()
+    await expect(page).toHaveURL(target.href)
+    await expect(page.getByRole('heading', { name: legalPage.heading, level: 1 })).toBeVisible()
+    await expect(page.locator(target.hash)).toBeInViewport()
+  })
 }
 
 test('Privacy Policy discloses the Google Search Console data lifecycle', async ({ page }) => {
