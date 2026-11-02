@@ -188,6 +188,7 @@ function mountWorkspace(props: Record<string, unknown> = {}) {
         LeadOutcomeDialog: true,
         InvoiceQuickDialog: true,
         ContactBookingDialog: true,
+        ReaformAppointmentCard: true,
       },
     },
   })
@@ -219,6 +220,43 @@ beforeEach(() => {
 })
 
 describe('CustomerRevenueWorkspace next step', () => {
+  it('routes booking to the clinic card and never opens the legacy calendar while the pilot is enabled or unavailable', async () => {
+    mocks.getWorkspace.mockResolvedValue(workspaceResponse({ journeys: [lead()] }))
+    const wrapper = mountWorkspace({ requestedAction: { kind: 'booking', nonce: 100 } })
+    await flushPromises()
+    expect(wrapper.findComponent(ContactBookingDialog).props('open')).toBe(false)
+    expect(wrapper.find('[data-testid="workspace-legacy-book"]').exists()).toBe(false)
+    const card = wrapper.findComponent({ name: 'ReaformAppointmentCard' })
+    card.vm.$emit('capability', { leadId: 'lead-1', status: 'enabled' })
+    await flushPromises()
+    expect(wrapper.emitted('action-consumed')).toEqual([[100]])
+    expect(wrapper.findComponent(ContactBookingDialog).props('open')).toBe(false)
+    expect(wrapper.find('[data-testid="workspace-legacy-book"]').exists()).toBe(false)
+    card.vm.$emit('capability', { leadId: 'lead-1', status: 'unavailable' })
+    await wrapper.setProps({ requestedAction: { kind: 'booking', nonce: 101 } })
+    await flushPromises()
+    expect(wrapper.findComponent(ContactBookingDialog).props('open')).toBe(false)
+    expect(wrapper.find('[data-testid="workspace-legacy-book"]').exists()).toBe(false)
+    card.vm.$emit('capability', { leadId: 'lead-1', status: 'disabled' })
+    await flushPromises()
+    await wrapper.get('[data-testid="workspace-legacy-book"]').trigger('click')
+    expect(wrapper.findComponent(ContactBookingDialog).props('open')).toBe(true)
+  })
+
+  it('shows the clinic appointment card for the selected lead and applies lead write access', async () => {
+    mocks.getWorkspace.mockResolvedValue(workspaceResponse({ journeys: [lead()] }))
+    const wrapper = mountWorkspace()
+    await flushPromises()
+    const card = wrapper.findComponent({ name: 'ReaformAppointmentCard' })
+    expect(card.props('leadId')).toBe('lead-1')
+    expect(card.props('canBook')).toBe(true)
+    wrapper.unmount()
+    mocks.hasPermission.mockImplementation((resource: string, action: string) => !(resource === 'crm.leads' && action === 'write'))
+    const readOnly = mountWorkspace()
+    await flushPromises()
+    expect(readOnly.findComponent({ name: 'ReaformAppointmentCard' }).props('canBook')).toBe(false)
+  })
+
   it('asks to add a customer without a lead to the pipeline', async () => {
     const wrapper = mountWorkspace()
     await flushPromises()

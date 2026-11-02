@@ -925,6 +925,7 @@ func (a *App) CreateCRMLead(r *fastglue.Request) error {
 	if req.Metadata == nil {
 		req.Metadata = models.JSONB{}
 	}
+	req.Metadata = preserveReaformMetadata(req.Metadata, nil)
 	if req.OwnerUserID == nil {
 		req.OwnerUserID = &userID
 	}
@@ -1186,6 +1187,9 @@ func (a *App) UpdateCRMLead(r *fastglue.Request) error {
 		}
 
 		if req.ContactID != nil {
+			if _, linked := lead.Metadata[reaformPilotMetadataKey]; linked && *req.ContactID != lead.ContactID {
+				return newProductCRMClientError(fasthttp.StatusConflict, "This journey has a clinic booking; its patient contact cannot be reassigned")
+			}
 			if err := ensureProductCRMTenantRecord(
 				tx,
 				&models.Contact{},
@@ -1246,7 +1250,7 @@ func (a *App) UpdateCRMLead(r *fastglue.Request) error {
 			updates["lost_reason"] = strings.TrimSpace(*req.LostReason)
 		}
 		if req.Metadata != nil {
-			updates["metadata"] = *req.Metadata
+			updates["metadata"] = preserveReaformMetadata(*req.Metadata, lead.Metadata)
 		}
 
 		result := tx.Model(&models.CRMLead{}).
@@ -3578,12 +3582,14 @@ func crmLeadToResponse(lead *models.CRMLead) CRMLeadResponse {
 		WonAt:             lead.WonAt,
 		LostAt:            lead.LostAt,
 		LostReason:        lead.LostReason,
-		Metadata:          lead.Metadata,
-		Version:           lead.Version,
-		Contact:           crmContactReference(lead.Contact),
-		Owner:             crmUserReference(lead.Owner),
-		CreatedAt:         lead.CreatedAt,
-		UpdatedAt:         lead.UpdatedAt,
+		// Clinic booking state has a stricter contact-visibility check in its
+		// dedicated endpoint and must not leak through generic CRM projections.
+		Metadata:  preserveReaformMetadata(lead.Metadata, nil),
+		Version:   lead.Version,
+		Contact:   crmContactReference(lead.Contact),
+		Owner:     crmUserReference(lead.Owner),
+		CreatedAt: lead.CreatedAt,
+		UpdatedAt: lead.UpdatedAt,
 	}
 	if response.Metadata == nil {
 		response.Metadata = models.JSONB{}

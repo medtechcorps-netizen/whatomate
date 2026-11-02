@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
   AlertCircle,
   ArrowUpRight,
@@ -90,6 +90,7 @@ import ContactInfoPanel from '@/components/chat/ContactInfoPanel.vue'
 import ContactBookingDialog from '@/components/booking/ContactBookingDialog.vue'
 import LeadCreateDialog from '@/components/crm/LeadCreateDialog.vue'
 import LeadOutcomeDialog from '@/components/crm/LeadOutcomeDialog.vue'
+import ReaformAppointmentCard from '@/components/crm/ReaformAppointmentCard.vue'
 import InvoiceQuickDialog from '@/components/commerce/InvoiceQuickDialog.vue'
 
 type WorkspaceTab = 'overview' | 'timeline' | 'details' | 'copilot'
@@ -252,6 +253,16 @@ const visibleLeads = computed(() =>
 )
 
 const focusLead = computed(() => pickFocusLead(journeys.value))
+const clinicAppointmentCard = ref<InstanceType<typeof ReaformAppointmentCard> | null>(null)
+const clinicBookingStatus = ref<'loading' | 'enabled' | 'disabled' | 'unavailable'>('loading')
+const hasClinicLead = computed(() => canViewCRM.value && Boolean(focusLead.value))
+const legacyBookingAvailable = computed(() => !hasClinicLead.value || clinicBookingStatus.value === 'disabled')
+watch(() => focusLead.value?.id, () => { clinicBookingStatus.value = 'loading' })
+function clinicCapabilityChanged(value: { leadId: string; status: typeof clinicBookingStatus.value }) {
+  if (value.leadId !== focusLead.value?.id) return
+  clinicBookingStatus.value = value.status
+  if (value.status !== 'disabled') showBookingDialog.value = false
+}
 // The focus lead is shown in the Next step card, so the list only shows the rest.
 const otherLeads = computed(() => visibleLeads.value.filter((lead) => lead.id !== focusLead.value?.id))
 const flowState = computed(() => leadFlowState(focusLead.value))
@@ -968,6 +979,11 @@ async function invoiceCreated() {
 }
 
 function openBooking() {
+  if (!legacyBookingAvailable.value) {
+    if (clinicBookingStatus.value === 'unavailable') toast.info('The clinic connection could not be checked. Try again in Clinic appointment.')
+    void nextTick(() => clinicAppointmentCard.value?.focus?.())
+    return
+  }
   if (!canCreateBooking.value) return
   showBookingDialog.value = true
 }
@@ -985,6 +1001,7 @@ function handleRequestedAction() {
     || !workspace.value
     || workspaceSelectionContactId.value !== props.contactId
   ) return
+  if (action.kind === 'booking' && hasClinicLead.value && clinicBookingStatus.value === 'loading') return
   handledActionNonce = action.nonce
   activeTab.value = 'overview'
   if (action.kind === 'lead') {
@@ -994,7 +1011,7 @@ function handleRequestedAction() {
     if (canCreateTask.value) openFollowUp()
     else toast.info('You do not have access to schedule follow-ups.')
   } else if (action.kind === 'booking') {
-    if (canCreateBooking.value) openBooking()
+    if ((hasClinicLead.value && !legacyBookingAvailable.value) || canCreateBooking.value) openBooking()
     else toast.info('You do not have access to book appointments.')
   }
   emit('action-consumed', action.nonce)
@@ -1182,7 +1199,7 @@ watch(
 )
 
 watch(
-  () => [props.requestedAction?.nonce, loading.value, workspace.value, workspaceSelectionContactId.value] as const,
+  () => [props.requestedAction?.nonce, loading.value, workspace.value, workspaceSelectionContactId.value, clinicBookingStatus.value] as const,
   () => handleRequestedAction(),
   { immediate: true },
 )
@@ -1651,6 +1668,15 @@ onMounted(() => void loadWorkspace())
               </RouterLink>
             </section>
 
+            <ReaformAppointmentCard
+              v-if="canViewCRM && focusLead"
+              ref="clinicAppointmentCard"
+              :key="`${canonicalContactId}:${focusLead.id}`"
+              :lead-id="focusLead.id"
+              :can-book="canMoveLead && focusLead.status !== 'archived'"
+              @capability="clinicCapabilityChanged"
+            />
+
             <p v-if="summaryLine" class="text-xs text-white/45 light:text-gray-500" data-testid="workspace-money-summary">
               {{ summaryLine }}
             </p>
@@ -1743,11 +1769,11 @@ onMounted(() => void loadWorkspace())
             </section>
 
             <!-- Appointments -->
-            <section v-if="canViewBookings" aria-labelledby="workspace-bookings-title">
+            <section v-if="canViewBookings && (legacyBookingAvailable || upcomingBookings.length || recentBookings.length)" aria-labelledby="workspace-bookings-title">
               <div class="mb-2 flex items-center justify-between gap-2">
                 <h3 id="workspace-bookings-title" class="flex items-center gap-2 text-xs font-semibold">
                   <CalendarClock class="h-3.5 w-3.5 text-fuchsia-300" />
-                  Appointments
+                  {{ legacyBookingAvailable ? 'Appointments' : 'Other appointments' }}
                 </h3>
                 <RouterLink
                   to="/calendar"
@@ -1758,11 +1784,12 @@ onMounted(() => void loadWorkspace())
               </div>
               <div class="space-y-2">
                 <Button
-                  v-if="canCreateBooking"
+                  v-if="canCreateBooking && legacyBookingAvailable"
                   type="button"
                   variant="outline"
                   class="h-10 w-full justify-center border-fuchsia-300/20 text-fuchsia-100 hover:bg-fuchsia-300/[0.08] light:text-fuchsia-800"
                   @click="openBooking"
+                  data-testid="workspace-legacy-book"
                 >
                   <Plus class="mr-2 h-4 w-4" />
                   Book appointment

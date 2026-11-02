@@ -979,6 +979,10 @@ func runServer(args []string) {
 	careCtx, careCancel := context.WithCancel(context.Background())
 	startLoop("care continuity loop", func() { careProcessor.Start(careCtx) })
 	lo.Info("Care continuity processor started")
+	// Default-off clinic pilot: bounded status/command reconciliation only.
+	// It never sends patient messages and never edits CRM stages.
+	reaformPilotCtx, reaformPilotCancel := context.WithCancel(context.Background())
+	startLoop("Reaform clinic pilot loop", func() { app.RunReaformPilotSync(reaformPilotCtx) })
 
 	// Enforce Copilot data retention independently of HTTP traffic. Expired
 	// output is hidden by handlers immediately and hard-purged here, including
@@ -1127,6 +1131,10 @@ func runServer(args []string) {
 		{"care continuity stop request", func(context.Context) error {
 			careCancel()
 			careProcessor.Stop()
+			return nil
+		}},
+		{"Reaform clinic pilot stop request", func(context.Context) error {
+			reaformPilotCancel()
 			return nil
 		}},
 		{"SLA stop request", func(context.Context) error {
@@ -1611,6 +1619,12 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	// short tenant phases and therefore must not hold the route tenant
 	// transaction open while waiting on an external service.
 	g.GET("/api/integrations", tenant((*handlers.App).GetIntegrations))
+	// These handlers commit short tenant phases before remote I/O.
+	g.GET("/api/integrations/reaform/patients", app.GetReaformPatients)
+	g.GET("/api/integrations/reaform/availability", app.GetReaformAvailability)
+	g.GET("/api/crm/leads/{id}/reaform", app.GetReaformLead)
+	g.POST("/api/crm/leads/{id}/reaform", app.CreateReaformAppointment)
+	g.POST("/api/crm/leads/{id}/reaform/refresh", app.RefreshReaformAppointment)
 	g.PUT("/api/integrations/{provider}", tenant((*handlers.App).UpdateIntegration))
 	g.DELETE("/api/integrations/{provider}/credentials", tenant((*handlers.App).DeleteIntegrationCredentials))
 	g.POST("/api/integrations/{provider}/connect", tenant((*handlers.App).ConnectIntegration))

@@ -42,6 +42,7 @@ type Config struct {
 	MetaInstagram       MetaInstagramConfig       `koanf:"meta_instagram_onboarding"`
 	ThreadsAppReview    ThreadsAppReviewConfig    `koanf:"threads_app_review"`
 	ThreadsManaged      ThreadsManagedConfig      `koanf:"threads_managed"`
+	ReaformPilot        ReaformPilotConfig        `koanf:"reaform_pilot"`
 }
 
 // LegacyWhatsAppReplyConfig is a deployment-owned rollout gate for the new
@@ -535,6 +536,9 @@ func Load(configPath string) (*Config, error) {
 		return nil, err
 	}
 	if err := ValidateLegacyWhatsAppReplyConfig(cfg.LegacyWhatsAppReply); err != nil {
+		return nil, err
+	}
+	if err := ValidateReaformPilotConfig(cfg.ReaformPilot); err != nil {
 		return nil, err
 	}
 	if err := validateWhatsAppConfig(cfg.WhatsApp, cfg.App.Environment); err != nil {
