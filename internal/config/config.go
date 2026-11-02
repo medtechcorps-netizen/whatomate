@@ -42,7 +42,6 @@ type Config struct {
 	MetaInstagram       MetaInstagramConfig       `koanf:"meta_instagram_onboarding"`
 	ThreadsAppReview    ThreadsAppReviewConfig    `koanf:"threads_app_review"`
 	ThreadsManaged      ThreadsManagedConfig      `koanf:"threads_managed"`
-	ReaformPilot        ReaformPilotConfig        `koanf:"reaform_pilot"`
 }
 
 // LegacyWhatsAppReplyConfig is a deployment-owned rollout gate for the new
@@ -536,9 +535,6 @@ func Load(configPath string) (*Config, error) {
 		return nil, err
 	}
 	if err := ValidateLegacyWhatsAppReplyConfig(cfg.LegacyWhatsAppReply); err != nil {
-		return nil, err
-	}
-	if err := ValidateReaformPilotConfig(cfg.ReaformPilot); err != nil {
 		return nil, err
 	}
 	if err := validateWhatsAppConfig(cfg.WhatsApp, cfg.App.Environment); err != nil {
@@ -1418,4 +1414,65 @@ func setDefaults(cfg *Config) {
 	if cfg.Calling.TransferTimeoutSecs == 0 {
 		cfg.Calling.TransferTimeoutSecs = 120
 	}
+}
+
+// Reaform360 single-clinic pilot configuration.
+
+// ReaformPilotConfig is deployment-owned. No tenant request can select a
+// destination, credential or clinic. Nothing is enabled by default.
+type ReaformPilotConfig struct {
+	Enabled               bool   `koanf:"enabled"`
+	OrganizationID        string `koanf:"organization_id"`
+	APIBaseURL            string `koanf:"api_base_url"`
+	APIToken              string `koanf:"api_token" json:"-"`
+	RemoteOrganizationID  string `koanf:"remote_organization_id"`
+	RemoteSiteID          string `koanf:"remote_site_id"`
+	TerminalRetentionDays int    `koanf:"terminal_retention_days"`
+}
+
+func ValidateReaformPilotConfig(c ReaformPilotConfig) error {
+	if !c.Enabled {
+		return nil
+	}
+	if !canonicalNonNilUUID(c.OrganizationID) || !canonicalNonNilUUID(c.RemoteOrganizationID) || !canonicalNonNilUUID(c.RemoteSiteID) {
+		return errors.New("reaform pilot requires canonical organization and clinic UUID bindings")
+	}
+	u, err := url.Parse(c.APIBaseURL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || (u.Port() != "" && u.Port() != "443") {
+		return errors.New("reaform pilot API base must be a public HTTPS origin with a DNS hostname")
+	}
+	host := strings.ToLower(u.Hostname())
+	dnsName, _ := regexp.MatchString(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z][a-z0-9-]*[a-z0-9]$`, host)
+	if !dnsName || len(host) > 253 || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return errors.New("reaform pilot API base must be a public HTTPS origin with a DNS hostname")
+	}
+	if len(c.APIToken) != 64 || strings.Trim(c.APIToken, "0123456789abcdef") != "" {
+		return errors.New("reaform pilot requires a dedicated 64-character lowercase hexadecimal API token")
+	}
+	if c.TerminalRetentionDays < 0 || c.TerminalRetentionDays > 3650 {
+		return errors.New("reaform pilot terminal retention must be 1 to 3650 days, or 0 for the 90-day default")
+	}
+	return nil
+}
+
+// LoadReaformPilot loads only the optional server integration configuration.
+// Keeping it outside Config prevents runtime-only credentials from entering
+// the shared migration/bootstrap configuration contract.
+func LoadReaformPilot(configPath string) (ReaformPilotConfig, error) {
+	k := koanf.New(".")
+	if configPath != "" {
+		if err := k.Load(file.Provider(configPath), toml.Parser()); err != nil {
+			return ReaformPilotConfig{}, err
+		}
+	}
+	if err := k.Load(env.Provider("WHATOMATE_REAFORM_PILOT__", ".", func(s string) string {
+		return "reaform_pilot." + strings.ToLower(strings.TrimPrefix(s, "WHATOMATE_REAFORM_PILOT__"))
+	}), nil); err != nil {
+		return ReaformPilotConfig{}, err
+	}
+	var cfg ReaformPilotConfig
+	if err := k.Unmarshal("reaform_pilot", &cfg); err != nil {
+		return ReaformPilotConfig{}, err
+	}
+	return cfg, ValidateReaformPilotConfig(cfg)
 }

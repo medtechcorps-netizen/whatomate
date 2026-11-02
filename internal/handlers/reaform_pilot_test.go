@@ -107,7 +107,7 @@ func TestReaformTransportNoRedirectAndExplicitRejection(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	a := &App{Config: &config.Config{ReaformPilot: reaformTestConfig(uuid.New())}, HTTPClient: testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{"https://clinic.example.test": server})}
+	a := &App{Config: &config.Config{}, ReaformPilot: reaformTestConfig(uuid.New()), HTTPClient: testutil.NewHTTPSRewriteClient(t, map[string]*httptest.Server{"https://clinic.example.test": server})}
 	var out any
 	require.Error(t, a.reaformRemote(context.Background(), "GET", "/redirect", nil, &out))
 	require.Zero(t, redirected.Load())
@@ -133,17 +133,22 @@ func reaformDBFixture(t *testing.T) (*App, *models.CRMLead, uuid.UUID) {
 	pipeline, stage := createProductCRMTestPipeline(t, app.DB, org.ID, user.ID)
 	lead := createProductCRMTestLead(t, app.DB, org.ID, user.ID, contact.ID, pipeline.ID, stage.ID, models.CRMLeadStatusOpen)
 	enableCareContinuityEntitlements(t, app.DB, org.ID, user.ID, "crm.enabled")
-	app.Config = &config.Config{ReaformPilot: reaformTestConfig(org.ID)}
+	app.Config = &config.Config{}
+	app.ReaformPilot = reaformTestConfig(org.ID)
+	require.NoError(t, app.WithCommittedTenantApp(org.ID, func(scoped *App) error {
+		require.Equal(t, app.ReaformPilot, scoped.ReaformPilot)
+		return nil
+	}))
 	return app, lead, user.ID
 }
 
 func reaformReserveDB(app *App, leadID, userID uuid.UUID, req reaformBookingRequest) error {
-	return app.WithCommittedTenantApp(uuid.MustParse(app.Config.ReaformPilot.OrganizationID), func(scoped *App) error {
+	return app.WithCommittedTenantApp(uuid.MustParse(app.ReaformPilot.OrganizationID), func(scoped *App) error {
 		var lead models.CRMLead
-		if err := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND organization_id = ?", leadID, app.Config.ReaformPilot.OrganizationID).First(&lead).Error; err != nil {
+		if err := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND organization_id = ?", leadID, app.ReaformPilot.OrganizationID).First(&lead).Error; err != nil {
 			return err
 		}
-		_, err := reserveReaformCommand(scoped.DB, &lead, userID, app.Config.ReaformPilot, req)
+		_, err := reserveReaformCommand(scoped.DB, &lead, userID, app.ReaformPilot, req)
 		return err
 	})
 }
@@ -206,7 +211,7 @@ func TestReaformDBConcurrentCommandsAndHumanMetadata(t *testing.T) {
 		if err := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "id = ?", lead.ID).Error; err != nil {
 			return err
 		}
-		_, err := claimReaformLink(scoped.DB, &row, app.Config.ReaformPilot, true, time.Now().UTC())
+		_, err := claimReaformLink(scoped.DB, &row, app.ReaformPilot, true, time.Now().UTC())
 		return err
 	}))
 	latest, claimed := reaformLoadDB(t, app, lead.ID)
@@ -225,7 +230,7 @@ func TestReaformDBUnknownResponseReconcilesWithoutSecondPOST(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == reaformPilotAPIPrefix+"/capabilities" {
-			c := app.Config.ReaformPilot
+			c := app.ReaformPilot
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": reaformCapability{1, c.RemoteOrganizationID, c.RemoteSiteID, "Synthetic clinic", 30, "in_person"}})
 			return
 		}
@@ -276,7 +281,7 @@ func TestReaformDBDefinitiveRejectionAllowsNewExplicitCommand(t *testing.T) {
 	require.NoError(t, reaformReserveDB(app, lead.ID, userID, req))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/capabilities") {
-			c := app.Config.ReaformPilot
+			c := app.ReaformPilot
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": reaformCapability{1, c.RemoteOrganizationID, c.RemoteSiteID, "Synthetic clinic", 30, "in_person"}})
 			return
 		}
@@ -317,7 +322,7 @@ func TestReaformDBBatchDrainsMoreThanTwentyAndQuarantinesCorruptState(t *testing
 	var reads atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/capabilities") {
-			c := app.Config.ReaformPilot
+			c := app.ReaformPilot
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": reaformCapability{1, c.RemoteOrganizationID, c.RemoteSiteID, "Synthetic clinic", 30, "in_person"}})
 			return
 		}
@@ -362,7 +367,7 @@ func TestReaformDBLeaseSurvivesConcurrentHumanEdit(t *testing.T) {
 			if err := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "id = ?", lead.ID).Error; err != nil {
 				return err
 			}
-			if _, err := claimReaformLink(scoped.DB, &row, app.Config.ReaformPilot, true, time.Now().UTC()); err != nil {
+			if _, err := claimReaformLink(scoped.DB, &row, app.ReaformPilot, true, time.Now().UTC()); err != nil {
 				return err
 			}
 			close(locked)
@@ -407,10 +412,10 @@ func TestReaformDBLeaseSurvivesConcurrentHumanEdit(t *testing.T) {
 		if err := scoped.DB.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "id = ?", lead.ID).Error; err != nil {
 			return err
 		}
-		claimed, err := claimReaformLink(scoped.DB, &row, app.Config.ReaformPilot, true, time.Now().UTC())
+		claimed, err := claimReaformLink(scoped.DB, &row, app.ReaformPilot, true, time.Now().UTC())
 		require.NoError(t, err)
 		require.Nil(t, claimed)
-		claimed, err = claimReaformLink(scoped.DB, &row, app.Config.ReaformPilot, true, time.Now().UTC().Add(time.Minute))
+		claimed, err = claimReaformLink(scoped.DB, &row, app.ReaformPilot, true, time.Now().UTC().Add(time.Minute))
 		require.NoError(t, err)
 		require.Equal(t, req.CommandID, claimed.CommandID)
 		require.NotEqual(t, link.LeaseToken, claimed.LeaseToken)
@@ -443,7 +448,7 @@ func TestReaformDBSavedStateOutageAndChangedBinding(t *testing.T) {
 	require.Equal(t, false, data["sync_available"])
 	link := data["link"].(map[string]any)
 	require.Equal(t, request.PatientID, link["patient_id"])
-	app.Config.ReaformPilot.RemoteSiteID = uuid.NewString()
+	app.ReaformPilot.RemoteSiteID = uuid.NewString()
 	data = get()
 	link = data["link"].(map[string]any)
 	require.Equal(t, "", link["patient_id"])

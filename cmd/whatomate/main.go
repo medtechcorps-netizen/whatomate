@@ -747,6 +747,10 @@ func runServer(args []string) {
 	if err != nil {
 		lo.Fatal("Failed to load config", "error", err)
 	}
+	reaformPilot, err := config.LoadReaformPilot(*configPath)
+	if err != nil {
+		lo.Fatal("Failed to load Reaform pilot config", "error", err)
+	}
 	if err := validateServerMigrationMode(cfg, *migrate); err != nil {
 		lo.Fatal(err.Error())
 	}
@@ -866,14 +870,15 @@ func runServer(args []string) {
 	}
 
 	app := &handlers.App{
-		Config:     cfg,
-		DB:         db,
-		Redis:      rdb,
-		Log:        lo,
-		WhatsApp:   waClient,
-		WSHub:      wsHub,
-		Queue:      jobQueue,
-		HTTPClient: httpClient,
+		ReaformPilot: reaformPilot,
+		Config:       cfg,
+		DB:           db,
+		Redis:        rdb,
+		Log:          lo,
+		WhatsApp:     waClient,
+		WSHub:        wsHub,
+		Queue:        jobQueue,
+		HTTPClient:   httpClient,
 	}
 
 	// Initialize the S3-compatible client when durable media storage or call

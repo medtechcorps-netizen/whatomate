@@ -37,7 +37,7 @@ nested key. All values are deployment-owned, never selected by a browser request
 |---|---|
 | `WHATOMATE_REAFORM_PILOT__ENABLED` | Enable explicitly; default false |
 | `WHATOMATE_REAFORM_PILOT__ORGANIZATION_ID` | One existing ReReply organization UUID |
-| `WHATOMATE_REAFORM_PILOT__API_BASE_URL` | Public HTTPS origin of the Reaform API; no path/query/userinfo |
+| `WHATOMATE_REAFORM_PILOT__API_BASE_URL` | Public HTTPS origin of the Reaform API with a DNS hostname; no path/query/userinfo |
 | `WHATOMATE_REAFORM_PILOT__API_TOKEN` | Reaform dedicated token: 64 lowercase hex characters |
 | `WHATOMATE_REAFORM_PILOT__REMOTE_ORGANIZATION_ID` | Expected Reaform organization UUID |
 | `WHATOMATE_REAFORM_PILOT__REMOTE_SITE_ID` | Expected Reaform clinic/site UUID |
