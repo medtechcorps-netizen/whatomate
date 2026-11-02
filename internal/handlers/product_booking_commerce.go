@@ -992,6 +992,23 @@ func (a *App) ListBookingEvents(r *fastglue.Request) error {
 		}
 		query = query.Where("status = ?", status)
 	}
+	// Calendar overlap is opt-in. Existing from/to consumers retain their
+	// inclusive starts-at contract, including the Today view.
+	overlapFrom, err := bookingCommerceQueryTime(r, "overlap_from")
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "overlap_from must be RFC3339", nil, "")
+	}
+	overlapTo, err := bookingCommerceQueryTime(r, "overlap_to")
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "overlap_to must be RFC3339", nil, "")
+	}
+	if r.RequestCtx.QueryArgs().Has("overlap_from") || r.RequestCtx.QueryArgs().Has("overlap_to") {
+		if overlapFrom == nil || overlapTo == nil || !overlapTo.After(*overlapFrom) ||
+			r.RequestCtx.QueryArgs().Has("from") || r.RequestCtx.QueryArgs().Has("to") {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Use both increasing overlap bounds without from/to", nil, "")
+		}
+		query = query.Where("booking_events.starts_at < ? AND booking_events.ends_at > ?", *overlapTo, *overlapFrom)
+	}
 	for _, filter := range []struct {
 		param    string
 		column   string
@@ -1021,7 +1038,7 @@ func (a *App) ListBookingEvents(r *fastglue.Request) error {
 	if err := pg.Apply(query.
 		Preload("Service", "organization_id = ?", orgID).
 		Preload("Resource", "organization_id = ?", orgID).
-		Order("starts_at ASC")).
+		Order("booking_events.starts_at ASC, booking_events.id ASC")).
 		Find(&events).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list booking events", nil, "")
 	}

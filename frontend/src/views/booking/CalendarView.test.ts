@@ -452,10 +452,10 @@ describe('Calendar person-first entry points', () => {
     })
     mocks.get.mockImplementation((url: string, options?: { params?: Record<string, string> }) => {
       if (url !== '/booking/events') return readFixture(url)
-      const from = Date.parse(options?.params?.from || '')
-      const to = Date.parse(options?.params?.to || '')
+      const from = Date.parse(options?.params?.overlap_from || '')
+      const to = Date.parse(options?.params?.overlap_to || '')
       const start = Date.parse(saved.starts_at)
-      const listed = savedOnServer && from <= start && start <= to ? [saved] : []
+      const listed = savedOnServer && from < Date.parse(saved.ends_at) && start < to ? [saved] : []
       return envelope({ events: listed, total: listed.length })
     })
     await open()
@@ -470,7 +470,8 @@ describe('Calendar person-first entry points', () => {
     expect(wrapper!.text()).toContain('8 Nov 2026')
     expect(wrapper!.get('[data-testid="calendar-event-card"]').text()).toContain('Consultation')
     expect(wrapper!.get('[data-testid="calendar-event-time"]').text()).toBe(
-      new Intl.DateTimeFormat('en-MY', { hour: '2-digit', minute: '2-digit', timeZone: 'Pacific/Auckland' }).format(new Date(saved.starts_at)),
+      new Intl.DateTimeFormat('en-MY', { hour: '2-digit', minute: '2-digit', timeZone: 'Pacific/Auckland' }).format(new Date(saved.starts_at)) + ' – ' +
+        new Intl.DateTimeFormat('en-MY', { hour: '2-digit', minute: '2-digit', timeZone: 'Pacific/Auckland' }).format(new Date(saved.ends_at)),
     )
   })
 
@@ -540,13 +541,13 @@ describe('Calendar weeks across resource timezones', () => {
       service: { ...services[0]!, name: item.id },
       ...(includeResource ? { resource: copy(item.resource) } : {}),
     }))
-    // Match the real API's inclusive starts_at filters, rather than returning
+    // Match the opt-in half-open interval filters, rather than returning
     // fixtures the old query would never receive.
     mocks.get.mockImplementation((url: string, options?: { params?: Record<string, string> }) => {
       if (url !== '/booking/events') return readFixture(url)
-      const from = Date.parse(options?.params?.from || '')
-      const to = Date.parse(options?.params?.to || '')
-      const listed = candidates.filter(item => from <= Date.parse(item.starts_at) && Date.parse(item.starts_at) <= to)
+      const from = Date.parse(options?.params?.overlap_from || '')
+      const to = Date.parse(options?.params?.overlap_to || '')
+      const listed = candidates.filter(item => from < Date.parse(item.ends_at) && Date.parse(item.starts_at) < to)
       return envelope({ events: listed, total: listed.length })
     })
     await open()
@@ -575,9 +576,9 @@ describe('Calendar weeks across resource timezones', () => {
     }))
     mocks.get.mockImplementation((url: string, options?: { params?: Record<string, string> }) => {
       if (url !== '/booking/events') return readFixture(url)
-      const from = Date.parse(options?.params?.from || '')
-      const to = Date.parse(options?.params?.to || '')
-      const listed = candidates.filter(item => from <= Date.parse(item.starts_at) && Date.parse(item.starts_at) <= to)
+      const from = Date.parse(options?.params?.overlap_from || '')
+      const to = Date.parse(options?.params?.overlap_to || '')
+      const listed = candidates.filter(item => from < Date.parse(item.ends_at) && Date.parse(item.starts_at) < to)
       return envelope({ events: listed, total: listed.length })
     })
     await open()
@@ -589,5 +590,125 @@ describe('Calendar weeks across resource timezones', () => {
     await flushPromises()
     expect(wrapper!.findAll('[data-testid="calendar-event-card"]')).toHaveLength(0)
     expect(wrapper!.text()).toContain('0/0 seats booked')
+  })
+})
+
+describe('Calendar occupied intervals and incomplete loads', () => {
+  function event(id: string, starts_at: string, ends_at: string): BookingEvent {
+    return { id, service_id: 'service-one', resource_id: 'resource-one', starts_at, ends_at,
+      capacity: 1, booked_quantity: 0, status: 'scheduled', version: 1,
+      service: { ...services[0]!, name: id } }
+  }
+
+  function serve(values: BookingEvent[]) {
+    mocks.get.mockImplementation((url: string, options?: { params?: Record<string, string | number> }) => {
+      if (url === '/bookings') return envelope({ bookings: [], total: 0 })
+      if (url !== '/booking/events') return readFixture(url)
+      const params = options?.params ?? {}
+      expect(params.from).toBeUndefined()
+      expect(params.to).toBeUndefined()
+      const from = Date.parse(String(params.overlap_from))
+      const to = Date.parse(String(params.overlap_to))
+      const matches = values.filter(item => Date.parse(item.starts_at) < to && Date.parse(item.ends_at) > from)
+        .sort((a, b) => Date.parse(a.starts_at) - Date.parse(b.starts_at) || a.id.localeCompare(b.id))
+      const page = Number(params.page), limit = Number(params.limit)
+      return envelope({ events: matches.slice((page - 1) * limit, page * limit), total: matches.length })
+    })
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 10, 4, 12))
+    resources[0]!.timezone = 'UTC'
+  })
+
+  it('shows previous-week continuations, clips at midnight and counts a multi-day event once', async () => {
+    serve([
+      event('overnight', '2026-11-01T23:30:00Z', '2026-11-02T00:30:00Z'),
+      event('whole-week', '2026-10-01T00:00:00Z', '2026-12-01T00:00:00Z'),
+      event('ends-at-start', '2026-11-01T23:30:00Z', '2026-11-02T00:00:00Z'),
+      event('starts-at-end', '2026-11-09T00:00:00Z', '2026-11-09T00:30:00Z'),
+    ])
+    await open()
+    expect(wrapper!.findAll('[data-testid="calendar-event-card"]')).toHaveLength(8)
+    expect(wrapper!.text()).toContain('2 schedules')
+    expect(wrapper!.text()).toContain('0/2 seats booked')
+    expect(wrapper!.text()).not.toContain('ends-at-start')
+    expect(wrapper!.text()).not.toContain('starts-at-end')
+    const overnight = wrapper!.findAll('[data-testid="calendar-event-card"]').find(card => card.text().includes('overnight'))!
+    expect(overnight.get('[data-testid="calendar-event-time"]').text()).toContain('Continues')
+    await overnight.trigger('click')
+    await flushPromises()
+    expect(wrapper!.text()).toContain('Attendee desk')
+  })
+
+  it('keeps repeated-midnight occupancy and exact-end labels distinct from the first midnight', async () => {
+    vi.setSystemTime(new Date(2026, 9, 28, 12))
+    resources[0]!.timezone = 'America/Havana'
+    serve([
+      event('repeated-midnight', '2026-11-01T04:30:00Z', '2026-11-01T05:00:00Z'),
+      event('first-midnight', '2026-11-01T03:30:00Z', '2026-11-01T04:00:00Z'),
+      event('spans-repeated-midnight', '2026-11-01T03:30:00Z', '2026-11-01T05:00:00Z'),
+    ])
+    await open()
+    const cards = wrapper!.findAll('[data-testid="calendar-event-card"]')
+    expect(cards).toHaveLength(4)
+    expect(wrapper!.text()).toContain('3 schedules')
+    const times = cards.map(card => card.get('[data-testid="calendar-event-time"]').text())
+    const label = (value: string) => new Intl.DateTimeFormat('en-MY', {
+      hour: '2-digit', minute: '2-digit', timeZone: 'America/Havana',
+    }).format(new Date(value))
+    expect(times).toContain(`${label('2026-11-01T04:30:00Z')} – ${label('2026-11-01T05:00:00Z')}`)
+    expect(times).toContain(`${label('2026-11-01T03:30:00Z')} – 24:00`)
+    expect(times).toContain(`${label('2026-11-01T03:30:00Z')} – continues`)
+    expect(times).toContain(`Continues – ${label('2026-11-01T05:00:00Z')}`)
+  })
+
+  it('shows the exact next-day end at a skipped midnight without adding an unoccupied date', async () => {
+    vi.setSystemTime(new Date(2026, 8, 2, 12))
+    resources[0]!.timezone = 'America/Santiago'
+    serve([event('skipped-midnight', '2026-09-06T03:30:00Z', '2026-09-06T04:00:00Z')])
+    await open()
+    const cards = wrapper!.findAll('[data-testid="calendar-event-card"]')
+    expect(cards).toHaveLength(1)
+    expect(wrapper!.text()).toContain('1 schedules')
+    const label = (value: string) => new Intl.DateTimeFormat('en-MY', {
+      hour: '2-digit', minute: '2-digit', timeZone: 'America/Santiago',
+    }).format(new Date(value))
+    expect(cards[0]!.get('[data-testid="calendar-event-time"]').text())
+      .toBe(`${label('2026-09-06T03:30:00Z')} – ${label('2026-09-06T04:00:00Z')} next day`)
+  })
+
+  it('loads more than100 equal-start intervals without duplicate totals', async () => {
+    serve(Array.from({ length: 101 }, (_, n) => event(`slot-${String(n).padStart(3, '0')}`, '2026-11-04T09:00:00Z', '2026-11-04T10:00:00Z')))
+    await open()
+    expect(wrapper!.findAll('[data-testid="calendar-event-card"]')).toHaveLength(101)
+    expect(wrapper!.text()).toContain('101 schedules')
+    expect(wrapper!.text()).toContain('0/101 seats booked')
+    expect(mocks.get.mock.calls.filter(([url]) => url === '/booking/events')).toHaveLength(2)
+  })
+
+  it.each(['', 'invalid', '2026-11-04T08:00:00Z'])('shows an incomplete-state error for invalid end %s', async end => {
+    const invalid = event('bad-interval', '2026-11-04T09:00:00Z', end)
+    mocks.get.mockImplementation((url: string) => url === '/booking/events'
+      ? envelope({ events: [invalid], total: 1 }) : readFixture(url))
+    wrapper = mountCalendar()
+    await flushPromises()
+    expect(wrapper!.get('[role="alert"]').text()).toContain('could not be loaded completely')
+    expect(wrapper!.findAll('[data-testid="calendar-event-card"]')).toHaveLength(0)
+    expect(wrapper!.text()).not.toContain('Open day')
+    expect(wrapper!.text()).not.toContain('0 schedules')
+  })
+
+  it('does not display the previous week as a successful refresh after the next read fails', async () => {
+    serve([event('old-week', '2026-11-04T09:00:00Z', '2026-11-04T10:00:00Z')])
+    await open()
+    expect(wrapper!.text()).toContain('old-week')
+    mocks.get.mockRejectedValue(new Error('Read failed'))
+    await action('Next week').trigger('click')
+    await flushPromises()
+    expect(wrapper!.get('[role="alert"]').text()).toContain('could not be loaded completely')
+    expect(wrapper!.text()).not.toContain('old-week')
+    expect(wrapper!.text()).not.toContain('Open day')
   })
 })
