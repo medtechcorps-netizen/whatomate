@@ -65,7 +65,7 @@ func captureMediaOwnerTerminal(parent context.Context, terminal *os.File) (raw [
 	// Register restoration before the first mutation. Flush queued input while
 	// echo is still off, including on cancellation, malformed data or overflow.
 	defer func() {
-		flushErr := unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH)
+		flushErr := unix.IoctlSetTermios(fd, unix.TCSETSF, &quiet)
 		restoreErr := unix.IoctlSetTermios(fd, unix.TCSETS, before)
 		_, flagsErr := unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags)
 		if flushErr != nil || restoreErr != nil || flagsErr != nil {
@@ -73,8 +73,10 @@ func captureMediaOwnerTerminal(parent context.Context, terminal *os.File) (raw [
 			raw, err = nil, mediaretirement.ErrIncomplete
 		}
 	}()
-	if unix.IoctlSetTermios(fd, unix.TCSETS, &quiet) != nil ||
-		unix.IoctlSetInt(fd, unix.TCFLSH, unix.TCIFLUSH) != nil {
+	// TCSETSF applies the quiet settings and discards pending input. Some
+	// hosted PTYs support this operation but reject the separate TCFLSH ioctl.
+	// Both entry and cleanup still require a successful input flush.
+	if unix.IoctlSetTermios(fd, unix.TCSETSF, &quiet) != nil {
 		return nil, mediaretirement.ErrIncomplete
 	}
 	if _, e := unix.FcntlInt(uintptr(fd), unix.F_SETFL, flags|unix.O_NONBLOCK); e != nil {

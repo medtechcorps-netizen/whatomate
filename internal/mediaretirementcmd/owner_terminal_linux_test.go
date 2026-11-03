@@ -169,6 +169,48 @@ func TestMediaOwnerInputTerminalBoundedFailures(t *testing.T) {
 	}
 }
 
+func TestMediaOwnerInputTerminalDiscardsInputQueuedBeforeReadiness(t *testing.T) {
+	master, slave := mediaOwnerTestPTY(t)
+	mfd, sfd := int(master.Fd()), int(slave.Fd())
+	require.NoError(t, unix.SetNonblock(mfd, true))
+	before, err := unix.IoctlGetTermios(sfd, unix.TCGETS)
+	require.NoError(t, err)
+	before.Lflag &^= unix.ECHO | unix.ECHONL
+	require.NoError(t, unix.IoctlSetTermios(sfd, unix.TCSETS, before))
+	stale := `{"version":1,"username":"stale_owner","password":"stale_password","ca_pem":"synthetic-pem-placeholder"}`
+	fresh := `{"version":1,"username":"fresh_owner","password":"fresh_password","ca_pem":"synthetic-pem-placeholder"}`
+	n, err := unix.Write(mfd, []byte(stale+"\n"))
+	require.NoError(t, err)
+	require.Equal(t, len(stale)+1, n)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.True(t, mediaOwnerPoll(ctx, sfd, unix.POLLIN), "stale input must already be queued")
+	type result struct {
+		raw []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		raw, err := captureMediaOwnerTerminal(ctx, slave)
+		done <- result{raw, err}
+	}()
+	mediaOwnerTestReady(t, mfd, ctx)
+	n, err = unix.Write(mfd, []byte(fresh+"\n"))
+	require.NoError(t, err)
+	require.Equal(t, len(fresh)+1, n)
+	select {
+	case r := <-done:
+		defer clear(r.raw)
+		require.NoError(t, r.err)
+		require.Equal(t, fresh, string(r.raw), "only input sent after readiness may be accepted")
+	case <-ctx.Done():
+		t.Fatal("terminal reader did not finish")
+	}
+	after, err := unix.IoctlGetTermios(sfd, unix.TCGETS)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+}
+
 func TestMediaOwnerInputTerminalRejectsNonTerminalAndUnboundedContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
