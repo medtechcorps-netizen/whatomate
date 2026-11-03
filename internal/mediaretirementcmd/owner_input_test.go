@@ -104,7 +104,7 @@ func TestMediaOwnerInputRequiresCertificateAuthority(t *testing.T) {
 	for name, text := range map[string]string{
 		"empty": "", "junk": "PRIVATE_CA", "prefix-junk": "PRIVATE_PREFIX" + valid,
 		"suffix-junk": valid + "PRIVATE_SUFFIX", "too-many": strings.Repeat(valid, 9),
-		"private-key-block": strings.Replace(valid, "CERTIFICATE", "PRIVATE KEY", -1),
+		"private-key-block": strings.ReplaceAll(valid, "CERTIFICATE", "PRIVATE KEY"),
 		"leaf":              mediaOwnerTestCA(t, false, at.Add(-time.Hour), at.Add(time.Hour)),
 		"future":            mediaOwnerTestCA(t, true, at.Add(time.Hour), at.Add(2*time.Hour)),
 		"expired":           mediaOwnerTestCA(t, true, at.Add(-2*time.Hour), at.Add(-time.Hour)),
