@@ -86,6 +86,27 @@ ineligible. PostgreSQL TLS and normal connection selection are preserved. Role
 and options-based startup overrides are refused. The database work is bounded,
 with separate time reserved for connection disposal.
 
+An operator may instead opt in to `-owner-stdin` on the standalone Linux tool
+built with `CGO_ENABLED=0`. The existing runtime host, port and database remain
+fixed. This mode never reads `MigrationURL` or changes the server configuration.
+Before asking for credentials it disables process dumpability and applies
+`NO_NEW_PRIVS` across the Go runtime threads; cgo-linked binaries refuse.
+
+The operator transport must use one fresh, exclusively owned terminal and wait
+for the exact `media-reference-inventory:owner-input-ready-v1` line. Only then may
+it send one compact JSON object followed by a newline, at most32768 JSON bytes,
+with exactly four fields: `version` (1), `username`, `password` and `ca_pem`.
+No routing, SQL or extra fields are accepted. The supplied CA must validate the
+server certificate and configured hostname; plaintext and TLS fallbacks are
+refused. All native owner/RLS, snapshot, output and cleanup guards still apply.
+The terminal input window is at most five seconds. Echo is disabled during
+capture; queued input is flushed and terminal settings are restored afterward.
+Captured byte buffers are cleared after connection configuration. Credentials
+exist transiently in this short-lived process; they must never be placed in
+command arguments, environment variables, persisted input files or logs.
+An operator transport and a released exact build must be reviewed before live
+use. Synthetic terminal/database tests alone do not authorize a live capture.
+
 Create the output directory beforehand, owned by the process user with mode0700.
 The command follows no directory or destination symlinks, refuses an existing
 destination, and creates a mode0600 temporary file inside that private directory.

@@ -25,6 +25,7 @@ const mediaInventoryUsage = `Usage: media-reference-inventory [options]
   -organization-id UUID   Exact organization UUID
   -account-id UUID        Exact current WhatsApp account UUID
   -output /absolute/file  New private JSON file, in an existing owned 0700 directory
+  -owner-stdin            Explicit owner authentication through a protected terminal
 
 Run in the Linux application environment with the explicitly configured database
 owner connection. No migration credential fallback is used. Output includes all
@@ -34,9 +35,17 @@ checkpoint counts are included without exposing their private values. Any
 populated global family needs an exact protection check. Nothing is deleted or fetched from
 object storage. The bounded snapshot is closed before the private file is saved.
 Existing files, symlinks and partial/truncated inventories are refused.
+With -owner-stdin, wait for owner-input-ready-v1 on the terminal, then send one
+bounded newline-framed JSON credential envelope. Its username, password and CA
+apply only to this maintenance process; the configured server and database are
+retained. Verified TLS and all native owner/RLS checks remain required. No owner
+credentials are accepted in command arguments, environment variables or files.
 `
 
-type mediaInventoryArgs struct{ configPath, organizationID, accountID, output string }
+type mediaInventoryArgs struct {
+	configPath, organizationID, accountID, output string
+	ownerStdin                                    bool
+}
 type mediaInventoryCollector func(context.Context, config.DatabaseConfig, mediaInventoryArgs) ([]byte, error)
 type mediaInventoryOutput interface {
 	publish(context.Context, []byte) (bool, error)
@@ -51,6 +60,7 @@ func parseMediaInventoryArgs(args []string) (mediaInventoryArgs, error) {
 	f.StringVar(&a.organizationID, "organization-id", "", "")
 	f.StringVar(&a.accountID, "account-id", "", "")
 	f.StringVar(&a.output, "output", "", "")
+	f.BoolVar(&a.ownerStdin, "owner-stdin", false, "")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return a, flag.ErrHelp
@@ -63,13 +73,18 @@ func parseMediaInventoryArgs(args []string) (mediaInventoryArgs, error) {
 		if !strings.HasPrefix(arg, "-") || arg == "-" || arg == "--" {
 			return a, mediaretirement.ErrIncomplete
 		}
-		name, _, equal := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		name, value, equal := strings.Cut(strings.TrimLeft(arg, "-"), "=")
 		if seen[name] {
 			return a, mediaretirement.ErrIncomplete
 		}
 		seen[name] = true
 		switch name {
 		case "config", "organization-id", "account-id", "output":
+		case "owner-stdin":
+			if equal && value != "true" {
+				return a, mediaretirement.ErrIncomplete
+			}
+			continue
 		default:
 			return a, mediaretirement.ErrIncomplete
 		}
@@ -171,11 +186,9 @@ func collectMediaInventory(parent context.Context, cfg config.DatabaseConfig, a 
 	workAt := until.Add(-3 * time.Second)
 	ctx, cancel := context.WithDeadline(parent, workAt)
 	defer cancel()
-	dsn, err := mediaInventoryDSN(cfg)
-	if err != nil {
-		return nil, mediaretirement.ErrIncomplete
-	}
-	parsed, err := pgx.ParseConfig(dsn)
+	parsed, err := prepareMediaInventoryConnection(ctx, cfg, a.ownerStdin, func(inputCtx context.Context) ([]byte, error) {
+		return readMediaOwnerInput(inputCtx, os.Stdin)
+	})
 	if err != nil {
 		return nil, mediaretirement.ErrIncomplete
 	}
