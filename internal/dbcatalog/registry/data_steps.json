@@ -1430,7 +1430,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "c2a2cb994e453ef8ba90e1d4f442f685b9fc28d44d17a479817a6c34a573cccd"
+    "closure_sha256": "51e090a7aa8708f46aeab500a71c173e37be04f21f18b83089a19f7e81f36309"
   },
   {
     "id": "BackfillLegacyWhatsAppInbox",

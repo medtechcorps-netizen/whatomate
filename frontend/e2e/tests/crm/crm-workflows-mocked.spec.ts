@@ -163,6 +163,12 @@ async function installBaseMocks(
 }
 
 async function installPipelineReads(page: Page) {
+  // These CRM regressions exercise the ordinary, pilot-disabled workspace.
+  // Keep the request explicit so unrelated or mutating API calls still fail.
+  await page.route(new RegExp(`/api/crm/leads/${leadId}/reaform$`), (route) => {
+    expect(route.request().method()).toBe('GET')
+    return route.fulfill({ json: { data: { enabled: false, can_write: false, link: null } } })
+  })
   await page.route(/\/api\/crm\/pipelines(?:\?.*)?$/, (route) =>
     route.fulfill({ json: { data: { pipelines: [pipeline], total: 1 } } }),
   )
@@ -263,6 +269,7 @@ test('lead editing keeps the draft open when optimistic concurrency rejects the 
   await dialog.getByRole('button', { name: 'Save changes' }).click()
 
   await expect(dialog.getByRole('alert')).toContainText('modified; refresh and retry')
+  await expect(dialog.getByTestId('reaform-appointment')).toHaveCount(0)
   await expect(title).toHaveValue('Website enquiry — revised')
   await expect(dialog.getByRole('button', { name: 'Archive', exact: true })).toHaveCount(0)
   await expect(dialog.getByRole('button', { name: 'Save changes' })).toBeEnabled()

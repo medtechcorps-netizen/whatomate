@@ -22,6 +22,7 @@ import {
 import { getErrorMessage } from '@/lib/api-utils'
 import { useAuthStore } from '@/stores/auth'
 import { crmService, type CRMLead } from '@/services/productSuite'
+import ReaformAppointmentCard from '@/components/crm/ReaformAppointmentCard.vue'
 
 const props = defineProps<{
   modelValue: boolean
@@ -174,7 +175,7 @@ async function transitionLead() {
 <template>
   <Dialog v-model:open="open">
     <DialogContent
-      class="w-[calc(100vw-1.5rem)] max-w-xl border-white/10 bg-[#111419] text-white light:border-slate-200 light:bg-white light:text-slate-950"
+      class="max-h-[90dvh] w-[calc(100vw-1.5rem)] max-w-xl overflow-y-auto border-white/10 bg-[#111419] text-white light:border-slate-200 light:bg-white light:text-slate-950"
     >
       <DialogHeader>
         <DialogTitle>{{ isArchived ? 'Review archived lead' : 'Edit lead' }}</DialogTitle>
@@ -289,6 +290,8 @@ async function transitionLead() {
           </div>
         </div>
       </form>
+
+      <ReaformAppointmentCard v-if="modelValue && lead" :key="lead.id" :lead-id="lead.id" :can-book="canWriteLeads && !isArchived && !saving && !transitioning" />
 
       <DialogFooter>
         <Button variant="outline" :disabled="saving || transitioning" @click="open = false">{{
