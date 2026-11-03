@@ -14,7 +14,7 @@ import (
 // releaseTargets are the only packages the release images build
 // (docker/release/*.Dockerfile). TestReleaseDockerfilesBuildOnlyTheseTargets
 // keeps this list honest.
-var releaseTargets = []string{"./cmd/gmail-relay", "./cmd/meta-relay", "./cmd/whatomate"}
+var releaseTargets = []string{"./cmd/gmail-relay", "./cmd/media-reference-inventory", "./cmd/meta-relay", "./cmd/whatomate"}
 
 func goTool(t *testing.T) string {
 	t.Helper()
@@ -74,7 +74,8 @@ func TestReleaseBinariesDoNotDependOnReleaseTree(t *testing.T) {
 	// Guard against a vacuous pass: the listing must contain the binaries
 	// and the product packages they are known to import.
 	for _, required := range []string{module + "/cmd/whatomate", module + "/cmd/meta-relay", module + "/cmd/gmail-relay",
-		module + "/internal/handlers", module + "/pkg/whatsapp", module + "/internal/metarelay"} {
+		module + "/internal/handlers", module + "/pkg/whatsapp", module + "/internal/metarelay",
+		module + "/cmd/media-reference-inventory", module + "/internal/mediaretirementcmd"} {
 		if !seen[required] {
 			t.Errorf("go list -deps did not list %s", required)
 		}

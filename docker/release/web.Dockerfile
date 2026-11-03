@@ -24,6 +24,8 @@ COPY . .
 COPY --from=frontend-builder /app/frontend/dist/ ./internal/frontend/dist/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -a -installsuffix cgo -o rereply ./cmd/whatomate
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -a -installsuffix cgo -o media-reference-inventory ./cmd/media-reference-inventory
 
 FROM --platform=linux/amd64 docker.io/library/node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS piper-download
 
@@ -65,6 +67,7 @@ RUN --mount=type=bind,from=piper-download,source=/tmp/libbrotli-security.deb,tar
     && test "$(dpkg-query -W -f='${Architecture}' libbrotli1:amd64)" = 'amd64' \
     && test "$(dpkg-query -W -f='${Status}' libbrotli1:amd64)" = 'install ok installed'
 COPY --from=builder /app/rereply ./rereply
+COPY --from=builder /app/media-reference-inventory ./media-reference-inventory
 COPY --from=builder /app/config.example.toml ./config.toml
 COPY --from=piper-download /tmp/piper/piper /usr/local/bin/piper
 COPY --from=piper-download /tmp/piper/lib*.so* /usr/local/lib/

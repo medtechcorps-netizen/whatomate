@@ -176,3 +176,36 @@ func ObserveIdentityPrerequisiteVisibility(ctx context.Context, tx pgx.Tx) ([]Id
 	}
 	return result, nil
 }
+
+// ValidateMediaReferenceVisibility checks the closed media inventory relation
+// set using the canonical owner, RLS and dependency validators. It reads only
+// catalog metadata. The separate inventory gateway owns the physical read-only
+// snapshot, locks, selector admission, pagination and connection disposal.
+// Keeping this uncalled adapter in the existing file adds no package imports
+// or initialization to the migration path.
+func ValidateMediaReferenceVisibility(ctx context.Context, tx pgx.Tx) error {
+	if ctx == nil || ctx.Err() != nil || tx == nil || tx.Conn() == nil || tx.Conn().PgConn().TxStatus() != 'T' {
+		return errPlanSeedUnavailable
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return errPlanSeedUnavailable
+	}
+	tables := [...]string{"organizations", "whatsapp_accounts", "channel_accounts", "whatsapp_coexistence_states",
+		"messages", "message_parts", "bulk_message_campaigns", "call_logs", "inbound_events",
+		"ivr_flows", "catalog_products", "contact_identities", "resellers", "recovery_checkpoints"}
+	for _, table := range tables {
+		if ctx.Err() != nil || tx.Conn().PgConn().TxStatus() != 'T' {
+			return errPlanSeedUnavailable
+		}
+		var err error
+		if table == "organizations" || table == "resellers" {
+			err = planSeedTables(ctx, tx, table)
+		} else {
+			err = planSeedTenantTable(ctx, tx, table)
+		}
+		if err != nil {
+			return errPlanSeedUnavailable
+		}
+	}
+	return nil
+}
