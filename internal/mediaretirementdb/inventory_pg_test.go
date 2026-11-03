@@ -96,6 +96,9 @@ func newMediaGatewayFixture(t *testing.T) *mediaGatewayFixture {
 	_, err = owner.Exec(ctx, mediaGatewayFixtureDDL)
 	mediaPGOK(t, err)
 	for _, table := range mediaInventoryTables[1:] {
+		if table == "resellers" {
+			continue
+		}
 		name := pgx.Identifier{"public", table}.Sanitize()
 		_, err := owner.Exec(ctx, "ALTER TABLE "+name+" ENABLE ROW LEVEL SECURITY; ALTER TABLE "+name+" FORCE ROW LEVEL SECURITY; CREATE POLICY rereply_migration_access ON "+name+" TO "+pgx.Identifier{f.owner}.Sanitize()+" USING(true) WITH CHECK(true); CREATE POLICY rereply_tenant_isolation ON "+name+" TO "+pgx.Identifier{f.runtime}.Sanitize()+" USING(organization_id=NULLIF(pg_catalog.current_setting('app.current_organization_id',true),'')::uuid) WITH CHECK(organization_id=NULLIF(pg_catalog.current_setting('app.current_organization_id',true),'')::uuid)")
 		mediaPGOK(t, err)
@@ -161,7 +164,7 @@ func TestMediaGatewayPGCompleteSnapshotAndDisposal(t *testing.T) {
 	mediaPGOK(t, err)
 	var m mediaInventoryManifest
 	mediaPGOK(t, json.Unmarshal(raw, &m))
-	if !conn.IsClosed() || !m.SessionDisposed || !m.SameSnapshot || m.HistoricalAttributionComplete || len(m.CompleteFamilies) != 9 || len(m.Pages) != 10 || m.Counts[mediaretirement.Messages] != 100 || m.Counts[mediaretirement.OrganizationAudio] != 1 {
+	if !conn.IsClosed() || !m.SessionDisposed || !m.SameSnapshot || m.HistoricalAttributionComplete || m.Version != 2 || !m.GlobalProtection.Complete || m.GlobalProtection.ExactOverlapRequired || m.GlobalProtection.ResellerLogoRows != 0 || m.GlobalProtection.RecoveryCheckpointRows != 0 || len(m.CompleteFamilies) != 9 || len(m.Pages) != 10 || m.Counts[mediaretirement.Messages] != 100 || m.Counts[mediaretirement.OrganizationAudio] != 1 {
 		t.Fatal("incomplete or overstated inventory")
 	}
 	for _, value := range []string{"DO_NOT_TRANSFER", "FOREIGN_REFERENCE", "private-phone"} {
@@ -249,7 +252,7 @@ func (trace *mediaGatewayTrace) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, 
 }
 
 func TestMediaGatewayPGCancellationAndExistingTransaction(t *testing.T) {
-	for _, phase := range []string{"LOCK TABLE", "FROM public.messages", "rollback"} {
+	for _, phase := range []string{"LOCK TABLE", "FROM public.messages", "FROM ONLY public.resellers", "rollback"} {
 		t.Run(phase, func(t *testing.T) {
 			f := newMediaGatewayFixture(t)
 			f.rows(t, 101, 20)
@@ -348,4 +351,48 @@ CREATE TABLE public.catalog_products(id uuid PRIMARY KEY,organization_id uuid,up
 CREATE TABLE public.contact_identities(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,channel_account_id uuid,contact_id uuid,avatar_url text);
 CREATE TABLE public.whatsapp_accounts(id uuid PRIMARY KEY,organization_id uuid,name text,phone_id text,status text,is_smb boolean,updated_at timestamptz,deleted_at timestamptz,access_token text);
 CREATE TABLE public.channel_accounts(id uuid PRIMARY KEY,organization_id uuid,channel text,provider text,external_account_id text,metadata jsonb,updated_at timestamptz,deleted_at timestamptz);
-CREATE TABLE public.whatsapp_coexistence_states(id uuid PRIMARY KEY,organization_id uuid,whats_app_account_id uuid,onboarding_cycle bigint,version bigint,lifecycle_status text,updated_at timestamptz);`
+CREATE TABLE public.whatsapp_coexistence_states(id uuid PRIMARY KEY,organization_id uuid,whats_app_account_id uuid,onboarding_cycle bigint,version bigint,lifecycle_status text,updated_at timestamptz);
+CREATE TABLE public.resellers(id uuid PRIMARY KEY,logo_url text,deleted_at timestamptz);
+CREATE TABLE public.recovery_checkpoints(id uuid PRIMARY KEY,organization_id uuid,deleted_at timestamptz,storage_provider text,storage_bucket text,storage_object_key text,encryption_key_ref text);`
+
+func TestMediaGatewayPGGlobalProtectionCountsWithoutPrivateValues(t *testing.T) {
+	f := newMediaGatewayFixture(t)
+	// Empty and NULL logos are unset; whitespace, active and deleted logos all
+	// remain protected. Every checkpoint counts, even with no coordinates.
+	f.exec(t, "INSERT INTO public.resellers VALUES ('80000000-0000-0000-0000-000000000001','',NULL),('80000000-0000-0000-0000-000000000002',NULL,NULL),('80000000-0000-0000-0000-000000000003','GLOBAL_BRANDING_DO_NOT_TRANSFER',NULL),('80000000-0000-0000-0000-000000000004','DELETED_BRANDING_DO_NOT_TRANSFER',now()),('80000000-0000-0000-0000-000000000005',' ',NULL)")
+	f.exec(t, "INSERT INTO public.recovery_checkpoints VALUES ('90000000-0000-0000-0000-000000000001','10000000-0000-0000-0000-000000000002',now(),'PRIVATE_PROVIDER','PRIVATE_BUCKET','PRIVATE_BACKUP_KEY','PRIVATE_ENCRYPTION_REF'),('90000000-0000-0000-0000-000000000002',$1::uuid,NULL,NULL,NULL,NULL,NULL)", mediaFixtureOrg)
+	conn := f.connection(t, f.owner, nil)
+	raw, err := mediaCollect(t, conn)
+	mediaPGOK(t, err)
+	var m mediaInventoryManifest
+	mediaPGOK(t, json.Unmarshal(raw, &m))
+	if m.Version != 2 || !m.SessionDisposed || !m.GlobalProtection.Complete || !m.GlobalProtection.ExactOverlapRequired || m.GlobalProtection.ResellerLogoRows != 3 || m.GlobalProtection.RecoveryCheckpointRows != 2 {
+		t.Fatal("global protected references omitted or permission overstated")
+	}
+	for _, value := range []string{"DO_NOT_TRANSFER", "PRIVATE_", "80000000-", "90000000-", "10000000-0000-0000-0000-000000000002"} {
+		if strings.Contains(string(raw), value) {
+			t.Fatal("global row identity, backup coordinates or private content transferred")
+		}
+	}
+}
+
+func TestMediaGatewayPGGlobalProtectionVisibilityRefusal(t *testing.T) {
+	cases := []struct{ name, mutation string }{
+		{"missing-resellers", "DROP TABLE public.resellers"},
+		{"missing-recovery", "DROP TABLE public.recovery_checkpoints"},
+		{"reseller-rls", "ALTER TABLE public.resellers ENABLE ROW LEVEL SECURITY"},
+		{"recovery-owner-policy", "DROP POLICY rereply_migration_access ON public.recovery_checkpoints"},
+		{"recovery-tenant-policy", "ALTER POLICY rereply_tenant_isolation ON public.recovery_checkpoints USING(true)"},
+		{"recovery-extra-policy", "CREATE POLICY extra ON public.recovery_checkpoints USING(true)"},
+		{"global-column-unavailable", "ALTER TABLE public.resellers DROP COLUMN logo_url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMediaGatewayFixture(t)
+			f.exec(t, tc.mutation)
+			conn := f.connection(t, f.owner, nil)
+			raw, err := mediaCollect(t, conn)
+			mediaRefused(t, conn, raw, err)
+		})
+	}
+}

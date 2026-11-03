@@ -26,12 +26,23 @@ var mediaInventoryFamilies = [...]mediaretirement.Family{
 var mediaInventoryTables = [...]string{
 	"organizations", "whatsapp_accounts", "channel_accounts", "whatsapp_coexistence_states",
 	"messages", "message_parts", "bulk_message_campaigns", "call_logs", "inbound_events",
-	"ivr_flows", "catalog_products", "contact_identities",
+	"ivr_flows", "catalog_products", "contact_identities", "resellers", "recovery_checkpoints",
 }
 
 type MediaInventoryScope struct {
 	OrganizationID string
 	AccountID      string
+}
+
+// Counts include all organizations and soft-deleted rows. A populated shared
+// family requires an exact protection check before any object retirement.
+// Zero counts prove only that these two database reference families are empty
+// in this snapshot; they never establish provider-wide closure or authority.
+type mediaInventoryGlobalProtection struct {
+	Complete               bool  `json:"complete"`
+	ResellerLogoRows       int64 `json:"reseller_logo_rows"`
+	RecoveryCheckpointRows int64 `json:"recovery_checkpoint_rows"`
+	ExactOverlapRequired   bool  `json:"exact_overlap_required"`
 }
 
 type mediaInventoryManifest struct {
@@ -45,6 +56,7 @@ type mediaInventoryManifest struct {
 	CompleteFamilies              []mediaretirement.Family         `json:"complete_families"`
 	Counts                        map[mediaretirement.Family]int64 `json:"counts"`
 	Pages                         []json.RawMessage                `json:"pages"`
+	GlobalProtection              mediaInventoryGlobalProtection   `json:"global_protection"`
 }
 
 type mediaInventorySessionWitness struct {
@@ -62,8 +74,10 @@ type mediaInventorySessionWitness struct {
 //
 // The manifest covers the nine fixed reference families for the organization,
 // including unmatched legacy names. The selected account witness is current
-// only. Global reseller/recovery overlap and historical attribution remain
-// separate requirements, as do fresh transaction checks before any mutation.
+// only. Global reseller-logo presence and all recovery checkpoint counts are
+// included without reading backup coordinates. Populated global families need
+// separate exact overlap checks. Historical attribution and fresh mutation
+// transaction checks remain separate requirements.
 func CollectMediaReferenceInventory(parent context.Context, conn *pgx.Conn, scope MediaInventoryScope) ([]byte, error) {
 	if conn == nil {
 		return nil, mediaretirement.ErrIncomplete
@@ -128,7 +142,7 @@ func CollectMediaReferenceInventory(parent context.Context, conn *pgx.Conn, scop
 		return nil, mediaretirement.ErrIncomplete
 	}
 	manifest := mediaInventoryManifest{
-		Version: 1, Purpose: "media_reference_inventory", ReferenceScope: "organization_nine_families",
+		Version: 2, Purpose: "media_reference_inventory", ReferenceScope: "organization_nine_families",
 		Scope: witness, SameSnapshot: true, CompleteFamilies: make([]mediaretirement.Family, 0, len(mediaInventoryFamilies)),
 		Counts: make(map[mediaretirement.Family]int64), Pages: make([]json.RawMessage, 0),
 	}
@@ -161,6 +175,20 @@ func CollectMediaReferenceInventory(parent context.Context, conn *pgx.Conn, scop
 			cursor = page.LastID
 		}
 	}
+	// Aggregate shared protection only after owner/RLS admission, inside this
+	// same snapshot. No backup coordinate, secret, content or row identity is
+	// selected, and neither organization nor deletion/status filters can hide
+	// a retained global reference. The existing statement and total deadlines
+	// also bound these scans; failure discards the entire private manifest.
+	if err := tx.QueryRow(ctx, `SELECT
+ (SELECT count(*) FROM ONLY public.resellers WHERE logo_url IS NOT NULL AND logo_url<>''),
+ (SELECT count(*) FROM ONLY public.recovery_checkpoints)`).Scan(
+		&manifest.GlobalProtection.ResellerLogoRows, &manifest.GlobalProtection.RecoveryCheckpointRows); err != nil ||
+		manifest.GlobalProtection.ResellerLogoRows < 0 || manifest.GlobalProtection.RecoveryCheckpointRows < 0 {
+		return nil, mediaretirement.ErrIncomplete
+	}
+	manifest.GlobalProtection.Complete = true
+	manifest.GlobalProtection.ExactOverlapRequired = manifest.GlobalProtection.ResellerLogoRows > 0 || manifest.GlobalProtection.RecoveryCheckpointRows > 0
 	// These are same-snapshot consistency checks, never a claim of observing
 	// changes committed after this snapshot. Retirement needs fresh guards.
 	afterWitness, err := mediaInventoryScope(ctx, tx, scope)

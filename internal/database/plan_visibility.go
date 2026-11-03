@@ -192,13 +192,13 @@ func ValidateMediaReferenceVisibility(ctx context.Context, tx pgx.Tx) error {
 	}
 	tables := [...]string{"organizations", "whatsapp_accounts", "channel_accounts", "whatsapp_coexistence_states",
 		"messages", "message_parts", "bulk_message_campaigns", "call_logs", "inbound_events",
-		"ivr_flows", "catalog_products", "contact_identities"}
-	for i, table := range tables {
+		"ivr_flows", "catalog_products", "contact_identities", "resellers", "recovery_checkpoints"}
+	for _, table := range tables {
 		if ctx.Err() != nil || tx.Conn().PgConn().TxStatus() != 'T' {
 			return errPlanSeedUnavailable
 		}
 		var err error
-		if i == 0 {
+		if table == "organizations" || table == "resellers" {
 			err = planSeedTables(ctx, tx, table)
 		} else {
 			err = planSeedTenantTable(ctx, tx, table)

@@ -53,6 +53,13 @@ func TestMediaInventoryPGInstalledSchemaPrivateCommand(t *testing.T) {
 			require.NoError(t, err)
 			require.NotContains(t, string(raw), "DO_NOT_TRANSFER")
 			var report struct {
+				Version          int `json:"version"`
+				GlobalProtection struct {
+					Complete               bool  `json:"complete"`
+					ResellerLogoRows       int64 `json:"reseller_logo_rows"`
+					RecoveryCheckpointRows int64 `json:"recovery_checkpoint_rows"`
+					ExactOverlapRequired   bool  `json:"exact_overlap_required"`
+				} `json:"global_protection"`
 				Purpose         string   `json:"purpose"`
 				SessionDisposed bool     `json:"session_disposed"`
 				SameSnapshot    bool     `json:"same_snapshot"`
@@ -65,6 +72,11 @@ func TestMediaInventoryPGInstalledSchemaPrivateCommand(t *testing.T) {
 			require.True(t, report.SameSnapshot)
 			require.False(t, report.Historical)
 			require.Len(t, report.Families, 9)
+			require.Equal(t, 2, report.Version)
+			require.True(t, report.GlobalProtection.Complete)
+			require.Zero(t, report.GlobalProtection.ResellerLogoRows)
+			require.Zero(t, report.GlobalProtection.RecoveryCheckpointRows)
+			require.False(t, report.GlobalProtection.ExactOverlapRequired)
 		})
 	}
 }

@@ -51,9 +51,19 @@ attribution. It is used inside the native owner/RLS gateway's physical snapshot.
 A same-snapshot recheck cannot detect a later
 concurrent change; mutation needs its own fresh transaction and guards.
 
-Reseller branding has wider scope and needs a separate bounded overlap check.
-Recovery artifacts belong to recovery services and require that service's
-protection check; do not expose backup coordinates or content in this manifest.
+Manifest version2 adds `global_protection`: counts of nonempty reseller logos
+and every recovery checkpoint, across all organizations and including deleted
+rows. Both relations join the locked, owner/RLS-validated snapshot. Logo values,
+row IDs, backup coordinates, encryption-key references and contents are never
+returned; the recovery query does not select those private columns at all.
+
+If either count is positive, `exact_overlap_required` is true: preserve potential
+shared objects until a separate bounded branding/recovery-service overlap check
+resolves them. Zero counts mean only that these two tracked database reference
+families are absent in this snapshot. They do not establish historical provider
+ownership, absence of other references or provider-wide closure. Unavailable
+tables/columns, visibility failures and scan timeouts refuse the entire manifest;
+they never become zero counts. All existing deadlines and disposal checks apply.
 Scheduled hydration work needs a fresh generation/reference recheck before any
 mutation. This inventory must not bypass reserved-event integrity triggers.
 

@@ -29,7 +29,9 @@ const mediaInventoryUsage = `Usage: media-reference-inventory [options]
 Run in the Linux application environment with the explicitly configured database
 owner connection. No migration credential fallback is used. Output includes all
 nine reference families in the organization, with current account selectors;
-historical attribution remains unverified. Nothing is deleted or fetched from
+historical attribution remains unverified. Global reseller-logo and recovery
+checkpoint counts are included without exposing their private values. Any
+populated global family needs an exact protection check. Nothing is deleted or fetched from
 object storage. The bounded snapshot is closed before the private file is saved.
 Existing files, symlinks and partial/truncated inventories are refused.
 `
