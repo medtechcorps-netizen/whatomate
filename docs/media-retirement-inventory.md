@@ -68,7 +68,7 @@ check.
 
 ## Private command
 
-Run `rereply media-reference-inventory -organization-id UUID -account-id UUID
+Run `/app/media-reference-inventory -organization-id UUID -account-id UUID
 -output /absolute/private-directory/manifest.json` in the Linux application
 environment. Configure the intended owner in the normal database connection;
 the command never substitutes `MigrationURL` when the runtime connection is
@@ -89,3 +89,10 @@ Other operating systems refuse output admission before connecting to a database.
 
 This command inventories references only. It does not probe objects, infer
 historical attribution, authorize retirement, or close any provider account.
+
+The inventory tool is a separate executable and package. It reuses the existing
+database visibility validators through a catalog-only adapter, without adding
+imports or initialization to the server or migration entry points. The release
+image includes the tool, but the regular server entry point does not invoke it.
+Migration caps, generated registry metadata, DDL and data-step revisions remain
+unchanged. Existing deployment and schema admission policy remains in force.

@@ -1,4 +1,4 @@
-package database
+package mediaretirementdb
 
 import (
 	"context"
@@ -6,7 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/mediaretirement"
 )
 
@@ -94,7 +96,7 @@ func CollectMediaReferenceInventory(parent context.Context, conn *pgx.Conn, scop
 		}
 	}()
 	if parent == nil || parent.Err() != nil || conn.IsClosed() || conn.PgConn().TxStatus() != 'I' ||
-		!identityInventoryScopeValid(IdentityInventoryScope{OrganizationID: scope.OrganizationID, AccountID: scope.AccountID}) {
+		!mediaInventoryScopeValid(scope) {
 		return nil, mediaretirement.ErrIncomplete
 	}
 	if _, ok := parent.Deadline(); !ok {
@@ -209,21 +211,20 @@ func mediaInventoryScope(ctx context.Context, tx pgx.Tx, scope MediaInventorySco
 }
 
 func mediaInventoryVisibility(ctx context.Context, tx pgx.Tx) error {
-	for _, table := range mediaInventoryTables {
-		if ctx.Err() != nil || tx.Conn().PgConn().TxStatus() != 'T' {
-			return mediaretirement.ErrIncomplete
-		}
-		var err error
-		if table == "organizations" {
-			err = planSeedTables(ctx, tx, table)
-		} else {
-			err = planSeedTenantTable(ctx, tx, table)
-		}
-		if err != nil {
-			return mediaretirement.ErrIncomplete
-		}
+	if database.ValidateMediaReferenceVisibility(ctx, tx) != nil {
+		return mediaretirement.ErrIncomplete
 	}
 	return nil
+}
+
+func mediaInventoryScopeValid(scope MediaInventoryScope) bool {
+	for _, value := range []string{scope.OrganizationID, scope.AccountID} {
+		id, err := uuid.Parse(value)
+		if err != nil || id == uuid.Nil || id.String() != value {
+			return false
+		}
+	}
+	return true
 }
 
 func mediaInventorySession(ctx context.Context, tx pgx.Tx) (mediaInventorySessionWitness, error) {

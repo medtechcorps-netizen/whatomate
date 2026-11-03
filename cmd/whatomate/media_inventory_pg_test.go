@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/mediaretirementcmd"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,7 +37,7 @@ func TestMediaInventoryPGInstalledSchemaPrivateCommand(t *testing.T) {
 				cfg = f.cfg
 			} // valid owner MigrationURL must not become fallback
 			var stdout, stderr bytes.Buffer
-			code := mediaInventoryCommand(context.Background(), args, &stdout, &stderr, func(string) (*config.Config, error) { return &config.Config{Database: cfg}, nil }, collectMediaInventory, openMediaInventoryOutput)
+			code := mediaretirementcmd.Execute(context.Background(), args, &stdout, &stderr, func(string) (*config.Config, error) { return &config.Config{Database: cfg}, nil })
 			require.NotContains(t, stdout.String()+stderr.String(), org)
 			require.NotContains(t, stdout.String()+stderr.String(), account.String())
 			require.NotContains(t, stdout.String()+stderr.String(), "DO_NOT_TRANSFER")

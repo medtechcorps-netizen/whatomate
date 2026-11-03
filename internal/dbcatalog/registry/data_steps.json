@@ -15,7 +15,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -25,8 +24,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -63,7 +60,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "3f8339c1214514b766794c8331ed8b4f0851945697d538f8dddd702c0f6f5832"
+    "closure_sha256": "e83359e30fbf730258b0b40f575c876259c917107f06e147ccf98d187f455da9"
   },
   {
     "id": "PrepareMessageIngestionOrder",
@@ -81,7 +78,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -91,8 +87,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -130,7 +124,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "276868cab54c04afd0d3b39718d507ff2a4a78b81649b7991132858b32e07dd4"
+    "closure_sha256": "2633ec5c0d83d6e2e89a70213ec95a7bf9816d10a0e37a98a99ff29ef9fcae91"
   },
   {
     "id": "PrepareMetaInstagramDeletionJournalTenant",
@@ -148,7 +142,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -158,8 +151,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -196,7 +187,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "57b1a226edbf33eee3dd971bf6d3706853839a0d93e4e98b292fe0ed99694562"
+    "closure_sha256": "e1c2d26494aafe97897a41dfc0dc1f081dd68388e998cbae3caf1d777aea7086"
   },
   {
     "id": "AutoMigrate",
@@ -214,7 +205,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -224,8 +214,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -263,7 +251,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "37f11b9b6e9fd83f1a41cb81c851e2dd7c461e7c1049562c2089d411e37ee0cc"
+    "closure_sha256": "96d906f93a582ea537e18a70dc922ab92a6e7ff5e13d37715579c4ccba2a825e"
   },
   {
     "id": "InstallMessageIngestionOrderTrigger",
@@ -281,7 +269,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -291,8 +278,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -330,7 +315,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "b8fdb671eb509b8143dd03ed938938f614c71a912518c4b5a1dd9072fb707d55"
+    "closure_sha256": "94dc5f5b9d9abdd1777c6a583c9d35a7295f36cf61e2403cb6002a74a1091483"
   },
   {
     "id": "BackfillProviderIntegrationBindings",
@@ -348,7 +333,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -358,8 +342,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -396,7 +378,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "7fa607513186e554dfb0ad56ca5a9d99703c0df7b4be650b8eada59f13166266"
+    "closure_sha256": "42f52bf1f23431c6ca83fedc2e59dd9aab02ba32d3d0e5279dabb2724865c426"
   },
   {
     "id": "SeedPermissionsAndRoles",
@@ -414,7 +396,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -424,8 +405,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -462,7 +441,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "7f21e1be6006d8e14b570b5ebc06c9da115a243682338f8c94bec4336c3999d1"
+    "closure_sha256": "50a49d5b2e65fe2251a4bf40a4e2850321f31cd424dc30ec750d5346acba704c"
   },
   {
     "id": "SeedSystemRolesForAllOrgs",
@@ -480,7 +459,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -490,8 +468,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -528,7 +504,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "ee3e4b24e73ecf26d53adafb8af11da80506b7ebdeb0aeef9b5285e83c0f8c16"
+    "closure_sha256": "df122650fcac7b7b2e900b886753df3c13d09c1207247da0601bb6c2d8f62544"
   },
   {
     "id": "SeedSystemRolesForAllOrgs/seedSystemRolesForOrg",
@@ -546,7 +522,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -556,8 +531,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -594,7 +567,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "487e0547a9ff49e29b93ba9174fbe7b0e8bd377eb56391377b443cb47a2c701e",
+    "closure_sha256": "a90a7ae5e4accf7c772c61ace380324d61a04789536fc115a8a8a5ac3bc52ed4",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
@@ -613,7 +586,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -623,8 +595,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -661,7 +631,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "1c263471e172f7d713741e3bf1a55c7c1db16012a525705e58d8855a6bf40b50",
+    "closure_sha256": "7115433b36d468f2ffcb7db15ebe51f48d9b9539d4897827b337b3af1cdf36e5",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
@@ -680,7 +650,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -690,8 +659,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -728,7 +695,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "201f0dd918a851008f4b5dfb79fd948642a2b22260df234b3097e516c67e192d",
+    "closure_sha256": "d7b3cfae4329ce163fe2ae7ea386c37b99ec13b2fee727375282c3589d5d91dd",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
@@ -747,7 +714,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -757,8 +723,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -795,7 +759,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "dcbeda11cefb2f0cab40df0cdc0c1fbb5e6850e48994db465d25933b487d1117",
+    "closure_sha256": "791333d92fa807d091b37e112449404f37c499bb8586381fce9578ce99f53222",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
@@ -814,7 +778,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -824,8 +787,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -862,7 +823,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "ee3e4b24e73ecf26d53adafb8af11da80506b7ebdeb0aeef9b5285e83c0f8c16",
+    "closure_sha256": "df122650fcac7b7b2e900b886753df3c13d09c1207247da0601bb6c2d8f62544",
     "parent": "SeedSystemRolesForAllOrgs"
   },
   {
@@ -881,7 +842,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -891,8 +851,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -929,7 +887,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "4feeea676532eaec7bdbe42f8331d0ed79e5309256d5d6e9e7a433e721902c77"
+    "closure_sha256": "1361dafc4cf947e403682bbeb02fff3bf0f2d4a1c478e4dcd565561c823823dc"
   },
   {
     "id": "CreateDefaultAdmin",
@@ -947,7 +905,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -957,8 +914,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -995,7 +950,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "d1e46dc25b0809f2c7eb11d23e9aa4b21ec74ae5e4bf5bcd53fd2d39885a8c61"
+    "closure_sha256": "61138620f200cf28278be07f1fbe2ecada8599e6753e2d59324a80d19c820335"
   },
   {
     "id": "EnsurePlatformReseller",
@@ -1013,7 +968,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -1023,8 +977,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -1061,7 +1013,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "85e790acad14c6949972c0f631328c25691cebb99a72e8ad073fc324a5183250"
+    "closure_sha256": "b66261680cee7e5e2195da145cfe94eea3e88ff7cd71f419bac5b668c9534a0a"
   },
   {
     "id": "EnsureReReplyProductCatalog",
@@ -1079,7 +1031,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -1089,8 +1040,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -1127,7 +1076,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "f475c294b4d358718cf34c9879a5e4d742c6199d8ea99db36d1bfa2c3d703d46"
+    "closure_sha256": "0b8dfbcdbfbe5569846ffd03125c5adecae2f46c767ab33532eb7a79fbc2edfd"
   },
   {
     "id": "SeedDefaultWidgets",
@@ -1145,7 +1094,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -1155,8 +1103,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -1193,7 +1139,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "b508b1dff24916e90ead000a23d892ffe048bc8cea46b37db4a0c88447584327"
+    "closure_sha256": "975cf5eebbb2d52ddf47897b3b355cd935b91c071bf92b6ed46bf40af8394ef7"
   },
   {
     "id": "BackfillLastInboundAt",
@@ -1211,7 +1157,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -1221,8 +1166,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -1259,7 +1202,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "b317dae2fd79da4e9456291ffacfaea0c3afcc8dce74509d02da57859d3e7674"
+    "closure_sha256": "b17e26f6192022cc70c719cc2e42073e396acb38461062de082e31a857da3e1b"
   },
   {
     "id": "BackfillChatbotFlowGraph",
@@ -1310,7 +1253,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -1435,8 +1377,6 @@
       "internal/handlers/whatsapp_identity_review.go",
       "internal/handlers/whatsapp_outbound.go",
       "internal/handlers/widgets.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -1490,7 +1430,7 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "c2172fe7d6be77313959ddd75a09407e50e689e3ab3e3262f83a27db832fdc3b"
+    "closure_sha256": "c2a2cb994e453ef8ba90e1d4f442f685b9fc28d44d17a479817a6c34a573cccd"
   },
   {
     "id": "BackfillLegacyWhatsAppInbox",
@@ -1520,7 +1460,6 @@
       "internal/database/contact_policy.go",
       "internal/database/data_gates.go",
       "internal/database/manager_settings_policy.go",
-      "internal/database/media_inventory.go",
       "internal/database/message_ingestion_trigger_contract.go",
       "internal/database/plan.go",
       "internal/database/plan_visibility.go",
@@ -1530,8 +1469,6 @@
       "internal/database/product_integrity.go",
       "internal/database/redis.go",
       "internal/database/tenant.go",
-      "internal/mediaretirement/page.go",
-      "internal/mediaretirement/scope.go",
       "internal/metaregistry/messenger_authority.go",
       "internal/metaregistry/protocol.go",
       "internal/metaregistry/types.go",
@@ -1570,6 +1507,6 @@
       "pkg/whatsapp/types.go",
       "pkg/whatsapp/webhook.go"
     ],
-    "closure_sha256": "8df5c0d53a72d0842e2c96b0404df5a75cc63e5a1725df4f416e39fc11aa5988"
+    "closure_sha256": "1599af618dbaa54ff5f27fe7862dd1cd058b90f49817429c91d06c7a08c5ddfb"
   }
 ]

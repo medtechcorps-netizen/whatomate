@@ -24,9 +24,9 @@ func pgFixture(t *testing.T) {
 	if pg(t, "SELECT current_database() || ':' || (current_setting('server_version_num')::int/10000)::text") != "media_retirement_fixture:17" {
 		t.Fatal("wrong fixture database")
 	}
-	pg(t, `CREATE TABLE IF NOT EXISTS public.messages(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,whatsapp_account text,media_url text,metadata jsonb,content text);
+	pg(t, `CREATE TABLE IF NOT EXISTS public.messages(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,whats_app_account text,media_url text,metadata jsonb,content text);
 CREATE TABLE IF NOT EXISTS public.message_parts(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,message_id uuid,media_url text,storage_key text,provider_media_ref text,caption text);
-CREATE TABLE IF NOT EXISTS public.bulk_message_campaigns(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,whatsapp_account text,header_media_local_path text,header_media_id text);
+CREATE TABLE IF NOT EXISTS public.bulk_message_campaigns(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,whats_app_account text,header_media_local_path text,header_media_id text);
 CREATE TABLE IF NOT EXISTS public.call_logs(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,whatsapp_account text,recording_s3_key text);
 CREATE TABLE IF NOT EXISTS public.inbound_events(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,channel_account_id uuid,review_hold_id uuid,payload jsonb,protocol text,event_type text,status text);
 CREATE TABLE IF NOT EXISTS public.ivr_flows(id uuid PRIMARY KEY,organization_id uuid,updated_at timestamptz,deleted_at timestamptz,whatsapp_account text,menu jsonb,welcome_audio_url text);

@@ -1,6 +1,6 @@
 //go:build !linux
 
-package main
+package mediaretirementcmd
 
 import "github.com/shridarpatil/whatomate/internal/mediaretirement"
 

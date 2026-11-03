@@ -1,4 +1,4 @@
-package main
+package mediaretirementcmd
 
 import (
 	"context"
@@ -16,11 +16,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/shridarpatil/whatomate/internal/config"
-	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/mediaretirement"
+	"github.com/shridarpatil/whatomate/internal/mediaretirementdb"
 )
 
-const mediaInventoryUsage = `Usage: rereply media-reference-inventory [options]
+const mediaInventoryUsage = `Usage: media-reference-inventory [options]
   -config string          Configuration file (default "config.toml")
   -organization-id UUID   Exact organization UUID
   -account-id UUID        Exact current WhatsApp account UUID
@@ -90,13 +90,18 @@ func parseMediaInventoryArgs(args []string) (mediaInventoryArgs, error) {
 	return a, nil
 }
 
-func runMediaReferenceInventory(args []string) {
+// Run executes the standalone inventory command with signal cancellation.
+func Run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := mediaInventoryCommand(ctx, args, os.Stdout, os.Stderr, config.Load, collectMediaInventory, openMediaInventoryOutput)
 	stop()
-	if code != 0 {
-		os.Exit(code)
-	}
+	return code
+}
+
+// Execute runs the command with an explicit configuration loader. It is also
+// used by installed-schema integration tests without copying fixture helpers.
+func Execute(parent context.Context, args []string, stdout, stderr io.Writer, load func(string) (*config.Config, error)) int {
+	return mediaInventoryCommand(parent, args, stdout, stderr, load, collectMediaInventory, openMediaInventoryOutput)
 }
 
 func mediaInventoryCommand(parent context.Context, args []string, stdout, stderr io.Writer, load func(string) (*config.Config, error), collect mediaInventoryCollector, open func(string) (mediaInventoryOutput, error)) (code int) {
@@ -161,10 +166,10 @@ func collectMediaInventory(parent context.Context, cfg config.DatabaseConfig, a 
 	if deadline, ok := parent.Deadline(); ok && deadline.Before(until) {
 		until = deadline
 	}
-	d := planDeadline{workAt: until.Add(-3 * time.Second), finalAt: until}
-	ctx, cancel := context.WithDeadline(parent, d.workAt)
+	workAt := until.Add(-3 * time.Second)
+	ctx, cancel := context.WithDeadline(parent, workAt)
 	defer cancel()
-	dsn, err := catalogRuntimeDSN(cfg)
+	dsn, err := mediaInventoryDSN(cfg)
 	if err != nil {
 		return nil, mediaretirement.ErrIncomplete
 	}
@@ -172,23 +177,23 @@ func collectMediaInventory(parent context.Context, cfg config.DatabaseConfig, a 
 	if err != nil {
 		return nil, mediaretirement.ErrIncomplete
 	}
-	observer, err := seedDiagnosticConfig(parsed, d, ctx)
+	observer, err := mediaInventoryConfig(parsed, workAt, ctx)
 	if err != nil {
 		return nil, mediaretirement.ErrIncomplete
 	}
-	observer.RuntimeParams["application_name"] = database.MediaInventoryApplication
+	observer.RuntimeParams["application_name"] = mediaretirementdb.MediaInventoryApplication
 	if observer.ConnectTimeout > 3*time.Second {
 		observer.ConnectTimeout = 3 * time.Second
 	}
 	conn, err := pgx.ConnectConfig(ctx, observer)
 	if err != nil {
 		if conn != nil {
-			_, _ = database.CollectMediaReferenceInventory(ctx, conn, database.MediaInventoryScope{})
+			_, _ = mediaretirementdb.CollectMediaReferenceInventory(ctx, conn, mediaretirementdb.MediaInventoryScope{})
 		}
 		return nil, mediaretirement.ErrIncomplete
 	}
-	raw, err := database.CollectMediaReferenceInventory(ctx, conn, database.MediaInventoryScope{OrganizationID: a.organizationID, AccountID: a.accountID})
-	if err != nil || parent.Err() != nil || !time.Now().Before(d.finalAt) {
+	raw, err := mediaretirementdb.CollectMediaReferenceInventory(ctx, conn, mediaretirementdb.MediaInventoryScope{OrganizationID: a.organizationID, AccountID: a.accountID})
+	if err != nil || parent.Err() != nil || !time.Now().Before(until) {
 		return nil, mediaretirement.ErrIncomplete
 	}
 	return raw, nil
