@@ -106,6 +106,8 @@ func (l *forwardWorkLease) release() {
 
 // App holds all dependencies for handlers
 type App struct {
+	// ReaformPilot is optional server-only integration configuration.
+	ReaformPilot      config.ReaformPilotConfig
 	Config            *config.Config
 	DB                *gorm.DB
 	Redis             *redis.Client

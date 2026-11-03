@@ -686,6 +686,7 @@ describe('LeadEditDialog labels', () => {
           AlertDialogFooter: Passthrough,
           AlertDialogHeader: Passthrough,
           AlertDialogTitle: Passthrough,
+          ReaformAppointmentCard: true,
         },
       },
     })
@@ -697,6 +698,7 @@ describe('LeadEditDialog labels', () => {
       expect(text).toContain('Save changes')
       expect(text).not.toContain('Next action')
       expect(text).not.toContain('Expected close')
+      expect(dialog.findComponent({ name: 'ReaformAppointmentCard' }).props('leadId')).toBe('lead-1')
     } finally {
       dialog.unmount()
     }

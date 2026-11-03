@@ -152,6 +152,7 @@ func (a *App) rootApp() *App {
 func (a *App) scopedApp(tx *gorm.DB, organizationID uuid.UUID) *App {
 	root := a.rootApp()
 	scoped := &App{
+		ReaformPilot:          root.ReaformPilot,
 		Config:                root.Config,
 		DB:                    tx,
 		Redis:                 root.Redis,
