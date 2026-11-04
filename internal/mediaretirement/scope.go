@@ -40,7 +40,7 @@ func ScopeProjection() Plan {
  AND phone_id IS NOT NULL AND octet_length(phone_id)<=255 AND status IS NOT NULL AND octet_length(status)<=64 AND is_smb IS NOT NULL)
  AND EXISTS(SELECT 1 FROM n WHERE id=$2::uuid AND deleted_at IS NULL)
  AND NOT EXISTS(SELECT 1 FROM c WHERE id='00000000-0000-0000-0000-000000000000'::uuid
- OR organization_id IS DISTINCT FROM $1::uuid OR channel IS DISTINCT FROM 'whatsapp' OR provider IS DISTINCT FROM 'meta'
+ OR organization_id IS DISTINCT FROM $1::uuid OR channel IS DISTINCT FROM 'whatsapp' OR provider IS DISTINCT FROM 'meta_legacy'
  OR external_account_id IS DISTINCT FROM 'legacy-account:'||$2::text OR legacy_account_id IS DISTINCT FROM pg_catalog.to_jsonb($2::text)
  OR updated_at IS NULL OR deleted_at IS NOT NULL)
  AND NOT EXISTS(SELECT 1 FROM s WHERE id='00000000-0000-0000-0000-000000000000'::uuid OR organization_id IS DISTINCT FROM $1::uuid
