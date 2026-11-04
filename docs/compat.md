@@ -608,9 +608,10 @@ tests independently validate generated closure bytes and reviewed caps.
 The existing compatibility producer still runs its complete experiment; neither
 source classification nor a plausible generated hash supplies measured proof.
 
-Test and Compatibility are separate workflows. Before the planned owner step
-makes `compat` required, the controlled merge gate must bind both successes to
-the current PR head/base/test-merge and exact run/attempt. Actions metadata can
+Test and Compatibility are separate workflows. The accepted October 12 H5
+checkpoint records `compat` as required; current protection must still be read
+back. Merge review must bind both successes to the current PR
+head/base/test-merge and exact run/attempt. Actions metadata can
 identify the PR head while result/context identify its synthetic merge; neither
 may be substituted for the actual main commit after merging. Main requires its
 own signed qualification. This CI source predicate does not configure
@@ -1009,7 +1010,7 @@ repaired fixture cases, 163 normal-collection cases and 154 custody/workflow cas
 The initial three fixture failures are retained; there was no fresh all-green
 79-case rerun. These tests do not establish hosted rollback qualification.
 
-### Negative-intent publisher and disabled outage consumer
+### Negative-intent publisher and installed outage consumer
 
 The producer setup is installed and the main-only Compatibility signing job
 runs the publisher before both signatures. Its embedded witness binds the
@@ -1017,8 +1018,39 @@ reviewed protected tag rule and records configuration observation only. It does
 not prove hosted token permissions, durable publication or signing order. The
 explicit absent-configuration path still refuses before reading operational
 paths, credentials or network state. The release gate's separate outage consumer
-is connected but disabled: `release/deployment/compat-negative-consumer-v1.json`
-is absent, so `promote-without-staging` still requires normal compatibility.
+is installed: `release/deployment/compat-negative-consumer-v1.json` binds one
+24-file lineage to producer `be2d3cbd18dff258b73695f05e7fd08de1046340` (P).
+The data-only consumer change (V) was introduced at
+`feb51554ba2a654adc8ea27688b13dc03d819168` and protected-merged in
+[PR 275](https://github.com/medtechcorps-netizen/whatomate/pull/275) as
+`2866e1a84b14326cbff5893cad148394459c17e7`.
+
+The accepted October 12, 2026 H5 checkpoints retain the signed normal
+[qualification 38225487826](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38225487826),
+the distinct ordinary-token synthetic
+[qualification 38225751545](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38225751545),
+and the post-merge no-PUT
+[dry-run 38232156004](https://github.com/medtechcorps-netizen/whatomate/actions/runs/38232156004).
+They also record the narrow addition of `compat` to strict required-status
+protection. These are accepted historical qualifications, not a current branch
+protection readback, a new hosted run or proof of a production outage promotion.
+
+At audited main `69c513765e42e2ca5ebe0728f150ca62f0f007e4`, the installed
+publisher inventory differs at `.github/workflows/compat.yml`,
+`internal/dbcatalog/registry/data_steps.json` and
+`release/deployment/record_transport.py`. That exact source is not covered by
+the installed outage lineage. Covering a successor publisher requires fresh
+accepted normal and distinct synthetic qualifications, followed by a separately
+reviewed data-only consumer update. Valid normal compatibility does not require
+outage coverage.
+
+PR16 still needs bounded active-catalog/contract semantic capability, hosted
+qualification of the real owner-read collector with its ordinary token, and
+hosted qualification of a legitimate exact target/live multi-change rollback
+span. Existing source and synthetic tests do not complete those qualifications.
+Preserve the one-business-day transition notice and normal review gates. PR20
+recovery preparation remains independent of PR19; this correction does not
+broaden PR23's four fixed v1 DDL steps or authorize active schema/data work.
 
 The signing job first runs a small evidence preparer whose source and local
 imports belong to the reviewed publisher inventory. It uses the shared public
@@ -1038,7 +1070,7 @@ uses a private configuration and permits only its closed API operations. Pure
 replay keeps complete raw rule/ref/HTTP observations with strict bounds. Setup
 installation and local tests do not establish hosted permissions or source
 coverage. The consumer data remains outside publisher imports, reads and its
-future immutable source inventory.
+immutable source inventory.
 
 The qualification sequence is complete source review and required CI, protected
 merge of producer P with consumer data absent, then two distinct hosted checks.
@@ -1051,8 +1083,9 @@ and deletion with unchanged-ref readback, positive no-write and negative intent
 publication before qualification signing. Its fixed pre-P source Q differs from
 the job's actual H and is permanently excluded from eligible producer lineages.
 It never attests a synthetic pair as ordinary compatibility evidence or creates
-a fabricated negative for a covered real candidate. These hosted results have
-not yet been established by this source change.
+a fabricated negative for a covered real candidate. The installed P/V lineage
+has the accepted historical hosted results above; a successor lineage must
+establish its own results.
 
 Only independent acceptance of both the exact-main result and the distinct
 synthetic qualification permits a separately reviewed data-only V activation PR.
@@ -1063,7 +1096,7 @@ CI still precede the protected V merge. No runtime qualification receipt replace
 these gates, and synthetic qualification does not claim an actual negative
 database measurement or lifetime administrator continuity.
 
-The disabled consumer retains the same actual normal collection pass plus both
+The installed consumer retains the same actual normal collection pass plus both
 closed raw inventory snapshots. Replay derives terminal execution windows from
 the attempt's own known workflow and checks complete run/job/check/artifact
 coverage. A failed collector, unknown workflow, active or no-work attempt,

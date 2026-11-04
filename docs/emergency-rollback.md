@@ -113,14 +113,20 @@ image digests only and will not notice.
 
 ## Compatibility outage preparation
 
-The separate compatibility-outage consumer remains disabled because its fixed
-`release/deployment/compat-negative-consumer-v1.json` data is absent. Producer
-setup is installed and the main-only Compatibility workflow publishes complete
-negative intent before both signatures; that configuration is not hosted
-permission or outage qualification. After protected merge, an exact-main normal
-positive and a distinct synthetic ordinary-token qualification must each receive
-independent acceptance before a separate data-only V activation PR. Synthetic
-qualification uses separate subjects and signer identity, never release proof.
+The separate compatibility-outage consumer is installed in
+`release/deployment/compat-negative-consumer-v1.json`, bound to producer
+`be2d3cbd18dff258b73695f05e7fd08de1046340`. The accepted October 12, 2026 H5/P/V
+sequence includes normal and distinct synthetic hosted qualification, protected
+consumer merge and a post-merge no-PUT dry-run. See the [historical evidence and
+remaining qualification gates](compat.md#negative-intent-publisher-and-installed-outage-consumer).
+This does not prove a production outage promotion. At audited main
+`69c513765e42e2ca5ebe0728f150ca62f0f007e4`, the installed inventory differs at
+`.github/workflows/compat.yml`, `internal/dbcatalog/registry/data_steps.json`
+and `release/deployment/record_transport.py`, so that exact source lacks matching
+outage coverage. A successor publisher needs accepted normal and distinct
+synthetic qualifications before a reviewed data-only consumer-lineage update.
+Valid normal compatibility remains usable. Synthetic qualification uses separate
+subjects and signer identity, never release proof.
 The consumer belongs only to the owner-dispatched `promote-without-staging` path.
 It does not change rollback eligibility, provide missing rollback proof, or
 authorize console overrides.
