@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -62,7 +63,7 @@ func TestScopedAppCreationDoesNotCopyOrRaceRootRealtimeState(t *testing.T) {
 func TestPublishRealtimeEventDeliversLocallyAndScopesTenant(t *testing.T) {
 	log := testutil.NopLogger()
 	hub := appwebsocket.NewHub(log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	orgID := uuid.New()
 	otherOrgID := uuid.New()
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), orgID)
@@ -104,7 +105,7 @@ func TestPublishRealtimeEventDeliversLocallyAndScopesTenant(t *testing.T) {
 func TestPublishRealtimeEventTargetsOneUserAcrossTheirTabs(t *testing.T) {
 	log := testutil.NopLogger()
 	hub := appwebsocket.NewHub(log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	orgID := uuid.New()
 	userID := uuid.New()
 	otherUserID := uuid.New()
@@ -153,7 +154,9 @@ func TestRealtimeFanoutAcrossTwoReplicasWithoutOriginEcho(t *testing.T) {
 	options, err := redis.ParseURL(redisURL)
 	require.NoError(t, err)
 	redisA := redis.NewClient(options)
-	redisB := redis.NewClient(options)
+	optionsB := *options
+	optionsB.ClientName = "realtime-recovery-" + uuid.NewString()
+	redisB := redis.NewClient(&optionsB)
 	t.Cleanup(func() {
 		_ = redisA.Close()
 		_ = redisB.Close()
@@ -220,7 +223,25 @@ func TestRealtimeFanoutAcrossTwoReplicasWithoutOriginEcho(t *testing.T) {
 	subscriberB := appB.realtimeSubscriber.Load()
 	require.NotNil(t, subscriberB)
 	reconnectsBefore := subscriberB.RealtimeReconnectCount()
-	require.NoError(t, subscriberB.Close())
+	clients, err := redisA.ClientList(context.Background()).Result()
+	require.NoError(t, err)
+	var subscriberIDs []string
+	for _, line := range strings.Split(clients, "\n") {
+		fields := make(map[string]string)
+		for _, field := range strings.Fields(line) {
+			key, value, ok := strings.Cut(field, "=")
+			if ok {
+				fields[key] = value
+			}
+		}
+		if fields["name"] == optionsB.ClientName && strings.Contains(fields["flags"], "P") {
+			subscriberIDs = append(subscriberIDs, fields["id"])
+		}
+	}
+	require.Len(t, subscriberIDs, 1)
+	killed, err := redisA.Do(context.Background(), "CLIENT", "KILL", "ID", subscriberIDs[0]).Int64()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), killed)
 	testutil.AssertEventually(t, func() bool {
 		return subscriberB.RealtimeReconnectCount() > reconnectsBefore && subscriberB.RealtimeLive()
 	}, 5*time.Second, "replica B realtime subscriber recovered")

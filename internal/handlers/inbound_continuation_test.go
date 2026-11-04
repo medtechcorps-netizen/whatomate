@@ -155,7 +155,7 @@ func TestInboundContinuation_CommittedNativeInboundPublishesRealtimeExactlyOnce(
 	}))
 
 	hub := appwebsocket.NewHub(app.Log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	app.WSHub = hub
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), organization.ID)
 	hub.Register(client)
@@ -240,7 +240,7 @@ func TestInboundContinuation_RolledBackNativeInboundPublishesNoRealtime(
 	require.False(t, duplicate)
 
 	hub := appwebsocket.NewHub(app.Log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	app.WSHub = hub
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), organization.ID)
 	hub.Register(client)

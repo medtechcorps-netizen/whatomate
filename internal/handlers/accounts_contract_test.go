@@ -4933,6 +4933,17 @@ func TestEmbeddedSignupGenerationAcquisitionUsesCallerBudget(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("generation acquisition exceeded the caller's budget")
 			}
+			// The inspection has a child context with this same deadline. Its timer
+			// can fire before the caller's timer, so returning does not imply that
+			// ctx.Err is already published. Still require a consumed caller budget.
+			deadline, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			require.False(t, time.Now().Before(deadline), "blocked acquisition must consume the caller's budget")
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+				t.Fatal("caller deadline cancellation was not published")
+			}
 			require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
 			require.NoError(t, holderCtx.Err(), "inspection must not cancel the held owner's context")
 			if nested {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"strings"
 	"testing"
 	"time"
@@ -84,7 +85,7 @@ func identityInventoryHold(t *testing.T, f *migrationPlanFixture, args catalogSn
 func identityInventoryShadow(t *testing.T, f *migrationPlanFixture, args catalogSnapshotArgs) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
-	identityInventoryExec(t, f, "INSERT INTO public.channel_accounts(id,organization_id,channel,provider,external_account_id,metadata) VALUES($1,$2::uuid,'whatsapp','meta',$3,jsonb_build_object('legacy_account_id',$4::text))", id, args.organizationID, "legacy-account:"+args.accountID, args.accountID)
+	identityInventoryExec(t, f, "INSERT INTO public.channel_accounts(id,organization_id,channel,provider,external_account_id,metadata) VALUES($1,$2::uuid,'whatsapp',$5,$3,jsonb_build_object('legacy_account_id',$4::text))", id, args.organizationID, "legacy-account:"+args.accountID, args.accountID, channelapi.LegacyMetaProvider)
 	return id
 }
 
@@ -405,11 +406,15 @@ func TestIdentityInventoryPGReceiptAndMemberAnomalies(t *testing.T) {
 	report = readIdentityInventory(t, cfg, args)
 	require.Equal(t, "deleted_exact", report.ShadowState)
 	require.Zero(t, report.Counts.ReceiptRecordedCopyShape)
+	identityInventoryExec(t, f, "UPDATE public.channel_accounts SET deleted_at=NULL,provider='meta' WHERE id=$1", shadow)
+	report = readIdentityInventory(t, cfg, args)
+	require.Equal(t, "contradictory", report.ShadowState, "a different Meta adapter is not the established WhatsApp bridge")
+	require.Zero(t, report.Counts.ReceiptRecordedCopyShape)
 	identityInventoryExec(t, f, "UPDATE public.channel_accounts SET deleted_at=NULL,provider='wrong' WHERE id=$1", shadow)
 	report = readIdentityInventory(t, cfg, args)
 	require.Equal(t, "contradictory", report.ShadowState)
 	require.Zero(t, report.Counts.ReceiptRecordedCopyShape)
-	identityInventoryExec(t, f, "UPDATE public.channel_accounts SET provider='meta',metadata=jsonb_build_object('legacy_account_id',$1::text) WHERE id=$2", uuid.NewString(), shadow)
+	identityInventoryExec(t, f, "UPDATE public.channel_accounts SET provider=$3,metadata=jsonb_build_object('legacy_account_id',$1::text) WHERE id=$2", uuid.NewString(), shadow, channelapi.LegacyMetaProvider)
 	raw, err := collectIdentityInventory(context.Background(), cfg, args)
 	require.Error(t, err)
 	require.Nil(t, raw, "one row with competing account selectors is ambiguous")

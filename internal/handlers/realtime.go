@@ -129,11 +129,19 @@ func (a *App) StartRealtimeSubscriber() error {
 		return errors.New("realtime WebSocket hub is unavailable")
 	}
 	root := a.rootApp()
-	root.realtimeSubscriberLive.Store(false)
 	root.realtimeSourceID()
-	ctx, cancel := context.WithCancel(context.Background())
-	subscriber := queue.NewSubscriber(root.Redis, root.Log)
-	if err := subscriber.SubscribeRealtime(ctx, func(event *queue.RealtimeEvent) {
+	owner, subscriber, err := root.beginSubscriber(true)
+	if err != nil {
+		return err
+	}
+	monitorStarted := false
+	defer func() {
+		if !monitorStarted {
+			close(owner.monitorDone)
+		}
+		close(owner.startDone)
+	}()
+	if err := subscriber.SubscribeRealtime(owner.ctx, func(event *queue.RealtimeEvent) {
 		if event == nil || event.OrganizationID == uuid.Nil {
 			return
 		}
@@ -150,30 +158,26 @@ func (a *App) StartRealtimeSubscriber() error {
 			root.WSHub.BroadcastToOrg(event.OrganizationID, message)
 		}
 	}); err != nil {
-		cancel()
+		owner.cancel()
 		return err
+	}
+	root.subscriberMu.Lock()
+	if owner.stopping || owner.ctx.Err() != nil {
+		root.subscriberMu.Unlock()
+		return context.Canceled
 	}
 	root.realtimeSubscriber.Store(subscriber)
 	root.realtimeSubscriberLive.Store(subscriber.RealtimeLive())
-	go func() {
-		<-subscriber.Done()
-		root.realtimeSubscriberLive.Store(false)
+	root.subscriberMu.Unlock()
+	monitorStarted = true
+	go root.monitorRealtimeSubscriber(owner, func() {
 		root.Log.Error("Required realtime subscriber stopped")
-	}()
-	root.RealtimeSubCancel = func() {
-		root.realtimeSubscriberLive.Store(false)
-		cancel()
-		_ = subscriber.Close()
-	}
+	})
 	root.Log.Info("Realtime subscriber started")
 	return nil
 }
 
 // StopRealtimeSubscriber stops this replica's Redis subscription.
 func (a *App) StopRealtimeSubscriber() {
-	root := a.rootApp()
-	if root != nil && root.RealtimeSubCancel != nil {
-		root.RealtimeSubCancel()
-		root.RealtimeSubCancel = nil
-	}
+	a.stopSubscriber(true)
 }
