@@ -168,6 +168,11 @@ type App struct {
 	// realtimeSubscriber exposes the confirmed receive-loop liveness to /ready;
 	// the queue subscriber marks itself unavailable while it resubscribes.
 	realtimeSubscriber atomic.Pointer[queue.Subscriber]
+	subscriberMu       sync.Mutex
+	realtimeOwned      *appSubscriber
+	campaignOwned      *appSubscriber
+	realtimeStopped    bool
+	campaignStopped    bool
 }
 
 // whatsAppClient returns the application's shared client when available. The
@@ -568,17 +573,21 @@ func (a *App) GetEmbeddedSignupConfig(r *fastglue.Request) error {
 // StartCampaignStatsSubscriber starts listening for campaign stats updates from Redis pub/sub
 // and broadcasts them via WebSocket
 func (a *App) StartCampaignStatsSubscriber() error {
+	if a == nil {
+		return nil
+	}
+	a = a.rootApp()
 	if a.WSHub == nil {
 		a.Log.Warn("WebSocket hub not initialized, skipping campaign stats subscriber")
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	a.CampaignSubCancel = cancel
-
-	subscriber := queue.NewSubscriber(a.Redis, a.Log)
-
-	err := subscriber.SubscribeCampaignStats(ctx, func(update *queue.CampaignStatsUpdate) {
+	owner, subscriber, err := a.beginSubscriber(false)
+	if err != nil {
+		return err
+	}
+	defer close(owner.startDone)
+	err = subscriber.SubscribeCampaignStats(owner.ctx, func(update *queue.CampaignStatsUpdate) {
 		a.Log.Debug("Received campaign stats update from Redis",
 			"campaign_id", update.CampaignID,
 			"status", update.Status,
@@ -600,7 +609,7 @@ func (a *App) StartCampaignStatsSubscriber() error {
 	})
 
 	if err != nil {
-		cancel()
+		owner.cancel()
 		return err
 	}
 
@@ -610,9 +619,7 @@ func (a *App) StartCampaignStatsSubscriber() error {
 
 // StopCampaignStatsSubscriber stops the campaign stats subscriber
 func (a *App) StopCampaignStatsSubscriber() {
-	if a.CampaignSubCancel != nil {
-		a.CampaignSubCancel()
-	}
+	a.stopSubscriber(false)
 }
 
 // getOrgAndUserID extracts both organization ID and user ID from the request context.
