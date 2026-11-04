@@ -63,7 +63,7 @@ func TestScopedAppCreationDoesNotCopyOrRaceRootRealtimeState(t *testing.T) {
 func TestPublishRealtimeEventDeliversLocallyAndScopesTenant(t *testing.T) {
 	log := testutil.NopLogger()
 	hub := appwebsocket.NewHub(log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	orgID := uuid.New()
 	otherOrgID := uuid.New()
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), orgID)
@@ -105,7 +105,7 @@ func TestPublishRealtimeEventDeliversLocallyAndScopesTenant(t *testing.T) {
 func TestPublishRealtimeEventTargetsOneUserAcrossTheirTabs(t *testing.T) {
 	log := testutil.NopLogger()
 	hub := appwebsocket.NewHub(log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	orgID := uuid.New()
 	userID := uuid.New()
 	otherUserID := uuid.New()

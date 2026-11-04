@@ -854,7 +854,7 @@ func runServer(args []string) {
 
 	// Initialize WebSocket hub
 	wsHub := websocket.NewHub(lo)
-	go wsHub.Run()
+	wsHub.Start()
 	lo.Info("WebSocket hub started")
 
 	// Initialize app with dependencies
@@ -949,6 +949,7 @@ func runServer(args []string) {
 
 	// Create server with CORS wrapper
 	server := &fasthttp.Server{
+		ConnState:          wsHub.ConnState,
 		Handler:            corsWrapper(g.Handler(), allowedOrigins),
 		ReadTimeout:        time.Duration(cfg.Server.ReadTimeout) * time.Second,
 		WriteTimeout:       time.Duration(cfg.Server.WriteTimeout) * time.Second,
@@ -1101,6 +1102,7 @@ func runServer(args []string) {
 	// listener shutdown or cancellation of another processor.
 	tasks := []serverShutdownTask{
 		{"HTTP shutdown", server.ShutdownWithContext},
+		{"WebSocket hub and connection drain", wsHub.Stop},
 		{"database pool diagnostics stop request", func(context.Context) error {
 			poolDiagnosticsCancel()
 			return nil
@@ -1168,9 +1170,9 @@ func runServer(args []string) {
 	tasks = append(tasks, ownedLoops...)
 	shutdownServer(deadline, tasks, func(result serverShutdownResult) {
 		// Best effort only: a blocked log sink must not keep main alive. Even
-		// success below joins only the tracked top-level loops, not WebSockets,
-		// worker heartbeats or other detached app work. Subscriber startup,
-		// receive callbacks and readiness monitors are joined above.
+		// success below joins the tracked loops, subscribers and WebSocket
+		// handoffs/pumps. Worker heartbeats and other detached app work still
+		// need their own lifecycle owners.
 		if result.deadlineExpired || len(result.failed) > 0 {
 			lo.Warn("Server shutdown incomplete", "deadline_expired", result.deadlineExpired,
 				"pending", result.pending, "failed", result.failed)

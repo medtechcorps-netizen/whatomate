@@ -249,5 +249,5 @@
     "pkg/whatsapp/types.go",
     "pkg/whatsapp/webhook.go"
   ],
-  "closure_sha256": "3c77c11c07a64fd96ef6b97492ef376582eab01bbd6cf710400dcd1185818bad"
+  "closure_sha256": "50e56ea313563f7e57e1a0e7369e9364e398ade041656b9d468a5b89306baeb7"
 }
