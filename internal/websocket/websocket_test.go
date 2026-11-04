@@ -1,6 +1,7 @@
 package websocket_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -18,7 +19,12 @@ func newTestHub(t *testing.T) *websocket.Hub {
 	t.Helper()
 	log := logf.New(logf.Opts{})
 	hub := websocket.NewHub(log)
-	go hub.Run()
+	hub.Start()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		require.NoError(t, hub.Stop(ctx))
+	})
 	return hub
 }
 

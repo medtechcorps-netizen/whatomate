@@ -172,7 +172,7 @@ func TestSLAProcessorSendsCustomerNoticesAfterTenantCommitWithRuntimeRoleRLS(t *
 	app.Config.Database.RLSEnabled = true
 	app.Config.Database.RuntimeRole = runtimeRole
 	app.WSHub = websocket.NewHub(app.Log)
-	go app.WSHub.Run()
+	StartOwnedWebSocketTestHub(t, app.WSHub)
 	deliveries := slaNoticeProvider(t, app, adminDB)
 
 	// Record every runtime-role statement that waits on a lock during the

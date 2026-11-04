@@ -158,7 +158,7 @@ func TestInboundContinuation_BroadcastUsesOwnTransaction(t *testing.T) {
 	require.Equal(t, true, work.Persisted.Metadata[incomingAutomaticAISuppressedKey])
 
 	hub := appwebsocket.NewHub(app.Log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	app.WSHub = hub
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), organization.ID)
 	hub.Register(client)
