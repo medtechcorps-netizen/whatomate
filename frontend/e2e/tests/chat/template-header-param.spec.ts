@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test'
 import { Client } from 'pg'
+import { randomUUID } from 'node:crypto'
 import { loginAsAdmin, ApiHelper } from '../../helpers'
 import { ChatPage } from '../../pages'
 import { createTestScope } from '../../framework'
@@ -43,54 +44,53 @@ test.describe('Chat composer — TEXT header parameter', () => {
 
   test.beforeAll(async () => {
     const reqContext = await playwrightRequest.newContext()
-    const api = new ApiHelper(reqContext)
-    await api.loginAsAdmin()
-
-    const phone = scope.phone()
-    await api.createContact(phone, scope.name('contact'))
-    const contacts = await api.getContacts()
-    const contact = contacts.find((c: any) => c.phone_number === phone) || contacts[0]
-    contactId = contact.id
-
-    let accounts: any[] = []
     try {
-      accounts = await api.getWhatsAppAccounts()
-    } catch {
-      // ignore
-    }
-    if (accounts.length === 0) {
-      const uid = Date.now().toString().slice(-8)
-      await api.createWhatsAppAccount({
-        name: `e2e-hdr-account-${uid}`,
-        phone_id: `phone-${uid}`,
-        business_id: `biz-${uid}`,
-        access_token: `token-${uid}`,
+      const api = new ApiHelper(reqContext)
+      await api.loginAsAdmin()
+
+      // Own both fixtures. Concurrent specs must not race on a shared account
+      // or seed templates with an empty account after an ignored setup failure.
+      const phone = scope.phone()
+      const contact = await api.createContact(phone, scope.name('contact'))
+      expect(contact.id).toBeTruthy()
+      expect(contact.phone_number).toBe(phone)
+      contactId = contact.id
+
+      const accountUID = randomUUID()
+      const expectedAccountName = scope.name(`account-${accountUID}`)
+      const account = await api.createWhatsAppAccount({
+        name: expectedAccountName,
+        phone_id: `e2e-phone-${accountUID}`,
+        business_id: `e2e-business-${accountUID}`,
+        access_token: 'e2e-fixture-local-only-token',
       })
-      accounts = await api.getWhatsAppAccounts()
+      expect(account.id).toBeTruthy()
+      expect(account.name).toBe(expectedAccountName)
+      accountName = account.name
+
+      const orgId = await execSQL(
+        `SELECT organization_id FROM users WHERE email = 'admin@test.com' LIMIT 1`,
+      )
+      await execSQL(`DELETE FROM templates WHERE name LIKE 'e2e_hdr_%' AND organization_id = '${orgId}'`)
+
+      const uid = Date.now().toString().slice(-6)
+
+      // Positional template — header {{1}} AND body {{1}}, the case that was
+      // collapsing to a single input before this work.
+      positionalTplName = `e2e_hdr_pos_${uid}`
+      await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, header_type, header_content, body_content, created_at, updated_at)
+        VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${positionalTplName}', 'E2E Header Pos ${uid}', 'en', 'UTILITY', 'APPROVED', 'TEXT', 'Order {{1}} update', 'Hi {{1}}, code {{2}}', NOW(), NOW())`)
+
+      // Named template — separate var names; covers the "header_params is
+      // optional, falls back to template_params" path.
+      namedTplName = `e2e_hdr_named_${uid}`
+      await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, header_type, header_content, body_content, created_at, updated_at)
+        VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${namedTplName}', 'E2E Header Named ${uid}', 'en', 'UTILITY', 'APPROVED', 'TEXT', 'Our {{season}} sale', 'Hi {{name}}', NOW(), NOW())`)
+
+      await execSQL(`UPDATE contacts SET whats_app_account = '${accountName}' WHERE id = '${contactId}'`)
+    } finally {
+      await reqContext.dispose()
     }
-    accountName = accounts[0].name
-
-    const orgId = await execSQL(
-      `SELECT organization_id FROM users WHERE email = 'admin@test.com' LIMIT 1`,
-    )
-    await execSQL(`DELETE FROM templates WHERE name LIKE 'e2e_hdr_%' AND organization_id = '${orgId}'`)
-
-    const uid = Date.now().toString().slice(-6)
-
-    // Positional template — header {{1}} AND body {{1}}, the case that was
-    // collapsing to a single input before this work.
-    positionalTplName = `e2e_hdr_pos_${uid}`
-    await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, header_type, header_content, body_content, created_at, updated_at)
-      VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${positionalTplName}', 'E2E Header Pos ${uid}', 'en', 'UTILITY', 'APPROVED', 'TEXT', 'Order {{1}} update', 'Hi {{1}}, code {{2}}', NOW(), NOW())`)
-
-    // Named template — separate var names; covers the "header_params is
-    // optional, falls back to template_params" path.
-    namedTplName = `e2e_hdr_named_${uid}`
-    await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, header_type, header_content, body_content, created_at, updated_at)
-      VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${namedTplName}', 'E2E Header Named ${uid}', 'en', 'UTILITY', 'APPROVED', 'TEXT', 'Our {{season}} sale', 'Hi {{name}}', NOW(), NOW())`)
-
-    await execSQL(`UPDATE contacts SET whats_app_account = '${accountName}' WHERE id = '${contactId}'`)
-    await reqContext.dispose()
   })
 
   test('positional template renders distinct header + body inputs', async ({ page }) => {

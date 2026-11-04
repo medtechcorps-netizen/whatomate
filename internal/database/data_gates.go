@@ -25,7 +25,7 @@ const dataGateMixedSQL = `SELECT pg_catalog.count(*)::bigint FROM (
  JOIN public.scheduled_jobs AS j ON j.organization_id = m.organization_id
   AND j.kind = 'inbound_message.continuation' AND j.aggregate_id = m.id
  WHERE m.direction = 'incoming'
- GROUP BY m.organization_id, m.contact_id
+%s GROUP BY m.organization_id, m.contact_id
  HAVING pg_catalog.count(DISTINCT COALESCE(NULLIF(j.payload -> 'message' ->> 'from_user_id', ''),
   NULLIF(j.payload -> 'message' ->> 'from_parent_user_id', ''))) > 1
 ) AS mixed_contacts`
@@ -38,6 +38,44 @@ AND (pg_catalog.btrim(c.phone_number, U&'\0009\000A\000B\000C\000D\0020\0085\00A
  OR pg_catalog.jsonb_exists(c.metadata, 'empty_phone_upgraded_from'))
 AND NOT EXISTS (SELECT 1 FROM public.scheduled_jobs AS j
  WHERE j.organization_id = m.organization_id AND j.kind = 'inbound_message.continuation' AND j.aggregate_id = m.id)`
+
+// Each interval contains complete contact groups, including both endpoint UUIDs
+// of the full UUID domain. A group cannot straddle two intervals. The caller
+// keeps all sixteen counts in the same read-only repeatable-read transaction.
+func dataGateMixedPartitionSQL(bucket int) (string, error) {
+	if bucket < 0 || bucket >= 16 {
+		return "", errors.New("data-gate partition unavailable")
+	}
+	predicate := fmt.Sprintf(" AND m.contact_id >= '%x0000000-0000-0000-0000-000000000000'::uuid\n", bucket)
+	if bucket < 15 {
+		predicate += fmt.Sprintf(" AND m.contact_id < '%x0000000-0000-0000-0000-000000000000'::uuid\n", bucket+1)
+	}
+	return fmt.Sprintf(dataGateMixedSQL, predicate), nil
+}
+
+func countDataGateMixedContacts(db *gorm.DB) (int64, error) {
+	var total int64
+	for bucket := 0; bucket < 16; bucket++ {
+		// WithContext retains the observer's one original work deadline. Neither
+		// a new transaction nor a per-partition timeout can extend that budget.
+		if err := db.Statement.Context.Err(); err != nil {
+			return 0, err
+		}
+		query, err := dataGateMixedPartitionSQL(bucket)
+		if err != nil {
+			return 0, err
+		}
+		var count int64
+		if err := db.Raw(query).Row().Scan(&count); err != nil {
+			return 0, err
+		}
+		if count < 0 || total > 9223372036854775807-count {
+			return 0, errors.New("data-gate count unavailable")
+		}
+		total += count
+	}
+	return total, nil
+}
 
 type dataGateObservation struct {
 	id    string
@@ -183,7 +221,11 @@ func observeMigrationDataGates(session *gorm.DB, runtimeRole string) (returnErr 
 		err := verifyCanonicalTenantPolicyInventory(db, tables, runtimeRole)
 		var count int64
 		if err == nil {
-			err = db.Raw(query).Row().Scan(&count)
+			if i == 1 {
+				count, err = countDataGateMixedContacts(db)
+			} else {
+				err = db.Raw(query).Row().Scan(&count)
+			}
 		}
 		if err != nil || count < 0 {
 			if db.Exec("ROLLBACK TO SAVEPOINT rereply_data_gate").Error != nil {

@@ -31,20 +31,33 @@ func assignmentSocketServer(t *testing.T, app *App) string {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	up := newUpgrader(nil)
-	server := &fasthttp.Server{Handler: func(ctx *fasthttp.RequestCtx) {
-		_ = up.Upgrade(ctx, func(conn *wire.Conn) {
-			client := ws.NewUnauthenticatedClient(app.WSHub, conn, app.validateWSTokenFn())
-			go client.WritePump()
-			client.ReadPump()
-		})
+	server := &fasthttp.Server{ConnState: app.WSHub.ConnState, Handler: func(ctx *fasthttp.RequestCtx) {
+		upgrade, accepted := app.WSHub.BeginUpgrade(ctx.Conn())
+		if !accepted {
+			ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			return
+		}
+		if err := up.Upgrade(ctx, func(conn *wire.Conn) {
+			upgrade.Serve(ws.NewUnauthenticatedClient(app.WSHub, conn, app.validateWSTokenFn()))
+		}); err != nil {
+			upgrade.Cancel()
+		}
 	}}
 	done := make(chan struct{})
 	go func() { defer close(done); _ = server.Serve(listener) }()
 	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := app.WSHub.Stop(ctx); err != nil {
+			t.Errorf("socket pumps did not stop: %v", err)
+		}
+		if err := server.ShutdownWithContext(ctx); err != nil {
+			t.Errorf("socket HTTP server did not stop: %v", err)
+		}
 		_ = listener.Close()
 		select {
 		case <-done:
-		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
 			t.Error("socket listener did not stop")
 		}
 	})
@@ -157,7 +170,7 @@ func TestAssignmentAudienceRealSocketsAndFreshAuthority(t *testing.T) {
 	require.NoError(t, app.DB.Model(contact).Update("assigned_user_id", old.ID).Error)
 	laneDCreateTransfer(t, app.DB, contact, account.Name, &transfer.ID, models.TransferStatusActive)
 	app.WSHub = ws.NewHub(app.Log)
-	go app.WSHub.Run()
+	StartOwnedWebSocketTestHub(t, app.WSHub)
 	address := assignmentSocketServer(t, app)
 	sockets := map[string]<-chan []byte{}
 	for name, u := range map[string]*models.User{"admin": admin, "reader": reader, "old": old, "next": next, "transfer": transfer, "observer": observer, "removed": removed, "inactive": inactive, "foreign": foreign} {

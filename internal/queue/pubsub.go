@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -175,226 +176,325 @@ func (p *Publisher) PublishRealtime(ctx context.Context, event *RealtimeEvent) e
 	return nil
 }
 
-// Subscriber subscribes to Redis pub/sub channels
+// ReceiveTimeout avoids go-redis's Channel helpers. Those helpers own hidden
+// goroutines and can remain blocked sending to a full channel after Close.
+const subscriberReceiveInterval = 250 * time.Millisecond
+
+type subscriberPubSub interface {
+	ReceiveTimeout(context.Context, time.Duration) (interface{}, error)
+	Ping(context.Context, ...string) error
+	Close() error
+}
+
+type ownedSubscriberPubSub struct {
+	connection subscriberPubSub
+	once       sync.Once
+	err        error
+	report     func(error)
+}
+
+func (p *ownedSubscriberPubSub) close() error {
+	p.once.Do(func() {
+		p.err = p.connection.Close()
+		p.report(p.err)
+	})
+	return p.err
+}
+
+// Subscriber owns one subscription lifetime, including startup, reconnect,
+// the synchronous handler and connection cleanup. It cannot be restarted.
 type Subscriber struct {
-	client     *redis.Client
 	log        logf.Logger
-	pubsubMu   sync.Mutex
-	pubsub     *redis.PubSub
+	open       func(context.Context, ...string) subscriberPubSub
+	mu         sync.Mutex
+	current    *ownedSubscriberPubSub
+	cancel     context.CancelFunc
+	started    bool
+	running    bool
+	stopping   bool
+	closing    bool
 	done       chan struct{}
-	doneOnce   sync.Once
+	doneClosed bool
+	closeErr   error
 	live       atomic.Bool
 	reconnects atomic.Uint64
 }
 
-// NewSubscriber creates a new Redis subscriber
 func NewSubscriber(client *redis.Client, log logf.Logger) *Subscriber {
-	return &Subscriber{
-		client: client,
-		log:    log,
-	}
-}
-
-// SubscribeCampaignStats subscribes to campaign stats updates
-// The handler is called for each received update
-func (s *Subscriber) SubscribeCampaignStats(ctx context.Context, handler func(update *CampaignStatsUpdate)) error {
-	pubsub := s.client.Subscribe(ctx, CampaignStatsChannel)
-	s.setPubSub(pubsub)
-
-	// Wait for subscription confirmation
-	_, err := pubsub.Receive(ctx)
-	if err != nil {
-		return err
-	}
-
-	s.log.Info("Subscribed to campaign stats channel")
-
-	// Start receiving messages
-	ch := pubsub.Channel()
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				s.log.Info("Campaign stats subscriber shutting down")
-				return
-			case msg, ok := <-ch:
-				if !ok {
-					s.log.Info("Campaign stats channel closed")
-					return
-				}
-
-				var update CampaignStatsUpdate
-				if err := json.Unmarshal([]byte(msg.Payload), &update); err != nil {
-					s.log.Error("Failed to unmarshal campaign stats update", "error", err)
-					continue
-				}
-
-				handler(&update)
-			}
+	s := &Subscriber{log: log, done: make(chan struct{})}
+	if client != nil {
+		s.open = func(ctx context.Context, channels ...string) subscriberPubSub {
+			return client.Subscribe(ctx, channels...)
 		}
-	}()
-
-	return nil
+	}
+	return s
 }
 
-// SubscribeRealtime subscribes an API replica to tenant-scoped invalidation
-// hints. Invalid or unscoped messages are discarded before reaching the hub.
-func (s *Subscriber) SubscribeRealtime(ctx context.Context, handler func(event *RealtimeEvent)) error {
-	if s == nil || s.client == nil {
-		return errors.New("realtime subscriber is unavailable")
+func (s *Subscriber) begin(parent context.Context) (context.Context, error) {
+	if s == nil || parent == nil || s.open == nil {
+		return nil, errors.New("subscriber is unavailable")
 	}
-	if handler == nil {
-		return errors.New("realtime subscriber handler is required")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started || s.stopping {
+		return nil, errors.New("subscriber lifetime already used")
 	}
-	pubsub, err := s.confirmRealtimeSubscription(ctx)
-	if err != nil {
-		return err
-	}
-	s.setPubSub(pubsub)
-
-	s.log.Info("Subscribed to realtime channel")
-	s.done = make(chan struct{})
-	s.live.Store(true)
-	go s.runRealtimeSubscriber(ctx, pubsub, handler)
-	return nil
+	ctx, cancel := context.WithCancel(parent)
+	s.cancel, s.started, s.running = cancel, true, true
+	return ctx, nil
 }
 
-func (s *Subscriber) confirmRealtimeSubscription(ctx context.Context) (*redis.PubSub, error) {
-	channels := []string{RealtimeChannel, RealtimeUserChannel}
-	pubsub := s.client.Subscribe(ctx, channels...)
-	confirmed := make(map[string]struct{}, len(channels))
-	for len(confirmed) < len(channels) {
-		received, err := pubsub.Receive(ctx)
+func (s *Subscriber) completeLocked() {
+	if s.stopping && !s.running && !s.closing && !s.doneClosed {
+		s.doneClosed = true
+		close(s.done)
+	}
+}
+
+func (s *Subscriber) requestStop() {
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		return
+	}
+	s.stopping = true
+	s.live.Store(false)
+	cancel, current := s.cancel, s.current
+	s.closing = current != nil
+	s.completeLocked()
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if current != nil {
+		go func() {
+			_ = current.close()
+			s.mu.Lock()
+			s.closing = false
+			s.completeLocked()
+			s.mu.Unlock()
+		}()
+	}
+}
+
+func (s *Subscriber) finish() {
+	s.requestStop()
+	s.mu.Lock()
+	s.running = false
+	s.completeLocked()
+	s.mu.Unlock()
+}
+
+func (s *Subscriber) confirm(ctx context.Context, channels []string) (*ownedSubscriberPubSub, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	connection := s.open(ctx, channels...)
+	if connection == nil {
+		return nil, errors.New("subscriber connection is unavailable")
+	}
+	p := &ownedSubscriberPubSub{connection: connection, report: func(err error) {
 		if err != nil {
-			_ = pubsub.Close()
+			s.mu.Lock()
+			s.closeErr = errors.Join(s.closeErr, err)
+			s.mu.Unlock()
+		}
+	}}
+	s.mu.Lock()
+	if s.stopping || ctx.Err() != nil {
+		s.mu.Unlock()
+		_ = p.close()
+		return nil, context.Canceled
+	}
+	// Publish the connection before confirmation so stop can interrupt startup.
+	s.current = p
+	s.mu.Unlock()
+	confirmed := make(map[string]bool, len(channels))
+	for len(confirmed) < len(channels) {
+		if err := ctx.Err(); err != nil {
+			_ = p.close()
 			return nil, err
 		}
-		subscription, ok := received.(*redis.Subscription)
-		if !ok || subscription.Kind != "subscribe" {
+		value, err := connection.ReceiveTimeout(ctx, subscriberReceiveInterval)
+		if subscriberTimeout(err) {
 			continue
 		}
-		for _, expected := range channels {
-			if subscription.Channel == expected {
-				confirmed[expected] = struct{}{}
-				break
+		if err != nil {
+			_ = p.close()
+			return nil, err
+		}
+		if subscription, ok := value.(*redis.Subscription); ok && subscription.Kind == "subscribe" {
+			for _, channel := range channels {
+				if channel == subscription.Channel {
+					confirmed[channel] = true
+				}
 			}
 		}
 	}
-	return pubsub, nil
+	return p, nil
 }
 
-func (s *Subscriber) runRealtimeSubscriber(
-	ctx context.Context,
-	pubsub *redis.PubSub,
-	handler func(event *RealtimeEvent),
-) {
-	defer func() {
-		s.live.Store(false)
-		s.doneOnce.Do(func() { close(s.done) })
-	}()
+func subscriberTimeout(err error) bool {
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
 
-	for {
-		ch := pubsub.Channel()
-		pingTicker := time.NewTicker(realtimeSubscriberPingInterval)
-		interrupted := false
-		for !interrupted {
-			select {
-			case <-ctx.Done():
-				pingTicker.Stop()
-				s.log.Info("Realtime subscriber shutting down")
-				return
-			case <-pingTicker.C:
-				pingContext, cancelPing := context.WithTimeout(ctx, realtimeSubscriberPingTimeout)
-				pingErr := pubsub.Ping(pingContext)
-				cancelPing()
-				if pingErr != nil {
-					s.log.Warn("Realtime subscription health check failed", "error", pingErr)
-					interrupted = true
-				}
-			case msg, ok := <-ch:
-				if !ok {
-					s.log.Warn("Realtime subscription channel closed unexpectedly")
-					interrupted = true
-					continue
-				}
-				var event RealtimeEvent
-				if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
-					s.log.Error("Failed to unmarshal realtime event", "error", err)
-					continue
-				}
-				if err := validateRealtimeEvent(&event); err != nil {
-					s.log.Warn("Discarding invalid realtime event", "error", err)
-					continue
-				}
-				if (msg.Channel == RealtimeUserChannel && event.UserID == nil) ||
-					(msg.Channel == RealtimeChannel && event.UserID != nil) {
-					s.log.Warn(
-						"Discarding realtime event from mismatched scope channel",
-						"channel", msg.Channel,
-						"event_id", event.EventID,
-					)
-					continue
-				}
-				func() {
-					defer func() {
-						if recovered := recover(); recovered != nil {
-							s.log.Error("Realtime subscriber handler panicked", "panic", recovered)
-						}
-					}()
-					handler(&event)
-				}()
-			}
+func (s *Subscriber) activate(ctx context.Context, realtime bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopping || ctx.Err() != nil {
+		return false
+	}
+	if realtime {
+		s.live.Store(true)
+	}
+	return true
+}
+
+func (s *Subscriber) subscribe(parent context.Context, channels []string, realtime bool, handler func(*redis.Message)) error {
+	ctx, err := s.begin(parent)
+	if err != nil {
+		return err
+	}
+	launched := false
+	defer func() {
+		if !launched {
+			s.finish()
 		}
-		pingTicker.Stop()
-		s.live.Store(false)
-		_ = pubsub.Close()
+	}()
+	p, err := s.confirm(ctx, channels)
+	if err != nil {
+		return err
+	}
+	if !s.activate(ctx, realtime) {
+		return context.Canceled
+	}
+	s.log.Info("Redis subscriber started", "channels", channels)
+	launched = true
+	go s.run(ctx, p, channels, realtime, handler)
+	return nil
+}
+
+func (s *Subscriber) run(ctx context.Context, p *ownedSubscriberPubSub, channels []string, realtime bool, handler func(*redis.Message)) {
+	defer s.finish()
+	lastPing := time.Now()
+	var awaitingPong time.Time
+	for ctx.Err() == nil {
+		value, err := p.connection.ReceiveTimeout(ctx, subscriberReceiveInterval)
 		if ctx.Err() != nil {
 			return
 		}
-
-		retryDelay := realtimeSubscriberRetryMin
+		if subscriberTimeout(err) {
+			err = nil
+			if !awaitingPong.IsZero() && time.Since(awaitingPong) >= realtimeSubscriberPingTimeout {
+				err = errors.New("redis subscriber health check timed out")
+			} else if awaitingPong.IsZero() && time.Since(lastPing) >= realtimeSubscriberPingInterval {
+				pingCtx, cancel := context.WithTimeout(ctx, realtimeSubscriberPingTimeout)
+				err = p.connection.Ping(pingCtx)
+				cancel()
+				lastPing = time.Now()
+				awaitingPong = lastPing
+			}
+		} else if err == nil {
+			// Any received reply proves that this connection is responsive.
+			lastPing = time.Now()
+			awaitingPong = time.Time{}
+		}
+		if err == nil {
+			if message, ok := value.(*redis.Message); ok {
+				func() {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							s.log.Error("Redis subscriber handler panicked", "panic", recovered)
+						}
+					}()
+					handler(message)
+				}()
+			}
+			continue
+		}
+		s.live.Store(false)
+		_ = p.close()
+		if ctx.Err() != nil {
+			return
+		}
+		s.log.Warn("Redis subscription interrupted", "error", err)
+		delay := realtimeSubscriberRetryMin
 		for {
-			timer := time.NewTimer(retryDelay)
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
 			case <-timer.C:
 			}
-			replacement, err := s.confirmRealtimeSubscription(ctx)
+			replacement, err := s.confirm(ctx, channels)
 			if err == nil {
-				pubsub = replacement
-				s.setPubSub(replacement)
-				s.reconnects.Add(1)
-				s.live.Store(true)
-				s.log.Info("Realtime subscription recovered", "reconnect_count", s.reconnects.Load())
+				if !s.activate(ctx, realtime) {
+					return
+				}
+				p = replacement
+				lastPing = time.Now()
+				awaitingPong = time.Time{}
+				if realtime {
+					s.reconnects.Add(1)
+				}
+				s.log.Info("Redis subscription recovered", "channels", channels)
 				break
 			}
-			s.log.Warn("Realtime subscription recovery failed", "error", err, "retry_in", retryDelay)
-			if retryDelay < realtimeSubscriberRetryMax {
-				retryDelay *= 2
-				if retryDelay > realtimeSubscriberRetryMax {
-					retryDelay = realtimeSubscriberRetryMax
+			if ctx.Err() != nil {
+				return
+			}
+			s.log.Warn("Redis subscription recovery failed", "error", err, "retry_in", delay)
+			if delay < realtimeSubscriberRetryMax {
+				delay *= 2
+				if delay > realtimeSubscriberRetryMax {
+					delay = realtimeSubscriberRetryMax
 				}
 			}
 		}
 	}
 }
 
-func (s *Subscriber) setPubSub(pubsub *redis.PubSub) {
-	s.pubsubMu.Lock()
-	s.pubsub = pubsub
-	s.pubsubMu.Unlock()
+func (s *Subscriber) SubscribeCampaignStats(ctx context.Context, handler func(*CampaignStatsUpdate)) error {
+	if handler == nil {
+		return errors.New("campaign stats handler is required")
+	}
+	return s.subscribe(ctx, []string{CampaignStatsChannel}, false, func(message *redis.Message) {
+		var update CampaignStatsUpdate
+		if err := json.Unmarshal([]byte(message.Payload), &update); err != nil {
+			s.log.Error("Failed to unmarshal campaign stats update", "error", err)
+			return
+		}
+		handler(&update)
+	})
 }
 
-// RealtimeLive reports whether the confirmed realtime subscription receive
-// loop is still running.
-func (s *Subscriber) RealtimeLive() bool {
-	return s != nil && s.live.Load()
+func (s *Subscriber) SubscribeRealtime(ctx context.Context, handler func(*RealtimeEvent)) error {
+	if handler == nil {
+		return errors.New("realtime subscriber handler is required")
+	}
+	return s.subscribe(ctx, []string{RealtimeChannel, RealtimeUserChannel}, true, func(message *redis.Message) {
+		var event RealtimeEvent
+		if err := json.Unmarshal([]byte(message.Payload), &event); err != nil {
+			s.log.Error("Failed to unmarshal realtime event", "error", err)
+			return
+		}
+		if err := validateRealtimeEvent(&event); err != nil {
+			s.log.Warn("Discarding invalid realtime event", "error", err)
+			return
+		}
+		if (message.Channel == RealtimeUserChannel && event.UserID == nil) ||
+			(message.Channel == RealtimeChannel && event.UserID != nil) {
+			s.log.Warn("Discarding realtime event from mismatched scope channel", "channel", message.Channel, "event_id", event.EventID)
+			return
+		}
+		handler(&event)
+	})
 }
 
-// RealtimeReconnectCount exposes confirmed receive-loop recoveries for health
-// diagnostics and interruption tests.
+func (s *Subscriber) RealtimeLive() bool { return s != nil && s.live.Load() }
+
 func (s *Subscriber) RealtimeReconnectCount() uint64 {
 	if s == nil {
 		return 0
@@ -402,7 +502,7 @@ func (s *Subscriber) RealtimeReconnectCount() uint64 {
 	return s.reconnects.Load()
 }
 
-// Done is closed when the realtime receive loop exits.
+// Done closes only after startup, receive/handler work and owned close finish.
 func (s *Subscriber) Done() <-chan struct{} {
 	if s == nil || s.done == nil {
 		closed := make(chan struct{})
@@ -412,16 +512,24 @@ func (s *Subscriber) Done() <-chan struct{} {
 	return s.done
 }
 
-// Close closes the subscriber
-func (s *Subscriber) Close() error {
-	if s == nil {
+// Stop requests cancellation and joins under the caller's existing deadline.
+// Expiry never marks an unfinished handler or close operation as complete.
+func (s *Subscriber) Stop(ctx context.Context) error {
+	if s == nil || s.done == nil {
 		return nil
 	}
-	s.pubsubMu.Lock()
-	pubsub := s.pubsub
-	s.pubsubMu.Unlock()
-	if pubsub == nil {
-		return nil
+	if ctx == nil {
+		return errors.New("subscriber stop context is required")
 	}
-	return pubsub.Close()
+	s.requestStop()
+	select {
+	case <-s.done:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
+
+func (s *Subscriber) Close() error { return s.Stop(context.Background()) }

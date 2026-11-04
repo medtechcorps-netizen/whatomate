@@ -424,7 +424,7 @@ func wsTypes(t *testing.T, client *appwebsocket.Client, quiet time.Duration) []s
 func replayGuardHub(t *testing.T, organizationID uuid.UUID) (*appwebsocket.Hub, *appwebsocket.Client) {
 	t.Helper()
 	hub := appwebsocket.NewHub(testutil.NopLogger())
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), organizationID)
 	hub.Register(client)
 	testutil.AssertEventually(t, func() bool { return hub.GetClientCount() == 1 }, 2*time.Second, "websocket client registered")
