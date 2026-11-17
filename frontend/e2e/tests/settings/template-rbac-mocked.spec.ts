@@ -125,7 +125,7 @@ test("template readers cannot see create, publish, sync, or delete controls", as
     page.getByRole("button", { name: "Create Template" }),
   ).toHaveCount(0);
   await expect(
-    page.getByRole("button", { name: "Sync from Meta" }),
+    page.getByRole("button", { name: /^Sync (?:from Meta|all accounts)$/ }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Delete", exact: true }),
@@ -154,7 +154,7 @@ test("template writers see create and publish but not sync or delete controls", 
     page.getByRole("button", { name: "Create Template" }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Sync from Meta" }),
+    page.getByRole("button", { name: /^Sync (?:from Meta|all accounts)$/ }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Delete", exact: true }),
@@ -176,7 +176,7 @@ test("template sync and delete controls use their dedicated permissions", async 
 
   await page.goto("/templates");
   await expect(
-    page.getByRole("button", { name: "Sync from Meta" }),
+    page.getByRole("button", { name: /^Sync (?:from Meta|all accounts)$/ }),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Create Template" }),
@@ -191,7 +191,7 @@ test("template sync and delete controls use their dedicated permissions", async 
     page.getByRole("button", { name: "Delete", exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Sync from Meta" }),
+    page.getByRole("button", { name: /^Sync (?:from Meta|all accounts)$/ }),
   ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "Create Template" }),

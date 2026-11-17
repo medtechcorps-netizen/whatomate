@@ -247,7 +247,7 @@ class ImageStageTests(StageCase):
         original = (REPO_ROOT / "docker/release/meta-relay.Dockerfile").read_text(encoding="ascii")
         web = (REPO_ROOT / "docker/release/web.Dockerfile").read_text(encoding="ascii")
         cases = {
-            "unpinned-from": original.replace("@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca", "", 1),
+            "unpinned-from": original.replace("@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab", "", 1),
             "other-platform": original.replace("--platform=linux/amd64", "--platform=linux/arm64", 1),
             "copy-from-image": original.replace("COPY --from=builder /out/passwd", "COPY --from=alpine:3 /etc/passwd", 1),
             "mount-from-image": original.replace("RUN go mod download", "RUN --mount=type=bind,from=alpine:3,target=/x go mod download", 1),
