@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -9,12 +9,14 @@ import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader, SearchInput, DataTable, IconButton, DeleteConfirmDialog, ErrorState, type Column } from '@/components/shared'
-import { api, templatesService } from '@/services/api'
+import { api, AUTH_SESSION_EVENT, templatesService } from '@/services/api'
 import { useOrganizationsStore } from '@/stores/organizations'
 import { useAuthStore } from '@/stores/auth'
 import { toast } from 'vue-sonner'
 import { Plus, RefreshCw, FileText, Pencil, Trash2, Loader2, MessageSquare, Image, FileIcon, Video } from 'lucide-vue-next'
 import { getErrorMessage } from '@/lib/api-utils'
+import { currentTabSession, isTabSessionCurrent } from '@/lib/tabSession'
+import { syncTemplateAccounts, type TemplateSyncResult } from '@/lib/templateSync'
 import { useSearchPagination } from '@/composables/useSearchPagination'
 import { getQualityBadgeClass, getQualityRatingLabel } from '@/lib/utils'
 
@@ -54,6 +56,14 @@ const accounts = ref<WhatsAppAccount[]>([])
 const isLoading = ref(true)
 const error = ref<string | null>(null)
 const isSyncing = ref(false)
+const syncResults = ref<TemplateSyncResult[]>([])
+const syncProgress = ref('')
+let accountsRequest = 0
+let templatesRequest = 0
+let syncRequest = 0
+let viewGeneration = 0
+let disposed = false
+let viewSession = currentTabSession()
 const selectedAccount = ref<string>(localStorage.getItem('templates_selected_account') || 'all')
 const canWrite = computed(() => authStore.hasPermission('templates', 'write'))
 const canDelete = computed(() => authStore.hasPermission('templates', 'delete'))
@@ -63,6 +73,23 @@ const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
 const deleteDialogOpen = ref(false)
 const templateToDelete = ref<Template | null>(null)
 const isDeleting = ref(false)
+let deleteRequest = 0
+
+// Dismissing and reopening even the same template creates a new UI owner.
+watch(deleteDialogOpen, open => {
+  if (open) return
+  deleteRequest++
+  isDeleting.value = false
+  templateToDelete.value = null
+}, { flush: 'sync' })
+
+watch(canDelete, allowed => {
+  if (allowed) return
+  deleteRequest++
+  deleteDialogOpen.value = false
+  templateToDelete.value = null
+  isDeleting.value = false
+}, { flush: 'sync' })
 
 const { searchQuery, currentPage, totalItems, pageSize, handlePageChange } = useSearchPagination({
   fetchFn: () => fetchTemplates(),
@@ -159,20 +186,90 @@ function getLanguageName(code: string): string {
   return languages.find(l => l.code === code)?.name || code
 }
 
-// Refetch data when organization changes
-watch(() => organizationsStore.selectedOrgId, async () => {
+// Equality alone misses an A -> B -> A workspace change. Capture the
+// generation as well as the logical session before each asynchronous workflow.
+function captureViewScope() {
+  const generation = viewGeneration
+  const org = organizationsStore.selectedOrgId
+  const session = currentTabSession()
+  return () => !disposed && generation === viewGeneration &&
+    org === organizationsStore.selectedOrgId && session !== null &&
+    session === currentTabSession() && isTabSessionCurrent()
+}
+
+function invalidateTemplates() {
+  templatesRequest++
+  templates.value = []
+  totalItems.value = 0
+  error.value = null
+  isLoading.value = false
+}
+
+function invalidateView() {
+  viewGeneration++
+  accountsRequest++
+  syncRequest++
+  accounts.value = []
+  invalidateTemplates()
+  syncResults.value = []
+  syncProgress.value = ''
+  isSyncing.value = false
+  deleteRequest++
+  deleteDialogOpen.value = false
+  templateToDelete.value = null
+  isDeleting.value = false
+}
+
+async function loadWorkspace() {
+  const current = captureViewScope()
+  if (!current()) return
+  isLoading.value = true
   await fetchAccounts()
-  await fetchTemplates()
+  if (current()) await fetchTemplates()
+}
+
+watch(() => organizationsStore.selectedOrgId, () => {
+  viewSession = currentTabSession()
+  invalidateView()
+  void loadWorkspace()
+}, { flush: 'sync' })
+
+// Invalidate immediately, including the debounce interval before the next GET.
+watch([selectedAccount, searchQuery, currentPage], () => {
+  invalidateTemplates()
+  isLoading.value = !disposed && isTabSessionCurrent()
+}, { flush: 'sync' })
+
+function onSessionState(event: Event) {
+  const state = (event as CustomEvent<{ state?: string }>).detail?.state
+  const session = currentTabSession()
+  // A token refresh in the same logical session does not interrupt a sync.
+  if (state !== 'expired' && session === viewSession && isTabSessionCurrent()) return
+  viewSession = session
+  invalidateView()
+  if (state !== 'expired' && isTabSessionCurrent()) void loadWorkspace()
+}
+
+onMounted(() => {
+  window.addEventListener(AUTH_SESSION_EVENT, onSessionState)
+  void loadWorkspace()
 })
 
-onMounted(async () => {
-  await fetchAccounts()
-  await fetchTemplates()
+onBeforeUnmount(() => {
+  disposed = true
+  invalidateView()
+  window.removeEventListener(AUTH_SESSION_EVENT, onSessionState)
 })
 
 async function fetchAccounts() {
+  const scope = captureViewScope()
+  if (!scope()) return
+  const request = ++accountsRequest
+  const current = () => scope() && request === accountsRequest
+  accounts.value = []
   try {
     const response = await api.get('/accounts')
+    if (!current()) return
     accounts.value = response.data.data?.accounts || []
     // Validate stored account still exists, fallback to 'all' if not
     if (selectedAccount.value !== 'all' && !accounts.value.some(a => a.name === selectedAccount.value)) {
@@ -180,6 +277,7 @@ async function fetchAccounts() {
       localStorage.setItem('templates_selected_account', 'all')
     }
   } catch (error) {
+    if (!current()) return
     console.error('Failed to fetch accounts:', error)
   }
 }
@@ -192,70 +290,101 @@ function onAccountChange(value: string | number | bigint | Record<string, any> |
 }
 
 async function fetchTemplates() {
+  const scope = captureViewScope()
+  if (!scope()) return
+  const request = ++templatesRequest
+  const current = () => scope() && request === templatesRequest
+  const params = {
+    account: selectedAccount.value !== 'all' ? selectedAccount.value : undefined,
+    search: searchQuery.value || undefined,
+    page: currentPage.value,
+    limit: pageSize
+  }
   isLoading.value = true
   error.value = null
   try {
-    const response = await templatesService.list({
-      account: selectedAccount.value !== 'all' ? selectedAccount.value : undefined,
-      search: searchQuery.value || undefined,
-      page: currentPage.value,
-      limit: pageSize
-    })
+    const response = await templatesService.list(params)
+    if (!current()) return
     const data = (response.data as any).data || response.data
     templates.value = data.templates || []
     totalItems.value = data.total ?? templates.value.length
   } catch (err: any) {
+    if (!current()) return
     console.error('Failed to fetch templates:', err)
     error.value = t('templates.errorLoadingTemplates')
     toast.error(t('common.failedLoad', { resource: t('resources.templates') }))
     templates.value = []
+    totalItems.value = 0
   } finally {
-    isLoading.value = false
+    if (current()) isLoading.value = false
   }
 }
 
 async function syncTemplates() {
-  if (!canSync.value) return
+  if (!canSync.value || isSyncing.value) return
+  const targets = selectedAccount.value === 'all'
+    ? accounts.value.map(account => account.name)
+    : accounts.value.filter(account => account.name === selectedAccount.value).map(account => account.name)
+  if (!targets.length) { toast.error(t('templates.noAccountsToSync')); return }
 
-  if (!selectedAccount.value || selectedAccount.value === 'all') {
-    toast.error(t('templates.selectAccountFirst'))
-    return
-  }
-
+  const scope = captureViewScope()
+  if (!scope()) return
+  const request = ++syncRequest
+  const ownsRequest = () => scope() && request === syncRequest
+  const current = () => ownsRequest() && canSync.value
   isSyncing.value = true
+  syncResults.value = []
   try {
-    const response = await api.post('/templates/sync', {
-      whatsapp_account: selectedAccount.value
-    })
-    toast.success(response.data.data.message || t('templates.syncSuccess'))
+    const results = await syncTemplateAccounts(targets, async account => {
+      syncProgress.value = account
+      await api.post('/templates/sync', { whatsapp_account: account })
+    }, current, t('templates.syncAccountFailed'))
+    if (!current()) return
+    syncResults.value = results
+    const failed = results.filter(result => !result.success).length
+    if (failed) toast.error(t('templates.syncPartialFailure', { count: failed }))
+    else toast.success(t('templates.syncAccountsSuccess', { count: results.length }))
     await fetchTemplates()
-  } catch (error) {
-    toast.error(getErrorMessage(error, t('templates.syncFailed')))
   } finally {
-    isSyncing.value = false
+    if (ownsRequest()) {
+      isSyncing.value = false
+      syncProgress.value = ''
+    }
   }
 }
 
 function openDeleteDialog(template: Template) {
-  if (!canDelete.value) return
+  const scope = captureViewScope()
+  if (!canDelete.value || !scope()) return
+  deleteRequest++
+  isDeleting.value = false
   templateToDelete.value = template
   deleteDialogOpen.value = true
 }
 
 async function confirmDeleteTemplate() {
-  if (!canDelete.value || !templateToDelete.value) return
+  if (!canDelete.value || !deleteDialogOpen.value || !templateToDelete.value || isDeleting.value) return
+  const scope = captureViewScope()
+  if (!scope()) return
+  const templateId = templateToDelete.value.id
+  const request = ++deleteRequest
+  const current = () => scope() && request === deleteRequest &&
+    deleteDialogOpen.value && templateToDelete.value?.id === templateId && canDelete.value
 
   isDeleting.value = true
   try {
-    await api.delete(`/templates/${templateToDelete.value.id}`)
+    // This already-issued DELETE is never cancelled, repeated, or retargeted.
+    await api.delete(`/templates/${templateId}`)
+    if (!current()) return
     toast.success(t('common.deletedSuccess', { resource: t('resources.Template') }))
     deleteDialogOpen.value = false
     templateToDelete.value = null
-    await fetchTemplates()
+    if (scope()) await fetchTemplates()
   } catch (error) {
+    if (!current()) return
     toast.error(getErrorMessage(error, t('common.failedDelete', { resource: t('resources.template') })))
   } finally {
-    isDeleting.value = false
+    if (current()) isDeleting.value = false
   }
 }
 
@@ -306,10 +435,10 @@ function getHeaderIcon(type: string) {
   <div class="flex flex-col h-full bg-[#0a0a0b] light:bg-gray-50">
     <PageHeader :title="$t('templates.title')" :subtitle="$t('templates.subtitle')" :icon="FileText" icon-gradient="bg-gradient-to-br from-blue-500 to-cyan-600 shadow-blue-500/20">
       <template #actions>
-        <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !selectedAccount || selectedAccount === 'all'">
+        <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !accounts.length">
           <Loader2 v-if="isSyncing" class="h-4 w-4 mr-2 animate-spin" />
           <RefreshCw v-else class="h-4 w-4 mr-2" />
-          {{ $t('templates.syncFromMeta') }}
+          {{ selectedAccount === 'all' ? $t('templates.syncAllAccounts') : $t('templates.syncFromMeta') }}
         </Button>
         <RouterLink v-if="canWrite" to="/templates/new">
           <Button variant="outline" size="sm">
@@ -323,6 +452,12 @@ function getHeaderIcon(type: string) {
     <ScrollArea class="flex-1">
       <div class="p-6">
         <div>
+          <p v-if="isSyncing && syncProgress" role="status" class="mb-4 text-sm text-muted-foreground">{{ $t('templates.syncingAccount', { account: syncProgress }) }}</p>
+          <div v-if="syncResults.length" :aria-label="$t('templates.syncResults')" class="mb-4 rounded-lg border p-4 text-sm space-y-2">
+            <p v-for="result in syncResults" :key="result.account" :class="result.success ? 'text-muted-foreground' : 'text-destructive'">
+              <span class="font-medium">{{ result.account }}</span>: {{ result.success ? $t('templates.synced') : result.error }}
+            </p>
+          </div>
           <ErrorState
             v-if="error && !isLoading"
             :title="$t('common.loadErrorTitle')"
@@ -424,9 +559,9 @@ function getHeaderIcon(type: string) {
                 </template>
                 <template #empty-action>
                   <div class="flex items-center justify-center gap-2">
-                    <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="!selectedAccount || selectedAccount === 'all'">
+                    <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !accounts.length">
                       <RefreshCw class="h-4 w-4 mr-2" />
-                      {{ $t('templates.syncFromMeta') }}
+                      {{ selectedAccount === 'all' ? $t('templates.syncAllAccounts') : $t('templates.syncFromMeta') }}
                     </Button>
                     <RouterLink v-if="canWrite" to="/templates/new">
                       <Button variant="outline" size="sm">

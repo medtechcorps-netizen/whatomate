@@ -9,7 +9,7 @@ RUN npm ci
 COPY frontend/ .
 RUN npm run build
 
-FROM --platform=linux/amd64 docker.io/library/golang:1.26.10-alpine@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca AS builder
+FROM --platform=linux/amd64 docker.io/library/golang:1.26.11-alpine@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
@@ -29,6 +29,10 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 FROM --platform=linux/amd64 docker.io/library/node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c AS piper-download
 
+# Bootstrap fixed APT before snapshot downloads (USN-8996-1 / CVE-2026-109518).
+ADD --checksum=sha256:ad2ea7f107f250ba88b0bfdba31812a341e3247589647aa2b03b9dc4e8abf8ed https://security.ubuntu.com/ubuntu/pool/main/a/apt/apt_2.8.4ubuntu0.1_amd64.deb /tmp/apt-security.deb
+ADD --checksum=sha256:a50f3e68a793f90b05f44a4b5f2f59f3ec7687e39b5d8bbd1da44c84671fa3d6 https://security.ubuntu.com/ubuntu/pool/main/a/apt/libapt-pkg6.0t64_2.8.4ubuntu0.1_amd64.deb /tmp/libapt-security.deb
+
 # Patch Brotli with checksum-pinned security package bytes; keep the APT snapshot.
 ADD --checksum=sha256:70b188a86d81f30d7510aab30e25d638ed5037dded6691af1533952b71ac61de https://archive.ubuntu.com/ubuntu/pool/main/b/brotli/libbrotli1_1.1.0-2ubuntu0.1_amd64.deb /tmp/libbrotli-security.deb
 
@@ -45,8 +49,17 @@ FROM --platform=linux/amd64 docker.io/library/ubuntu:24.04@sha256:1e0a86e57d2479
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG UBUNTU_SNAPSHOT=20260930T000000Z
 WORKDIR /app
-RUN set -eu; \
-    printf 'APT::Snapshot "%s";\nAcquire::Retries "10";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
+# The security packages are mounted; their archives do not enter final layers.
+RUN --mount=type=bind,from=piper-download,source=/tmp/libapt-security.deb,target=/tmp/libapt-security.deb,ro \
+    --mount=type=bind,from=piper-download,source=/tmp/apt-security.deb,target=/tmp/apt-security.deb,ro \
+    set -eu; \
+    dpkg -i /tmp/libapt-security.deb /tmp/apt-security.deb \
+    && for package in apt:amd64 libapt-pkg6.0t64:amd64; do \
+         test "$(dpkg-query -W -f='${Version}' "$package")" = '2.8.4ubuntu0.1' || exit 1; \
+         test "$(dpkg-query -W -f='${Architecture}' "$package")" = 'amd64' || exit 1; \
+         test "$(dpkg-query -W -f='${Status}' "$package")" = 'install ok installed' || exit 1; \
+       done \
+    && printf 'APT::Snapshot "%s";\nAcquire::Retries "10";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends \
       ca-certificates=20260601~24.04.1 \
@@ -57,6 +70,11 @@ RUN set -eu; \
       libssl3t64=3.0.13-0ubuntu3.16 \
     && for package in ca-certificates tzdata espeak-ng opus-tools ffmpeg libssl3t64; do \
          apt-cache policy "$package" | grep -F 'snapshot.ubuntu.com' > /dev/null || exit 1; \
+       done \
+    && for package in apt:amd64 libapt-pkg6.0t64:amd64; do \
+         test "$(dpkg-query -W -f='${Version}' "$package")" = '2.8.4ubuntu0.1' || exit 1; \
+         test "$(dpkg-query -W -f='${Architecture}' "$package")" = 'amd64' || exit 1; \
+         test "$(dpkg-query -W -f='${Status}' "$package")" = 'install ok installed' || exit 1; \
        done \
     && printf 'APT::Snapshot "%s";\n' "$UBUNTU_SNAPSHOT" > /etc/apt/apt.conf.d/50snapshot \
     && rm -rf /var/lib/apt/lists/*
