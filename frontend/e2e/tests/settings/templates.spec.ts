@@ -74,18 +74,50 @@ test.describe('Message Templates - List View', () => {
 
 test.describe('Message Templates - Sync', () => {
   let templatesPage: TemplatesPage
+  let syncRequests = 0
 
   test.beforeEach(async ({ page }) => {
     await loginAsAdmin(page)
+    await page.evaluate(() => localStorage.removeItem('templates_selected_account'))
+    syncRequests = 0
+    // These cases check availability only; never send a request to Meta.
+    await page.route(/\/api\/templates\/sync(?:\?.*)?$/, async route => {
+      syncRequests++
+      await route.abort('blockedbyclient')
+    })
+    await page.route(/\/api\/templates(?:\?.*)?$/, route => route.fulfill({
+      json: { data: { templates: [], total: 0 } },
+    }))
     templatesPage = new TemplatesPage(page)
-    await templatesPage.goto()
   })
 
-  test('should have sync button disabled when no account selected', async () => {
-    const allAccountsSelected = await templatesPage.accountSelect.textContent()
-    if (allAccountsSelected?.includes('All')) {
-      await expect(templatesPage.syncButton).toBeDisabled()
-    }
+  test.afterEach(() => {
+    expect(syncRequests).toBe(0)
+  })
+
+  test('should disable sync when no accounts are available', async ({ page }) => {
+    await page.route(/\/api\/accounts(?:\?.*)?$/, route => route.fulfill({
+      json: { data: { accounts: [] } },
+    }))
+    await templatesPage.goto()
+    await expect(templatesPage.accountSelect).toContainText('All')
+    await expect(templatesPage.syncButton).toHaveText('Sync all accounts')
+    await expect(templatesPage.syncButton).toBeDisabled()
+  })
+
+  test('should enable sync for all accounts and an available individual account', async ({ page }) => {
+    const accountName = 'Templates sync fixture'
+    await page.route(/\/api\/accounts(?:\?.*)?$/, route => route.fulfill({
+      json: { data: { accounts: [{ id: 'sync-fixture-account', name: accountName, phone_id: 'sync-fixture-phone' }] } },
+    }))
+    await templatesPage.goto()
+    await expect(templatesPage.accountSelect).toContainText('All')
+    await expect(templatesPage.syncButton).toHaveText('Sync all accounts')
+    await expect(templatesPage.syncButton).toBeEnabled()
+
+    await templatesPage.selectAccount(accountName)
+    await expect(templatesPage.syncButton).toHaveText('Sync from Meta')
+    await expect(templatesPage.syncButton).toBeEnabled()
   })
 })
 

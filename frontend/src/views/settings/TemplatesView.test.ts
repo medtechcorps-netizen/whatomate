@@ -1,0 +1,328 @@
+/** @vitest-environment happy-dom */
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { defineComponent, nextTick, reactive } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import TemplatesView from './TemplatesView.vue'
+
+const mocks = vi.hoisted(() => ({
+  get: vi.fn(), post: vi.fn(), list: vi.fn(), remove: vi.fn(),
+  success: vi.fn(), error: vi.fn(),
+}))
+const context = reactive({ selectedOrgId: 'org-A', session: 'session-A', live: true, canSync: true })
+vi.mock('@/services/api', () => ({
+  AUTH_SESSION_EVENT: 'auth-session-state',
+  api: { get: mocks.get, post: mocks.post, delete: mocks.remove },
+  templatesService: { list: mocks.list },
+}))
+vi.mock('@/stores/organizations', () => ({ useOrganizationsStore: () => context }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ hasPermission: (_resource: string, action: string) => action === 'sync' && context.canSync }) }))
+vi.mock('@/lib/tabSession', () => ({ currentTabSession: () => context.session, isTabSessionCurrent: () => context.live }))
+vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
+vi.mock('vue-sonner', () => ({ toast: { success: mocks.success, error: mocks.error } }))
+vi.mock('@/components/shared', async () => {
+  const { defineComponent: define } = await import('vue')
+  return {
+    PageHeader: define({ template: '<div><slot name="actions" /><slot /></div>' }),
+    SearchInput: define({ props: ['modelValue'], emits: ['update:modelValue'], template: '<input data-search :value="modelValue" @input="$emit(\'update:modelValue\', $event.target.value)" />' }),
+    DataTable: define({ name: 'TemplateTable', props: ['items', 'isLoading', 'totalItems', 'currentPage'], emits: ['page-change'], template: '<div data-table :data-loading="isLoading" :data-total="totalItems"><span v-for="item in items" :key="item.id">{{ item.name }}</span></div>' }),
+    ErrorState: define({ props: ['description'], emits: ['retry'], template: '<div role="alert">{{ description }}<button data-retry @click="$emit(\'retry\')">Retry</button></div>' }),
+    IconButton: define({ template: '<button />' }),
+    DeleteConfirmDialog: define({ template: '<div />' }),
+  }
+})
+vi.mock('@/components/ui/select', async () => {
+  const { defineComponent: define } = await import('vue')
+  const pass = define({ template: '<div><slot /></div>' })
+  return {
+    Select: define({ name: 'AccountSelect', props: ['modelValue'], emits: ['update:modelValue'], template: '<div><slot /></div>' }),
+    SelectContent: pass, SelectItem: pass, SelectTrigger: pass, SelectValue: pass,
+  }
+})
+
+const Pass = defineComponent({ template: '<div><slot /></div>' })
+const Button = defineComponent({ props: ['disabled'], template: '<button :disabled="disabled"><slot /></button>' })
+const accounts = (names = ['A', 'B']) => ({ data: { data: { accounts: names.map(name => ({ id: name, name, phone_id: name })) } } })
+const rows = (name: string, total = 1) => ({ data: { data: { templates: [{ id: name, name }], total } } })
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+const wrappers: VueWrapper[] = []
+async function render() {
+  const wrapper = mount(TemplatesView, { global: {
+    mocks: { $t: (key: string) => key },
+    stubs: { Card: Pass, CardContent: Pass, CardDescription: Pass, CardHeader: Pass, CardTitle: Pass, ScrollArea: Pass, Label: Pass, Badge: Pass, Button, RouterLink: Pass },
+  } })
+  wrappers.push(wrapper)
+  await flushPromises()
+  return wrapper
+}
+const table = (wrapper: VueWrapper) => wrapper.findComponent({ name: 'TemplateTable' })
+const syncButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.text() === 'Sync all accounts')!
+async function account(wrapper: VueWrapper, name: string) {
+  wrapper.findComponent({ name: 'AccountSelect' }).vm.$emit('update:modelValue', name)
+  await nextTick()
+}
+async function page(wrapper: VueWrapper, value: number) {
+  table(wrapper).vm.$emit('page-change', value)
+  await nextTick()
+}
+function sessionEvent(state: string) {
+  window.dispatchEvent(new CustomEvent('auth-session-state', { detail: { state } }))
+}
+
+describe('template view request ownership', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    Object.values(mocks).forEach(mock => mock.mockReset())
+    context.selectedOrgId = 'org-A'
+    context.session = 'session-A'
+    context.live = true
+    context.canSync = true
+    localStorage.clear()
+    mocks.get.mockResolvedValue(accounts())
+    mocks.list.mockResolvedValue(rows('current'))
+    mocks.post.mockResolvedValue({})
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  })
+  afterEach(() => {
+    wrappers.splice(0).forEach(wrapper => wrapper.unmount())
+    vi.clearAllTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('keeps newer workspace rows/count when the older response finishes last', async () => {
+    const old = deferred<ReturnType<typeof rows>>()
+    mocks.list.mockReturnValueOnce(old.promise)
+    const wrapper = await render()
+    context.selectedOrgId = 'org-B'
+    await flushPromises()
+    expect(table(wrapper).props('items')).toEqual([{ id: 'current', name: 'current' }])
+    old.resolve(rows('old workspace', 99))
+    await flushPromises()
+    expect(table(wrapper).props('totalItems')).toBe(1)
+    expect(wrapper.text()).not.toContain('old workspace')
+  })
+
+  it('shows loading while the new workspace accounts request is pending', async () => {
+    const wrapper = await render()
+    const pending = deferred<ReturnType<typeof accounts>>()
+    mocks.get.mockReturnValueOnce(pending.promise)
+    context.selectedOrgId = 'org-B'
+    await nextTick()
+    expect(table(wrapper).props('items')).toEqual([])
+    expect(table(wrapper).props('isLoading')).toBe(true)
+    pending.resolve(accounts())
+    await flushPromises()
+    expect(table(wrapper).props('isLoading')).toBe(false)
+  })
+
+  it('does not revive accounts or mounted continuations across A to B to A', async () => {
+    const old = deferred<ReturnType<typeof accounts>>()
+    mocks.get.mockReturnValueOnce(old.promise)
+    const wrapper = await render()
+    context.selectedOrgId = 'org-B'
+    context.selectedOrgId = 'org-A'
+    await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(1)
+    old.resolve(accounts(['obsolete']))
+    await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).not.toContain('obsolete')
+  })
+
+  it('ignores an older org-change continuation still waiting for its accounts', async () => {
+    const wrapper = await render()
+    const old = deferred<ReturnType<typeof accounts>>()
+    mocks.get.mockReturnValueOnce(old.promise)
+    context.selectedOrgId = 'org-B'
+    context.selectedOrgId = 'org-C'
+    await flushPromises()
+    const calls = mocks.list.mock.calls.length
+    old.reject(new Error('old account request'))
+    await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(calls)
+    expect(console.error).not.toHaveBeenCalled()
+    expect(table(wrapper).props('isLoading')).toBe(false)
+  })
+
+  it('invalidates search before debounce and ignores an old error/finally', async () => {
+    const old = deferred<ReturnType<typeof rows>>()
+    mocks.list.mockReturnValueOnce(old.promise)
+    const wrapper = await render()
+    await wrapper.get('[data-search]').setValue('new search')
+    old.reject(new Error('obsolete list'))
+    await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(1)
+    expect(table(wrapper).props('isLoading')).toBe(true)
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(mocks.error).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ search: 'new search' }))
+    expect(table(wrapper).props('isLoading')).toBe(false)
+  })
+
+  it('does not revive the first search request when its text returns before debounce', async () => {
+    const old = deferred<ReturnType<typeof rows>>()
+    mocks.list.mockReturnValueOnce(old.promise)
+    const wrapper = await render()
+    await wrapper.get('[data-search]').setValue('temporary')
+    await wrapper.get('[data-search]').setValue('')
+    old.resolve(rows('obsolete empty search', 27))
+    await flushPromises()
+    expect(table(wrapper).props('items')).toEqual([])
+    expect(table(wrapper).props('totalItems')).toBe(0)
+    expect(table(wrapper).props('isLoading')).toBe(true)
+  })
+
+  it('keeps the latest account result when account requests finish out of order', async () => {
+    const wrapper = await render()
+    const old = deferred<ReturnType<typeof rows>>()
+    mocks.list.mockReturnValueOnce(old.promise).mockResolvedValueOnce(rows('B result', 7))
+    await account(wrapper, 'A')
+    await account(wrapper, 'B')
+    await flushPromises()
+    old.resolve(rows('A result', 22))
+    await flushPromises()
+    expect(table(wrapper).props('totalItems')).toBe(7)
+    expect(wrapper.text()).toContain('B result')
+    expect(wrapper.text()).not.toContain('A result')
+  })
+
+  it('does not let an older page finally clear the latest page loading state', async () => {
+    const wrapper = await render()
+    const old = deferred<ReturnType<typeof rows>>()
+    const latest = deferred<ReturnType<typeof rows>>()
+    mocks.list.mockReturnValueOnce(old.promise).mockReturnValueOnce(latest.promise)
+    await page(wrapper, 2)
+    await page(wrapper, 3)
+    old.resolve(rows('old page'))
+    await flushPromises()
+    expect(table(wrapper).props('isLoading')).toBe(true)
+    latest.resolve(rows('latest page', 61))
+    await flushPromises()
+    expect(table(wrapper).props('isLoading')).toBe(false)
+    expect(table(wrapper).props('totalItems')).toBe(61)
+  })
+
+  it('shows a current error and clears its stale count, then permits retry', async () => {
+    const wrapper = await render()
+    mocks.list.mockRejectedValueOnce(new Error('current failure'))
+    await page(wrapper, 2)
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('templates.errorLoadingTemplates')
+    expect(mocks.error).toHaveBeenCalledTimes(1)
+    await wrapper.get('[data-retry]').trigger('click')
+    await flushPromises()
+    expect(table(wrapper).props('totalItems')).toBe(1)
+  })
+
+  it('ignores a replaced logical session even without a session notification', async () => {
+    const old = deferred<ReturnType<typeof rows>>()
+    mocks.list.mockReturnValueOnce(old.promise)
+    const wrapper = await render()
+    context.session = 'session-B'
+    old.resolve(rows('private old response'))
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('private old response')
+    expect(mocks.error).not.toHaveBeenCalled()
+  })
+
+  it('clears session-visible data and stops a sync queue on expiry', async () => {
+    const wrapper = await render()
+    const pending = deferred<object>()
+    mocks.post.mockReturnValueOnce(pending.promise)
+    await syncButton(wrapper).trigger('click')
+    context.live = false
+    sessionEvent('expired')
+    await nextTick()
+    expect(table(wrapper).props('items')).toEqual([])
+    expect(table(wrapper).props('totalItems')).toBe(0)
+    pending.resolve({})
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledTimes(1)
+    expect(mocks.success).not.toHaveBeenCalled()
+  })
+
+  it('does not revive an old sync or clear a new sync after A to B to A', async () => {
+    const wrapper = await render()
+    const old = deferred<object>()
+    const latest = deferred<object>()
+    mocks.post.mockReturnValueOnce(old.promise).mockReturnValueOnce(latest.promise)
+    await syncButton(wrapper).trigger('click')
+    context.selectedOrgId = 'org-B'
+    context.selectedOrgId = 'org-A'
+    await flushPromises()
+    await syncButton(wrapper).trigger('click')
+    old.reject(new Error('obsolete sync'))
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledTimes(2)
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    expect(wrapper.find('[role="status"]').text()).toContain('A')
+    expect(mocks.error).not.toHaveBeenCalled()
+    latest.resolve({})
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledTimes(3)
+    expect(mocks.success).toHaveBeenCalledTimes(1)
+    expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
+  })
+
+  it('preserves sequential partial sync results through a same-session token refresh', async () => {
+    const wrapper = await render()
+    const first = deferred<object>()
+    mocks.post.mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error('B unavailable'))
+    await syncButton(wrapper).trigger('click')
+    sessionEvent('refreshed')
+    first.resolve({})
+    await flushPromises()
+    expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'B'])
+    expect(wrapper.get('[aria-label="Template sync results"]').text()).toContain('A: Synced')
+    expect(mocks.error).toHaveBeenCalledTimes(1)
+    expect(mocks.success).not.toHaveBeenCalled()
+  })
+
+  it('keeps the started sync target snapshot when only the list filter changes', async () => {
+    const wrapper = await render()
+    const first = deferred<object>()
+    mocks.post.mockReturnValueOnce(first.promise)
+    await syncButton(wrapper).trigger('click')
+    await account(wrapper, 'B')
+    first.resolve({})
+    await flushPromises()
+    expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'B'])
+    expect(mocks.success).toHaveBeenCalledTimes(1)
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'B' }))
+  })
+
+  it('starts no list continuation when unmounted during the accounts request', async () => {
+    const pending = deferred<ReturnType<typeof accounts>>()
+    mocks.get.mockReturnValueOnce(pending.promise)
+    const wrapper = await render()
+    wrapper.unmount()
+    wrappers.splice(wrappers.indexOf(wrapper), 1)
+    pending.resolve(accounts())
+    await flushPromises()
+    expect(mocks.list).not.toHaveBeenCalled()
+    sessionEvent('expired')
+    expect(mocks.get).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops sync after unmount without a toast, list refresh, or another account', async () => {
+    const wrapper = await render()
+    const pending = deferred<object>()
+    mocks.post.mockReturnValueOnce(pending.promise)
+    await syncButton(wrapper).trigger('click')
+    wrapper.unmount()
+    wrappers.splice(wrappers.indexOf(wrapper), 1)
+    pending.resolve({})
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledTimes(1)
+    expect(mocks.list).toHaveBeenCalledTimes(1)
+    expect(mocks.success).not.toHaveBeenCalled()
+    expect(mocks.error).not.toHaveBeenCalled()
+  })
+})
