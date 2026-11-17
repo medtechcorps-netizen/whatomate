@@ -325,7 +325,7 @@ async function syncTemplates() {
   const targets = selectedAccount.value === 'all'
     ? accounts.value.map(account => account.name)
     : accounts.value.filter(account => account.name === selectedAccount.value).map(account => account.name)
-  if (!targets.length) { toast.error('No accounts are available to sync.'); return }
+  if (!targets.length) { toast.error(t('templates.noAccountsToSync')); return }
 
   const scope = captureViewScope()
   if (!scope()) return
@@ -338,12 +338,12 @@ async function syncTemplates() {
     const results = await syncTemplateAccounts(targets, async account => {
       syncProgress.value = account
       await api.post('/templates/sync', { whatsapp_account: account })
-    }, current)
+    }, current, t('templates.syncAccountFailed'))
     if (!current()) return
     syncResults.value = results
     const failed = results.filter(result => !result.success).length
-    if (failed) toast.error(`${failed} account${failed === 1 ? '' : 's'} could not sync. See the results below.`)
-    else toast.success(`Templates synced for ${results.length} account${results.length === 1 ? '' : 's'}.`)
+    if (failed) toast.error(t('templates.syncPartialFailure', { count: failed }))
+    else toast.success(t('templates.syncAccountsSuccess', { count: results.length }))
     await fetchTemplates()
   } finally {
     if (ownsRequest()) {
@@ -438,7 +438,7 @@ function getHeaderIcon(type: string) {
         <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !accounts.length">
           <Loader2 v-if="isSyncing" class="h-4 w-4 mr-2 animate-spin" />
           <RefreshCw v-else class="h-4 w-4 mr-2" />
-          {{ selectedAccount === 'all' ? 'Sync all accounts' : $t('templates.syncFromMeta') }}
+          {{ selectedAccount === 'all' ? $t('templates.syncAllAccounts') : $t('templates.syncFromMeta') }}
         </Button>
         <RouterLink v-if="canWrite" to="/templates/new">
           <Button variant="outline" size="sm">
@@ -452,10 +452,10 @@ function getHeaderIcon(type: string) {
     <ScrollArea class="flex-1">
       <div class="p-6">
         <div>
-          <p v-if="isSyncing && syncProgress" role="status" class="mb-4 text-sm text-muted-foreground">Syncing {{ syncProgress }}…</p>
-          <div v-if="syncResults.length" aria-label="Template sync results" class="mb-4 rounded-lg border p-4 text-sm space-y-2">
+          <p v-if="isSyncing && syncProgress" role="status" class="mb-4 text-sm text-muted-foreground">{{ $t('templates.syncingAccount', { account: syncProgress }) }}</p>
+          <div v-if="syncResults.length" :aria-label="$t('templates.syncResults')" class="mb-4 rounded-lg border p-4 text-sm space-y-2">
             <p v-for="result in syncResults" :key="result.account" :class="result.success ? 'text-muted-foreground' : 'text-destructive'">
-              <span class="font-medium">{{ result.account }}</span>: {{ result.success ? 'Synced' : result.error }}
+              <span class="font-medium">{{ result.account }}</span>: {{ result.success ? $t('templates.synced') : result.error }}
             </p>
           </div>
           <ErrorState
@@ -561,7 +561,7 @@ function getHeaderIcon(type: string) {
                   <div class="flex items-center justify-center gap-2">
                     <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !accounts.length">
                       <RefreshCw class="h-4 w-4 mr-2" />
-                      {{ selectedAccount === 'all' ? 'Sync all accounts' : $t('templates.syncFromMeta') }}
+                      {{ selectedAccount === 'all' ? $t('templates.syncAllAccounts') : $t('templates.syncFromMeta') }}
                     </Button>
                     <RouterLink v-if="canWrite" to="/templates/new">
                       <Button variant="outline" size="sm">

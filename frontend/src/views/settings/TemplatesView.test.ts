@@ -17,7 +17,7 @@ vi.mock('@/services/api', () => ({
 vi.mock('@/stores/organizations', () => ({ useOrganizationsStore: () => context }))
 vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ hasPermission: (_resource: string, action: string) => action === 'sync' && context.canSync }) }))
 vi.mock('@/lib/tabSession', () => ({ currentTabSession: () => context.session, isTabSessionCurrent: () => context.live }))
-vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
+vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string, params?: Record<string, string | number>) => params ? `${key} ${Object.values(params).join(' ')}` : key }) }))
 vi.mock('vue-sonner', () => ({ toast: { success: mocks.success, error: mocks.error } }))
 vi.mock('@/components/shared', async () => {
   const { defineComponent: define } = await import('vue')
@@ -52,7 +52,7 @@ function deferred<T>() {
 const wrappers: VueWrapper[] = []
 async function render() {
   const wrapper = mount(TemplatesView, { global: {
-    mocks: { $t: (key: string) => key },
+    mocks: { $t: (key: string, params?: Record<string, string | number>) => params ? `${key} ${Object.values(params).join(' ')}` : key },
     stubs: { Card: Pass, CardContent: Pass, CardDescription: Pass, CardHeader: Pass, CardTitle: Pass, ScrollArea: Pass, Label: Pass, Badge: Pass, Button, RouterLink: Pass },
   } })
   wrappers.push(wrapper)
@@ -60,7 +60,7 @@ async function render() {
   return wrapper
 }
 const table = (wrapper: VueWrapper) => wrapper.findComponent({ name: 'TemplateTable' })
-const syncButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.text() === 'Sync all accounts')!
+const syncButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.text() === 'templates.syncAllAccounts')!
 async function account(wrapper: VueWrapper, name: string) {
   wrapper.findComponent({ name: 'AccountSelect' }).vm.$emit('update:modelValue', name)
   await nextTick()
@@ -272,16 +272,21 @@ describe('template view request ownership', () => {
   })
 
   it('preserves sequential partial sync results through a same-session token refresh', async () => {
+    mocks.get.mockResolvedValueOnce(accounts(['A', 'B', 'C']))
     const wrapper = await render()
     const first = deferred<object>()
-    mocks.post.mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error('B unavailable'))
+    mocks.post.mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error('B unavailable')).mockRejectedValueOnce({})
     await syncButton(wrapper).trigger('click')
     sessionEvent('refreshed')
     first.resolve({})
     await flushPromises()
-    expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'B'])
-    expect(wrapper.get('[aria-label="Template sync results"]').text()).toContain('A: Synced')
+    expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'B', 'C'])
+    const results = wrapper.get('[aria-label="templates.syncResults"]').text()
+    expect(results).toContain('A: templates.synced')
+    expect(results).toContain('B: B unavailable')
+    expect(results).toContain('C: templates.syncAccountFailed')
     expect(mocks.error).toHaveBeenCalledTimes(1)
+    expect(mocks.error).toHaveBeenCalledWith('templates.syncPartialFailure 2')
     expect(mocks.success).not.toHaveBeenCalled()
   })
 
@@ -295,6 +300,7 @@ describe('template view request ownership', () => {
     await flushPromises()
     expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'B'])
     expect(mocks.success).toHaveBeenCalledTimes(1)
+    expect(mocks.success).toHaveBeenCalledWith('templates.syncAccountsSuccess 2')
     expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'B' }))
   })
 

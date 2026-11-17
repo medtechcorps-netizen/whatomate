@@ -12,6 +12,7 @@ export async function syncTemplateAccounts(
   accounts: string[],
   sync: (account: string) => Promise<unknown>,
   isCurrent: () => boolean,
+  errorFallback = 'Sync failed. Try this account again.',
 ): Promise<TemplateSyncResult[]> {
   const results: TemplateSyncResult[] = []
   for (const account of new Set(accounts)) {
@@ -22,7 +23,7 @@ export async function syncTemplateAccounts(
       results.push({ account, success: true })
     } catch (error) {
       if (!isCurrent()) break
-      results.push({ account, success: false, error: getErrorMessage(error, 'Sync failed. Try this account again.') })
+      results.push({ account, success: false, error: getErrorMessage(error, errorFallback) })
     }
   }
   return results
