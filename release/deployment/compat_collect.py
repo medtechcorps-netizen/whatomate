@@ -5,7 +5,7 @@ unknown. Complete current-attempt job intervals establish execution windows;
 run_started_at remains a processing boundary, never a human request time.
 """
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import math
 from pathlib import Path
@@ -288,6 +288,31 @@ _job = envelope._job
 _artifact = envelope._artifact
 
 
+def _normal_attempt_meta(row, request, workflow, observed, latest):
+    """Recognize only the first-attempt endpoint split against a strict list row.
+
+    Keep both raw time values in the snapshot. The caller must additionally
+    prove all four successful job/check windows before using the later bound.
+    Retained outage and rollback envelope readers keep their strict parser.
+    """
+    try:
+        return _run_meta(row, request, workflow, observed), False
+    except evidence.CompatRefusal as error:
+        if (error.code, error.detail) != ("compat-stale", "collect-run-time"):
+            raise
+    run = envelope._run_meta_fields(row, request, workflow, observed)
+    _need(latest["event"] == "push" and latest["attempt"] == 1
+          and latest["status"] == "completed" and latest["conclusion"] == "success"
+          and run.keys() == latest.keys()
+          and all(value == latest[key] for key, value in run.items() if key != "created")
+          and latest["created"] == latest["started"] == run["started"]
+          and run["created"] == latest["created"] + timedelta(seconds=1)
+          and run["created"] <= run["updated"]
+          and all(value.microsecond == 0 for value in
+                  (latest["created"], run["created"], run["updated"])), "collect-attempt-clock")
+    return run, True
+
+
 def _snapshot(client, request, steps, observed, *, retain=False, retention_limit=None):
     if retain:
         if retention_limit is None:
@@ -318,17 +343,21 @@ def _snapshot(client, request, steps, observed, *, retain=False, retention_limit
         artifacts[rid] = sorted(metas, key=lambda a:a["id"])
         for number in range(1, latest["attempt"]+1):
             row = client.get(API + f"/actions/runs/{rid}/attempts/{number}")
-            run = _run_meta(row, request, wid, observed)
+            if retain:
+                run, endpoint_split = _run_meta(row, request, wid, observed), False
+            else:
+                run, endpoint_split = _normal_attempt_meta(row, request, wid, observed, latest)
             if retain:
                 raw_run = envelope._project_run(row, latest["attempt"])
             _need(run["id"] == rid and run["attempt"] == number and run["number"] == latest["number"]
-                  and run["event"] == latest["event"] and run["created"] == latest["created"], "collect-attempt")
+                  and run["event"] == latest["event"]
+                  and (endpoint_split or run["created"] == latest["created"]), "collect-attempt")
             if number == latest["attempt"]:
                 # List and attempt endpoints have distinct update clocks. Both
                 # stay in the snapshot; only cross-endpoint identity excludes them.
                 _need(run.keys() == latest.keys()
                       and all(value == latest[key] for key, value in run.items()
-                              if key != "updated"), "collect-latest-changed")
+                              if key != "updated" and not (endpoint_split and key == "created")), "collect-latest-changed")
             raw_jobs = _pages(client, API + f"/actions/runs/{rid}/attempts/{number}/jobs?", "jobs", 4)
             raw_checks = _pages(client, API + f"/check-suites/{run['suite']}/check-runs?filter=all", "check_runs", 4*latest["attempt"])
             checks = {c["id"]:c for c in raw_checks}
@@ -336,6 +365,9 @@ def _snapshot(client, request, steps, observed, *, retain=False, retention_limit
             jobs, details, names, known, intervals = [], [], set(), True, []
             for job in raw_jobs:
                 typed, eligible, terminal, executed, detail = _job(job, checks, run, request.sha, steps, observed)
+                if endpoint_split:
+                    _need(eligible and terminal and typed.status == "completed" and typed.conclusion == "success"
+                          and executed is not None and run["created"] <= detail[0] <= executed[0], "collect-attempt-clock-jobs")
                 _need(typed.name not in names and typed.job_id not in all_jobs and typed.check_run_id not in all_checks, "collect-job-duplicate")
                 names.add(typed.name); all_jobs.add(typed.job_id); all_checks.add(typed.check_run_id)
                 known &= terminal
@@ -345,9 +377,14 @@ def _snapshot(client, request, steps, observed, *, retain=False, retention_limit
             known &= names == set(evidence.JOBS) and run["status"] == "completed" and bool(intervals)
             completion = max(end for _, end in intervals) if known else None
             window = evidence.ExecutionWindow(min(start for start, _ in intervals), completion, True) if known and len(jobs) == 4 else None
+            if endpoint_split:
+                _need(window is not None and len(intervals) == 4, "collect-attempt-clock-jobs")
+            # A derived conservative processing bound, not a rewritten API time.
+            # The raw run/list dictionaries below still drive snapshot stability.
+            started = run["created"] if endpoint_split else run["started"]
             attempt = evidence.Attempt(evidence.REPOSITORY, evidence.WORKFLOW, request.sha, request.sha,
                 run["event"], evidence.REF, rid, run["number"], number, latest["attempt"], run["status"],
-                run["conclusion"], run["created"] if number == 1 else None, run["started"], completion,
+                run["conclusion"], latest["created"] if number == 1 else None, started, completion,
                 tuple(sorted(jobs,key=lambda j:j.name)), evidence.MissingEvidence.ACTIVE if run["status"] != "completed" else evidence.MissingEvidence.MISSING,
                 execution_window=window)
             attempts.append(attempt)
