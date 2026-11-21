@@ -4907,7 +4907,13 @@ func TestEmbeddedSignupGenerationAcquisitionUsesCallerBudget(t *testing.T) {
 			beforeWaits := pool.Stats().WaitCount
 			ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
 			defer cancel()
-			done := make(chan error, 1)
+			callerDeadline, hasDeadline := ctx.Deadline()
+			require.True(t, hasDeadline)
+			type inspectionResult struct {
+				err        error
+				returnedAt time.Time
+			}
+			done := make(chan inspectionResult, 1)
 			joined := false
 			t.Cleanup(func() {
 				cancel()
@@ -4922,18 +4928,27 @@ func TestEmbeddedSignupGenerationAcquisitionUsesCallerBudget(t *testing.T) {
 			})
 			go func() {
 				_, inspectErr := receiver.inspectEmbeddedSignupAccountGeneration(ctx, org.ID, phoneID)
-				done <- inspectErr
+				done <- inspectionResult{err: inspectErr, returnedAt: time.Now()}
 			}()
 			require.Eventually(t, func() bool { return pool.Stats().WaitCount > beforeWaits }, 500*time.Millisecond, 10*time.Millisecond,
 				"the real max-one pool must observe a waiting acquisition")
 			select {
-			case inspectErr := <-done:
+			case inspection := <-done:
 				joined = true
-				require.ErrorIs(t, inspectErr, errEmbeddedSignupAccountInspection)
+				require.ErrorIs(t, inspection.err, errEmbeddedSignupAccountInspection)
+				require.False(t, inspection.returnedAt.Before(callerDeadline),
+					"generation acquisition must not return before the caller deadline")
 			case <-time.After(2 * time.Second):
 				t.Fatal("generation acquisition exceeded the caller's budget")
 			}
-			require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+			// A child with the same deadline may publish cancellation before its parent.
+			// The recorded return time above rejects an early inspection error.
+			select {
+			case <-ctx.Done():
+				require.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+			case <-time.After(2 * time.Second):
+				t.Fatal("caller deadline cancellation was not observed")
+			}
 			require.NoError(t, holderCtx.Err(), "inspection must not cancel the held owner's context")
 			if nested {
 				require.NoError(t, receiver.DB.Exec("SELECT 1").Error, "the caller's held transaction remains usable")
