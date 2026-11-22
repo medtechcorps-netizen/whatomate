@@ -5,7 +5,11 @@
 import { createHmac, randomBytes } from 'node:crypto'
 import { canonicalOrigin, loadProfile } from './profiles.ts'
 import { StubClient } from './stub-client.ts'
-import { DEFAULT_TIMEOUT_MS, BOTTOM_TOLERANCE_PX, LATE_LAYOUT_VIEWPORT, LATE_LAYOUT_NARROW_VIEWPORT, LATE_LAYOUT_SETTLE_MS, LATE_LAYOUT_FRAME_SETTLE_MS, NATIVE_SELECTION_SETTLE_TIMEOUT_MS } from './checks.ts'
+import {
+  BOTTOM_TOLERANCE_PX, CANARY_FAILURE_PHASES, DEFAULT_TIMEOUT_MS, LATE_LAYOUT_FRAME_SETTLE_MS,
+  LATE_LAYOUT_NARROW_VIEWPORT, LATE_LAYOUT_SETTLE_MS, LATE_LAYOUT_VIEWPORT,
+  NATIVE_SELECTION_SETTLE_TIMEOUT_MS, type RunCanaryPhase,
+} from './checks.ts'
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
@@ -940,9 +944,9 @@ export class LiveProductScenario {
     }
   }
 
-  async runCheck(name) {
-    const before = (await this.stub.journal()).latest;
-    const passed = await this[name]();
+  async runCheck(name, runPhase: RunCanaryPhase = (_phase, run) => run()) {
+    const before = (await runPhase(CANARY_FAILURE_PHASES.inboundJournal, () => this.stub.journal())).latest;
+    const passed = await runPhase(CANARY_FAILURE_PHASES.inboundCheck, () => this[name]());
     if (passed !== true) fail('Canary did not explicitly pass');
     if (name === 'klinik_whatsapp_outbound') {
       await this.stub.assertSend(before, {

@@ -65,3 +65,13 @@ export const LATE_LAYOUT_FRAME_SETTLE_MS = 250;
 // Native Chat positions a newly selected transcript on a short timer after it
 // renders, so the latest-message boundary is polled for a bounded interval.
 export const NATIVE_SELECTION_SETTLE_TIMEOUT_MS = 5_000;
+
+export const CANARY_FAILURE_PHASES = Object.freeze({
+  setupFixture: 'setup-fixture',
+  setupPrepare: 'setup-prepare',
+  inboundJournal: 'inbound-stub-journal',
+  inboundCheck: 'inbound-check',
+} as const)
+
+export type CanaryFailurePhase = typeof CANARY_FAILURE_PHASES[keyof typeof CANARY_FAILURE_PHASES]
+export type RunCanaryPhase = <T>(phase: CanaryFailurePhase, run: () => Promise<T>) => Promise<T>

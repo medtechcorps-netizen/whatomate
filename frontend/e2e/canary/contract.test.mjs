@@ -4,7 +4,7 @@ import { readFileSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSyn
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
-import { UI_CHECKS, CHECK_EXECUTION_ORDER } from './checks.ts'
+import { CANARY_FAILURE_PHASES, UI_CHECKS, CHECK_EXECUTION_ORDER } from './checks.ts'
 import { readPrivateFile, validateProfile } from './profiles.ts'
 import { controlHeaders, StubClient } from './stub-client.ts'
 import { LiveProductScenario } from './scenario.ts'
@@ -158,8 +158,13 @@ test('failure progress and provisioning errors never serialize sensitive call lo
   t.mock.method(console, 'error', value => output.push(value))
   const reporter = new PrivateReporter()
   reporter.onError(new Error(`locator.fill("${secret}")`))
-  reporter.onTestEnd({ title: UI_CHECKS[0], expectedStatus: 'passed', outcome: () => 'unexpected' },
-    { status: 'failed', retry: 0, error: { message: secret, stack: secret }, stdout: [secret], attachments: [{ body: secret }] })
+  const check = { title: CHECK_EXECUTION_ORDER[0], expectedStatus: 'passed', outcome: () => 'unexpected' }
+  const error = { message: secret, stack: secret }
+  const result = { status: 'failed', retry: 0, error, errors: [error], stdout: [secret], attachments: [{ body: secret }] }
+  const phase = CANARY_FAILURE_PHASES.inboundJournal
+  reporter.onStepEnd(check, result, { category: 'test.step', title: phase, error })
+  reporter.onTestEnd(check, result)
+  assert.ok(output.includes(`[canary-phase] failed=${phase}`))
   assert.equal(output.some(value => value.includes(secret)), false)
   assert.equal(reporter.printsToStdio(), true)
   const api = new ProductAPI({ storageState: async () => ({ cookies: [] }), fetch: async () => { throw new Error(secret) } })
