@@ -55,7 +55,7 @@ def _repository(value):
     _need(type(value) is dict and type(value.get("id")) is int and value["id"] == REPOSITORY_ID
           and value.get("full_name") == evidence.REPOSITORY, "collect-repository")
 
-def _run_meta_fields(row, request, workflow, observed):
+def _run_meta(row, request, workflow, observed):
     _need(type(row) is dict, "collect-run")
     _repository(row.get("repository")); _repository(row.get("head_repository"))
     rid = _integer(row.get("id"))
@@ -68,16 +68,11 @@ def _run_meta_fields(row, request, workflow, observed):
     created = _date(row.get("created_at"), observed)
     started = _date(row["run_started_at"], observed) if row.get("run_started_at") is not None else None
     updated = _date(row.get("updated_at"), observed)
+    _need(created <= updated and (started is None or created <= started <= updated), "collect-run-time")
     return {"id":rid, "number":_integer(row.get("run_number")),
         "attempt":_integer(row.get("run_attempt"), evidence.MAX_ATTEMPTS),
         "suite":_integer(row.get("check_suite_id")), "event":row["event"],
         "status":status, "conclusion":conclusion, "created":created, "started":started, "updated":updated}
-
-def _run_meta(row, request, workflow, observed):
-    run = _run_meta_fields(row, request, workflow, observed)
-    _need(run["created"] <= run["updated"] and (run["started"] is None
-          or run["created"] <= run["started"] <= run["updated"]), "collect-run-time")
-    return run
 
 def _steps(rows, expected, job_start, job_end, observed):
     _need(type(rows) is list and len(rows) <= len(expected) + 3, "collect-steps")
