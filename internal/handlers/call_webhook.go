@@ -474,6 +474,9 @@ func (a *App) getOrCreateCallLog(account *models.WhatsAppAccount, contact *model
 	if err == nil {
 		return &callLog, false
 	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, false
+	}
 
 	// Create a new call log
 	callLog = models.CallLog{
