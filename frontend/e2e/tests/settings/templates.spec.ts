@@ -101,19 +101,19 @@ test.describe('Message Templates - Sync', () => {
     }))
     await templatesPage.goto()
     await expect(templatesPage.accountSelect).toContainText('All')
-    await expect(templatesPage.syncButton).toHaveText('Sync all accounts')
+    await expect(templatesPage.syncButton).toHaveText('Sync from Meta')
     await expect(templatesPage.syncButton).toBeDisabled()
   })
 
-  test('should enable sync for all accounts and an available individual account', async ({ page }) => {
+  test('should enable sync only after selecting an available account', async ({ page }) => {
     const accountName = 'Templates sync fixture'
     await page.route(/\/api\/accounts(?:\?.*)?$/, route => route.fulfill({
       json: { data: { accounts: [{ id: 'sync-fixture-account', name: accountName, phone_id: 'sync-fixture-phone' }] } },
     }))
     await templatesPage.goto()
     await expect(templatesPage.accountSelect).toContainText('All')
-    await expect(templatesPage.syncButton).toHaveText('Sync all accounts')
-    await expect(templatesPage.syncButton).toBeEnabled()
+    await expect(templatesPage.syncButton).toHaveText('Sync from Meta')
+    await expect(templatesPage.syncButton).toBeDisabled()
 
     await templatesPage.selectAccount(accountName)
     await expect(templatesPage.syncButton).toHaveText('Sync from Meta')

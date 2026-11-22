@@ -8,7 +8,7 @@ let scenario: ReturnType<typeof createScenario>
 const runPhase: RunCanaryPhase = (phase, run) => test.step(phase, run)
 test.beforeAll(async ({ playwright }, testInfo) => {
   scenario = await runPhase(CANARY_FAILURE_PHASES.setupFixture, async () => createScenario(playwright.chromium))
-  await runPhase(CANARY_FAILURE_PHASES.setupPrepare, () => scenario.prepare())
+  await scenario.prepare(runPhase)
   testInfo.annotations.push({ type: DRILL_PREPARED, description: 'complete' })
 })
 test.afterAll(async () => { await scenario?.close() })

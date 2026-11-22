@@ -958,17 +958,21 @@ export class LiveProductScenario {
     if (name.endsWith('_send_denied')) await this.stub.assertNoSend(before);
   }
 
-  async prepare() {
+  async prepare(runPhase: RunCanaryPhase = (_phase, run) => run()) {
     // The stub stores accounts in memory; a staging redeploy must be harmless
     // before a scenario starts. A restart during a check invalidates its journal.
-    const meta = this.descriptor.klinik.meta;
-    await this.stub.request('POST', '/_control/accounts', {
-      business_account_id: meta.business_account_id,
-      phone_number_id: meta.phone_number_id,
-      display_phone_number: meta.display_phone_number,
-      verified_name: this.descriptor.fixture_namespace,
+    await runPhase(CANARY_FAILURE_PHASES.prepareStubAccount, async () => {
+      const meta = this.descriptor.klinik.meta;
+      await this.stub.request('POST', '/_control/accounts', {
+        business_account_id: meta.business_account_id,
+        phone_number_id: meta.phone_number_id,
+        display_phone_number: meta.display_phone_number,
+        verified_name: this.descriptor.fixture_namespace,
+      });
     });
-    this.browser = await this.chromium.launch({ headless: true });
+    this.browser = await runPhase(CANARY_FAILURE_PHASES.prepareBrowser, () =>
+      this.chromium.launch({ headless: true }),
+    );
     const createPage = async (loginValue, organizationID) => {
       const context = await this.browser.newContext({
         viewport: { width: 1440, height: 900 },
@@ -993,74 +997,82 @@ export class LiveProductScenario {
       );
       return page;
     };
-    [
-      this.pages.omniPrimary,
-      this.pages.omniObserver,
-      this.pages.native,
-      this.pages.nonKlinik,
-    ] = await Promise.all([
-      createPage(this.klinikLogin, this.descriptor.klinik.organization_id),
-      createPage(this.klinikLogin, this.descriptor.klinik.organization_id),
-      createPage(this.klinikLogin, this.descriptor.klinik.organization_id),
-      createPage(
-        this.nonKlinikLogin,
-        this.descriptor.non_klinik.organization_id,
-      ),
-    ]);
-
-    const [liveA, liveB] = await Promise.all([
-      loadLiveFixtureConversation(
+    await runPhase(CANARY_FAILURE_PHASES.prepareSessions, async () => {
+      [
         this.pages.omniPrimary,
-        this.descriptor,
-        this.descriptor.klinik.conversations.a,
-      ),
-      loadLiveFixtureConversation(
-        this.pages.omniPrimary,
-        this.descriptor,
-        this.descriptor.klinik.conversations.b,
-      ),
-    ]);
-    if (liveB.unread_count !== 0) {
-      fail("synthetic unread fixture is not initially clear");
-    }
-    this.state.liveA = liveA;
-    this.state.liveB = liveB;
-
-    const conversationA = this.descriptor.klinik.conversations.a;
-    await Promise.all([
-      this.pages.omniPrimary.goto(this.descriptor.product_origin + "/inbox", {
-        waitUntil: "domcontentloaded",
-      }),
-      this.pages.omniObserver.goto(this.descriptor.product_origin + "/inbox", {
-        waitUntil: "domcontentloaded",
-      }),
-      this.pages.native.goto(
-        this.descriptor.product_origin + "/chat/" + conversationA.contact_id,
-        {
-          waitUntil: "domcontentloaded",
-        },
-      ),
-    ]);
-    await Promise.all([
-      selectOmnichannelConversation(
-        this.pages.omniPrimary,
-        conversationA.conversation_id,
-        this.timeout,
-      ),
-      selectOmnichannelConversation(
         this.pages.omniObserver,
-        conversationA.conversation_id,
-        this.timeout,
-      ),
-      this.pages.native.getByTestId("chat-message-list").waitFor({
-        state: "visible",
-        timeout: this.timeout,
-      }),
-    ]);
-    this.state.omniObserverDocument = await documentCount(
-      this.pages.omniObserver,
-    );
-    this.state.nativeDocument = await documentCount(this.pages.native);
+        this.pages.native,
+        this.pages.nonKlinik,
+      ] = await Promise.all([
+        createPage(this.klinikLogin, this.descriptor.klinik.organization_id),
+        createPage(this.klinikLogin, this.descriptor.klinik.organization_id),
+        createPage(this.klinikLogin, this.descriptor.klinik.organization_id),
+        createPage(
+          this.nonKlinikLogin,
+          this.descriptor.non_klinik.organization_id,
+        ),
+      ]);
+    });
+
+    await runPhase(CANARY_FAILURE_PHASES.prepareFixtureConversations, async () => {
+      const [liveA, liveB] = await Promise.all([
+        loadLiveFixtureConversation(
+          this.pages.omniPrimary,
+          this.descriptor,
+          this.descriptor.klinik.conversations.a,
+        ),
+        loadLiveFixtureConversation(
+          this.pages.omniPrimary,
+          this.descriptor,
+          this.descriptor.klinik.conversations.b,
+        ),
+      ]);
+      if (liveB.unread_count !== 0) {
+        fail("synthetic unread fixture is not initially clear");
+      }
+      this.state.liveA = liveA;
+      this.state.liveB = liveB;
+    });
+
+    await runPhase(CANARY_FAILURE_PHASES.prepareViews, async () => {
+      const conversationA = this.descriptor.klinik.conversations.a;
+      await Promise.all([
+        this.pages.omniPrimary.goto(this.descriptor.product_origin + "/inbox", {
+          waitUntil: "domcontentloaded",
+        }),
+        this.pages.omniObserver.goto(this.descriptor.product_origin + "/inbox", {
+          waitUntil: "domcontentloaded",
+        }),
+        this.pages.native.goto(
+          this.descriptor.product_origin + "/chat/" + conversationA.contact_id,
+          {
+            waitUntil: "domcontentloaded",
+          },
+        ),
+      ]);
+      await Promise.all([
+        selectOmnichannelConversation(
+          this.pages.omniPrimary,
+          conversationA.conversation_id,
+          this.timeout,
+        ),
+        selectOmnichannelConversation(
+          this.pages.omniObserver,
+          conversationA.conversation_id,
+          this.timeout,
+        ),
+        this.pages.native.getByTestId("chat-message-list").waitFor({
+          state: "visible",
+          timeout: this.timeout,
+        }),
+      ]);
+    });
+    await runPhase(CANARY_FAILURE_PHASES.prepareDocumentBaseline, async () => {
+      this.state.omniObserverDocument = await documentCount(
+        this.pages.omniObserver,
+      );
+      this.state.nativeDocument = await documentCount(this.pages.native);
+    });
   }
 
   async close() {
