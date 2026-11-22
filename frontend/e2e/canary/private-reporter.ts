@@ -1,6 +1,6 @@
-import type { FullResult, Reporter, TestCase, TestResult } from '@playwright/test/reporter'
+import type { FullResult, Reporter, TestCase, TestResult, TestStep } from '@playwright/test/reporter'
 import { atomicWritePrivate } from './private-files.mjs'
-import { CHECK_EXECUTION_ORDER } from './checks.ts'
+import { CANARY_FAILURE_PHASES, CHECK_EXECUTION_ORDER, type CanaryFailurePhase } from './checks.ts'
 import { DRILL_PREPARED, DRILL_TRIGGERED, DRILL_ERROR, DRILL_EVIDENCE } from './stage-drill.mjs'
 
 // A minimal machine report contains names/statuses only. Never serialize test
@@ -9,12 +9,22 @@ export default class PrivateReporter implements Reporter {
   private specs: object[] = []
   private drillResults: boolean[] = []
   private runnerError = false
+  private failedPhases = new WeakMap<TestResult, CanaryFailurePhase | null>()
   printsToStdio() { return true }
   onError() {
     this.runnerError = true
     console.error('Canary setup or runner failed; details suppressed because they may contain credentials')
   }
+  onStepEnd(test: TestCase, result: TestResult, step: TestStep) {
+    if (test.title !== CHECK_EXECUTION_ORDER[0] || step.category !== 'test.step' || !step.error) return
+    const phase = Object.values(CANARY_FAILURE_PHASES).find(allowed => allowed === step.title)
+    if (phase) this.failedPhases.set(result, this.failedPhases.has(result) ? null : phase)
+  }
   onTestEnd(test: TestCase, result: TestResult) {
+    const phase = this.failedPhases.get(result)
+    if (phase && result.retry === 0 && ['failed', 'timedOut', 'interrupted'].includes(result.status)) {
+      console.log(`[canary-phase] failed=${phase}`)
+    }
     const index = this.specs.length
     const annotations = result.annotations ?? []
     const exactAnnotation = (type: string, description: string) =>
