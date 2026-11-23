@@ -68,7 +68,12 @@ export const NATIVE_SELECTION_SETTLE_TIMEOUT_MS = 5_000;
 
 export const CANARY_FAILURE_PHASES = Object.freeze({
   setupFixture: 'setup-fixture',
-  setupPrepare: 'setup-prepare',
+  prepareStubAccount: 'prepare-stub-account',
+  prepareBrowser: 'prepare-browser',
+  prepareSessions: 'prepare-sessions',
+  prepareFixtureConversations: 'prepare-fixture-conversations',
+  prepareViews: 'prepare-views',
+  prepareDocumentBaseline: 'prepare-document-baseline',
   inboundJournal: 'inbound-stub-journal',
   inboundCheck: 'inbound-check',
 } as const)

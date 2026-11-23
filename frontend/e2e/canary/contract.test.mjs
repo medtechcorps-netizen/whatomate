@@ -8,7 +8,6 @@ import { CANARY_FAILURE_PHASES, UI_CHECKS, CHECK_EXECUTION_ORDER } from './check
 import { readPrivateFile, validateProfile } from './profiles.ts'
 import { controlHeaders, StubClient } from './stub-client.ts'
 import { LiveProductScenario } from './scenario.ts'
-import { ProductAPI } from './provision.ts'
 import PrivateReporter from './private-reporter.ts'
 import { verifyReport } from './verify-report.mjs'
 import { assertPrivateLocation, assertPrivateOutput, atomicWritePrivate, checkoutRoot, childEnvironment, refuseAmbient, secureWindowsPath, validateReportPath } from './private-files.mjs'
@@ -152,7 +151,61 @@ test('scenario restores the saved synthetic account before browser launch', asyn
   assert.deepEqual(calls, [['POST', '/_control/accounts', { ...meta, verified_name: local.namespace }]])
 })
 
+test('prepare reports only the failed fixed phase for each setup operation', async t => {
+  const phases = [
+    'prepare-stub-account',
+    'prepare-browser',
+    'prepare-sessions',
+    'prepare-fixture-conversations',
+    'prepare-views',
+    'prepare-document-baseline',
+  ]
+  const meta = {
+    business_account_id: '999000000001',
+    phone_number_id: '999000000002',
+    display_phone_number: '999000000003',
+  }
+  const error = new Error('synthetic password sentinel')
+  const check = { title: CHECK_EXECUTION_ORDER[0], expectedStatus: 'passed', outcome: () => 'unexpected' }
+  const output = []
+  t.mock.method(console, 'log', value => output.push(value))
+
+  for (const [index, failedPhase] of phases.entries()) {
+    const reporter = new PrivateReporter()
+    const result = { status: 'failed', retry: 0, error, errors: [error] }
+    const seen = []
+    const scenario = new LiveProductScenario({
+      descriptor: { fixture_namespace: local.namespace, klinik: { meta } },
+      stub: { request: async () => { if (index === 0) throw error } },
+      chromium: { launch: async () => { throw error } },
+    })
+
+    await assert.rejects(scenario.prepare(async (phase, operation) => {
+      seen.push(phase)
+      if (seen.length <= index) {
+        if (phase === 'prepare-stub-account') await operation()
+        return
+      }
+      try {
+        if (index < 2) await operation()
+        else throw error
+      } catch (failure) {
+        reporter.onStepEnd(check, result, { category: 'test.step', title: phase, error: failure })
+        throw failure
+      }
+    }), failure => failure === error)
+
+    assert.deepEqual(seen, phases.slice(0, index + 1))
+    reporter.onTestEnd(check, result)
+    assert.deepEqual(output.splice(0), [
+      `[canary-phase] failed=${failedPhase}`,
+      `[canary] ${check.title}: failed`,
+    ])
+  }
+})
+
 test('failure progress and provisioning errors never serialize sensitive call logs', async t => {
+  const { ProductAPI } = await import('./provision.ts')
   const secret = 'synthetic-password-and-session-cookie-marker', output = []
   t.mock.method(console, 'log', value => output.push(value))
   t.mock.method(console, 'error', value => output.push(value))

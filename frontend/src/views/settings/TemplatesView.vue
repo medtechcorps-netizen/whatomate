@@ -68,6 +68,10 @@ const selectedAccount = ref<string>(localStorage.getItem('templates_selected_acc
 const canWrite = computed(() => authStore.hasPermission('templates', 'write'))
 const canDelete = computed(() => authStore.hasPermission('templates', 'delete'))
 const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
+const selectedSyncAccount = computed(() => {
+  const name = selectedAccount.value
+  return name && name !== 'all' && accounts.value.some(account => account.name === name) ? name : null
+})
 
 // Delete dialog state
 const deleteDialogOpen = ref(false)
@@ -322,10 +326,8 @@ async function fetchTemplates() {
 
 async function syncTemplates() {
   if (!canSync.value || isSyncing.value) return
-  const targets = selectedAccount.value === 'all'
-    ? accounts.value.map(account => account.name)
-    : accounts.value.filter(account => account.name === selectedAccount.value).map(account => account.name)
-  if (!targets.length) { toast.error(t('templates.noAccountsToSync')); return }
+  const target = selectedSyncAccount.value
+  if (!target) { toast.error(t('templates.selectAccountFirst')); return }
 
   const scope = captureViewScope()
   if (!scope()) return
@@ -335,7 +337,7 @@ async function syncTemplates() {
   isSyncing.value = true
   syncResults.value = []
   try {
-    const results = await syncTemplateAccounts(targets, async account => {
+    const results = await syncTemplateAccounts([target], async account => {
       syncProgress.value = account
       await api.post('/templates/sync', { whatsapp_account: account })
     }, current, t('templates.syncAccountFailed'))
@@ -435,10 +437,10 @@ function getHeaderIcon(type: string) {
   <div class="flex flex-col h-full bg-[#0a0a0b] light:bg-gray-50">
     <PageHeader :title="$t('templates.title')" :subtitle="$t('templates.subtitle')" :icon="FileText" icon-gradient="bg-gradient-to-br from-blue-500 to-cyan-600 shadow-blue-500/20">
       <template #actions>
-        <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !accounts.length">
+        <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !selectedSyncAccount">
           <Loader2 v-if="isSyncing" class="h-4 w-4 mr-2 animate-spin" />
           <RefreshCw v-else class="h-4 w-4 mr-2" />
-          {{ selectedAccount === 'all' ? $t('templates.syncAllAccounts') : $t('templates.syncFromMeta') }}
+          {{ $t('templates.syncFromMeta') }}
         </Button>
         <RouterLink v-if="canWrite" to="/templates/new">
           <Button variant="outline" size="sm">
@@ -559,9 +561,9 @@ function getHeaderIcon(type: string) {
                 </template>
                 <template #empty-action>
                   <div class="flex items-center justify-center gap-2">
-                    <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !accounts.length">
+                    <Button v-if="canSync" variant="outline" size="sm" @click="syncTemplates" :disabled="isSyncing || !selectedSyncAccount">
                       <RefreshCw class="h-4 w-4 mr-2" />
-                      {{ selectedAccount === 'all' ? $t('templates.syncAllAccounts') : $t('templates.syncFromMeta') }}
+                      {{ $t('templates.syncFromMeta') }}
                     </Button>
                     <RouterLink v-if="canWrite" to="/templates/new">
                       <Button variant="outline" size="sm">

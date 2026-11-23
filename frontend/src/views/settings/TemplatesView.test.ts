@@ -60,7 +60,7 @@ async function render() {
   return wrapper
 }
 const table = (wrapper: VueWrapper) => wrapper.findComponent({ name: 'TemplateTable' })
-const syncButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.text() === 'templates.syncAllAccounts')!
+const syncButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.text() === 'templates.syncFromMeta')!
 async function account(wrapper: VueWrapper, name: string) {
   wrapper.findComponent({ name: 'AccountSelect' }).vm.$emit('update:modelValue', name)
   await nextTick()
@@ -232,10 +232,11 @@ describe('template view request ownership', () => {
     expect(mocks.error).not.toHaveBeenCalled()
   })
 
-  it('clears session-visible data and stops a sync queue on expiry', async () => {
+  it('clears session-visible data and ignores an in-flight sync on expiry', async () => {
     const wrapper = await render()
     const pending = deferred<object>()
     mocks.post.mockReturnValueOnce(pending.promise)
+    await account(wrapper, 'A')
     await syncButton(wrapper).trigger('click')
     context.live = false
     sessionEvent('expired')
@@ -253,10 +254,12 @@ describe('template view request ownership', () => {
     const old = deferred<object>()
     const latest = deferred<object>()
     mocks.post.mockReturnValueOnce(old.promise).mockReturnValueOnce(latest.promise)
+    await account(wrapper, 'A')
     await syncButton(wrapper).trigger('click')
     context.selectedOrgId = 'org-B'
     context.selectedOrgId = 'org-A'
     await flushPromises()
+    await account(wrapper, 'A')
     await syncButton(wrapper).trigger('click')
     old.reject(new Error('obsolete sync'))
     await flushPromises()
@@ -266,27 +269,33 @@ describe('template view request ownership', () => {
     expect(mocks.error).not.toHaveBeenCalled()
     latest.resolve({})
     await flushPromises()
-    expect(mocks.post).toHaveBeenCalledTimes(3)
+    expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'A'])
     expect(mocks.success).toHaveBeenCalledTimes(1)
     expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
   })
 
-  it('preserves sequential partial sync results through a same-session token refresh', async () => {
+  it('requires a current selected account and preserves its failure through a same-session token refresh', async () => {
     mocks.get.mockResolvedValueOnce(accounts(['A', 'B', 'C']))
     const wrapper = await render()
-    const first = deferred<object>()
-    mocks.post.mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error('B unavailable')).mockRejectedValueOnce({})
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    await syncButton(wrapper).trigger('click')
+    await account(wrapper, 'missing')
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    await syncButton(wrapper).trigger('click')
+    expect(mocks.post).not.toHaveBeenCalled()
+
+    await account(wrapper, 'B')
+    const pending = deferred<object>()
+    mocks.post.mockReturnValueOnce(pending.promise)
     await syncButton(wrapper).trigger('click')
     sessionEvent('refreshed')
-    first.resolve({})
+    pending.reject(new Error('B unavailable'))
     await flushPromises()
-    expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'B', 'C'])
+    expect(mocks.post.mock.calls).toEqual([['/templates/sync', { whatsapp_account: 'B' }]])
     const results = wrapper.get('[aria-label="templates.syncResults"]').text()
-    expect(results).toContain('A: templates.synced')
     expect(results).toContain('B: B unavailable')
-    expect(results).toContain('C: templates.syncAccountFailed')
     expect(mocks.error).toHaveBeenCalledTimes(1)
-    expect(mocks.error).toHaveBeenCalledWith('templates.syncPartialFailure 2')
+    expect(mocks.error).toHaveBeenCalledWith('templates.syncPartialFailure 1')
     expect(mocks.success).not.toHaveBeenCalled()
   })
 
@@ -294,13 +303,14 @@ describe('template view request ownership', () => {
     const wrapper = await render()
     const first = deferred<object>()
     mocks.post.mockReturnValueOnce(first.promise)
+    await account(wrapper, 'A')
     await syncButton(wrapper).trigger('click')
     await account(wrapper, 'B')
     first.resolve({})
     await flushPromises()
-    expect(mocks.post.mock.calls.map(call => call[1].whatsapp_account)).toEqual(['A', 'B'])
+    expect(mocks.post.mock.calls).toEqual([['/templates/sync', { whatsapp_account: 'A' }]])
     expect(mocks.success).toHaveBeenCalledTimes(1)
-    expect(mocks.success).toHaveBeenCalledWith('templates.syncAccountsSuccess 2')
+    expect(mocks.success).toHaveBeenCalledWith('templates.syncAccountsSuccess 1')
     expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'B' }))
   })
 
@@ -317,17 +327,19 @@ describe('template view request ownership', () => {
     expect(mocks.get).toHaveBeenCalledTimes(1)
   })
 
-  it('stops sync after unmount without a toast, list refresh, or another account', async () => {
+  it('ignores sync completion after unmount without a toast or list refresh', async () => {
     const wrapper = await render()
     const pending = deferred<object>()
     mocks.post.mockReturnValueOnce(pending.promise)
+    await account(wrapper, 'A')
     await syncButton(wrapper).trigger('click')
+    const listCallsBeforeUnmount = mocks.list.mock.calls.length
     wrapper.unmount()
     wrappers.splice(wrappers.indexOf(wrapper), 1)
     pending.resolve({})
     await flushPromises()
     expect(mocks.post).toHaveBeenCalledTimes(1)
-    expect(mocks.list).toHaveBeenCalledTimes(1)
+    expect(mocks.list).toHaveBeenCalledTimes(listCallsBeforeUnmount)
     expect(mocks.success).not.toHaveBeenCalled()
     expect(mocks.error).not.toHaveBeenCalled()
   })

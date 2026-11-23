@@ -248,17 +248,17 @@ test.describe('Message Templates - Request ownership', () => {
     expect(accountsReply.outcome()).toBe('delivered')
   })
 
-  test('keeps the captured sync queue sequential after a filter change and shows partial outcomes', async ({ page }) => {
+  test('keeps one captured sync account after a filter change and shows its outcome', async ({ page }) => {
     const first = heldReply({ message: 'Synthetic sync refusal' }, 400)
-    const second = heldReply({ data: {} })
-    pending.push(first, second)
+    pending.push(first)
     fixture.sync = route => {
-      const index = fixture.syncs.length - 1
-      expect(fixture.syncs[index]).toBe(accounts[index]?.name)
-      expect(index).toBeLessThan(2)
-      return (index === 0 ? first : second).reply(route)
+      expect(fixture.syncs).toEqual([accounts[0]!.name])
+      return first.reply(route)
     }
     await openTemplates(page)
+    await expect(syncButton(page)).toBeDisabled()
+    expect(fixture.syncs).toEqual([])
+    await selectAccount(page, accounts[0]!.name)
     await expect(syncButton(page)).toBeEnabled()
     await syncButton(page).click()
     await first.seen
@@ -270,22 +270,16 @@ test.describe('Message Templates - Request ownership', () => {
     await expect(page.locator('tbody tr').filter({ hasText: alpha.display_name })).toBeVisible()
     const readsBeforeCompletion = fixture.lists.length
     first.release()
-    await second.seen
-    await expect(page.locator('p[role="status"]')).toContainText(accounts[1]!.name)
-    expect(fixture.syncs).toEqual(accounts.map(a => a.name))
-    second.release()
-    await second.settled
+    await first.settled
     const results = page.locator('[aria-label="Template sync results"]')
-    await expect(results.locator('p')).toHaveCount(2)
+    await expect(results.locator('p')).toHaveCount(1)
     await expect(results.locator('p').nth(0)).toHaveText(accounts[0]!.name + ': Synthetic sync refusal')
-    await expect(results.locator('p').nth(1)).toHaveText(accounts[1]!.name + ': Synced')
     await expect(syncButton(page)).toBeEnabled()
     await expect(page.locator('tbody .skeleton-shimmer')).toHaveCount(0)
     expect(fixture.lists).toHaveLength(readsBeforeCompletion + 1)
     expect(fixture.lists.at(-1)!.account).toBe(accounts[1]!.name)
-    expect(fixture.syncs).toEqual(accounts.map(a => a.name))
+    expect(fixture.syncs).toEqual([accounts[0]!.name])
     expect(first.outcome()).toBe('delivered')
-    expect(second.outcome()).toBe('delivered')
   })
 
   test('ignores an older list response after selecting a different account', async ({ page }) => {
@@ -339,7 +333,7 @@ test.describe('Message Templates - Request ownership', () => {
     expect(['delivered', 'aborted']).toContain(stale.outcome())
   })
 
-  test('stops queued sync after real logout in a second tab', async ({ page, context }) => {
+  test('ignores in-flight sync after real logout in a second tab', async ({ page, context }) => {
     const stale = heldReply({ message: 'Old session sync refusal' }, 400, true)
     pending.push(stale)
     fixture.sync = route => {
@@ -347,6 +341,7 @@ test.describe('Message Templates - Request ownership', () => {
       return stale.reply(route)
     }
     await openTemplates(page)
+    await selectAccount(page, accounts[0]!.name)
     await expect(syncButton(page)).toBeEnabled()
     await syncButton(page).click()
     await stale.seen
@@ -361,6 +356,7 @@ test.describe('Message Templates - Request ownership', () => {
 
       await loginAs(page, user)
       await openTemplates(page)
+      await selectAccount(page, accounts[0]!.name)
       await expect(syncButton(page)).toBeEnabled()
       await expect(page.locator('[aria-label="Template sync results"]')).toHaveCount(0)
       await expect(page.getByText('Old session sync refusal', { exact: true })).toHaveCount(0)
