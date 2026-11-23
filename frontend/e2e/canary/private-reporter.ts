@@ -3,13 +3,27 @@ import { atomicWritePrivate } from './private-files.mjs'
 import { CANARY_FAILURE_PHASES, CHECK_EXECUTION_ORDER, type CanaryFailurePhase } from './checks.ts'
 import { DRILL_PREPARED, DRILL_TRIGGERED, DRILL_ERROR, DRILL_EVIDENCE } from './stage-drill.mjs'
 
+const FIXTURE_CONVERSATION_PREDICATES = new Map([
+  ['live fixture inventory request is indeterminate', 'fixture-request-indeterminate'],
+  ['live fixture inventory authorization failed', 'fixture-request-auth'],
+  ['live fixture inventory entitlement is unavailable', 'fixture-entitlement'],
+  ['live fixture inventory is unavailable', 'fixture-request-http'],
+  ['live fixture inventory response is invalid', 'fixture-list-wire'],
+  ['product list response differs', 'fixture-list-wire'],
+  ['live fixture inventory differs', 'fixture-row-cardinality'],
+  ['live fixture conversation is invalid', 'fixture-identity'],
+  ['live fixture identity differs from the protected descriptor', 'fixture-identity'],
+  ['live fixture unread state is invalid', 'fixture-unread-invalid'],
+  ['synthetic unread fixture is not initially clear', 'fixture-unread-not-clear'],
+])
+
 // A minimal machine report contains names/statuses only. Never serialize test
 // errors, source, config, stdout, attachment paths or the private fixture.
 export default class PrivateReporter implements Reporter {
   private specs: object[] = []
   private drillResults: boolean[] = []
   private runnerError = false
-  private failedPhases = new WeakMap<TestResult, CanaryFailurePhase | null>()
+  private failedPhases = new WeakMap<TestResult, { phase: CanaryFailurePhase, predicate: string | undefined } | null>()
   printsToStdio() { return true }
   onError() {
     this.runnerError = true
@@ -18,12 +32,18 @@ export default class PrivateReporter implements Reporter {
   onStepEnd(test: TestCase, result: TestResult, step: TestStep) {
     if (test.title !== CHECK_EXECUTION_ORDER[0] || step.category !== 'test.step' || !step.error) return
     const phase = Object.values(CANARY_FAILURE_PHASES).find(allowed => allowed === step.title)
-    if (phase) this.failedPhases.set(result, this.failedPhases.has(result) ? null : phase)
+    if (!phase) return
+    const message = step.error.message
+    const predicate = phase === CANARY_FAILURE_PHASES.prepareFixtureConversations && typeof message === 'string'
+      ? FIXTURE_CONVERSATION_PREDICATES.get(message.replace(/^(?:Error|SyntheticCanaryFailure): /, ''))
+      : undefined
+    this.failedPhases.set(result, this.failedPhases.has(result) ? null : { phase, predicate })
   }
   onTestEnd(test: TestCase, result: TestResult) {
-    const phase = this.failedPhases.get(result)
-    if (phase && result.retry === 0 && ['failed', 'timedOut', 'interrupted'].includes(result.status)) {
-      console.log(`[canary-phase] failed=${phase}`)
+    const failure = this.failedPhases.get(result)
+    if (failure && result.retry === 0 && ['failed', 'timedOut', 'interrupted'].includes(result.status)) {
+      console.log(`[canary-phase] failed=${failure.phase}`)
+      if (failure.predicate) console.log(`[canary-predicate] code=${failure.predicate}`)
     }
     const index = this.specs.length
     const annotations = result.annotations ?? []
