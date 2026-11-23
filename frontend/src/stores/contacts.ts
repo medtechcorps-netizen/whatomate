@@ -589,25 +589,48 @@ export const useContactsStore = defineStore('contacts', () => {
     extra?: {
       interactive?: Parameters<typeof messagesService.send>[1]['interactive']
       forwardOfMessageId?: string
+      // Captured by the native text composer before its first await.
+      organizationId?: string
     },
   ) {
     const identity = identityGeneration
     const organizationScope = activeOrganizationScope.value
+    const explicitOrganization = extra?.organizationId
+    if (explicitOrganization !== undefined && (
+      !explicitOrganization.trim() || explicitOrganization !== organizationScope ||
+      explicitOrganization !== messagesOrganizationScope.value ||
+      currentContact.value?.id !== contactId
+    )) {
+      throw new Error('Text send workspace changed before dispatch')
+    }
     try {
-      const response = await messagesService.send(contactId, {
+      const request = {
         type,
         content,
         reply_to_message_id: replyToMessageId,
         whatsapp_account: whatsappAccount,
         ...(extra?.interactive ? { interactive: extra.interactive } : {}),
         ...(extra?.forwardOfMessageId ? { forward_of_message_id: extra.forwardOfMessageId } : {}),
-      })
+      }
+      const response = explicitOrganization === undefined
+        ? await messagesService.send(contactId, request)
+        : await messagesService.send(contactId, request, { organizationId: explicitOrganization })
       // API returns { status: "success", data: { ... } }
       const newMessage = response.data.data || response.data
+      if (explicitOrganization !== undefined && (
+        !newMessage || typeof newMessage.id !== 'string' || !newMessage.id.trim() ||
+        newMessage.contact_id !== contactId || newMessage.direction !== 'outgoing' ||
+        newMessage.message_type !== type || typeof newMessage.whatsapp_account !== 'string' ||
+        !newMessage.whatsapp_account.trim() || (whatsappAccount && newMessage.whatsapp_account !== whatsappAccount) ||
+        !['pending', 'sent', 'delivered', 'read', 'failed'].includes(newMessage.status)
+      )) {
+        throw new Error('Text send acceptance is unconfirmed')
+      }
       if (
         identity === identityGeneration &&
         organizationScope === activeOrganizationScope.value &&
         currentContact.value?.id === contactId &&
+        (explicitOrganization === undefined || messagesOrganizationScope.value === explicitOrganization) &&
         newMessage?.contact_id === contactId
       ) {
         // Use addMessage which has duplicate checking (WebSocket may also broadcast this).

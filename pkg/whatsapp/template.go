@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/shridarpatil/whatomate/internal/templateutil"
 )
 
 // TemplateSubmission represents a template to be submitted to Meta
@@ -168,6 +170,9 @@ func (c *Client) buildAuthComponents(template *TemplateSubmission) []map[string]
 
 // buildStandardComponents builds Meta API components for MARKETING/UTILITY templates.
 func (c *Client) buildStandardComponents(template *TemplateSubmission) ([]map[string]any, error) {
+	if err := templateutil.ValidateFooter(template.FooterContent); err != nil {
+		return nil, err
+	}
 	components := []map[string]any{}
 
 	isNamedParams := template.ParameterFormat == "named" || hasNamedParams(template.BodyContent)
@@ -248,10 +253,10 @@ func (c *Client) buildStandardComponents(template *TemplateSubmission) ([]map[st
 	components = append(components, body)
 
 	// Footer component
-	if template.FooterContent != "" {
+	if footer := strings.TrimSpace(template.FooterContent); footer != "" {
 		components = append(components, map[string]any{
 			"type": "FOOTER",
-			"text": template.FooterContent,
+			"text": footer,
 		})
 	}
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // ParameterPattern matches template parameters like {{1}}, {{name}}, {{order_id}}
@@ -187,4 +188,17 @@ func ReplaceWithJSONBParams(bodyContent, content string, params map[string]any) 
 		content = strings.ReplaceAll(content, fmt.Sprintf("{{%d}}", i+1), val)
 	}
 	return content
+}
+
+// ValidateFooter checks the static text footer accepted by Meta templates.
+// Count Unicode characters, not UTF-8 bytes, so non-English footers are valid.
+func ValidateFooter(content string) error {
+	content = strings.TrimSpace(content)
+	if utf8.RuneCountInString(content) > 60 {
+		return fmt.Errorf("footer must contain at most 60 characters")
+	}
+	if strings.Contains(content, "{{") || strings.Contains(content, "}}") {
+		return fmt.Errorf("footer cannot contain variables; place variables in the body instead")
+	}
+	return nil
 }

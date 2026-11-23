@@ -500,6 +500,12 @@
     "sendMedia": "Send Media",
     "attachFile": "Attach file",
     "composer": {
+      "textSend": {
+        "accepted": "Message accepted.",
+        "scopeChanged": "The conversation or workspace changed. Reload this conversation before sending.",
+        "sending": "Sending message…",
+        "unconfirmed": "Send status is unconfirmed. Check the conversation before sending again. Your draft has been kept."
+      },
       "formatting": "Text formatting",
       "bold": "Bold",
       "italic": "Italic",
@@ -1058,6 +1064,10 @@
     "exportReport": "Export Report"
   },
   "templates": {
+    "footerHelp": "Optional static text below the body, up to {max} characters. Variables belong in the body.",
+    "footerTooLong": "Footer must contain at most {max} characters.",
+    "footerVariablesNotAllowed": "Footer cannot contain variables. Put variables in the body instead.",
+    "saveChangesBeforePublishing": "Save your changes before publishing.",
     "quality": "Quality",
     "qualityRating": "Quality Rating",
     "title": "Message Templates",

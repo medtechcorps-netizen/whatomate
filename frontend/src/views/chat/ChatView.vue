@@ -131,7 +131,7 @@ import MediaSendDialog from '@/components/chat/MediaSendDialog.vue'
 import ComposerFormatToolbar from '@/components/chat/ComposerFormatToolbar.vue'
 import WhatsAppText from '@/components/chat/WhatsAppText.vue'
 import ChatDropZoneOverlay from '@/components/chat/ChatDropZoneOverlay.vue'
-import { readLogicalSessionMarker, readWorkspaceIdentity, useChatAttachments } from '@/composables/useChatAttachments'
+import { readLogicalSessionMarker, readWorkspaceIdentity, SESSION_ENDING_EVENT, useChatAttachments } from '@/composables/useChatAttachments'
 import { useComposerFormatting } from '@/composables/useComposerFormatting'
 import { CHAT_ATTACHMENT_ACCEPT, filesFromClipboard, summarizeFileNames } from '@/lib/chatAttachments'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
@@ -162,6 +162,55 @@ const messagesEndRef = ref<HTMLElement | null>(null)
 const messagesContentRef = ref<HTMLElement | null>(null)
 const messageInputRef = ref<HTMLTextAreaElement | null>(null)
 const isSending = ref(false)
+// Local request feedback is separate from canonical message delivery status.
+const textSendFeedback = ref<'idle' | 'sending' | 'accepted' | 'unconfirmed' | 'scopeChanged'>('idle')
+let textDraftRevision = 0
+let textReplyRevision = 0
+let textSendScopeRevision = 0
+let activeTextSend: object | null = null
+watch(messageInput, () => { textDraftRevision++ }, { flush: 'sync' })
+watch(
+  () => [contactsStore.replyingTo, contactsStore.replyingTo?.id, contactsStore.replyingTo?.contact_id],
+  () => { textReplyRevision++ },
+  { flush: 'sync' },
+)
+
+function resetTextSendFeedback() {
+  textSendScopeRevision++
+  activeTextSend = null
+  isSending.value = false
+  textSendFeedback.value = 'idle'
+}
+
+function readTextComposerIdentity() {
+  return JSON.stringify([
+    authStore.isAuthenticated, authStore.user?.id, authStore.organizationId,
+    organizationsStore.selectedOrgId || authStore.organizationId, readLogicalSessionMarker(),
+    readWorkspaceIdentity(authStore.organizationId, authStore.user?.id),
+  ])
+}
+let textComposerIdentity = readTextComposerIdentity()
+function retireTextComposerIdentity() {
+  resetTextSendFeedback()
+  messageInput.value = ''
+  contactsStore.clearReplyingTo()
+}
+function syncTextComposerIdentity() {
+  const identity = readTextComposerIdentity()
+  if (identity === textComposerIdentity) return
+  textComposerIdentity = identity
+  retireTextComposerIdentity()
+}
+watch(
+  () => [authStore.isAuthenticated, authStore.user?.id, authStore.organizationId, organizationsStore.selectedOrgId],
+  syncTextComposerIdentity,
+  { flush: 'sync' },
+)
+function onTextSendStorage(event: StorageEvent) {
+  if (event.key === null || ['whm_session_id', 'user', 'selected_organization_id'].includes(event.key)) {
+    syncTextComposerIdentity()
+  }
+}
 const isAssignDialogOpen = ref(false)
 const isTransferring = ref(false)
 const isResuming = ref(false)
@@ -597,6 +646,14 @@ const messageMenuScope = computed(() => JSON.stringify([
   selectedAccount.value,
 ]))
 
+// Scope changes retire only local request feedback, never a provider request.
+// A later completion cannot release a newer attempt or clear a replacement draft.
+watch(
+  () => [messageMenuScope.value, contactsStore.messagesOrganizationScope],
+  resetTextSendFeedback,
+  { flush: 'sync' },
+)
+
 // Get active transfer for current contact from the store (reactive)
 const activeTransfer = computed(() => {
   if (!contactsStore.currentContact) return null
@@ -871,6 +928,8 @@ async function executeCustomAction(action: CustomAction) {
 // Fetch contacts on mount (WebSocket is connected in AppLayout)
 onMounted(async () => {
   chatViewMounted = true
+  window.addEventListener(SESSION_ENDING_EVENT, retireTextComposerIdentity)
+  window.addEventListener('storage', onTextSendStorage)
   // Ensure auth session is restored
   if (!authStore.isAuthenticated) {
     authStore.restoreSession()
@@ -1015,6 +1074,9 @@ function onChatOnline() {
 
 onUnmounted(() => {
   chatViewMounted = false
+  window.removeEventListener(SESSION_ENDING_EVENT, retireTextComposerIdentity)
+  window.removeEventListener('storage', onTextSendStorage)
+  resetTextSendFeedback()
   canonicalCatchUpQueued = false
   readCursorCheckQueued = false
   if (visibleBoundaryFrame !== null) {
@@ -1132,6 +1194,7 @@ function startMessagesContentResizeObserver(generation: number, contactID: strin
 }
 
 function invalidateContactSelection() {
+  resetTextSendFeedback()
   contactSelectionGeneration++
   conversationAIStateGeneration++
   conversationAIStateLoadingForContact.value = null
@@ -1359,36 +1422,88 @@ async function markChatUnread(contactID: string) {
   }
 }
 
+function onTextSendEnter(event: KeyboardEvent) {
+  // Let IME confirmation finish; Shift+Enter does not enter this exact-key handler.
+  if (event.isComposing || event.keyCode === 229) return
+  event.preventDefault()
+  if (event.repeat) return
+  void sendMessage()
+}
+
 async function sendMessage() {
-  if (!messageInput.value.trim() || !contactsStore.currentContact) return
+  if (isSending.value || !messageInput.value.trim() || !contactsStore.currentContact) return
 
   const contactIdAtSend = contactsStore.currentContact.id
+  const organizationId = organizationsStore.selectedOrgId || authStore.organizationId || ''
+  const sessionMarker = readLogicalSessionMarker()
+  if (!authStore.isAuthenticated || !authStore.user?.id || !sessionMarker ||
+      !organizationId.trim() || contactsStore.messagesOrganizationScope !== organizationId ||
+      contactId.value !== contactIdAtSend) {
+    textSendFeedback.value = 'scopeChanged'
+    return
+  }
   const selectionGeneration = contactSelectionGeneration
+  const scopeRevision = textSendScopeRevision
+  const menuScope = messageMenuScope.value
+  const workspaceIdentity = readWorkspaceIdentity(authStore.organizationId, authStore.user.id)
   const bodyAtSend = messageInput.value
+  const draftRevision = textDraftRevision
+  const replyRevision = textReplyRevision
+  const reply = contactsStore.replyingTo
+  // Keep a stale/foreign quote out of this request without discarding the reply bar.
+  const replyId = reply?.contact_id === contactIdAtSend ? reply.id : undefined
+  const accountAtSend = selectedAccount.value || undefined
+  const attempt = {}
+  activeTextSend = attempt
   isSending.value = true
+  textSendFeedback.value = 'sending'
+  const isCurrent = () => activeTextSend === attempt && chatViewMounted &&
+    scopeRevision === textSendScopeRevision && menuScope === messageMenuScope.value &&
+    sessionMarker === readLogicalSessionMarker() &&
+    workspaceIdentity === readWorkspaceIdentity(authStore.organizationId, authStore.user?.id) &&
+    contactsStore.messagesOrganizationScope === organizationId &&
+    isContactSelectionActive(selectionGeneration, contactIdAtSend)
   try {
-    await contactsStore.sendMessage(
+    const message = await contactsStore.sendMessage(
       contactIdAtSend,
       'text',
       { body: bodyAtSend },
-      contactsStore.replyingTo?.id,
-      selectedAccount.value || undefined
+      replyId,
+      accountAtSend,
+      { organizationId },
     )
-    if (!isContactSelectionActive(selectionGeneration, contactIdAtSend)) return
-    messageInput.value = ''
-    contactsStore.clearReplyingTo()
-    resetTextareaHeight()
-    await nextTick()
-    scrollToBottom(false, () =>
-      isContactSelectionActive(selectionGeneration, contactIdAtSend),
-    )
-  } catch (error) {
-    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
-      toast.error(getErrorMessage(error, t('chat.sendMessageFailed')))
+    if (!isCurrent()) return
+    // A resolved promise alone is not server acceptance, nor is acceptance delivery.
+    if (!message || typeof message.id !== 'string' || !message.id.trim() ||
+        message.contact_id !== contactIdAtSend || message.direction !== 'outgoing' ||
+        message.message_type !== 'text' || typeof message.whatsapp_account !== 'string' ||
+        !message.whatsapp_account.trim() || (accountAtSend && message.whatsapp_account !== accountAtSend) ||
+        !['pending', 'sent', 'delivered', 'read', 'failed'].includes(message.status)) {
+      textSendFeedback.value = 'unconfirmed'
+      return
+    }
+    textSendFeedback.value = 'accepted'
+    if (textDraftRevision === draftRevision) {
+      messageInput.value = ''
+      resetTextareaHeight()
+    }
+    if (replyId && textReplyRevision === replyRevision && contactsStore.replyingTo?.id === replyId) {
+      contactsStore.clearReplyingTo()
+    }
+    // Editing the next draft must not move its caret or a scrolled-up reader.
+    if (isAtBottom.value) {
+      await nextTick()
+      if (isCurrent()) scrollToBottom(false, isCurrent)
+    }
+  } catch {
+    if (isCurrent()) {
+      // A lost answer or a server error can follow commit. Keep the draft; do not resend.
+      textSendFeedback.value = 'unconfirmed'
     }
   } finally {
-    if (isContactSelectionActive(selectionGeneration, contactIdAtSend)) {
+    if (activeTextSend === attempt) {
       isSending.value = false
+      if (!isCurrent()) resetTextSendFeedback()
     }
   }
 }
@@ -3165,6 +3280,9 @@ watch(contactId, () => chatAttachments.reset())
         <!-- Message Input -->
         <div class="p-4 border-t border-white/[0.08] light:border-gray-200 bg-[#0f0f10] light:bg-white">
           <ComposerFormatToolbar class="-mt-2 mb-1.5" @format="composerFormatting.applyFormat" />
+          <p id="text-send-feedback" role="status" aria-live="polite" aria-atomic="true" class="text-xs text-muted-foreground mb-1.5" data-testid="text-send-feedback">
+            <span v-if="textSendFeedback !== 'idle'">{{ $t('chat.composer.textSend.' + textSendFeedback) }}</span>
+          </p>
           <form @submit.prevent="sendMessage" class="flex items-center gap-2 p-2 rounded-xl bg-white/[0.06] light:bg-gray-100 border border-white/[0.08] light:border-gray-200">
             <Tooltip>
               <TooltipTrigger as-child>
@@ -3234,13 +3352,15 @@ watch(contactId, () => chatAttachments.reset())
               :placeholder="$t('chat.typeMessage') + '...'"
               rows="1"
               class="flex-1 bg-transparent text-[14px] text-white light:text-gray-900 placeholder:text-white/30 light:placeholder:text-gray-400 focus:outline-none resize-none min-h-[36px] max-h-[120px] py-2 overflow-y-auto"
-              @keydown.enter.exact.prevent="sendMessage"
+              aria-describedby="text-send-feedback"
+              @keydown.enter.exact="onTextSendEnter"
               @keydown="composerFormatting.onKeydown"
               @paste="handleComposerPaste"
               @input="autoResizeTextarea"
             />
-            <button type="submit" class="w-9 h-9 rounded-lg bg-emerald-600 hover:bg-emerald-500 light:bg-emerald-500 light:hover:bg-emerald-600 flex items-center justify-center transition-colors disabled:opacity-50" :disabled="!messageInput.trim() || isSending">
-              <Send class="w-4 h-4 text-white" />
+            <button type="submit" class="w-9 h-9 rounded-lg bg-emerald-600 hover:bg-emerald-500 light:bg-emerald-500 light:hover:bg-emerald-600 flex items-center justify-center transition-colors disabled:opacity-50" :disabled="!messageInput.trim() || isSending" :aria-label="$t('chat.send')" :aria-busy="isSending">
+              <Loader2 v-if="isSending" class="w-4 h-4 text-white animate-spin motion-reduce:animate-none" aria-hidden="true" data-testid="text-send-spinner" />
+              <Send v-else class="w-4 h-4 text-white" aria-hidden="true" />
             </button>
           </form>
         </div>

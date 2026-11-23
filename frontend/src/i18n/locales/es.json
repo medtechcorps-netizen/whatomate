@@ -288,6 +288,14 @@
     "goAway": "Ausentarse"
   },
   "chat": {
+    "composer": {
+      "textSend": {
+        "accepted": "Mensaje aceptado.",
+        "scopeChanged": "La conversación o el espacio de trabajo ha cambiado. Vuelve a cargar esta conversación antes de enviar.",
+        "sending": "Enviando mensaje…",
+        "unconfirmed": "El estado del envío no está confirmado. Revisa la conversación antes de volver a enviar. Se ha conservado tu borrador."
+      }
+    },
     "conversations": "Conversaciones",
     "messages": "Mensajes",
     "noContacts": "No se encontraron contactos",
@@ -785,6 +793,10 @@
     "exportReport": "Exportar reporte"
   },
   "templates": {
+    "footerHelp": "Texto fijo opcional debajo del cuerpo del mensaje, de hasta {max} caracteres. Añade las variables al cuerpo del mensaje.",
+    "footerTooLong": "El pie de página no puede superar los {max} caracteres.",
+    "footerVariablesNotAllowed": "El pie de página no puede contener variables. Añade las variables al cuerpo del mensaje.",
+    "saveChangesBeforePublishing": "Guarda los cambios antes de publicar.",
     "title": "Plantillas de mensaje",
     "subtitle": "Crear y gestionar plantillas de mensajes de WhatsApp",
     "newTemplate": "Nueva plantilla",

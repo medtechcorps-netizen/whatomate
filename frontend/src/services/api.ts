@@ -2441,7 +2441,13 @@ export const messagesService = {
       // server derives type and content; type/content are ignored.
       forward_of_message_id?: string;
     },
-  ) => api.post(`/contacts/${contactId}/messages`, data),
+    options: { organizationId?: string; signal?: AbortSignal } = {},
+  ) => options.organizationId === undefined && options.signal === undefined
+    ? api.post(`/contacts/${contactId}/messages`, data)
+    : api.post(`/contacts/${contactId}/messages`, data, {
+      signal: options.signal,
+      ...(options.organizationId ? { headers: { 'X-Organization-ID': options.organizationId } } : {}),
+    }),
   sendTemplate: (
     contactId: string,
     data: {

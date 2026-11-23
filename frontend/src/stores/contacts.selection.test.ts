@@ -96,6 +96,129 @@ describe('contacts store conversation selection', () => {
     mocks.readSelectedOrganizationId.mockReturnValue(null)
   })
 
+  describe('captured native text send', () => {
+    async function scopedStore() {
+      mocks.sendMessage.mockReset()
+      const { useOrganizationsStore } = await import('./organizations')
+      useOrganizationsStore().selectedOrgId = 'organization-a'
+      const { useContactsStore } = await import('./contacts')
+      const store = useContactsStore()
+      store.setCurrentContact(contact('first'))
+      store.messagesOrganizationScope = 'organization-a'
+      return store
+    }
+    function accepted(id = 'accepted'): Message {
+      return { ...message(id, 'first'), direction: 'outgoing', status: 'pending', whatsapp_account: 'account-a' }
+    }
+
+    it('pins the captured workspace through the service option before persistence changes', async () => {
+      const store = await scopedStore()
+      const response = deferred<{ data: { data: Message } }>()
+      mocks.sendMessage.mockReturnValueOnce(response.promise)
+      const send = store.sendMessage('first', 'text', { body: 'Private draft' }, 'quote', 'account-a', { organizationId: 'organization-a' })
+      mocks.readSelectedOrganizationId.mockReturnValue('organization-b')
+      expect(mocks.sendMessage).toHaveBeenCalledWith('first', {
+        type: 'text', content: { body: 'Private draft' }, reply_to_message_id: 'quote', whatsapp_account: 'account-a',
+      }, { organizationId: 'organization-a' })
+      response.resolve({ data: { data: accepted() } })
+      await send
+      expect(mocks.sendMessage).toHaveBeenCalledTimes(1)
+      expect(store.messages.map(item => item.id)).toEqual(['accepted'])
+    })
+
+    it.each(['', 'organization-b'])('refuses explicit workspace %s before a request', async organizationId => {
+      const store = await scopedStore()
+      await expect(store.sendMessage('first', 'text', { body: 'Private draft' }, undefined, undefined, { organizationId })).rejects.toThrow('workspace changed')
+      expect(mocks.sendMessage).not.toHaveBeenCalled()
+      expect(store.messages).toEqual([])
+    })
+
+    it('refuses a stale transcript or another contact before a request', async () => {
+      const store = await scopedStore()
+      store.messagesOrganizationScope = 'organization-b'
+      await expect(store.sendMessage('first', 'text', { body: 'Private draft' }, undefined, undefined, { organizationId: 'organization-a' })).rejects.toThrow('workspace changed')
+      store.messagesOrganizationScope = 'organization-a'
+      await expect(store.sendMessage('second', 'text', { body: 'Private draft' }, undefined, undefined, { organizationId: 'organization-a' })).rejects.toThrow('workspace changed')
+      expect(mocks.sendMessage).not.toHaveBeenCalled()
+    })
+
+    it('joins socket first by canonical id without downgrading status or losing the reply preview', async () => {
+      const store = await scopedStore()
+      const response = deferred<{ data: { data: Message } }>()
+      mocks.sendMessage.mockReturnValueOnce(response.promise)
+      const send = store.sendMessage('first', 'text', { body: 'Body' }, 'quote', 'account-a', { organizationId: 'organization-a' })
+      store.addMessage({ ...accepted(), status: 'delivered' })
+      const late = { ...accepted(), reply_to_message_id: 'quote', reply_to_message: { id: 'quote', content: { body: 'Quoted' }, message_type: 'text', direction: 'incoming' as const } }
+      response.resolve({ data: { data: late } })
+      await send
+      expect(store.messages).toHaveLength(1)
+      expect(store.messages[0]).toMatchObject({ id: 'accepted', status: 'delivered', reply_to_message_id: 'quote' })
+      expect(store.messages[0].reply_to_message?.content.body).toBe('Quoted')
+      expect(mocks.sendMessage).toHaveBeenCalledTimes(1)
+    })
+
+    it('joins response first with its socket echo without creating a local message', async () => {
+      const store = await scopedStore()
+      mocks.sendMessage.mockResolvedValueOnce({ data: { data: accepted() } })
+      await store.sendMessage('first', 'text', { body: 'Body' }, undefined, 'account-a', { organizationId: 'organization-a' })
+      store.addMessage(accepted())
+      store.updateMessageStatus('accepted', 'sent')
+      expect(store.messages).toHaveLength(1)
+      expect(store.messages[0]).toMatchObject({ id: 'accepted', status: 'sent' })
+    })
+
+    it.each<[string, Partial<Message>]>([
+      ['id', { id: '' }], ['contact', { contact_id: 'second' }], ['account', { whatsapp_account: 'account-b' }],
+      ['direction', { direction: 'incoming' }], ['type', { message_type: 'image' }], ['status', { status: 'invented' }],
+    ])('rejects a noncanonical %s response without appending or resending', async (_kind, fields) => {
+      const store = await scopedStore()
+      mocks.sendMessage.mockResolvedValueOnce({ data: { data: { ...accepted(), ...fields } } })
+      await expect(store.sendMessage('first', 'text', { body: 'Body' }, undefined, 'account-a', { organizationId: 'organization-a' })).rejects.toThrow('unconfirmed')
+      expect(store.messages).toEqual([])
+      expect(mocks.sendMessage).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps late acceptance out of a replacement identity transcript', async () => {
+      const store = await scopedStore()
+      const response = deferred<{ data: { data: Message } }>()
+      mocks.sendMessage.mockReturnValueOnce(response.promise)
+      const send = store.sendMessage('first', 'text', { body: 'Body' }, undefined, 'account-a', { organizationId: 'organization-a' })
+      store.resetForIdentityChange()
+      store.setCurrentContact(contact('first'))
+      store.messagesOrganizationScope = 'organization-a'
+      store.messages = [message('replacement', 'first')]
+      response.resolve({ data: { data: accepted() } })
+      await send
+      expect(store.messages.map(item => item.id)).toEqual(['replacement'])
+      expect(mocks.sendMessage).toHaveBeenCalledTimes(1)
+    })
+
+
+    it('keeps captured acceptance out of a transcript whose workspace changed', async () => {
+      const store = await scopedStore()
+      const response = deferred<{ data: { data: Message } }>()
+      mocks.sendMessage.mockReturnValueOnce(response.promise)
+      const send = store.sendMessage('first', 'text', { body: 'Body' }, undefined, 'account-a', { organizationId: 'organization-a' })
+      store.messagesOrganizationScope = 'organization-b'
+      store.messages = [message('replacement', 'first')]
+      response.resolve({ data: { data: accepted() } })
+      await send
+      expect(store.messages.map(item => item.id)).toEqual(['replacement'])
+      expect(mocks.sendMessage).toHaveBeenCalledTimes(1)
+    })
+
+    it('preserves the account filter when another account acceptance arrives', async () => {
+      const store = await scopedStore()
+      const response = deferred<{ data: { data: Message } }>()
+      mocks.sendMessage.mockReturnValueOnce(response.promise)
+      const send = store.sendMessage('first', 'text', { body: 'Body' }, undefined, 'account-a', { organizationId: 'organization-a' })
+      store.setAccountFilter('account-b')
+      response.resolve({ data: { data: accepted() } })
+      await send
+      expect(store.messages).toEqual([])
+    })
+  })
+
   it('does not select a contact merely because its deep-link lookup finishes', async () => {
     const { useContactsStore } = await import('./contacts')
     const store = useContactsStore()
