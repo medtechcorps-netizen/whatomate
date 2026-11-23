@@ -69,7 +69,11 @@ function verifyScenarioProvenance(source) {
     const pattern = new RegExp(`(?:export )?(?:async )?function ${name}\\([^]*?(?=\\n(?:export |async )?function |\\nexport class |$)`)
     const match = port.match(pattern)
     assert.ok(match, `missing original helper: ${name}`)
-    assert.equal(hash(match[0]), provenance.helpers_sha256[name], name)
+    // Only the unavailable-inventory error text can differ from the frozen helper.
+    const originalHelper = name === 'loadLiveFixtureConversation'
+      ? match[0].replace('fail(fixtureInventoryFailure(response.status));', 'fail("live fixture inventory is unavailable");')
+      : match[0]
+    assert.equal(hash(originalHelper), provenance.helpers_sha256[name], name)
   }
 }
 test('all 13 scenario methods retain the original assertion bytes', () => {
@@ -81,6 +85,7 @@ test('historical provenance refuses changed assertions and missing helpers', () 
     source.replace('  async klinik_whatsapp_outbound(', '  async renamed_outbound('),
     source.replace('function scrollMetrics(', 'function missingScrollMetrics('),
     source.replace('  async requireDenied(', '  async requireDenied( /* altered assertion */ '),
+    source.replace('fail(fixtureInventoryFailure(response.status));', 'fail(fixtureInventoryFailure(402));'),
   ]) {
     assert.notEqual(changed, source)
     assert.throws(() => verifyScenarioProvenance(changed))
@@ -201,6 +206,74 @@ test('prepare reports only the failed fixed phase for each setup operation', asy
       `[canary-phase] failed=${failedPhase}`,
       `[canary] ${check.title}: failed`,
     ])
+  }
+})
+
+test('fixture conversation diagnostics report only fixed request failure codes', async t => {
+  const testCase = { title: CHECK_EXECUTION_ORDER[0], expectedStatus: 'passed', outcome: () => 'unexpected' }
+  const phase = CANARY_FAILURE_PHASES.prepareFixtureConversations
+  const output = []
+  t.mock.method(console, 'log', value => output.push(value))
+
+  const cases = [
+    [0, true, null, 'fixture-request-indeterminate'],
+    [401, false, null, 'fixture-request-auth'],
+    [403, false, null, 'fixture-request-auth'],
+    [402, false, { detail: 'synthetic-private-response-marker' }, 'fixture-entitlement'],
+    [503, false, null, 'fixture-request-http'],
+    [200, true, null, 'fixture-list-wire'],
+    [200, false, { conversations: 'synthetic-private-response-marker' }, 'fixture-list-wire'],
+    [200, false, { conversations: [] }, 'fixture-row-cardinality'],
+  ]
+  for (const [status, invalid, json, expected] of cases) {
+    const scenario = new LiveProductScenario({
+      descriptor: { klinik: { organization_id: 'synthetic-fixture-org', conversations: {
+        a: { sender_wa_id: '999000000001' },
+        b: { sender_wa_id: '999000000002' },
+      } } },
+    })
+    scenario.pages.omniPrimary = { evaluate: async () => ({ status, invalid, json }) }
+    const reporter = new PrivateReporter()
+    const result = { status: 'failed', retry: 0, errors: [] }
+
+    await assert.rejects(scenario.prepare(async (name, operation) => {
+      if (name === phase) await operation()
+    }), error => {
+      reporter.onStepEnd(testCase, result, { category: 'test.step', title: phase, error })
+      return true
+    })
+    reporter.onTestEnd(testCase, result)
+
+    assert.deepEqual(output.splice(0), [
+      '[canary-phase] failed=prepare-fixture-conversations',
+      '[canary-predicate] code=' + expected,
+      '[canary] ' + testCase.title + ': failed',
+    ], 'response status ' + status)
+  }
+})
+
+test('fixture conversation diagnostics drop arbitrary, ambiguous, or retried error text', t => {
+  const testCase = { title: CHECK_EXECUTION_ORDER[0], expectedStatus: 'passed', outcome: () => 'unexpected' }
+  const phase = CANARY_FAILURE_PHASES.prepareFixtureConversations
+  const allowed = 'SyntheticCanaryFailure: live fixture unread state is invalid'
+  const output = []
+  t.mock.method(console, 'log', value => output.push(value))
+
+  const cases = [
+    { messages: [allowed], retry: 0, phase, expected: ['[canary-phase] failed=prepare-fixture-conversations', '[canary-predicate] code=fixture-unread-invalid'] },
+    { messages: [allowed + ' synthetic-private-marker'], retry: 0, phase, expected: ['[canary-phase] failed=prepare-fixture-conversations'] },
+    { messages: [allowed, allowed], retry: 0, phase, expected: [] },
+    { messages: [allowed], retry: 1, phase, expected: [] },
+    { messages: [allowed], retry: 0, phase: CANARY_FAILURE_PHASES.prepareViews, expected: ['[canary-phase] failed=prepare-views'] },
+  ]
+  for (const { messages, retry, phase: title, expected } of cases) {
+    const reporter = new PrivateReporter()
+    const result = { status: 'failed', retry, errors: [] }
+    for (const message of messages) {
+      reporter.onStepEnd(testCase, result, { category: 'test.step', title, error: { message } })
+    }
+    reporter.onTestEnd(testCase, result)
+    assert.deepEqual(output.splice(0), [...expected, '[canary] ' + testCase.title + ': failed'])
   }
 })
 

@@ -530,6 +530,22 @@ export function validateRefreshedServiceWindow(value, now) {
   return true;
 }
 
+function fixtureInventoryFailure(status) {
+  switch (status) {
+    case 0:
+      return "live fixture inventory request is indeterminate";
+    case 401:
+    case 403:
+      return "live fixture inventory authorization failed";
+    case 402:
+      return "live fixture inventory entitlement is unavailable";
+    case 200:
+      return "live fixture inventory response is invalid";
+    default:
+      return "live fixture inventory is unavailable";
+  }
+}
+
 async function loadLiveFixtureConversation(page, descriptor, fixture) {
   const response = await pageFetch(
     page,
@@ -542,7 +558,7 @@ async function loadLiveFixtureConversation(page, descriptor, fixture) {
     },
   );
   if (response.status !== 200 || response.invalid) {
-    fail("live fixture inventory is unavailable");
+    fail(fixtureInventoryFailure(response.status));
   }
   const matches = unwrapList(response.json, "conversations").filter(
     (conversation) =>
