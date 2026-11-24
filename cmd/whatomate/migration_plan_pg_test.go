@@ -292,9 +292,26 @@ func TestMigrationPlanPGRuntimeDisposedBeforeOwnerAndPoolLimits(t *testing.T) {
 					t.Fatal("planner did not return")
 				}
 			}
-			var remaining int
-			planPGOK(t, f.admin.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE datname=$1 AND application_name IN ($2,$3)", f.database, planRuntimeName, planOwnerName).Scan(&remaining), "verify observer disposal")
-			require.Zero(t, remaining)
+			// Local driver cleanup can complete before PostgreSQL removes the
+			// backend from pg_stat_activity. Keep the pre-owner barrier strict and
+			// allow only brief server-side visibility lag after the planner returns.
+			disposalCtx, stopDisposal := context.WithTimeout(ctx, time.Second)
+			defer stopDisposal()
+			disposalTick := time.NewTicker(10 * time.Millisecond)
+			defer disposalTick.Stop()
+			for {
+				var remaining int
+				planPGOK(t, f.admin.QueryRow(disposalCtx, "SELECT count(*) FROM pg_stat_activity WHERE datname=$1 AND application_name IN ($2,$3)", f.database, planRuntimeName, planOwnerName).Scan(&remaining), "verify observer disposal")
+				if remaining == 0 {
+					require.NoError(t, disposalCtx.Err(), "observe disposed backends before the deadline")
+					break
+				}
+				select {
+				case <-disposalCtx.Done():
+					t.Fatalf("observer disposal deadline reached with %d backends still visible", remaining)
+				case <-disposalTick.C:
+				}
+			}
 			require.Equal(t, "spent", state.observe(ctx).incomplete[0].Code, "no reconnect on repeated callback")
 			relay.mu.Lock()
 			attempts := relay.attempts
