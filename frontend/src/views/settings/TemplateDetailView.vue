@@ -448,8 +448,23 @@ watch(() => form.value.category, (newCat, oldCat) => {
   }
 })
 
+const maxFooterCharacters = 60
+const footerText = computed(() => form.value.footer_content.trim())
+const footerCharacterCount = computed(() => Array.from(footerText.value).length)
+const footerError = computed(() => {
+  if (isAuthentication.value) return ''
+  if (footerCharacterCount.value > maxFooterCharacters) {
+    return t('templates.footerTooLong', { max: maxFooterCharacters })
+  }
+  if (footerText.value.includes('{{') || footerText.value.includes('}}')) {
+    return t('templates.footerVariablesNotAllowed')
+  }
+  return ''
+})
+
 async function save() {
-  if (!canWrite.value) return
+  if (!canWrite.value || isSaving.value || isPublishing.value) return
+  if (footerError.value) { toast.error(footerError.value); return }
 
   if (!form.value.name.trim()) {
     toast.error(t('templates.nameRequired', 'Template name is required'))
@@ -510,7 +525,7 @@ async function save() {
       header_type: isAuthentication.value ? 'NONE' : form.value.header_type,
       header_content: isAuthentication.value ? '' : form.value.header_content,
       body_content: isAuthentication.value ? '{{1}} is your verification code.' : form.value.body_content,
-      footer_content: isAuthentication.value ? '' : form.value.footer_content,
+      footer_content: isAuthentication.value ? '' : footerText.value,
       buttons: form.value.buttons,
       sample_values: form.value.sample_values,
       add_security_recommendation: form.value.add_security_recommendation,
@@ -600,7 +615,12 @@ const canPublish = computed(() => {
 })
 
 async function confirmPublish() {
-  if (!canWrite.value || !template.value) return
+  if (!canWrite.value || !template.value || isPublishing.value || isSaving.value) return
+  if (hasChanges.value) {
+    toast.error(t('templates.saveChangesBeforePublishing'))
+    return
+  }
+  if (footerError.value) { toast.error(footerError.value); return }
   isPublishing.value = true
   try {
     const response = await api.post(`/templates/${template.value.id}/publish`)
@@ -680,12 +700,15 @@ onMounted(async () => {
         <Button v-if="!isNew" variant="outline" size="sm" @click="isPreviewOpen = true">
           <Eye class="h-4 w-4 mr-1" /> {{ $t('templates.preview', 'Preview') }}
         </Button>
-        <Button v-if="canPublish" variant="outline" size="sm" @click="publishDialogOpen = true" :disabled="isPublishing">
+        <span v-if="canPublish && hasChanges" class="text-xs text-muted-foreground">
+          {{ $t('templates.saveChangesBeforePublishing') }}
+        </span>
+        <Button v-if="canPublish" variant="outline" size="sm" @click="publishDialogOpen = true" :disabled="isPublishing || isSaving || hasChanges || Boolean(footerError)">
           <Loader2 v-if="isPublishing" class="h-4 w-4 mr-1 animate-spin" />
           <Send v-else class="h-4 w-4 mr-1" />
           {{ template?.meta_template_id ? $t('templates.republish', 'Republish') : $t('templates.publish', 'Publish') }}
         </Button>
-        <Button v-if="canWrite && (hasChanges || isNew)" size="sm" @click="save" :disabled="isSaving">
+        <Button v-if="canWrite && (hasChanges || isNew)" size="sm" @click="save" :disabled="isSaving || isPublishing">
           <Save class="h-4 w-4 mr-1" /> {{ isSaving ? $t('common.saving', 'Saving...') : isNew ? $t('common.create') : $t('common.save') }}
         </Button>
         <Button v-if="canDelete && !isNew" variant="destructive" size="sm" @click="deleteDialogOpen = true">
@@ -1015,6 +1038,22 @@ onMounted(async () => {
           </div>
         </div>
 
+        <div v-if="!isAuthentication" class="space-y-1.5">
+          <Label for="template-footer" class="text-xs">{{ $t('templates.footer') }}</Label>
+          <Textarea
+            id="template-footer"
+            v-model="form.footer_content"
+            :rows="2"
+            :disabled="!canWrite || !isEditable"
+            :aria-invalid="Boolean(footerError)"
+            aria-describedby="template-footer-help"
+          />
+          <p id="template-footer-help" class="text-xs" :class="footerError ? 'text-destructive' : 'text-muted-foreground'">
+            {{ footerError || $t('templates.footerHelp', { max: maxFooterCharacters }) }}
+            {{ footerCharacterCount }}/{{ maxFooterCharacters }}
+          </p>
+        </div>
+
         <!-- Buttons (hidden for auth templates — OTP managed via selector above) -->
         <div v-if="!isAuthentication" class="space-y-3">
           <div class="flex items-center justify-between">
@@ -1144,14 +1183,6 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div v-if="!isAuthentication" class="space-y-1.5">
-          <Label class="text-xs">{{ $t('templates.footerContent', 'Footer Content') }}</Label>
-          <Textarea
-            v-model="form.footer_content"
-            :rows="2"
-            :disabled="!canWrite || !isEditable"
-          />
-        </div>
         </CardContent>
     </Card>
 
@@ -1286,7 +1317,7 @@ onMounted(async () => {
       </AlertDialogHeader>
       <AlertDialogFooter>
         <AlertDialogCancel>{{ $t('common.cancel') }}</AlertDialogCancel>
-        <AlertDialogAction @click="confirmPublish" :disabled="isPublishing">
+        <AlertDialogAction @click="confirmPublish" :disabled="isPublishing || isSaving || hasChanges || Boolean(footerError)">
           {{ template?.meta_template_id ? $t('templates.republish', 'Republish') : $t('templates.publish', 'Publish') }}
         </AlertDialogAction>
       </AlertDialogFooter>

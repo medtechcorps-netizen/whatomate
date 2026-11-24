@@ -6,6 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ChatViewComponent from './ChatView.vue'
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 
+// The request client is mocked; retain the logical-session boundary used by text sends.
+vi.mock('@/lib/tabSession', () => ({
+  currentTabSession: () => {
+    const marker = localStorage.getItem('whm_session_id')
+    return marker?.startsWith('ended:') ? null : marker
+  },
+}))
+
 const mocks = vi.hoisted(() => ({
   routeSource: { params: { contactId: 'first' as string | undefined } },
   route: null as { params: { contactId?: string } } | null,
@@ -311,6 +319,7 @@ describe('ChatView conversation selection', () => {
   let wrapper: VueWrapper | null = null
 
   beforeEach(() => {
+    localStorage.setItem('whm_session_id', 'selection-test-session')
     vi.useFakeTimers()
     vi.clearAllMocks()
     mocks.infiniteControllers = []
@@ -391,6 +400,7 @@ describe('ChatView conversation selection', () => {
   })
 
   afterEach(() => {
+    localStorage.removeItem('whm_session_id')
     wrapper?.unmount()
     wrapper = null
     vi.runOnlyPendingTimers()
@@ -985,6 +995,7 @@ describe('ChatView conversation selection', () => {
     mocks.fetchMessages.mockResolvedValue(undefined)
     const pendingSend = deferredValue<unknown>()
     mocks.contactsStore!.sendMessage.mockReturnValue(pendingSend.promise)
+    mocks.contactsStore!.messagesOrganizationScope = 'organization-1'
 
     wrapper = shallowMount(ChatViewComponent, {
       global: {
@@ -1017,6 +1028,7 @@ describe('ChatView conversation selection', () => {
       { body: 'Contact A draft' },
       undefined,
       undefined,
+      { organizationId: 'organization-1' },
     )
 
     mocks.route!.params.contactId = 'second'
@@ -1038,6 +1050,81 @@ describe('ChatView conversation selection', () => {
     expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
     expect(mocks.scrollIntoView).not.toHaveBeenCalled()
     expect(mocks.contactsStore!.currentContact.id).toBe('second')
+  })
+
+
+  it('keeps a returned-to-contact draft and newer request owned when the first request completes', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.contactsStore!.messagesOrganizationScope = 'organization-1'
+    const first = deferredValue<unknown>()
+    const second = deferredValue<unknown>()
+    mocks.contactsStore!.sendMessage.mockReset().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    wrapper = mountChatView()
+    await flushPromises()
+    await wrapper.get('textarea').setValue('First visit')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    mocks.route!.params.contactId = 'second'
+    await flushPromises()
+    mocks.route!.params.contactId = 'first'
+    await flushPromises()
+    mocks.contactsStore!.messagesOrganizationScope = 'organization-1'
+    await wrapper.get('textarea').setValue('Returned draft')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    first.resolve({ id: 'old', contact_id: 'first', direction: 'outgoing', message_type: 'text', status: 'pending', whatsapp_account: 'account-a' })
+    await flushPromises()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('Returned draft')
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.sending')
+    second.resolve({ id: 'new', contact_id: 'first', direction: 'outgoing', message_type: 'text', status: 'pending', whatsapp_account: 'account-a' })
+    await flushPromises()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not force a scrolled-up reader to the bottom after text acceptance', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.contactsStore!.messagesOrganizationScope = 'organization-1'
+    const pending = deferredValue<unknown>()
+    mocks.contactsStore!.sendMessage.mockReset().mockReturnValueOnce(pending.promise)
+    wrapper = mountChatView()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(50)
+    const view = wrapper.vm as any
+    view.isAtBottom = false
+    await wrapper.get('textarea').setValue('Draft')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    mocks.scrollIntoView.mockClear()
+    pending.resolve({ id: 'accepted', contact_id: 'first', direction: 'outgoing', message_type: 'text', status: 'pending', whatsapp_account: 'account-a' })
+    await flushPromises()
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
+    expect(mocks.scrollIntoView).not.toHaveBeenCalled()
+  })
+
+  it('removes text request identity listeners when the composer unmounts', async () => {
+    mocks.fetchMessages.mockResolvedValue(undefined)
+    mocks.contactsStore!.messagesOrganizationScope = 'organization-1'
+    const add = vi.spyOn(window, 'addEventListener')
+    const remove = vi.spyOn(window, 'removeEventListener')
+    const pending = deferredValue<unknown>()
+    mocks.contactsStore!.sendMessage.mockReset().mockReturnValueOnce(pending.promise)
+    wrapper = mountChatView()
+    await flushPromises()
+    await wrapper.get('textarea').setValue('Draft')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    const listeners = add.mock.calls.filter(([name, listener]) =>
+      (name === 'rereply:session-ending' || name === 'storage') && typeof listener === 'function' &&
+      ['retireTextComposerIdentity', 'onTextSendStorage'].includes(listener.name),
+    )
+    expect(listeners).toHaveLength(2)
+    wrapper.unmount()
+    wrapper = null
+    for (const [name, listener] of listeners) expect(remove).toHaveBeenCalledWith(name, listener)
+    pending.resolve({ id: 'accepted', contact_id: 'first', direction: 'outgoing', message_type: 'text', status: 'pending', whatsapp_account: 'account-a' })
+    await flushPromises()
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+    add.mockRestore()
+    remove.mockRestore()
   })
 
   it('catches up canonical native Chat state every thirty visible seconds', async () => {

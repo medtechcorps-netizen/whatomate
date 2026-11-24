@@ -388,6 +388,12 @@ func (a *App) SubmitTemplate(r *fastglue.Request) error {
 				template.HeaderType, strings.ToLower(template.HeaderType)), nil, "")
 	}
 
+	if !strings.EqualFold(template.Category, "AUTHENTICATION") {
+		if err := whatsapp.ValidateTemplateFooter(template.FooterContent); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
+		}
+	}
+
 	// Get the WhatsApp account
 	account, err := a.resolveWhatsAppAccount(orgID, template.WhatsAppAccount)
 	if err != nil {

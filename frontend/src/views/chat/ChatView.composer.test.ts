@@ -220,6 +220,11 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+function acceptedTextMessage(id = 'accepted-text', contactId = 'first', account = 'clinic-account') {
+  return { id, contact_id: contactId, direction: 'outgoing', message_type: 'text',
+    status: 'pending', whatsapp_account: account, content: { body: 'Submitted text' } }
+}
+
 function png(name: string) {
   return new File(['png'], name, { type: 'image/png' })
 }
@@ -270,7 +275,10 @@ describe('ChatView composer', () => {
       sortedContacts: [first, second],
       currentContact: null,
       messages: [],
+      messagesOrganizationScope: 'organization-1',
+      replyingTo: null,
     })
+    mocks.contactsStore!.sendMessage.mockReset().mockResolvedValue(acceptedTextMessage())
     mocks.setCurrentContact.mockImplementation(value => {
       mocks.contactsStore!.currentContact = value
     })
@@ -320,6 +328,377 @@ describe('ChatView composer', () => {
     // The formatting toolbar sits outside the form and adds no submit buttons.
     expect(wrapper.findComponent(ComposerFormatToolbar).exists()).toBe(true)
     expect(form.findComponent(ComposerFormatToolbar).exists()).toBe(false)
+  })
+
+  it('ignores repeated Enter and submit while a text send is pending', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const form = wrapper.findAll('form').find(f => f.find('textarea').exists())!
+    const textarea = form.get('textarea')
+    await textarea.setValue('Only send once')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await form.trigger('submit')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+    expect(form.get('button[type="submit"]').attributes('disabled')).toBeDefined()
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+    await textarea.setValue('Next message')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(2)
+  })
+
+
+  it('does not resend an unconfirmed draft from held Enter repeats', async () => {
+    mocks.contactsStore!.sendMessage.mockRejectedValueOnce(new Error('offline'))
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Keep this draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Keep this draft')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.unconfirmed')
+
+    const repeated = new KeyboardEvent('keydown', { key: 'Enter', repeat: true, bubbles: true, cancelable: true })
+    textarea.element.dispatchEvent(repeated)
+    await settle()
+    expect(repeated.defaultPrevented).toBe(true)
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Keep this draft')
+
+    await textarea.trigger('keydown', { key: 'Enter', repeat: false })
+    await settle()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(2)
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('shows accessible text request feedback before acceptance without adding a bubble', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    const status = wrapper.get('[data-testid="text-send-feedback"]')
+    expect(status.attributes()).toMatchObject({ role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' })
+    expect(status.text()).toBe('chat.composer.textSend.sending')
+    expect(wrapper.get('[data-testid="text-send-spinner"]').attributes('aria-hidden')).toBe('true')
+    expect(wrapper.get('[data-testid="text-send-spinner"]').classes()).toContain('motion-reduce:animate-none')
+    expect(wrapper.get('button[type="submit"]').attributes()).toMatchObject({ 'aria-label': 'chat.send', 'aria-busy': 'true' })
+    expect(textarea.attributes('disabled')).toBeUndefined()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Submitted text')
+    expect(mocks.contactsStore!.messages).toEqual([])
+    expect(mocks.contactsStore!.addMessage).not.toHaveBeenCalled()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledWith(
+      'first', 'text', { body: 'Submitted text' }, undefined, undefined, { organizationId: 'organization-1' },
+    )
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect(status.text()).toBe('chat.composer.textSend.accepted')
+    expect(wrapper.find('[data-testid="text-send-spinner"]').exists()).toBe(false)
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('preserves a newer same-chat draft reply caret and focus when acceptance arrives', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    mocks.contactsStore!.replyingTo = replyMessage('original-quote', 'first', 'Original')
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await textarea.setValue('Next draft')
+    const input = textarea.element as HTMLTextAreaElement
+    input.focus()
+    input.setSelectionRange(2, 5)
+    input.style.height = '100px'
+    mocks.contactsStore!.replyingTo = replyMessage('next-quote', 'first', 'Next')
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect(input.value).toBe('Next draft')
+    expect(document.activeElement).toBe(input)
+    expect([input.selectionStart, input.selectionEnd]).toEqual([2, 5])
+    expect(input.style.height).toBe('100px')
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+    expect(mocks.contactsStore!.replyingTo.id).toBe('next-quote')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledWith(
+      'first', 'text', { body: 'Submitted text' }, 'original-quote', undefined, { organizationId: 'organization-1' },
+    )
+  })
+
+  it('uses draft and reply revisions even when edits return to the original values', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    const originalReply = replyMessage('original-quote', 'first', 'Original')
+    mocks.contactsStore!.replyingTo = originalReply
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await textarea.setValue('Changed')
+    await textarea.setValue('Submitted text')
+    mocks.contactsStore!.replyingTo = null
+    mocks.contactsStore!.replyingTo = originalReply
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Submitted text')
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+  })
+
+  it('clears only the unchanged submitted reply after canonical acceptance', async () => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('original-quote', 'first', 'Original')
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect(mocks.contactsStore!.clearReplyingTo).toHaveBeenCalledTimes(1)
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('does not send or clear a quote belonging to another contact', async () => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.replyingTo = replyMessage('foreign-quote', 'second', 'Private other chat')
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledWith(
+      'first', 'text', { body: 'Submitted text' }, undefined, undefined, { organizationId: 'organization-1' },
+    )
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['network', new Error('offline')],
+    ['timeout', { code: 'ECONNABORTED' }],
+    ['abort', { code: 'ERR_CANCELED' }],
+    ['server', { response: { status: 500 } }],
+    ['refusal', { response: { status: 400 } }],
+  ])('keeps an unconfirmed text draft without resend after %s failure', async (_kind, failure) => {
+    mocks.contactsStore!.sendMessage.mockRejectedValueOnce(failure)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Keep this draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.unconfirmed')
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Keep this draft')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+    expect(mocks.contactsStore!.addMessage).not.toHaveBeenCalled()
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeUndefined()
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['foreign contact', acceptedTextMessage('wrong', 'second')],
+    ['missing account', { ...acceptedTextMessage(), whatsapp_account: undefined }],
+    ['wrong direction', { ...acceptedTextMessage(), direction: 'incoming' }],
+  ])('does not infer acceptance from a %s response', async (_kind, response) => {
+    mocks.contactsStore!.sendMessage.mockResolvedValueOnce(response)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Keep this draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Keep this draft')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.unconfirmed')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['', 'other-workspace'])('refuses text before POST when transcript workspace is %s', async scope => {
+    wrapper = mountView()
+    await settle()
+    mocks.contactsStore!.messagesOrganizationScope = scope
+    await wrapper.get('textarea').setValue('Private draft')
+    await wrapper.get('textarea').trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect(mocks.contactsStore!.sendMessage).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.scopeChanged')
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('Private draft')
+  })
+
+  it('leaves IME confirmation and Shift Enter out of text submission', async () => {
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Draft')
+    const ime = new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true })
+    textarea.element.dispatchEvent(ime)
+    expect(ime.defaultPrevented).toBe(false)
+    await textarea.trigger('keydown', { key: 'Enter', shiftKey: true })
+    expect(mocks.contactsStore!.sendMessage).not.toHaveBeenCalled()
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await settle()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('retires request feedback on session ending and ignores the late answer', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Private draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    window.dispatchEvent(new CustomEvent('rereply:session-ending'))
+    localStorage.setItem('whm_session_id', 'ended:old-session')
+    await nextTick()
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('')
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('')
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+  })
+
+  it('ignores an old account attempt without releasing a replacement send', async () => {
+    const old = deferred<unknown>()
+    const current = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+    wrapper = mountView()
+    await settle()
+    const view = wrapper.vm as any
+    const textarea = wrapper.get('textarea')
+    view.selectedAccount = 'account-a'
+    await textarea.setValue('A draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    view.selectedAccount = 'account-b'
+    await textarea.setValue('B draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    old.resolve(acceptedTextMessage('old', 'first', 'account-a'))
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('B draft')
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.sending')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenNthCalledWith(2,
+      'first', 'text', { body: 'B draft' }, undefined, 'account-b', { organizationId: 'organization-1' },
+    )
+    current.resolve(acceptedTextMessage('current', 'first', 'account-b'))
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+  })
+
+  it('hides old workspace feedback before a deferred answer can clear its replacement draft', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Old workspace draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    mocks.organizationsStore.selectedOrgId = 'organization-2'
+    mocks.contactsStore!.messagesOrganizationScope = 'organization-2'
+    await nextTick()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+    await textarea.setValue('New workspace draft')
+    mocks.contactsStore!.clearReplyingTo.mockClear()
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('New workspace draft')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('')
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+  })
+
+
+  it('keeps edited text and reply after a deferred uncertain failure', async () => {
+    let reject!: (reason?: unknown) => void
+    const pending = new Promise<unknown>((_resolve, rejectPromise) => { reject = rejectPromise })
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    await textarea.setValue('New edited draft')
+    mocks.contactsStore!.replyingTo = replyMessage('next-quote', 'first', 'Next')
+    reject({ code: 'ECONNABORTED' })
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('New edited draft')
+    expect(mocks.contactsStore!.replyingTo.id).toBe('next-quote')
+    expect(mocks.contactsStore!.clearReplyingTo).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.unconfirmed')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not revive an account attempt after switching away and back', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const view = wrapper.vm as any
+    const textarea = wrapper.get('textarea')
+    view.selectedAccount = 'account-a'
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    view.selectedAccount = 'account-b'
+    view.selectedAccount = 'account-a'
+    await textarea.setValue('Current account draft')
+    pending.resolve(acceptedTextMessage('accepted', 'first', 'account-a'))
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Current account draft')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('')
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeUndefined()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('retires private draft and request feedback when the logical login changes in storage', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Retired private draft')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    localStorage.setItem('whm_session_id', 'replacement-login')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'whm_session_id', newValue: 'replacement-login' }))
+    await nextTick()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('')
+    await textarea.setValue('Replacement login draft')
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Replacement login draft')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('')
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+
+  it('keeps an active request when the switcher initializes the same effective workspace', async () => {
+    const pending = deferred<unknown>()
+    mocks.contactsStore!.sendMessage.mockReturnValueOnce(pending.promise)
+    wrapper = mountView()
+    await settle()
+    const textarea = wrapper.get('textarea')
+    await textarea.setValue('Submitted text')
+    await textarea.trigger('keydown', { key: 'Enter' })
+    mocks.organizationsStore.selectedOrgId = 'organization-1'
+    await nextTick()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('Submitted text')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.sending')
+    expect(wrapper.get('button[type="submit"]').attributes('disabled')).toBeDefined()
+    pending.resolve(acceptedTextMessage())
+    await settle()
+    expect((textarea.element as HTMLTextAreaElement).value).toBe('')
+    expect(wrapper.get('[data-testid="text-send-feedback"]').text()).toBe('chat.composer.textSend.accepted')
+    expect(mocks.contactsStore!.sendMessage).toHaveBeenCalledTimes(1)
   })
 
   it('stages every chosen file and sends them one request at a time', async () => {

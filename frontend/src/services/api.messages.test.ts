@@ -48,6 +48,44 @@ describe('legacy Chat message service', () => {
     )
   })
 
+  it('preserves the legacy two-argument text send when no options are supplied', async () => {
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ data: { data: { id: 'accepted' } } })
+    const message = { type: 'text', content: { body: 'Draft' } }
+
+    await messagesService.send('contact-1', message)
+
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post).toHaveBeenCalledWith('/contacts/contact-1/messages', message)
+  })
+
+  it('pins a text send to its captured workspace through the request interceptor', async () => {
+    const previousAdapter = api.defaults.adapter
+    const previousOrganization = localStorage.getItem('selected_organization_id')
+    const signal = new AbortController().signal
+    let sent: InternalAxiosRequestConfig | undefined
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      sent = config
+      return { data: { data: { id: 'accepted' } }, status: 200, statusText: 'OK', headers: {}, config }
+    })
+    api.defaults.adapter = adapter
+    localStorage.setItem('selected_organization_id', 'organization-replacement')
+    try {
+      await messagesService.send('contact-1', { type: 'text', content: { body: 'Draft' } }, {
+        organizationId: 'organization-captured', signal,
+      })
+
+      expect(adapter).toHaveBeenCalledTimes(1)
+      expect(sent?.url).toBe('/contacts/contact-1/messages')
+      expect(sent?.headers.get('X-Organization-ID')).toBe('organization-captured')
+      expect(sent?.signal).toBe(signal)
+      expect(JSON.parse(sent!.data)).toEqual({ type: 'text', content: { body: 'Draft' } })
+    } finally {
+      api.defaults.adapter = previousAdapter
+      if (previousOrganization === null) localStorage.removeItem('selected_organization_id')
+      else localStorage.setItem('selected_organization_id', previousOrganization)
+    }
+  })
+
   describe('chat media', () => {
     type Adapter = (config: InternalAxiosRequestConfig) => Promise<unknown>
     const ok = (config: InternalAxiosRequestConfig) => ({
