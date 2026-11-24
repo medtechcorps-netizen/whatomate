@@ -43,3 +43,18 @@ func TestClient_SubmitTemplate_FooterOrderingAndValidation(t *testing.T) {
 	}
 	require.Equal(t, 1, calls, "invalid footers must fail before calling Meta")
 }
+
+func TestValidateTemplateFooter(t *testing.T) {
+	for _, tt := range []struct {
+		text  string
+		valid bool
+	}{
+		{"", true}, {"  ", true}, {"Terima kasih!", true}, {strings.Repeat("界", 60), true},
+		{strings.Repeat("界", 61), false}, {"Thank you {{1}}", false}, {"Thank you {{name}}", false},
+		{"Contact: https://example.test/a_b", true},
+	} {
+		if err := whatsapp.ValidateTemplateFooter(tt.text); (err == nil) != tt.valid {
+			t.Errorf("ValidateTemplateFooter(%q)=%v, valid=%v", tt.text, err, tt.valid)
+		}
+	}
+}

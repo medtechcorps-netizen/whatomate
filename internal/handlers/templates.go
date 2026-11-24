@@ -389,7 +389,7 @@ func (a *App) SubmitTemplate(r *fastglue.Request) error {
 	}
 
 	if !strings.EqualFold(template.Category, "AUTHENTICATION") {
-		if err := templateutil.ValidateFooter(template.FooterContent); err != nil {
+		if err := whatsapp.ValidateTemplateFooter(template.FooterContent); err != nil {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, err.Error(), nil, "")
 		}
 	}
