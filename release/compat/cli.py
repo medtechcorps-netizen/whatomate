@@ -454,6 +454,50 @@ def _failure_diagnostic(error):
     return "compatibility-diagnostic: " + "; ".join(parts)
 
 
+_IMAGE_ATTESTATION_OWNER = record_transport.ReleaseGh.verify_image.__code__
+_RELEASE_CAPTURE_OWNER = record_transport.OperationBudget.capture.__code__
+_COMMAND_CAPTURE_OWNER = runtime.bounded_command.__code__
+
+
+def _owns_trace(error, owner):
+    trace = BaseException.__traceback__.__get__(error)
+    for _ in range(64):
+        if trace is None:
+            return False
+        if trace.tb_frame.f_code is owner:
+            return True
+        trace = trace.tb_next
+    return False
+
+
+def _owned_transport_refusal(error, owner, code):
+    if type(error) is not record_transport.TransportRefusal or not _owns_trace(error, owner):
+        return False
+    args = BaseException.args.__get__(error)
+    return len(args) == 1 and type(args[0]) is str and args[0] == code
+
+
+def _image_capture_failure_diagnostic(error):
+    """Publish only a fixed reason from the owned image-attestation failure path."""
+
+    seen = set()
+    for _ in range(8):
+        if error is None or id(error) in seen:
+            break
+        seen.add(id(error))
+        context = BaseException.__context__.__get__(error)
+        if (_owned_transport_refusal(error, _IMAGE_ATTESTATION_OWNER, "record-chain-invalid:transport-signature")
+                and _owned_transport_refusal(context, _RELEASE_CAPTURE_OWNER, "record-chain-invalid:transport-capture")):
+            failure = BaseException.__context__.__get__(context)
+            if type(failure) is runtime._CommandCaptureFailure and _owns_trace(failure, _COMMAND_CAPTURE_OWNER):
+                reason = failure.capture_reason
+                if type(reason) is str and reason in runtime._COMMAND_CAPTURE_REASONS:
+                    return "compatibility-capture-diagnostic: phase=release-image-attestation reason=" + reason
+        cause = BaseException.__cause__.__get__(error)
+        error = cause if cause is not None else context
+    return None
+
+
 def _build_failure_diagnostic(error):
     seen = set()
     for _ in range(4):
@@ -566,6 +610,9 @@ def main(argv=None):
             OSError, ValueError, TypeError, KeyError) as error:
         print(_failure_message(error), file=sys.stderr)
         print(_failure_diagnostic(error), file=sys.stderr)
+        capture_diagnostic = _image_capture_failure_diagnostic(error)
+        if capture_diagnostic is not None:
+            print(capture_diagnostic, file=sys.stderr)
         build_diagnostic = _build_failure_diagnostic(error)
         if build_diagnostic is not None:
             print(build_diagnostic, file=sys.stderr)

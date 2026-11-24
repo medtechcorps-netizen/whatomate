@@ -48,6 +48,22 @@ class Capture:
     stderr: bytes = field(repr=False)
 
 
+_COMMAND_CAPTURE_REASONS = frozenset({
+    "deadline", "stdout-overflow", "stderr-overflow", "stdout-pipe", "stderr-pipe",
+    "stdin-pipe", "spawn", "thread-start", "reap", "cleanup-pipe",
+})
+
+
+class _CommandCaptureFailure(proof.InfrastructureFailure):
+    """Fixed subprocess reason, with the existing public failure code."""
+
+    __slots__ = ("capture_reason",)
+
+    def __init__(self, reason: str):
+        super().__init__("process" if reason in ("spawn", "thread-start", "reap") else "capture")
+        self.capture_reason = reason
+
+
 def bounded_command(
     argv: Sequence[str], *, env: Mapping[str, str], timeout: float,
     stdout_limit: int, stderr_limit: int = MIB, input_bytes: bytes | None = None,
@@ -73,13 +89,23 @@ def bounded_command(
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 shell=False, start_new_session=os.name == "posix")
     except (OSError, ValueError, subprocess.SubprocessError):
-        raise proof.InfrastructureFailure("process") from None
+        raise _CommandCaptureFailure("spawn") from None
     streams = (proc.stdout, proc.stderr)
     chunks = [bytearray(), bytearray()]
     failed = threading.Event()
+    failure_lock = threading.Lock()
+    failure_reason = None
+
+    def mark_failure(reason: str) -> None:
+        nonlocal failure_reason
+        with failure_lock:
+            if failure_reason is None:
+                failure_reason = reason
+                failed.set()
 
     def drain(index: int, limit: int) -> None:
         stream = streams[index]
+        channel = ("stdout", "stderr")[index]
         try:
             while True:
                 # Read at most one byte beyond the cap; retain no excess data.
@@ -87,16 +113,16 @@ def bounded_command(
                 if not part:
                     break
                 if len(chunks[index]) + len(part) > limit:
-                    failed.set()
+                    mark_failure(channel + "-overflow")
                     break
                 chunks[index].extend(part)
         except (OSError, ValueError):
-            failed.set()
+            mark_failure(channel + "-pipe")
         finally:
             try:
                 stream.close()
             except OSError:
-                failed.set()
+                mark_failure(channel + "-pipe")
 
     threads = [threading.Thread(target=drain, args=(i, cap), daemon=True)
                for i, cap in enumerate((stdout_limit, stderr_limit))]
@@ -111,12 +137,12 @@ def bounded_command(
                 view = view[written:]
             proc.stdin.flush()
         except (OSError, ValueError):
-            failed.set()
+            mark_failure("stdin-pipe")
         finally:
             try:
                 proc.stdin.close()
             except (OSError, ValueError):
-                failed.set()
+                mark_failure("stdin-pipe")
 
     if input_bytes is not None:
         threads.append(threading.Thread(target=feed, daemon=True))
@@ -136,13 +162,16 @@ def bounded_command(
             for thread in threads:
                 thread.start()
         except RuntimeError:
-            raise proof.InfrastructureFailure("process") from None
+            raise _CommandCaptureFailure("thread-start") from None
         while proc.poll() is None or any(thread.is_alive() for thread in threads):
-            if failed.is_set() or time.monotonic() >= deadline:
-                raise proof.InfrastructureFailure("capture")
+            if failed.is_set():
+                raise _CommandCaptureFailure(failure_reason)
+            if time.monotonic() >= deadline:
+                mark_failure("deadline")
+                raise _CommandCaptureFailure(failure_reason)
             time.sleep(min(0.01, max(0, deadline - time.monotonic())))
         if failed.is_set():
-            raise proof.InfrastructureFailure("capture")
+            raise _CommandCaptureFailure(failure_reason)
         return Capture(proc.returncode, bytes(chunks[0]), bytes(chunks[1]))
     finally:
         if proc.poll() is None or any(thread.is_alive() for thread in threads):
@@ -150,7 +179,7 @@ def bounded_command(
         try:
             proc.wait(timeout=2)
         except (OSError, subprocess.SubprocessError):
-            raise proof.InfrastructureFailure("process") from None
+            raise _CommandCaptureFailure("reap") from None
         for thread in threads:
             if thread.ident is not None:
                 thread.join(timeout=0.1)
@@ -159,7 +188,7 @@ def bounded_command(
                 try:
                     stream.close()
                 except OSError:
-                    raise proof.InfrastructureFailure("capture") from None
+                    raise _CommandCaptureFailure("cleanup-pipe") from None
 
 
 def _empty_directory(value: Path) -> Path:

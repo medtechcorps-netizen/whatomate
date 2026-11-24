@@ -34,9 +34,23 @@ class CommandTests(unittest.TestCase):
         result = self.call("import os; os.write(1,b'x'*4096); os.write(2,b'y'*4096)")
         self.assertEqual(len(result.stdout), 4096)
         self.assertEqual(len(result.stderr), 4096)
-        for descriptor in (1, 2):
-            with self.subTest(descriptor=descriptor), self.assertRaisesRegex(proof.InfrastructureFailure, "^capture$"):
-                self.call(f"import os; os.write({descriptor},b'z'*4097)")
+        for descriptor, reason in ((1, "stdout-overflow"), (2, "stderr-overflow")):
+            with self.subTest(descriptor=descriptor):
+                with self.assertRaisesRegex(proof.InfrastructureFailure, "^capture$") as error:
+                    self.call(f"import os; os.write({descriptor},b'z'*4097)")
+                self.assertEqual(error.exception.capture_reason, reason)
+
+    def test_stdout_pipe_failure_uses_fixed_label(self):
+        process = mock.Mock(returncode=0)
+        process.poll.return_value = 0
+        process.stdout.read.side_effect = OSError("private pipe error")
+        process.stderr.read.return_value = b""
+        with mock.patch.object(runtime.subprocess, "Popen", return_value=process), \
+             mock.patch.object(runtime.os, "killpg", create=True):
+            with self.assertRaisesRegex(proof.InfrastructureFailure, "^capture$") as error:
+                self.call("pass")
+        self.assertEqual(error.exception.capture_reason, "stdout-pipe")
+        self.assertNotIn("private", repr(error.exception))
 
     def test_timeout_reaps_child_and_never_exposes_raw_error_or_arguments(self):
         seen = []
@@ -47,14 +61,16 @@ class CommandTests(unittest.TestCase):
             return process
         start = time.monotonic()
         with mock.patch.object(runtime.subprocess, "Popen", side_effect=record):
-            with self.assertRaisesRegex(proof.InfrastructureFailure, "^capture$"):
+            with self.assertRaisesRegex(proof.InfrastructureFailure, "^capture$") as error:
                 self.call("import time; time.sleep(30)", timeout=0.15)
+        self.assertEqual(error.exception.capture_reason, "deadline")
         self.assertLess(time.monotonic() - start, 3)
         self.assertIsNotNone(seen[0].poll())
         with mock.patch.object(runtime.subprocess, "Popen", side_effect=OSError("sensitive argv and host")):
             with self.assertRaisesRegex(proof.InfrastructureFailure, "^process$") as error:
                 self.call("sensitive argv")
         self.assertNotIn("sensitive", str(error.exception))
+        self.assertEqual(error.exception.capture_reason, "spawn")
         self.assertTrue(error.exception.__suppress_context__)
 
     def test_no_shell_no_inherited_stdin_and_environment_is_explicit(self):
@@ -78,8 +94,9 @@ class CommandTests(unittest.TestCase):
             seen.append(process)
             return process
         with mock.patch.object(runtime.subprocess, "Popen", side_effect=record), mock.patch.object(runtime.threading.Thread, "start", side_effect=RuntimeError("synthetic")):
-            with self.assertRaisesRegex(proof.InfrastructureFailure, "^process$"):
+            with self.assertRaisesRegex(proof.InfrastructureFailure, "^process$") as error:
                 self.call("import time; time.sleep(30)")
+        self.assertEqual(error.exception.capture_reason, "thread-start")
         self.assertIsNotNone(seen[0].poll())
         self.assertTrue(seen[0].stdout.closed and seen[0].stderr.closed)
 

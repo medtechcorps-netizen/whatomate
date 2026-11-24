@@ -221,6 +221,59 @@ class ReleaseTransportTests(unittest.TestCase):
         client.recheck(snapshot, selected_tag="prod-0000", latest_tag="prod-0000")
         self.assertEqual(sum(a[1:3] == ["attestation", "verify"] for a, _ in self.world.calls), 6)
 
+    def test_compat_capture_diagnostic_reports_only_an_owned_image_attestation(self):
+        import cli
+
+        client = self.client()
+        client.capture_snapshot()
+        captured = []
+
+        def fail_command(argv, **options):
+            captured.append((argv[1:3], options["timeout"], options["stdout_limit"], options["stderr_limit"]))
+            return rt.runtime.bounded_command(argv, **options)
+
+        client.budget._capture = fail_command
+        ownerless = rt.OperationBudget(self.clock.now + 600, capture=fail_command, clock=self.clock)
+        with mock.patch.object(rt.runtime.subprocess, "Popen", side_effect=OSError("private token and path")):
+            with self.assertRaisesRegex(rt.TransportRefusal, "transport-image-verification$") as owned:
+                client.verify_selected_images(None)
+            with self.assertRaisesRegex(rt.TransportRefusal, "transport-capture$") as unrelated:
+                ownerless.capture(["private-command"], env={}, timeout=1, stdout_limit=10, stderr_limit=10)
+        self.assertEqual(captured[0], (["attestation", "verify"], 60, 4 * rt.MIB, 65536))
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(
+            cli._image_capture_failure_diagnostic(owned.exception),
+            "compatibility-capture-diagnostic: phase=release-image-attestation reason=spawn",
+        )
+        self.assertIsNone(cli._image_capture_failure_diagnostic(unrelated.exception))
+        self.assertIsNone(cli._image_capture_failure_diagnostic(
+            rt.TransportRefusal("record-chain-invalid:transport-signature")))
+
+    def test_capture_diagnostic_does_not_compare_non_string_exception_arguments(self):
+        import cli
+
+        class UntrustedValue:
+            compared = False
+
+            def __eq__(self, other):
+                self.compared = True
+                raise AssertionError("diagnostic evaluated an untrusted value")
+
+        value = UntrustedValue()
+
+        def raise_refusal():
+            raise rt.TransportRefusal(value)
+
+        try:
+            raise_refusal()
+        except rt.TransportRefusal as error:
+            self.assertFalse(cli._owned_transport_refusal(
+                error, raise_refusal.__code__, "record-chain-invalid:transport-capture",
+            ))
+        else:
+            self.fail("expected test refusal")
+        self.assertFalse(value.compared)
+
     def test_later_record_reusing_bootstrap_images_retains_actual_legacy_source(self):
         bootstrap = records.load_bootstrap()
         legacy = bootstrap["legacy_signer"]
