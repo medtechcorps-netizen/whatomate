@@ -7,6 +7,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/access"
+	"github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
@@ -464,9 +467,14 @@ func (a *App) submitTemplateToMeta(account *models.WhatsAppAccount, template *mo
 	return a.WhatsApp.SubmitTemplate(ctx, waAccount, submission)
 }
 
+var (
+	errTemplateSyncAccountChanged = errors.New("template sync account changed")
+	errTemplateSyncForbidden      = errors.New("template sync permission is no longer available")
+)
+
 // SyncTemplates syncs templates from Meta API
 func (a *App) SyncTemplates(r *fastglue.Request) error {
-	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
 	if err != nil {
 		return nil
 	}
@@ -488,21 +496,67 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "whatsapp_account is required", nil, "")
 	}
 
-	account, err := a.resolveWhatsAppAccount(orgID, accountName)
-	if err != nil {
+	// Keep the stored binding, including the original token representation.
+	// Only the copy used for the provider request is decrypted.
+	var account models.WhatsAppAccount
+	if err := a.DB.Where("organization_id = ? AND name = ?", orgID, accountName).First(&account).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "WhatsApp account not found", nil, "")
+	}
+	providerAccount := account
+	if err := a.prepareWhatsAppAccountForOutbound(&providerAccount); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "WhatsApp account not found", nil, "")
 	}
 
-	// Fetch templates from Meta API
-	templates, err := a.fetchTemplatesFromMeta(account)
+	templates, err := a.WhatsApp.FetchTemplates(requestContext(r), a.toWhatsAppAccount(&providerAccount))
 	if err != nil {
 		a.Log.Error("Failed to fetch templates from Meta", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "Failed to fetch templates from Meta", nil, "")
 	}
 
-	// Sync to database
 	synced := 0
 	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		// Fetch the full provider result before acquiring the same locks used by
+		// account edits and deletion. Template rows still use the account name.
+		if err := channel.LockLegacyMetaOrganizationAndWhatsAppAccount(tx, orgID, account.ID); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errExplicitOrganizationUnavailable
+			}
+			return err
+		}
+
+		// The lock can find an archived organization row. Check the ordinary
+		// tenant boundary again before using any account or membership data.
+		reader := &App{DB: tx, Log: a.Log}
+		if _, err := reader.requireAuthenticatedTenant(orgID); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, database.ErrPlatformComplianceTenant) {
+				return errExplicitOrganizationUnavailable
+			}
+			return err
+		}
+
+		var current models.WhatsAppAccount
+		if err := tx.Where("organization_id = ? AND id = ?", orgID, account.ID).First(&current).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errTemplateSyncAccountChanged
+			}
+			return err
+		}
+		if current.Name != account.Name || current.PhoneID != account.PhoneID ||
+			current.BusinessID != account.BusinessID || current.AppID != account.AppID ||
+			current.APIVersion != account.APIVersion || current.Status != account.Status ||
+			current.AccessToken != account.AccessToken ||
+			(current.AccessTokenExpiresAt == nil) != (account.AccessTokenExpiresAt == nil) ||
+			(current.AccessTokenExpiresAt != nil && !current.AccessTokenExpiresAt.Equal(*account.AccessTokenExpiresAt)) {
+			return errTemplateSyncAccountChanged
+		}
+		if err := a.prepareWhatsAppAccountForOutbound(&current); err != nil {
+			return errTemplateSyncAccountChanged
+		}
+
+		if err := reader.requireCurrentTemplateSyncPermission(orgID, userID); err != nil {
+			return err
+		}
+
 		for _, metaTemplate := range templates {
 			// Quality rating: prefer the nested score object (newer field), fall back
 			// to the legacy top-level rating. Empty string means "Meta didn't tell us"
@@ -593,7 +647,14 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 		}
 		return nil
 	})
-	if err != nil {
+	switch {
+	case errors.Is(err, errExplicitOrganizationUnavailable):
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+	case errors.Is(err, errTemplateSyncAccountChanged):
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account changed while syncing templates. Try again.", nil, "")
+	case errors.Is(err, errTemplateSyncForbidden):
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	case err != nil:
 		a.Log.Error("Failed to persist templates from Meta", "error", err, "account", accountName)
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save synced templates", nil, "")
 	}
@@ -604,11 +665,44 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 	})
 }
 
-func (a *App) fetchTemplatesFromMeta(account *models.WhatsAppAccount) ([]whatsapp.MetaTemplate, error) {
-	waAccount := a.toWhatsAppAccount(account)
+// requireCurrentTemplateSyncPermission runs on the persistence transaction and
+// distinguishes a missing grant from a failed database read.
+func (a *App) requireCurrentTemplateSyncPermission(orgID, userID uuid.UUID) error {
+	var user models.User
+	if err := a.DB.Select("is_super_admin").Where("id = ? AND is_active = ?", userID, true).Take(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errTemplateSyncForbidden
+		}
+		return err
+	}
+	if user.IsSuperAdmin {
+		return nil
+	}
 
-	ctx := context.Background()
-	return a.WhatsApp.FetchTemplates(ctx, waAccount)
+	membership, active, err := access.OrganizationMembershipChecked(a.DB, userID, orgID)
+	if err != nil {
+		return err
+	}
+	if !active || membership.RoleID == nil {
+		return errTemplateSyncForbidden
+	}
+
+	var role models.CustomRole
+	if err := a.DB.Select("id").Where("organization_id = ? AND id = ?", orgID, *membership.RoleID).Take(&role).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errTemplateSyncForbidden
+		}
+		return err
+	}
+	if err := a.loadRolePermissions(&role); err != nil {
+		return err
+	}
+	for _, permission := range role.Permissions {
+		if permission.Resource == models.ResourceTemplates && permission.Action == models.ActionSync {
+			return nil
+		}
+	}
+	return errTemplateSyncForbidden
 }
 
 func (a *App) deleteTemplateFromMeta(account *models.WhatsAppAccount, templateName string) {
