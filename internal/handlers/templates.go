@@ -12,6 +12,7 @@ import (
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
 
 // TemplateRequest represents the request body for creating/updating a template
@@ -501,79 +502,100 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 
 	// Sync to database
 	synced := 0
-	for _, metaTemplate := range templates {
-		// Quality rating: prefer the nested score object (newer field), fall back
-		// to the legacy top-level rating. Empty string means "Meta didn't tell us"
-		// — on INSERT the column default 'UNKNOWN' applies; on UPDATE we skip
-		// the column so we don't clobber a previously-known rating.
-		qualityRating := metaTemplate.QualityRating
-		if metaTemplate.QualityScore != nil && metaTemplate.QualityScore.Score != "" {
-			qualityRating = metaTemplate.QualityScore.Score
-		}
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		for _, metaTemplate := range templates {
+			// Quality rating: prefer the nested score object (newer field), fall back
+			// to the legacy top-level rating. Empty string means "Meta didn't tell us"
+			// — on INSERT the column default 'UNKNOWN' applies; on UPDATE we skip
+			// the column so we don't clobber a previously-known rating.
+			qualityRating := metaTemplate.QualityRating
+			if metaTemplate.QualityScore != nil && metaTemplate.QualityScore.Score != "" {
+				qualityRating = metaTemplate.QualityScore.Score
+			}
 
-		template := models.Template{
-			OrganizationID:  orgID,
-			WhatsAppAccount: account.Name,
-			MetaTemplateID:  metaTemplate.ID,
-			Name:            metaTemplate.Name,
-			DisplayName:     metaTemplate.Name,
-			Language:        metaTemplate.Language,
-			Category:        metaTemplate.Category,
-			Status:          metaTemplate.Status,
-			QualityRating:   qualityRating,
-		}
+			template := models.Template{
+				OrganizationID:  orgID,
+				WhatsAppAccount: account.Name,
+				MetaTemplateID:  metaTemplate.ID,
+				Name:            metaTemplate.Name,
+				DisplayName:     metaTemplate.Name,
+				Language:        metaTemplate.Language,
+				Category:        metaTemplate.Category,
+				Status:          metaTemplate.Status,
+				QualityRating:   qualityRating,
+			}
 
-		// Parse components
-		for _, comp := range metaTemplate.Components {
-			switch comp.Type {
-			case "HEADER":
-				template.HeaderType = comp.Format
-				if comp.Text != "" {
-					template.HeaderContent = comp.Text
+			// Parse components
+			for _, comp := range metaTemplate.Components {
+				switch comp.Type {
+				case "HEADER":
+					template.HeaderType = comp.Format
+					if comp.Text != "" {
+						template.HeaderContent = comp.Text
+					}
+				case "BODY":
+					template.BodyContent = comp.Text
+				case "FOOTER":
+					template.FooterContent = comp.Text
+				case "BUTTONS":
+					// Convert []TemplateButton to []any
+					buttons := make([]any, len(comp.Buttons))
+					for i, btn := range comp.Buttons {
+						buttons[i] = btn
+					}
+					template.Buttons = convertToJSONBArray(buttons)
 				}
-			case "BODY":
-				template.BodyContent = comp.Text
-			case "FOOTER":
-				template.FooterContent = comp.Text
-			case "BUTTONS":
-				// Convert []TemplateButton to []any
-				buttons := make([]any, len(comp.Buttons))
-				for i, btn := range comp.Buttons {
-					buttons[i] = btn
-				}
-				template.Buttons = convertToJSONBArray(buttons)
 			}
-		}
 
-		// Upsert (including soft-deleted templates to restore them)
-		existing := models.Template{}
-		if err := a.DB.Unscoped().Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ?",
-			orgID, account.Name, template.Name, template.Language).First(&existing).Error; err == nil {
-			// Update existing and restore if soft-deleted (explicitly set deleted_at to NULL)
-			template.ID = existing.ID
-			updates := map[string]any{
-				"meta_template_id": template.MetaTemplateID,
-				"display_name":     template.DisplayName,
-				"category":         template.Category,
-				"status":           template.Status,
-				"header_type":      template.HeaderType,
-				"header_content":   template.HeaderContent,
-				"body_content":     template.BodyContent,
-				"footer_content":   template.FooterContent,
-				"buttons":          template.Buttons,
-				"deleted_at":       nil, // Restore soft-deleted template
+			// Upsert (including soft-deleted templates to restore them)
+			existing := models.Template{}
+			if err := tx.Unscoped().Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ?",
+				orgID, account.Name, template.Name, template.Language).First(&existing).Error; err == nil {
+				// Update existing and restore if soft-deleted (explicitly set deleted_at to NULL)
+				template.ID = existing.ID
+				updates := map[string]any{
+					"meta_template_id": template.MetaTemplateID,
+					"display_name":     template.DisplayName,
+					"category":         template.Category,
+					"status":           template.Status,
+					"header_type":      template.HeaderType,
+					"header_content":   template.HeaderContent,
+					"body_content":     template.BodyContent,
+					"footer_content":   template.FooterContent,
+					"buttons":          template.Buttons,
+					"deleted_at":       nil, // Restore soft-deleted template
+				}
+				// Only update quality_rating when Meta returned a value; otherwise
+				// keep whatever we had previously.
+				if template.QualityRating != "" {
+					updates["quality_rating"] = template.QualityRating
+				}
+				result := tx.Unscoped().Model(&template).Updates(updates)
+				if result.Error != nil {
+					return fmt.Errorf("update synced template: %w", result.Error)
+				}
+				if result.RowsAffected != 1 {
+					return fmt.Errorf("update synced template affected %d rows", result.RowsAffected)
+				}
+			} else if errors.Is(err, gorm.ErrRecordNotFound) {
+				// Only a missing row permits creation; other lookup failures abort the batch.
+				result := tx.Create(&template)
+				if result.Error != nil {
+					return fmt.Errorf("create synced template: %w", result.Error)
+				}
+				if result.RowsAffected != 1 {
+					return fmt.Errorf("create synced template affected %d rows", result.RowsAffected)
+				}
+			} else {
+				return fmt.Errorf("look up synced template: %w", err)
 			}
-			// Only update quality_rating when Meta returned a value; otherwise
-			// keep whatever we had previously.
-			if template.QualityRating != "" {
-				updates["quality_rating"] = template.QualityRating
-			}
-			a.DB.Unscoped().Model(&template).Updates(updates)
-		} else {
-			// Create new
-			a.DB.Create(&template)
+			synced++
 		}
-		synced++
+		return nil
+	})
+	if err != nil {
+		a.Log.Error("Failed to persist templates from Meta", "error", err, "account", accountName)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save synced templates", nil, "")
 	}
 
 	return r.SendEnvelope(map[string]any{
