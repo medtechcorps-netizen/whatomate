@@ -102,6 +102,31 @@ describe('template view request ownership', () => {
     vi.restoreAllMocks()
   })
 
+  it('recovers a failed account load without syncing until an account is selected', async () => {
+    localStorage.setItem('templates_selected_account_option', 'account:stale')
+    mocks.get.mockRejectedValueOnce(new Error('accounts unavailable')).mockResolvedValueOnce(accounts(['all']))
+    const wrapper = await render()
+    expect(wrapper.get('[role="alert"]').text()).toBe('common.failedLoad resources.accounts')
+    expect(table(wrapper).props('items')).toEqual([{ id: 'current', name: 'current' }])
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+
+    const retry = wrapper.findAll('button').find(button => button.text() === 'common.retry')!
+    await retry.trigger('click')
+    await flushPromises()
+    expect(mocks.get).toHaveBeenCalledTimes(2)
+    expect(mocks.get).toHaveBeenLastCalledWith('/accounts', expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: undefined }), expect.any(Object))
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    expect(mocks.post).not.toHaveBeenCalled()
+
+    await account(wrapper, 'all')
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all' },
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
+  })
+
   it('keeps newer workspace rows/count when the older response finishes last', async () => {
     const old = deferred<ReturnType<typeof rows>>()
     mocks.list.mockReturnValueOnce(old.promise)

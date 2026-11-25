@@ -56,6 +56,7 @@ const organizationId = computed(() => organizationsStore.selectedOrgId || authSt
 
 const templates = ref<Template[]>([])
 const accounts = ref<WhatsAppAccount[]>([])
+const accountsLoadFailed = ref(false)
 const isLoading = ref(true)
 const error = ref<string | null>(null)
 const isSyncing = ref(false)
@@ -255,6 +256,7 @@ function invalidateView() {
   accountsRequest++
   syncRequest++
   accounts.value = []
+  accountsLoadFailed.value = false
   invalidateTemplates()
   syncResults.value = []
   syncProgress.value = ''
@@ -330,6 +332,7 @@ async function fetchAccounts() {
   const request = ++accountsRequest
   const current = () => scope.isCurrent() && request === accountsRequest
   accounts.value = []
+  accountsLoadFailed.value = false
   try {
     const response = await api.get('/accounts', workspaceRequest(scope.organizationId, current))
     if (!current()) return
@@ -341,6 +344,7 @@ async function fetchAccounts() {
   } catch (error) {
     if (!current()) return
     console.error('Failed to fetch accounts:', error)
+    accountsLoadFailed.value = true
   }
 }
 
@@ -517,6 +521,10 @@ function getHeaderIcon(type: string) {
             <p v-for="result in syncResults" :key="result.account" :class="result.success ? 'text-muted-foreground' : 'text-destructive'">
               <span class="font-medium">{{ result.account }}</span>: {{ result.success ? $t('templates.synced') : result.error }}
             </p>
+          </div>
+          <div v-if="accountsLoadFailed" class="mb-4 flex flex-wrap items-center gap-2">
+            <p role="alert" class="text-sm text-destructive">{{ $t('common.failedLoad', { resource: $t('resources.accounts') }) }}</p>
+            <Button type="button" variant="outline" size="sm" @click="loadWorkspace">{{ $t('common.retry') }}</Button>
           </div>
           <ErrorState
             v-if="error && !isLoading"
