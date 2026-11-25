@@ -189,7 +189,13 @@ type TemplateExample struct {
 
 // TemplateListResponse represents response from fetching templates
 type TemplateListResponse struct {
-	Data []MetaTemplate `json:"data"`
+	Data   []MetaTemplate `json:"data"`
+	Paging struct {
+		Next    string `json:"next"`
+		Cursors struct {
+			After string `json:"after"`
+		} `json:"cursors"`
+	} `json:"paging"`
 }
 
 // WebhookPayload represents the incoming webhook from Meta

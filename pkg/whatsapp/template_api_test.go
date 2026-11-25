@@ -3,8 +3,11 @@ package whatsapp_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -264,6 +267,103 @@ func TestClient_FetchTemplates_Success(t *testing.T) {
 	assert.Equal(t, "HIGH", templates[0].QualityRating)
 	assert.Equal(t, "goodbye", templates[1].Name)
 	assert.Equal(t, "UNKNOWN", templates[1].QualityRating)
+}
+
+func TestClient_FetchTemplates_PaginatesPinnedAccount(t *testing.T) {
+	t.Parallel()
+
+	account := testAccount("")
+	const firstCursor = "opaque+/=a&v=%"
+	const secondCursor = "another+opaque"
+	pages := []struct {
+		after string
+		body  string
+	}{
+		{"", `{"data":[{"id":"1","name":"first"}],"paging":{"next":"/wrong-edge","cursors":{"after":"` + firstCursor + `"}}}`},
+		{firstCursor, `{"data":[],"paging":{"next":"/wrong-waba","cursors":{"after":"` + secondCursor + `"}}}`},
+		{secondCursor, `{"data":[{"id":"2","name":"last"}],"paging":{"cursors":{"after":"not-a-next-page"}}}`},
+	}
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := int(calls.Add(1)) - 1
+		if page >= len(pages) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/"+account.APIVersion+"/"+account.BusinessID+"/message_templates", r.URL.Path)
+		assert.Equal(t, "Bearer "+account.AccessToken, r.Header.Get("Authorization"))
+		query := r.URL.Query()
+		assert.Equal(t, "100", query.Get("limit"))
+		assert.Equal(t, "id,name,language,category,status,components,quality_score,quality_rating", query.Get("fields"))
+		if pages[page].after == "" {
+			assert.False(t, query.Has("after"))
+			assert.Len(t, query, 2)
+		} else {
+			assert.Equal(t, []string{pages[page].after}, query["after"])
+			assert.Len(t, query, 3)
+		}
+		_, _ = w.Write([]byte(pages[page].body))
+	}))
+	defer server.Close()
+	client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+
+	templates, err := client.FetchTemplates(context.Background(), account)
+	require.NoError(t, err)
+	require.Len(t, templates, 2)
+	assert.Equal(t, "first", templates[0].Name)
+	assert.Equal(t, "last", templates[1].Name)
+	assert.EqualValues(t, 3, calls.Load())
+}
+
+func TestClient_FetchTemplates_RejectsIncompletePagination(t *testing.T) {
+	t.Parallel()
+
+	type response struct {
+		status int
+		body   string
+	}
+	const cursor = "private-opaque-token"
+	continuation := func(after string) response {
+		return response{http.StatusOK, fmt.Sprintf(`{"data":[{"id":"1"}],"paging":{"next":"/ignored","cursors":{"after":%q}}}`, after)}
+	}
+	pageLimit := make([]response, 100)
+	for i := range pageLimit {
+		pageLimit[i] = continuation(fmt.Sprintf("cursor-%d", i))
+	}
+	for _, tc := range []struct {
+		name  string
+		pages []response
+		error string
+	}{
+		{"missing cursor", []response{continuation("")}, "invalid continuation cursor"},
+		{"invalid cursor", []response{continuation("unsafe cursor")}, "invalid continuation cursor"},
+		{"oversize cursor", []response{continuation(strings.Repeat("a", 4097))}, "invalid continuation cursor"},
+		{"repeated cursor", []response{continuation(cursor), continuation(cursor)}, "repeated a continuation cursor"},
+		{"later HTTP failure", []response{continuation(cursor), {http.StatusBadGateway, `{"error":{"message":"` + cursor + `"}}`}}, "HTTP status 502"},
+		{"later missing data", []response{continuation(cursor), {http.StatusOK, `{}`}}, "invalid template page 2"},
+		{"page limit", pageLimit, "pagination exceeded 100 pages"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				i := int(calls.Add(1)) - 1
+				if i >= len(tc.pages) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				w.WriteHeader(tc.pages[i].status)
+				_, _ = w.Write([]byte(tc.pages[i].body))
+			}))
+			defer server.Close()
+			client := whatsapp.NewWithBaseURL(testutil.NopLogger(), server.URL)
+			templates, err := client.FetchTemplates(context.Background(), testAccount(server.URL))
+			require.ErrorContains(t, err, tc.error)
+			assert.NotContains(t, err.Error(), cursor)
+			assert.Nil(t, templates, "an unfinished list must not reach the caller")
+			assert.EqualValues(t, len(tc.pages), calls.Load())
+		})
+	}
 }
 
 func TestClient_FetchTemplates_Empty(t *testing.T) {

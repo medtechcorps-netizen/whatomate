@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -36,6 +37,50 @@ func templateSyncPrivateDB(t *testing.T, app *handlers.App, pool gorm.ConnPool) 
 
 func templateSyncIsTemplate(tx *gorm.DB) bool {
 	return tx.Statement.Schema != nil && tx.Statement.Schema.Table == "templates"
+}
+
+func TestApp_SyncTemplates_LaterPageFailureDoesNotPersist(t *testing.T) {
+	const cursor = "synthetic-template-continue"
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		switch calls.Add(1) {
+		case 1:
+			assert.False(t, r.URL.Query().Has("after"))
+			_, _ = w.Write([]byte(`{"data":[
+				{"id":"1","name":"page_one_update","language":"en","status":"APPROVED","category":"UTILITY"},
+				{"id":"2","name":"page_one_insert","language":"en","status":"APPROVED","category":"UTILITY"}
+			],"paging":{"next":"/ignored","cursors":{"after":"` + cursor + `"}}}`))
+		case 2:
+			assert.Equal(t, cursor, r.URL.Query().Get("after"))
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"` + cursor + `"}}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	app := newTemplateTestApp(t, server)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createTemplateTestUser(t, app, org.ID, "templates:sync")
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	existing := createTestTemplateInDB(t, app, org.ID, account.Name, "page_one_update", "PENDING")
+
+	req := testutil.NewJSONRequest(t, map[string]any{"whatsapp_account": account.Name})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", org.ID.String())
+	require.NoError(t, app.SyncTemplates(req))
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusBadGateway, "Failed to fetch templates from Meta")
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), cursor)
+	require.EqualValues(t, 2, calls.Load())
+
+	var rows []models.Template
+	require.NoError(t, app.DB.Unscoped().Where("organization_id = ? AND whats_app_account = ?", org.ID, account.Name).Find(&rows).Error)
+	require.Len(t, rows, 1)
+	assert.Equal(t, existing.ID, rows[0].ID)
+	assert.Equal(t, existing.MetaTemplateID, rows[0].MetaTemplateID)
+	assert.Equal(t, existing.Status, rows[0].Status)
+	assert.Equal(t, existing.BodyContent, rows[0].BodyContent)
 }
 
 func TestApp_SyncTemplates_PersistenceFailureRollsBack(t *testing.T) {
