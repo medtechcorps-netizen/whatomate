@@ -297,3 +297,83 @@ func TestApp_SyncTemplates_EmptyProviderBatchReturnsZero(t *testing.T) {
 	assert.Equal(t, existing.ID, rows[0].ID)
 	assert.Equal(t, existing.BodyContent, rows[0].BodyContent)
 }
+
+// The existing unique index spans account, name and language across organizations.
+// A foreign organization's conflicting row must never be adopted or updated; the
+// whole provider batch must roll back when its later insert hits that constraint.
+func TestApp_SyncTemplates_CrossOrganizationConflictRollsBack(t *testing.T) {
+	server := newMockTemplateServer(t)
+	defer server.Close()
+	app := newTemplateTestApp(t, server)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := createTemplateTestUser(t, app, org.ID, "templates:sync")
+	account := testutil.CreateTestWhatsAppAccount(t, app.DB, org.ID)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+
+	// Deliberately adversarial ownership: no same-key row exists in the syncing
+	// organization. Omitting the organization predicate would update this row.
+	foreign := createTestTemplateInDB(t, app, otherOrg.ID, account.Name, "synced_template_two", "PENDING")
+
+	originalDB := app.DB
+	pool, err := originalDB.DB()
+	require.NoError(t, err)
+	app.DB = templateSyncPrivateDB(t, app, pool)
+	armed := false
+	var createOrder []string
+	t.Cleanup(func() {
+		armed = false
+		app.DB = originalDB
+	})
+	requestTemplate := func(tx *gorm.DB) (*models.Template, bool) {
+		if !armed || !templateSyncIsTemplate(tx) {
+			return nil, false
+		}
+		row, ok := tx.Statement.Dest.(*models.Template)
+		return row, ok && row != nil && row.OrganizationID == org.ID &&
+			row.WhatsAppAccount == account.Name && row.Language == "en"
+	}
+	require.NoError(t, app.DB.Callback().Create().Before("gorm:create").Register("test:sync_conflict_attempt", func(tx *gorm.DB) {
+		if row, ok := requestTemplate(tx); ok {
+			createOrder = append(createOrder, row.Name+":attempt")
+		}
+	}))
+	require.NoError(t, app.DB.Callback().Create().After("gorm:create").Register("test:sync_conflict_result", func(tx *gorm.DB) {
+		if row, ok := requestTemplate(tx); ok {
+			if tx.Error == nil && tx.RowsAffected == 1 {
+				createOrder = append(createOrder, row.Name+":created")
+			} else if tx.Error != nil {
+				createOrder = append(createOrder, row.Name+":refused")
+			}
+		}
+	}))
+
+	req := testutil.NewJSONRequest(t, map[string]any{"whatsapp_account": account.Name})
+	testutil.SetAuthContext(req, org.ID, user.ID)
+	armed = true
+	require.NoError(t, app.SyncTemplates(req))
+	armed = false
+	app.DB = originalDB
+	assert.Equal(t, []string{
+		"synced_template_one:attempt",
+		"synced_template_one:created",
+		"synced_template_two:attempt",
+		"synced_template_two:refused",
+	}, createOrder, "one successful insert must precede the later conflicting insert")
+	testutil.AssertErrorResponse(t, req, fasthttp.StatusInternalServerError, "Failed to save synced templates")
+	assert.NotContains(t, string(testutil.GetResponseBody(req)), "Synced ")
+
+	var actual models.Template
+	require.NoError(t, app.DB.Unscoped().First(&actual, "id = ?", foreign.ID).Error)
+	assert.Equal(t, foreign.OrganizationID, actual.OrganizationID)
+	assert.Equal(t, foreign.WhatsAppAccount, actual.WhatsAppAccount)
+	assert.Equal(t, foreign.Name, actual.Name)
+	assert.Equal(t, foreign.Language, actual.Language)
+	assert.Equal(t, foreign.BodyContent, actual.BodyContent)
+	assert.Equal(t, foreign.Status, actual.Status)
+	assert.Empty(t, actual.MetaTemplateID)
+	assert.False(t, actual.DeletedAt.Valid)
+
+	var count int64
+	require.NoError(t, app.DB.Unscoped().Model(&models.Template{}).Where("organization_id = ? AND whats_app_account = ?", org.ID, account.Name).Count(&count).Error)
+	assert.Zero(t, count, "the first successful provider insert must roll back with the later conflict")
+}
