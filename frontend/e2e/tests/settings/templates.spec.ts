@@ -78,7 +78,10 @@ test.describe('Message Templates - Sync', () => {
 
   test.beforeEach(async ({ page }) => {
     await loginAsAdmin(page)
-    await page.evaluate(() => localStorage.removeItem('templates_selected_account'))
+    await page.evaluate(() => {
+      localStorage.removeItem('templates_selected_account')
+      localStorage.removeItem('templates_selected_account_option')
+    })
     syncRequests = 0
     // These cases check availability only; never send a request to Meta.
     await page.route(/\/api\/templates\/sync(?:\?.*)?$/, async route => {

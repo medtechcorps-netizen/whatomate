@@ -62,7 +62,7 @@ async function render() {
 const table = (wrapper: VueWrapper) => wrapper.findComponent({ name: 'TemplateTable' })
 const syncButton = (wrapper: VueWrapper) => wrapper.findAll('button').find(button => button.text() === 'templates.syncFromMeta')!
 async function account(wrapper: VueWrapper, name: string) {
-  wrapper.findComponent({ name: 'AccountSelect' }).vm.$emit('update:modelValue', name)
+  wrapper.findComponent({ name: 'AccountSelect' }).vm.$emit('update:modelValue', `account:${name}`)
   await nextTick()
 }
 async function page(wrapper: VueWrapper, value: number) {
@@ -282,6 +282,10 @@ describe('template view request ownership', () => {
     await account(wrapper, 'missing')
     expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
     await syncButton(wrapper).trigger('click')
+    wrapper.findComponent({ name: 'AccountSelect' }).vm.$emit('update:modelValue', null)
+    await nextTick()
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    await syncButton(wrapper).trigger('click')
     expect(mocks.post).not.toHaveBeenCalled()
 
     await account(wrapper, 'B')
@@ -297,6 +301,17 @@ describe('template view request ownership', () => {
     expect(mocks.error).toHaveBeenCalledTimes(1)
     expect(mocks.error).toHaveBeenCalledWith('templates.syncPartialFailure 1')
     expect(mocks.success).not.toHaveBeenCalled()
+  })
+
+  it('restores a legacy configured account name that contains the picker prefix', async () => {
+    localStorage.setItem('templates_selected_account', 'account:B')
+    mocks.get.mockResolvedValueOnce(accounts(['B', 'account:B']))
+    const wrapper = await render()
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'account:B' }))
+    expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(mocks.post.mock.calls).toEqual([['/templates/sync', { whatsapp_account: 'account:B' }]])
   })
 
   it('keeps the started sync target snapshot when only the list filter changes', async () => {

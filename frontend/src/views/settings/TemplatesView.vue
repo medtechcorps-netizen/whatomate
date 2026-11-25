@@ -64,13 +64,34 @@ let syncRequest = 0
 let viewGeneration = 0
 let disposed = false
 let viewSession = currentTabSession()
-const selectedAccount = ref<string>(localStorage.getItem('templates_selected_account') || 'all')
+const allAccountsOption = 'all'
+const accountOptionPrefix = 'account:'
+const accountOptionPreference = 'templates_selected_account_option'
+const legacyAccountPreference = 'templates_selected_account'
+
+function accountOption(name: string): string {
+  return accountOptionPrefix + name
+}
+
+function accountNameForOption(option: unknown): string | undefined {
+  if (typeof option !== 'string' || !option.startsWith(accountOptionPrefix)) return undefined
+  return option.slice(accountOptionPrefix.length) || undefined
+}
+
+const legacyAccount = localStorage.getItem(legacyAccountPreference)
+const selectedAccount = ref(localStorage.getItem(accountOptionPreference) ??
+  (legacyAccount && legacyAccount !== allAccountsOption ? accountOption(legacyAccount) : allAccountsOption))
+
+function persistAccountOption(option: string) {
+  localStorage.setItem(accountOptionPreference, option)
+  localStorage.setItem(legacyAccountPreference, accountNameForOption(option) ?? allAccountsOption)
+}
 const canWrite = computed(() => authStore.hasPermission('templates', 'write'))
 const canDelete = computed(() => authStore.hasPermission('templates', 'delete'))
 const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
 const selectedSyncAccount = computed(() => {
-  const name = selectedAccount.value
-  return name && name !== 'all' && accounts.value.some(account => account.name === name) ? name : null
+  const name = accountNameForOption(selectedAccount.value)
+  return name && accounts.value.some(account => account.name === name) ? name : null
 })
 
 // Delete dialog state
@@ -275,10 +296,9 @@ async function fetchAccounts() {
     const response = await api.get('/accounts')
     if (!current()) return
     accounts.value = response.data.data?.accounts || []
-    // Validate stored account still exists, fallback to 'all' if not
-    if (selectedAccount.value !== 'all' && !accounts.value.some(a => a.name === selectedAccount.value)) {
-      selectedAccount.value = 'all'
-      localStorage.setItem('templates_selected_account', 'all')
+    if (selectedAccount.value !== allAccountsOption && selectedSyncAccount.value === null) {
+      selectedAccount.value = allAccountsOption
+      persistAccountOption(allAccountsOption)
     }
   } catch (error) {
     if (!current()) return
@@ -288,7 +308,7 @@ async function fetchAccounts() {
 
 function onAccountChange(value: string | number | bigint | Record<string, any> | null) {
   if (typeof value !== 'string') return
-  localStorage.setItem('templates_selected_account', value)
+  persistAccountOption(value)
   currentPage.value = 1
   fetchTemplates()
 }
@@ -299,7 +319,7 @@ async function fetchTemplates() {
   const request = ++templatesRequest
   const current = () => scope() && request === templatesRequest
   const params = {
-    account: selectedAccount.value !== 'all' ? selectedAccount.value : undefined,
+    account: accountNameForOption(selectedAccount.value),
     search: searchQuery.value || undefined,
     page: currentPage.value,
     limit: pageSize
@@ -482,8 +502,8 @@ function getHeaderIcon(type: string) {
                         <SelectValue :placeholder="$t('templates.allAccounts')" />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="all">{{ $t('templates.allAccounts') }}</SelectItem>
-                        <SelectItem v-for="account in accounts" :key="account.id" :value="account.name">
+                        <SelectItem :value="allAccountsOption">{{ $t('templates.allAccounts') }}</SelectItem>
+                        <SelectItem v-for="account in accounts" :key="account.id" :value="accountOption(account.name)">
                           {{ account.name }}
                         </SelectItem>
                       </SelectContent>

@@ -210,7 +210,10 @@ test.describe('Message Templates - Request ownership', () => {
     await loginAs(page, user)
     // Only the template filter preference is cleared; auth/session/org state
     // is established by the real login and switcher paths.
-    await page.evaluate(() => localStorage.removeItem('templates_selected_account'))
+    await page.evaluate(() => {
+      localStorage.removeItem('templates_selected_account')
+      localStorage.removeItem('templates_selected_account_option')
+    })
     fixture = await installTemplates(page)
   })
 
@@ -246,6 +249,40 @@ test.describe('Message Templates - Request ownership', () => {
     await expect(page.locator('tbody .skeleton-shimmer')).toHaveCount(0)
     expect(fixture.syncs).toEqual([])
     expect(accountsReply.outcome()).toBe('delivered')
+  })
+
+  test('keeps All Accounts filter-only and syncs a configured account named all after reload', async ({ page }) => {
+    const namedAll = { id: 'ownership-account-all', name: 'all', phone_id: 'ownership-phone-all' }
+    fixture.accounts = route => route.fulfill({ json: { data: { accounts: [...accounts, namedAll] } } })
+    fixture.sync = route => {
+      expect(route.request().postDataJSON()).toEqual({ whatsapp_account: 'all' })
+      expect(fixture.syncs).toEqual(['all'])
+      return route.fulfill({ json: { data: { count: 1 } } })
+    }
+    await page.evaluate(() => localStorage.setItem('templates_selected_account', 'all'))
+    await openTemplates(page)
+    await expect(accountSelect(page)).toContainText('All Accounts')
+    await expect(syncButton(page)).toBeDisabled()
+    await expect.poll(() => fixture.lists.at(-1)?.account).toBeNull()
+    expect(fixture.syncs).toEqual([])
+
+    await selectAccount(page, 'all')
+    await expect(accountSelect(page)).toHaveText('all')
+    await expect(syncButton(page)).toBeEnabled()
+    await expect.poll(() => fixture.lists.at(-1)?.account).toBe('all')
+    const beforeReload = fixture.lists.length
+    await page.reload({ waitUntil: 'domcontentloaded' })
+    await expect(accountSelect(page)).toHaveText('all')
+    await expect(syncButton(page)).toBeEnabled()
+    await expect.poll(() => fixture.lists.slice(beforeReload).at(-1)?.account).toBe('all')
+
+    await syncButton(page).click()
+    await expect(page.getByLabel('Template sync results')).toContainText('all: Synced')
+    expect(fixture.syncs).toEqual(['all'])
+    await selectAccount(page, 'All Accounts')
+    await expect(syncButton(page)).toBeDisabled()
+    await expect.poll(() => fixture.lists.at(-1)?.account).toBeNull()
+    expect(fixture.syncs).toEqual(['all'])
   })
 
   test('keeps one captured sync account after a filter change and shows its outcome', async ({ page }) => {
