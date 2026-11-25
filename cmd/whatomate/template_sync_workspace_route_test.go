@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/shridarpatil/whatomate/internal/config"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/handlers"
 	"github.com/shridarpatil/whatomate/internal/middleware"
 	"github.com/shridarpatil/whatomate/internal/models"
@@ -20,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
 
 type templateSyncRouteTransport func(*http.Request) (*http.Response, error)
@@ -28,6 +32,7 @@ func (f templateSyncRouteTransport) RoundTrip(req *http.Request) (*http.Response
 	return f(req)
 }
 
+// Run serially because installing RLS changes the disposable fixture schema.
 func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 	db := testutil.SetupTestDB(t)
 	home := testutil.CreateTestOrganization(t, db)
@@ -83,13 +88,45 @@ func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(providerBody))}, nil
 	})
 
-	// Exercise the real tenant transaction, cookie auth and CSRF middleware on
-	// the fixture database connection.
+	runtimeRole := "rereply_template_route_" + uuid.NewString()[:8]
+	runtimePassword := uuid.NewString() + uuid.NewString()
+	require.NoError(t, db.Exec(fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION",
+		runtimeRole, runtimePassword,
+	)).Error)
+	rlsApplied := false
+	t.Cleanup(func() {
+		if rlsApplied {
+			if err := database.RemoveTenantRLS(db); err != nil {
+				t.Errorf("remove disposable Template Sync RLS: %v", err)
+			}
+		}
+		if err := db.Exec("DROP OWNED BY " + runtimeRole).Error; err != nil {
+			t.Errorf("remove disposable Template Sync grants: %v", err)
+		}
+		if err := db.Exec("DROP ROLE " + runtimeRole).Error; err != nil {
+			t.Errorf("remove disposable Template Sync role: %v", err)
+		}
+	})
+	require.NoError(t, database.ApplyTenantRLS(db, runtimeRole))
+	rlsApplied = true
+	runtime := testutil.OpenTestDBAsRole(t, runtimeRole, runtimePassword)
+	require.NoError(t, database.VerifyTenantRLS(runtime, runtimeRole))
+	pool, err := runtime.DB()
+	require.NoError(t, err)
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	runtime = runtime.WithContext(ctx)
+
+	// The mounted route runs with the restricted login, while the fixture
+	// owner is used only for setup, independent observation, and cleanup.
 	cfg := &config.Config{
-		Database: config.DatabaseConfig{RLSEnabled: true},
+		Database: config.DatabaseConfig{RLSEnabled: true, RuntimeRole: runtimeRole},
 		JWT:      config.JWTConfig{Secret: testutil.TestJWTSecret},
 	}
-	app := &handlers.App{DB: db, Config: cfg, Log: log, WhatsApp: client}
+	app := &handlers.App{DB: runtime, Config: cfg, Log: log, WhatsApp: client}
 	glue := fastglue.NewGlue()
 	glue.Before(middleware.SecurityHeaders())
 	glue.Before(middleware.Recovery(log))
@@ -147,6 +184,17 @@ func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 	require.Equal(t, all.Name, rows[0].WhatsAppAccount)
 	require.Equal(t, templateName, rows[0].Name)
 	require.Equal(t, templateID, rows[0].MetaTemplateID)
+
+	for _, scope := range []struct {
+		workspace uuid.UUID
+		count     int64
+	}{{selected.ID, 1}, {home.ID, 0}} {
+		var count int64
+		require.NoError(t, database.WithTenant(runtime, scope.workspace, func(tx *gorm.DB) error {
+			return tx.Model(&models.Template{}).Where("id = ?", rows[0].ID).Count(&count).Error
+		}))
+		require.Equal(t, scope.count, count)
+	}
 
 	removed := db.Delete(&membership)
 	require.NoError(t, removed.Error)
