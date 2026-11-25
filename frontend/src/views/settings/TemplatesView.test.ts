@@ -1,21 +1,22 @@
 /** @vitest-environment happy-dom */
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import axios, { AxiosHeaders } from 'axios'
 import { defineComponent, nextTick, reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import TemplatesView from './TemplatesView.vue'
 
 const mocks = vi.hoisted(() => ({
-  get: vi.fn(), post: vi.fn(), list: vi.fn(), remove: vi.fn(),
+  get: vi.fn(), post: vi.fn(), list: vi.fn(), remove: vi.fn(), adapter: vi.fn(),
   success: vi.fn(), error: vi.fn(),
 }))
-const context = reactive({ selectedOrgId: 'org-A', session: 'session-A', live: true, canSync: true })
+const context = reactive({ selectedOrgId: 'org-A' as string | null, session: 'session-A', live: true, canSync: true })
 vi.mock('@/services/api', () => ({
   AUTH_SESSION_EVENT: 'auth-session-state',
-  api: { get: mocks.get, post: mocks.post, delete: mocks.remove },
+  api: { get: mocks.get, post: mocks.post, delete: mocks.remove, defaults: { adapter: mocks.adapter } },
   templatesService: { list: mocks.list },
 }))
 vi.mock('@/stores/organizations', () => ({ useOrganizationsStore: () => context }))
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ hasPermission: (_resource: string, action: string) => action === 'sync' && context.canSync }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ organizationId: 'org-A', hasPermission: (_resource: string, action: string) => action === 'sync' && context.canSync }) }))
 vi.mock('@/lib/tabSession', () => ({ currentTabSession: () => context.session, isTabSessionCurrent: () => context.live }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string, params?: Record<string, string | number>) => params ? `${key} ${Object.values(params).join(' ')}` : key }) }))
 vi.mock('vue-sonner', () => ({ toast: { success: mocks.success, error: mocks.error } }))
@@ -69,6 +70,11 @@ async function page(wrapper: VueWrapper, value: number) {
   table(wrapper).vm.$emit('page-change', value)
   await nextTick()
 }
+function selectWorkspace(organizationId: string) {
+  // Match the Pinia selection update order.
+  context.selectedOrgId = organizationId
+  localStorage.setItem('selected_organization_id', organizationId)
+}
 function sessionEvent(state: string) {
   window.dispatchEvent(new CustomEvent('auth-session-state', { detail: { state } }))
 }
@@ -82,7 +88,9 @@ describe('template view request ownership', () => {
     context.live = true
     context.canSync = true
     localStorage.clear()
+    localStorage.setItem('selected_organization_id', 'org-A')
     mocks.get.mockResolvedValue(accounts())
+    mocks.adapter.mockResolvedValue({})
     mocks.list.mockResolvedValue(rows('current'))
     mocks.post.mockResolvedValue({})
     vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -98,7 +106,7 @@ describe('template view request ownership', () => {
     const old = deferred<ReturnType<typeof rows>>()
     mocks.list.mockReturnValueOnce(old.promise)
     const wrapper = await render()
-    context.selectedOrgId = 'org-B'
+    selectWorkspace('org-B')
     await flushPromises()
     expect(table(wrapper).props('items')).toEqual([{ id: 'current', name: 'current' }])
     old.resolve(rows('old workspace', 99))
@@ -111,8 +119,8 @@ describe('template view request ownership', () => {
     const wrapper = await render()
     const pending = deferred<ReturnType<typeof accounts>>()
     mocks.get.mockReturnValueOnce(pending.promise)
-    context.selectedOrgId = 'org-B'
-    await nextTick()
+    selectWorkspace('org-B')
+    await flushPromises()
     expect(table(wrapper).props('items')).toEqual([])
     expect(table(wrapper).props('isLoading')).toBe(true)
     pending.resolve(accounts())
@@ -124,8 +132,8 @@ describe('template view request ownership', () => {
     const old = deferred<ReturnType<typeof accounts>>()
     mocks.get.mockReturnValueOnce(old.promise)
     const wrapper = await render()
-    context.selectedOrgId = 'org-B'
-    context.selectedOrgId = 'org-A'
+    selectWorkspace('org-B')
+    selectWorkspace('org-A')
     await flushPromises()
     expect(mocks.list).toHaveBeenCalledTimes(1)
     old.resolve(accounts(['obsolete']))
@@ -138,8 +146,9 @@ describe('template view request ownership', () => {
     const wrapper = await render()
     const old = deferred<ReturnType<typeof accounts>>()
     mocks.get.mockReturnValueOnce(old.promise)
-    context.selectedOrgId = 'org-B'
-    context.selectedOrgId = 'org-C'
+    selectWorkspace('org-B')
+    await flushPromises()
+    selectWorkspace('org-C')
     await flushPromises()
     const calls = mocks.list.mock.calls.length
     old.reject(new Error('old account request'))
@@ -162,7 +171,7 @@ describe('template view request ownership', () => {
     expect(mocks.error).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(300)
     await flushPromises()
-    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ search: 'new search' }))
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ search: 'new search' }), expect.any(Object))
     expect(table(wrapper).props('isLoading')).toBe(false)
   })
 
@@ -256,8 +265,8 @@ describe('template view request ownership', () => {
     mocks.post.mockReturnValueOnce(old.promise).mockReturnValueOnce(latest.promise)
     await account(wrapper, 'A')
     await syncButton(wrapper).trigger('click')
-    context.selectedOrgId = 'org-B'
-    context.selectedOrgId = 'org-A'
+    selectWorkspace('org-B')
+    selectWorkspace('org-A')
     await flushPromises()
     await account(wrapper, 'A')
     await syncButton(wrapper).trigger('click')
@@ -295,7 +304,8 @@ describe('template view request ownership', () => {
     sessionEvent('refreshed')
     pending.reject(new Error('B unavailable'))
     await flushPromises()
-    expect(mocks.post.mock.calls).toEqual([['/templates/sync', { whatsapp_account: 'B' }]])
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'B' },
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
     const results = wrapper.get('[aria-label="templates.syncResults"]').text()
     expect(results).toContain('B: B unavailable')
     expect(mocks.error).toHaveBeenCalledTimes(1)
@@ -307,11 +317,69 @@ describe('template view request ownership', () => {
     localStorage.setItem('templates_selected_account', 'account:B')
     mocks.get.mockResolvedValueOnce(accounts(['B', 'account:B']))
     const wrapper = await render()
-    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'account:B' }))
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'account:B' }), expect.any(Object))
     expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
     await syncButton(wrapper).trigger('click')
     await flushPromises()
-    expect(mocks.post.mock.calls).toEqual([['/templates/sync', { whatsapp_account: 'account:B' }]])
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'account:B' },
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
+  })
+
+  it('pins a literal all account and rejects a late adapter dispatch after the stored workspace moves', async () => {
+    mocks.get.mockResolvedValueOnce(accounts(['all']))
+    const pending = deferred<object>()
+    mocks.post.mockReturnValueOnce(pending.promise)
+    const wrapper = await render()
+    const workspaceHeaders = { 'X-Organization-ID': 'org-A' }
+    expect(mocks.get).toHaveBeenCalledExactlyOnceWith('/accounts', expect.objectContaining({ headers: workspaceHeaders }))
+
+    await account(wrapper, 'all')
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'all' }),
+      expect.objectContaining({ headers: workspaceHeaders }))
+    await syncButton(wrapper).trigger('click')
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all' },
+      expect.objectContaining({ headers: workspaceHeaders }))
+
+    const adapter = axios.getAdapter(mocks.post.mock.calls[0]![2].adapter)
+    const config = { headers: new AxiosHeaders(workspaceHeaders) }
+    await adapter(config)
+    localStorage.setItem('selected_organization_id', 'org-B')
+    expect(context.selectedOrgId).toBe('org-A')
+    await expect(adapter(config)).rejects.toMatchObject({ code: 'ERR_CANCELED' })
+    expect(mocks.adapter).toHaveBeenCalledTimes(1)
+
+    const lists = mocks.list.mock.calls.length
+    pending.resolve({})
+    await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(lists)
+    expect(mocks.success).not.toHaveBeenCalled()
+    await syncButton(wrapper).trigger('click')
+    expect(mocks.post).toHaveBeenCalledTimes(1)
+  })
+
+  it('settles loading and waits for the reactive and stored workspace to agree before listing accounts', async () => {
+    localStorage.setItem('selected_organization_id', 'org-B')
+    const wrapper = await render()
+    expect(table(wrapper).props('isLoading')).toBe(false)
+    await page(wrapper, 2)
+    await flushPromises()
+    expect(table(wrapper).props('isLoading')).toBe(false)
+    expect(mocks.get).not.toHaveBeenCalled()
+    expect(mocks.list).not.toHaveBeenCalled()
+
+    selectWorkspace('org-B')
+    await flushPromises()
+    expect(mocks.get).toHaveBeenCalledExactlyOnceWith('/accounts',
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-B' } }))
+    expect(mocks.list).toHaveBeenCalledTimes(1)
+  })
+
+  it('pins the authenticated workspace when there is no selected override', async () => {
+    context.selectedOrgId = null
+    localStorage.removeItem('selected_organization_id')
+    await render()
+    expect(mocks.get).toHaveBeenCalledExactlyOnceWith('/accounts',
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
   })
 
   it('keeps the started sync target snapshot when only the list filter changes', async () => {
@@ -323,10 +391,11 @@ describe('template view request ownership', () => {
     await account(wrapper, 'B')
     first.resolve({})
     await flushPromises()
-    expect(mocks.post.mock.calls).toEqual([['/templates/sync', { whatsapp_account: 'A' }]])
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'A' },
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
     expect(mocks.success).toHaveBeenCalledTimes(1)
     expect(mocks.success).toHaveBeenCalledWith('templates.syncAccountsSuccess 1')
-    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'B' }))
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'B' }), expect.any(Object))
   })
 
   it('starts no list continuation when unmounted during the accounts request', async () => {

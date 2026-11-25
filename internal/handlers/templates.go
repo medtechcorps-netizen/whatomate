@@ -64,6 +64,9 @@ func (a *App) ListTemplates(r *fastglue.Request) error {
 	if err != nil {
 		return nil
 	}
+	if !a.requireMatchingExplicitOrganization(r, orgID) {
+		return nil
+	}
 
 	pg := parsePagination(r)
 
@@ -464,6 +467,9 @@ func (a *App) submitTemplateToMeta(account *models.WhatsAppAccount, template *mo
 func (a *App) SyncTemplates(r *fastglue.Request) error {
 	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
 	if err != nil {
+		return nil
+	}
+	if !a.requireMatchingExplicitOrganization(r, orgID) {
 		return nil
 	}
 

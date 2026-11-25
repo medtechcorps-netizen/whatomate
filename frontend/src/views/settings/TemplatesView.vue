@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue'
 import { RouterLink } from 'vue-router'
+import axios, { type AxiosRequestConfig } from 'axios'
 import { useI18n } from 'vue-i18n'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -15,6 +16,7 @@ import { useAuthStore } from '@/stores/auth'
 import { toast } from 'vue-sonner'
 import { Plus, RefreshCw, FileText, Pencil, Trash2, Loader2, MessageSquare, Image, FileIcon, Video } from 'lucide-vue-next'
 import { getErrorMessage } from '@/lib/api-utils'
+import { readSelectedOrganizationId, SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
 import { currentTabSession, isTabSessionCurrent } from '@/lib/tabSession'
 import { syncTemplateAccounts, type TemplateSyncResult } from '@/lib/templateSync'
 import { useSearchPagination } from '@/composables/useSearchPagination'
@@ -50,6 +52,7 @@ interface Template {
 
 const organizationsStore = useOrganizationsStore()
 const authStore = useAuthStore()
+const organizationId = computed(() => organizationsStore.selectedOrgId || authStore.organizationId || '')
 
 const templates = ref<Template[]>([])
 const accounts = ref<WhatsAppAccount[]>([])
@@ -215,11 +218,28 @@ function getLanguageName(code: string): string {
 // generation as well as the logical session before each asynchronous workflow.
 function captureViewScope() {
   const generation = viewGeneration
-  const org = organizationsStore.selectedOrgId
+  const org = organizationId.value
+  const storedOrg = readSelectedOrganizationId()
   const session = currentTabSession()
-  return () => !disposed && generation === viewGeneration &&
-    org === organizationsStore.selectedOrgId && session !== null &&
-    session === currentTabSession() && isTabSessionCurrent()
+  return {
+    organizationId: org,
+    isCurrent: () => !disposed && generation === viewGeneration && !!org &&
+      org === organizationId.value && storedOrg === readSelectedOrganizationId() &&
+      (storedOrg === null ? org === authStore.organizationId : storedOrg === org) &&
+      session !== null && session === currentTabSession() && isTabSessionCurrent(),
+  }
+}
+
+function workspaceRequest(org: string, isCurrent: () => boolean): AxiosRequestConfig {
+  const send = axios.getAdapter(api.defaults.adapter)
+  return {
+    headers: { 'X-Organization-ID': org },
+    // Axios can dispatch after the click, including a replay after auth refresh.
+    adapter: async config => {
+      if (!isCurrent()) throw new axios.CanceledError()
+      return send(config)
+    },
+  }
 }
 
 function invalidateTemplates() {
@@ -246,23 +266,39 @@ function invalidateView() {
 }
 
 async function loadWorkspace() {
-  const current = captureViewScope()
-  if (!current()) return
+  const scope = captureViewScope()
+  if (!scope.isCurrent()) {
+    isLoading.value = false
+    return
+  }
   isLoading.value = true
   await fetchAccounts()
-  if (current()) await fetchTemplates()
+  if (scope.isCurrent()) await fetchTemplates()
 }
 
-watch(() => organizationsStore.selectedOrgId, () => {
+function onWorkspaceChange() {
   viewSession = currentTabSession()
   invalidateView()
-  void loadWorkspace()
-}, { flush: 'sync' })
+  const generation = viewGeneration
+  // The store publishes its reactive selection before persisting it.
+  queueMicrotask(() => {
+    if (!disposed && generation === viewGeneration) void loadWorkspace()
+  })
+}
+
+watch([() => organizationsStore.selectedOrgId, () => authStore.organizationId], onWorkspaceChange, { flush: 'sync' })
+
+function onWorkspaceStorage(event: StorageEvent) {
+  if (event.storageArea === localStorage &&
+    (event.key === SELECTED_ORGANIZATION_STORAGE_KEY || event.key === null)) {
+    onWorkspaceChange()
+  }
+}
 
 // Invalidate immediately, including the debounce interval before the next GET.
 watch([selectedAccount, searchQuery, currentPage], () => {
   invalidateTemplates()
-  isLoading.value = !disposed && isTabSessionCurrent()
+  isLoading.value = captureViewScope().isCurrent()
 }, { flush: 'sync' })
 
 function onSessionState(event: Event) {
@@ -277,6 +313,7 @@ function onSessionState(event: Event) {
 
 onMounted(() => {
   window.addEventListener(AUTH_SESSION_EVENT, onSessionState)
+  window.addEventListener('storage', onWorkspaceStorage)
   void loadWorkspace()
 })
 
@@ -284,16 +321,17 @@ onBeforeUnmount(() => {
   disposed = true
   invalidateView()
   window.removeEventListener(AUTH_SESSION_EVENT, onSessionState)
+  window.removeEventListener('storage', onWorkspaceStorage)
 })
 
 async function fetchAccounts() {
   const scope = captureViewScope()
-  if (!scope()) return
+  if (!scope.isCurrent()) return
   const request = ++accountsRequest
-  const current = () => scope() && request === accountsRequest
+  const current = () => scope.isCurrent() && request === accountsRequest
   accounts.value = []
   try {
-    const response = await api.get('/accounts')
+    const response = await api.get('/accounts', workspaceRequest(scope.organizationId, current))
     if (!current()) return
     accounts.value = response.data.data?.accounts || []
     if (selectedAccount.value !== allAccountsOption && selectedSyncAccount.value === null) {
@@ -315,9 +353,9 @@ function onAccountChange(value: string | number | bigint | Record<string, any> |
 
 async function fetchTemplates() {
   const scope = captureViewScope()
-  if (!scope()) return
+  if (!scope.isCurrent()) return
   const request = ++templatesRequest
-  const current = () => scope() && request === templatesRequest
+  const current = () => scope.isCurrent() && request === templatesRequest
   const params = {
     account: accountNameForOption(selectedAccount.value),
     search: searchQuery.value || undefined,
@@ -327,7 +365,7 @@ async function fetchTemplates() {
   isLoading.value = true
   error.value = null
   try {
-    const response = await templatesService.list(params)
+    const response = await templatesService.list(params, workspaceRequest(scope.organizationId, current))
     if (!current()) return
     const data = (response.data as any).data || response.data
     templates.value = data.templates || []
@@ -350,16 +388,16 @@ async function syncTemplates() {
   if (!target) { toast.error(t('templates.selectAccountFirst')); return }
 
   const scope = captureViewScope()
-  if (!scope()) return
+  if (!scope.isCurrent()) return
   const request = ++syncRequest
-  const ownsRequest = () => scope() && request === syncRequest
-  const current = () => ownsRequest() && canSync.value
+  const ownsRequest = () => request === syncRequest
+  const current = () => ownsRequest() && scope.isCurrent() && canSync.value
   isSyncing.value = true
   syncResults.value = []
   try {
     const results = await syncTemplateAccounts([target], async account => {
       syncProgress.value = account
-      await api.post('/templates/sync', { whatsapp_account: account })
+      await api.post('/templates/sync', { whatsapp_account: account }, workspaceRequest(scope.organizationId, current))
     }, current, t('templates.syncAccountFailed'))
     if (!current()) return
     syncResults.value = results
@@ -377,7 +415,7 @@ async function syncTemplates() {
 
 function openDeleteDialog(template: Template) {
   const scope = captureViewScope()
-  if (!canDelete.value || !scope()) return
+  if (!canDelete.value || !scope.isCurrent()) return
   deleteRequest++
   isDeleting.value = false
   templateToDelete.value = template
@@ -387,10 +425,10 @@ function openDeleteDialog(template: Template) {
 async function confirmDeleteTemplate() {
   if (!canDelete.value || !deleteDialogOpen.value || !templateToDelete.value || isDeleting.value) return
   const scope = captureViewScope()
-  if (!scope()) return
+  if (!scope.isCurrent()) return
   const templateId = templateToDelete.value.id
   const request = ++deleteRequest
-  const current = () => scope() && request === deleteRequest &&
+  const current = () => scope.isCurrent() && request === deleteRequest &&
     deleteDialogOpen.value && templateToDelete.value?.id === templateId && canDelete.value
 
   isDeleting.value = true
@@ -401,7 +439,7 @@ async function confirmDeleteTemplate() {
     toast.success(t('common.deletedSuccess', { resource: t('resources.Template') }))
     deleteDialogOpen.value = false
     templateToDelete.value = null
-    if (scope()) await fetchTemplates()
+    if (scope.isCurrent()) await fetchTemplates()
   } catch (error) {
     if (!current()) return
     toast.error(getErrorMessage(error, t('common.failedDelete', { resource: t('resources.template') })))

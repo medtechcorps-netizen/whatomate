@@ -109,6 +109,9 @@ func (a *App) ListAccounts(r *fastglue.Request) error {
 	if err != nil {
 		return nil
 	}
+	if !a.requireMatchingExplicitOrganization(r, orgID) {
+		return nil
+	}
 
 	var accounts []models.WhatsAppAccount
 	if err := a.DB.Where("organization_id = ?", orgID).Order("created_at DESC").Find(&accounts).Error; err != nil {
