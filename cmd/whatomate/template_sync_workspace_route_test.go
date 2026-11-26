@@ -200,7 +200,24 @@ func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 	}, choiceResult.Data.Accounts)
 	require.Zero(t, providerCalls)
 
-	synced := invoke(cookies, headers)
+	for _, candidate := range []struct {
+		path   string
+		id     any
+		status int
+	}{
+		{"/api/templates/sync", other.ID.String(), fasthttp.StatusNotFound},
+		{"/api/templates/sync", "invalid-uuid", fasthttp.StatusBadRequest},
+		{"/api/templates/sync?account=all", nil, fasthttp.StatusBadRequest},
+		{"/api/templates/sync", uuid.Nil.String(), fasthttp.StatusBadRequest},
+	} {
+		refused := laneAInvoke(glue, fasthttp.MethodPost, candidate.path, cookies, headers,
+			map[string]any{"whatsapp_account": "all", "whatsapp_account_id": candidate.id})
+		require.Equal(t, candidate.status, refused.Response.StatusCode())
+		require.Zero(t, providerCalls)
+	}
+
+	synced := laneAInvoke(glue, fasthttp.MethodPost, "/api/templates/sync", cookies, headers,
+		map[string]string{"whatsapp_account": "all", "whatsapp_account_id": all.ID.String()})
 	require.Equal(t, fasthttp.StatusOK, synced.Response.StatusCode())
 	var result struct {
 		Data struct {

@@ -2,6 +2,7 @@ import { expect, test, type BrowserContext, type Page } from "@playwright/test";
 
 const workspaceA = { id: "2c111111-1111-4111-8111-111111111111", name: "Synthetic workspace A" };
 const workspaceB = { id: "2c222222-2222-4222-8222-222222222222", name: "Synthetic workspace B" };
+const literalAllAccount = { id: "3c333333-3333-4333-8333-333333333333", name: "all" };
 const sessionMarker = "synthetic-template-sync-session";
 const csrf = "synthetic-template-sync-csrf";
 const syncPath = "/api/templates/sync";
@@ -119,7 +120,7 @@ async function mockApi(
         }
         const accounts = organization === workspaceA.id
           ? [
-              { id: "a-all", name: "all" },
+              literalAllAccount,
               { id: "a-other", name: "Alternate A account" },
             ]
           : [{ id: "b-other", name: "Alternate B account" }];
@@ -169,7 +170,7 @@ const result = (page: Page) => page.getByLabel("Template sync results");
 const expectedSync = {
   organization: workspaceA.id,
   csrf,
-  body: { whatsapp_account: "all" },
+  body: { whatsapp_account: "all", whatsapp_account_id: literalAllAccount.id },
 };
 
 async function openTemplates(page: Page) {

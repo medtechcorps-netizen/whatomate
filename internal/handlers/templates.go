@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -520,13 +521,18 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 		return nil
 	}
 
-	// Get account name from query or body
+	var body struct {
+		WhatsAppAccount   string          `json:"whatsapp_account"`
+		WhatsAppAccountID json.RawMessage `json:"whatsapp_account_id"`
+	}
+	if len(r.RequestCtx.PostBody()) != 0 {
+		if err := r.Decode(&body, "json"); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid template sync request", nil, "")
+		}
+	}
+
 	accountName := string(r.RequestCtx.QueryArgs().Peek("account"))
 	if accountName == "" {
-		var body struct {
-			WhatsAppAccount string `json:"whatsapp_account"`
-		}
-		_ = r.Decode(&body, "json")
 		accountName = body.WhatsAppAccount
 	}
 
@@ -534,10 +540,23 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "whatsapp_account is required", nil, "")
 	}
 
+	query := a.DB.Where("organization_id = ? AND name = ?", orgID, accountName)
+	if body.WhatsAppAccountID != nil {
+		var rawID string
+		if err := json.Unmarshal(body.WhatsAppAccountID, &rawID); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid whatsapp_account_id", nil, "")
+		}
+		accountID, err := uuid.Parse(rawID)
+		if err != nil || accountID == uuid.Nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid whatsapp_account_id", nil, "")
+		}
+		query = query.Where("id = ?", accountID)
+	}
+
 	// Keep the stored binding, including the original token representation.
 	// Only the copy used for the provider request is decrypted.
 	var account models.WhatsAppAccount
-	if err := a.DB.Where("organization_id = ? AND name = ?", orgID, accountName).First(&account).Error; err != nil {
+	if err := query.First(&account).Error; err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "WhatsApp account not found", nil, "")
 	}
 	providerAccount := account

@@ -96,11 +96,12 @@ const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
 const canReadAccounts = computed(() => authStore.hasPermission('accounts', 'read'))
 const selectedListedAccount = computed(() => {
   const name = accountNameForOption(selectedAccount.value)
-  return name && accounts.value.some(account => account.name === name) ? name : null
+  return accounts.value.find(account => account.name === name) ?? null
 })
 const selectedSyncAccount = computed(() => {
-  const name = selectedListedAccount.value
-  return name && syncAccounts.value.some(account => account.name === name) ? name : null
+  const listed = selectedListedAccount.value
+  if (!listed?.id) return null
+  return syncAccounts.value.some(account => account.id === listed.id && account.name === listed.name) ? listed : null
 })
 
 // Delete dialog state
@@ -280,8 +281,9 @@ async function loadWorkspace() {
     return
   }
   isLoading.value = true
-  await fetchAccounts()
-  if (scope.isCurrent()) await fetchTemplates()
+  const request = ++accountsRequest
+  await fetchAccounts(scope, request)
+  if (scope.isCurrent() && request === accountsRequest) await fetchTemplates()
 }
 
 function onWorkspaceChange() {
@@ -333,10 +335,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('storage', onWorkspaceStorage)
 })
 
-async function fetchAccounts() {
-  const scope = captureViewScope()
-  if (!scope.isCurrent()) return
-  const request = ++accountsRequest
+async function fetchAccounts(scope: ReturnType<typeof captureViewScope>, request: number) {
   const maySync = canSync.value
   const mayReadAccounts = canReadAccounts.value
   const useSyncChoicesForBrowsing = maySync && !mayReadAccounts
@@ -427,9 +426,12 @@ async function syncTemplates() {
   isSyncing.value = true
   syncResults.value = []
   try {
-    const results = await syncTemplateAccounts([target], async account => {
+    const results = await syncTemplateAccounts([target.name], async account => {
       syncProgress.value = account
-      await api.post('/templates/sync', { whatsapp_account: account }, workspaceRequest(scope.organizationId, current))
+      await api.post('/templates/sync', {
+        whatsapp_account: account,
+        whatsapp_account_id: target.id,
+      }, workspaceRequest(scope.organizationId, current))
     }, current, t('templates.syncAccountFailed'))
     if (!current()) return
     syncResults.value = results

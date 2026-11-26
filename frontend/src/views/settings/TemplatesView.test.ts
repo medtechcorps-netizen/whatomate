@@ -52,7 +52,17 @@ vi.mock('@/components/ui/select', async () => {
 
 const Pass = defineComponent({ template: '<div><slot /></div>' })
 const Button = defineComponent({ props: ['disabled'], template: '<button :disabled="disabled"><slot /></button>' })
-const accounts = (names = ['A', 'B']) => ({ data: { data: { accounts: names.map(name => ({ id: name, name, phone_id: name })) } } })
+const accountIds: Record<string, string> = {
+  A: '3c111111-1111-4111-8111-111111111111',
+  B: '3c222222-2222-4222-8222-222222222222',
+  all: '3c333333-3333-4333-8333-333333333333',
+  active: '3c444444-4444-4444-8444-444444444444',
+  shared: '3c555555-5555-4555-8555-555555555555',
+  'account:B': '3c666666-6666-4666-8666-666666666666',
+}
+const accounts = (names = ['A', 'B'], ids = accountIds) => ({
+  data: { data: { accounts: names.map(name => ({ id: ids[name] ?? name, name, phone_id: name })) } },
+})
 const rows = (name: string, total = 1) => ({ data: { data: { templates: [{ id: name, name }], total } } })
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -136,7 +146,7 @@ describe('template view request ownership', () => {
     await account(wrapper, 'all')
     await syncButton(wrapper).trigger('click')
     await flushPromises()
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all' },
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all', whatsapp_account_id: accountIds.all },
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
   })
 
@@ -153,7 +163,7 @@ describe('template view request ownership', () => {
     await account(wrapper, 'all')
     await syncButton(wrapper).trigger('click')
     await flushPromises()
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all' },
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all', whatsapp_account_id: accountIds.all },
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
   })
 
@@ -177,7 +187,8 @@ describe('template view request ownership', () => {
     const workspace = expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } })
     expect(mocks.get).toHaveBeenCalledExactlyOnceWith('/accounts', workspace)
     expect(mocks.syncChoices).toHaveBeenCalledExactlyOnceWith('/templates/sync/accounts', workspace)
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'active' }, workspace)
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync',
+      { whatsapp_account: 'active', whatsapp_account_id: accountIds.active }, workspace)
   })
 
   it('disables sync for a shared account name until current workspace eligibility retries successfully', async () => {
@@ -210,7 +221,8 @@ describe('template view request ownership', () => {
       .toEqual(['org-A', 'org-B', 'org-B'])
     await syncButton(wrapper).trigger('click')
     await flushPromises()
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'shared' },
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync',
+      { whatsapp_account: 'shared', whatsapp_account_id: accountIds.shared },
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-B' } }))
   })
 
@@ -232,6 +244,31 @@ describe('template view request ownership', () => {
     expect(mocks.post).not.toHaveBeenCalled()
     expect(mocks.syncChoices.mock.calls.map(([, config]) => config.headers['X-Organization-ID']))
       .toEqual(['org-A', 'org-B'])
+  })
+
+  it('keeps sync disabled when a listed account name now belongs to another ID', async () => {
+    mocks.get.mockResolvedValue(accounts(['shared']))
+    mocks.syncChoices.mockResolvedValue(accounts(['shared'], { shared: accountIds.active! }))
+    const wrapper = await render()
+    await account(wrapper, 'shared')
+
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'shared' }), expect.any(Object))
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    await syncButton(wrapper).trigger('click')
+    expect(mocks.post).not.toHaveBeenCalled()
+  })
+
+  it('ignores an obsolete account-list continuation after a same-workspace permission change', async () => {
+    const old = deferred<ReturnType<typeof accounts>>()
+    mocks.get.mockReturnValueOnce(old.promise)
+    await render()
+    context.canReadAccounts = false
+    await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(1)
+
+    old.resolve(accounts(['obsolete']))
+    await flushPromises()
+    expect(mocks.list).toHaveBeenCalledTimes(1)
   })
 
   it('keeps newer workspace rows/count when the older response finishes last', async () => {
@@ -436,7 +473,7 @@ describe('template view request ownership', () => {
     sessionEvent('refreshed')
     pending.reject(new Error('B unavailable'))
     await flushPromises()
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'B' },
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'B', whatsapp_account_id: accountIds.B },
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
     const results = wrapper.get('[aria-label="templates.syncResults"]').text()
     expect(results).toContain('B: B unavailable')
@@ -454,7 +491,8 @@ describe('template view request ownership', () => {
     expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
     await syncButton(wrapper).trigger('click')
     await flushPromises()
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'account:B' },
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync',
+      { whatsapp_account: 'account:B', whatsapp_account_id: accountIds['account:B'] },
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
   })
 
@@ -471,7 +509,7 @@ describe('template view request ownership', () => {
     expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'all' }),
       expect.objectContaining({ headers: workspaceHeaders }))
     await syncButton(wrapper).trigger('click')
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all' },
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all', whatsapp_account_id: accountIds.all },
       expect.objectContaining({ headers: workspaceHeaders }))
 
     const adapter = axios.getAdapter(mocks.post.mock.calls[0]![2].adapter)
@@ -525,7 +563,7 @@ describe('template view request ownership', () => {
     await account(wrapper, 'B')
     first.resolve({})
     await flushPromises()
-    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'A' },
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'A', whatsapp_account_id: accountIds.A },
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
     expect(mocks.success).toHaveBeenCalledTimes(1)
     expect(mocks.success).toHaveBeenCalledWith('templates.syncAccountsSuccess 1')
