@@ -6,13 +6,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import TemplatesView from './TemplatesView.vue'
 
 const mocks = vi.hoisted(() => ({
-  get: vi.fn(), post: vi.fn(), list: vi.fn(), remove: vi.fn(), adapter: vi.fn(),
+  get: vi.fn(), syncChoices: vi.fn(), post: vi.fn(), list: vi.fn(), remove: vi.fn(), adapter: vi.fn(),
   success: vi.fn(), error: vi.fn(),
 }))
 const context = reactive({ selectedOrgId: 'org-A' as string | null, session: 'session-A', live: true, canSync: true, canReadAccounts: true })
 vi.mock('@/services/api', () => ({
   AUTH_SESSION_EVENT: 'auth-session-state',
-  api: { get: mocks.get, post: mocks.post, delete: mocks.remove, defaults: { adapter: mocks.adapter } },
+  api: {
+    get: (endpoint: string, options: unknown) => endpoint === '/templates/sync/accounts'
+      ? mocks.syncChoices(endpoint, options)
+      : mocks.get(endpoint, options),
+    post: mocks.post, delete: mocks.remove, defaults: { adapter: mocks.adapter },
+  },
   templatesService: { list: mocks.list },
 }))
 vi.mock('@/stores/organizations', () => ({ useOrganizationsStore: () => context }))
@@ -96,6 +101,7 @@ describe('template view request ownership', () => {
     localStorage.clear()
     localStorage.setItem('selected_organization_id', 'org-A')
     mocks.get.mockResolvedValue(accounts())
+    mocks.syncChoices.mockResolvedValue(accounts())
     mocks.adapter.mockResolvedValue({})
     mocks.list.mockResolvedValue(rows('current'))
     mocks.post.mockResolvedValue({})
@@ -111,6 +117,7 @@ describe('template view request ownership', () => {
   it('recovers a failed account load without syncing until an account is selected', async () => {
     localStorage.setItem('templates_selected_account_option', 'account:stale')
     mocks.get.mockRejectedValueOnce(new Error('accounts unavailable')).mockResolvedValueOnce(accounts(['all']))
+    mocks.syncChoices.mockResolvedValue(accounts(['all']))
     const wrapper = await render()
     expect(wrapper.get('[role="alert"]').text()).toBe('common.failedLoad resources.accounts')
     expect(table(wrapper).props('items')).toEqual([{ id: 'current', name: 'current' }])
@@ -135,12 +142,10 @@ describe('template view request ownership', () => {
 
   it('loads scoped sync choices without account-management access and syncs only literal all', async () => {
     context.canReadAccounts = false
-    mocks.get.mockImplementation(async (endpoint: string) => {
-      if (endpoint !== '/templates/sync/accounts') throw new Error('Insufficient permissions')
-      return { data: { data: { accounts: [{ id: 'account-all', name: 'all' }] } } }
-    })
+    mocks.syncChoices.mockResolvedValue(accounts(['all']))
     const wrapper = await render()
-    expect(mocks.get).toHaveBeenCalledExactlyOnceWith('/templates/sync/accounts',
+    expect(mocks.get).not.toHaveBeenCalled()
+    expect(mocks.syncChoices).toHaveBeenCalledExactlyOnceWith('/templates/sync/accounts',
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
     expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
     expect(mocks.post).not.toHaveBeenCalled()
@@ -150,6 +155,83 @@ describe('template view request ownership', () => {
     await flushPromises()
     expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all' },
       expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
+  })
+
+  it('keeps ordinary account filters while syncing only a scoped eligible choice', async () => {
+    mocks.get.mockResolvedValue(accounts(['pending', 'expired', 'active']))
+    mocks.syncChoices.mockResolvedValue(accounts(['active']))
+    const wrapper = await render()
+
+    for (const name of ['pending', 'expired']) {
+      await account(wrapper, name)
+      expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: name }), expect.any(Object))
+      expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+      await syncButton(wrapper).trigger('click')
+    }
+    expect(mocks.post).not.toHaveBeenCalled()
+
+    await account(wrapper, 'active')
+    expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+    const workspace = expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } })
+    expect(mocks.get).toHaveBeenCalledExactlyOnceWith('/accounts', workspace)
+    expect(mocks.syncChoices).toHaveBeenCalledExactlyOnceWith('/templates/sync/accounts', workspace)
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'active' }, workspace)
+  })
+
+  it('disables sync for a shared account name until current workspace eligibility retries successfully', async () => {
+    const pending = deferred<ReturnType<typeof accounts>>()
+    mocks.get.mockResolvedValue(accounts(['shared']))
+    mocks.syncChoices.mockResolvedValueOnce(accounts(['shared'])).mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce(accounts(['shared']))
+    const wrapper = await render()
+    await account(wrapper, 'shared')
+    expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
+
+    selectWorkspace('org-B')
+    await flushPromises()
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'shared' }),
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-B' } }))
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+
+    pending.reject(new Error('eligibility unavailable'))
+    await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toBe('common.failedLoad resources.accounts')
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    await syncButton(wrapper).trigger('click')
+    expect(mocks.post).not.toHaveBeenCalled()
+
+    await wrapper.findAll('button').find(button => button.text() === 'common.retry')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
+    expect(mocks.syncChoices.mock.calls.map(([, config]) => config.headers['X-Organization-ID']))
+      .toEqual(['org-A', 'org-B', 'org-B'])
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'shared' },
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-B' } }))
+  })
+
+  it('ignores an eligible choice arriving from an obsolete workspace', async () => {
+    const old = deferred<ReturnType<typeof accounts>>()
+    mocks.get.mockResolvedValue(accounts(['shared']))
+    mocks.syncChoices.mockReturnValueOnce(old.promise).mockResolvedValue(accounts([]))
+    const wrapper = await render()
+    await account(wrapper, 'shared')
+    selectWorkspace('org-B')
+    await flushPromises()
+    old.resolve(accounts(['shared']))
+    await flushPromises()
+
+    expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'shared' }),
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-B' } }))
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    await syncButton(wrapper).trigger('click')
+    expect(mocks.post).not.toHaveBeenCalled()
+    expect(mocks.syncChoices.mock.calls.map(([, config]) => config.headers['X-Organization-ID']))
+      .toEqual(['org-A', 'org-B'])
   })
 
   it('keeps newer workspace rows/count when the older response finishes last', async () => {
@@ -366,6 +448,7 @@ describe('template view request ownership', () => {
   it('restores a legacy configured account name that contains the picker prefix', async () => {
     localStorage.setItem('templates_selected_account', 'account:B')
     mocks.get.mockResolvedValueOnce(accounts(['B', 'account:B']))
+    mocks.syncChoices.mockResolvedValueOnce(accounts(['B', 'account:B']))
     const wrapper = await render()
     expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: 'account:B' }), expect.any(Object))
     expect(syncButton(wrapper).attributes('disabled')).toBeUndefined()
@@ -377,6 +460,7 @@ describe('template view request ownership', () => {
 
   it('pins a literal all account and rejects a late adapter dispatch after the stored workspace moves', async () => {
     mocks.get.mockResolvedValueOnce(accounts(['all']))
+    mocks.syncChoices.mockResolvedValueOnce(accounts(['all']))
     const pending = deferred<object>()
     mocks.post.mockReturnValueOnce(pending.promise)
     const wrapper = await render()

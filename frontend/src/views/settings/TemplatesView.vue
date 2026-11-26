@@ -55,6 +55,7 @@ const organizationId = computed(() => organizationsStore.selectedOrgId || authSt
 
 const templates = ref<Template[]>([])
 const accounts = ref<WhatsAppAccountChoice[]>([])
+const syncAccounts = ref<WhatsAppAccountChoice[]>([])
 const accountsLoadFailed = ref(false)
 const isLoading = ref(true)
 const error = ref<string | null>(null)
@@ -92,10 +93,14 @@ function persistAccountOption(option: string) {
 const canWrite = computed(() => authStore.hasPermission('templates', 'write'))
 const canDelete = computed(() => authStore.hasPermission('templates', 'delete'))
 const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
-const useTemplateSyncChoices = computed(() => canSync.value && !authStore.hasPermission('accounts', 'read'))
-const selectedSyncAccount = computed(() => {
+const canReadAccounts = computed(() => authStore.hasPermission('accounts', 'read'))
+const selectedListedAccount = computed(() => {
   const name = accountNameForOption(selectedAccount.value)
   return name && accounts.value.some(account => account.name === name) ? name : null
+})
+const selectedSyncAccount = computed(() => {
+  const name = selectedListedAccount.value
+  return name && syncAccounts.value.some(account => account.name === name) ? name : null
 })
 
 // Delete dialog state
@@ -256,6 +261,7 @@ function invalidateView() {
   accountsRequest++
   syncRequest++
   accounts.value = []
+  syncAccounts.value = []
   accountsLoadFailed.value = false
   invalidateTemplates()
   syncResults.value = []
@@ -289,7 +295,7 @@ function onWorkspaceChange() {
 }
 
 watch([() => organizationsStore.selectedOrgId, () => authStore.organizationId], onWorkspaceChange, { flush: 'sync' })
-watch(useTemplateSyncChoices, () => { void loadWorkspace() }, { flush: 'sync' })
+watch([canSync, canReadAccounts], () => { void loadWorkspace() }, { flush: 'sync' })
 
 function onWorkspaceStorage(event: StorageEvent) {
   if (event.storageArea === localStorage &&
@@ -331,24 +337,41 @@ async function fetchAccounts() {
   const scope = captureViewScope()
   if (!scope.isCurrent()) return
   const request = ++accountsRequest
-  const useSyncChoices = useTemplateSyncChoices.value
+  const maySync = canSync.value
+  const mayReadAccounts = canReadAccounts.value
+  const useSyncChoicesForBrowsing = maySync && !mayReadAccounts
   const current = () => scope.isCurrent() && request === accountsRequest &&
-    useSyncChoices === useTemplateSyncChoices.value
+    maySync === canSync.value && mayReadAccounts === canReadAccounts.value
   accounts.value = []
+  syncAccounts.value = []
   accountsLoadFailed.value = false
-  try {
-    const endpoint = useSyncChoices ? '/templates/sync/accounts' : '/accounts'
-    const response = await api.get(endpoint, workspaceRequest(scope.organizationId, current))
-    if (!current()) return
-    accounts.value = response.data.data?.accounts || []
-    if (selectedAccount.value !== allAccountsOption && selectedSyncAccount.value === null) {
-      selectedAccount.value = allAccountsOption
-      persistAccountOption(allAccountsOption)
+
+  async function loadChoices(endpoint: string): Promise<WhatsAppAccountChoice[] | undefined> {
+    try {
+      const response = await api.get(endpoint, workspaceRequest(scope.organizationId, current))
+      if (current()) return response.data.data?.accounts ?? []
+    } catch (error) {
+      if (!current()) return
+      console.error('Failed to fetch accounts:', error)
+      accountsLoadFailed.value = true
     }
-  } catch (error) {
-    if (!current()) return
-    console.error('Failed to fetch accounts:', error)
-    accountsLoadFailed.value = true
+  }
+
+  const syncChoicesEndpoint = '/templates/sync/accounts'
+  const listed = await loadChoices(useSyncChoicesForBrowsing ? syncChoicesEndpoint : '/accounts')
+  if (!current() || !listed) return
+  accounts.value = listed
+  if (selectedAccount.value !== allAccountsOption && selectedListedAccount.value === null) {
+    selectedAccount.value = allAccountsOption
+    persistAccountOption(allAccountsOption)
+  }
+  if (useSyncChoicesForBrowsing) {
+    syncAccounts.value = listed
+  } else if (maySync) {
+    // Browsing remains usable while the sync-specific eligibility check settles.
+    void loadChoices(syncChoicesEndpoint).then(eligible => {
+      if (current() && eligible) syncAccounts.value = eligible
+    })
   }
 }
 
@@ -397,9 +420,10 @@ async function syncTemplates() {
 
   const scope = captureViewScope()
   if (!scope.isCurrent()) return
+  const eligibilityRequest = accountsRequest
   const request = ++syncRequest
   const ownsRequest = () => request === syncRequest
-  const current = () => ownsRequest() && scope.isCurrent() && canSync.value
+  const current = () => ownsRequest() && scope.isCurrent() && canSync.value && eligibilityRequest === accountsRequest
   isSyncing.value = true
   syncResults.value = []
   try {
