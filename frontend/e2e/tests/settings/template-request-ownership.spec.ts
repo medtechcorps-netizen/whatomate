@@ -13,8 +13,8 @@ const permissions = [
   { resource: 'accounts', action: 'read' },
 ]
 const accounts = [
-  { id: 'ownership-account-a', name: 'Ownership account A', phone_id: 'ownership-phone-a' },
-  { id: 'ownership-account-b', name: 'Ownership account B', phone_id: 'ownership-phone-b' },
+  { id: '4c111111-1111-4111-8111-111111111111', name: 'Ownership account A', phone_id: 'ownership-phone-a' },
+  { id: '4c222222-2222-4222-8222-222222222222', name: 'Ownership account B', phone_id: 'ownership-phone-b' },
 ]
 
 function template(id: string, name: string) {
@@ -32,6 +32,8 @@ const beta = template('ownership-template-b', 'Ownership template B')
 type Reply = (route: Route) => Promise<void>
 const listReply = (rows = [alpha, beta]): Reply => route =>
   route.fulfill({ json: { data: { templates: rows, total: rows.length } } })
+const syncAccountReply = (choices: Array<{ id: string; name: string }>): Reply => route =>
+  route.fulfill({ json: { data: { accounts: choices.map(({ id, name }) => ({ id, name })) } } })
 
 function heldReply(json: unknown, status = 200, allowNavigationAbort = false) {
   let started = false
@@ -69,6 +71,7 @@ function heldReply(json: unknown, status = 200, allowNavigationAbort = false) {
 async function installTemplates(page: Page) {
   const fixture = {
     accounts: ((route: Route) => route.fulfill({ json: { data: { accounts } } })) as Reply,
+    syncAccounts: syncAccountReply(accounts),
     list: listReply(),
     sync: null as Reply | null,
     remove: null as Reply | null,
@@ -84,6 +87,8 @@ async function installTemplates(page: Page) {
     const url = new URL(request.url())
     if (request.method() === 'GET' && url.pathname === '/api/accounts') {
       await fixture.accounts(route)
+    } else if (request.method() === 'GET' && url.pathname === '/api/templates/sync/accounts') {
+      await fixture.syncAccounts(route)
     } else if (request.method() === 'GET' && url.pathname === '/api/templates') {
       fixture.lists.push({
         account: url.searchParams.get('account'),
@@ -235,6 +240,7 @@ test.describe('Message Templates - Request ownership', () => {
     const accountsReply = heldReply({ data: { accounts: [] } })
     pending.push(accountsReply)
     fixture.accounts = accountsReply.reply
+    fixture.syncAccounts = syncAccountReply([])
     fixture.list = listReply([])
     await openTemplates(page)
     await accountsReply.seen
@@ -252,10 +258,11 @@ test.describe('Message Templates - Request ownership', () => {
   })
 
   test('keeps All Accounts filter-only and syncs a configured account named all after reload', async ({ page }) => {
-    const namedAll = { id: 'ownership-account-all', name: 'all', phone_id: 'ownership-phone-all' }
+    const namedAll = { id: '4c333333-3333-4333-8333-333333333333', name: 'all', phone_id: 'ownership-phone-all' }
     fixture.accounts = route => route.fulfill({ json: { data: { accounts: [...accounts, namedAll] } } })
+    fixture.syncAccounts = syncAccountReply([...accounts, namedAll])
     fixture.sync = route => {
-      expect(route.request().postDataJSON()).toEqual({ whatsapp_account: 'all' })
+      expect(route.request().postDataJSON()).toEqual({ whatsapp_account: 'all', whatsapp_account_id: namedAll.id })
       expect(fixture.syncs).toEqual(['all'])
       return route.fulfill({ json: { data: { count: 1 } } })
     }

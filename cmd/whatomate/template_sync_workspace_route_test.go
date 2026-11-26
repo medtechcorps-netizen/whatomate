@@ -207,6 +207,7 @@ func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 	}{
 		{"/api/templates/sync", other.ID.String(), fasthttp.StatusNotFound},
 		{"/api/templates/sync", "invalid-uuid", fasthttp.StatusBadRequest},
+		{"/api/templates/sync", "!" + all.ID.String() + "?", fasthttp.StatusBadRequest},
 		{"/api/templates/sync?account=all", nil, fasthttp.StatusBadRequest},
 		{"/api/templates/sync", uuid.Nil.String(), fasthttp.StatusBadRequest},
 	} {

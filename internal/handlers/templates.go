@@ -547,7 +547,7 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid whatsapp_account_id", nil, "")
 		}
 		accountID, err := uuid.Parse(rawID)
-		if err != nil || accountID == uuid.Nil {
+		if err != nil || accountID == uuid.Nil || accountID.String() != rawID {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid whatsapp_account_id", nil, "")
 		}
 		query = query.Where("id = ?", accountID)
