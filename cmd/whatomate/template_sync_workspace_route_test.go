@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"testing"
 	"time"
 
@@ -32,9 +34,9 @@ func (f templateSyncRouteTransport) RoundTrip(req *http.Request) (*http.Response
 	return f(req)
 }
 
-// Run serially because installing RLS changes the disposable fixture schema.
+// Give the mounted route its own database so the RLS verifier only sees this fixture.
 func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
-	db := testutil.SetupTestDB(t)
+	db, runtimeRole := testutil.OpenIsolatedTestDatabaseAsAdmin(t)
 	reseller := testutil.CreateTestReseller(t, db)
 	home := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
 	selected := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
@@ -60,22 +62,14 @@ func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 	all := testutil.CreateTestWhatsAppAccountWith(t, db, selected.ID, testutil.WithAccountName("all"), func(account *models.WhatsAppAccount) {
 		account.AccessToken = "synthetic-template-sync-selected-account"
 	})
-	inactive := testutil.CreateTestWhatsAppAccountWith(t, db, selected.ID, func(account *models.WhatsAppAccount) {
+	testutil.CreateTestWhatsAppAccountWith(t, db, selected.ID, func(account *models.WhatsAppAccount) {
 		account.Status = "pending_subscription"
 	})
-	expired := testutil.CreateTestWhatsAppAccountWith(t, db, selected.ID, func(account *models.WhatsAppAccount) {
+	testutil.CreateTestWhatsAppAccountWith(t, db, selected.ID, func(account *models.WhatsAppAccount) {
 		expires := time.Now().Add(-time.Hour)
 		account.AccessTokenExpiresAt = &expires
 	})
 	templateName := "synthetic_route_template_" + uuid.NewString()[:8]
-	t.Cleanup(func() {
-		if err := db.Unscoped().Where("name = ? AND organization_id IN ?", templateName, []uuid.UUID{home.ID, selected.ID}).Delete(&models.Template{}).Error; err != nil {
-			t.Errorf("remove synthetic synced template: %v", err)
-		}
-		if err := db.Unscoped().Where("id IN ?", []uuid.UUID{all.ID, inactive.ID, expired.ID}).Delete(&models.WhatsAppAccount{}).Error; err != nil {
-			t.Errorf("remove synthetic template sync accounts: %v", err)
-		}
-	})
 	const templateID = "123450000000001"
 	providerBody, err := json.Marshal(map[string]any{"data": []whatsapp.MetaTemplate{{
 		ID: templateID, Name: templateName, Language: "en", Category: "UTILITY", Status: "APPROVED",
@@ -97,34 +91,37 @@ func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(providerBody))}, nil
 	})
 
-	runtimeRole := "rereply_template_route_" + uuid.NewString()[:8]
+	var fixtureDatabase string
+	planPGOK(t, db.Raw("SELECT pg_catalog.current_database()").Scan(&fixtureDatabase).Error, "identify isolated Template Sync database")
+	require.NotEmpty(t, fixtureDatabase)
+	runtimeURL, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	planPGOK(t, err, "parse isolated Template Sync test URL")
 	runtimePassword := uuid.NewString() + uuid.NewString()
-	require.NoError(t, db.Exec(fmt.Sprintf(
-		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION",
-		runtimeRole, runtimePassword,
-	)).Error)
-	rlsApplied := false
-	t.Cleanup(func() {
-		if rlsApplied {
-			if err := database.RemoveTenantRLS(db); err != nil {
-				t.Errorf("remove disposable Template Sync RLS: %v", err)
-			}
-		}
-		if err := db.Exec("DROP OWNED BY " + runtimeRole).Error; err != nil {
-			t.Errorf("remove disposable Template Sync grants: %v", err)
-		}
-		if err := db.Exec("DROP ROLE " + runtimeRole).Error; err != nil {
-			t.Errorf("remove disposable Template Sync role: %v", err)
-		}
-	})
+	runtimeURL.User = url.UserPassword(runtimeRole, runtimePassword)
+	runtimeURL.Path = "/" + fixtureDatabase
+	runtimeURL.RawPath = ""
+	// pgx gives these query fields precedence over the fixture login and path.
+	query := runtimeURL.Query()
+	query.Del("database")
+	query.Del("dbname")
+	query.Del("user")
+	query.Del("password")
+	runtimeURL.RawQuery = query.Encode()
+	// Keep the isolation helper's restricted role attributes and enable direct test login.
+	planPGOK(t, db.Exec(fmt.Sprintf("ALTER ROLE %s LOGIN PASSWORD '%s'", runtimeRole, runtimePassword)).Error, "enable isolated Template Sync login")
 	require.NoError(t, database.ApplyTenantRLS(db, runtimeRole))
-	rlsApplied = true
-	runtime := testutil.OpenTestDBAsRole(t, runtimeRole, runtimePassword)
-	require.NoError(t, database.VerifyTenantRLS(runtime, runtimeRole))
+	runtimeConfig := config.DatabaseConfig{URL: runtimeURL.String(), MaxOpenConns: 1, MaxIdleConns: 1}
+	connectCtx, cancelConnect := context.WithTimeout(t.Context(), 30*time.Second)
+	runtime, err := database.NewPostgresWithContext(connectCtx, &runtimeConfig, false)
+	cancelConnect()
+	planPGOK(t, err, "open isolated Template Sync runtime")
 	pool, err := runtime.DB()
-	require.NoError(t, err)
-	pool.SetMaxOpenConns(1)
-	pool.SetMaxIdleConns(1)
+	planPGOK(t, err, "inspect isolated Template Sync runtime pool")
+	t.Cleanup(func() { planPGOK(t, pool.Close(), "close isolated Template Sync runtime") })
+	var runtimeDatabase string
+	planPGOK(t, runtime.Raw("SELECT pg_catalog.current_database()").Scan(&runtimeDatabase).Error, "verify isolated Template Sync runtime database")
+	require.Equal(t, fixtureDatabase, runtimeDatabase)
+	require.NoError(t, database.VerifyTenantRLS(runtime, runtimeRole))
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	runtime = runtime.WithContext(ctx)
