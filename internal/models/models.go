@@ -438,15 +438,20 @@ type Message struct {
 // A star is private to its viewer and must never appear in a raw message JSON.
 const MessageBookmarksMetadataKey = "crm_bookmarks_v1"
 
+// MessageCoexistencePendingQuoteMetadataKey stores an encrypted, row-bound quote reference.
+const MessageCoexistencePendingQuoteMetadataKey = "coexistence_pending_quote_v1"
+
 func (Message) TableName() string {
 	return "messages"
 }
 
 func (m Message) MarshalJSON() ([]byte, error) {
-	if _, exists := m.Metadata[MessageBookmarksMetadataKey]; exists {
-		metadata := make(JSONB, len(m.Metadata)-1)
+	_, hasBookmarks := m.Metadata[MessageBookmarksMetadataKey]
+	_, hasPendingQuote := m.Metadata[MessageCoexistencePendingQuoteMetadataKey]
+	if hasBookmarks || hasPendingQuote {
+		metadata := make(JSONB, len(m.Metadata))
 		for key, value := range m.Metadata {
-			if key != MessageBookmarksMetadataKey {
+			if key != MessageBookmarksMetadataKey && key != MessageCoexistencePendingQuoteMetadataKey {
 				metadata[key] = value
 			}
 		}
