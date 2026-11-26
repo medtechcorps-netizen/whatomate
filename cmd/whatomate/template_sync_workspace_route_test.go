@@ -35,9 +35,10 @@ func (f templateSyncRouteTransport) RoundTrip(req *http.Request) (*http.Response
 // Run serially because installing RLS changes the disposable fixture schema.
 func TestTemplateSyncRegisteredRouteUsesExactSelectedAccount(t *testing.T) {
 	db := testutil.SetupTestDB(t)
-	home := testutil.CreateTestOrganization(t, db)
-	selected := testutil.CreateTestOrganization(t, db)
-	foreign := testutil.CreateTestOrganization(t, db)
+	reseller := testutil.CreateTestReseller(t, db)
+	home := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
+	selected := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
+	foreign := testutil.CreateTestOrganizationForReseller(t, db, reseller.ID)
 	homeRole := testutil.CreateTestRoleWithKeys(t, db, home.ID, "home-template-sync", []string{"templates:sync"})
 	selectedReader := testutil.CreateTestRoleWithKeys(t, db, selected.ID, "selected-template-reader", []string{"templates:read"})
 	selectedRole := testutil.CreateTestRoleWithKeys(t, db, selected.ID, "selected-template-sync", []string{"templates:sync"})
