@@ -24,10 +24,9 @@ import { getQualityBadgeClass, getQualityRatingLabel } from '@/lib/utils'
 
 const { t } = useI18n()
 
-interface WhatsAppAccount {
+interface WhatsAppAccountChoice {
   id: string
   name: string
-  phone_id: string
 }
 
 interface Template {
@@ -55,7 +54,7 @@ const authStore = useAuthStore()
 const organizationId = computed(() => organizationsStore.selectedOrgId || authStore.organizationId || '')
 
 const templates = ref<Template[]>([])
-const accounts = ref<WhatsAppAccount[]>([])
+const accounts = ref<WhatsAppAccountChoice[]>([])
 const accountsLoadFailed = ref(false)
 const isLoading = ref(true)
 const error = ref<string | null>(null)
@@ -93,6 +92,7 @@ function persistAccountOption(option: string) {
 const canWrite = computed(() => authStore.hasPermission('templates', 'write'))
 const canDelete = computed(() => authStore.hasPermission('templates', 'delete'))
 const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
+const useTemplateSyncChoices = computed(() => canSync.value && !authStore.hasPermission('accounts', 'read'))
 const selectedSyncAccount = computed(() => {
   const name = accountNameForOption(selectedAccount.value)
   return name && accounts.value.some(account => account.name === name) ? name : null
@@ -289,6 +289,7 @@ function onWorkspaceChange() {
 }
 
 watch([() => organizationsStore.selectedOrgId, () => authStore.organizationId], onWorkspaceChange, { flush: 'sync' })
+watch(useTemplateSyncChoices, () => { void loadWorkspace() }, { flush: 'sync' })
 
 function onWorkspaceStorage(event: StorageEvent) {
   if (event.storageArea === localStorage &&
@@ -330,11 +331,14 @@ async function fetchAccounts() {
   const scope = captureViewScope()
   if (!scope.isCurrent()) return
   const request = ++accountsRequest
-  const current = () => scope.isCurrent() && request === accountsRequest
+  const useSyncChoices = useTemplateSyncChoices.value
+  const current = () => scope.isCurrent() && request === accountsRequest &&
+    useSyncChoices === useTemplateSyncChoices.value
   accounts.value = []
   accountsLoadFailed.value = false
   try {
-    const response = await api.get('/accounts', workspaceRequest(scope.organizationId, current))
+    const endpoint = useSyncChoices ? '/templates/sync/accounts' : '/accounts'
+    const response = await api.get(endpoint, workspaceRequest(scope.organizationId, current))
     if (!current()) return
     accounts.value = response.data.data?.accounts || []
     if (selectedAccount.value !== allAccountsOption && selectedSyncAccount.value === null) {

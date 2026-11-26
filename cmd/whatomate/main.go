@@ -1872,6 +1872,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 	g.GET("/api/templates/{id}", tenant((*handlers.App).GetTemplate))
 	g.PUT("/api/templates/{id}", tenant((*handlers.App).UpdateTemplate))
 	g.DELETE("/api/templates/{id}", tenant((*handlers.App).DeleteTemplate))
+	g.GET("/api/templates/sync/accounts", tenant((*handlers.App).ListTemplateSyncAccounts))
 	g.POST("/api/templates/sync", tenant((*handlers.App).SyncTemplates))
 	g.POST("/api/templates/{id}/publish", tenant((*handlers.App).SubmitTemplate))
 	g.POST("/api/templates/upload-media", tenant((*handlers.App).UploadTemplateMedia))

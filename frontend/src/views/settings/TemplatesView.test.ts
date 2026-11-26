@@ -9,14 +9,19 @@ const mocks = vi.hoisted(() => ({
   get: vi.fn(), post: vi.fn(), list: vi.fn(), remove: vi.fn(), adapter: vi.fn(),
   success: vi.fn(), error: vi.fn(),
 }))
-const context = reactive({ selectedOrgId: 'org-A' as string | null, session: 'session-A', live: true, canSync: true })
+const context = reactive({ selectedOrgId: 'org-A' as string | null, session: 'session-A', live: true, canSync: true, canReadAccounts: true })
 vi.mock('@/services/api', () => ({
   AUTH_SESSION_EVENT: 'auth-session-state',
   api: { get: mocks.get, post: mocks.post, delete: mocks.remove, defaults: { adapter: mocks.adapter } },
   templatesService: { list: mocks.list },
 }))
 vi.mock('@/stores/organizations', () => ({ useOrganizationsStore: () => context }))
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ organizationId: 'org-A', hasPermission: (_resource: string, action: string) => action === 'sync' && context.canSync }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({
+  organizationId: 'org-A',
+  hasPermission: (resource: string, action: string) =>
+    (resource === 'templates' && action === 'sync' && context.canSync) ||
+    (resource === 'accounts' && action === 'read' && context.canReadAccounts),
+}) }))
 vi.mock('@/lib/tabSession', () => ({ currentTabSession: () => context.session, isTabSessionCurrent: () => context.live }))
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string, params?: Record<string, string | number>) => params ? `${key} ${Object.values(params).join(' ')}` : key }) }))
 vi.mock('vue-sonner', () => ({ toast: { success: mocks.success, error: mocks.error } }))
@@ -87,6 +92,7 @@ describe('template view request ownership', () => {
     context.session = 'session-A'
     context.live = true
     context.canSync = true
+    context.canReadAccounts = true
     localStorage.clear()
     localStorage.setItem('selected_organization_id', 'org-A')
     mocks.get.mockResolvedValue(accounts())
@@ -117,6 +123,25 @@ describe('template view request ownership', () => {
     expect(mocks.get).toHaveBeenLastCalledWith('/accounts', expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
     expect(wrapper.find('[role="alert"]').exists()).toBe(false)
     expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ account: undefined }), expect.any(Object))
+    expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
+    expect(mocks.post).not.toHaveBeenCalled()
+
+    await account(wrapper, 'all')
+    await syncButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(mocks.post).toHaveBeenCalledExactlyOnceWith('/templates/sync', { whatsapp_account: 'all' },
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
+  })
+
+  it('loads scoped sync choices without account-management access and syncs only literal all', async () => {
+    context.canReadAccounts = false
+    mocks.get.mockImplementation(async (endpoint: string) => {
+      if (endpoint !== '/templates/sync/accounts') throw new Error('Insufficient permissions')
+      return { data: { data: { accounts: [{ id: 'account-all', name: 'all' }] } } }
+    })
+    const wrapper = await render()
+    expect(mocks.get).toHaveBeenCalledExactlyOnceWith('/templates/sync/accounts',
+      expect.objectContaining({ headers: { 'X-Organization-ID': 'org-A' } }))
     expect(syncButton(wrapper).attributes('disabled')).toBeDefined()
     expect(mocks.post).not.toHaveBeenCalled()
 

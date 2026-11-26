@@ -472,6 +472,44 @@ var (
 	errTemplateSyncForbidden      = errors.New("template sync permission is no longer available")
 )
 
+// ListTemplateSyncAccounts returns the choices needed by a template sync operator.
+func (a *App) ListTemplateSyncAccounts(r *fastglue.Request) error {
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
+	if err != nil {
+		return nil
+	}
+	if len(r.RequestCtx.Request.Header.PeekAll("X-Organization-ID")) != 1 {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "X-Organization-ID must identify the selected organization", nil, "")
+	}
+	if !a.requireMatchingExplicitOrganization(r, orgID) {
+		return nil
+	}
+	if err := a.requireCurrentTemplateSyncPermission(orgID, userID); err != nil {
+		if errors.Is(err, errTemplateSyncForbidden) {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load template sync accounts", nil, "")
+	}
+
+	var accounts []models.WhatsAppAccount
+	if err := a.DB.Select("id", "name", "status", "access_token", "access_token_expires_at").
+		Where("organization_id = ?", orgID).Order("created_at DESC, id DESC").Find(&accounts).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load template sync accounts", nil, "")
+	}
+	type accountChoice struct {
+		ID   uuid.UUID `json:"id"`
+		Name string    `json:"name"`
+	}
+	choices := make([]accountChoice, 0, len(accounts))
+	for _, account := range accounts {
+		if account.Name != "" && a.prepareWhatsAppAccountForOutbound(&account) == nil {
+			choices = append(choices, accountChoice{ID: account.ID, Name: account.Name})
+		}
+	}
+	return r.SendEnvelope(map[string]any{"accounts": choices})
+}
+
 // SyncTemplates syncs templates from Meta API
 func (a *App) SyncTemplates(r *fastglue.Request) error {
 	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
@@ -665,8 +703,8 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 	})
 }
 
-// requireCurrentTemplateSyncPermission runs on the persistence transaction and
-// distinguishes a missing grant from a failed database read.
+// requireCurrentTemplateSyncPermission reads the current tenant role without
+// using cached grants and distinguishes a missing grant from a failed read.
 func (a *App) requireCurrentTemplateSyncPermission(orgID, userID uuid.UUID) error {
 	var user models.User
 	if err := a.DB.Select("is_super_admin").Where("id = ? AND is_active = ?", userID, true).Take(&user).Error; err != nil {

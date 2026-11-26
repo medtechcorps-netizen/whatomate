@@ -5,6 +5,7 @@ const workspaceB = { id: "2c222222-2222-4222-8222-222222222222", name: "Syntheti
 const sessionMarker = "synthetic-template-sync-session";
 const csrf = "synthetic-template-sync-csrf";
 const syncPath = "/api/templates/sync";
+const syncAccountsPath = "/api/templates/sync/accounts";
 const refreshPath = "/api/auth/refresh";
 const selectedKey = "selected_organization_id";
 const sessionKey = "whm_session_id";
@@ -38,7 +39,7 @@ async function mockApi(
       ],
     },
   };
-  const accountReads: Array<{ organization: string | undefined; primary: boolean }> = [];
+  const accountReads: Array<{ path: string; organization: string | undefined; primary: boolean }> = [];
   const templateReads: Array<{
     organization: string | undefined;
     account: string | null;
@@ -102,21 +103,26 @@ async function mockApi(
       return route.abort("blockedbyclient");
     }
 
-    if (url.pathname === "/api/accounts" || url.pathname === "/api/templates") {
+    const accountRead = url.pathname === "/api/accounts" || url.pathname === syncAccountsPath;
+    if (accountRead || url.pathname === "/api/templates") {
       const primary = request.frame().page() === page;
-      if (url.pathname === "/api/accounts") accountReads.push({ organization, primary });
+      if (accountRead) accountReads.push({ path: url.pathname, organization, primary });
       else templateReads.push({ organization, account: url.searchParams.get("account"), primary });
       if (organization !== workspaceA.id && organization !== workspaceB.id) {
         return route.fulfill({ status: 403, json: { message: "Explicit workspace required" } });
       }
 
-      if (url.pathname === "/api/accounts") {
+      if (accountRead) {
+        // Only the synthetic super-admin can use the full management endpoint.
+        if (url.pathname === "/api/accounts" && !viewer.is_super_admin) {
+          return route.fulfill({ status: 403, json: { message: "Insufficient permissions" } });
+        }
         const accounts = organization === workspaceA.id
           ? [
-              { id: "a-all", name: "all", phone_id: "630000000000261" },
-              { id: "a-other", name: "Alternate A account", phone_id: "630000000000262" },
+              { id: "a-all", name: "all" },
+              { id: "a-other", name: "Alternate A account" },
             ]
-          : [{ id: "b-other", name: "Alternate B account", phone_id: "630000000000263" }];
+          : [{ id: "b-other", name: "Alternate B account" }];
         return route.fulfill({ json: { data: { accounts } } });
       }
       return route.fulfill({
@@ -186,7 +192,7 @@ test("syncs only the selected literal all account under its explicit workspace",
   await expect(page.getByText("Workspace A template", { exact: true })).toBeVisible();
   await expect(filter(page)).toContainText("All Accounts");
   await expect(syncButton(page)).toBeDisabled();
-  expect(wire.accountReads).toEqual([{ organization: workspaceA.id, primary: true }]);
+  expect(wire.accountReads).toEqual([{ path: syncAccountsPath, organization: workspaceA.id, primary: true }]);
   expect(wire.templateReads).toEqual([
     { organization: workspaceA.id, account: null, primary: true },
   ]);
