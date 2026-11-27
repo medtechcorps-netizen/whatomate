@@ -21,6 +21,7 @@ export default defineConfig({
   testMatch: 'booking-people-built.spec.ts',
   fullyParallel: false,
   workers: 1,
+  reporter: 'list',
   retries: 0,
   forbidOnly: true,
   timeout: 60_000,
