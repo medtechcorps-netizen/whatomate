@@ -65,13 +65,16 @@ seed or schema operation and grants no compatibility, staging, deployment or
 rollback authority. The unchanged-registry route and public legacy guards
 retain their existing behavior.
 
-Compatibility remains an independent merge obligation. Until the planned owner
-step adds `compat` to strict branch protection, the controlled merge review must
-require both the required Test checks and successful compatibility for the exact
-current PR head, base and synthetic merge. A source-guard pass alone is
-insufficient. After merging, the actual main commit needs its own signed
-compatibility result and fresh release admission. This CI transition changes no
-branch protection, workflow permissions, generated caps or active database rules.
+Compatibility remains an independent merge obligation. The accepted October 12,
+2026 H5 checkpoint records that `compat` was added to strict required-status
+protection; this historical acceptance is not a current protection readback.
+Merge review must still verify the configured required Test and compatibility
+checks for the exact current PR head, base and synthetic merge. A source-guard
+pass alone is insufficient. After merging, the actual main commit needs its own
+signed compatibility result and fresh release admission. See the retained
+[H5/P/V qualification](compat.md#negative-intent-publisher-and-installed-outage-consumer).
+This documentation correction changes no branch protection, workflow permissions,
+generated caps or active database rules.
 
 A successful promote writes a schema-v2 manifest. It records the measured
 database catalog independently of the images currently running, including the
@@ -370,11 +373,11 @@ banner appears in plan/candidate/production summaries, and release notes state
 `staging: bypassed`. It immediately follows the normal promote code path and
 records kind `promote`; the attested manifest schema and record-chain rules do
 not gain a bypass kind. Schema-v2 records explicitly retain `staging: bypassed`.
-The installed configuration still requires green compatibility evidence. It admits only `none`
+The normal path requires green compatibility evidence. It admits only `none`
 with the required catalog, history, global-table, seed and data-registry artifacts
 unchanged and no migration-path change; unavailable source facts refuse it.
-The preparatory outage consumer described below is disabled; a signed semantic
-failure can never be bypassed.
+The installed outage consumer described below requires its own exact-source
+coverage and outage evidence; a signed semantic failure can never be bypassed.
 A retained database origin that differs from the latest record's source also
 refuses this bounded staging bypass: artifact equality alone does not prove
 migration-path equality. Use the normal staging path for those releases.
@@ -382,24 +385,24 @@ A staging bypass is not permission to skip a failing product test or a productio
 guard.
 
 The separate outage preflight is connected only to `promote-without-staging`.
-Its fixed `release/deployment/compat-negative-consumer-v1.json` file is absent,
-so it delegates to the existing normal compatibility gate. Producer setup is
-installed, and the main-only Compatibility signing job publishes any complete
-negative intent before either subject is signed. That source wiring and its
-configuration witness do not establish hosted permissions or outage admission;
-active database artifacts and provider modes remain unchanged.
+Its fixed `release/deployment/compat-negative-consumer-v1.json` is installed with
+one 24-file lineage bound to producer `be2d3cbd18dff258b73695f05e7fd08de1046340`.
+The accepted October 12 H5/P/V sequence includes the exact-main normal proof,
+distinct synthetic ordinary-token qualification, protected consumer merge and
+post-merge no-PUT dry-run; see the [qualification evidence and remaining
+gates](compat.md#negative-intent-publisher-and-installed-outage-consumer).
+These historical proofs do not establish an actual production outage promotion.
 
-The sequence is protected merge of complete producer P with consumer data absent,
-then an actual exact-main positive Compatibility run and a distinct main-only
-synthetic ordinary-token qualification. The latter has separate subjects, signer
-and predicate and cannot supply release compatibility. Both results require
-independent acceptance before a separate data-only V activation PR binds P and
-its complete source inventory. Consumer data stays outside publisher inputs and
-cannot include itself in that inventory. Required CI and review precede each
-protected merge. No hosted permission, signing-order or outage qualification is
-claimed complete by the installed source or setup witness.
+At audited main `69c513765e42e2ca5ebe0728f150ca62f0f007e4`, three publisher
+inventory paths differ from that installed lineage: `.github/workflows/compat.yml`,
+`internal/dbcatalog/registry/data_steps.json` and
+`release/deployment/record_transport.py`. That source therefore lacks matching
+outage coverage. A successor publisher needs its own accepted normal and
+distinct synthetic qualifications before a separately reviewed data-only
+consumer-lineage update; rewriting hashes alone is not qualification. Consumer
+data stays outside publisher inputs. Valid normal compatibility remains usable.
 
-Once configured, outage admission requires either a complete fixed-endpoint
+Outage admission requires either a complete fixed-endpoint
 502/503/504 response or complete missing/expired compatibility history. It also
 requires matching publisher ancestry and full source bytes, complete unchanged
 Python import namespaces, repeated unchanged protected-rule and empty
