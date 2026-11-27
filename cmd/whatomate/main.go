@@ -1105,14 +1105,8 @@ func runServer(args []string) {
 			poolDiagnosticsCancel()
 			return nil
 		}},
-		{"realtime subscriber stop call", func(context.Context) error {
-			app.StopRealtimeSubscriber()
-			return nil
-		}},
-		{"campaign stats stop request", func(context.Context) error {
-			app.StopCampaignStatsSubscriber()
-			return nil
-		}},
+		{"realtime subscriber drain", app.DrainRealtimeSubscriber},
+		{"campaign stats subscriber drain", app.DrainCampaignStatsSubscriber},
 		{"Coexistence media stop request", func(context.Context) error {
 			coexistenceMediaCancel()
 			coexistenceMediaProcessor.Stop()
@@ -1175,7 +1169,8 @@ func runServer(args []string) {
 	shutdownServer(deadline, tasks, func(result serverShutdownResult) {
 		// Best effort only: a blocked log sink must not keep main alive. Even
 		// success below joins only the tracked top-level loops, not WebSockets,
-		// subscriber internals, worker heartbeats or other detached app work.
+		// worker heartbeats or other detached app work. Subscriber startup,
+		// receive callbacks and readiness monitors are joined above.
 		if result.deadlineExpired || len(result.failed) > 0 {
 			lo.Warn("Server shutdown incomplete", "deadline_expired", result.deadlineExpired,
 				"pending", result.pending, "failed", result.failed)
