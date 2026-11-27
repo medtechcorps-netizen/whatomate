@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test'
 import { Client } from 'pg'
+import { randomUUID } from 'node:crypto'
 import { loginAsAdmin, ApiHelper } from '../../helpers'
 import { ChatPage } from '../../pages'
 import { createTestScope } from '../../framework'
@@ -45,76 +46,67 @@ test.describe('Template Sending', () => {
 
   test.beforeAll(async () => {
     const reqContext = await playwrightRequest.newContext()
-    const api = new ApiHelper(reqContext)
-    await api.loginAsAdmin()
-
-    // Always create a fresh contact for template tests so it has no
-    // message history from other accounts (which would override selectedAccount).
-    const tplPhone = scope.phone()
-    await api.createContact(tplPhone, scope.name('contact'))
-    const contacts = await api.getContacts()
-    // Find the contact we just created (most recent by phone)
-    const tplContact = contacts.find((c: any) => c.phone_number === tplPhone) || contacts[0]
-    contactId = tplContact.id
-
-    // Ensure we have a WhatsApp account (required for templates)
-    let accounts: any[] = []
     try {
-      accounts = await api.getWhatsAppAccounts()
-    } catch {
-      // ignore
+      const api = new ApiHelper(reqContext)
+      await api.loginAsAdmin()
+
+      // Own both fixtures. Concurrent specs must not race on a shared account
+      // or seed templates with an empty account after an ignored setup failure.
+      const phone = scope.phone()
+      const contact = await api.createContact(phone, scope.name('contact'))
+      expect(contact.id).toBeTruthy()
+      expect(contact.phone_number).toBe(phone)
+      contactId = contact.id
+
+      const accountUID = randomUUID()
+      const expectedAccountName = scope.name(`account-${accountUID}`)
+      const account = await api.createWhatsAppAccount({
+        name: expectedAccountName,
+        phone_id: `e2e-phone-${accountUID}`,
+        business_id: `e2e-business-${accountUID}`,
+        access_token: 'e2e-fixture-local-only-token',
+      })
+      expect(account.id).toBeTruthy()
+      expect(account.name).toBe(expectedAccountName)
+      accountName = account.name
+
+      // Get the organization ID for the logged-in user
+      const orgId = await execSQL(`SELECT organization_id FROM users WHERE email = 'admin@test.com' LIMIT 1`)
+
+      // Clean up only this spec's template families. Other specs run in parallel
+      // and own fixtures such as e2e_hdr_* that must not be deleted here.
+      await execSQL(`DELETE FROM templates
+        WHERE organization_id = '${orgId}'
+          AND (name LIKE 'e2e_simple_%'
+            OR name LIKE 'e2e_params_%'
+            OR name LIKE 'e2e_buttons_%')`)
+
+      // Seed APPROVED templates directly via SQL (API only creates DRAFT)
+      const uid = Date.now().toString().slice(-6)
+
+      simpleTemplateName = `e2e_simple_${uid}`
+      await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, body_content, created_at, updated_at)
+        VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${simpleTemplateName}', 'E2E Simple ${uid}', 'en', 'UTILITY', 'APPROVED', 'Welcome to our service! We are glad to have you.', NOW(), NOW())
+        ON CONFLICT DO NOTHING`)
+
+      paramTemplateName = `e2e_params_${uid}`
+      await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, body_content, created_at, updated_at)
+        VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${paramTemplateName}', 'E2E Params ${uid}', 'en', 'UTILITY', 'APPROVED', 'Hello {{name}}! Your order {{order_id}} is confirmed.', NOW(), NOW())
+        ON CONFLICT DO NOTHING`)
+
+      buttonTemplateName = `e2e_buttons_${uid}`
+      await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, body_content, buttons, created_at, updated_at)
+        VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${buttonTemplateName}', 'E2E Buttons ${uid}', 'en', 'UTILITY', 'APPROVED', 'Would you like to proceed with your order?', '[{"type":"QUICK_REPLY","text":"Yes"},{"type":"QUICK_REPLY","text":"No"}]'::jsonb, NOW(), NOW())
+        ON CONFLICT DO NOTHING`)
+
+      // Ensure the contact's whatsapp_account matches the template account
+      // so ChatView's selectedAccount aligns and the TemplatePicker doesn't
+      // filter templates out.
+      await execSQL(`UPDATE contacts SET whats_app_account = '${accountName}' WHERE id = '${contactId}'`)
+
+    } finally {
+      await reqContext.dispose()
     }
-    if (accounts.length === 0) {
-      const uid = Date.now().toString().slice(-8)
-      try {
-        await api.createWhatsAppAccount({
-          name: `e2e-account-${uid}`,
-          phone_id: `phone-${uid}`,
-          business_id: `biz-${uid}`,
-          access_token: `token-${uid}`
-        })
-        accounts = await api.getWhatsAppAccounts()
-      } catch {
-        // ignore
-      }
-    }
-    accountName = accounts.length > 0 ? accounts[0].name : ''
-
-    // Get the organization ID for the logged-in user
-    const orgId = await execSQL(`SELECT organization_id FROM users WHERE email = 'admin@test.com' LIMIT 1`)
-
-    // Clean up only this spec's template families. Other specs run in parallel
-    // and own fixtures such as e2e_hdr_* that must not be deleted here.
-    await execSQL(`DELETE FROM templates
-      WHERE organization_id = '${orgId}'
-        AND (name LIKE 'e2e_simple_%'
-          OR name LIKE 'e2e_params_%'
-          OR name LIKE 'e2e_buttons_%')`)
-
-    // Seed APPROVED templates directly via SQL (API only creates DRAFT)
-    const uid = Date.now().toString().slice(-6)
-
-    simpleTemplateName = `e2e_simple_${uid}`
-    await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, body_content, created_at, updated_at)
-      VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${simpleTemplateName}', 'E2E Simple ${uid}', 'en', 'UTILITY', 'APPROVED', 'Welcome to our service! We are glad to have you.', NOW(), NOW())
-      ON CONFLICT DO NOTHING`)
-
-    paramTemplateName = `e2e_params_${uid}`
-    await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, body_content, created_at, updated_at)
-      VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${paramTemplateName}', 'E2E Params ${uid}', 'en', 'UTILITY', 'APPROVED', 'Hello {{name}}! Your order {{order_id}} is confirmed.', NOW(), NOW())
-      ON CONFLICT DO NOTHING`)
-
-    buttonTemplateName = `e2e_buttons_${uid}`
-    await execSQL(`INSERT INTO templates (id, organization_id, whats_app_account, name, display_name, language, category, status, body_content, buttons, created_at, updated_at)
-      VALUES (gen_random_uuid(), '${orgId}', '${accountName}', '${buttonTemplateName}', 'E2E Buttons ${uid}', 'en', 'UTILITY', 'APPROVED', 'Would you like to proceed with your order?', '[{"type":"QUICK_REPLY","text":"Yes"},{"type":"QUICK_REPLY","text":"No"}]'::jsonb, NOW(), NOW())
-      ON CONFLICT DO NOTHING`)
-
-    // Ensure the contact's whatsapp_account matches the template account
-    // so ChatView's selectedAccount aligns and the TemplatePicker doesn't
-    // filter templates out.
-    await execSQL(`UPDATE contacts SET whats_app_account = '${accountName}' WHERE id = '${contactId}'`)
-
-    await reqContext.dispose()
   })
 
   test('should show template picker button when contact is selected', async ({ page }) => {

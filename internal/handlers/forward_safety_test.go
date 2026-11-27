@@ -226,7 +226,7 @@ func TestForwardAdmissionRemainsHeldThroughProviderCompletion(t *testing.T) {
 func TestForwardBroadcastCarriesOnlyBooleanProvenanceToOtherAgent(t *testing.T) {
 	w := laneENewForwardWorld(t)
 	hub := appwebsocket.NewHub(testutil.NopLogger())
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), w.org.ID)
 	otherTenant := appwebsocket.NewClient(hub, nil, uuid.New(), uuid.New())
 	hub.Register(client)

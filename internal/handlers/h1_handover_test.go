@@ -260,7 +260,7 @@ func h1PathEntries(session *models.ChatbotSession, node string) int {
 func h1CountTransferEnvelopes(t *testing.T, app *App, organizationID uuid.UUID) *atomic.Int32 {
 	t.Helper()
 	hub := appwebsocket.NewHub(app.Log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	app.WSHub = hub
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), organizationID)
 	hub.Register(client)

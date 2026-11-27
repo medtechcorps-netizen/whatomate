@@ -305,7 +305,7 @@ func TestIncrementCampaignStatPublishesOnlyAfterTenantCommit(t *testing.T) {
 	organization, _, campaign, _ := webhookTestData(t, app, models.MessageStatusSent)
 
 	hub := websocket.NewHub(app.Log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	app.WSHub = hub
 	client := websocket.NewClient(hub, nil, uuid.New(), organization.ID)
 	hub.Register(client)
@@ -2057,7 +2057,7 @@ func TestWebhookStatusRetryEchoReplayKeepsSideEffectsStable(t *testing.T) {
 	account := orphanStatusTestAccount(t, app, true)
 
 	hub := websocket.NewHub(app.Log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	app.WSHub = hub
 	client := websocket.NewClient(hub, nil, uuid.New(), account.OrganizationID)
 	hub.Register(client)
@@ -2369,7 +2369,7 @@ func TestUpdateMessageStatus_FailedBroadcastsErrorMessageViaWebSocket(t *testing
 	db := testutil.SetupTestDB(t)
 	log := testutil.NopLogger()
 	hub := websocket.NewHub(log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 
 	app := &App{
 		DB:    db,
@@ -2452,7 +2452,7 @@ func TestUpdateMessageStatus_DeliveredBroadcastsViaWebSocket_NoErrorMessage(t *t
 	db := testutil.SetupTestDB(t)
 	log := testutil.NopLogger()
 	hub := websocket.NewHub(log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 
 	app := &App{
 		DB:    db,

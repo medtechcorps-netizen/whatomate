@@ -317,3 +317,30 @@ func TestGetWSTokenRejectsStalePurposeOrganizationContext(t *testing.T) {
 	assert.Equal(t, fasthttp.StatusUnauthorized, testutil.GetResponseStatusCode(request))
 	assert.Empty(t, testutil.GetResponseCookie(request, cookieAccessName))
 }
+
+// Shutdown must revoke in-flight database authorization as well as registration.
+func TestValidateWSTokenStopsDatabaseAuthorizationWithHub(t *testing.T) {
+	app := authFenceTestApp(t)
+	app.WSHub = ws.NewHub(testutil.NopLogger())
+	require.True(t, app.WSHub.Start())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		require.NoError(t, app.WSHub.Stop(ctx))
+	})
+	org := testutil.CreateTestOrganization(t, app.DB)
+	user := testutil.CreateTestUser(t, app.DB, org.ID)
+	token := signAuthFenceToken(t, user.ID, org.ID, middleware.JWTSubjectWebSocket, "", jwt.SigningMethodHS256)
+	validate := app.validateWSTokenFn()
+	gotUser, gotOrg, err := validate(token)
+	require.NoError(t, err)
+	require.Equal(t, user.ID, gotUser)
+	require.Equal(t, org.ID, gotOrg)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, app.WSHub.Stop(ctx))
+	gotUser, gotOrg, err = validate(token)
+	require.Equal(t, jwt.ErrTokenInvalidClaims, err)
+	require.Equal(t, uuid.Nil, gotUser)
+	require.Equal(t, uuid.Nil, gotOrg)
+}

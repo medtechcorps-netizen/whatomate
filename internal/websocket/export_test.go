@@ -9,17 +9,19 @@ func ClientSendChan(c *Client) <-chan []byte {
 
 // ClientAuthenticated returns whether the client has authenticated.
 func ClientAuthenticated(c *Client) bool {
-	return c.authenticated
+	return c.isAuthenticated()
 }
 
 // ClientUserID returns the client's user ID.
 func ClientUserID(c *Client) uuid.UUID {
-	return c.userID
+	userID, _ := c.identity()
+	return userID
 }
 
 // ClientOrgID returns the client's organization ID.
 func ClientOrgID(c *Client) uuid.UUID {
-	return c.organizationID
+	_, orgID := c.identity()
+	return orgID
 }
 
 // ClientHandleAuthMessage exposes handleAuthMessage for testing.

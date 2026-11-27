@@ -160,7 +160,7 @@ func laneDHub(t *testing.T, organizationID uuid.UUID, userIDs ...uuid.UUID) (*ap
 	t.Helper()
 	log := testutil.NopLogger()
 	hub := appwebsocket.NewHub(log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	userID := uuid.New()
 	if len(userIDs) > 0 {
 		userID = userIDs[0]

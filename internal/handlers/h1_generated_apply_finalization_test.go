@@ -230,7 +230,7 @@ type h1GeneratedFallback struct {
 func h1GeneratedFallbackCapture(t *testing.T, f *h1CapacityLegacyFixture) *h1GeneratedFallback {
 	t.Helper()
 	hub := appwebsocket.NewHub(f.app.Log)
-	go hub.Run()
+	StartOwnedWebSocketTestHub(t, hub)
 	client := appwebsocket.NewClient(hub, nil, uuid.New(), f.works[0].OrganizationID)
 	hub.Register(client)
 	capture := &h1GeneratedFallback{}

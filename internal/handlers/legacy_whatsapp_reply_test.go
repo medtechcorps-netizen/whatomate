@@ -91,7 +91,7 @@ func TestSendLegacyWhatsAppConversationReplyBroadcastsOnlyFinalEnvelope(t *testi
 			fixture.mock.returnError = test.providerFail
 			fixture.mock.errorMessage = "provider rejected reply"
 			hub := appwebsocket.NewHub(testutil.NopLogger())
-			go hub.Run()
+			handlers.StartOwnedWebSocketTestHub(t, hub)
 			fixture.app.WSHub = hub
 			client := appwebsocket.NewClient(hub, nil, uuid.New(), fixture.organization.ID)
 			hub.Register(client)
@@ -207,7 +207,7 @@ func TestSendLegacyWhatsAppConversationReplyReplaysNonSentClaimWithoutProvider(t
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newLegacyReplyFixture(t)
 			hub := appwebsocket.NewHub(testutil.NopLogger())
-			go hub.Run()
+			handlers.StartOwnedWebSocketTestHub(t, hub)
 			fixture.app.WSHub = hub
 			client := appwebsocket.NewClient(hub, nil, uuid.New(), fixture.organization.ID)
 			hub.Register(client)
