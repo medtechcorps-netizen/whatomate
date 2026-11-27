@@ -1,8 +1,9 @@
 /** @vitest-environment happy-dom */
 
 import { flushPromises, shallowMount, type VueWrapper } from '@vue/test-utils'
-import { defineComponent, nextTick } from 'vue'
+import { defineComponent, nextTick, type Component } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
 import ChatViewComponent from './ChatView.vue'
 import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
 
@@ -12,6 +13,7 @@ vi.mock('@/lib/tabSession', () => ({
     const marker = localStorage.getItem('whm_session_id')
     return marker?.startsWith('ended:') ? null : marker
   },
+  isTabSessionCurrent: () => !localStorage.getItem('whm_session_id')?.startsWith('ended:'),
 }))
 
 const mocks = vi.hoisted(() => ({
@@ -40,6 +42,7 @@ const mocks = vi.hoisted(() => ({
   fetchNotes: vi.fn(),
   clearNotes: vi.fn(),
   listAccounts: vi.fn(),
+  getReplyContextMedia: vi.fn(),
   getSessionData: vi.fn(),
   markRead: vi.fn(),
   refreshUnread: vi.fn(),
@@ -119,13 +122,19 @@ vi.mock('@/composables/useInfiniteScroll', () => ({
 }))
 
 vi.mock('@/stores/contacts', async () => {
-  const { reactive } = await import('vue')
+  const { reactive, ref } = await import('vue')
+  const quoteContextCurrent = ref(false)
   const store = reactive({
+    get quoteContextCurrent() { return quoteContextCurrent.value },
+    set quoteContextCurrent(value: boolean) { quoteContextCurrent.value = value },
     contacts: [] as Array<Record<string, unknown>>,
     sortedContacts: [] as Array<Record<string, unknown>>,
     currentContact: null as Record<string, any> | null,
     messages: [] as Array<Record<string, unknown>>,
     messagesOrganizationScope: '',
+    transcriptAccountFilter: null as string | null,
+    ownsReplyContext: (_message: unknown) => quoteContextCurrent.value,
+    retireReplyContexts: () => { quoteContextCurrent.value = false },
     replyingTo: null,
     searchQuery: '',
     selectedTags: [] as string[],
@@ -247,7 +256,7 @@ vi.mock('@/services/api', () => ({
     createTransfer: mocks.createTransfer,
     resumeTransfer: mocks.resumeTransfer,
   },
-  messagesService: { sendReaction: vi.fn() },
+  messagesService: { sendReaction: vi.fn(), getReplyContextMedia: mocks.getReplyContextMedia },
   customActionsService: { list: vi.fn(), execute: vi.fn() },
   accountsService: { list: mocks.listAccounts },
   cannedResponsesService: { use: vi.fn() },
@@ -295,7 +304,7 @@ function contact(id: string) {
   }
 }
 
-function mountChatView() {
+function mountChatView(extraStubs: Record<string, boolean | Component> = {}) {
   return shallowMount(ChatViewComponent, {
     global: {
       mocks: {
@@ -310,6 +319,7 @@ function mountChatView() {
         TooltipContent: { template: '<div><slot /></div>' },
         Button: { template: '<button><slot /></button>' },
         Badge: { template: '<span><slot /></span>' },
+        ...extraStubs,
       },
     },
   })
@@ -434,6 +444,103 @@ describe('ChatView conversation selection', () => {
     const message = transcript.get('[data-testid="chat-message"]')
     expect(message.attributes('data-message-id')).toBe('message-selector-1')
     expect(message.attributes('data-message-direction')).toBe('incoming')
+  })
+
+  it('shows the authorized original photo caption and scopes its preview to the reply', async () => {
+    mocks.hasPermission.mockImplementation((resource, action) => resource === 'chat' && action === 'read')
+    mocks.listAccounts.mockResolvedValue({ data: { data: { accounts: [{ name: 'account-a' }] } } })
+    mocks.getReplyContextMedia.mockResolvedValue(new Blob(['image bytes'], { type: 'image/jpeg' }))
+    const revision = 'b'.repeat(64)
+    const photo = {
+      id: 'reply-child', contact_id: 'first', direction: 'incoming',
+      message_type: 'text', content: { body: 'Is this still available?' },
+      whatsapp_account: 'account-a', is_reply: true, reply_to_message_id: 'quoted-photo',
+      reply_to_message: {
+        id: 'quoted-photo', direction: 'outgoing', message_type: 'image', scoped_context: true,
+        content: { body: '*Back in stock* — delivery is available next week.' }, image_revision: revision,
+      },
+      status: 'received', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+    }
+    mocks.fetchMessages.mockImplementation(async () => {
+      mocks.contactsStore!.messagesOrganizationScope = 'organization-1'
+      mocks.contactsStore!.messages = [
+        { ...photo, id: 'second-account-reply', whatsapp_account: 'account-b' },
+        photo,
+        {
+          ...photo,
+          id: 'ordinary-photo',
+          reply_to_message: {
+            ...photo.reply_to_message,
+            scoped_context: undefined,
+            content: { body: 'Ordinary quote caption' },
+          },
+        },
+        {
+          ...photo,
+          id: 'stored-text',
+          reply_to_message_id: 'quoted-text',
+          reply_to_message: {
+            ...photo.reply_to_message,
+            id: 'quoted-text',
+            message_type: 'text',
+            content: { body: 'Stored original text' },
+            image_revision: undefined,
+          },
+        },
+        { ...photo, id: 'missing-original', reply_to_message: undefined, reply_context_unavailable: true },
+      ]
+      mocks.contactsStore!.quoteContextCurrent = true
+    })
+    wrapper = mountChatView({ WhatsAppText: false })
+    await flushPromises()
+    await nextTick()
+
+    const row = wrapper.get('[data-message-id="reply-child"]')
+    expect(row.get('.reply-preview strong').text()).toBe('Back in stock')
+    expect(row.text()).toContain('delivery is available next week')
+    const ordinaryPhoto = wrapper.get('[data-message-id="ordinary-photo"] .reply-preview')
+    expect(ordinaryPhoto.text()).toContain('[Photo]')
+    expect(ordinaryPhoto.text()).not.toContain('Ordinary quote caption')
+    expect(wrapper.get('[data-message-id="missing-original"]').text()).toContain('chat.replyContextUnavailable')
+    const thumbnails = wrapper.findAllComponents(ProtectedMessageMedia)
+    expect(thumbnails).toHaveLength(2)
+    const media = thumbnails.find(value => value.props('message').id === photo.id)!
+    const source = media.props('scopedSource')!
+    const signal = new AbortController().signal
+    const onProgress = vi.fn()
+    await source.load({ signal, onProgress })
+    expect(mocks.getReplyContextMedia).toHaveBeenCalledExactlyOnceWith(
+      'first', 'reply-child', 'account-a', revision,
+      { organizationId: 'organization-1', signal, isCurrent: expect.any(Function) },
+      onProgress,
+    )
+    expect(source.isCurrent()).toBe(true)
+
+    const storedText = wrapper.get('[data-message-id="stored-text"]')
+    expect(storedText.text()).toContain('Stored original text')
+    mocks.contactsStore!.retireReplyContexts()
+    await nextTick()
+    expect(wrapper.find('[data-message-id="stored-text"]').exists()).toBe(true)
+    expect(storedText.text()).not.toContain('Stored original text')
+    expect(storedText.find('.reply-preview').exists()).toBe(false)
+    await mocks.fetchMessages()
+    await nextTick()
+
+    const selectedWorkspace = localStorage.getItem(SELECTED_ORGANIZATION_STORAGE_KEY)
+    localStorage.setItem(SELECTED_ORGANIZATION_STORAGE_KEY, 'organization-2')
+    try {
+      expect(source.isCurrent()).toBe(false)
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: SELECTED_ORGANIZATION_STORAGE_KEY, oldValue: selectedWorkspace, newValue: 'organization-2',
+      }))
+      await nextTick()
+      expect(row.text()).not.toContain('delivery is available next week')
+      expect(wrapper.findComponent(ProtectedMessageMedia).exists()).toBe(false)
+    } finally {
+      if (selectedWorkspace === null) localStorage.removeItem(SELECTED_ORGANIZATION_STORAGE_KEY)
+      else localStorage.setItem(SELECTED_ORGANIZATION_STORAGE_KEY, selectedWorkspace)
+    }
+    expect(source.isCurrent()).toBe(false)
   })
 
   describe('chat media', () => {

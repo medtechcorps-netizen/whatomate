@@ -224,6 +224,9 @@ type whatsAppMessageLookup struct {
 	Direction        models.Direction // Empty allows either proven reply-target direction.
 	Lock             bool
 	RepairProjection bool
+	// Native transcript quotes must keep the exact current contact and must
+	// not open the historical merged-contact proof path.
+	exactContact bool
 	// Only the committed continuation-validation phase sets this. It may repair
 	// an already proven display name, but must not learn a contact selector.
 	continuationValidation bool
@@ -411,7 +414,7 @@ func (a *App) resolveWhatsAppMessage(account *models.WhatsAppAccount, lookup wha
 		}
 	}
 	var legacyEvidence *channelapi.LegacyMergedProjectionEvidence
-	historicalEligible := !reviewRouted && message.Direction == models.DirectionOutgoing && !lookup.continuationValidation && strings.TrimSpace(lookup.Identity.UserID) != ""
+	historicalEligible := !lookup.exactContact && !reviewRouted && message.Direction == models.DirectionOutgoing && !lookup.continuationValidation && strings.TrimSpace(lookup.Identity.UserID) != ""
 	var legacyCancel func()
 	defer func() {
 		if legacyCancel != nil {

@@ -1893,12 +1893,13 @@ func (a *App) persistCoexistenceRevoke(
 	original := resolved.Message
 	metadata := cloneMessageMetadata(original.Metadata)
 	eventID := strings.TrimSpace(event.ID)
+	_, pendingQuote := metadata[models.MessageCoexistencePendingQuoteMetadataKey]
 	alreadySanitized := metadata[coexistenceMediaRevokedMetadataKey] == true &&
 		eventID != "" && metadata["coexistence_revoke_event_id"] == eventID &&
 		original.Content == "[Message deleted from WhatsApp Business App]" && original.MessageType == models.MessageTypeText &&
 		original.MediaURL == "" && original.MediaMimeType == "" && original.MediaFilename == "" &&
 		coexistenceMediaMetadataString(metadata, coexistenceMediaProviderIDMetadataKey) == "" &&
-		coexistenceMediaMetadataString(metadata, coexistenceMediaHydratedIDMetadataKey) == ""
+		coexistenceMediaMetadataString(metadata, coexistenceMediaHydratedIDMetadataKey) == "" && !pendingQuote
 	if alreadySanitized {
 		return nil
 	}
@@ -1909,6 +1910,7 @@ func (a *App) persistCoexistenceRevoke(
 	delete(metadata, coexistenceMediaHydratedIDMetadataKey)
 	delete(metadata, "coexistence_media_sha256")
 	delete(metadata, "history_media_placeholder")
+	delete(metadata, models.MessageCoexistencePendingQuoteMetadataKey)
 	if err := a.DB.Model(&models.Message{}).Where(
 		"organization_id = ? AND id = ?",
 		account.OrganizationID,
@@ -2391,6 +2393,7 @@ func (a *App) persistCoexistenceMessage(
 		return nil, false, errors.New("coexistence message has no type")
 	}
 	metadata = cloneMessageMetadata(metadata)
+	delete(metadata, models.MessageCoexistencePendingQuoteMetadataKey)
 	if identity.UserID != "" {
 		metadata["coexistence_user_id"] = identity.UserID
 	}
@@ -2434,17 +2437,9 @@ func (a *App) persistCoexistenceMessage(
 		messageRow.MediaMimeType = extracted.Media.MediaMimeType
 		messageRow.MediaFilename = extracted.Media.MediaFilename
 	}
-	if message.Context != nil && strings.TrimSpace(message.Context.ID) != "" {
-		// A reply may reference either side of this conversation. Prove the
-		// target's own direction rather than imposing the envelope's direction.
-		reply, err := a.resolveWhatsAppMessage(account, whatsAppMessageLookup{
-			WAMID: strings.TrimSpace(message.Context.ID), ContactID: contact.ID, Identity: identity,
-		})
-		if err == nil {
-			messageRow.IsReply = true
-			messageRow.ReplyToMessageID = &reply.Message.ID
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, false, fmt.Errorf("load coexistence reply context: %w", err)
+	if message.Context != nil {
+		if err := a.bindCoexistenceQuote(account, &messageRow, identity, message.Context.ID, ordinaryCoexistenceEcho(metadata)); err != nil {
+			return nil, false, err
 		}
 	}
 
@@ -2587,7 +2582,8 @@ func (a *App) mergeCoexistenceMessageDetails(
 	mergedMetadata := cloneMessageMetadata(existing.Metadata)
 	for key, value := range metadata {
 		switch key {
-		case coexistenceMediaProviderIDMetadataKey, "coexistence_media_sha256", coexistenceMediaHydratedIDMetadataKey:
+		case coexistenceMediaProviderIDMetadataKey, "coexistence_media_sha256", coexistenceMediaHydratedIDMetadataKey,
+			models.MessageCoexistencePendingQuoteMetadataKey:
 			// Only a compatible declared media payload below may replace these;
 			// incoming correlation metadata is not a media revision authority.
 			continue
@@ -2595,6 +2591,21 @@ func (a *App) mergeCoexistenceMessageDetails(
 		mergedMetadata[key] = value
 	}
 	updates := map[string]any{"metadata": mergedMetadata}
+	// An ordinary, proven replay can supply the first explicit context. An
+	// earlier linked or encrypted quote always keeps its original target.
+	_, hasPendingQuote := existing.Metadata[models.MessageCoexistencePendingQuoteMetadataKey]
+	if message.Context != nil && !existing.IsReply && existing.ReplyToMessageID == nil && !hasPendingQuote &&
+		ordinaryCoexistenceEcho(existing.Metadata) && ordinaryCoexistenceEcho(metadata) {
+		withQuote := *existing
+		withQuote.Metadata = mergedMetadata
+		if err := a.bindCoexistenceQuote(account, &withQuote, identity, message.Context.ID, true); err != nil {
+			return err
+		}
+		if withQuote.IsReply {
+			updates["is_reply"] = true
+			updates["reply_to_message_id"] = withQuote.ReplyToMessageID
+		}
+	}
 	if existing.MessageType == models.MessageType("media_placeholder") || existing.MessageType == models.MessageType(extracted.Type) {
 		replaceContent := existing.MessageType == models.MessageType("media_placeholder")
 		for key, value := range coexistenceMediaReplacementUpdates(existing, message.IncomingTextMessage, extracted, mergedMetadata, replaceContent) {

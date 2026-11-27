@@ -1673,6 +1673,8 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).GetInboxConversationMessages),
 	)
+	// End the tenant transaction before reading storage, then authorize the response again.
+	g.GET("/api/conversations/{id}/messages/{message_id}/reply-context-media", app.ServeInboxReplyContextMedia)
 	g.POST(
 		"/api/conversations/{id}/messages",
 		tenant((*handlers.App).SendInboxConversationMessage),
@@ -1849,6 +1851,7 @@ func setupRoutes(g *fastglue.Fastglue, app *handlers.App, lo logf.Logger, basePa
 
 	// Messages
 	g.GET("/api/contacts/{id}/messages", tenant((*handlers.App).GetMessages))
+	g.GET("/api/contacts/{id}/messages/{message_id}/reply-context-media", app.ServeNativeReplyContextMedia)
 	g.POST("/api/contacts/{id}/messages", tenant((*handlers.App).SendMessage))
 	g.POST("/api/contacts/{id}/mark-read", tenant((*handlers.App).MarkContactRead))
 	g.POST("/api/contacts/{id}/messages/{message_id}/reaction", tenant((*handlers.App).SendReaction))

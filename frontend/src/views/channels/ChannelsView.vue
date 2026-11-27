@@ -35,6 +35,12 @@ import {
   SheetDescription,
   SheetTitle,
 } from '@/components/ui/sheet'
+import WhatsAppText from '@/components/chat/WhatsAppText.vue'
+import ProtectedMessageMedia, { type ScopedMessageMediaSource } from '@/components/chat/ProtectedMessageMedia.vue'
+import { currentTabSession } from '@/lib/tabSession'
+import { AUTH_SESSION_EVENT } from '@/lib/authSessionEvent'
+import { readSelectedOrganizationId, SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
+import { LOGICAL_SESSION_STORAGE_KEY, readWorkspaceIdentity, SESSION_ENDING_EVENT } from '@/composables/useChatAttachments'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
@@ -97,10 +103,19 @@ interface InboxMessage {
   status: string
   ingested_at?: string
   created_at: string
+  replyContext?: {
+    body: string
+    type: 'image' | 'text' | 'unavailable'
+    organizationId: string
+    isCurrent: () => boolean
+    image?: ScopedMessageMediaSource
+  }
 }
 
 interface InboxMessageEnvelope {
   message: InboxMessage
+  reply_to_message?: unknown
+  reply_context_unavailable?: boolean
   parts?: Array<{
     type: string
     text?: string
@@ -144,6 +159,13 @@ const selectedConversation = ref<InboxConversation | null>(null)
 const isWorkspaceOpen = ref(false)
 const isWorkspaceRail = useMediaQuery('(min-width: 1280px)')
 const messages = ref<InboxMessage[]>([])
+const replyContextGeneration = ref(0)
+let quoteRequests = new AbortController()
+let endingInboxSession: string | null = null
+let quoteSession = currentTabSession()
+const replyContextImages = computed(() => new Map(
+  messages.value.map(message => [message.id, message.replyContext?.image]),
+))
 const messagesViewport = ref<HTMLElement | null>(null)
 const messagesContent = ref<HTMLElement | null>(null)
 const channelFilter = ref<ChannelType | 'all'>('all')
@@ -198,6 +220,7 @@ const canReconcileMetaInstagram = computed(
   () => canManageMetaInstagram.value && canDeleteAccounts.value,
 )
 const canReadConversations = computed(() => authStore.hasPermission('conversations', 'read'))
+const canReadReplyContexts = computed(() => canReadConversations.value && authStore.hasPermission('chat', 'read'))
 const canManageConversations = computed(() => authStore.hasPermission('conversations', 'write'))
 const canReviewContactIdentity = computed(() =>
   authStore.hasPermission('contacts', 'write')
@@ -627,12 +650,107 @@ function conversationName(conversation: InboxConversation) {
   )
 }
 
-function normalizeMessage(envelope: InboxMessageEnvelope): InboxMessage {
-  const part = envelope.parts?.find((item) => item.text || item.caption)
+function captureInboxReadOwner(organizationContext: OrganizationRequestContext) {
+  const { organizationId } = organizationContext
+  const userId = authStore.user?.id
+  const homeOrganization = authStore.organizationId
+  const session = currentTabSession()
+  const storedOrganization = readSelectedOrganizationId()
+  const browserIdentity = readWorkspaceIdentity(homeOrganization, userId)
+  if (!organizationId || !userId || session === null || session === endingInboxSession || !canReadConversations.value
+    || (storedOrganization && storedOrganization !== organizationId)
+    || browserIdentity !== JSON.stringify([storedOrganization || homeOrganization || '', homeOrganization ?? '', userId])) return
   return {
-    ...envelope.message,
-    content: envelope.message.content || part?.text || part?.caption || '',
+    organizationId,
+    userId,
+    session,
+    browserIdentity,
+    isCurrent: () => isCurrentOrganizationContext(organizationContext)
+      && canReadConversations.value
+      && authStore.user?.id === userId
+      && currentTabSession() === session
+      && readSelectedOrganizationId() === storedOrganization
+      && readWorkspaceIdentity(authStore.organizationId, authStore.user?.id) === browserIdentity,
   }
+}
+
+function captureReplyContext() {
+  const conversation = selectedConversation.value
+  const organizationId = activeOrganizationId.value
+  const storedOrganization = readSelectedOrganizationId()
+  const actor = authStore.user?.id
+  const session = currentTabSession()
+  if (!conversation || !organizationId || !actor || session === null) return
+  // Compare live shared storage as well as reactive selection. Another tab
+  // can change the selected workspace before the storage event reaches us.
+  if ((storedOrganization || authStore.organizationId) !== organizationId) return
+  const { id, channel_account_id, contact_id } = conversation
+  const viewSequence = conversationViewSequence
+  const generation = replyContextGeneration.value
+  const organizationContext = captureOrganizationContext()
+  const quoteReadOwner = captureInboxReadOwner(organizationContext)
+  const isCurrent = () => viewMounted
+    && generation === replyContextGeneration.value
+    && isCurrentConversationView(viewSequence, id, organizationContext)
+    && selectedConversation.value?.channel === 'whatsapp'
+    && selectedConversation.value.channel_account_id === channel_account_id
+    && selectedConversation.value.contact_id === contact_id
+    && selectedAccount.value?.provider === 'meta_legacy'
+    && canReadReplyContexts.value
+    && authStore.user?.id === actor
+    && currentTabSession() === session
+    && readSelectedOrganizationId() === storedOrganization
+  if (!isCurrent() || !quoteReadOwner?.isCurrent()) return
+  return {
+    organizationId,
+    conversationId: id,
+    key: [organizationId, id, channel_account_id, contact_id, actor, session, viewSequence, generation],
+    signal: quoteRequests.signal,
+    isCurrent: () => isCurrent() && quoteReadOwner?.isCurrent() === true,
+  }
+}
+
+function normalizeMessage(
+  envelope: InboxMessageEnvelope,
+  owner?: ReturnType<typeof captureReplyContext>,
+): InboxMessage {
+  const part = envelope.parts?.find(item => item.text || item.caption)
+  const { id, direction, message_type, content, status, ingested_at, created_at } = envelope.message
+  const message: InboxMessage = {
+    id, direction, message_type, status, ingested_at, created_at,
+    content: content || part?.text || part?.caption || '',
+  }
+  if (owner?.isCurrent()) {
+    const { organizationId, conversationId, isCurrent } = owner
+    const quote = envelope.reply_to_message as {
+      id?: unknown
+      message_type?: unknown
+      content?: { body?: unknown } | null
+      scoped_context?: unknown
+      image_revision?: unknown
+    } | undefined
+    const type = quote?.message_type
+    const body = quote?.content?.body
+    if (envelope.reply_context_unavailable === true) {
+      message.replyContext = { body: '', type: 'unavailable', organizationId, isCurrent }
+    } else if (quote?.scoped_context === true && typeof quote.id === 'string' && quote.id && typeof body === 'string' &&
+      (type === 'image' || (type === 'text' && body.trim()))) {
+      message.replyContext = { body, type, organizationId, isCurrent }
+      const revision = quote.image_revision
+      if (type === 'image' && typeof revision === 'string' && /^[a-f0-9]{64}$/.test(revision)) {
+        const key = JSON.stringify([...owner.key, id, quote.id, revision])
+        const ownsImage = () => isCurrent() && replyContextImages.value.get(id)?.key === key
+        message.replyContext.image = {
+          key,
+          isCurrent: ownsImage,
+          load: ({ signal, onProgress }) => channelsService.replyContextMedia(
+            conversationId, id, revision, { organizationId, signal, isCurrent: ownsImage }, onProgress,
+          ),
+        }
+      }
+    }
+  }
+  return message
 }
 
 function normalizeLegacyWhatsAppMessage(message: LegacyWhatsAppMessage): InboxMessage {
@@ -887,13 +1005,15 @@ async function load(silent = false, append = false) {
     if (silent && selectedConversation.value) {
       const conversationId = selectedConversation.value.id
       const viewSequence = conversationViewSequence
-      const messageResponse = await channelsService.messages(conversationId, { limit: 100 })
+      const quoteOwner = captureReplyContext()
+      const messageResponse = await channelsService.messages(conversationId, { limit: 100 }, quoteOwner)
+      if (quoteOwner && !quoteOwner.isCurrent()) return
       if (
         !isCurrentConversationView(viewSequence, conversationId, organizationContext)
         || projectionGeneration !== conversationProjectionGeneration
       ) return
       const latest = unwrapListResponse<InboxMessageEnvelope>(messageResponse, 'messages')
-        .map(normalizeMessage)
+        .map(row => normalizeMessage(row, quoteOwner))
         .reverse()
       const shouldFollowLatestMessage = isMessageViewportNearBottom()
       messageTotal.value = totalFromResponse(messageResponse)
@@ -1029,10 +1149,12 @@ async function selectConversation(conversation: InboxConversation) {
   loadingMessages.value = true
   let loaded = false
   try {
-    const response = await channelsService.messages(conversation.id, { limit: 100 })
+    const quoteOwner = captureReplyContext()
+    const response = await channelsService.messages(conversation.id, { limit: 100 }, quoteOwner)
+    if (quoteOwner && !quoteOwner.isCurrent()) return
     if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
     messages.value = unwrapListResponse<InboxMessageEnvelope>(response, 'messages')
-      .map(normalizeMessage)
+      .map(row => normalizeMessage(row, quoteOwner))
       .reverse()
     messageTotal.value = totalFromResponse(response)
     loaded = true
@@ -1127,13 +1249,15 @@ async function loadOlderMessages() {
   const previousScrollTop = viewport?.scrollTop ?? 0
   loadingOlderMessages.value = true
   try {
+    const quoteOwner = captureReplyContext()
     const response = await channelsService.messages(conversation.id, {
       before: oldest.id,
       limit: 100,
-    })
+    }, quoteOwner)
+    if (quoteOwner && !quoteOwner.isCurrent()) return
     if (!isCurrentConversationView(viewSequence, conversation.id, organizationContext)) return
     const older = unwrapListResponse<InboxMessageEnvelope>(response, 'messages')
-      .map(normalizeMessage)
+      .map(row => normalizeMessage(row, quoteOwner))
       .reverse()
     messageTotal.value = totalFromResponse(response)
     const existingIDs = new Set(messages.value.map((message) => message.id))
@@ -2130,8 +2254,56 @@ function consumeMetaInstagramCallbackResult() {
   }
 }
 
+function retireReplyContexts() {
+  replyContextGeneration.value++
+  quoteRequests.abort()
+  quoteRequests = new AbortController()
+}
+
+function onReplySessionEnding() {
+  endingInboxSession = currentTabSession() ?? endingInboxSession
+  retireReplyContexts()
+}
+
+function onReplySessionChange() {
+  const session = currentTabSession()
+  if (session === quoteSession) return
+  quoteSession = session
+  retireReplyContexts()
+}
+
+function onReplyStorage(event: StorageEvent) {
+  if (event.storageArea && event.storageArea !== window.localStorage) return
+  const recordIdentity = (record: string | null) => readWorkspaceIdentity(authStore.organizationId, authStore.user?.id, record)
+  if (event.key === null ||
+    (event.key === SELECTED_ORGANIZATION_STORAGE_KEY && event.oldValue !== event.newValue) ||
+    (event.key === LOGICAL_SESSION_STORAGE_KEY && event.oldValue !== event.newValue) ||
+    (event.key === 'user' && recordIdentity(event.oldValue) !== recordIdentity(event.newValue))) {
+    retireReplyContexts()
+  }
+}
+
+watch([
+  activeOrganizationId,
+  () => authStore.user?.id,
+  () => authStore.user?.role?.id ?? authStore.user?.role_id,
+  () => authStore.user?.is_super_admin,
+  canReadReplyContexts,
+  // Losing full contact visibility can tighten assignment and history rules
+  // even when both attachment read grants remain in place.
+  () => authStore.hasPermission('contacts', 'read'),
+  () => selectedConversation.value?.id,
+  () => selectedConversation.value?.contact_id,
+  () => selectedConversation.value?.channel_account_id,
+  () => selectedConversation.value?.channel,
+  () => selectedAccount.value?.provider,
+], retireReplyContexts, { flush: 'sync' })
+
 onMounted(() => {
   viewMounted = true
+  window.addEventListener(SESSION_ENDING_EVENT, onReplySessionEnding)
+  window.addEventListener(AUTH_SESSION_EVENT, onReplySessionChange)
+  window.addEventListener('storage', onReplyStorage)
   window.addEventListener('beforeunload', guardMetaMessengerNavigation)
   document.addEventListener('visibilitychange', catchUpInbox)
   window.addEventListener('focus', catchUpInbox)
@@ -2226,6 +2398,10 @@ watch(
 
 onBeforeUnmount(() => {
   viewMounted = false
+  window.removeEventListener(SESSION_ENDING_EVENT, onReplySessionEnding)
+  window.removeEventListener(AUTH_SESSION_EVENT, onReplySessionChange)
+  window.removeEventListener('storage', onReplyStorage)
+  retireReplyContexts()
   refreshQueued = false
   organizationReloadQueued = false
   organizationGeneration += 1
@@ -3037,6 +3213,25 @@ function guardMetaMessengerNavigation(event: BeforeUnloadEvent) {
                       : 'rounded-bl-md border border-white/[0.07] bg-white/[0.04] text-white/80 light:border-slate-300 light:bg-slate-50 light:text-slate-900'
                   "
                 >
+                  <div
+                    v-if="message.replyContext?.isCurrent()"
+                    data-testid="reply-context"
+                    class="mb-1 rounded-md border-s-2 border-current/30 bg-current/5 px-2 py-1 text-xs"
+                  >
+                    <p v-if="message.replyContext.type === 'unavailable'">{{ $t('chat.replyContextUnavailable') }}</p>
+                    <p v-else-if="message.replyContext.body" class="whitespace-pre-wrap break-words">
+                      <WhatsAppText :text="message.replyContext.body" />
+                    </p>
+                    <p v-else-if="message.replyContext.type === 'image'">{{ $t('chat.photo') }}</p>
+                    <ProtectedMessageMedia
+                      v-if="message.replyContext.image?.isCurrent()"
+                      :key="message.replyContext.image.key"
+                      :organization-id="message.replyContext.organizationId"
+                      :message="{ id: message.id, message_type: 'image', content: {} }"
+                      :scoped-source="message.replyContext.image"
+                      thumbnail
+                    />
+                  </div>
                   <p>{{ message.content }}</p>
                   <p class="mt-1 text-right text-[9px] opacity-50">{{ formatTime(message.created_at) }} · {{ message.status }}</p>
                 </div>

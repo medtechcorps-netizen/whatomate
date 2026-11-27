@@ -2788,6 +2788,93 @@ def _ci_h1_bootstrap_closure(repo: _Repository, base: str, head: str,
     _ci_paired_metadata_history(repo, base, head, old_pair, new_pair)
 
 
+_CI_QUOTE_FILES = tuple("internal/handlers/" + name for name in (
+    "coexistence_pending_quote.go", "inbox_attachment_scope.go", "inbox_attachment_storage.go",
+    "inbox_attachment_storage_linux.go", "native_media_binding_read.go", "quoted_reply_context.go",
+))
+# SHA-256 of the canonical data registry, migration document and physical
+# source inventory, in that order. The native Go resolver independently
+# checks the declaration hashes and both reviewed caps.
+_CI_QUOTE_STATES = (
+    ("87985bc9327334e12747fbae3393bdd9b432beaa1098581cfbddc4cfa52a6722",
+     "6e1a229c6f5f50078ef73d5c7627a23b259a6befacd7a7e6c140ec5583bf7d9b",
+     "5b5d1222c23db0823595631150dc4dfdf4a95ef541c7897f6fe17b4a31b859f3"),
+    ("9d141f427f1d7e90f2870d46d06e317106aa27dbde448765df33069e43926bea",
+     "b0ae8f348fb874e7449703c26724d2919e64880e9eba3478d1ab0b0685c79d43",
+     "3b54b9e99ea43c3af266aaadac71023e9ef544cdf4ec87054af525e3d67bae4f"),
+)
+
+
+def _ci_quote_source_digest(repo: _Repository, revision: str) -> str:
+    # Include the other-platform fallback and module graph as well as all
+    # production Go files. The raw Git records bind path, mode and blob OID.
+    extra = {path.encode() for path in (
+        *_CI_H1_ACTIVE, DORMANT, REGISTRY, MIGRATION_PATH, "go.mod", "go.sum", "internal/dbcatalog/registry/closure_caps.json",
+        "internal/dbcatalog/registry/migration_path_test.go",
+    )}
+    raw = _git(repo.root, ["ls-tree", "-r", "-z", revision, "--", "cmd", "internal", "pkg", "go.mod", "go.sum"])
+    _valid(0 < len(raw) <= MAX_ARTIFACT_BYTES and raw.endswith(b"\x00"))
+    repo.total += len(raw)
+    _valid(repo.total <= 64 * 1024 * 1024)
+    digest = hashlib.sha256()
+    for row in raw[:-1].split(b"\x00"):
+        meta, sep, path = row.partition(b"\t")
+        _valid(sep and path)
+        if (path in extra or path.startswith(_V2_PENDING.encode())
+                or (path.endswith(b".go") and not path.endswith(b"_test.go"))):
+            _valid(re.fullmatch(rb"100644 blob [0-9a-f]{40}", meta))
+            digest.update(row + b"\x00")
+    return digest.hexdigest()
+
+
+def _ci_quote_writer_closure(repo: _Repository, base: str, head: str) -> None:
+    def state(revision: str) -> int:
+        registry = repo.blob(revision, REGISTRY)
+        migration = repo.blob(revision, MIGRATION_PATH)
+        _valid(registry and migration)
+        documents = (hashlib.sha256(registry).hexdigest(), hashlib.sha256(migration).hexdigest())
+        for index, (expected_registry, expected_migration, expected_source) in enumerate(_CI_QUOTE_STATES):
+            if documents == (expected_registry, expected_migration):
+                _valid(_ci_quote_source_digest(repo, revision) == expected_source)
+                return index
+        raise _Invalid()
+
+    _valid(state(base) == 0 and state(head) == 1)
+    old = repo.document(base, MIGRATION_PATH, lambda _: None)
+    new = repo.document(head, MIGRATION_PATH, lambda _: None)
+    _valid(not set(_CI_QUOTE_FILES).intersection(old["closure_files"])
+           and sorted(old["closure_files"] + list(_CI_QUOTE_FILES)) == new["closure_files"])
+    for path in _CI_QUOTE_FILES:
+        _valid(repo.blob(base, path) is None and bool(repo.blob(head, path)))
+    _ci_paired_metadata_history(repo, base, head,
+                                (repo.blob(base, REGISTRY), repo.blob(base, MIGRATION_PATH)),
+                                (repo.blob(head, REGISTRY), repo.blob(head, MIGRATION_PATH)))
+
+    # A synthetic PR merge can conceal edits that were reverted on the topic
+    # branch. Inspect both ancestries, allowing only one introduction of the
+    # complete writer. A later clean merge of that change is not a second one.
+    graph = _git(repo.root, ["rev-list", "--parents", "--topo-order", "--reverse",
+                             f"--max-count={MAX_HISTORY_COMMITS + 1}", f"{base}..{head}"])
+    _valid(graph.endswith(b"\n") and len(graph) <= MAX_HISTORY_COMMITS * 123)
+    rows = graph.decode("ascii").splitlines()
+    _valid(0 < len(rows) <= MAX_HISTORY_COMMITS)
+    seen = {base: 0}
+    introductions = 0
+    for row in rows:
+        revision, *parents = row.split(" ")
+        _valid(re.fullmatch(r"[0-9a-f]{40}", revision) and revision not in seen
+               and 1 <= len(parents) <= 2 and len(set(parents)) == len(parents)
+               and all(parent in seen for parent in parents))
+        actual = _git(repo.root, ["show", "-s", "--format=%P", revision])
+        _valid(actual == (" ".join(parents) + "\n").encode("ascii"))
+        current = 1 if revision == head else state(revision)
+        inherited = max(seen[parent] for parent in parents)
+        _valid(current >= inherited)
+        introductions += current - inherited
+        seen[revision] = current
+    _valid(revision == head and seen[head] == 1 and introductions == 1)
+
+
 def _ci_generated_closure_hash_refresh(repo: _Repository, base: str, head: str,
                                        old_migration: dict, new_migration: dict) -> None:
     """Validate one hash-only refresh of the protected handler baseline closure."""
@@ -2930,6 +3017,17 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
             return ()
     except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
         return tuple(sorted(set(legacy.reasons) | {_PR18_OBSERVER_REASON}))
+    # Reserve the introduction of the Quote writer. A stale or missing
+    # generated pair must not take the ordinary unchanged-registry path.
+    try:
+        marker = _CI_QUOTE_FILES[0]
+        quote_writer = not repo._tree(base, marker) and bool(repo._tree(head, marker))
+        if quote_writer:
+            _valid(legacy.reasons == ("migration-path-changed:closure",)
+                   and legacy.kind == "none" and legacy.dormant is False
+                   and repo.blob(base, REGISTRY) != repo.blob(head, REGISTRY))
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {"quote-writer-closure-incomplete"}))
     if legacy.reasons != ("migration-path-changed:closure",):
         return legacy.reasons
     policy = _classify_v2(repo, base, head, legacy)
@@ -2953,7 +3051,9 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
                    and 0 < len(before) <= MAX_ARTIFACT_BYTES
                    and 0 < len(after) <= MAX_ARTIFACT_BYTES)
             if path == REGISTRY and before != after:
-                if old["closure_files"] == new["closure_files"]:
+                if quote_writer:
+                    _ci_quote_writer_closure(repo, base, head)
+                elif old["closure_files"] == new["closure_files"]:
                     _ci_generated_closure_hash_refresh(repo, base, head, old, new)
                 else:
                     _ci_h1_bootstrap_closure(repo, base, head, old, new)

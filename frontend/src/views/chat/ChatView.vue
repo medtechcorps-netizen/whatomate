@@ -119,7 +119,7 @@ import ContactAssigneeBadge from '@/components/chat/ContactAssigneeBadge.vue'
 import ContactIdentityReviewDialog from '@/components/chat/ContactIdentityReviewDialog.vue'
 import StagedIdentityReviewNotice from '@/components/chat/StagedIdentityReviewNotice.vue'
 import type { IdentityReviewScope } from '@/composables/useIdentityReviewObservation'
-import ProtectedMessageMedia from '@/components/chat/ProtectedMessageMedia.vue'
+import ProtectedMessageMedia, { type ScopedMessageMediaSource } from '@/components/chat/ProtectedMessageMedia.vue'
 import MessageActions from '@/components/chat/MessageActions.vue'
 import MessageContextMenu from '@/components/chat/MessageContextMenu.vue'
 import ForwardMessageDialog from '@/components/chat/ForwardMessageDialog.vue'
@@ -131,7 +131,10 @@ import MediaSendDialog from '@/components/chat/MediaSendDialog.vue'
 import ComposerFormatToolbar from '@/components/chat/ComposerFormatToolbar.vue'
 import WhatsAppText from '@/components/chat/WhatsAppText.vue'
 import ChatDropZoneOverlay from '@/components/chat/ChatDropZoneOverlay.vue'
-import { readLogicalSessionMarker, readWorkspaceIdentity, SESSION_ENDING_EVENT, useChatAttachments } from '@/composables/useChatAttachments'
+import { readSelectedOrganizationId, SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
+import { AUTH_SESSION_EVENT } from '@/lib/authSessionEvent'
+import { currentTabSession, isTabSessionCurrent } from '@/lib/tabSession'
+import { LOGICAL_SESSION_STORAGE_KEY, readLogicalSessionMarker, readWorkspaceIdentity, SESSION_ENDING_EVENT, useChatAttachments } from '@/composables/useChatAttachments'
 import { useComposerFormatting } from '@/composables/useComposerFormatting'
 import { CHAT_ATTACHMENT_ACCEPT, filesFromClipboard, summarizeFileNames } from '@/lib/chatAttachments'
 import CustomerRevenueWorkspace from '@/components/chat/CustomerRevenueWorkspace.vue'
@@ -928,6 +931,9 @@ async function executeCustomAction(action: CustomAction) {
 // Fetch contacts on mount (WebSocket is connected in AppLayout)
 onMounted(async () => {
   chatViewMounted = true
+  window.addEventListener(SESSION_ENDING_EVENT, contactsStore.retireReplyContexts)
+  window.addEventListener(AUTH_SESSION_EVENT, onReplyContextSessionChange)
+  window.addEventListener('storage', onReplyContextStorage)
   window.addEventListener(SESSION_ENDING_EVENT, retireTextComposerIdentity)
   window.addEventListener('storage', onTextSendStorage)
   // Ensure auth session is restored
@@ -1074,6 +1080,10 @@ function onChatOnline() {
 
 onUnmounted(() => {
   chatViewMounted = false
+  window.removeEventListener(SESSION_ENDING_EVENT, contactsStore.retireReplyContexts)
+  window.removeEventListener(AUTH_SESSION_EVENT, onReplyContextSessionChange)
+  window.removeEventListener('storage', onReplyContextStorage)
+  contactsStore.retireReplyContexts()
   window.removeEventListener(SESSION_ENDING_EVENT, retireTextComposerIdentity)
   window.removeEventListener('storage', onTextSendStorage)
   resetTextSendFeedback()
@@ -1562,6 +1572,80 @@ function resetTextareaHeight() {
   if (!textarea) return
   textarea.style.height = 'auto'
 }
+
+let replyContextSession = currentTabSession()
+
+function onReplyContextSessionChange() {
+  const session = currentTabSession()
+  if (replyContextSession === session) return
+  replyContextSession = session
+  contactsStore.retireReplyContexts()
+}
+
+function onReplyContextStorage(event: StorageEvent) {
+  if (event.storageArea && event.storageArea !== window.localStorage) return
+  if (event.key === null || (event.oldValue !== event.newValue && (
+    event.key === SELECTED_ORGANIZATION_STORAGE_KEY || event.key === LOGICAL_SESSION_STORAGE_KEY || event.key === 'user'
+  ))) contactsStore.retireReplyContexts()
+}
+
+function getStoredReplyBody(message: Message): string {
+  const quote = message.reply_to_message
+  return !message.reply_context_unavailable && quote?.scoped_context === true &&
+    contactsStore.ownsReplyContext(message) && (quote.message_type === 'image' || quote.message_type === 'text') &&
+    typeof quote.content?.body === 'string' ? quote.content.body.trim() : ''
+}
+
+const replyContextViewGeneration = ref(0)
+watch(
+  [messageMenuScope, () => contactsStore.transcriptAccountFilter],
+  () => { replyContextViewGeneration.value++ },
+  { flush: 'sync' },
+)
+
+const replyContextImages = computed<Map<string, ScopedMessageMediaSource>>(() => {
+  const result = new Map<string, ScopedMessageMediaSource>()
+  const organizationId = contactsStore.messagesOrganizationScope
+  const storedOrganization = readSelectedOrganizationId()
+  const contact = contactId.value
+  const accountFilter = contactsStore.transcriptAccountFilter
+  const actor = authStore.user?.id
+  const session = currentTabSession()
+  const selection = contactSelectionGeneration
+  const scope = messageMenuScope.value
+  const viewGeneration = replyContextViewGeneration.value
+  const ownsConversation = () => chatViewMounted && authStore.isAuthenticated &&
+    replyContextViewGeneration.value === viewGeneration &&
+    authStore.hasPermission('chat', 'read') && authStore.user?.id === actor &&
+    messageMenuScope.value === scope && currentTabSession() === session && isTabSessionCurrent() &&
+    readSelectedOrganizationId() === storedOrganization &&
+    (storedOrganization || authStore.organizationId) === organizationId &&
+    contactsStore.messagesOrganizationScope === organizationId &&
+    !!contact && isContactSelectionActive(selection, contact)
+  if (!organizationId || !actor || !contact || session === null || !ownsConversation()) return result
+
+  for (const message of contactsStore.messages) {
+    const quote = message.reply_to_message
+    const revision = quote?.image_revision
+    const account = message.whatsapp_account
+    if (!message.is_reply || message.reply_context_unavailable || message.contact_id !== contact ||
+      !account || (accountFilter && account !== accountFilter) || !contactsStore.ownsReplyContext(message) ||
+      quote?.scoped_context !== true || quote.message_type !== 'image' || quote.id !== message.reply_to_message_id ||
+      typeof revision !== 'string' || !/^[a-f0-9]{64}$/.test(revision)) continue
+
+    const key = JSON.stringify([scope, selection, session, viewGeneration, account, message.id, quote.id, revision])
+    const isCurrent = () => ownsConversation() && contactsStore.ownsReplyContext(message) &&
+      replyContextImages.value.get(message.id)?.key === key
+    result.set(message.id, {
+      key,
+      isCurrent,
+      load: ({ signal, onProgress }) => messagesService.getReplyContextMedia(
+        contact, message.id, account, revision, { organizationId, signal, isCurrent }, onProgress,
+      ),
+    })
+  }
+  return result
+})
 
 function getReplyPreviewContent(message: Message): string {
   if (!message.reply_to_message) return ''
@@ -3046,23 +3130,42 @@ watch(contactId, () => chatAttachments.reset())
                 ]"
               >
                 <ForwardedChip v-if="isForwardedMessage(message)" :message="message" />
-                <!-- Reply preview (if this message is replying to another) -->
                 <div
-                  v-if="message.is_reply && message.reply_to_message"
-                  class="reply-preview cursor-pointer text-xs"
-                  role="button"
-                  tabindex="0"
-                  @click="scrollToMessage(message.reply_to_message_id)"
-                  @keydown.enter.prevent="scrollToMessage(message.reply_to_message_id)"
-                  @keydown.space.prevent="scrollToMessage(message.reply_to_message_id)"
+                  v-if="message.is_reply && message.reply_to_message &&
+                    (message.reply_to_message.scoped_context !== true || contactsStore.ownsReplyContext(message))"
+                  class="reply-preview text-xs"
                 >
-                  <p class="font-medium">
-                    {{ message.reply_to_message.direction === 'incoming' ? (contactsStore.currentContact?.profile_name || contactsStore.currentContact?.name || 'Customer') : 'You' }}
+                  <button
+                    type="button"
+                    class="block w-full min-w-0 cursor-pointer text-start"
+                    :aria-label="$t('chat.jumpToReply')"
+                    @click="scrollToMessage(message.reply_to_message_id)"
+                  >
+                    <span class="block font-medium">
+                      {{ message.reply_to_message.direction === 'incoming' ? (contactsStore.currentContact?.profile_name || contactsStore.currentContact?.name || 'Customer') : 'You' }}
+                    </span>
+                    <span v-if="!getStoredReplyBody(message)" class="block truncate">
+                      {{ getReplyPreviewContent(message) }}
+                    </span>
+                  </button>
+                  <p v-if="getStoredReplyBody(message)" class="whitespace-pre-wrap break-words">
+                    <WhatsAppText :text="getStoredReplyBody(message)" />
                   </p>
-                  <p class="truncate">
-                    {{ getReplyPreviewContent(message) }}
-                  </p>
+                  <ProtectedMessageMedia
+                    v-if="replyContextImages.get(message.id)?.isCurrent()"
+                    :key="replyContextImages.get(message.id)?.key"
+                    :organization-id="contactsStore.messagesOrganizationScope"
+                    :message="{ id: message.id, message_type: 'image', content: {} }"
+                    :scoped-source="replyContextImages.get(message.id)"
+                    thumbnail
+                  />
                 </div>
+                <p
+                  v-else-if="message.reply_context_unavailable && contactsStore.ownsReplyContext(message)"
+                  class="reply-preview text-xs"
+                >
+                  {{ $t('chat.replyContextUnavailable') }}
+                </p>
                 <!-- Template header, image, sticker, video, audio and document media,
                      fetched from the workspace the transcript was requested from. -->
                 <ProtectedMessageMedia

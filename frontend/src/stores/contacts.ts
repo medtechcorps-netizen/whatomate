@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { ref, computed, watch } from 'vue'
+import { ref, computed, toRaw, watch } from 'vue'
 import {
   contactsService,
   messagesService,
@@ -7,8 +7,10 @@ import {
 } from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
 import { useOrganizationsStore } from '@/stores/organizations'
+import { readWorkspaceIdentity } from '@/composables/useChatAttachments'
 import { compareMessageIngestionOrder } from '@/lib/messageOrdering'
 import { readSelectedOrganizationId } from '@/lib/browserIdentity'
+import { currentTabSession, isTabSessionCurrent } from '@/lib/tabSession'
 
 // Phones are stored without leading + or whitespace (see CreateContact in
 // internal/handlers/contacts.go). Strip them from a digit-only query so a user
@@ -79,12 +81,16 @@ export function contactListFilterParams(
 }
 
 const CONTACT_UPDATE_REFRESH_DELAY_MS = 250
+const QUOTE_REFRESH_DELAY_MS = 150
+const QUOTE_REFRESH_BATCH_SIZE = 50
 
 export interface ReplyPreview {
   id: string
   content: any
   message_type: string
   direction: 'incoming' | 'outgoing'
+  scoped_context?: true
+  image_revision?: string
 }
 
 export interface Reaction {
@@ -120,9 +126,12 @@ export interface Message {
   wamid?: string
   error_message?: string
   is_reply?: boolean
+  quote_pending?: boolean
   is_forwarded?: boolean
   reply_to_message_id?: string
   reply_to_message?: ReplyPreview
+  reply_context_unavailable?: boolean
+  bookmark_unavailable?: boolean
   reactions?: Reaction[]
   whatsapp_account?: string
   ingested_at?: string
@@ -147,6 +156,7 @@ export const useContactsStore = defineStore('contacts', () => {
   const selectedTags = ref<string[]>([])
   const replyingTo = ref<Message | null>(null)
   const accountFilter = ref<string | null>(null)
+  const transcriptAccountFilter = computed(() => accountFilter.value)
   const listFilter = ref<ContactListFilter>('all')
   let contactUpdateRefreshHandle: ReturnType<typeof setTimeout> | null = null
   const pendingContactUpdates = new Set<string>()
@@ -168,6 +178,87 @@ export const useContactsStore = defineStore('contacts', () => {
     // session's own workspace.
     return readSelectedOrganizationId() || authStore.organizationId || ''
   }
+
+  type ReplyContextOwner = { organizationId: string; isCurrent: () => boolean }
+  const replyContextEpoch = ref(0)
+  const replyContextIdentity = computed(() => JSON.stringify([
+    authStore.isAuthenticated, authStore.user?.id, authStore.organizationId, activeOrganizationScope.value,
+    authStore.user?.role?.id ?? authStore.user?.role_id, authStore.user?.is_super_admin,
+    authStore.hasPermission('chat', 'read'), authStore.hasPermission('contacts', 'read'),
+  ]))
+  const replyContextProofs = new WeakMap<Message, {
+    owner: ReplyContextOwner
+    descriptor: string
+    quote: ReplyPreview | undefined
+  }>()
+  // A websocket or locally merged row can reuse a message ID without carrying
+  // the authenticated quote projection for that row.
+  const transcriptRows = computed(() => new Set(messages.value.map(message => toRaw(message))))
+
+  function retireReplyContexts() {
+    replyContextEpoch.value++
+  }
+
+  watch(replyContextIdentity, () => {
+    retireReplyContexts()
+    cancelQuoteRefresh()
+  }, { flush: 'sync' })
+
+  function captureReplyContextOwner(contactId: string): ReplyContextOwner | undefined {
+    const organizationId = activeOrganizationScope.value
+    const actor = authStore.user?.id
+    const session = currentTabSession()
+    if (!organizationId || !actor || session === null || !authStore.isAuthenticated ||
+      !authStore.hasPermission('chat', 'read')) return
+    const browserIdentity = JSON.stringify([organizationId, authStore.organizationId ?? '', actor])
+    const identity = replyContextIdentity.value
+    const epoch = replyContextEpoch.value
+    const isCurrent = () => replyContextEpoch.value === epoch && replyContextIdentity.value === identity &&
+      currentContact.value?.id === contactId && messagesOrganizationScope.value === organizationId &&
+      transcriptRequestOrganizationScope() === organizationId &&
+      readWorkspaceIdentity(authStore.organizationId, authStore.user?.id) === browserIdentity &&
+      isTabSessionCurrent() && currentTabSession() === session
+    if (isCurrent()) return { organizationId, isCurrent }
+  }
+
+  function replyContextDescriptor(message: Message): string | undefined {
+    const { id, contact_id, whatsapp_account, is_reply, reply_to_message_id, reply_to_message: quote } = message
+    if (!id || !contact_id || typeof whatsapp_account !== 'string' || !whatsapp_account.trim() ||
+      message.bookmark_unavailable) return
+    if (message.reply_context_unavailable === true) {
+      if (!quote) return JSON.stringify([id, contact_id, whatsapp_account, 'unavailable'])
+      return
+    }
+    if (is_reply !== true || quote?.scoped_context !== true || typeof quote.id !== 'string' || !quote.id ||
+      quote.id !== reply_to_message_id ||
+      (quote.message_type !== 'image' && quote.message_type !== 'text') ||
+      (quote.direction !== 'incoming' && quote.direction !== 'outgoing') ||
+      typeof quote.content?.body !== 'string' ||
+      (quote.image_revision !== undefined && typeof quote.image_revision !== 'string')) return
+    return JSON.stringify([id, contact_id, whatsapp_account, quote.id, quote.message_type,
+      quote.direction, quote.content.body, quote.image_revision])
+  }
+
+  function acceptReplyContexts(rows: Message[], owner: ReplyContextOwner | undefined, contactId: string, account?: string | null) {
+    if (!owner?.isCurrent()) return
+    for (const message of rows) {
+      if (message.contact_id !== contactId || (account && message.whatsapp_account !== account)) continue
+      const descriptor = replyContextDescriptor(message)
+      if (!descriptor) continue
+      const quote = message.reply_to_message
+      replyContextProofs.set(toRaw(message), { owner, descriptor, quote: quote && toRaw(quote) })
+    }
+  }
+
+  function ownsReplyContext(message: Message): boolean {
+    const row = toRaw(message)
+    const proof = replyContextProofs.get(row)
+    const quote = message.reply_to_message
+    return !!proof && proof.owner.isCurrent() && transcriptRows.value.has(row) &&
+      (!accountFilter.value || message.whatsapp_account === accountFilter.value) &&
+      proof.quote === (quote && toRaw(quote)) && proof.descriptor === replyContextDescriptor(message)
+  }
+
   let identityGeneration = 0
   let contactLoadGeneration = 0
   let contactLoadAbortController: AbortController | null = null
@@ -176,6 +267,11 @@ export const useContactsStore = defineStore('contacts', () => {
   let messageLoadGeneration = 0
   let messageLoadAbortController: AbortController | null = null
   let messageRefreshQueued = false
+  let quoteRefreshGeneration = 0
+  let quoteRefreshController: AbortController | null = null
+  let quoteRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  let quoteRefreshCursor = 0
+  const quoteRefreshAccounts = new Set<string>()
   let olderMessageLoadGeneration = 0
   let olderMessageLoadAbortController: AbortController | null = null
   let searchDebounceHandle: ReturnType<typeof setTimeout> | null = null
@@ -224,6 +320,8 @@ export const useContactsStore = defineStore('contacts', () => {
   }
 
   function resetForIdentityChange() {
+    retireReplyContexts()
+    cancelQuoteRefresh()
     identityGeneration++
     contactSelectionGeneration++
     contactLoadGeneration++
@@ -467,6 +565,9 @@ export const useContactsStore = defineStore('contacts', () => {
     const identity = identityGeneration
     const organizationScope = activeOrganizationScope.value
     messageLoadAbortController?.abort()
+    // Let the canonical response establish the current quote state first.
+    quoteRefreshController?.abort()
+    quoteRefreshController = null
     const controller = new AbortController()
     messageLoadAbortController = controller
     if (!preserveExisting) {
@@ -475,16 +576,21 @@ export const useContactsStore = defineStore('contacts', () => {
       messages.value = []
       messagesOrganizationScope.value = transcriptRequestOrganizationScope()
     }
+    const replyOwner = captureReplyContextOwner(contactId)
     try {
-      const response = await messagesService.list(contactId, params, controller.signal)
+      const response = await (replyOwner
+        ? messagesService.list(contactId, params, controller.signal, { ...replyOwner, signal: controller.signal })
+        : messagesService.list(contactId, params, controller.signal))
       if (
         loadGeneration !== messageLoadGeneration ||
         identity !== identityGeneration ||
-        organizationScope !== activeOrganizationScope.value
+        organizationScope !== activeOrganizationScope.value ||
+        (replyOwner && !replyOwner.isCurrent())
       ) return
       // API returns { status: "success", data: { messages: [...], has_more: boolean } }
       const data = response.data.data || response.data
       const fetchedMessages = data.messages || []
+      acceptReplyContexts(fetchedMessages, replyOwner, contactId, params?.account)
       if (preserveExisting) {
         // A realtime refresh returns the canonical latest page. Merge it into
         // already-loaded history so a reader who paged upward does not lose
@@ -513,6 +619,7 @@ export const useContactsStore = defineStore('contacts', () => {
           messageRefreshQueued = false
           void refreshCurrentMessages()
         }
+        scheduleQuoteRefresh()
       }
     }
   }
@@ -520,13 +627,104 @@ export const useContactsStore = defineStore('contacts', () => {
   async function refreshCurrentMessages() {
     const contactId = currentContact.value?.id
     if (!contactId) return
-    if (isLoadingMessages.value) {
+    if (messageLoadAbortController || isLoadingMessages.value) {
       messageRefreshQueued = true
       return
     }
+    const quoteGeneration = quoteRefreshGeneration
     await fetchMessages(contactId, {
       account: accountFilter.value || undefined,
     }, { preserveExisting: true })
+    if (quoteGeneration === quoteRefreshGeneration) await refreshPendingQuotes()
+  }
+
+  function cancelQuoteRefresh() {
+    quoteRefreshGeneration++
+    quoteRefreshController?.abort()
+    quoteRefreshController = null
+    if (quoteRefreshTimer !== null) clearTimeout(quoteRefreshTimer)
+    quoteRefreshTimer = null
+    quoteRefreshCursor = 0
+    quoteRefreshAccounts.clear()
+  }
+
+  function scheduleQuoteRefresh() {
+    if (quoteRefreshTimer !== null || quoteRefreshController || messageLoadAbortController ||
+      quoteRefreshAccounts.size === 0) return
+    quoteRefreshTimer = setTimeout(() => {
+      quoteRefreshTimer = null
+      if (quoteRefreshController || messageLoadAbortController) return
+      const accounts = new Set(quoteRefreshAccounts)
+      quoteRefreshAccounts.clear()
+      void refreshPendingQuotes(accounts)
+    }, QUOTE_REFRESH_DELAY_MS)
+  }
+
+  function notePossibleQuoteOriginal(account?: string) {
+    if (!account || !messages.value.some(message => message.quote_pending === true && message.whatsapp_account === account)) return
+    quoteRefreshAccounts.add(account)
+    scheduleQuoteRefresh()
+  }
+
+  async function refreshPendingQuotes(eventAccounts?: ReadonlySet<string>) {
+    if (quoteRefreshController || messageLoadAbortController || isLoadingMessages.value) return
+    const contactId = currentContact.value?.id
+    if (!contactId) return
+    const replyOwner = captureReplyContextOwner(contactId)
+    if (!replyOwner) return
+    const { organizationId } = replyOwner
+    const account = accountFilter.value
+    const generation = quoteRefreshGeneration
+
+    const eligible = [...new Set(messages.value.filter(message =>
+      message.quote_pending === true && message.contact_id === contactId &&
+      (!account || message.whatsapp_account === account) &&
+      (!eventAccounts || (!!message.whatsapp_account && eventAccounts.has(message.whatsapp_account))),
+    ).map(message => message.id))]
+    if (eligible.length === 0) return
+    const start = quoteRefreshCursor % eligible.length
+    const ids = [...eligible.slice(start), ...eligible.slice(0, start)].slice(0, QUOTE_REFRESH_BATCH_SIZE)
+    quoteRefreshCursor = start + ids.length
+    const requested = new Set(ids)
+    const requestedRows = new Set(messages.value.filter(row => requested.has(row.id)).map(row => toRaw(row)))
+
+    const controller = new AbortController()
+    quoteRefreshController = controller
+    try {
+      const response = await messagesService.quoteUpdates(contactId, ids, account, organizationId, controller.signal)
+      if (controller.signal.aborted || generation !== quoteRefreshGeneration ||
+        account !== accountFilter.value || !replyOwner.isCurrent()) return
+      const updates: { id: string; reply_to_message_id: string; reply_to_message: ReplyPreview }[] | undefined =
+        response.data.data?.quote_updates
+      if (!Array.isArray(updates)) return
+      const byId = new Map(updates.filter(update => update && requested.has(update.id) &&
+        typeof update.reply_to_message_id === 'string' && update.reply_to_message?.id === update.reply_to_message_id,
+      ).map(update => [update.id, update]))
+      if (byId.size === 0) return
+      messages.value = messages.value.map(message => {
+        const update = byId.get(message.id)
+        if (!update || message.quote_pending !== true || message.contact_id !== contactId ||
+          (account && message.whatsapp_account !== account) ||
+          !requestedRows.has(toRaw(message))) return message
+        const next = {
+          ...message,
+          quote_pending: false,
+          is_reply: true,
+          reply_to_message_id: update.reply_to_message_id,
+          reply_to_message: update.reply_to_message,
+          reply_context_unavailable: undefined,
+        }
+        acceptReplyContexts([next], replyOwner, contactId, account)
+        return next
+      })
+    } catch {
+      // The existing transcript remains usable when the optional lookup fails.
+    } finally {
+      if (quoteRefreshController === controller) {
+        quoteRefreshController = null
+        scheduleQuoteRefresh()
+      }
+    }
   }
 
   async function fetchOlderMessages(contactId: string, account?: string) {
@@ -541,22 +739,24 @@ export const useContactsStore = defineStore('contacts', () => {
     const controller = new AbortController()
     olderMessageLoadAbortController = controller
     isLoadingOlderMessages.value = true
+    const replyOwner = captureReplyContextOwner(contactId)
     try {
       // Get the oldest message ID for cursor-based pagination
       const oldestMessageId = messages.value[0].id
-      const response = await messagesService.list(
-        contactId,
-        { before_id: oldestMessageId, account },
-        controller.signal,
-      )
+      const params = { before_id: oldestMessageId, account }
+      const response = await (replyOwner
+        ? messagesService.list(contactId, params, controller.signal, { ...replyOwner, signal: controller.signal })
+        : messagesService.list(contactId, params, controller.signal))
       if (
         loadGeneration !== olderMessageLoadGeneration ||
         identity !== identityGeneration ||
         organizationScope !== activeOrganizationScope.value ||
-        currentContact.value?.id !== contactId
+        currentContact.value?.id !== contactId ||
+        (replyOwner && !replyOwner.isCurrent())
       ) return
       const data = response.data.data || response.data
       const olderMessages = data.messages || []
+      acceptReplyContexts(olderMessages, replyOwner, contactId, account)
 
       if (olderMessages.length > 0) {
         // Prepend older messages (they come in chronological order, oldest first)
@@ -724,6 +924,7 @@ export const useContactsStore = defineStore('contacts', () => {
     if (index === -1) {
       messages.value.push(message)
       messages.value.sort(compareMessageIngestionOrder)
+      if (message.wamid) notePossibleQuoteOriginal(message.whatsapp_account)
       return
     }
     // The socket copy can arrive before the send response. Keep its fields
@@ -744,16 +945,22 @@ export const useContactsStore = defineStore('contacts', () => {
   function updateMessageStatus(messageId: string, status: string, errorMessage?: string) {
     const index = messages.value.findIndex(m => m.id === messageId)
     if (index !== -1) {
+      const prior = messages.value[index]
       messages.value[index] = {
-        ...messages.value[index],
+        ...prior,
         status,
         ...(errorMessage ? { error_message: errorMessage } : {})
+      }
+      if (prior.direction === 'outgoing' && prior.status === 'pending' && ['sent', 'delivered', 'read'].includes(status)) {
+        notePossibleQuoteOriginal(prior.whatsapp_account)
       }
     }
   }
 
   function setCurrentContact(contact: Contact | null) {
     if (currentContact.value?.id !== contact?.id) {
+      retireReplyContexts()
+      cancelQuoteRefresh()
       contactSelectionGeneration++
       // Invalidate a slower message request for the previous contact before it
       // can replace the active conversation's messages.
@@ -775,10 +982,16 @@ export const useContactsStore = defineStore('contacts', () => {
   }
 
   function setAccountFilter(account: string | null) {
+    if (accountFilter.value !== account) {
+      retireReplyContexts()
+      cancelQuoteRefresh()
+    }
     accountFilter.value = account
   }
 
   function clearMessages() {
+    retireReplyContexts()
+    cancelQuoteRefresh()
     messageLoadGeneration++
     olderMessageLoadGeneration++
     messageLoadAbortController?.abort()
@@ -960,6 +1173,9 @@ export const useContactsStore = defineStore('contacts', () => {
     currentContact,
     messages,
     messagesOrganizationScope,
+    transcriptAccountFilter,
+    ownsReplyContext,
+    retireReplyContexts,
     isLoading,
     contactListError,
     retryContactList,

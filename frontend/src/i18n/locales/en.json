@@ -614,6 +614,9 @@
     "mediaFailedDesc": "Please try again",
     "mediaLoading": "Loading attachment",
     "mediaLoadFailed": "Could not load attachment",
+    "replyContextUnavailable": "Original message unavailable",
+    "attachmentUnavailable": "Attachment unavailable",
+    "jumpToReply": "Jump to message",
     "playVideo": "Play video",
     "playAudio": "Play audio",
     "mediaPreview": {

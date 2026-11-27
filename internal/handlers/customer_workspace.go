@@ -594,7 +594,11 @@ func (a *App) customerConversationScope(
 	if !settings.AgentAssignment.CurrentConversationOnly {
 		return false, nil, nil
 	}
+	cutoff, err := a.customerConversationCutoff(orgID, userID, contactIDs)
+	return true, cutoff, err
+}
 
+func (a *App) customerConversationCutoff(orgID, userID uuid.UUID, contactIDs []uuid.UUID) (*time.Time, error) {
 	var cutoff *time.Time
 	var session models.ChatbotSession
 	sessionErr := a.DB.Where(
@@ -606,7 +610,7 @@ func (a *App) customerConversationScope(
 		startedAt := session.StartedAt.UTC()
 		cutoff = &startedAt
 	} else if !errors.Is(sessionErr, gorm.ErrRecordNotFound) {
-		return true, nil, sessionErr
+		return nil, sessionErr
 	}
 
 	// Chatbot-disabled and manual transfers may have no session. The transfer
@@ -626,10 +630,10 @@ func (a *App) customerConversationScope(
 			cutoff = &transferredAt
 		}
 	} else if !errors.Is(transferErr, gorm.ErrRecordNotFound) {
-		return true, nil, transferErr
+		return nil, transferErr
 	}
 
-	return true, cutoff, nil
+	return cutoff, nil
 }
 
 // ListCustomerActivities returns the append-only activity stream only. The

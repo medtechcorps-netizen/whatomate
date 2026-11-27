@@ -2398,6 +2398,107 @@ export const dataService = {
 // A chat media download that receives no bytes for this long is abandoned.
 export const MEDIA_STALL_TIMEOUT_MS = 30000;
 
+interface ConversationMessageScope {
+  organizationId: string;
+  signal: AbortSignal;
+  isCurrent: () => boolean;
+}
+
+function conversationMessageConfig(scope: ConversationMessageScope): AxiosRequestConfig & { skipAuthRefresh: true } {
+  const transport = axios.getAdapter(api.defaults.adapter);
+  return {
+    headers: { "X-Organization-ID": scope.organizationId },
+    signal: scope.signal,
+    timeout: 10_000,
+    skipAuthRefresh: true,
+    adapter: async request => {
+      if (scope.signal.aborted || !scope.isCurrent()) throw new axios.CanceledError();
+      return transport(request);
+    },
+  };
+}
+
+export function getProtectedMediaBlob(
+  mediaPath: string,
+  organizationId: string,
+  options: {
+    signal?: AbortSignal;
+    onProgress?: (loaded: number, total: number | undefined) => void;
+    initialTimeoutMs?: number;
+  } = {},
+  transport?: Pick<AuthAwareRequestConfig, "adapter" | "params" | "skipAuthRefresh">,
+) {
+  const explicitOrganizationId = organizationId.trim();
+  if (!explicitOrganizationId) {
+    throw new Error("Organization is required to load chat media");
+  }
+  const { signal, onProgress, initialTimeoutMs = MEDIA_STALL_TIMEOUT_MS } = options;
+  // Valid attachments on a slow link may take minutes. Fail when progress
+  // stops, with a separate initial wait for routes that prepare the response.
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) forwardAbort();
+  else signal?.addEventListener("abort", forwardAbort, { once: true });
+  let stalled = false;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const restartWatchdog = (delay = MEDIA_STALL_TIMEOUT_MS) => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      stalled = true;
+      controller.abort();
+    }, delay);
+  };
+  restartWatchdog(initialTimeoutMs);
+  const config: AxiosRequestConfig & { skipAuthRefresh?: boolean } = {
+    ...transport,
+    responseType: "blob",
+    timeout: 0,
+    headers: { "X-Organization-ID": explicitOrganizationId },
+    signal: controller.signal,
+    onDownloadProgress: (event) => {
+      restartWatchdog();
+      onProgress?.(event.loaded, event.total);
+    },
+  };
+  return api
+    .get<Blob>(mediaPath, config)
+    .catch((error: unknown) => {
+      if (stalled) throw new Error("Chat media download stalled");
+      throw error;
+    })
+    .finally(() => {
+      clearTimeout(watchdog);
+      signal?.removeEventListener("abort", forwardAbort);
+    });
+}
+
+export async function getReplyContextMediaBlob(
+  path: string,
+  params: { revision: string; account?: string },
+  scope: ConversationMessageScope,
+  onProgress?: (loaded: number, total?: number) => void,
+): Promise<Blob> {
+  const checkScope = () => {
+    if (scope.signal.aborted || !scope.isCurrent()) throw new axios.CanceledError();
+  };
+  checkScope();
+  const { adapter, skipAuthRefresh } = conversationMessageConfig(scope);
+  const response = await getProtectedMediaBlob(
+    path,
+    scope.organizationId,
+    {
+      signal: scope.signal,
+      onProgress: (loaded, total) => {
+        if (scope.isCurrent()) onProgress?.(loaded, total);
+      },
+    },
+    { adapter, skipAuthRefresh, params },
+  );
+  checkScope();
+  return response.data;
+}
+
+
 export const messagesService = {
   list: (
     contactId: string,
@@ -2408,13 +2509,35 @@ export const messagesService = {
       account?: string;
     },
     signal?: AbortSignal,
-  ) => api.get(`/contacts/${contactId}/messages`, {
-    // The legacy endpoint historically marked the whole contact read on GET.
-    // The current Chat UI owns an exact visible-message cursor instead, so
-    // every transcript fetch must remain side-effect free.
-    params: { ...params, acknowledge: false },
-    signal,
-  }),
+    replyScope?: ConversationMessageScope,
+  ) => {
+    const scopeConfig = replyScope ? conversationMessageConfig(replyScope) : undefined;
+    return api.get(`/contacts/${contactId}/messages`, {
+      // The legacy endpoint historically marked the whole contact read on GET.
+      // The current Chat UI owns an exact visible-message cursor instead, so
+      // every transcript fetch must remain side-effect free.
+      params: { ...params, acknowledge: false },
+      signal,
+      headers: scopeConfig?.headers,
+      adapter: scopeConfig?.adapter,
+    });
+  },
+  quoteUpdates: (
+    contactId: string,
+    ids: string[],
+    account: string | null,
+    organizationId: string,
+    signal: AbortSignal,
+  ) => {
+    const config: AxiosRequestConfig & { skipAuthRefresh: boolean } = {
+      headers: { "X-Organization-ID": organizationId },
+      params: { quote_ids: ids.join(","), account: account || undefined, acknowledge: false },
+      signal,
+      timeout: 5000,
+      skipAuthRefresh: true,
+    };
+    return api.get(`/contacts/${contactId}/messages`, config);
+  },
   send: (
     contactId: string,
     data: {
@@ -2526,6 +2649,17 @@ export const messagesService = {
         options.onUploadProgress?.(event.loaded, event.total),
     });
   },
+  getReplyContextMedia: (
+    contactId: string,
+    messageId: string,
+    account: string,
+    revision: string,
+    scope: ConversationMessageScope,
+    onProgress?: (loaded: number, total?: number) => void,
+  ) => getReplyContextMediaBlob(
+    `/contacts/${encodeURIComponent(contactId)}/messages/${encodeURIComponent(messageId)}/reply-context-media`,
+    { account, revision }, scope, onProgress,
+  ),
   // Native <img>/<video>/<audio>/<a> requests carry the auth cookie but not the
   // X-Organization-ID header, so the server would resolve them against the
   // login (default) workspace. Chat media is fetched through this client
@@ -2537,49 +2671,7 @@ export const messagesService = {
       signal?: AbortSignal;
       onProgress?: (loaded: number, total: number | undefined) => void;
     } = {},
-  ) => {
-    const explicitOrganizationId = organizationId.trim();
-    if (!explicitOrganizationId) {
-      throw new Error("Organization is required to load chat media");
-    }
-    const { signal, onProgress } = options;
-    // WhatsApp media can be up to 16 MB, which takes minutes on a slow link,
-    // so a download fails only when it stops making progress rather than
-    // after a fixed total time.
-    const controller = new AbortController();
-    const forwardAbort = () => controller.abort(signal?.reason);
-    if (signal?.aborted) forwardAbort();
-    else signal?.addEventListener("abort", forwardAbort, { once: true });
-    let stalled = false;
-    let watchdog: ReturnType<typeof setTimeout> | undefined;
-    const restartWatchdog = () => {
-      clearTimeout(watchdog);
-      watchdog = setTimeout(() => {
-        stalled = true;
-        controller.abort();
-      }, MEDIA_STALL_TIMEOUT_MS);
-    };
-    restartWatchdog();
-    return api
-      .get<Blob>(`/media/${encodeURIComponent(messageId)}`, {
-        responseType: "blob",
-        timeout: 0,
-        headers: { "X-Organization-ID": explicitOrganizationId },
-        signal: controller.signal,
-        onDownloadProgress: (event) => {
-          restartWatchdog();
-          onProgress?.(event.loaded, event.total);
-        },
-      })
-      .catch((error: unknown) => {
-        if (stalled) throw new Error("Chat media download stalled");
-        throw error;
-      })
-      .finally(() => {
-        clearTimeout(watchdog);
-        signal?.removeEventListener("abort", forwardAbort);
-      });
-  },
+  ) => getProtectedMediaBlob(`/media/${encodeURIComponent(messageId)}`, organizationId, options),
 };
 
 export const templatesService = {
