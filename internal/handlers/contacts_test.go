@@ -18,6 +18,204 @@ import (
 
 // --- ListContacts Tests ---
 
+func TestListContactsLatestForwardActivity(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	adminRole := testutil.CreateAdminRole(t, app.DB, org.ID)
+	user := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&adminRole.ID))
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	older := testutil.CreateTestContact(t, app.DB, org.ID)
+	otherOrg := testutil.CreateTestOrganization(t, app.DB)
+	other := testutil.CreateTestContact(t, app.DB, otherOrg.ID)
+
+	at := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	summaryAt := at.Add(2 * time.Hour)
+	const cached = "Imported summary"
+	updateSummary := func(t *testing.T, text string, stamp *time.Time) {
+		t.Helper()
+		require.NoError(t, app.DB.Model(contact).Updates(map[string]any{"last_message_at": stamp, "last_message_preview": text}).Error)
+	}
+	updateSummary(t, cached, &summaryAt)
+	require.NoError(t, app.DB.Model(older).Updates(map[string]any{"last_message_at": at.Add(-time.Hour), "last_message_preview": "Older summary"}).Error)
+
+	type listData struct {
+		Contacts []handlers.ContactResponse
+		Total    int64
+		Page     int
+		Limit    int
+	}
+	list := func(t *testing.T, viewer uuid.UUID, include bool, page, limit int) listData {
+		t.Helper()
+		req := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(req, org.ID, viewer)
+		if include {
+			testutil.SetQueryParam(req, "include_forward_activity", "true")
+		}
+		testutil.SetQueryParam(req, "page", page)
+		testutil.SetQueryParam(req, "limit", limit)
+		require.NoError(t, app.ListContacts(req))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+		var response struct{ Data listData }
+		require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+		return response.Data
+	}
+	row := func(t *testing.T, viewer uuid.UUID, include bool) handlers.ContactResponse {
+		t.Helper()
+		for _, c := range list(t, viewer, include, 1, 20).Contacts {
+			if c.ID == contact.ID {
+				return c
+			}
+		}
+		t.Fatal("test contact missing")
+		return handlers.ContactResponse{}
+	}
+	check := func(t *testing.T, preview string, stamp *time.Time, state string, recordedAt time.Time) {
+		t.Helper()
+		c := row(t, user.ID, true)
+		require.Equal(t, preview, c.LastMessagePreview)
+		if stamp == nil {
+			require.Nil(t, c.LastMessageAt)
+		} else {
+			require.NotNil(t, c.LastMessageAt)
+			require.True(t, stamp.Equal(*c.LastMessageAt))
+		}
+		if state == "" {
+			require.Nil(t, c.LatestForwardActivity)
+		} else {
+			require.NotNil(t, c.LatestForwardActivity)
+			require.Equal(t, state, c.LatestForwardActivity.State)
+			require.True(t, recordedAt.Equal(c.LatestForwardActivity.RecordedAt))
+		}
+	}
+	provenance := models.JSONB{"forwarded_from": map[string]any{"message_id": uuid.NewString()}}
+	foreign := createTestMessage(t, app, otherOrg.ID, other.ID, models.DirectionOutgoing, at)
+	require.NoError(t, app.DB.Model(foreign).Updates(map[string]any{"metadata": provenance, "status": models.MessageStatusFailed}).Error)
+
+	t.Run("summary without a message", func(t *testing.T) {
+		check(t, cached, &summaryAt, "", time.Time{})
+	})
+
+	forward := createTestMessage(t, app, org.ID, contact.ID, models.DirectionOutgoing, at)
+	require.NoError(t, app.DB.Model(forward).Updates(map[string]any{"ingested_at": at, "status": models.MessageStatusFailed, "metadata": models.JSONB{"forwarded_from": nil}}).Error)
+	t.Run("ordinary failed outgoing", func(t *testing.T) {
+		check(t, cached, &summaryAt, "", time.Time{})
+	})
+	for _, tc := range []struct {
+		status       models.MessageStatus
+		phase, state string
+	}{
+		{models.MessageStatusPending, "queued", "unconfirmed"},
+		{models.MessageStatusPending, "provider", "unconfirmed"},
+		{models.MessageStatusFailed, "provider", "failed"},
+		{models.MessageStatus("unknown"), "provider", "unconfirmed"},
+		{models.MessageStatusSent, "provider", ""},
+		{models.MessageStatusDelivered, "provider", ""},
+		{models.MessageStatusRead, "provider", ""},
+	} {
+		t.Run(string(tc.status)+"/"+tc.phase, func(t *testing.T) {
+			require.NoError(t, app.DB.Model(forward).Updates(map[string]any{
+				"status": tc.status, "metadata": models.JSONB{"forwarded_from": provenance["forwarded_from"], "forward_dispatch": tc.phase},
+			}).Error)
+			check(t, cached, &summaryAt, tc.state, at)
+		})
+	}
+	require.NoError(t, app.DB.Model(forward).Update("status", models.MessageStatusFailed).Error)
+
+	t.Run("blank summary and no timestamp", func(t *testing.T) {
+		updateSummary(t, "", nil)
+		t.Cleanup(func() { updateSummary(t, cached, &summaryAt) })
+		check(t, "", nil, "failed", at)
+	})
+	t.Run("manual summary with identical text and timestamp", func(t *testing.T) {
+		updateSummary(t, forward.Content, &at)
+		t.Cleanup(func() { updateSummary(t, cached, &summaryAt) })
+		check(t, forward.Content, &at, "failed", at)
+	})
+	t.Run("two pages and legacy caller", func(t *testing.T) {
+		for _, include := range []bool{false, true} {
+			for i, id := range []uuid.UUID{contact.ID, older.ID} {
+				data := list(t, user.ID, include, i+1, 1)
+				require.EqualValues(t, 2, data.Total)
+				require.Equal(t, i+1, data.Page)
+				require.Equal(t, 1, data.Limit)
+				require.Len(t, data.Contacts, 1)
+				c := data.Contacts[0]
+				require.Equal(t, id, c.ID)
+				if i == 0 && include {
+					require.NotNil(t, c.LatestForwardActivity)
+				} else {
+					require.Nil(t, c.LatestForwardActivity)
+				}
+			}
+		}
+	})
+	t.Run("contacts reader without chat history permission", func(t *testing.T) {
+		role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "directory-only", []string{models.ResourceContacts + ":" + models.ActionRead})
+		viewer := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+		c := row(t, viewer.ID, true)
+		require.Equal(t, cached, c.LastMessagePreview)
+		require.Nil(t, c.LatestForwardActivity)
+	})
+	t.Run("assigned chat reader with current conversation cutoff", func(t *testing.T) {
+		role := testutil.CreateTestRoleWithKeys(t, app.DB, org.ID, "assigned-chat-only", []string{models.ResourceChat + ":" + models.ActionRead})
+		viewer := testutil.CreateTestUser(t, app.DB, org.ID, testutil.WithRoleID(&role.ID))
+		require.NoError(t, app.DB.Create(&models.ChatbotSettings{
+			OrganizationID: org.ID, AgentAssignment: models.AgentAssignmentConfig{CurrentConversationOnly: true},
+		}).Error)
+		createTestAgentTransfer(t, app, org.ID, contact.ID, &viewer.ID, models.TransferStatusActive, models.TransferSourceManual, summaryAt, nil)
+		history := testutil.NewGETRequest(t)
+		testutil.SetAuthContext(history, org.ID, viewer.ID)
+		testutil.SetPathParam(history, "id", contact.ID.String())
+		testutil.SetQueryParam(history, "acknowledge", "false")
+		require.NoError(t, app.GetMessages(history))
+		require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(history))
+		var historyResponse struct {
+			Data struct {
+				Messages []handlers.MessageResponse
+				Total    int64
+			}
+		}
+		require.NoError(t, json.Unmarshal(testutil.GetResponseBody(history), &historyResponse))
+		require.Empty(t, historyResponse.Data.Messages)
+		require.Zero(t, historyResponse.Data.Total)
+		data := list(t, viewer.ID, true, 1, 20)
+		require.EqualValues(t, 1, data.Total)
+		require.Len(t, data.Contacts, 1)
+		c := data.Contacts[0]
+		require.Equal(t, contact.ID, c.ID)
+		require.Equal(t, cached, c.LastMessagePreview)
+		require.Nil(t, c.LatestForwardActivity)
+	})
+	t.Run("ordinary newer message and deletion", func(t *testing.T) {
+		newer := createTestMessage(t, app, org.ID, contact.ID, models.DirectionIncoming, summaryAt)
+		require.NoError(t, app.DB.Model(newer).Updates(map[string]any{"ingested_at": summaryAt, "content": cached, "metadata": provenance}).Error)
+		check(t, cached, &summaryAt, "", time.Time{})
+		// The newer summary is still visible even when the history row that
+		// produced it is gone. The surviving forward has its own earlier time.
+		require.NoError(t, app.DB.Delete(newer).Error)
+		check(t, cached, &summaryAt, "failed", at)
+	})
+	t.Run("equal ingestion dates use the history ID tie breaker", func(t *testing.T) {
+		sameDate := createTestMessage(t, app, org.ID, contact.ID, models.DirectionOutgoing, at)
+		defer func() { require.NoError(t, app.DB.Delete(sameDate).Error) }()
+		high, low := sameDate, forward
+		if high.ID.String() < low.ID.String() {
+			high, low = low, high
+		}
+		// Make the larger ID the legacy row. Both effective dates now match.
+		require.NoError(t, app.DB.Model(high).Updates(map[string]any{"ingested_at": nil, "status": models.MessageStatusPending, "metadata": provenance}).Error)
+		require.NoError(t, app.DB.Model(low).Updates(map[string]any{"ingested_at": at, "status": models.MessageStatusFailed, "metadata": provenance}).Error)
+		check(t, cached, &summaryAt, "unconfirmed", at)
+		// A later ingestion wins even with the same occurrence date.
+		require.NoError(t, app.DB.Model(low).Update("ingested_at", at.Add(time.Minute)).Error)
+		check(t, cached, &summaryAt, "failed", at)
+	})
+	t.Run("deleted forward without surviving history", func(t *testing.T) {
+		require.NoError(t, app.DB.Delete(forward).Error)
+		check(t, cached, &summaryAt, "", time.Time{})
+	})
+}
+
 func TestApp_ListContacts(t *testing.T) {
 	t.Parallel()
 

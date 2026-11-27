@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"testing"
 
 	"github.com/google/uuid"
@@ -21,6 +22,43 @@ func tenantAdmissionTestApp(dbConfig config.DatabaseConfig, t *testing.T) *App {
 		DB:     testutil.SetupTestDB(t),
 		Log:    testutil.NopLogger(),
 		Config: &config.Config{Database: dbConfig},
+	}
+}
+
+func TestTenantAdmissionPreservesSessionDuringPurposeLookupFailure(t *testing.T) {
+	base := tenantAdmissionTestApp(config.DatabaseConfig{}, t)
+	ordinary := testutil.CreateTestOrganization(t, base.DB)
+	for _, rlsEnabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "rls_disabled", true: "rls_enabled"}[rlsEnabled], func(t *testing.T) {
+			app := &App{DB: base.DB, Log: base.Log, Config: &config.Config{Database: config.DatabaseConfig{RLSEnabled: rlsEnabled}}}
+			calls := 0
+			route := app.Tenant(func(*App, *fastglue.Request) error { calls++; return nil })
+			request := func(org any) *fastglue.Request {
+				r := testutil.NewGETRequest(t)
+				if org != nil {
+					r.RequestCtx.SetUserValue("organization_id", org)
+				}
+				require.NoError(t, route(r))
+				return r
+			}
+
+			unavailable, cancel := context.WithCancel(context.Background())
+			cancel()
+			app.DB = base.DB.WithContext(unavailable)
+			outage := request(ordinary.ID)
+			require.Equal(t, fasthttp.StatusServiceUnavailable, testutil.GetResponseStatusCode(outage))
+			require.Empty(t, outage.RequestCtx.Response.Header.Peek("Set-Cookie"))
+			require.NotContains(t, string(testutil.GetResponseBody(outage)), "context canceled")
+			require.Zero(t, calls)
+
+			app.DB = base.DB
+			for _, denied := range []any{nil, "malformed", 42, uuid.Nil, uuid.New()} {
+				require.Equal(t, fasthttp.StatusUnauthorized, testutil.GetResponseStatusCode(request(denied)))
+			}
+			require.Zero(t, calls)
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(request(ordinary.ID)))
+			require.Equal(t, 1, calls)
+		})
 	}
 }
 

@@ -33,6 +33,8 @@ import (
 // authority evidence. Query failures must not revoke or issue a session.
 func organizationAccessDenied(err error) bool {
 	return errors.Is(err, gorm.ErrRecordNotFound) ||
+		errors.Is(err, errExplicitOrganizationUnavailable) ||
+		errors.Is(err, invalidUserContext{}) ||
 		errors.Is(err, database.ErrPlatformComplianceTenant) ||
 		errors.Is(err, database.ErrPlatformComplianceMarkerInvalid) ||
 		errors.Is(err, database.ErrMissingTenant)
@@ -199,7 +201,7 @@ func (a *App) getOrgID(r *fastglue.Request) (uuid.UUID, error) {
 	var defaultOrgID uuid.UUID
 	orgIDVal := r.RequestCtx.UserValue("organization_id")
 	if orgIDVal == nil {
-		return uuid.Nil, errors.New("organization_id not found in context")
+		return uuid.Nil, database.ErrMissingTenant
 	}
 	switch v := orgIDVal.(type) {
 	case uuid.UUID:
@@ -207,28 +209,42 @@ func (a *App) getOrgID(r *fastglue.Request) (uuid.UUID, error) {
 	case string:
 		parsed, err := uuid.Parse(v)
 		if err != nil {
-			return uuid.Nil, errors.New("organization_id is not a valid UUID")
+			return uuid.Nil, database.ErrMissingTenant
 		}
 		defaultOrgID = parsed
 	default:
-		return uuid.Nil, errors.New("organization_id is not a valid UUID")
+		return uuid.Nil, database.ErrMissingTenant
 	}
 
 	// Check for X-Organization-ID header to switch organizations
+	if a == nil || a.DB == nil {
+		return uuid.Nil, gorm.ErrInvalidDB
+	}
 	userID, _ := r.RequestCtx.UserValue("user_id").(uuid.UUID)
 	overrideOrgID := string(r.RequestCtx.Request.Header.Peek("X-Organization-ID"))
 	if overrideOrgID != "" {
 		parsedOrgID, err := uuid.Parse(overrideOrgID)
 		if err == nil && parsedOrgID != defaultOrgID {
-			if a.IsSuperAdmin(userID) {
+			perms, err := a.getUserPermissionsCached(userID)
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return uuid.Nil, err
+			}
+			if perms != nil && perms.IsSuperAdmin {
 				// Super admins can access any org
 				var count int64
-				if err := a.DB.Table("organizations").Where("id = ?", parsedOrgID).Count(&count).Error; err == nil && count > 0 {
+				if err := a.DB.Table("organizations").Where("id = ?", parsedOrgID).Count(&count).Error; err != nil {
+					return uuid.Nil, err
+				}
+				if count > 0 {
 					return a.requireAuthenticatedTenant(parsedOrgID)
 				}
 			} else {
 				// Non-super-admins can switch if they have membership
-				if _, ok := access.OrganizationMembership(a.DB, userID, parsedOrgID); ok {
+				_, active, err := access.OrganizationMembershipChecked(a.DB, userID, parsedOrgID)
+				if err != nil {
+					return uuid.Nil, err
+				}
+				if active {
 					return a.requireAuthenticatedTenant(parsedOrgID)
 				}
 			}
@@ -271,7 +287,10 @@ func (a *App) getExplicitOrgID(r *fastglue.Request) (uuid.UUID, error) {
 		return uuid.Nil, errExplicitOrganizationInvalid
 	}
 	resolved, err := a.getOrgID(r)
-	if err != nil || resolved != requested {
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if resolved != requested {
 		return uuid.Nil, errExplicitOrganizationUnavailable
 	}
 	// getOrgID proves access, but a stale membership (or a super-admin lookup
@@ -280,9 +299,8 @@ func (a *App) getExplicitOrgID(r *fastglue.Request) (uuid.UUID, error) {
 	// request or tenant write. A scoped App must retain its transaction-local
 	// tenant context for this lookup.
 	var activeOrganization models.Organization
-	if a == nil || a.DB == nil ||
-		a.DB.Select("id").Where("id = ?", requested).First(&activeOrganization).Error != nil {
-		return uuid.Nil, errExplicitOrganizationUnavailable
+	if err := a.DB.Select("id").Where("id = ?", requested).First(&activeOrganization).Error; err != nil {
+		return uuid.Nil, err
 	}
 	return requested, nil
 }
@@ -298,7 +316,7 @@ func (a *App) requireExplicitOrganization(r *fastglue.Request) (uuid.UUID, error
 	if errors.Is(err, errExplicitOrganizationRequired) || errors.Is(err, errExplicitOrganizationInvalid) {
 		_ = r.SendErrorEnvelope(fasthttp.StatusBadRequest, "X-Organization-ID must identify the selected organization", nil, "")
 	} else {
-		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+		_ = sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Selected organization is not available")
 	}
 	return uuid.Nil, errEnvelopeSent
 }
@@ -646,36 +664,49 @@ func (a *App) getOrgAndUserID(r *fastglue.Request) (orgID, userID uuid.UUID, err
 	}
 
 	userIDVal := r.RequestCtx.UserValue("user_id")
-	if userIDVal == nil {
-		return uuid.Nil, uuid.Nil, errors.New("user_id not found in context")
-	}
 	switch v := userIDVal.(type) {
 	case uuid.UUID:
 		userID = v
 	case string:
 		userID, err = uuid.Parse(v)
 		if err != nil {
-			return uuid.Nil, uuid.Nil, errors.New("user_id is not a valid UUID")
+			return uuid.Nil, uuid.Nil, invalidUserContext{}
 		}
 	default:
-		return uuid.Nil, uuid.Nil, errors.New("user_id is not a valid UUID")
+		return uuid.Nil, uuid.Nil, invalidUserContext{}
 	}
-
+	if userID == uuid.Nil {
+		return uuid.Nil, uuid.Nil, invalidUserContext{}
+	}
 	return orgID, userID, nil
 }
 
+type invalidUserContext struct{}
+
+func (invalidUserContext) Error() string {
+	return "user_id is missing or invalid in the authenticated context"
+}
+
 // requirePermission checks if the user has the required permission.
-// Returns nil if permitted, otherwise sends a 403 error envelope and returns errEnvelopeSent.
 // Automatically extracts orgID from the request for org-aware permission checks.
 func (a *App) requirePermission(r *fastglue.Request, userID uuid.UUID, resource, action string) error {
 	orgID, err := a.getOrgID(r)
 	if err != nil {
 		a.Log.Error("Failed to get organization ID for permission check", "error", err, "user_id", userID)
-		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+		_ = sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Insufficient permissions")
 		return errEnvelopeSent
 	}
-	if !a.HasPermission(userID, resource, action, orgID) {
-		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	return a.requireOrgPermission(r, userID, orgID, resource, action, "Insufficient permissions")
+}
+
+func (a *App) requireOrgPermission(r *fastglue.Request, userID, orgID uuid.UUID, resource, action, deniedMessage string) error {
+	allowed, err := a.hasPermissionChecked(userID, resource, action, orgID)
+	if err != nil {
+		_ = sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, deniedMessage)
+		return errEnvelopeSent
+	}
+	if !allowed {
+		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, deniedMessage, nil, "")
 		return errEnvelopeSent
 	}
 	return nil
@@ -683,16 +714,15 @@ func (a *App) requirePermission(r *fastglue.Request, userID uuid.UUID, resource,
 
 // requireAuth extracts the organization ID and user ID from the request and
 // verifies the user holds the given permission. On failure it writes the
-// appropriate error envelope (401 if unauthenticated, 403 if the permission is
-// missing) and returns errEnvelopeSent, so callers should `return nil` early.
+// appropriate error envelope and returns errEnvelopeSent, so callers should
+// return early before starting any protected work.
 func (a *App) requireAuth(r *fastglue.Request, resource, action string) (orgID, userID uuid.UUID, err error) {
 	orgID, userID, err = a.getOrgAndUserID(r)
 	if err != nil {
-		_ = r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		_ = sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Unauthorized")
 		return uuid.Nil, uuid.Nil, errEnvelopeSent
 	}
-	if !a.HasPermission(userID, resource, action, orgID) {
-		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	if err := a.requireOrgPermission(r, userID, orgID, resource, action, "Insufficient permissions"); err != nil {
 		return uuid.Nil, uuid.Nil, errEnvelopeSent
 	}
 	if entitlementKey, licensed := ProductEntitlementKeyForResource(resource); licensed {

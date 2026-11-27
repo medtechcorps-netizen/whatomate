@@ -58,6 +58,57 @@ func TestApp_GetAgentDetails_CrossOrgMember(t *testing.T) {
 	assert.Equal(t, int64(1), resp.Data.Agent.TransfersHandled)
 }
 
+func TestApp_GetAgentDetails_CountsConfirmedOutgoingMessages(t *testing.T) {
+	app := newTestApp(t)
+	org := testutil.CreateTestOrganization(t, app.DB)
+	viewer := createAgentAnalyticsViewer(t, app, org.ID)
+	agent := testutil.CreateTestUser(t, app.DB, org.ID)
+	contact := testutil.CreateTestContact(t, app.DB, org.ID)
+	otherContact := testutil.CreateTestContact(t, app.DB, org.ID)
+	at := time.Date(2025, time.April, 15, 12, 0, 0, 0, time.UTC)
+	createTestAgentTransfer(t, app, org.ID, contact.ID, &agent.ID, models.TransferStatusActive, models.TransferSourceManual, at.Add(-time.Hour), nil)
+
+	createTestMessage(t, app, org.ID, contact.ID, models.DirectionOutgoing, at)
+	createTestMessage(t, app, org.ID, contact.ID, models.DirectionIncoming, at)
+	createTestMessage(t, app, org.ID, otherContact.ID, models.DirectionOutgoing, at)
+	createTestMessage(t, app, org.ID, contact.ID, models.DirectionOutgoing, at.AddDate(0, -1, 0))
+	forward := createTestMessage(t, app, org.ID, contact.ID, models.DirectionOutgoing, at)
+	origin := models.JSONB{"message_id": uuid.NewString(), "contact_id": otherContact.ID.String()}
+
+	for _, tc := range []struct {
+		status   models.MessageStatus
+		dispatch string
+		want     int64
+	}{
+		{models.MessageStatusPending, "queued", 1},
+		{models.MessageStatusPending, "provider", 1},
+		{models.MessageStatusFailed, "provider", 1},
+		{models.MessageStatusSent, "provider", 2},
+		{models.MessageStatusDelivered, "provider", 2},
+		{models.MessageStatusRead, "provider", 2},
+	} {
+		t.Run(string(tc.status)+"/"+tc.dispatch, func(t *testing.T) {
+			require.NoError(t, app.DB.Model(forward).Updates(map[string]any{
+				"status": tc.status, "metadata": models.JSONB{"forwarded_from": origin, "forward_dispatch": tc.dispatch},
+			}).Error)
+			req := testutil.NewGETRequest(t)
+			testutil.SetAuthContext(req, org.ID, viewer.ID)
+			testutil.SetPathParam(req, "id", agent.ID.String())
+			req.RequestCtx.QueryArgs().Set("from", "2025-04-01")
+			req.RequestCtx.QueryArgs().Set("to", "2025-04-30")
+			require.NoError(t, app.GetAgentDetails(req))
+			require.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+			var response struct {
+				Data struct {
+					Agent handlers.AgentPerformanceStats
+				}
+			}
+			require.NoError(t, json.Unmarshal(testutil.GetResponseBody(req), &response))
+			assert.Equal(t, tc.want, response.Data.Agent.MessagesSent)
+		})
+	}
+}
+
 func TestApp_GetAgentDetails_RejectsNonMemberAndSuspendedResellerMembership(t *testing.T) {
 	app := newTestApp(t)
 	reseller := testutil.CreateTestReseller(t, app.DB)

@@ -636,6 +636,8 @@ type UserPermissions struct {
 	Permissions  []string  `json:"permissions"` // Format: "resource:action"
 }
 
+var errWorkspaceMemberWithoutRole = fmt.Errorf("workspace member has no role: %w", gorm.ErrRecordNotFound)
+
 // getUserPermissionsCached retrieves user permissions from cache or database.
 // When orgID is provided, it looks up the user's role from user_organizations for that org.
 // When orgID is not provided, it falls back to the user's default RoleID.
@@ -659,7 +661,11 @@ func (a *App) getUserPermissionsCached(userID uuid.UUID, orgIDs ...uuid.UUID) (*
 		return nil, err
 	}
 	if orgID != uuid.Nil && !user.IsSuperAdmin {
-		if _, ok := access.OrganizationMembership(a.DB, userID, orgID); !ok {
+		_, active, err := access.OrganizationMembershipChecked(a.DB, userID, orgID)
+		if err != nil {
+			return nil, err
+		}
+		if !active {
 			return nil, gorm.ErrRecordNotFound
 		}
 	}
@@ -682,6 +688,9 @@ func (a *App) getUserPermissionsCached(userID uuid.UUID, orgIDs ...uuid.UUID) (*
 		// Look up role from user_organizations for this specific org
 		var userOrg models.UserOrganization
 		err := a.DB.Where("user_id = ? AND organization_id = ?", userID, orgID).First(&userOrg).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
 		if err == nil && userOrg.RoleID != nil {
 			roleID = userOrg.RoleID
 		} else if user.IsSuperAdmin {
@@ -689,6 +698,8 @@ func (a *App) getUserPermissionsCached(userID uuid.UUID, orgIDs ...uuid.UUID) (*
 			// membership; their global role is only used for display because
 			// permission checks below grant them full access.
 			roleID = user.RoleID
+		} else if err == nil {
+			return nil, errWorkspaceMemberWithoutRole
 		} else {
 			return nil, gorm.ErrRecordNotFound
 		}
@@ -739,25 +750,31 @@ func (a *App) getUserPermissionsCached(userID uuid.UUID, orgIDs ...uuid.UUID) (*
 // Super admins have all permissions automatically.
 // Optional orgIDs parameter allows checking permissions for a specific org.
 func (a *App) HasPermission(userID uuid.UUID, resource, action string, orgIDs ...uuid.UUID) bool {
-	perms, err := a.getUserPermissionsCached(userID, orgIDs...)
+	allowed, err := a.hasPermissionChecked(userID, resource, action, orgIDs...)
 	if err != nil {
 		a.Log.Error("Failed to get user permissions", "error", err, "user_id", userID)
-		return false
 	}
+	return allowed
+}
 
+func (a *App) hasPermissionChecked(userID uuid.UUID, resource, action string, orgIDs ...uuid.UUID) (bool, error) {
+	perms, err := a.getUserPermissionsCached(userID, orgIDs...)
+	if err != nil {
+		return false, err
+	}
 	// Super admins have all permissions
 	if perms.IsSuperAdmin {
-		return true
+		return true, nil
 	}
 
 	permKey := resource + ":" + action
 	for _, p := range perms.Permissions {
 		if p == permKey {
-			return true
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // HasAnyPermission checks if a user has any of the specified permissions.

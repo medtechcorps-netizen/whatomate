@@ -42,6 +42,7 @@ type ContactResponse struct {
 	Metadata              any                                  `json:"metadata"`
 	LastMessageAt         *time.Time                           `json:"last_message_at"`
 	LastMessagePreview    string                               `json:"last_message_preview"`
+	LatestForwardActivity *ContactForwardActivity              `json:"latest_forward_activity,omitempty"`
 	UnreadCount           int                                  `json:"unread_count"`
 	ManualUnread          bool                                 `json:"manual_unread"`
 	AssignedUserID        *uuid.UUID                           `json:"assigned_user_id,omitempty"`
@@ -61,6 +62,13 @@ type ContactResponse struct {
 	WABusinessSavedNameRemoved bool      `json:"wa_business_saved_name_removed,omitempty"`
 	CreatedAt                  time.Time `json:"created_at"`
 	UpdatedAt                  time.Time `json:"updated_at"`
+}
+
+// ContactForwardActivity describes the latest visible message when it is an
+// unresolved or failed outgoing forward. It does not describe the cached summary.
+type ContactForwardActivity struct {
+	State      string    `json:"state"`
+	RecordedAt time.Time `json:"recorded_at"`
 }
 
 // MessageResponse represents a message for the frontend
@@ -609,12 +617,54 @@ func (a *App) sendWhatsAppIdentityReviewError(r *fastglue.Request, err error, op
 	}
 }
 
+// Look up one row per page contact using the same live-history index and
+// cursor tuple as GetMessages. Classify only after selecting that row:
+// a later ordinary message supersedes an older forward.
+func latestContactForwardActivity(db *gorm.DB, orgID uuid.UUID, contactIDs []uuid.UUID) (map[uuid.UUID]ContactForwardActivity, error) {
+	var rows []struct {
+		ContactID  uuid.UUID
+		State      string
+		RecordedAt time.Time
+	}
+	err := db.Raw(`SELECT c.id AS contact_id, m.created_at AS recorded_at,
+        CASE WHEN m.status = ? THEN 'failed' ELSE 'unconfirmed' END AS state
+        FROM contacts c
+        CROSS JOIN LATERAL (
+            SELECT direction, status, metadata, created_at
+            FROM messages
+            WHERE organization_id = c.organization_id AND contact_id = c.id AND deleted_at IS NULL
+            ORDER BY COALESCE(ingested_at, created_at) DESC, id DESC LIMIT 1
+        ) m
+        WHERE c.organization_id = ? AND c.id IN ? AND c.deleted_at IS NULL
+          AND m.direction = ? AND m.metadata ->> CAST(? AS text) IS NOT NULL AND COALESCE(m.status, '') NOT IN ?`,
+		models.MessageStatusFailed, orgID, contactIDs, models.DirectionOutgoing, forwardedFromMetadataKey,
+		[]models.MessageStatus{models.MessageStatusSent, models.MessageStatusDelivered, models.MessageStatusRead}).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	activity := make(map[uuid.UUID]ContactForwardActivity, len(rows))
+	for _, row := range rows {
+		activity[row.ContactID] = ContactForwardActivity{State: row.State, RecordedAt: row.RecordedAt}
+	}
+	return activity, nil
+}
+
+// A member with no workspace role can still list assigned contacts. A failed
+// permission lookup leaves the directory scope unknown and must be retried.
+func (a *App) contactListReadPermission(userID, orgID uuid.UUID, resource string) (bool, error) {
+	allowed, err := a.hasPermissionChecked(userID, resource, models.ActionRead, orgID)
+	if errors.Is(err, errWorkspaceMemberWithoutRole) {
+		return false, nil
+	}
+	return allowed, err
+}
+
 // ListContacts returns all contacts for the organization
 // Users without contacts:read permission only see contacts assigned to them
 func (a *App) ListContacts(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Unauthorized")
 	}
 
 	// Pagination
@@ -640,7 +690,13 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 
 	// Users without contacts:read permission can only see contacts assigned to them
 	// or contacts with an active chat transfer to them
-	query = a.scopeAssignedContact(query, userID, orgID)
+	canReadContacts, err := a.contactListReadPermission(userID, orgID, models.ResourceContacts)
+	if err != nil {
+		return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Insufficient permissions")
+	}
+	if !canReadContacts {
+		query = a.whereContactAssignedTo(query, userID, orgID)
+	}
 
 	// Inbox filters narrow the visible set before Count, so totals and
 	// pagination describe the filtered list.
@@ -705,14 +761,40 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list contacts", nil, "")
 	}
 
-	// Check if phone masking is enabled
-	shouldMask := a.ShouldMaskPhoneNumbers(orgID)
+	shouldMask, err := a.phoneNumberMaskSetting(orgID)
+	if err != nil {
+		a.Log.Error("Failed to load contact phone masking setting", "error", err)
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contacts are temporarily unavailable. Please retry.", nil, "contact_list_unavailable")
+	}
 
 	// Convert to response format
 	contactIDs := make([]uuid.UUID, len(contacts))
 	for i := range contacts {
 		contactIDs[i] = contacts[i].ID
 	}
+	// Only the settings directory requests this message-history detail. Assigned
+	// readers can have a conversation cutoff. Leave their original summaries intact.
+	var forwardActivity map[uuid.UUID]ContactForwardActivity
+	var canReadHistory bool
+	if canReadContacts && len(contactIDs) > 0 && string(r.RequestCtx.QueryArgs().Peek("include_forward_activity")) == "true" {
+		canReadHistory, err = a.contactListReadPermission(userID, orgID, models.ResourceChat)
+		if err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Insufficient permissions")
+		}
+	}
+	if canReadHistory {
+		pageDB, cancel := contactListDB(listDB)
+		defer cancel()
+		forwardActivity, err = latestContactForwardActivity(pageDB, orgID, contactIDs)
+		if err != nil {
+			a.Log.Error("Failed to read contact forward activity", "error", err)
+			if contactListContextFailure(pageDB, err) {
+				return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Contacts are temporarily unavailable. Please retry.", nil, "contact_list_unavailable")
+			}
+			return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to list contacts", nil, "")
+		}
+	}
+
 	effectiveStates := make(map[uuid.UUID]WhatsAppIdentityReviewEffectiveState, len(contacts))
 	if len(contactIDs) > 0 {
 		effectiveStates, err = a.GetWhatsAppIdentityReviewEffectiveStates(a.DB, orgID, contactIDs)
@@ -775,6 +857,9 @@ func (a *App) ListContacts(r *fastglue.Request) error {
 			IdentityReviewAIState: effectiveState,
 			CreatedAt:             c.CreatedAt,
 			UpdatedAt:             c.UpdatedAt,
+		}
+		if activity, found := forwardActivity[c.ID]; found {
+			response[i].LatestForwardActivity = &activity
 		}
 		applyContactNameFields(&response[i], c.Metadata, shouldMask)
 		listState.applyAssignee(&response[i], c.AssignedUserID)
@@ -2275,10 +2360,10 @@ type ButtonContent struct {
 func (a *App) SendMessage(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Unauthorized")
 	}
-	if !a.HasPermission(userID, models.ResourceChat, models.ActionWrite, orgID) {
-		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to send messages", nil, "")
+	if err := a.requireOrgPermission(r, userID, orgID, models.ResourceChat, models.ActionWrite, "You don't have permission to send messages"); err != nil {
+		return nil
 	}
 	contactID, err := parsePathUUID(r, "id", "contact")
 	if err != nil {
@@ -3015,6 +3100,23 @@ type AssignContactRequest struct {
 
 var errAssignedContactUserNotFound = errors.New("assigned contact user not found")
 
+// Keep an assignee lookup distinct from a contact that disappeared during the
+// same transaction. Preserve its cause for ordinary transaction retries.
+type contactAssigneeLookupError struct{ error }
+
+func (e contactAssigneeLookupError) Unwrap() error { return e.error }
+
+func checkContactAssignee(tx *gorm.DB, userID, orgID uuid.UUID) error {
+	_, err := lookupOrgMemberUser(tx, userID, orgID, true)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return errAssignedContactUserNotFound
+	}
+	if err != nil {
+		return contactAssigneeLookupError{err}
+	}
+	return nil
+}
+
 // AssignContact assigns a contact to a user (agent)
 // Only users with write permission can assign contacts
 func (a *App) AssignContact(r *fastglue.Request) error {
@@ -3056,8 +3158,8 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 		// user_organizations row) so a removed or deactivated member cannot be
 		// assigned and a member whose home is another organization can.
 		if req.UserID != nil {
-			if _, isMember := lookupOrgMemberUser(tx, *req.UserID, orgID, true); !isMember {
-				return errAssignedContactUserNotFound
+			if err := checkContactAssignee(tx, *req.UserID, orgID); err != nil {
+				return err
 			}
 		}
 
@@ -3105,6 +3207,10 @@ func (a *App) AssignContact(r *fastglue.Request) error {
 	if err != nil {
 		if errors.Is(err, errAssignedContactUserNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "User not found", nil, "")
+		}
+		var assigneeErr contactAssigneeLookupError
+		if errors.As(err, &assigneeErr) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Assignee membership could not be checked", nil, "")
 		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
@@ -3601,8 +3707,8 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 		if req.ClearAssignedAgent == nil || !*req.ClearAssignedAgent {
 			if req.AssignedUserID != nil {
 				// Same membership rule as AssignContact.
-				if _, isMember := lookupOrgMemberUser(tx, *req.AssignedUserID, orgID, true); !isMember {
-					return errAssignedContactUserNotFound
+				if err := checkContactAssignee(tx, *req.AssignedUserID, orgID); err != nil {
+					return err
 				}
 			}
 		}
@@ -3646,6 +3752,10 @@ func (a *App) UpdateContact(r *fastglue.Request) error {
 	if err != nil {
 		if errors.Is(err, errAssignedContactUserNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Assigned user not found", nil, "")
+		}
+		var assigneeErr contactAssigneeLookupError
+		if errors.As(err, &assigneeErr) {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Assignee membership could not be checked", nil, "")
 		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")

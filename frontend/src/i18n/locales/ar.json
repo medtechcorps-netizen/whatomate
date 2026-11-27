@@ -472,6 +472,8 @@
     "sendTemplateAction": "إرسال قالب"
   },
   "contacts": {
+    "recordedForwardFailed": "سُجلت محاولة إعادة التوجيه في {time} · فشلت المحاولة",
+    "recordedForwardUnconfirmed": "سُجلت محاولة إعادة التوجيه في {time} · لم يتأكد الإرسال",
     "title": "جهات الاتصال",
     "subtitle": "إدارة جهات الاتصال ومعلومات العملاء",
     "newContact": "جهة اتصال جديدة",

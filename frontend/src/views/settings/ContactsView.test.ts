@@ -45,7 +45,10 @@ vi.mock('vue-router', () => ({
 }))
 vi.mock('vue-i18n', async (importOriginal) => ({
   ...(await importOriginal<typeof import('vue-i18n')>()),
-  useI18n: () => ({ t: (key: string, fallback?: unknown) => (typeof fallback === 'string' ? fallback : key) }),
+  useI18n: () => ({ t: (key: string, fallback?: unknown) => {
+    if (fallback && typeof fallback === 'object' && 'time' in fallback) return key + ' ' + fallback.time
+    return typeof fallback === 'string' ? fallback : key
+  } }),
 }))
 vi.mock('vue-sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 
@@ -140,7 +143,7 @@ afterEach(() => {
   wrapper = undefined
 })
 
-describe('ContactsView phone column', () => {
+describe('ContactsView directory rows', () => {
   async function openList(contacts: ReturnType<typeof contact>[]) {
     mocks.listContacts.mockResolvedValue({ data: { data: { contacts, total: contacts.length } } })
     const view = mount(ContactsView, {
@@ -162,6 +165,25 @@ describe('ContactsView phone column', () => {
     await vi.waitFor(() => expect(view.findAll('[data-testid="contact-row"]')).toHaveLength(contacts.length))
     return view
   }
+
+  it('shows the recorded forward separately from the cached summary', async () => {
+    const recordedAt = '2026-01-01T12:00:00Z'
+    const view = await openList([
+      contact({ id: 'failed', last_message_preview: 'Imported summary', last_message_at: '2026-02-10T12:00:00Z', latest_forward_activity: { state: 'failed', recorded_at: recordedAt } }),
+      contact({ id: 'pending', last_message_preview: '', latest_forward_activity: { state: 'unconfirmed', recorded_at: recordedAt } }),
+      contact({ id: 'ordinary', last_message_preview: 'Ordinary summary' }),
+    ])
+    expect(mocks.listContacts).toHaveBeenCalledWith(expect.objectContaining({ include_forward_activity: true }))
+    const cells = view.findAll('[data-column="profile_name"]')
+    const activity = '[data-testid="latest-forward-activity"]'
+    expect(visibleText(cells[0]!)).toContain('Imported summary')
+    expect(cells[0]!.get(activity).text()).toContain('contacts.recordedForwardFailed')
+    expect(cells[0]!.get(activity).text()).toContain('Jan')
+    expect(cells[0]!.get(activity).text()).not.toContain('Imported summary')
+    expect(cells[1]!.get(activity).text()).toContain('contacts.recordedForwardUnconfirmed')
+    expect(visibleText(cells[2]!)).toContain('Ordinary summary')
+    expect(cells[2]!.find(activity).exists()).toBe(false)
+  })
 
   it('reacts to staged-review permission gain and loss without querying before the grant', async () => {
     authority.review = false
