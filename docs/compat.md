@@ -1109,3 +1109,18 @@ still proves the generated hashes and separately reviewed caps. This adds no
 seed or schema operation and grants no compatibility, staging, deployment or
 rollback authority. The unchanged-registry route and public legacy guards
 retain their existing behavior.
+
+### Quote writer inventory review
+
+The Quote writer adds six Linux-selected handler files to both
+`BackfillChatbotFlowGraph` and the migration path. Their reviewed limits are
+221 and 245 files respectively. The portable attachment fallback also forms
+part of the reviewed source. The Linux resolver includes only its Linux
+implementation in the generated inventories.
+
+The ordinary CI source check binds the complete generated documents, both
+limits, production Go sources, module graph and active database contracts.
+The exact reader and writer states must meet in a single commit. CI checks
+the first-parent history and both parents of a pull request merge, including
+intermediate topic commits. A change to the measured inputs requires a fresh
+review. The Go registry tests still recompute every closure.

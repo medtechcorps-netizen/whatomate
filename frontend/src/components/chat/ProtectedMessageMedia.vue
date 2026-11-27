@@ -1,3 +1,11 @@
+<script lang="ts">
+export interface ScopedMessageMediaSource {
+  key: string
+  isCurrent: () => boolean
+  load: (options: { signal: AbortSignal; onProgress: (loaded: number, total?: number) => void }) => Promise<Blob>
+}
+</script>
+
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -24,6 +32,8 @@ const props = defineProps<{
   organizationId: string
   message: Pick<Message, 'id' | 'message_type' | 'media_url' | 'media_mime_type' | 'media_filename' | 'content'> &
     Partial<Pick<Message, 'status' | 'direction'>>
+  scopedSource?: ScopedMessageMediaSource
+  thumbnail?: boolean
 }>()
 
 const { t } = useI18n()
@@ -142,13 +152,29 @@ function releaseMedia() {
   documentPreview.value = null
 }
 
+function hasCurrentScope() {
+  return props.scopedSource?.isCurrent() ?? true
+}
+
+function canUseLoadedMedia() {
+  if (hasCurrentScope()) return true
+  releaseMedia()
+  status.value = 'error'
+  return false
+}
+
+function guardDownload(event: MouseEvent) {
+  if (!canUseLoadedMedia()) event.preventDefault()
+}
+
 // A quiet load leaves the failure on screen until it succeeds.
 async function loadMedia(options: { userInitiated?: boolean; quiet?: boolean } = {}): Promise<string> {
   releaseMedia()
   const requestGeneration = generation
   const organizationId = props.organizationId.trim()
   const messageId = props.message.id
-  if (!organizationId || !messageId || !props.message.media_url) {
+  const source = props.scopedSource
+  if (!organizationId || !messageId || (source ? !source.isCurrent() : !props.message.media_url)) {
     // Fail closed: without a workspace the request would silently fall back
     // to the login workspace. Only a prop change or Retry loads again.
     failedWhilePending = false
@@ -160,27 +186,36 @@ async function loadMedia(options: { userInitiated?: boolean; quiet?: boolean } =
   const startedPending = props.message.status === 'pending'
   const controller = new AbortController()
   requestController = controller
+  function canAcceptBytes() {
+    if (requestGeneration !== generation) return false
+    if (!source || source.isCurrent()) return true
+    releaseMedia()
+    status.value = 'error'
+    return false
+  }
   let slot: (() => void) | null = null
   try {
     // Loads the agent asked for go ahead of images that load by themselves.
     slot = await chatMediaLoadLimiter.acquire(controller.signal, { priority: options.userInitiated })
-    if (requestGeneration !== generation) return ''
+    if (!canAcceptBytes()) return ''
     releaseSlot = slot
-    const response = await messagesService.getMedia(messageId, organizationId, {
+    const mediaOptions = {
       signal: controller.signal,
-      onProgress: (loaded, total) => {
-        if (requestGeneration === generation && total) progress.value = Math.min(loaded / total, 1)
+      onProgress: (loaded: number, total?: number) => {
+        if (requestGeneration === generation && total && hasCurrentScope()) progress.value = Math.min(loaded / total, 1)
       },
-    })
+    }
+    const blob = source
+      ? await source.load(mediaOptions)
+      : (await messagesService.getMedia(messageId, organizationId, mediaOptions)).data
     // A newer load, a workspace change or unmount superseded this response.
-    if (requestGeneration !== generation) return ''
-    const blob = response.data
+    if (!canAcceptBytes()) return ''
     if (!(blob instanceof Blob) || blob.size === 0) throw new Error('Empty media response')
     const displayBlob = displaySafeMediaBlob(blob, kind.value)
     // A document's preview depends on what its bytes are, never on the type
     // the sender declared.
     const previewType = kind.value === 'document' ? await documentPreviewType(blob) : null
-    if (requestGeneration !== generation) return ''
+    if (!canAcceptBytes()) return ''
     mediaURL.value = URL.createObjectURL(displayBlob)
     loadedType.value = displayBlob.type
     loadedBlob.value = displayBlob
@@ -220,7 +255,7 @@ async function openDocument() {
     return
   }
   await nextTick()
-  if (mediaURL.value === url) documentLink.value?.click()
+  if (mediaURL.value === url && canUseLoadedMedia()) documentLink.value?.click()
 }
 
 // Video and audio load when the agent presses play, then start playing.
@@ -228,7 +263,7 @@ async function playMedia() {
   const url = await loadMedia({ userInitiated: true })
   if (!url) return
   await nextTick()
-  if (mediaURL.value !== url) return
+  if (mediaURL.value !== url || !canUseLoadedMedia()) return
   try {
     await mediaElement.value?.play()
   } catch {
@@ -293,7 +328,7 @@ function retry() {
 }
 
 function openPreview() {
-  if (!previewable.value) return
+  if (!previewable.value || !canUseLoadedMedia()) return
   previewMounted.value = true
   previewOpen.value = true
 }
@@ -318,14 +353,16 @@ watch(
     () => props.message.media_url,
     () => props.message.media_mime_type,
     () => props.message.message_type,
+    () => props.scopedSource?.key,
+    hasCurrentScope,
   ],
   () => {
     cancelAutoReload()
     autoReloadsUsed = 0
     failedWhilePending = false
     releaseMedia()
-    status.value = 'idle'
-    if (loadsAutomatically.value) void loadMedia()
+    status.value = hasCurrentScope() ? 'idle' : 'error'
+    if (status.value === 'idle' && loadsAutomatically.value) void loadMedia()
   },
   // Sync flush aborts the previous workspace's request before anything else
   // can observe the new props.
@@ -397,7 +434,7 @@ onBeforeUnmount(() => {
       <span class="flex min-w-0 flex-1 flex-col">
         <!-- Say which attachment failed: the error replaces its filename button. -->
         <span v-if="kind === 'document'" class="truncate font-medium" :title="documentName">{{ documentName }}</span>
-        <span>{{ t('chat.mediaLoadFailed') }}</span>
+        <span>{{ t(scopedSource ? 'chat.attachmentUnavailable' : 'chat.mediaLoadFailed') }}</span>
       </span>
       <button
         type="button"
@@ -409,8 +446,15 @@ onBeforeUnmount(() => {
       </button>
     </div>
     <template v-else-if="kind === 'image' || kind === 'sticker'">
+      <img
+        v-if="thumbnail"
+        :src="mediaURL"
+        :alt="imageAlt"
+        class="max-h-24 max-w-full rounded-md object-contain"
+        @error="handleImageError"
+      />
       <button
-        v-if="previewable"
+        v-else-if="previewable"
         type="button"
         aria-haspopup="dialog"
         class="block w-fit rounded-lg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
@@ -460,6 +504,7 @@ onBeforeUnmount(() => {
       ref="documentLink"
       :href="mediaURL"
       :download="documentName"
+      @click="guardDownload"
       class="flex items-center gap-2 px-3 py-2 bg-background/50 rounded-lg hover:bg-background/80 transition-colors"
     >
       <FileText class="h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -472,6 +517,7 @@ onBeforeUnmount(() => {
       :title="previewTitle"
       :download-url="mediaURL"
       :download-name="downloadName"
+      :can-download="canUseLoadedMedia"
     />
   </div>
 </template>

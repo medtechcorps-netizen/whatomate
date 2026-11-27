@@ -63,3 +63,40 @@ func TestMessageJSONDoesNotExposePendingQuoteMetadata(t *testing.T) {
 	require.Equal(t, "synthetic-child-sealed-value", child.Metadata[pendingKey])
 	require.Contains(t, child.Metadata, MessageBookmarksMetadataKey)
 }
+
+func TestMessageJSONKeepsPrivateMetadataOutOfNestedReplies(t *testing.T) {
+	private := JSONB{
+		"public":                    "ordinary metadata",
+		MessageBookmarksMetadataKey: map[string]any{"synthetic-viewer": true},
+		MessageCoexistencePendingQuoteMetadataKey: "synthetic-sealed-context",
+		MessageNativeMediaRetryMetadataKey: map[string]any{
+			"identity": map[string]any{"content": "synthetic-retained-caption", "media_id": "synthetic-provider-object"},
+		},
+	}
+	reply := Message{Content: "synthetic reply", Metadata: private}
+	message := Message{Content: "synthetic message", Metadata: private, ReplyToMessage: &reply}
+
+	raw, err := json.Marshal(struct {
+		Message Message `json:"message"`
+	}{Message: message})
+	require.NoError(t, err)
+	var envelope struct {
+		Message struct {
+			Content        string         `json:"content"`
+			Metadata       map[string]any `json:"metadata"`
+			ReplyToMessage struct {
+				Content  string         `json:"content"`
+				Metadata map[string]any `json:"metadata"`
+			} `json:"reply_to_message"`
+		} `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &envelope))
+	require.Equal(t, "synthetic message", envelope.Message.Content)
+	require.Equal(t, "synthetic reply", envelope.Message.ReplyToMessage.Content)
+	require.Equal(t, map[string]any{"public": "ordinary metadata"}, envelope.Message.Metadata)
+	require.Equal(t, map[string]any{"public": "ordinary metadata"}, envelope.Message.ReplyToMessage.Metadata)
+	require.Len(t, private, 4)
+	require.Equal(t, "synthetic-sealed-context", private[MessageCoexistencePendingQuoteMetadataKey])
+	require.Contains(t, private, MessageNativeMediaRetryMetadataKey)
+	require.Contains(t, private, MessageBookmarksMetadataKey)
+}

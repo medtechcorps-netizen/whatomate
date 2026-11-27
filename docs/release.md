@@ -65,6 +65,15 @@ seed or schema operation and grants no compatibility, staging, deployment or
 rollback authority. The unchanged-registry route and public legacy guards
 retain their existing behavior.
 
+For the Quote writer, release the privacy reader first and retain its signed
+production record as the rollback target. The separate writer review brings
+six Linux source files into the backfill and migration inventories in one
+commit, with limits of 221 and 245 files. CI checks the exact source and
+generated documents throughout the pull request and main histories. Both
+compatibility directions, signed evidence on main, staging CRM and protected
+production approval apply to the writer. See the Quote writer inventory
+review in `docs/compat.md`.
+
 Compatibility remains an independent merge obligation. Until the planned owner
 step adds `compat` to strict branch protection, the controlled merge review must
 require both the required Test checks and successful compatibility for the exact

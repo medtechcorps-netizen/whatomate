@@ -32,11 +32,18 @@ const props = defineProps<{
   title: string
   downloadUrl: string
   downloadName: string
+  canDownload?: () => boolean
 }>()
 
 const emit = defineEmits<{ 'update:open': [open: boolean] }>()
 
 const { t } = useI18n()
+
+function guardDownload(event: MouseEvent) {
+  if (props.canDownload?.() !== false) return
+  event.preventDefault()
+  emit('update:open', false)
+}
 
 const viewport = ref<HTMLElement | null>(null)
 const image = ref<HTMLImageElement | null>(null)
@@ -335,6 +342,7 @@ onBeforeUnmount(closePdf)
           size="sm"
           :href="downloadUrl"
           :download="downloadName"
+          @click="guardDownload"
           data-testid="chat-media-preview-download"
         >
           <Download aria-hidden="true" />
@@ -354,7 +362,7 @@ onBeforeUnmount(closePdf)
         >
           <AlertCircle class="h-6 w-6 text-muted-foreground" aria-hidden="true" />
           <p>{{ failureMessage }}</p>
-          <Button as="a" size="sm" :href="downloadUrl" :download="downloadName">
+          <Button as="a" size="sm" :href="downloadUrl" :download="downloadName" @click="guardDownload">
             <Download aria-hidden="true" />
             {{ t('chat.mediaPreview.download') }}
           </Button>
@@ -389,7 +397,7 @@ onBeforeUnmount(closePdf)
             data-testid="chat-media-preview-image-limit"
           >
             <p>{{ t('chat.mediaPreview.imageLimit') }}</p>
-            <Button as="a" variant="outline" size="sm" :href="downloadUrl" :download="downloadName">
+            <Button as="a" variant="outline" size="sm" :href="downloadUrl" :download="downloadName" @click="guardDownload">
               <Download aria-hidden="true" />
               {{ t('chat.mediaPreview.download') }}
             </Button>
@@ -435,7 +443,7 @@ onBeforeUnmount(closePdf)
             data-testid="chat-media-preview-page-limit"
           >
             <p>{{ t('chat.mediaPreview.pageLimit', { shown: pages.length, total: pageCount }) }}</p>
-            <Button as="a" variant="outline" size="sm" :href="downloadUrl" :download="downloadName">
+            <Button as="a" variant="outline" size="sm" :href="downloadUrl" :download="downloadName" @click="guardDownload">
               <Download aria-hidden="true" />
               {{ t('chat.mediaPreview.download') }}
             </Button>
