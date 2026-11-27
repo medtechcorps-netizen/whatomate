@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -422,14 +421,11 @@ func (c *Client) FetchTemplates(ctx context.Context, account *Account) ([]MetaTe
 	}
 
 	endpoint := c.buildTemplatesURL(account)
-	query := url.Values{
-		"fields": {"id,name,language,category,status,components,quality_score,quality_rating"},
-		"limit":  {"100"},
-	}
+	var after string
 	templates := make([]MetaTemplate, 0)
 	seenCursors := make(map[string]struct{})
 	for pageNumber := 1; pageNumber <= maxTemplatePages; pageNumber++ {
-		body, err := c.doRequest(ctx, http.MethodGet, endpoint+"?"+query.Encode(), nil, account.AccessToken)
+		body, err := c.doRequest(ctx, http.MethodGet, templateListPageURL(endpoint, after), nil, account.AccessToken)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -457,7 +453,7 @@ func (c *Client) FetchTemplates(ctx context.Context, account *Account) ([]MetaTe
 
 		// Next is only a continuation signal. Only the after token becomes
 		// query data on the exact same endpoint, including on an empty page.
-		after := page.Paging.Cursors.After
+		after = page.Paging.Cursors.After
 		if after == "" || len(after) > maxTemplateCursorBytes || strings.ContainsFunc(after, func(r rune) bool {
 			return r <= ' ' || r > '~'
 		}) {
@@ -467,7 +463,6 @@ func (c *Client) FetchTemplates(ctx context.Context, account *Account) ([]MetaTe
 			return nil, errors.New("Meta template pagination repeated a continuation cursor")
 		}
 		seenCursors[after] = struct{}{}
-		query.Set("after", after)
 	}
 	return nil, fmt.Errorf("Meta template pagination exceeded %d pages", maxTemplatePages)
 }

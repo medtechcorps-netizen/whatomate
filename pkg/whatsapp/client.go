@@ -384,6 +384,17 @@ func (c *Client) buildTemplatesURL(account *Account) string {
 	return fmt.Sprintf("%s/%s/%s/message_templates", c.getBaseURL(), account.APIVersion, account.BusinessID)
 }
 
+func templateListPageURL(endpoint, after string) string {
+	query := url.Values{
+		"fields": {"id,name,language,category,status,components,quality_score,quality_rating"},
+		"limit":  {"100"},
+	}
+	if after != "" {
+		query.Set("after", after)
+	}
+	return endpoint + "?" + query.Encode()
+}
+
 // MediaURLResponse represents the response from Meta's media endpoint
 type MediaURLResponse struct {
 	URL              string `json:"url"`
