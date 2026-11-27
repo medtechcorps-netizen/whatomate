@@ -78,7 +78,10 @@ test.describe('Message Templates - Sync', () => {
 
   test.beforeEach(async ({ page }) => {
     await loginAsAdmin(page)
-    await page.evaluate(() => localStorage.removeItem('templates_selected_account'))
+    await page.evaluate(() => {
+      localStorage.removeItem('templates_selected_account')
+      localStorage.removeItem('templates_selected_account_option')
+    })
     syncRequests = 0
     // These cases check availability only; never send a request to Meta.
     await page.route(/\/api\/templates\/sync(?:\?.*)?$/, async route => {
@@ -99,6 +102,9 @@ test.describe('Message Templates - Sync', () => {
     await page.route(/\/api\/accounts(?:\?.*)?$/, route => route.fulfill({
       json: { data: { accounts: [] } },
     }))
+    await page.route(/\/api\/templates\/sync\/accounts(?:\?.*)?$/, route => route.fulfill({
+      json: { data: { accounts: [] } },
+    }))
     await templatesPage.goto()
     await expect(templatesPage.accountSelect).toContainText('All')
     await expect(templatesPage.syncButton).toHaveText('Sync from Meta')
@@ -106,16 +112,19 @@ test.describe('Message Templates - Sync', () => {
   })
 
   test('should enable sync only after selecting an available account', async ({ page }) => {
-    const accountName = 'Templates sync fixture'
+    const account = { id: '4c444444-4444-4444-8444-444444444444', name: 'Templates sync fixture', phone_id: 'sync-fixture-phone' }
     await page.route(/\/api\/accounts(?:\?.*)?$/, route => route.fulfill({
-      json: { data: { accounts: [{ id: 'sync-fixture-account', name: accountName, phone_id: 'sync-fixture-phone' }] } },
+      json: { data: { accounts: [account] } },
+    }))
+    await page.route(/\/api\/templates\/sync\/accounts(?:\?.*)?$/, route => route.fulfill({
+      json: { data: { accounts: [{ id: account.id, name: account.name }] } },
     }))
     await templatesPage.goto()
     await expect(templatesPage.accountSelect).toContainText('All')
     await expect(templatesPage.syncButton).toHaveText('Sync from Meta')
     await expect(templatesPage.syncButton).toBeDisabled()
 
-    await templatesPage.selectAccount(accountName)
+    await templatesPage.selectAccount(account.name)
     await expect(templatesPage.syncButton).toHaveText('Sync from Meta')
     await expect(templatesPage.syncButton).toBeEnabled()
   })

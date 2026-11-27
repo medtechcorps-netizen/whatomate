@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue'
 import { RouterLink } from 'vue-router'
+import axios, { type AxiosRequestConfig } from 'axios'
 import { useI18n } from 'vue-i18n'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -15,6 +16,7 @@ import { useAuthStore } from '@/stores/auth'
 import { toast } from 'vue-sonner'
 import { Plus, RefreshCw, FileText, Pencil, Trash2, Loader2, MessageSquare, Image, FileIcon, Video } from 'lucide-vue-next'
 import { getErrorMessage } from '@/lib/api-utils'
+import { readSelectedOrganizationId, SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
 import { currentTabSession, isTabSessionCurrent } from '@/lib/tabSession'
 import { syncTemplateAccounts, type TemplateSyncResult } from '@/lib/templateSync'
 import { useSearchPagination } from '@/composables/useSearchPagination'
@@ -22,10 +24,9 @@ import { getQualityBadgeClass, getQualityRatingLabel } from '@/lib/utils'
 
 const { t } = useI18n()
 
-interface WhatsAppAccount {
+interface WhatsAppAccountChoice {
   id: string
   name: string
-  phone_id: string
 }
 
 interface Template {
@@ -50,9 +51,12 @@ interface Template {
 
 const organizationsStore = useOrganizationsStore()
 const authStore = useAuthStore()
+const organizationId = computed(() => organizationsStore.selectedOrgId || authStore.organizationId || '')
 
 const templates = ref<Template[]>([])
-const accounts = ref<WhatsAppAccount[]>([])
+const accounts = ref<WhatsAppAccountChoice[]>([])
+const syncAccounts = ref<WhatsAppAccountChoice[]>([])
+const accountsLoadFailed = ref(false)
 const isLoading = ref(true)
 const error = ref<string | null>(null)
 const isSyncing = ref(false)
@@ -64,13 +68,40 @@ let syncRequest = 0
 let viewGeneration = 0
 let disposed = false
 let viewSession = currentTabSession()
-const selectedAccount = ref<string>(localStorage.getItem('templates_selected_account') || 'all')
+const allAccountsOption = 'all'
+const accountOptionPrefix = 'account:'
+const accountOptionPreference = 'templates_selected_account_option'
+const legacyAccountPreference = 'templates_selected_account'
+
+function accountOption(name: string): string {
+  return accountOptionPrefix + name
+}
+
+function accountNameForOption(option: unknown): string | undefined {
+  if (typeof option !== 'string' || !option.startsWith(accountOptionPrefix)) return undefined
+  return option.slice(accountOptionPrefix.length) || undefined
+}
+
+const legacyAccount = localStorage.getItem(legacyAccountPreference)
+const selectedAccount = ref(localStorage.getItem(accountOptionPreference) ??
+  (legacyAccount && legacyAccount !== allAccountsOption ? accountOption(legacyAccount) : allAccountsOption))
+
+function persistAccountOption(option: string) {
+  localStorage.setItem(accountOptionPreference, option)
+  localStorage.setItem(legacyAccountPreference, accountNameForOption(option) ?? allAccountsOption)
+}
 const canWrite = computed(() => authStore.hasPermission('templates', 'write'))
 const canDelete = computed(() => authStore.hasPermission('templates', 'delete'))
 const canSync = computed(() => authStore.hasPermission('templates', 'sync'))
+const canReadAccounts = computed(() => authStore.hasPermission('accounts', 'read'))
+const selectedListedAccount = computed(() => {
+  const name = accountNameForOption(selectedAccount.value)
+  return accounts.value.find(account => account.name === name) ?? null
+})
 const selectedSyncAccount = computed(() => {
-  const name = selectedAccount.value
-  return name && name !== 'all' && accounts.value.some(account => account.name === name) ? name : null
+  const listed = selectedListedAccount.value
+  if (!listed?.id) return null
+  return syncAccounts.value.some(account => account.id === listed.id && account.name === listed.name) ? listed : null
 })
 
 // Delete dialog state
@@ -194,11 +225,28 @@ function getLanguageName(code: string): string {
 // generation as well as the logical session before each asynchronous workflow.
 function captureViewScope() {
   const generation = viewGeneration
-  const org = organizationsStore.selectedOrgId
+  const org = organizationId.value
+  const storedOrg = readSelectedOrganizationId()
   const session = currentTabSession()
-  return () => !disposed && generation === viewGeneration &&
-    org === organizationsStore.selectedOrgId && session !== null &&
-    session === currentTabSession() && isTabSessionCurrent()
+  return {
+    organizationId: org,
+    isCurrent: () => !disposed && generation === viewGeneration && !!org &&
+      org === organizationId.value && storedOrg === readSelectedOrganizationId() &&
+      (storedOrg === null ? org === authStore.organizationId : storedOrg === org) &&
+      session !== null && session === currentTabSession() && isTabSessionCurrent(),
+  }
+}
+
+function workspaceRequest(org: string, isCurrent: () => boolean): AxiosRequestConfig {
+  const send = axios.getAdapter(api.defaults.adapter)
+  return {
+    headers: { 'X-Organization-ID': org },
+    // Axios can dispatch after the click, including a replay after auth refresh.
+    adapter: async config => {
+      if (!isCurrent()) throw new axios.CanceledError()
+      return send(config)
+    },
+  }
 }
 
 function invalidateTemplates() {
@@ -214,6 +262,8 @@ function invalidateView() {
   accountsRequest++
   syncRequest++
   accounts.value = []
+  syncAccounts.value = []
+  accountsLoadFailed.value = false
   invalidateTemplates()
   syncResults.value = []
   syncProgress.value = ''
@@ -225,23 +275,41 @@ function invalidateView() {
 }
 
 async function loadWorkspace() {
-  const current = captureViewScope()
-  if (!current()) return
+  const scope = captureViewScope()
+  if (!scope.isCurrent()) {
+    isLoading.value = false
+    return
+  }
   isLoading.value = true
-  await fetchAccounts()
-  if (current()) await fetchTemplates()
+  const request = ++accountsRequest
+  await fetchAccounts(scope, request)
+  if (scope.isCurrent() && request === accountsRequest) await fetchTemplates()
 }
 
-watch(() => organizationsStore.selectedOrgId, () => {
+function onWorkspaceChange() {
   viewSession = currentTabSession()
   invalidateView()
-  void loadWorkspace()
-}, { flush: 'sync' })
+  const generation = viewGeneration
+  // The store publishes its reactive selection before persisting it.
+  queueMicrotask(() => {
+    if (!disposed && generation === viewGeneration) void loadWorkspace()
+  })
+}
+
+watch([() => organizationsStore.selectedOrgId, () => authStore.organizationId], onWorkspaceChange, { flush: 'sync' })
+watch([canSync, canReadAccounts], () => { void loadWorkspace() }, { flush: 'sync' })
+
+function onWorkspaceStorage(event: StorageEvent) {
+  if (event.storageArea === localStorage &&
+    (event.key === SELECTED_ORGANIZATION_STORAGE_KEY || event.key === null)) {
+    onWorkspaceChange()
+  }
+}
 
 // Invalidate immediately, including the debounce interval before the next GET.
 watch([selectedAccount, searchQuery, currentPage], () => {
   invalidateTemplates()
-  isLoading.value = !disposed && isTabSessionCurrent()
+  isLoading.value = captureViewScope().isCurrent()
 }, { flush: 'sync' })
 
 function onSessionState(event: Event) {
@@ -256,6 +324,7 @@ function onSessionState(event: Event) {
 
 onMounted(() => {
   window.addEventListener(AUTH_SESSION_EVENT, onSessionState)
+  window.addEventListener('storage', onWorkspaceStorage)
   void loadWorkspace()
 })
 
@@ -263,43 +332,62 @@ onBeforeUnmount(() => {
   disposed = true
   invalidateView()
   window.removeEventListener(AUTH_SESSION_EVENT, onSessionState)
+  window.removeEventListener('storage', onWorkspaceStorage)
 })
 
-async function fetchAccounts() {
-  const scope = captureViewScope()
-  if (!scope()) return
-  const request = ++accountsRequest
-  const current = () => scope() && request === accountsRequest
+async function fetchAccounts(scope: ReturnType<typeof captureViewScope>, request: number) {
+  const maySync = canSync.value
+  const mayReadAccounts = canReadAccounts.value
+  const useSyncChoicesForBrowsing = maySync && !mayReadAccounts
+  const current = () => scope.isCurrent() && request === accountsRequest &&
+    maySync === canSync.value && mayReadAccounts === canReadAccounts.value
   accounts.value = []
-  try {
-    const response = await api.get('/accounts')
-    if (!current()) return
-    accounts.value = response.data.data?.accounts || []
-    // Validate stored account still exists, fallback to 'all' if not
-    if (selectedAccount.value !== 'all' && !accounts.value.some(a => a.name === selectedAccount.value)) {
-      selectedAccount.value = 'all'
-      localStorage.setItem('templates_selected_account', 'all')
+  syncAccounts.value = []
+  accountsLoadFailed.value = false
+
+  async function loadChoices(endpoint: string): Promise<WhatsAppAccountChoice[] | undefined> {
+    try {
+      const response = await api.get(endpoint, workspaceRequest(scope.organizationId, current))
+      if (current()) return response.data.data?.accounts ?? []
+    } catch (error) {
+      if (!current()) return
+      console.error('Failed to fetch accounts:', error)
+      accountsLoadFailed.value = true
     }
-  } catch (error) {
-    if (!current()) return
-    console.error('Failed to fetch accounts:', error)
+  }
+
+  const syncChoicesEndpoint = '/templates/sync/accounts'
+  const listed = await loadChoices(useSyncChoicesForBrowsing ? syncChoicesEndpoint : '/accounts')
+  if (!current() || !listed) return
+  accounts.value = listed
+  if (selectedAccount.value !== allAccountsOption && selectedListedAccount.value === null) {
+    selectedAccount.value = allAccountsOption
+    persistAccountOption(allAccountsOption)
+  }
+  if (useSyncChoicesForBrowsing) {
+    syncAccounts.value = listed
+  } else if (maySync) {
+    // Browsing remains usable while the sync-specific eligibility check settles.
+    void loadChoices(syncChoicesEndpoint).then(eligible => {
+      if (current() && eligible) syncAccounts.value = eligible
+    })
   }
 }
 
 function onAccountChange(value: string | number | bigint | Record<string, any> | null) {
   if (typeof value !== 'string') return
-  localStorage.setItem('templates_selected_account', value)
+  persistAccountOption(value)
   currentPage.value = 1
   fetchTemplates()
 }
 
 async function fetchTemplates() {
   const scope = captureViewScope()
-  if (!scope()) return
+  if (!scope.isCurrent()) return
   const request = ++templatesRequest
-  const current = () => scope() && request === templatesRequest
+  const current = () => scope.isCurrent() && request === templatesRequest
   const params = {
-    account: selectedAccount.value !== 'all' ? selectedAccount.value : undefined,
+    account: accountNameForOption(selectedAccount.value),
     search: searchQuery.value || undefined,
     page: currentPage.value,
     limit: pageSize
@@ -307,7 +395,7 @@ async function fetchTemplates() {
   isLoading.value = true
   error.value = null
   try {
-    const response = await templatesService.list(params)
+    const response = await templatesService.list(params, workspaceRequest(scope.organizationId, current))
     if (!current()) return
     const data = (response.data as any).data || response.data
     templates.value = data.templates || []
@@ -330,16 +418,20 @@ async function syncTemplates() {
   if (!target) { toast.error(t('templates.selectAccountFirst')); return }
 
   const scope = captureViewScope()
-  if (!scope()) return
+  if (!scope.isCurrent()) return
+  const eligibilityRequest = accountsRequest
   const request = ++syncRequest
-  const ownsRequest = () => scope() && request === syncRequest
-  const current = () => ownsRequest() && canSync.value
+  const ownsRequest = () => request === syncRequest
+  const current = () => ownsRequest() && scope.isCurrent() && canSync.value && eligibilityRequest === accountsRequest
   isSyncing.value = true
   syncResults.value = []
   try {
-    const results = await syncTemplateAccounts([target], async account => {
+    const results = await syncTemplateAccounts([target.name], async account => {
       syncProgress.value = account
-      await api.post('/templates/sync', { whatsapp_account: account })
+      await api.post('/templates/sync', {
+        whatsapp_account: account,
+        whatsapp_account_id: target.id,
+      }, workspaceRequest(scope.organizationId, current))
     }, current, t('templates.syncAccountFailed'))
     if (!current()) return
     syncResults.value = results
@@ -357,7 +449,7 @@ async function syncTemplates() {
 
 function openDeleteDialog(template: Template) {
   const scope = captureViewScope()
-  if (!canDelete.value || !scope()) return
+  if (!canDelete.value || !scope.isCurrent()) return
   deleteRequest++
   isDeleting.value = false
   templateToDelete.value = template
@@ -367,10 +459,10 @@ function openDeleteDialog(template: Template) {
 async function confirmDeleteTemplate() {
   if (!canDelete.value || !deleteDialogOpen.value || !templateToDelete.value || isDeleting.value) return
   const scope = captureViewScope()
-  if (!scope()) return
+  if (!scope.isCurrent()) return
   const templateId = templateToDelete.value.id
   const request = ++deleteRequest
-  const current = () => scope() && request === deleteRequest &&
+  const current = () => scope.isCurrent() && request === deleteRequest &&
     deleteDialogOpen.value && templateToDelete.value?.id === templateId && canDelete.value
 
   isDeleting.value = true
@@ -381,7 +473,7 @@ async function confirmDeleteTemplate() {
     toast.success(t('common.deletedSuccess', { resource: t('resources.Template') }))
     deleteDialogOpen.value = false
     templateToDelete.value = null
-    if (scope()) await fetchTemplates()
+    if (scope.isCurrent()) await fetchTemplates()
   } catch (error) {
     if (!current()) return
     toast.error(getErrorMessage(error, t('common.failedDelete', { resource: t('resources.template') })))
@@ -460,6 +552,10 @@ function getHeaderIcon(type: string) {
               <span class="font-medium">{{ result.account }}</span>: {{ result.success ? $t('templates.synced') : result.error }}
             </p>
           </div>
+          <div v-if="accountsLoadFailed" class="mb-4 flex flex-wrap items-center gap-2">
+            <p role="alert" class="text-sm text-destructive">{{ $t('common.failedLoad', { resource: $t('resources.accounts') }) }}</p>
+            <Button type="button" variant="outline" size="sm" @click="loadWorkspace">{{ $t('common.retry') }}</Button>
+          </div>
           <ErrorState
             v-if="error && !isLoading"
             :title="$t('common.loadErrorTitle')"
@@ -482,8 +578,8 @@ function getHeaderIcon(type: string) {
                         <SelectValue :placeholder="$t('templates.allAccounts')" />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="all">{{ $t('templates.allAccounts') }}</SelectItem>
-                        <SelectItem v-for="account in accounts" :key="account.id" :value="account.name">
+                        <SelectItem :value="allAccountsOption">{{ $t('templates.allAccounts') }}</SelectItem>
+                        <SelectItem v-for="account in accounts" :key="account.id" :value="accountOption(account.name)">
                           {{ account.name }}
                         </SelectItem>
                       </SelectContent>

@@ -2682,7 +2682,8 @@ export const templatesService = {
     search?: string;
     page?: number;
     limit?: number;
-  }) => api.get<{ templates: any[]; total?: number }>("/templates", { params }),
+  }, config?: Pick<AxiosRequestConfig, "headers" | "adapter">) =>
+    api.get<{ templates: any[]; total?: number }>("/templates", { ...config, params }),
   get: (id: string) => api.get(`/templates/${id}`),
   uploadMedia: (accountName: string, file: File) => {
     const formData = new FormData();

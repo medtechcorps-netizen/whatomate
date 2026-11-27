@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -1342,6 +1343,71 @@ func TestApp_SyncTemplates_Success(t *testing.T) {
 	assert.Equal(t, "UNKNOWN", tmpl2.QualityRating)
 	assert.NotEmpty(t, tmpl3.ID)
 	assert.Equal(t, "GREEN", tmpl3.QualityRating)
+}
+
+func TestTemplateSyncWorkspaceRejectsExplicitFallback(t *testing.T) {
+	var providerCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []string{}})
+	}))
+	defer server.Close()
+
+	app := newTemplateTestApp(t, server)
+	home := testutil.CreateTestOrganization(t, app.DB)
+	other := testutil.CreateTestOrganization(t, app.DB)
+	role := testutil.CreateTestRoleWithKeys(t, app.DB, home.ID, "template-sync-workspace", []string{
+		"accounts:read", "templates:read", "templates:sync",
+	})
+	user := testutil.CreateTestUser(t, app.DB, home.ID, testutil.WithRoleID(&role.ID))
+	account := testutil.CreateTestWhatsAppAccountWith(t, app.DB, home.ID, testutil.WithAccountName("all"))
+
+	endpoints := []struct {
+		name    string
+		handler handlers.TenantRequestHandler
+	}{
+		{"accounts", (*handlers.App).ListAccounts},
+		{"templates", (*handlers.App).ListTemplates},
+		{"sync", (*handlers.App).SyncTemplates},
+	}
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			for _, selection := range []struct {
+				name     string
+				headers  []string
+				expected int
+			}{
+				{"empty", []string{""}, fasthttp.StatusBadRequest},
+				{"malformed", []string{"not-a-workspace"}, fasthttp.StatusBadRequest},
+				{"duplicate", []string{home.ID.String(), other.ID.String()}, fasthttp.StatusBadRequest},
+				{"inaccessible", []string{other.ID.String()}, fasthttp.StatusForbidden},
+			} {
+				t.Run(selection.name, func(t *testing.T) {
+					req := testutil.NewGETRequest(t)
+					if endpoint.name == "sync" {
+						req = testutil.NewJSONRequest(t, map[string]any{"whatsapp_account": account.Name})
+					}
+					testutil.SetAuthContext(req, home.ID, user.ID)
+					for _, header := range selection.headers {
+						req.RequestCtx.Request.Header.Add("X-Organization-ID", header)
+					}
+					require.NoError(t, app.Tenant(endpoint.handler)(req))
+					assert.Equal(t, selection.expected, testutil.GetResponseStatusCode(req))
+				})
+			}
+		})
+	}
+	assert.Zero(t, providerCalls.Load())
+	var templates int64
+	require.NoError(t, app.DB.Model(&models.Template{}).Where("organization_id = ?", home.ID).Count(&templates).Error)
+	assert.Zero(t, templates)
+
+	req := testutil.NewJSONRequest(t, map[string]any{"whatsapp_account": "all"})
+	testutil.SetAuthContext(req, home.ID, user.ID)
+	testutil.SetHeader(req, "X-Organization-ID", home.ID.String())
+	require.NoError(t, app.Tenant((*handlers.App).SyncTemplates)(req))
+	assert.Equal(t, fasthttp.StatusOK, testutil.GetResponseStatusCode(req))
+	assert.EqualValues(t, 1, providerCalls.Load())
 }
 
 func TestApp_SyncTemplates_MissingAccount(t *testing.T) {
