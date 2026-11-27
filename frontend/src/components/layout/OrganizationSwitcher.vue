@@ -21,6 +21,7 @@ import {
   SESSION_UNSUPPORTED_CODE,
 } from '@/services/api'
 import { wsService } from '@/services/websocket'
+import { prepareWorkspaceActivityReload } from '@/lib/sessionActivityDiscovery'
 import { toast } from 'vue-sonner'
 import { Building2, Plus, Loader2 } from 'lucide-vue-next'
 
@@ -93,6 +94,10 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
     return
   }
 
+  // A super admin changes the selected header while retaining the token's own organization.
+  const destination = isSuperAdmin.value ? authStore.user?.organization_id : value
+  const saveActivity = destination ? prepareWorkspaceActivityReload(authStore.user, destination) : undefined
+
   if (isSuperAdmin.value) {
     // Super admins: set localStorage header and reload
     wsService.disconnect()
@@ -103,6 +108,7 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
         query: { ...route.query, organization_id: value }
       })
     }
+    saveActivity?.()
     window.location.reload()
   } else {
     // Multi-org users: call switchOrg API for new JWT tokens, then reload.
@@ -115,6 +121,7 @@ const handleOrgChange = async (value: string | number | bigint | Record<string, 
       await authStore.switchOrg(value)
       wsService.disconnect()
       organizationsStore.selectOrganization(value)
+      saveActivity?.()
       window.location.reload()
     } catch (error: any) {
       // If switch fails, don't reload

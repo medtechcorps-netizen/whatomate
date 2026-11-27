@@ -1,7 +1,7 @@
 import { api, getReplyContextMediaBlob } from '@/services/api'
 import type { ContactIdentityReviewEffectiveState } from '@/services/api'
 import { unwrapListResponse } from '@/lib/api-utils'
-import axios, { type AxiosResponse } from 'axios'
+import axios, { type AxiosRequestConfig, type AxiosResponse } from 'axios'
 
 const PRODUCT_PAGE_LIMIT = 100
 const PRODUCT_MAX_PAGES = 200
@@ -861,14 +861,31 @@ function bookingOrganization(organizationId?: string) {
   return organizationId ? { headers: { 'X-Organization-ID': organizationId } } : undefined
 }
 
+function bookingCreateRequest(
+  organizationId?: string,
+  isCurrent?: () => boolean,
+): AxiosRequestConfig | undefined {
+  const organization = bookingOrganization(organizationId)
+  if (!isCurrent) return organization
+  const send = axios.getAdapter(api.defaults.adapter)
+  return {
+    ...organization,
+    // Check at transport entry, including a replay of this request after auth refresh.
+    adapter: async (config) => {
+      if (!isCurrent()) throw new axios.CanceledError()
+      return send(config)
+    },
+  }
+}
+
 export const bookingService = {
   services: () => api.get('/booking/services'),
   allServices: () =>
     fetchAllPages<BookingService>('services', (page, limit) =>
       api.get('/booking/services', { params: { page, limit } }),
     ),
-  createService: (data: Partial<BookingService>, organizationId?: string) =>
-    api.post('/booking/services', data, bookingOrganization(organizationId)),
+  createService: (data: Partial<BookingService>, organizationId?: string, isCurrent?: () => boolean) =>
+    api.post('/booking/services', data, bookingCreateRequest(organizationId, isCurrent)),
   updateService: (id: string, data: Partial<BookingService>, organizationId?: string) =>
     api.put(`/booking/services/${encodeURIComponent(id)}`, data, bookingOrganization(organizationId)),
   deleteService: (id: string, version: number, organizationId?: string) =>
@@ -881,8 +898,8 @@ export const bookingService = {
     fetchAllPages<BookingResource>('resources', (page, limit) =>
       api.get('/booking/resources', { params: { page, limit } }),
     ),
-  createResource: (data: Partial<BookingResource>, organizationId?: string) =>
-    api.post('/booking/resources', data, bookingOrganization(organizationId)),
+  createResource: (data: Partial<BookingResource>, organizationId?: string, isCurrent?: () => boolean) =>
+    api.post('/booking/resources', data, bookingCreateRequest(organizationId, isCurrent)),
   updateResource: (id: string, data: Partial<BookingResource>, organizationId?: string) =>
     api.put(`/booking/resources/${encodeURIComponent(id)}`, data, bookingOrganization(organizationId)),
   deleteResource: (id: string, version: number, organizationId?: string) =>
@@ -960,7 +977,8 @@ export const bookingService = {
       timezone?: string
     },
     organizationId?: string,
-  ) => api.post('/booking/events', data, bookingOrganization(organizationId)),
+    isCurrent?: () => boolean,
+  ) => api.post('/booking/events', data, bookingCreateRequest(organizationId, isCurrent)),
   bookings: (params?: Record<string, string | number>) => api.get('/bookings', { params }),
   allBookings: (params?: Record<string, string | number>) =>
     fetchAllPages<Booking>('bookings', (page, limit) =>

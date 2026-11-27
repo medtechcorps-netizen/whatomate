@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { ssoExchangeInterrupted } from '@/services/api'
+import { pendingIdleStartup } from '@/lib/sessionActivityDiscovery'
 import { routes } from './routes'
 
 // Permission-based route meta type
@@ -129,6 +130,10 @@ router.beforeEach(async (to, _from, next) => {
 
   // Check if route requires auth
   if (to.meta.requiresAuth !== false) {
+    const startup = pendingIdleStartup()
+    if (startup && !(await startup)) {
+      return next({ name: 'login', query: { redirect: to.fullPath } })
+    }
     if (!authStore.isAuthenticated) {
       // An SSO exchange this tab sent was cut off (a reload while it was out):
       // the stored identity may not be the jar's session any more. Nothing is

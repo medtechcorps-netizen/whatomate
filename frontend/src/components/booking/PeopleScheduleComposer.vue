@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CalendarDays, Loader2, Plus, UserRound, X } from 'lucide-vue-next'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAuthStore } from '@/stores/auth'
 import { getErrorMessage, unwrapItemResponse } from '@/lib/api-utils'
-import { readSelectedOrganizationId } from '@/lib/browserIdentity'
+import { readSelectedOrganizationId, SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
+import { currentTabSession } from '@/lib/tabSession'
+import { formatDateInTimeZone } from '@/lib/zonedDateTime'
 import {
   bookingService,
   type BookingEvent,
@@ -40,10 +42,11 @@ const selectedResourceId = ref('')
 const selectedServiceId = ref('')
 const acknowledgedResources = ref<BookingResource[]>([])
 const acknowledgedServices = ref<BookingService[]>([])
+const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kuala_Lumpur'
 const person = reactive({
   name: '',
   kind: 'practitioner' as 'practitioner' | 'instructor' | 'staff',
-  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kuala_Lumpur',
+  timezone: browserTimezone,
   location: '',
 })
 const service = reactive({
@@ -54,20 +57,35 @@ const service = reactive({
   price: '0',
   currency: 'MYR',
 })
-const today = new Date()
-const date = ref(new Date(today.getTime() - today.getTimezoneOffset() * 60_000).toISOString().slice(0, 10))
 const startTime = ref('09:00')
 const capacity = ref(1)
-const location = ref('')
+const owner = {
+  organization: props.organization,
+  selectedOrganization: readSelectedOrganizationId(),
+  actor: auth.user?.id,
+  session: currentTabSession(),
+}
+const retired = ref(false)
 let mounted = true
-let contextGeneration = 0
 
-const currentOrganization = () => readSelectedOrganizationId() || auth.organizationId || ''
-const contextIsCurrent = (generation = contextGeneration) =>
-  mounted &&
-  generation === contextGeneration &&
-  !!props.organization &&
-  props.organization === currentOrganization()
+function contextIsCurrent() {
+  const selectedOrganization = readSelectedOrganizationId()
+  return (
+    mounted &&
+    !retired.value &&
+    !!owner.organization &&
+    !!owner.actor &&
+    props.organization === owner.organization &&
+    owner.selectedOrganization === selectedOrganization &&
+    (selectedOrganization ?? auth.organizationId) === owner.organization &&
+    auth.user?.id === owner.actor &&
+    owner.session !== null &&
+    currentTabSession() === owner.session
+  )
+}
+
+const canDispatchSettings = () => contextIsCurrent() && props.canManage
+const canDispatchSchedule = () => contextIsCurrent() && props.canSchedule
 const availableResources = computed(() => {
   const values = new Map(props.resources.map((resource) => [resource.id, resource]))
   // A completed create remains usable even if a background catalogue refresh fails.
@@ -86,6 +104,27 @@ const otherResources = computed(() =>
 const selectedResource = computed(() =>
   availableResources.value.find((resource) => resource.id === selectedResourceId.value),
 )
+const enteredLocation = ref<string>()
+const location = computed({
+  get: () => enteredLocation.value ?? selectedResource.value?.location ?? '',
+  set: (value: string) => { enteredLocation.value = value },
+})
+const enteredDate = ref<string>()
+const date = computed({
+  get() {
+    if (enteredDate.value !== undefined) return enteredDate.value
+    try {
+      return formatDateInTimeZone(new Date(), selectedResource.value?.timezone ?? browserTimezone)
+    } catch (cause) {
+      // A legacy timezone may be unavailable in this browser. Leave the day for the operator to choose.
+      if (cause instanceof RangeError) return ''
+      throw cause
+    }
+  },
+  set(value: string) {
+    enteredDate.value = value
+  },
+})
 const compatibleServices = computed(() => {
   if (!selectedResource.value) return []
   const values = new Map(props.services.map((item) => [item.id, item]))
@@ -107,20 +146,29 @@ const canSaveSchedule = computed(
     !!selectedService.value,
 )
 
+let needsResourceChoice = false
 watch(
   availableResources,
   (values) => {
-    if (selectedResourceId.value && !values.some((item) => item.id === selectedResourceId.value))
+    if (selectedResourceId.value && !values.some((item) => item.id === selectedResourceId.value)) {
+      // A refreshed catalogue must not assign the draft to a different person.
+      needsResourceChoice = true
       selectedResourceId.value = ''
-    if (!selectedResourceId.value && values.length === 1) selectedResourceId.value = values[0]!.id
+    } else if (!needsResourceChoice && !selectedResourceId.value && values.length === 1) {
+      selectedResourceId.value = values[0]!.id
+    }
   },
   { immediate: true },
 )
+let needsServiceChoice = false
 watch(
-  compatibleServices,
-  (values) => {
-    if (!values.some((item) => item.id === selectedServiceId.value))
-      selectedServiceId.value = values.length === 1 ? values[0]!.id : ''
+  [selectedResourceId, compatibleServices],
+  ([resourceId, values], [previousResourceId]) => {
+    const personChanged = resourceId !== previousResourceId
+    if (personChanged) needsServiceChoice = false
+    if (values.some((item) => item.id === selectedServiceId.value)) return
+    if (!personChanged && selectedServiceId.value) needsServiceChoice = true
+    selectedServiceId.value = !needsServiceChoice && values.length === 1 ? values[0]!.id : ''
   },
   { immediate: true },
 )
@@ -145,17 +193,28 @@ watch(
     acknowledgedServices.value = acknowledgedServices.value.filter((item) => !ids.has(item.id))
   },
 )
-watch(
-  () => auth.organizationId,
-  () => {
-    ++contextGeneration
-    error.value = 'Your workspace changed. Close this form and reopen it in the current workspace.'
-  },
-)
+function retireContext() {
+  retired.value = true
+  error.value = 'Your workspace changed. Close this form and reopen it in the current workspace.'
+}
+
+function onWorkspaceStorage(event: StorageEvent) {
+  if (
+    event.storageArea === localStorage &&
+    (event.key === SELECTED_ORGANIZATION_STORAGE_KEY || event.key === null)
+  ) {
+    retireContext()
+  }
+}
+
+watch([() => props.organization, () => auth.organizationId, () => auth.user?.id], retireContext, {
+  flush: 'sync',
+})
 watch(busy, (value) => emit('busy', value), { flush: 'sync' })
+onMounted(() => window.addEventListener('storage', onWorkspaceStorage))
 onBeforeUnmount(() => {
   mounted = false
-  ++contextGeneration
+  window.removeEventListener('storage', onWorkspaceStorage)
 })
 
 function guard(permission: boolean) {
@@ -179,7 +238,6 @@ async function addPerson() {
     error.value = 'Enter a name and a valid timezone.'
     return
   }
-  const generation = contextGeneration
   busy.value = true
   try {
     const response = await bookingService.createResource(
@@ -190,26 +248,27 @@ async function addPerson() {
         location: person.location.trim(),
         is_active: true,
       },
-      props.organization,
+      owner.organization,
+      canDispatchSettings,
     )
-    if (!contextIsCurrent(generation)) return
+    if (!contextIsCurrent()) return
     const created = unwrapItemResponse<BookingResource>(response)
     acknowledgedResources.value.push(created)
     selectedResourceId.value = created.id
-    location.value = created.location || ''
     addingPerson.value = false
     // Keep the acknowledged ID for every later service/schedule retry.
     notice.value = created.name + ' was added. You can use this person for future schedules.'
     emit('resourceCreated', created)
     if (props.canSchedule) mode.value = 'schedule'
   } catch (cause) {
-    if (contextIsCurrent(generation)) error.value = getErrorMessage(cause, 'Person could not be added.')
+    if (contextIsCurrent()) error.value = getErrorMessage(cause, 'Person could not be added.')
   } finally {
     busy.value = false
   }
 }
 async function addService() {
-  if (!guard(props.canManage) || !selectedResource.value) return
+  const resource = selectedResource.value
+  if (!guard(props.canManage) || !resource) return
   const price = Math.round(Number(service.price) * 100)
   if (
     !service.name.trim() ||
@@ -225,8 +284,7 @@ async function addService() {
     error.value = 'Enter a service name, duration, capacity and a valid price.'
     return
   }
-  const generation = contextGeneration
-  const resourceId = selectedResourceId.value
+  const personIsSelected = () => selectedResource.value?.id === resource.id
   busy.value = true
   try {
     const response = await bookingService.createService(
@@ -237,20 +295,23 @@ async function addService() {
         default_capacity: service.default_capacity,
         price_minor: price,
         currency: service.currency,
-        resource_ids: [resourceId],
+        resource_ids: [resource.id],
         is_active: true,
       },
-      props.organization,
+      owner.organization,
+      () => canDispatchSettings() && personIsSelected(),
     )
-    if (!contextIsCurrent(generation)) return
+    if (!contextIsCurrent()) return
     const created = unwrapItemResponse<BookingService>(response)
     acknowledgedServices.value.push(created)
-    selectedServiceId.value = created.id
-    capacity.value = created.default_capacity
-    notice.value = created.name + ' was added for ' + selectedResource.value?.name + '.'
+    if (personIsSelected()) {
+      selectedServiceId.value = created.id
+      capacity.value = created.default_capacity
+    }
+    notice.value = created.name + ' was added for ' + resource.name + '.'
     emit('serviceCreated', created)
   } catch (cause) {
-    if (contextIsCurrent(generation))
+    if (contextIsCurrent())
       error.value = getErrorMessage(cause, 'Service could not be added. Your person is already saved.')
   } finally {
     busy.value = false
@@ -274,7 +335,6 @@ async function saveSchedule() {
     error.value = 'Choose a person, a compatible service, a date, a start time and a valid capacity.'
     return
   }
-  const generation = contextGeneration
   busy.value = true
   try {
     const response = await bookingService.createEvent(
@@ -290,12 +350,16 @@ async function saveSchedule() {
         status: 'scheduled',
         location: location.value.trim(),
       },
-      props.organization,
+      owner.organization,
+      () =>
+        canDispatchSchedule() &&
+        selectedResource.value?.id === resource.id &&
+        selectedService.value?.id === offering.id,
     )
-    if (!contextIsCurrent(generation)) return
+    if (!contextIsCurrent()) return
     emit('scheduled', unwrapItemResponse<BookingEvent>(response))
   } catch (cause) {
-    if (contextIsCurrent(generation))
+    if (contextIsCurrent())
       error.value = getErrorMessage(
         cause,
         'Schedule could not be saved. Your person and service are preserved.',
@@ -479,7 +543,7 @@ async function saveSchedule() {
                 </option>
               </select>
             </label>
-            <p v-if="compatibleServices.length === 1" class="text-xs text-white/50 light:text-gray-600">
+            <p v-if="compatibleServices.length === 1 && selectedService" class="text-xs text-white/50 light:text-gray-600">
               The one available service is selected for you.
             </p>
             <form

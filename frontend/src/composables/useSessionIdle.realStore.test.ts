@@ -84,6 +84,20 @@ function sharedState() {
   return Object.fromEntries(SHARED_KEYS.map((key) => [key, localStorage.getItem(key)]))
 }
 
+function denyActivityWrites() {
+  const storage = localStorage
+  const deniedWrite = vi.fn((key: string, value: string) => {
+    if (key === 'whm_last_activity') throw new Error('storage denied')
+    // Keep session markers writable so expiry can exercise the actual revoke.
+    storage.setItem(key, value)
+  })
+  vi.stubGlobal('localStorage', {
+    getItem: storage.getItem.bind(storage), setItem: deniedWrite,
+    removeItem: storage.removeItem.bind(storage), clear: storage.clear.bind(storage),
+  })
+  return deniedWrite
+}
+
 // A tab that loads with U1 signed in (session s1), as after a page load.
 async function openTab() {
   vi.resetModules()
@@ -183,6 +197,58 @@ describe('the per-tab session with the real store and API client', () => {
   })
 
 
+  it.each(['reload', 'expired', 'different workspace', 'ordinary navigation', 'peer activity only'] as const)(
+    'a switching tab retains only its observed activity on a matching workspace reload (%s)', async scenario => {
+      const tab = await openTab()
+      const persisted = localStorage.getItem('whm_last_activity')
+      denyActivityWrites()
+      localStorage.setItem('whm_session_idle_minutes', JSON.stringify({
+        'user-1|org-1': 30, 'user-1|org-2': 30, 'user-1|org-3': 30,
+      }))
+      await vi.advanceTimersByTimeAsync(20 * MINUTE)
+      const observedAt = Date.now()
+      if (scenario === 'peer activity only') {
+        expect(tab.activity.rememberSessionActivity(observedAt, 's1', 'user-1|org-1')).toBe(true)
+      } else {
+        window.dispatchEvent(new Event('pointerdown'))
+      }
+      await vi.advanceTimersByTimeAsync(11 * MINUTE)
+      const beforeReload = (await import('@/lib/sessionActivityDiscovery')).prepareWorkspaceActivityReload(tab.store.user, 'org-2')
+      const switched = { ...U1, organization_id: 'org-2' }
+      tab.api.api.defaults.adapter = async config => ({
+        config, data: { data: { user: switched } }, status: 200, statusText: 'OK', headers: {},
+      })
+      await tab.store.switchOrg('org-2')
+      expect(tab.store.user?.organization_id).toBe('org-2')
+      history.replaceState({ position: 7 }, '')
+      beforeReload?.()
+      wrappers.pop()!.unmount()
+      apis.pop()!.disposeForTests()
+      if (scenario === 'expired') vi.setSystemTime(observedAt + 30 * MINUTE)
+      if (scenario === 'different workspace') localStorage.setItem('user', JSON.stringify({ ...U1, organization_id: 'org-3' }))
+      const type = scenario === 'ordinary navigation' ? 'navigate' : 'reload'
+      vi.spyOn(performance, 'getEntriesByType').mockReturnValue([{ type }] as PerformanceNavigationTiming[])
+
+      vi.resetModules()
+      const cold = await import('@/services/api')
+      apis.push(cold)
+      await vi.advanceTimersByTimeAsync(501)
+      await cold.whenLogoutSettled()
+      expect(history.state).toEqual({ position: 7 })
+      if (scenario === 'reload') {
+        expect((await import('@/lib/sessionActivity')).readLastActivity()).toBe(observedAt)
+        expect(localStorage.getItem('whm_last_activity')).toBe(persisted)
+        expect(cold.currentTabSession()).toBe('s1')
+        expect(JSON.parse(localStorage.getItem('user')!).organization_id).toBe('org-2')
+        expect(posts).not.toContain('revoke')
+        expect(posts).not.toContain('/auth/logout')
+      } else {
+        expect(localStorage.getItem('whm_session_id')).toBe('ended:s1')
+        expect(posts.slice(-2)).toEqual(['revoke', '/auth/logout'])
+      }
+    },
+  )
+
   it.each([true, false])('uses isolated tab clocks and activity delivery to prevent false idle revoke (delivery %s)', async (deliverActivity) => {
     // Both clients will reach their proactive-refresh idle guard after the
     // original persisted30minute deadline, so a view-only fix is insufficient.
@@ -196,17 +262,7 @@ describe('the per-tab session with the real store and API client', () => {
     expect(active.activity.readLastActivity).not.toBe(passive.activity.readLastActivity)
     FakeBroadcastChannel.deliverActivity = deliverActivity
     const persisted = localStorage.getItem('whm_last_activity')
-    const storage = localStorage
-    const deniedWrite = vi.fn((key: string, value: string) => {
-      if (key === 'whm_last_activity') throw new Error('storage denied')
-      // Keep the independent session-ending marker writable so the negative
-      // control reaches the real revoke path instead of its ownership refusal.
-      storage.setItem(key, value)
-    })
-    vi.stubGlobal('localStorage', {
-      getItem: storage.getItem.bind(storage), setItem: deniedWrite,
-      removeItem: storage.removeItem.bind(storage), clear: storage.clear.bind(storage),
-    })
+    const deniedWrite = denyActivityWrites()
     expect(() => localStorage.setItem('whm_last_activity', 'denial-probe')).toThrow('storage denied')
     deniedWrite.mockClear()
 
@@ -455,6 +511,104 @@ describe('the per-tab session with the real store and API client', () => {
     window.dispatchEvent(new StorageEvent('storage', { key: 'whm_session_id', newValue: 'ended:s2' }))
     expect(assignedHref).toBe('/login')
     expect(api.readTabSession()).toBeNull()
+  })
+
+  it.each([true, false])('a cold protected page waits for a mounted peer with unwritable activity storage (delivery %s)', async deliverReply => {
+    let replies = 0
+    class QueuedChannel extends FakeBroadcastChannel {
+      override postMessage(data: unknown) {
+        if ((data as { type?: string }).type === 'activity-reply') {
+          replies++
+          if (!deliverReply) return
+        }
+        setTimeout(() => super.postMessage(data), 1)
+      }
+    }
+    vi.stubGlobal('BroadcastChannel', QueuedChannel)
+    await openTab()
+    const persisted = localStorage.getItem('whm_last_activity')
+    const deniedWrite = denyActivityWrites()
+    await vi.advanceTimersByTimeAsync(20 * MINUTE)
+    window.dispatchEvent(new Event('pointerdown'))
+    const activityAt = Date.now()
+    expect(deniedWrite).toHaveBeenCalledWith('whm_last_activity', String(activityAt))
+    await vi.advanceTimersByTimeAsync(11 * MINUTE)
+    expect(localStorage.getItem('whm_last_activity')).toBe(persisted)
+
+    vi.resetModules()
+    const pinia = await import('pinia')
+    pinia.setActivePinia(pinia.createPinia())
+    const cold = await import('@/services/api')
+    apis.push(cold)
+    expect(localStorage.getItem('whm_session_id')).toBe('s1')
+    const coldStore = (await import('@/stores/auth')).useAuthStore()
+    expect(coldStore.restoreSession()).toBe(false)
+    const restore = vi.spyOn(coldStore, 'restoreSession')
+    vi.spyOn(coldStore, 'ensureProductEntitlements').mockResolvedValue(true)
+    const { default: router } = await import('@/router')
+    router.addRoute({ path: '/idle-probe', component: { render: () => null } })
+    router.addRoute({ name: 'login', path: '/login', meta: { requiresAuth: false }, component: { render: () => null } })
+    const navigating = router.push('/idle-probe')
+    const dispatch = vi.fn(async (config) => ({ config, data: {}, status: 200, statusText: 'OK', headers: {} }))
+    cold.api.defaults.adapter = dispatch
+    const read = cold.api.get('/contacts').then(response => response.status, () => null)
+    await flushPromises()
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(restore).not.toHaveBeenCalled()
+    expect(router.currentRoute.value.path).not.toBe('/idle-probe')
+    expect(posts).toEqual([])
+    await vi.advanceTimersByTimeAsync(10)
+    expect(replies).toBe(1)
+    if (!deliverReply) {
+      await vi.advanceTimersByTimeAsync(490)
+      await navigating
+      await cold.whenLogoutSettled()
+      expect(await read).toBeNull()
+      expect(router.currentRoute.value.name).toBe('login')
+      expect(restore).not.toHaveBeenCalled()
+      expect(dispatch).not.toHaveBeenCalled()
+      expect(posts).toEqual(['revoke', '/auth/logout'])
+      return
+    }
+    await navigating
+    expect(await read).toBe(200)
+    expect(router.currentRoute.value.path).toBe('/idle-probe')
+    expect(restore).toHaveBeenCalledTimes(1)
+    expect(coldStore.user?.id).toBe(U1.id)
+    expect((await import('@/lib/sessionActivity')).readLastActivity()).toBe(activityAt)
+    expect(localStorage.getItem('whm_last_activity')).toBe(persisted)
+    expect(dispatch).toHaveBeenCalledTimes(1)
+    expect(posts).toEqual([])
+  })
+
+  it('a mounted peer only reports observed activity for its adopted user within its reply budget', async () => {
+    await openTab()
+    const peer = new FakeBroadcastChannel('whm-session')
+    const replies: Array<{ nonce: string; at: number }> = []
+    peer.onmessage = ({ data }) => { if (data.type === 'activity-reply') replies.push(data) }
+    const query = (n: number, identity = 'user-1|org-1') => peer.postMessage({
+      type: 'activity-query', session: 's1', identity,
+      nonce: `acf00bb0-8822-4aae-a421-${String(n).padStart(12, '0')}`,
+    })
+    query(1)
+    expect(replies).toEqual([]) // mounting and restored storage are not observed input
+    window.dispatchEvent(new Event('pointerdown'))
+    const at = Date.now()
+    await vi.advanceTimersByTimeAsync(100)
+    query(2)
+    query(2)
+    query(3, 'user-2|org-2')
+    localStorage.setItem('user', JSON.stringify(U2))
+    query(4, 'user-2|org-2') // the mounted store still shows U1
+    localStorage.setItem('user', JSON.stringify(U1))
+    for (let n = 5; n <= 12; n++) query(n)
+    expect(replies.map(r => Number(r.nonce.slice(-12)))).toEqual([2, 5, 6, 7])
+    await vi.advanceTimersByTimeAsync(5000)
+    query(7)
+    query(13)
+    expect(replies.map(r => Number(r.nonce.slice(-12)))).toEqual([2, 5, 6, 7, 13])
+    expect(replies.every(r => r.at === at)).toBe(true)
+    peer.close()
   })
 
   it('an identity stored under an ended session is not restored', async () => {

@@ -1,6 +1,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   checkSessionIdlePolicy,
+  canAnswerIdleDiscovery,
   endSessionInBackground,
   keepSessionAlive,
   isTabSessionCurrent,
@@ -9,6 +10,7 @@ import {
   readTabSession,
 } from '@/services/api'
 import { useAuthStore } from '@/stores/auth'
+import { createActivityResponder } from '@/lib/sessionActivityDiscovery'
 import { useCallingStore } from '@/stores/calling'
 import { recordSignOutReason } from '@/lib/sessionSignout'
 import { SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
@@ -73,6 +75,7 @@ function loginPath() {
 
 export function useSessionIdle() {
   const authStore = useAuthStore()
+  const peerActivity = createActivityResponder()
   let callingStore: ReturnType<typeof useCallingStore> | null = null
   try {
     callingStore = useCallingStore()
@@ -230,6 +233,7 @@ export function useSessionIdle() {
     // A call in progress keeps the session alive.
     if (isOnCall()) {
       localLastActivity = now
+      peerActivity.record(now, authStore.user)
       warningOpen.value = false
       if (now - lastSharedAt >= ACTIVITY_SHARE_INTERVAL_MS) shareActivity(now)
       return
@@ -255,6 +259,7 @@ export function useSessionIdle() {
     // Once the warning is up, only "Stay signed in" keeps the session.
     if (warningOpen.value) return
     localLastActivity = now
+    peerActivity.record(now, authStore.user)
     if (now - lastSharedAt >= ACTIVITY_SHARE_INTERVAL_MS) shareActivity(now)
   }
 
@@ -319,7 +324,9 @@ export function useSessionIdle() {
   async function staySignedIn() {
     if (signingOut) return
     warningOpen.value = false
-    shareActivity(Date.now())
+    const now = Date.now()
+    peerActivity.record(now, authStore.user)
+    shareActivity(now)
     try {
       await keepSessionAlive()
     } catch {
@@ -361,6 +368,8 @@ export function useSessionIdle() {
         channel.onmessage = (event: MessageEvent) => {
           if (event.data?.type === 'signed-out') {
             onSignedOutElsewhere(event.data.reason, event.data.session)
+          } else if (event.data?.type === 'activity-query' && channel && isActive() && canAnswerIdleDiscovery()) {
+            peerActivity.reply(event.data, channel, authStore.user)
           } else if (event.data?.type === 'activity' && isActive() && isTabSessionCurrent() &&
                      event.data.session === readTabSession() &&
                      rememberSessionActivity(event.data.at, event.data.session, event.data.identity)) {

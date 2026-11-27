@@ -1629,6 +1629,53 @@ describe('ChannelsView messaging behavior', () => {
     expect(resizeObserver.disconnect).toHaveBeenCalledTimes(1)
   })
 
+  it('continues following when a queued bottom scroll arrives after the next reflow', async () => {
+    setInbox()
+    const view = await mountAndSelectConversation()
+    const observer = mocks.resizeObservers[0]
+    const content = view.get('[data-testid="omnichannel-message-list"]').element
+    const viewport = view.get('[data-testid="omnichannel-message-viewport"]').element as HTMLElement
+    const viewportHeight = 300
+    let contentHeight = 400
+    let top = 100
+    Object.defineProperties(viewport, {
+      clientHeight: { configurable: true, value: viewportHeight },
+      scrollHeight: { configurable: true, get: () => contentHeight },
+      scrollTop: {
+        configurable: true,
+        get: () => top,
+        set: (requested: number) => {
+          top = Math.max(0, Math.min(requested, contentHeight - viewportHeight))
+        },
+      },
+    })
+    const deliverResize = async () => {
+      observer.callback([{
+        target: content,
+        contentRect: { height: contentHeight },
+      } as ResizeObserverEntry], {} as ResizeObserver)
+      await flushPromises()
+    }
+
+    viewport.dispatchEvent(new Event('scroll'))
+    contentHeight = 600
+    await deliverResize()
+    expect(top).toBe(300)
+
+    // The browser queues a scroll event for the write above. Narrowing can
+    // rewrap the messages before that event and its ResizeObserver run.
+    contentHeight = 900
+    viewport.dispatchEvent(new Event('scroll'))
+    await deliverResize()
+    expect(top).toBe(600)
+
+    viewport.scrollTop = 240
+    viewport.dispatchEvent(new Event('scroll'))
+    contentHeight = 1100
+    await deliverResize()
+    expect(top).toBe(240)
+  })
+
   it('disconnects transcript observation when a refresh removes the selected conversation', async () => {
     vi.useFakeTimers()
     try {
