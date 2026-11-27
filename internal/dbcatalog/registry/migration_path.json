@@ -108,6 +108,7 @@
     "internal/handlers/chatbot_graph_types.go",
     "internal/handlers/chatbot_outbound_contract.go",
     "internal/handlers/chatbot_processor.go",
+    "internal/handlers/coexistence_pending_quote.go",
     "internal/handlers/contacts.go",
     "internal/handlers/conversation_notes.go",
     "internal/handlers/cookies.go",
@@ -122,6 +123,9 @@
     "internal/handlers/inbound_continuation.go",
     "internal/handlers/inbound_continuation_admission.go",
     "internal/handlers/inbound_continuation_capacity.go",
+    "internal/handlers/inbox_attachment_scope.go",
+    "internal/handlers/inbox_attachment_storage.go",
+    "internal/handlers/inbox_attachment_storage_linux.go",
     "internal/handlers/inbox_channels.go",
     "internal/handlers/integrations.go",
     "internal/handlers/invitations.go",
@@ -150,6 +154,7 @@
     "internal/handlers/meta_registry_internal.go",
     "internal/handlers/meta_registry_provision.go",
     "internal/handlers/native_ai_booking.go",
+    "internal/handlers/native_media_binding_read.go",
     "internal/handlers/organization.go",
     "internal/handlers/outbound_headers.go",
     "internal/handlers/outgoing_calls.go",
@@ -158,6 +163,7 @@
     "internal/handlers/product_copilot.go",
     "internal/handlers/product_crm.go",
     "internal/handlers/product_templates.go",
+    "internal/handlers/quoted_reply_context.go",
     "internal/handlers/realtime.go",
     "internal/handlers/resellers.go",
     "internal/handlers/roles.go",
@@ -249,5 +255,5 @@
     "pkg/whatsapp/types.go",
     "pkg/whatsapp/webhook.go"
   ],
-  "closure_sha256": "f98ca995c8ba05f324c1d72e447d207b991c6a18f79e0615ed684843ae804473"
+  "closure_sha256": "53c8bad110afa5e64b0db0a7b4f17c19bb59c01d5dc768196bd7364c46e04b7e"
 }

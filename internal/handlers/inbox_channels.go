@@ -58,8 +58,10 @@ type InboxConversationResponse struct {
 }
 
 type InboxMessageResponse struct {
-	Message models.Message       `json:"message"`
-	Parts   []models.MessagePart `json:"parts"`
+	ReplyToMessage          *ReplyPreview        `json:"reply_to_message,omitempty"`
+	ReplyContextUnavailable bool                 `json:"reply_context_unavailable,omitempty"`
+	Message                 models.Message       `json:"message"`
+	Parts                   []models.MessagePart `json:"parts"`
 }
 
 // InboxAttentionSummaryResponse is intentionally content-free so the shared
@@ -424,7 +426,7 @@ func validateInboxReadReceiptMessageIDs(
 }
 
 func (a *App) GetInboxConversationMessages(r *fastglue.Request) error {
-	orgID, _, err := a.requireAuth(r, models.ResourceConversations, models.ActionRead)
+	orgID, userID, err := a.requireAuth(r, models.ResourceConversations, models.ActionRead)
 	if err != nil {
 		return nil
 	}
@@ -432,7 +434,8 @@ func (a *App) GetInboxConversationMessages(r *fastglue.Request) error {
 	if err != nil {
 		return nil
 	}
-	if _, err := loadInboxConversation(a.DB, orgID, conversationID, false); err != nil {
+	conversation, err := loadInboxConversation(a.DB, orgID, conversationID, false)
+	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Conversation not found", nil, "")
 	}
 	pagination := parsePaginationWithDefaults(r, 50, 100)
@@ -494,11 +497,44 @@ func (a *App) GetInboxConversationMessages(r *fastglue.Request) error {
 		}
 	}
 
+	_, legacyAccountErr := channelapi.LegacyMetaWhatsAppAccountID(conversation.ChannelAccount)
+	legacyWhatsApp := legacyAccountErr == nil && conversation.Channel == models.ChannelWhatsApp &&
+		conversation.ChannelAccount.ID == conversation.ChannelAccountID
+	var replyContexts map[uuid.UUID]scopedReplyContext
+	if legacyWhatsApp && len(r.RequestCtx.Request.Header.PeekAll("X-Organization-ID")) == 1 && inboxAttachmentSelectedOrg(r) == orgID {
+		for i := range messages {
+			child := &messages[i]
+			if !hasStoredReplyContext(child) && child.Metadata[models.MessageCoexistencePendingQuoteMetadataKey] == nil {
+				continue
+			}
+			// Optional proof stays in a savepoint so a failure cannot affect
+			// the existing conversation response.
+			if err := a.DB.Transaction(func(tx *gorm.DB) error {
+				reader := a.scopedApp(tx, orgID)
+				reader.Redis = nil
+				scope, err := reader.inboxAttachmentScope(orgID, userID, conversation)
+				if err != nil {
+					return err
+				}
+				replyContexts, err = reader.projectInboxReplyContexts(messages, scope)
+				return err
+			}); err == nil && len(replyContexts) != 0 {
+				r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+			} else if err != nil {
+				replyContexts = nil
+			}
+			break
+		}
+	}
 	response := make([]InboxMessageResponse, len(messages))
 	for i := range messages {
 		response[i] = InboxMessageResponse{
 			Message: messages[i],
 			Parts:   partsByMessage[messages[i].ID],
+		}
+		if quote, ok := replyContexts[messages[i].ID]; ok {
+			response[i].ReplyToMessage = quote.preview
+			response[i].ReplyContextUnavailable = quote.unavailable
 		}
 	}
 	return r.SendEnvelope(listEnvelope("messages", response, total, pagination))

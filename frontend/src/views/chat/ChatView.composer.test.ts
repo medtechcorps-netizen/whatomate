@@ -16,6 +16,7 @@ import ChatDropZoneOverlay from '@/components/chat/ChatDropZoneOverlay.vue'
 
 // The API client is mocked below; retain its current-tab session seam here.
 vi.mock('@/lib/tabSession', () => ({
+  isTabSessionCurrent: () => !localStorage.getItem('whm_session_id')?.startsWith('ended:'),
   currentTabSession: () => {
     const marker = localStorage.getItem('whm_session_id')
     return marker?.startsWith('ended:') ? null : marker
@@ -93,6 +94,9 @@ vi.mock('@/stores/contacts', async () => {
     currentContact: null as Record<string, any> | null,
     messages: [] as Array<Record<string, unknown>>,
     messagesOrganizationScope: '',
+    transcriptAccountFilter: null,
+    ownsReplyContext: () => false,
+    retireReplyContexts: vi.fn(),
     replyingTo: null,
     searchQuery: '',
     selectedTags: [] as string[],

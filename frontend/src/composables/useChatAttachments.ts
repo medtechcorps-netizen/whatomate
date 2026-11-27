@@ -188,8 +188,7 @@ function readStorage(key: string): string | null {
   }
 }
 
-function persistedUser(): { id: string | null; organizationId: string | null } {
-  const raw = readStorage(PERSISTED_USER_STORAGE_KEY)
+function persistedUser(raw: string | null): { id: string | null; organizationId: string | null } {
   if (!raw) return { id: null, organizationId: null }
   try {
     const user = JSON.parse(raw) as { id?: unknown; organization_id?: unknown } | null
@@ -227,9 +226,10 @@ function persistedUser(): { id: string | null; organizationId: string | null } {
 export function readWorkspaceIdentity(
   inMemoryOrganizationId?: string | null,
   inMemoryUserId?: string | number | null,
+  storedUser?: string | null,
 ): string {
   const storedSelection = readStorage(SELECTED_ORGANIZATION_STORAGE_KEY)
-  const persisted = persistedUser()
+  const persisted = persistedUser(storedUser === undefined ? readStorage(PERSISTED_USER_STORAGE_KEY) : storedUser)
   const workspace = storedSelection || persisted.organizationId || inMemoryOrganizationId || ''
   const account = persisted.id || (inMemoryUserId === null || inMemoryUserId === undefined ? '' : String(inMemoryUserId))
   return JSON.stringify([workspace, inMemoryOrganizationId ?? '', account])

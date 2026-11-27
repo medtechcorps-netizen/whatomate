@@ -441,6 +441,9 @@ const MessageBookmarksMetadataKey = "crm_bookmarks_v1"
 // MessageCoexistencePendingQuoteMetadataKey stores an encrypted, row-bound quote reference.
 const MessageCoexistencePendingQuoteMetadataKey = "coexistence_pending_quote_v1"
 
+// MessageNativeMediaRetryMetadataKey stores private retry identity and lease state.
+const MessageNativeMediaRetryMetadataKey = "native_media_retry_v1"
+
 func (Message) TableName() string {
 	return "messages"
 }
@@ -448,10 +451,11 @@ func (Message) TableName() string {
 func (m Message) MarshalJSON() ([]byte, error) {
 	_, hasBookmarks := m.Metadata[MessageBookmarksMetadataKey]
 	_, hasPendingQuote := m.Metadata[MessageCoexistencePendingQuoteMetadataKey]
-	if hasBookmarks || hasPendingQuote {
+	_, hasNativeMediaRetry := m.Metadata[MessageNativeMediaRetryMetadataKey]
+	if hasBookmarks || hasPendingQuote || hasNativeMediaRetry {
 		metadata := make(JSONB, len(m.Metadata))
 		for key, value := range m.Metadata {
-			if key != MessageBookmarksMetadataKey && key != MessageCoexistencePendingQuoteMetadataKey {
+			if key != MessageBookmarksMetadataKey && key != MessageCoexistencePendingQuoteMetadataKey && key != MessageNativeMediaRetryMetadataKey {
 				metadata[key] = value
 			}
 		}

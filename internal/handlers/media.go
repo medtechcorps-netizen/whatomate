@@ -462,6 +462,13 @@ func (a *App) downloadAndSaveMedia(
 	return a.saveTenantMedia(ctx, orgID, path.Join("messages", subdir), subdir, filename, data, mimeType)
 }
 
+func downloadedMediaExtension(mimeType string) string {
+	if ext := getExtensionFromMimeType(mimeType); ext != "" {
+		return ext
+	}
+	return ".bin"
+}
+
 // ServeMedia serves media files from local storage
 // Only authorized users who have access to the message can view the media
 func (a *App) ServeMedia(r *fastglue.Request) error {

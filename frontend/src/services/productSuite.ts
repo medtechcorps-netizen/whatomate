@@ -1,7 +1,7 @@
-import { api } from '@/services/api'
+import { api, getReplyContextMediaBlob } from '@/services/api'
 import type { ContactIdentityReviewEffectiveState } from '@/services/api'
 import { unwrapListResponse } from '@/lib/api-utils'
-import type { AxiosResponse } from 'axios'
+import axios, { type AxiosResponse } from 'axios'
 
 const PRODUCT_PAGE_LIMIT = 100
 const PRODUCT_MAX_PAGES = 200
@@ -1015,6 +1015,31 @@ export const copilotService = {
     api.post(`/copilot/runs/${runId}/feedback`, data),
 }
 
+export interface InboxReadScope {
+  organizationId: string
+  signal: AbortSignal
+  isCurrent: () => boolean
+}
+
+function inboxReadOptions(scope?: InboxReadScope) {
+  if (!scope) return
+  const check = () => {
+    if (!scope.organizationId || scope.signal.aborted || !scope.isCurrent()) {
+      throw new axios.CanceledError('Inbox filter scope changed')
+    }
+  }
+  check()
+  const adapter = axios.getAdapter(api.defaults.adapter)
+  return {
+    headers: { 'X-Organization-ID': scope.organizationId },
+    signal: scope.signal,
+    adapter: (request: Parameters<typeof adapter>[0]) => {
+      check()
+      return adapter(request)
+    },
+  }
+}
+
 export const channelsService = {
   accounts: () => api.get('/channel-accounts'),
   createAccount: (data: Record<string, unknown>) => api.post('/channel-accounts', data),
@@ -1037,8 +1062,23 @@ export const channelsService = {
       headers: { 'X-Organization-ID': explicitOrganizationId },
     })
   },
-  messages: (id: string, params?: { before?: string; limit?: number }) =>
-    api.get(`/conversations/${id}/messages`, { params }),
+  messages: (id: string, params?: { before?: string; limit?: number }, organization?: string | InboxReadScope) =>
+    api.get(`/conversations/${id}/messages`, {
+      params,
+      ...(typeof organization === 'object'
+        ? inboxReadOptions(organization)
+        : { headers: organization ? { 'X-Organization-ID': organization } : undefined }),
+    }),
+  replyContextMedia: (
+    conversationId: string,
+    messageId: string,
+    revision: string,
+    scope: Parameters<typeof getReplyContextMediaBlob>[2],
+    onProgress?: (loaded: number, total?: number) => void,
+  ) => getReplyContextMediaBlob(
+    `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/reply-context-media`,
+    { revision }, scope, onProgress,
+  ),
   send: (id: string, data: Record<string, unknown>) => api.post(`/conversations/${id}/messages`, data),
   replyLegacyWhatsApp: (
     id: string,

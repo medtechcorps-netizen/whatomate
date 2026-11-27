@@ -3,6 +3,9 @@
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { nextTick, ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { InternalAxiosRequestConfig } from 'axios'
+import { api, messagesService } from '@/services/api'
+import { SELECTED_ORGANIZATION_STORAGE_KEY } from '@/lib/browserIdentity'
 import ChannelsView from './ChannelsView.vue'
 import {
   clearLegacyWhatsAppReplyAttemptNamespace,
@@ -41,6 +44,16 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('vue-router', () => ({
   onBeforeRouteLeave: vi.fn(),
+}))
+
+vi.mock('vue-i18n', async importOriginal => ({
+  ...(await importOriginal<typeof import('vue-i18n')>()),
+  useI18n: () => ({ t: (key: string) => key }),
+}))
+
+vi.mock('@/lib/tabSession', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/lib/tabSession')>()),
+  currentTabSession: () => 'session-1',
 }))
 
 vi.mock('@vueuse/core', () => ({
@@ -103,8 +116,9 @@ vi.mock('@/composables/useAppToast', () => ({
   }),
 }))
 
-vi.mock('@/services/productSuite', () => ({
+vi.mock('@/services/productSuite', async importOriginal => ({
   channelsService: {
+    replyContextMedia: (await importOriginal<typeof import('@/services/productSuite')>()).channelsService.replyContextMedia,
     accounts: mocks.accounts,
     conversations: mocks.conversations,
     messages: mocks.messages,
@@ -300,9 +314,62 @@ function setInbox(options: InboxOptions = {}) {
   return { selectedAccount, conversation }
 }
 
+const defaultAdapter = api.defaults.adapter
+let restoreAttachmentStorage: (() => void) | undefined
+const firstAttachmentVersion = 'a'.repeat(64)
+
+function forwardedAttachmentRow(id: string, message_type: string, descriptor?: Record<string, unknown>) {
+  return {
+    message: {
+      id,
+      direction: 'incoming',
+      message_type,
+      content: 'Customer caption',
+      status: 'received',
+      created_at: '2026-08-24T04:00:00Z',
+      media_url: 'https://example.invalid/never-fetch-this',
+    },
+    customer_forwarded: true,
+    forwarded_attachment: descriptor ? { version: firstAttachmentVersion, ...descriptor } : undefined,
+  }
+}
+
+function recordForwardedAttachments(rows: Array<ReturnType<typeof forwardedAttachmentRow>>, storedSelection = true) {
+  setInbox()
+  mocks.messages.mockResolvedValue({ data: { data: { messages: rows, total: rows.length } } })
+  const previous = localStorage.getItem(SELECTED_ORGANIZATION_STORAGE_KEY)
+  restoreAttachmentStorage = () => {
+    if (previous === null) localStorage.removeItem(SELECTED_ORGANIZATION_STORAGE_KEY)
+    else localStorage.setItem(SELECTED_ORGANIZATION_STORAGE_KEY, previous)
+  }
+  if (storedSelection) localStorage.setItem(SELECTED_ORGANIZATION_STORAGE_KEY, 'organization-1')
+  else localStorage.removeItem(SELECTED_ORGANIZATION_STORAGE_KEY)
+  const createURL = vi.fn<(body: Blob) => string>(() => 'blob:omni-forwarded')
+  const revokeURL = vi.fn<(url: string) => void>()
+  vi.stubGlobal('URL', class extends URL {
+    static createObjectURL = createURL
+    static revokeObjectURL = revokeURL
+  })
+  const nativeMedia = vi.spyOn(messagesService, 'getMedia').mockRejectedValue(new Error('Unexpected native media request'))
+  return { createURL, revokeURL, nativeMedia }
+}
+
+function respondWithAttachment(body: Blob | Promise<Blob>) {
+  const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => ({
+    config,
+    data: await body,
+    headers: {},
+    status: 200,
+    statusText: 'OK',
+  }))
+  api.defaults.adapter = adapter
+  return adapter
+}
+
 async function mountAndSelectConversation() {
   wrapper = mount(ChannelsView, {
     global: {
+      mocks: { $t: (key: string) => key },
       stubs: {
         CustomerRevenueWorkspace: true,
         RouterLink: {
@@ -387,10 +454,83 @@ describe('ChannelsView messaging behavior', () => {
   afterEach(() => {
     wrapper?.unmount()
     wrapper = null
+    api.defaults.adapter = defaultAdapter
+    restoreAttachmentStorage?.()
+    restoreAttachmentStorage = undefined
     inboxActivityHandler = null
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })
+
+  it.each(['pending', 'loaded'] as const)(
+    'renders an authorized original photo and retires a %s preview after browser identity changes',
+    async (phase) => {
+      const row = {
+        ...forwardedAttachmentRow('reply-child', 'text'),
+        customer_forwarded: false,
+        reply_to_message: {
+          id: 'original', direction: 'outgoing', message_type: 'image', scoped_context: true,
+          content: { body: '*Back in stock* — delivery is available next week.' }, image_revision: firstAttachmentVersion,
+        },
+      }
+      const missing = {
+        ...forwardedAttachmentRow('missing-original', 'text'),
+        customer_forwarded: false,
+        reply_context_unavailable: true,
+      }
+      const ordinary = {
+        ...forwardedAttachmentRow('ordinary-photo', 'text'),
+        customer_forwarded: false,
+        reply_to_message: {
+          ...row.reply_to_message,
+          scoped_context: undefined,
+          content: { body: 'Ordinary quote caption' },
+        },
+      }
+      const { createURL, revokeURL, nativeMedia } = recordForwardedAttachments([row, missing, ordinary])
+      const pending = deferred<Blob>()
+      const bytes = new Blob(['image bytes'], { type: 'image/jpeg' })
+      if (phase === 'loaded') pending.resolve(bytes)
+      const adapter = respondWithAttachment(pending.promise)
+      const view = await mountAndSelectConversation()
+      const quote = view.get('[data-message-id="reply-child"] [data-testid="reply-context"]')
+      expect(quote.get('strong').text()).toBe('Back in stock')
+      expect(quote.text()).toContain('delivery is available next week')
+      expect(view.find('[data-message-id="ordinary-photo"] [data-testid="reply-context"]').exists()).toBe(false)
+      expect(view.get('[data-message-id="missing-original"]').text()).toContain('chat.replyContextUnavailable')
+      expect(adapter).toHaveBeenCalledTimes(1)
+      const request = adapter.mock.calls[0]![0]
+      expect(request.url).toBe('/conversations/conversation-1/messages/reply-child/reply-context-media')
+      expect(request.headers.get('X-Organization-ID')).toBe('organization-1')
+      expect(request.params).toEqual({ revision: firstAttachmentVersion })
+      expect(request.responseType).toBe('blob')
+      expect(request).toHaveProperty('skipAuthRefresh', true)
+
+      const previousUser = localStorage.getItem('user')
+      const replacementUser = JSON.stringify({ id: 'another-agent', organization_id: 'organization-1' })
+      try {
+        if (phase === 'loaded') expect(quote.get('img').attributes('src')).toBe('blob:omni-forwarded')
+        localStorage.setItem('user', replacementUser)
+        if (phase === 'pending') {
+          // The recorded response arrives before the storage event or Pinia update.
+          pending.resolve(bytes)
+          await flushPromises()
+          expect(createURL).not.toHaveBeenCalled()
+        }
+        window.dispatchEvent(new StorageEvent('storage', {
+          key: 'user', oldValue: previousUser, newValue: replacementUser,
+        }))
+        await nextTick()
+        expect(view.find('[data-testid="reply-context"] img').exists()).toBe(false)
+        expect(view.text()).not.toContain('delivery is available next week')
+        if (phase === 'loaded') expect(revokeURL).toHaveBeenCalledWith('blob:omni-forwarded')
+        expect(nativeMedia).not.toHaveBeenCalled()
+      } finally {
+        if (previousUser === null) localStorage.removeItem('user')
+        else localStorage.setItem('user', previousUser)
+      }
+    },
+  )
 
   it('requests the per-user unread view only while its chip is on', async () => {
     setInbox()

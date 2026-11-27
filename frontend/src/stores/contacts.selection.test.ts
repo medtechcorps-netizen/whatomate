@@ -1,20 +1,27 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { nextTick } from 'vue'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Contact, Message } from './contacts'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Contact, Message, ReplyPreview, useContactsStore } from './contacts'
 
 const mocks = vi.hoisted(() => ({
   getContact: vi.fn(),
   listContacts: vi.fn(),
   listMessages: vi.fn(),
+  quoteUpdates: vi.fn(),
   sendMessage: vi.fn(),
   sendTemplate: vi.fn(),
   readSelectedOrganizationId: vi.fn((): string | null => null),
+  currentTabSession: vi.fn((): string | null => ''),
 }))
 
 vi.mock('@/lib/browserIdentity', async importOriginal => ({
   ...(await importOriginal<typeof import('@/lib/browserIdentity')>()),
   readSelectedOrganizationId: mocks.readSelectedOrganizationId,
+}))
+
+vi.mock('@/lib/tabSession', async importOriginal => ({
+  ...(await importOriginal<typeof import('@/lib/tabSession')>()),
+  currentTabSession: mocks.currentTabSession,
 }))
 
 vi.mock('@/services/api', () => ({
@@ -24,6 +31,7 @@ vi.mock('@/services/api', () => ({
   },
   messagesService: {
     list: mocks.listMessages,
+    quoteUpdates: mocks.quoteUpdates,
     send: mocks.sendMessage,
     sendTemplate: mocks.sendTemplate,
   },
@@ -94,6 +102,7 @@ describe('contacts store conversation selection', () => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
     mocks.readSelectedOrganizationId.mockReturnValue(null)
+    mocks.currentTabSession.mockReturnValue('')
   })
 
   describe('captured native text send', () => {
@@ -216,6 +225,327 @@ describe('contacts store conversation selection', () => {
       response.resolve({ data: { data: accepted() } })
       await send
       expect(store.messages).toEqual([])
+    })
+  })
+
+  describe('late quote refresh', () => {
+    const organizationId = 'organization-a'
+    const contactId = 'quote-chat'
+    const account = 'account-a'
+    const preview: ReplyPreview = {
+      id: 'original',
+      content: { body: 'Late original' },
+      message_type: 'text',
+      direction: 'incoming',
+    }
+
+    function user(id: string) {
+      const roleId = 'fixture-quote-reader'
+      return {
+        id, email: `${id}@example.test`, full_name: id, organization_id: organizationId,
+        role_id: roleId,
+        role: {
+          id: roleId, name: 'agent', is_system: false,
+          permissions: [{ id: 'chat-read', resource: 'chat', action: 'read' }],
+        },
+      }
+    }
+
+    function pendingQuote(): Message {
+      return {
+        ...message('older-loaded-reply', contactId),
+        whatsapp_account: account,
+        quote_pending: true,
+        is_reply: false,
+        reactions: [{ emoji: '👍' }],
+      }
+    }
+
+    function socketMessage(id: string, whatsappAccount?: string): Message {
+      return {
+        ...message(id, contactId),
+        wamid: `wamid.synthetic-${id}`,
+        whatsapp_account: whatsappAccount,
+        ingested_at: '2026-01-01T00:02:00Z',
+      }
+    }
+
+    function quoteResponse(id: string, reply: ReplyPreview = preview) {
+      return {
+        data: {
+          data: {
+            quote_updates: [{
+              id,
+              reply_to_message_id: preview.id,
+              reply_to_message: reply,
+              // A quote lookup must never replace unrelated transcript state.
+              content: { body: 'Must not be merged' },
+              status: 'failed',
+              whatsapp_account: 'account-b',
+              reactions: [],
+            }],
+          },
+        },
+      }
+    }
+
+    async function loadTranscript(store: ReturnType<typeof useContactsStore>, rows: Message[], selectedAccount: string | null) {
+      store.setCurrentContact(contact(contactId))
+      store.setAccountFilter(selectedAccount)
+      mocks.listMessages.mockResolvedValueOnce({ data: { data: { messages: rows, has_more: true } } })
+      await store.fetchMessages(contactId, { account: selectedAccount ?? undefined })
+    }
+
+    async function openTranscript(rows: Message[], selectedAccount: string | null = account) {
+      const { useAuthStore } = await import('./auth')
+      const { useOrganizationsStore } = await import('./organizations')
+      const { useContactsStore } = await import('./contacts')
+      const auth = useAuthStore()
+      auth.user = user('agent-a')
+      useOrganizationsStore().selectedOrgId = organizationId
+      mocks.readSelectedOrganizationId.mockReturnValue(organizationId)
+      const store = useContactsStore()
+      await loadTranscript(store, rows, selectedAccount)
+      return { store, auth }
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      mocks.quoteUpdates.mockReset()
+      mocks.currentTabSession.mockReturnValue('session-a')
+    })
+
+    afterEach(() => {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    })
+
+    it.each(['message and status', 'status only'] as const)(
+      'coalesces matching %s events and merges only the older loaded reply fields',
+      async events => {
+        const older = pendingQuote()
+        const queued: Message = {
+          ...message('queued-outgoing', contactId),
+          direction: 'outgoing',
+          status: 'pending',
+          whatsapp_account: account,
+          ingested_at: '2026-01-01T00:01:00Z',
+        }
+        const secondQueued = { ...queued, id: 'second-queued-outgoing' }
+        const { store } = await openTranscript([older, queued, secondQueued])
+        const reply = deferred<ReturnType<typeof quoteResponse>>()
+        mocks.quoteUpdates.mockReturnValueOnce(reply.promise)
+
+        if (events === 'message and status') {
+          store.addMessage(socketMessage('original', account))
+          store.addMessage(socketMessage('another-message', account))
+        } else {
+          store.updateMessageStatus(secondQueued.id, 'delivered')
+        }
+        store.updateMessageStatus(queued.id, 'sent')
+        expect(mocks.quoteUpdates).not.toHaveBeenCalled()
+        await vi.runOnlyPendingTimersAsync()
+
+        expect(mocks.quoteUpdates).toHaveBeenCalledExactlyOnceWith(
+          contactId, [older.id], account, organizationId, expect.any(AbortSignal),
+        )
+        expect(store.messages.find(row => row.id === older.id)).toEqual(older)
+        const beforeResponse = JSON.parse(JSON.stringify(store.messages)) as Message[]
+        reply.resolve(quoteResponse(older.id))
+        await reply.promise
+        await nextTick()
+
+        expect(store.messages).toEqual(beforeResponse.map(row => row.id === older.id ? {
+          ...row,
+          quote_pending: false,
+          is_reply: true,
+          reply_to_message_id: preview.id,
+          reply_to_message: preview,
+        } : row))
+        expect(store.messages.find(row => row.id === queued.id)?.status).toBe('sent')
+        expect(store.hasMoreMessages).toBe(true)
+        expect(mocks.listMessages).toHaveBeenCalledTimes(1)
+        expect(mocks.sendMessage).not.toHaveBeenCalled()
+      },
+    )
+
+    it('ignores unrelated account and fieldless events in an all-accounts transcript', async () => {
+      const older = pendingQuote()
+      const otherOutgoing: Message = {
+        ...message('other-outgoing', contactId),
+        direction: 'outgoing',
+        status: 'pending',
+        whatsapp_account: 'account-b',
+      }
+      const { store } = await openTranscript([older, otherOutgoing], null)
+
+      store.addMessage(socketMessage('other-new', 'account-b'))
+      store.addMessage(socketMessage('unknown-account'))
+      store.updateMessageStatus(otherOutgoing.id, 'delivered')
+      await vi.runOnlyPendingTimersAsync()
+
+      expect(store.messages.map(row => row.id)).toEqual(expect.arrayContaining(['other-new', 'unknown-account']))
+      expect(store.messages.find(row => row.id === otherOutgoing.id)?.status).toBe('delivered')
+      expect(store.messages.find(row => row.id === older.id)).toEqual(older)
+      expect(mocks.quoteUpdates).not.toHaveBeenCalled()
+      expect(mocks.listMessages).toHaveBeenCalledTimes(1)
+    })
+
+    it('defers new quote hints until the latest canonical load and ignores the superseded lookup', async () => {
+      const older = pendingQuote()
+      const canonical = { ...older, content: { body: 'Canonical replacement' }, status: 'read' }
+      const { store } = await openTranscript([older])
+      const superseded = deferred<ReturnType<typeof quoteResponse>>()
+      const current = deferred<ReturnType<typeof quoteResponse>>()
+      mocks.quoteUpdates.mockReturnValueOnce(superseded.promise).mockReturnValueOnce(current.promise)
+      store.addMessage(socketMessage('first-original-event', account))
+      await vi.runOnlyPendingTimersAsync()
+      expect(mocks.quoteUpdates).toHaveBeenCalledTimes(1)
+      const supersededSignal = mocks.quoteUpdates.mock.calls[0][4] as AbortSignal
+
+      const response = deferred<MessageListResponse>()
+      mocks.listMessages.mockReturnValueOnce(response.promise)
+      const load = store.fetchMessages(contactId, { account }, { preserveExisting: true })
+      expect(supersededSignal.aborted).toBe(true)
+      store.addMessage(socketMessage('second-original-event', account))
+      await vi.runOnlyPendingTimersAsync()
+      expect(mocks.quoteUpdates).toHaveBeenCalledTimes(1)
+
+      response.resolve({ data: { data: { messages: [canonical], has_more: true } } })
+      await load
+      await vi.runOnlyPendingTimersAsync()
+      expect(mocks.quoteUpdates).toHaveBeenCalledTimes(2)
+      expect(mocks.quoteUpdates).toHaveBeenLastCalledWith(
+        contactId, [older.id], account, organizationId, expect.any(AbortSignal),
+      )
+      const currentSignal = mocks.quoteUpdates.mock.calls[1][4] as AbortSignal
+
+      superseded.resolve(quoteResponse(older.id))
+      await superseded.promise
+      await nextTick()
+      expect(store.messages.find(row => row.id === older.id)).toEqual(canonical)
+      expect(currentSignal.aborted).toBe(false)
+
+      current.resolve(quoteResponse(older.id))
+      await current.promise
+      await nextTick()
+      expect(store.messages.find(row => row.id === older.id)).toEqual({
+        ...canonical,
+        quote_pending: false,
+        is_reply: true,
+        reply_to_message_id: preview.id,
+        reply_to_message: preview,
+      })
+    })
+
+    it('does not request a pending quote without a current reader owner', async () => {
+      const older = pendingQuote()
+      const { store, auth } = await openTranscript([older])
+      const initial = user('agent-a')
+      auth.user = { ...initial, role: { ...initial.role, permissions: [] } }
+
+      store.addMessage(socketMessage('original', account))
+      await vi.runOnlyPendingTimersAsync()
+
+      expect(mocks.quoteUpdates).not.toHaveBeenCalled()
+      expect(store.messages.find(row => row.id === older.id)).toMatchObject({ quote_pending: true, is_reply: false })
+    })
+
+    it.each(['chat', 'contacts'])('drops a pending quote after same-session %s read authority is revoked and restored', async resource => {
+      const older = pendingQuote()
+      const { store, auth } = await openTranscript([older])
+      const initial = user('agent-a')
+      const authorized = {
+        ...initial,
+        role: {
+          ...initial.role,
+          permissions: [...initial.role.permissions, { id: 'contacts-read', resource: 'contacts', action: 'read' }],
+        },
+      }
+      auth.user = authorized
+      const reply = deferred<ReturnType<typeof quoteResponse>>()
+      mocks.quoteUpdates.mockReturnValueOnce(reply.promise)
+      store.addMessage(socketMessage('original', account))
+      await vi.runOnlyPendingTimersAsync()
+      expect(mocks.quoteUpdates).toHaveBeenCalledTimes(1)
+      const signal = mocks.quoteUpdates.mock.calls[0][4] as AbortSignal
+
+      auth.user = {
+        ...authorized,
+        role: { ...authorized.role, permissions: authorized.role.permissions.filter(permission => permission.resource !== resource) },
+      }
+      expect(signal.aborted).toBe(true)
+      auth.user = authorized
+      reply.resolve(quoteResponse(older.id))
+      await reply.promise
+      await nextTick()
+
+      const row = store.messages.find(item => item.id === older.id)
+      expect(row).toMatchObject({ quote_pending: true, is_reply: false })
+      expect(row?.reply_to_message).toBeUndefined()
+      expect(mocks.quoteUpdates).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps an assigned-contact quote lookup after an auth refresh with unchanged read authority', async () => {
+      const older = pendingQuote()
+      const { store, auth } = await openTranscript([older])
+      const reply = deferred<ReturnType<typeof quoteResponse>>()
+      mocks.quoteUpdates.mockReturnValueOnce(reply.promise)
+      store.addMessage(socketMessage('original', account))
+      await vi.runOnlyPendingTimersAsync()
+      expect(mocks.quoteUpdates).toHaveBeenCalledTimes(1)
+      const signal = mocks.quoteUpdates.mock.calls[0][4] as AbortSignal
+
+      auth.user = { ...user('agent-a'), full_name: 'Refreshed profile' }
+      expect(signal.aborted).toBe(false)
+      const scopedPreview: ReplyPreview = { ...preview, scoped_context: true }
+      reply.resolve(quoteResponse(older.id, scopedPreview))
+      await reply.promise
+      await nextTick()
+
+      const row = store.messages.find(item => item.id === older.id)!
+      expect(row).toMatchObject({
+        quote_pending: false, is_reply: true, reply_to_message_id: preview.id, reply_to_message: scopedPreview,
+      })
+      expect(store.ownsReplyContext(row)).toBe(true)
+    })
+
+    it.each(['account', 'identity', 'tab session'] as const)('drops an in-flight quote response after a %s change', async owner => {
+      const older = pendingQuote()
+      const { store, auth } = await openTranscript([older])
+      const reply = deferred<ReturnType<typeof quoteResponse>>()
+      mocks.quoteUpdates.mockReturnValueOnce(reply.promise)
+      store.addMessage(socketMessage('original', account))
+      await vi.runOnlyPendingTimersAsync()
+      expect(mocks.quoteUpdates).toHaveBeenCalledExactlyOnceWith(
+        contactId, [older.id], account, organizationId, expect.any(AbortSignal),
+      )
+      const signal = mocks.quoteUpdates.mock.calls[0][4] as AbortSignal
+
+      if (owner === 'account') {
+        // Return to the same filter before delivery to exercise the generation fence.
+        store.setAccountFilter('account-b')
+        store.setAccountFilter(account)
+        expect(signal.aborted).toBe(true)
+      } else if (owner === 'identity') {
+        store.resetForIdentityChange()
+        auth.user = user('agent-b')
+        await loadTranscript(store, [{ ...older, content: { body: 'Replacement transcript' } }], account)
+        expect(signal.aborted).toBe(true)
+      } else {
+        // A tab session can change before the reactive transcript is reset.
+        mocks.currentTabSession.mockReturnValue('session-b')
+        expect(signal.aborted).toBe(false)
+      }
+      const beforeResponse = JSON.parse(JSON.stringify(store.messages)) as Message[]
+      reply.resolve(quoteResponse(older.id))
+      await reply.promise
+      await nextTick()
+
+      expect(store.messages).toEqual(beforeResponse)
+      expect(store.messages.find(row => row.id === older.id)).toMatchObject({ quote_pending: true, is_reply: false })
+      expect(store.messages.find(row => row.id === older.id)?.reply_to_message).toBeUndefined()
+      expect(mocks.quoteUpdates).toHaveBeenCalledTimes(1)
     })
   })
 
@@ -393,6 +723,84 @@ describe('contacts store conversation selection', () => {
     function messagesResponse(messages: Message[]): MessageListResponse {
       return { data: { data: { messages, has_more: false } } }
     }
+
+    it('requires a fresh authorized transcript read after quote ownership retires', async () => {
+      const { useAuthStore } = await import('./auth')
+      const { useOrganizationsStore } = await import('./organizations')
+      const { useContactsStore } = await import('./contacts')
+      const organizationId = 'organization-a'
+      const account = 'account-a'
+      const chatRead = { id: 'chat-read', resource: 'chat', action: 'read' }
+      const contactsRead = { id: 'contacts-read', resource: 'contacts', action: 'read' }
+      const fullRole = { id: 'role-a', name: 'Reader', is_system: false, permissions: [chatRead, contactsRead] }
+      const user = {
+        id: 'agent-a',
+        email: 'agent-a@example.test',
+        full_name: 'Agent A',
+        organization_id: organizationId,
+        role: fullRole,
+      }
+      const auth = useAuthStore()
+      auth.user = user
+      useOrganizationsStore().selectedOrgId = organizationId
+      mocks.readSelectedOrganizationId.mockReturnValue(organizationId)
+      mocks.currentTabSession.mockReturnValue('session-a')
+
+      const store = useContactsStore()
+      store.setCurrentContact(contact('first'))
+      store.setAccountFilter(account)
+      const storedReply = (): Message => ({
+        ...message('child', 'first'),
+        whatsapp_account: account,
+        is_reply: true,
+        reply_to_message_id: 'parent',
+        reply_to_message: {
+          id: 'parent',
+          content: { body: 'Original image caption' },
+          message_type: 'image',
+          direction: 'outgoing',
+          scoped_context: true,
+          image_revision: 'a'.repeat(64),
+        },
+      })
+      async function readReply() {
+        const protectedReply = storedReply()
+        const ordinaryReply = {
+          ...protectedReply,
+          id: 'ordinary-child',
+          reply_to_message: { ...protectedReply.reply_to_message!, scoped_context: undefined },
+        }
+        mocks.listMessages.mockResolvedValueOnce(messagesResponse([protectedReply, ordinaryReply]))
+        await store.fetchMessages('first', { account })
+        const row = store.messages[0]!
+        expect(store.ownsReplyContext(row)).toBe(true)
+        expect(store.ownsReplyContext(store.messages[1]!)).toBe(false)
+        return row
+      }
+
+      const first = await readReply()
+      expect(mocks.listMessages).toHaveBeenLastCalledWith(
+        'first', { account }, expect.any(AbortSignal),
+        expect.objectContaining({ organizationId, isCurrent: expect.any(Function) }),
+      )
+      // Even with identical ID and nested quote data, a replacement row
+      // introduced outside the authenticated read cannot inherit the proof.
+      store.messages = [{ ...first }]
+      expect(store.ownsReplyContext(store.messages[0]!)).toBe(false)
+
+      const second = await readReply()
+      auth.user = { ...user, role: { ...fullRole, id: 'role-b', permissions: [chatRead] } }
+      expect(auth.hasPermission('chat', 'read')).toBe(true)
+      expect(auth.hasPermission('contacts', 'read')).toBe(false)
+      expect(store.ownsReplyContext(second)).toBe(false)
+
+      auth.user = user
+      expect(auth.hasPermission('contacts', 'read')).toBe(true)
+      expect(store.ownsReplyContext(second)).toBe(false)
+      const latest = await readReply()
+      expect(latest).not.toBe(second)
+      expect(store.ownsReplyContext(second)).toBe(false)
+    })
 
     it('records the workspace the transcript request is sent to when the load starts', async () => {
       const { useAuthStore } = await import('./auth')

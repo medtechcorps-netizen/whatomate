@@ -10,10 +10,12 @@ import (
 	"mime"
 	"net/http"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	channelapi "github.com/shridarpatil/whatomate/internal/channel"
@@ -63,27 +65,29 @@ type ContactResponse struct {
 
 // MessageResponse represents a message for the frontend
 type MessageResponse struct {
-	ID                  uuid.UUID            `json:"id"`
-	ContactID           uuid.UUID            `json:"contact_id"`
-	Direction           models.Direction     `json:"direction"`
-	MessageType         models.MessageType   `json:"message_type"`
-	Content             any                  `json:"content"`
-	MediaURL            string               `json:"media_url,omitempty"`
-	MediaMimeType       string               `json:"media_mime_type,omitempty"`
-	MediaFilename       string               `json:"media_filename,omitempty"`
-	InteractiveData     models.JSONB         `json:"interactive_data,omitempty"`
-	Status              models.MessageStatus `json:"status"`
-	WAMID               string               `json:"wamid"`
-	Error               string               `json:"error_message"`
-	IsReply             bool                 `json:"is_reply"`
-	ReplyToMessageID    *string              `json:"reply_to_message_id,omitempty"`
-	ReplyToMessage      *ReplyPreview        `json:"reply_to_message,omitempty"`
-	Reactions           []ReactionInfo       `json:"reactions,omitempty"`
-	WhatsAppAccount     string               `json:"whatsapp_account,omitempty"`
-	InboxConversationID *uuid.UUID           `json:"inbox_conversation_id,omitempty"`
-	IngestedAt          *time.Time           `json:"ingested_at,omitempty"`
-	CreatedAt           time.Time            `json:"created_at"`
-	UpdatedAt           time.Time            `json:"updated_at"`
+	ID                      uuid.UUID            `json:"id"`
+	ContactID               uuid.UUID            `json:"contact_id"`
+	Direction               models.Direction     `json:"direction"`
+	MessageType             models.MessageType   `json:"message_type"`
+	Content                 any                  `json:"content"`
+	MediaURL                string               `json:"media_url,omitempty"`
+	MediaMimeType           string               `json:"media_mime_type,omitempty"`
+	MediaFilename           string               `json:"media_filename,omitempty"`
+	InteractiveData         models.JSONB         `json:"interactive_data,omitempty"`
+	Status                  models.MessageStatus `json:"status"`
+	WAMID                   string               `json:"wamid"`
+	Error                   string               `json:"error_message"`
+	IsReply                 bool                 `json:"is_reply"`
+	QuotePending            bool                 `json:"quote_pending,omitempty"`
+	ReplyContextUnavailable bool                 `json:"reply_context_unavailable,omitempty"`
+	ReplyToMessageID        *string              `json:"reply_to_message_id,omitempty"`
+	ReplyToMessage          *ReplyPreview        `json:"reply_to_message,omitempty"`
+	Reactions               []ReactionInfo       `json:"reactions,omitempty"`
+	WhatsAppAccount         string               `json:"whatsapp_account,omitempty"`
+	InboxConversationID     *uuid.UUID           `json:"inbox_conversation_id,omitempty"`
+	IngestedAt              *time.Time           `json:"ingested_at,omitempty"`
+	CreatedAt               time.Time            `json:"created_at"`
+	UpdatedAt               time.Time            `json:"updated_at"`
 	// IsForwarded marks an agent forward for the CRM only; the customer
 	// receives an ordinary message.
 	IsForwarded bool `json:"is_forwarded,omitempty"`
@@ -99,10 +103,12 @@ type MessageResponse struct {
 
 // ReplyPreview contains a preview of the replied-to message
 type ReplyPreview struct {
-	ID          string             `json:"id"`
-	Content     any                `json:"content"`
-	MessageType models.MessageType `json:"message_type"`
-	Direction   models.Direction   `json:"direction"`
+	ID            string             `json:"id"`
+	Content       any                `json:"content"`
+	MessageType   models.MessageType `json:"message_type"`
+	Direction     models.Direction   `json:"direction"`
+	ImageRevision string             `json:"image_revision,omitempty"`
+	ScopedContext bool               `json:"scoped_context,omitempty"`
 }
 
 // ReactionInfo represents a reaction on a message
@@ -1266,6 +1272,81 @@ func (a *App) GetContact(r *fastglue.Request) error {
 	return r.SendEnvelope(response)
 }
 
+var errConversationReadForbidden = errors.New("conversation read authority unavailable")
+
+func validConversationAccount(account string) bool {
+	return strings.TrimSpace(account) != "" && utf8.ValidString(account) && utf8.RuneCountInString(account) <= 100
+}
+
+type conversationReadScope struct {
+	allContacts bool
+	hideHistory bool
+	cutoff      time.Time
+}
+
+func (a *App) conversationScopedContacts(orgID, userID, contactID uuid.UUID, allContacts bool) *gorm.DB {
+	contacts := a.DB.Model(&models.Contact{}).Where("contacts.id = ? AND contacts.organization_id = ?", contactID, orgID)
+	if !allContacts {
+		contacts = a.whereContactAssignedTo(contacts, userID, orgID)
+	}
+	return contacts
+}
+
+func (a *App) readConversationScope(orgID, userID, contactID uuid.UUID) (conversationReadScope, error) {
+	var scope conversationReadScope
+	// Use the same permission loader as requireAuth without the Redis cache.
+	// Chat permission itself can be withdrawn while the page is selected.
+	permissions, err := a.getUserPermissionsCached(userID, orgID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return scope, errConversationReadForbidden
+	}
+	if err != nil {
+		return scope, err
+	}
+	if !permissions.IsSuperAdmin && !slices.Contains(permissions.Permissions, models.ResourceChat+":"+models.ActionRead) {
+		return scope, errConversationReadForbidden
+	}
+	scope.allContacts = permissions.IsSuperAdmin || slices.Contains(permissions.Permissions, models.ResourceContacts+":"+models.ActionRead)
+	var contact models.Contact
+	if err := a.conversationScopedContacts(orgID, userID, contactID, scope.allContacts).Select("id").Take(&contact).Error; err != nil {
+		return scope, err
+	}
+	if scope.allContacts {
+		return scope, nil
+	}
+
+	// Recheck just the workspace's current-conversation flag on this bounded
+	// connection. This read does not need cached settings or AI credentials.
+	var settings models.ChatbotSettings
+	err = a.DB.Select("id", "agent_current_conversation_only").
+		Where("organization_id = ? AND whats_app_account = ''", orgID).Take(&settings).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return scope, nil
+	}
+	if err != nil || !settings.AgentAssignment.CurrentConversationOnly {
+		return scope, err
+	}
+	cutoff, err := a.customerConversationCutoff(orgID, userID, []uuid.UUID{contactID})
+	scope.hideHistory = cutoff == nil
+	if cutoff != nil {
+		scope.cutoff = cutoff.UTC()
+	}
+	return scope, err
+}
+
+func (a *App) conversationScopedMessages(
+	orgID, userID, contactID uuid.UUID, account string, scope conversationReadScope,
+) *gorm.DB {
+	contacts := a.conversationScopedContacts(orgID, userID, contactID, scope.allContacts).Select("contacts.id")
+	query := a.DB.Model(&models.Message{}).
+		Where("organization_id = ? AND contact_id = ? AND whats_app_account = ?", orgID, contactID, account).
+		Where("contact_id IN (?)", contacts)
+	if !scope.cutoff.IsZero() {
+		query = query.Where("created_at >= ?", scope.cutoff)
+	}
+	return query
+}
+
 // GetMessages returns messages for a contact
 // Agents can only access messages for their assigned contacts
 // Supports cursor-based pagination with before_id for loading older messages
@@ -1273,6 +1354,23 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+	}
+	args := r.RequestCtx.QueryArgs()
+	var quoteIDs []uuid.UUID
+	if args.Has("quote_ids") {
+		r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+		var ok bool
+		quoteIDs, ok = transcriptQuoteIDs(args)
+		if !ok {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid quote lookup", nil, "")
+		}
+		selectedOrgID, err := a.requireExplicitOrganization(r)
+		if err != nil {
+			return nil
+		}
+		if selectedOrgID != orgID || (a.hasTenantScope() && a.tenantOrgID != orgID) {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+		}
 	}
 	if !a.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
 		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
@@ -1290,31 +1388,14 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "Contact not found", nil, "")
 	}
 
-	// Pagination parameters
-	limit, _ := strconv.Atoi(string(r.RequestCtx.QueryArgs().Peek("limit")))
-	beforeIDStr := string(r.RequestCtx.QueryArgs().Peek("before_id"))
-
-	if limit < 1 || limit > 100 {
-		limit = 50
-	}
-
 	// Build base query
 	msgQuery := a.DB.Where("organization_id = ? AND contact_id = ?", orgID, contactID)
 
 	// Filter by WhatsApp account if specified
-	accountFilter := string(r.RequestCtx.QueryArgs().Peek("account"))
+	accountFilter := string(args.Peek("account"))
 	if accountFilter != "" {
 		msgQuery = msgQuery.Where("whats_app_account = ?", accountFilter)
 	}
-	// Preserve the established GET side effect for cached/older write-capable
-	// clients. New clients opt out for polling and use POST /mark-read with an
-	// exact visible cursor after rendering instead. A chat:read-only principal
-	// may view rows but must not mutate tenant-shared legacy status or send a
-	// provider receipt.
-	acknowledgeRead := !strings.EqualFold(
-		strings.TrimSpace(string(r.RequestCtx.QueryArgs().Peek("acknowledge"))),
-		"false",
-	) && a.HasPermission(userID, models.ResourceChat, models.ActionWrite, orgID)
 
 	conversationRestricted, conversationCutoff, scopeErr := a.customerConversationScope(
 		orgID,
@@ -1329,6 +1410,43 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 		msgQuery = msgQuery.Where("1 = 0")
 	} else if conversationCutoff != nil {
 		msgQuery = msgQuery.Where("created_at >= ?", conversationCutoff.UTC())
+	}
+	if quoteIDs != nil {
+		return a.getTranscriptQuoteUpdates(r, msgQuery, quoteIDs, orgID, contactID, conversationCutoff)
+	}
+
+	limit, _ := strconv.Atoi(string(args.Peek("limit")))
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	beforeIDStr := string(args.Peek("before_id"))
+
+	// Preserve the established GET side effect for cached/older write-capable
+	// clients. New clients opt out for polling and use POST /mark-read with an
+	// exact visible cursor after rendering instead. A chat:read-only principal
+	// may view rows but must not mutate tenant-shared legacy status or send a
+	// provider receipt.
+	acknowledgeRead := !strings.EqualFold(
+		strings.TrimSpace(string(args.Peek("acknowledge"))),
+		"false",
+	) && a.HasPermission(userID, models.ResourceChat, models.ActionWrite, orgID)
+
+	replyScope := func(parent *gorm.DB) *gorm.DB {
+		parent = parent.Where("organization_id = ? AND contact_id = ?", orgID, contactID)
+		if conversationCutoff != nil {
+			parent = parent.Where("created_at >= ?", conversationCutoff.UTC())
+		}
+		return parent
+	}
+
+	projectTranscript := func(messages []models.Message) []MessageResponse {
+		response := a.buildTranscriptMessagesResponse(messages, orgID, contactID, conversationCutoff)
+		if slices.ContainsFunc(response, func(row MessageResponse) bool {
+			return row.ReplyToMessage != nil || row.ReplyContextUnavailable
+		}) {
+			r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+		}
+		return response
 	}
 
 	// Count total messages (with session filter if applied)
@@ -1363,7 +1481,7 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 		}
 		// For loading older messages, order DESC and limit, then reverse
 		var messages []models.Message
-		if err := msgQuery.Preload("ReplyToMessage").
+		if err := msgQuery.Preload("ReplyToMessage", replyScope).
 			Order("COALESCE(ingested_at, created_at) DESC, id DESC").
 			Limit(limit).
 			Find(&messages).Error; err != nil {
@@ -1375,7 +1493,7 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 			messages[i], messages[j] = messages[j], messages[i]
 		}
 
-		response := a.buildMessagesResponse(messages)
+		response := projectTranscript(messages)
 		return r.SendEnvelope(map[string]any{
 			"messages": response,
 			"total":    total,
@@ -1402,7 +1520,7 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 	}
 
 	var messages []models.Message
-	if err := msgQuery.Preload("ReplyToMessage").
+	if err := msgQuery.Preload("ReplyToMessage", replyScope).
 		Order("COALESCE(ingested_at, created_at) ASC, id ASC").
 		Offset(offset).
 		Limit(queryLimit).
@@ -1414,7 +1532,7 @@ func (a *App) GetMessages(r *fastglue.Request) error {
 		a.markMessagesAsRead(orgID, contactID, &contact)
 	}
 
-	response := a.buildMessagesResponse(messages)
+	response := projectTranscript(messages)
 	return r.SendEnvelope(map[string]any{
 		"messages": response,
 		"total":    total,
@@ -1466,12 +1584,7 @@ func (a *App) buildMessagesResponse(messages []models.Message) []MessageResponse
 			replyToID := m.ReplyToMessageID.String()
 			msgResp.ReplyToMessageID = &replyToID
 			if m.ReplyToMessage != nil {
-				msgResp.ReplyToMessage = &ReplyPreview{
-					ID:          m.ReplyToMessage.ID.String(),
-					Content:     map[string]string{"body": m.ReplyToMessage.Content},
-					MessageType: m.ReplyToMessage.MessageType,
-					Direction:   m.ReplyToMessage.Direction,
-				}
+				msgResp.ReplyToMessage = transcriptReplyPreview(m.ReplyToMessage)
 			}
 		}
 
