@@ -542,6 +542,73 @@ describe('Person-first scheduling', () => {
     expect(wrapper!.get<HTMLSelectElement>('[name="schedule-person"]').element.value).toBe('')
   })
 
+  it('retires an inline service waiting for transport when its person becomes inactive', async () => {
+    const pending = deferred<unknown>()
+    mocks.createService.mockReturnValueOnce(pending.promise)
+    const person = resource()
+    open({ resources: [person] })
+    await fillService()
+    await wrapper!.get('form[aria-label="Add service for person"]').trigger('submit')
+    const [payload, organization, isCurrent] = mocks.createService.mock.calls[0]!
+    expect(payload.resource_ids).toEqual([person.id])
+    expect(organization).toBe('org-one')
+    expect(isCurrent()).toBe(true)
+
+    await wrapper!.setProps({ resources: [{ ...person, is_active: false }] })
+    expect(isCurrent()).toBe(false)
+    pending.resolve(envelope(service()))
+    await flushPromises()
+  })
+
+  it('acknowledges a saved inline service for its original person after the catalogue changes', async () => {
+    const pending = deferred<unknown>()
+    mocks.createService.mockReturnValueOnce(pending.promise)
+    const person = resource()
+    const replacement = resource('person-two')
+    const savedService = service('Consultation', [person.id])
+    open({ resources: [person] })
+    await fillService()
+    await wrapper!.get('form[aria-label="Add service for person"]').trigger('submit')
+    await wrapper!.setProps({ resources: [replacement] })
+
+    pending.resolve(envelope(savedService))
+    await flushPromises()
+    expect(wrapper!.emitted('serviceCreated')).toEqual([[savedService]])
+    expect(wrapper!.get('[role="status"]').text()).toBe('Consultation was added for Dr Aina.')
+    const picker = wrapper!.get<HTMLSelectElement>('[name="schedule-person"]')
+    expect(picker.element.value).toBe('')
+    await picker.setValue(replacement.id)
+    expect(wrapper!.get<HTMLSelectElement>('[name="schedule-service"]').element.value).toBe('')
+    expect(mocks.createEvent).not.toHaveBeenCalled()
+  })
+
+  it.each(['permission', 'actor'])('handles a service acknowledgement after a change of %s', async change => {
+    const pending = deferred<unknown>()
+    mocks.createService.mockReturnValueOnce(pending.promise)
+    const savedService = service('Consultation')
+    open({ resources: [resource()] })
+    await fillService()
+    const form = wrapper!.get('form[aria-label="Add service for person"]')
+    await form.trigger('submit')
+    await form.trigger('submit')
+    expect(mocks.createService).toHaveBeenCalledTimes(1)
+    const isCurrent = mocks.createService.mock.calls[0]![2]
+    if (change === 'permission') await wrapper!.setProps({ canManage: false })
+    else mocks.actor = 'new-actor'
+    expect(isCurrent()).toBe(false)
+
+    pending.resolve(envelope(savedService))
+    await flushPromises()
+    if (change === 'permission') {
+      expect(wrapper!.emitted('serviceCreated')).toEqual([[savedService]])
+      expect(wrapper!.get('[role="status"]').text()).toBe('Consultation was added for Dr Aina.')
+    } else {
+      expect(wrapper!.emitted('serviceCreated')).toBeUndefined()
+      expect(wrapper!.find('[role="status"]').exists()).toBe(false)
+    }
+    expect(mocks.createService).toHaveBeenCalledTimes(1)
+  })
+
   it('requires an explicit replacement when the selected person disappears during scheduling', async () => {
     const north = { ...resource(), location: 'North office' }
     const south = { ...resource('person-two'), location: 'South office' }

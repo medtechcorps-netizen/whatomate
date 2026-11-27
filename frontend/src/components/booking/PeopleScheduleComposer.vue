@@ -267,7 +267,8 @@ async function addPerson() {
   }
 }
 async function addService() {
-  if (!guard(props.canManage) || !selectedResource.value) return
+  const resource = selectedResource.value
+  if (!guard(props.canManage) || !resource) return
   const price = Math.round(Number(service.price) * 100)
   if (
     !service.name.trim() ||
@@ -283,7 +284,7 @@ async function addService() {
     error.value = 'Enter a service name, duration, capacity and a valid price.'
     return
   }
-  const resourceId = selectedResourceId.value
+  const personIsSelected = () => selectedResource.value?.id === resource.id
   busy.value = true
   try {
     const response = await bookingService.createService(
@@ -294,18 +295,20 @@ async function addService() {
         default_capacity: service.default_capacity,
         price_minor: price,
         currency: service.currency,
-        resource_ids: [resourceId],
+        resource_ids: [resource.id],
         is_active: true,
       },
       owner.organization,
-      canDispatchSettings,
+      () => canDispatchSettings() && personIsSelected(),
     )
     if (!contextIsCurrent()) return
     const created = unwrapItemResponse<BookingService>(response)
     acknowledgedServices.value.push(created)
-    selectedServiceId.value = created.id
-    capacity.value = created.default_capacity
-    notice.value = created.name + ' was added for ' + selectedResource.value?.name + '.'
+    if (personIsSelected()) {
+      selectedServiceId.value = created.id
+      capacity.value = created.default_capacity
+    }
+    notice.value = created.name + ' was added for ' + resource.name + '.'
     emit('serviceCreated', created)
   } catch (cause) {
     if (contextIsCurrent())
