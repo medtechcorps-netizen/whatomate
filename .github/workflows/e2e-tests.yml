@@ -81,7 +81,7 @@ jobs:
           encryption_key = "synthetic-e2e-key-not-for-production" # gitleaks:allow
 
           [server]
-          host = "0.0.0.0"
+          host = "127.0.0.1"
           port = 8080
           read_timeout = 30
           write_timeout = 30
@@ -176,6 +176,15 @@ jobs:
           TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/whatomate_test
           E2E_SEED_WHATSAPP_ACCOUNTS: "1"
           CI: true
+
+      - name: Qualify staff scheduling against the built application
+        if: ${{ matrix.shard == 1 }}
+        working-directory: frontend
+        timeout-minutes: 5
+        run: node --experimental-strip-types e2e/qualification/run-booking-people-built.ts
+        env:
+          BASE_URL: http://127.0.0.1:8080
+          TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/whatomate_test
 
       - name: Upload Playwright report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

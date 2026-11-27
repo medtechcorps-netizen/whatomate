@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
 }))
 vi.mock('@/services/api', () => ({
   api: {
+    defaults: { adapter: vi.fn() },
     get: mocks.get,
     post: mocks.post,
     put: mocks.put,
@@ -28,12 +29,14 @@ vi.mock('@/services/api', () => ({
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => ({
     hasPermission: mocks.hasPermission,
+    user: { id: 'calendar-test-user' },
     get organizationId() {
       return mocks.organization
     },
   }),
 }))
 vi.mock('@/lib/browserIdentity', () => ({
+  SELECTED_ORGANIZATION_STORAGE_KEY: 'selected_organization_id',
   readSelectedOrganizationId: () => mocks.organization,
 }))
 vi.mock('@/composables/useAppToast', () => ({
@@ -493,7 +496,7 @@ describe('Calendar person-first entry points', () => {
     expect(mocks.post).toHaveBeenCalledTimes(1)
     expect(mocks.post).toHaveBeenCalledWith('/booking/events', expect.objectContaining({
       resource_id: 'resource-one', service_id: 'service-one', timezone: 'Asia/Kuala_Lumpur',
-    }), { headers: { 'X-Organization-ID': 'organization-one' } })
+    }), { headers: { 'X-Organization-ID': 'organization-one' }, adapter: expect.any(Function) })
   })
 
   it('opens Add schedule on an empty catalogue without opening advanced setup', async () => {

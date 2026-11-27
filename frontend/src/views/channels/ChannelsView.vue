@@ -258,6 +258,7 @@ let messageViewportScrollFrame: number | null = null
 let messagesContentResizeObserver: ResizeObserver | null = null
 let messagesContentObservedHeight = 0
 let messageViewportFollowingBottom = true
+let pendingBottomScroll: { viewport: HTMLElement; top: number } | null = null
 let readCursorInFlightKey: string | null = null
 let readCursorCheckQueued = false
 let metaMessengerContextVersion = 0
@@ -795,11 +796,16 @@ async function scrollMessagesToBottom(
   const viewport = messagesViewport.value
   if (!viewport) return
   if (smooth && !prefersReducedMotion() && typeof viewport.scrollTo === 'function') {
+    pendingBottomScroll = null
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
     messageViewportFollowingBottom = true
     return
   }
+  const previousTop = viewport.scrollTop
   viewport.scrollTop = viewport.scrollHeight
+  if (viewport.scrollTop !== previousTop) {
+    pendingBottomScroll = { viewport, top: viewport.scrollTop }
+  }
   messageViewportFollowingBottom = true
 }
 
@@ -1100,7 +1106,14 @@ function scheduleMessageViewportReadCheck() {
 }
 
 function handleMessageViewportScroll() {
-  messageViewportFollowingBottom = isMessageViewportNearBottom()
+  const viewport = messagesViewport.value
+  // A resize can rewrap the transcript before the browser delivers the scroll
+  // event from our last move to the bottom. Its original position still counts.
+  const completedBottomScroll = pendingBottomScroll !== null
+    && pendingBottomScroll.viewport === viewport
+    && pendingBottomScroll.top === viewport.scrollTop
+  pendingBottomScroll = null
+  messageViewportFollowingBottom = completedBottomScroll || isMessageViewportNearBottom()
   scheduleMessageViewportReadCheck()
 }
 

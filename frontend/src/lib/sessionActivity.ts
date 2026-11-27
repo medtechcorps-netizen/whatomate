@@ -130,6 +130,7 @@ export function rememberSessionIdlePolicy(value: unknown, identity: string) {
 }
 
 type ScopedActivity = { session: string; identity: string; at: number }
+export type ActivityScope = Pick<ScopedActivity, 'session' | 'identity'>
 
 // This document's clock is shared by the view and the API client's idle checks.
 // A denied storage write must not leave the refresh path on an older clock.
@@ -142,14 +143,19 @@ function activityIdentityPart(value: unknown): value is string {
     value.trim() === value && !value.includes('|')
 }
 
+export function activityUserIdentity(user: { id?: unknown; organization_id?: unknown } | null): string | null {
+  return activityIdentityPart(user?.id) && activityIdentityPart(user?.organization_id)
+    ? `${user.id}|${user.organization_id}` : null
+}
+
 /** Complete browser identity for activity only; policy-cache parsing is unchanged. */
-export function currentSessionActivityScope(): { session: string; identity: string } | null {
+export function currentSessionActivityScope(): ActivityScope | null {
   const session = currentTabSession()
   if (typeof session !== 'string' || session.trim() === '') return null
   try {
     const user = JSON.parse(localStorage.getItem('user') || 'null')
-    if (!activityIdentityPart(user?.id) || !activityIdentityPart(user?.organization_id)) return null
-    return { session, identity: `${user.id}|${user.organization_id}` }
+    const identity = activityUserIdentity(user)
+    return identity ? { session, identity } : null
   } catch {
     return null
   }

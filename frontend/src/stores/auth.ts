@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '@/services/api'
 import { AUTH_SESSION_EVENT } from '@/lib/authSessionEvent'
+import { pendingIdleStartup } from '@/lib/sessionActivityDiscovery'
 import {
   adoptTabSession,
   browserSessionEnded,
@@ -160,6 +161,7 @@ export const useAuthStore = defineStore('auth', () => {
    * handles 401s and token refresh automatically.
    */
   function restoreSession(): boolean {
+    if (pendingIdleStartup()) return false
     const storedUser = safeGetLocalStorage('user')
 
     // Remove legacy token keys if present
