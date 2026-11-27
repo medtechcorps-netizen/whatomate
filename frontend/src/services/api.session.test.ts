@@ -212,6 +212,92 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     expect(sessionEvents).toContain('refreshed')
   })
 
+  describe.each([
+    ['createResource', '/booking/resources'],
+    ['createService', '/booking/services'],
+    ['createEvent', '/booking/events'],
+  ] as const)('person-first booking %s through Axios', (method, path) => {
+    const payload = { version: 1 }
+    const workspaceKey = 'selected_organization_id'
+    const workspace = 'booking-workspace'
+    const otherWorkspace = 'switched-workspace'
+    const session = 'same-booking-session'
+    const isCurrent = () => localStorage.getItem(workspaceKey) === workspace
+
+    beforeEach(() => {
+      localStorage.setItem(workspaceKey, workspace)
+      localStorage.setItem('whm_session_id', session)
+    })
+
+    function unauthorizedOnce() {
+      return vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+        .mockImplementationOnce(async (config) => { throw httpError(401, config) })
+    }
+
+    it('preserves the authenticated same-workspace replay', async () => {
+      const transport = unauthorizedOnce()
+      await loadTab(transport)
+      const { bookingService } = await import('./productSuite')
+      postSpy.mockResolvedValue(refreshOk())
+
+      await expect(bookingService[method](payload, workspace, isCurrent)).resolves.toMatchObject({ status: 200 })
+
+      expect(postSpy).toHaveBeenCalledTimes(1)
+      expect(postSpy.mock.calls[0]?.[0]).toMatch(/\/api\/auth\/refresh$/)
+      expect(transport).toHaveBeenCalledTimes(2)
+      for (const [config] of transport.mock.calls) {
+        expect(config.method).toBe('post')
+        expect(config.url).toBe(path)
+        expect(config.headers.get('X-Organization-ID')).toBe(workspace)
+        expect(config.headers.get('X-CSRF-Token')).toBe('csrf-token-1')
+        expect(JSON.parse(String(config.data))).toEqual(payload)
+      }
+    })
+
+    it('refuses stale first dispatch after another interceptor changes the workspace', async () => {
+      const transport = vi.fn(async (config: InternalAxiosRequestConfig) => ok(config))
+      const { api } = await loadTab(transport)
+      const { bookingService } = await import('./productSuite')
+      const switchDuringRequest = vi.fn((config: InternalAxiosRequestConfig) => {
+        localStorage.setItem(workspaceKey, otherWorkspace)
+        return config
+      })
+      api.interceptors.request.use(switchDuringRequest)
+
+      await expect(bookingService[method](payload, workspace, isCurrent)).rejects.toMatchObject({
+        code: AxiosError.ERR_CANCELED,
+      })
+
+      expect(switchDuringRequest).toHaveBeenCalledTimes(1)
+      expect(transport).not.toHaveBeenCalled()
+      expect(postSpy).not.toHaveBeenCalled()
+    })
+
+    it('refuses stale same-session replay when the workspace changes during refresh', async () => {
+      const transport = unauthorizedOnce()
+      const { api } = await loadTab(transport)
+      const { bookingService } = await import('./productSuite')
+      const requestChain = vi.fn((config: InternalAxiosRequestConfig) => config)
+      api.interceptors.request.use(requestChain)
+      postSpy.mockImplementation(async () => {
+        localStorage.setItem(workspaceKey, otherWorkspace)
+        return refreshOk()
+      })
+
+      await expect(bookingService[method](payload, workspace, isCurrent)).rejects.toMatchObject({
+        code: AxiosError.ERR_CANCELED,
+      })
+
+      expect(postSpy).toHaveBeenCalledTimes(1)
+      expect(postSpy.mock.calls[0]?.[0]).toMatch(/\/api\/auth\/refresh$/)
+      expect(sessionEvents).toContain('refreshed')
+      expect(localStorage.getItem('whm_session_id')).toBe(session)
+      expect(requestChain).toHaveBeenCalledTimes(2)
+      expect(transport).toHaveBeenCalledTimes(1)
+      expect(transport.mock.calls[0]?.[0].headers.get('X-Organization-ID')).toBe(workspace)
+    })
+  })
+
   it('refreshes once when two tabs hit 401 together (Web Locks queue)', async () => {
     const locks = installWebLocks()
     let rotated = false
@@ -3119,6 +3205,156 @@ describe('session refresh interceptor', { timeout: 20_000 }, () => {
     // The same ordered end as a logout: revoke, then /auth/logout.
     expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
     expect(localStorage.getItem('whm_logout_pending')).toBeNull()
+  })
+
+  function coldDiscoveryFixture() {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel)
+    FakeBroadcastChannel.channels.clear()
+    localStorage.setItem('whm_session_id', 'cold-1')
+    localStorage.setItem('user', JSON.stringify({ id: 'u1', email: 'u1@example.test', organization_id: 'o1' }))
+    setPolicy(30)
+    localStorage.setItem('whm_last_activity', String(Date.now() - 60 * 60_000))
+    const peer = new FakeBroadcastChannel('whm-session')
+    const queries: Array<{ nonce: string; session: string; identity: string }> = []
+    peer.onmessage = ({ data }) => { if (data.type === 'activity-query') queries.push(data) }
+    const order: string[] = []
+    recordPosts(order)
+    return { peer, queries, order }
+  }
+
+  it.each(['silence', 'invalid replies', 'late delivery'] as const)(
+    'cold discovery preserves a single idle teardown after %s', async (scenario) => {
+      const { peer, queries, order } = coldDiscoveryFixture()
+      localStorage.setItem('whm_auth_expires_at', String(Date.now()))
+      const tab = await loadTab(async (config) => ok(config))
+      expect(queries).toHaveLength(1)
+      const reply = { ...queries[0], type: 'activity-reply', at: Date.now() - 100 }
+      const request = expect(tab.api.get('/contacts')).rejects.toBeTruthy()
+      const refresh = expect(tab.keepSessionAlive()).rejects.toBeTruthy()
+      if (scenario === 'invalid replies') {
+        for (const delta of [{ nonce: 'other' }, { session: 'other' }, { identity: 'u2|o1' }, { identity: 'u1|o2' },
+          { at: Date.now() + 1000 }, { at: '1000' }, { at: 0 }, { at: 0.5 }, { at: Date.now() - 30 * 60_000 }]) {
+          peer.postMessage({ ...reply, ...delta })
+        }
+      }
+      await vi.advanceTimersByTimeAsync(499)
+      expect(order).toEqual([])
+      expect(tab.api.defaults.adapter).not.toHaveBeenCalled()
+      expect(localStorage.getItem('whm_session_id')).toBe('cold-1')
+      if (scenario === 'late delivery') {
+        // A suspended document can resume in a message task before its timer runs.
+        vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 2)
+        peer.postMessage(reply)
+      }
+      await vi.advanceTimersByTimeAsync(1)
+      await Promise.all([request, refresh, tab.whenLogoutSettled()])
+      peer.postMessage(reply)
+      expect(queries).toHaveLength(1)
+      expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+      expect(tab.api.defaults.adapter).not.toHaveBeenCalled()
+      expect(localStorage.getItem('user')).toBeNull()
+      expect(localStorage.getItem('whm_session_id')).toBe('ended:cold-1')
+      expect([...FakeBroadcastChannel.channels].filter(c => c.name === 'whm-session')).toEqual([peer])
+      peer.close()
+    },
+  )
+
+  it.each(['replace', 'end', 'dispose'] as const)('cold discovery discards delayed work on %s', async action => {
+    const { peer, queries, order } = coldDiscoveryFixture()
+    const tab = await loadTab(async config => ok(config))
+    const request = expect(tab.api.get('/contacts')).rejects.toBeTruthy()
+    await Promise.resolve()
+    const marker = action === 'replace' ? 'new-lifespan' : action === 'end' ? 'ended:cold-1' : 'cold-1'
+    if (action === 'dispose') tab.disposeForTests()
+    else {
+      localStorage.setItem('whm_session_id', marker)
+      if (action === 'replace') localStorage.setItem('user', JSON.stringify({ id: 'new', organization_id: 'new-org' }))
+      window.dispatchEvent(new StorageEvent('storage', { key: 'whm_session_id', newValue: marker }))
+    }
+    peer.postMessage({ ...queries[0], type: 'activity-reply', at: Date.now() })
+    await vi.advanceTimersByTimeAsync(501)
+    await request
+    expect(tab.api.defaults.adapter).not.toHaveBeenCalled()
+    expect(order).toEqual([])
+    expect(localStorage.getItem('whm_session_id')).toBe(marker)
+    if (action === 'replace') expect(JSON.parse(localStorage.getItem('user')!).id).toBe('new')
+    expect([...FakeBroadcastChannel.channels].filter(c => c.name === 'whm-session')).toEqual([peer])
+    peer.close()
+  })
+
+  it.each(['storage event', 'decision timeout'] as const)(
+    'cold discovery leaves a switched workspace intact on %s', async delivery => {
+      const { peer, queries, order } = coldDiscoveryFixture()
+      const stale = String(Date.now() - 5 * 60 * 60_000)
+      localStorage.setItem('whm_last_activity', stale)
+      const tab = await loadTab(async config => ok(config))
+      const request = expect(tab.api.get('/contacts')).rejects.toBeTruthy()
+      const refresh = expect(tab.keepSessionAlive()).rejects.toBeTruthy()
+      await Promise.resolve()
+      const before = localStorage.getItem('user')
+      const after = JSON.stringify({ id: 'u1', email: 'u1@example.test', organization_id: 'o2' })
+      localStorage.setItem('user', after)
+      if (delivery === 'storage event') {
+        window.dispatchEvent(new StorageEvent('storage', { key: 'user', oldValue: before, newValue: after }))
+      }
+      await vi.advanceTimersByTimeAsync(501)
+      peer.postMessage({ ...queries[0], type: 'activity-reply', at: Date.now() })
+      await Promise.all([request, refresh, tab.whenLogoutSettled()])
+      expect(assignedHref).toBeNull()
+      expect(tab.adoptTabSession()).toBe(false)
+      expect(tab.currentTabSession()).toBeNull()
+      await expect(tab.api.get('/contacts')).rejects.toBeTruthy()
+      expect(tab.api.defaults.adapter).not.toHaveBeenCalled()
+      expect(order).toEqual([])
+      expect(localStorage.getItem('user')).toBe(after)
+      expect(localStorage.getItem('whm_session_id')).toBe('cold-1')
+      expect(localStorage.getItem('whm_last_activity')).toBe(stale)
+
+      await tab.api.post('/auth/login', { email: 'u1@example.test', password: 'fixture' })
+      expect(tab.adoptTabSession()).toBe(true)
+      expect(tab.currentTabSession()).not.toBe('cold-1')
+      peer.close()
+    },
+  )
+
+  it.each(['/login', '/register', '/auth/sso/callback'])('cold discovery preserves immediate public startup on %s', async path => {
+    const { peer, queries, order } = coldDiscoveryFixture()
+    stubLocation(path)
+    const tab = await loadTab(async config => ok(config))
+    await tab.whenLogoutSettled()
+    expect(queries).toEqual([])
+    expect(assignedHref).toBeNull()
+    expect(order).toEqual(['revoke csrf-token-1', 'logout csrf-token-1'])
+    peer.close()
+  })
+
+  it('cold discovery leaves a disabled policy immediately available', async () => {
+    const { peer, queries, order } = coldDiscoveryFixture()
+    setPolicy(0)
+    const tab = await loadTab(async config => ok(config))
+    expect((await tab.api.get('/contacts')).status).toBe(200)
+    expect(queries).toEqual([])
+    expect(order).toEqual([])
+    peer.close()
+  })
+
+  it('cold discovery admits the ordinary 401 refresh and retry only after a valid reply', async () => {
+    const { peer, queries, order } = coldDiscoveryFixture()
+    let attempts = 0
+    const tab = await loadTab(async config => {
+      if (++attempts === 1) throw httpError(401, config)
+      return ok(config)
+    })
+    const request = tab.api.get('/contacts')
+    await vi.advanceTimersByTimeAsync(30)
+    expect(attempts).toBe(0)
+    expect(order).toEqual([])
+    peer.postMessage({ ...queries[0], type: 'activity-reply', at: Date.now() - 100 })
+    expect((await request).status).toBe(200)
+    expect(attempts).toBe(2)
+    expect(order).toEqual(['refresh'])
+    peer.close()
   })
 
   it('announces the session is ending before an expiry clears it', async () => {

@@ -14,10 +14,13 @@ import {
 } from "@/lib/browserIdentity";
 import { clearSignOutReason, recordSignOutReason } from "@/lib/sessionSignout";
 import { registerTabSession } from "@/lib/tabSession";
+import { cancelIdleStartup, consumeWorkspaceReloadActivity, discoverPeerActivity, pendingIdleStartup } from "@/lib/sessionActivityDiscovery";
 import {
+  activityUserIdentity,
   announceSessionEnding,
   clearLastActivity,
   currentPolicyIdentity,
+  currentSessionActivityScope,
   isIdleSessionStale,
   readSessionIdlePolicy,
   recordActivity,
@@ -211,6 +214,8 @@ let logoutRequests: AbortController | null = null;
 // establishes an identity, cleared when it ends or leaves. A tab acts only on
 // ends of this session, and never sends this session's work under another.
 let tabSession: string | null = null;
+// A protected startup which lost its scope can only adopt a new explicit sign-in.
+let retiredIdleStartup = false;
 // The pending logout this tab is responsible for: one it started, took over
 // from a closing tab or resumed on load (kept when its lock wait was deferred).
 let ownedLogout: string | null = null;
@@ -283,6 +288,8 @@ export function readSessionId(): string {
 // beginSessionMarker starts a new logical session. An older logout that has
 // not got through is moot: the jar now holds the new session's cookies.
 function beginSessionMarker(): string {
+  cancelIdleStartup();
+  retiredIdleStartup = false;
   writeStoredValue(LOGOUT_PENDING_KEY, null);
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
   tabSession = id;
@@ -346,6 +353,7 @@ export function isTabSessionCurrent(): boolean {
  * then the identity at hand is not this tab's to show, and the tab leaves.
  */
 export function adoptTabSession(): boolean {
+  if (retiredIdleStartup) return false;
   const marker = readSessionMarker();
   if (isEndedMarker(marker)) {
     tabSession = null;
@@ -545,6 +553,7 @@ function onSessionIssued(expiresInSeconds: unknown) {
  * views drop unsaved-work guards before the identity is cleared.
  */
 export function markSessionEnding() {
+  cancelIdleStartup();
   if (sessionEnding) return;
   sessionEnding = true;
   announceSessionEnding();
@@ -1469,6 +1478,7 @@ function clearStoredIdentity() {
 // the background (finishLogout: revoke, then /auth/logout, ordered on the
 // lock), and a pending record keeps it until it has got through.
 function startServerLogout(identity: string, expected: string | null): boolean {
+  cancelIdleStartup();
   tabSession = null;
   const ended = expected === null ? null : endSessionMarker(expected);
   if (ended === null) {
@@ -1534,6 +1544,45 @@ function idleSessionEnded(): boolean {
   return true;
 }
 
+export function canAnswerIdleDiscovery(): boolean {
+  return isTabSessionCurrent() && !sessionEnding && !pendingLogoutApplies() && !ssoExchangeInterrupted();
+}
+
+// The protected router is still waiting for this document's identity. Cancel
+// its restore in place. A full login-page reload would evaluate idle teardown
+// afresh for the workspace or session which just replaced it.
+function retireIdleStartup() {
+  retiredIdleStartup = true;
+  tabSession = null;
+  markSessionEnding();
+}
+
+function resolveStaleSessionAtStartup(pendingTeardown: boolean) {
+  // Public pages keep their current ordered logout, including before an SSO exchange.
+  if (isOnPublicPage()) {
+    tabSession = readSessionId();
+    endIdleSession(false);
+    return;
+  }
+  const initial = currentSessionActivityScope();
+  if (!initial || pendingTeardown || !canAnswerIdleDiscovery()) {
+    endIdleSession(false);
+    return;
+  }
+  const stillCurrent = () => canAnswerIdleDiscovery() && readTabSession() === initial.session &&
+    currentSessionActivityScope()?.identity === initial.identity;
+  const decide = () => {
+    if (!stillCurrent()) {
+      retireIdleStartup();
+      return false;
+    }
+    if (!isIdleSessionStale()) return true;
+    endIdleSession(false);
+    return false;
+  };
+  if (!discoverPeerActivity(initial, stillCurrent, decide)) endIdleSession(false);
+}
+
 /**
  * Re-reads the organization's inactivity policy (it rides on GET /me). A
  * failure keeps the last-known policy and never refreshes or ends the session.
@@ -1558,6 +1607,8 @@ export async function keepSessionAlive(): Promise<void> {
   // "Stay signed in" or a delayed check never extends an ending session, or
   // one that ended in another tab (a tab still showing it leaves it).
   const marker = readSessionMarker();
+  const startup = pendingIdleStartup();
+  if (startup && (!(await startup) || readSessionMarker() !== marker)) throw sessionChangedError();
   try {
     await ensureFreshSession(readAuthEpoch(), marker);
   } catch (refreshError) {
@@ -1572,6 +1623,8 @@ export async function keepSessionAlive(): Promise<void> {
 
 async function runProactiveRefresh() {
   proactiveRefreshTimer = null;
+  const startup = pendingIdleStartup();
+  if (startup && !(await startup)) return;
   // Hidden tabs wait for visibilitychange; a visible tab keeps the session warm.
   if (document.visibilityState === "hidden") return;
   // No identity stored any more (an end in another tab clears it): a tab
@@ -1645,6 +1698,7 @@ function onDocument<K extends keyof DocumentEventMap>(
  * loaded later reacts to page events.
  */
 export function disposeForTests() {
+  cancelIdleStartup();
   for (const detach of detachers.splice(0)) detach();
   tabChannel?.close();
   tabChannel = null;
@@ -1669,6 +1723,21 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     }
   });
   onWindow("storage", (event) => {
+    if (pendingIdleStartup()) {
+      // Storage events can be queued. A change away and back still retires
+      // the earlier discovery even when the current shared marker matches.
+      if (event.key === "user") {
+        let same = false;
+        try {
+          const before = activityUserIdentity(JSON.parse(event.oldValue ?? "null"));
+          same = before !== null && before === activityUserIdentity(JSON.parse(event.newValue ?? "null"));
+        } catch { /* the replacement cannot be identified */ }
+        if (!same) retireIdleStartup();
+      } else if (event.key === SESSION_MARKER_KEY &&
+                 (event.newValue !== readTabSession() || !isTabSessionCurrent())) {
+        retireIdleStartup();
+      }
+    }
     if (event.key === AUTH_EXPIRES_AT_KEY) scheduleProactiveRefresh();
     // Another tab began a session: this tab's logout requests still in flight
     // must not clear its cookies.
@@ -1682,7 +1751,10 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
     // new one: leave at once, without waiting for a 401.
     if (event.key === SESSION_MARKER_KEY) onSessionChanged();
   });
-  onWindow("pagehide", sendLogoutOnPageHide);
+  onWindow("pagehide", (event) => {
+    if (!event.persisted) cancelIdleStartup();
+    sendLogoutOnPageHide();
+  });
   onWindow("pageshow", (event) => {
     // Back from the back/forward cache: say hello again.
     if (event.persisted) {
@@ -1746,6 +1818,7 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   // (say, an invitation being accepted while another account is stored).
   if (hasStoredUser() && !isEndedMarker(readSessionMarker()) && !isOnPublicPage()) {
     tabSession = readSessionId();
+    if (!pendingAtLoad && canAnswerIdleDiscovery()) consumeWorkspaceReloadActivity();
   }
 
   // A session left idle past the organization's policy (a tab reopened the
@@ -1753,16 +1826,19 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   // before the router or any view renders: with the identity gone, the app
   // opens on the login page, which explains why.
   if (hasStoredUser() && isIdleSessionStale()) {
-    // A public page (an SSO callback page too: its exchange then goes after
-    // this logout) ends it as the browser's, and stays where it is.
-    if (isOnPublicPage()) tabSession = readSessionId();
-    endIdleSession(false);
+    resolveStaleSessionAtStartup(Boolean(pendingAtLoad));
   }
 }
 
 // Request interceptor to add CSRF token and organization header
 api.interceptors.request.use(
-  (config: InternalAxiosRequestConfig) => {
+  async (config: InternalAxiosRequestConfig) => {
+    const startup = pendingIdleStartup();
+    if (startup && (!isSessionlessAuthEndpoint(config.url) ||
+        (requestPath(config.url) === "/auth/refresh" && !(config as AuthAwareRequestConfig)._ssoExchange))) {
+      const scope = sessionScope();
+      if (!(await startup) || sessionScope() !== scope) throw sessionChangedError(config);
+    }
     // Stamp the auth epoch and logical session the request is sent under.
     (config as AuthAwareRequestConfig)._authEpoch = readAuthEpoch();
     (config as AuthAwareRequestConfig)._sessionMarker = readSessionMarker();
@@ -2018,6 +2094,8 @@ api.interceptors.response.use(
     }
 
     // No refresh may race the revoke of a session that is ending.
+    const startup = pendingIdleStartup();
+    if (startup && !(await startup)) return Promise.reject(error);
     if (sessionEnding) {
       return Promise.reject(error);
     }
