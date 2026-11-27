@@ -457,14 +457,14 @@ func (c *Client) FetchTemplates(ctx context.Context, account *Account) ([]MetaTe
 		if after == "" || len(after) > maxTemplateCursorBytes || strings.ContainsFunc(after, func(r rune) bool {
 			return r <= ' ' || r > '~'
 		}) {
-			return nil, errors.New("Meta template pagination returned an invalid continuation cursor")
+			return nil, errors.New("the Meta template API returned an invalid continuation cursor")
 		}
 		if _, repeated := seenCursors[after]; repeated {
-			return nil, errors.New("Meta template pagination repeated a continuation cursor")
+			return nil, errors.New("the Meta template API repeated a continuation cursor")
 		}
 		seenCursors[after] = struct{}{}
 	}
-	return nil, fmt.Errorf("Meta template pagination exceeded %d pages", maxTemplatePages)
+	return nil, fmt.Errorf("template pagination exceeded %d pages while reading from Meta", maxTemplatePages)
 }
 
 // FetchTemplate fetches one template's current name, language and status from

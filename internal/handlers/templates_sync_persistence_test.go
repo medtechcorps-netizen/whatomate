@@ -204,7 +204,7 @@ type templateSyncFailCommitTx struct {
 }
 
 func (tx *templateSyncFailCommitTx) Commit() error {
-	if err := tx.Tx.Rollback(); err != nil {
+	if err := tx.Rollback(); err != nil {
 		return err
 	}
 	return errTemplateSyncPersistence
