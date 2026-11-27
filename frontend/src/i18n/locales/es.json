@@ -429,6 +429,8 @@
     "sendTemplateAction": "Enviar plantilla"
   },
   "contacts": {
+    "recordedForwardFailed": "Reenvío registrado el {time} · Fallido",
+    "recordedForwardUnconfirmed": "Reenvío registrado el {time} · Envío sin confirmar",
     "title": "Contactos",
     "subtitle": "Administre sus contactos e información de clientes",
     "newContact": "Nuevo contacto",

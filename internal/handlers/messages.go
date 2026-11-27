@@ -3188,7 +3188,11 @@ func (a *App) forwardMessage(
 	defer cancel()
 	session := a.forwardSessionApp(ctx)
 
-	if !session.HasPermission(userID, models.ResourceChat, models.ActionRead, orgID) {
+	allowed, permissionErr := session.hasPermissionChecked(userID, models.ResourceChat, models.ActionRead, orgID)
+	if permissionErr != nil && !organizationAccessDenied(permissionErr) {
+		return forwardNotAcceptedRefusal().send(r)
+	}
+	if !allowed {
 		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "You don't have permission to view messages", nil, "")
 	}
 	if !a.allowForward(orgID, userID) {
@@ -3894,7 +3898,10 @@ func (a *App) chatExportAccess(orgID, userID uuid.UUID) (chatExportAccess, error
 	// request-specific scoped App has Redis=nil; no permission cache is written.
 	permissions, err := a.getUserPermissionsCached(userID, orgID)
 	if err != nil {
-		return result, errChatExportDenied
+		if organizationAccessDenied(err) {
+			return result, errChatExportDenied
+		}
+		return result, err
 	}
 	has := func(key string) bool {
 		if permissions.IsSuperAdmin {
@@ -4111,13 +4118,16 @@ func (a *App) chatExportActor(r *fastglue.Request) (uuid.UUID, uuid.UUID, error)
 	defer cancel()
 	root := a.rootApp()
 	if root == nil || root.DB == nil {
-		return uuid.Nil, uuid.Nil, errChatExportDenied
+		return uuid.Nil, uuid.Nil, gorm.ErrInvalidDB
 	}
 	scoped := root.scopedApp(root.DB.WithContext(ctx), uuid.Nil)
 	scoped.Redis = nil
 	orgID, err := scoped.getExplicitOrgID(r)
 	if err != nil {
-		return uuid.Nil, uuid.Nil, errChatExportDenied
+		if organizationAccessDenied(err) || errors.Is(err, errExplicitOrganizationRequired) || errors.Is(err, errExplicitOrganizationInvalid) {
+			return uuid.Nil, uuid.Nil, errChatExportDenied
+		}
+		return uuid.Nil, uuid.Nil, err
 	}
 	var userID uuid.UUID
 	switch value := r.RequestCtx.UserValue("user_id").(type) {
@@ -4132,11 +4142,18 @@ func (a *App) chatExportActor(r *fastglue.Request) (uuid.UUID, uuid.UUID, error)
 		return uuid.Nil, uuid.Nil, errChatExportDenied
 	}
 	var user models.User
-	if scoped.DB.Select("id", "is_super_admin").Where("id = ? AND is_active = ?", userID, true).First(&user).Error != nil {
-		return uuid.Nil, uuid.Nil, errChatExportDenied
+	if err := scoped.DB.Select("id", "is_super_admin").Where("id = ? AND is_active = ?", userID, true).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return uuid.Nil, uuid.Nil, errChatExportDenied
+		}
+		return uuid.Nil, uuid.Nil, err
 	}
 	if !user.IsSuperAdmin {
-		if _, ok := access.OrganizationMembership(scoped.DB, userID, orgID); !ok {
+		_, active, err := access.OrganizationMembershipChecked(scoped.DB, userID, orgID)
+		if err != nil {
+			return uuid.Nil, uuid.Nil, err
+		}
+		if !active {
 			return uuid.Nil, uuid.Nil, errChatExportDenied
 		}
 	}
@@ -4208,7 +4225,7 @@ func parseChatExportRequest(r *fastglue.Request) (chatExportRequest, error) {
 func (a *App) GetChatExportCapabilities(r *fastglue.Request) error {
 	orgID, userID, err := a.chatExportActor(r)
 	if err != nil {
-		return chatExportError(r, errChatExportDenied)
+		return chatExportError(r, err)
 	}
 	ctx, cancel := context.WithTimeout(requestContext(r), 5*time.Second)
 	defer cancel()
@@ -4224,7 +4241,7 @@ func (a *App) GetChatExportCapabilities(r *fastglue.Request) error {
 func (a *App) PreviewChatExport(r *fastglue.Request) error {
 	orgID, userID, err := a.chatExportActor(r)
 	if err != nil {
-		return chatExportError(r, errChatExportDenied)
+		return chatExportError(r, err)
 	}
 	req, err := parseChatExportRequest(r)
 	if err != nil {
@@ -4265,7 +4282,7 @@ func chatExportOwnerKey(orgID, userID uuid.UUID) string {
 func (a *App) CancelChatExport(r *fastglue.Request) error {
 	orgID, userID, err := a.chatExportActor(r)
 	if err != nil {
-		return chatExportError(r, errChatExportDenied)
+		return chatExportError(r, err)
 	}
 	id, err := parsePathUUID(r, "id", "export")
 	if err != nil {
@@ -4316,7 +4333,7 @@ func (d *chatExportDownload) Close() error {
 func (a *App) DownloadChatExport(r *fastglue.Request) error {
 	orgID, userID, err := a.chatExportActor(r)
 	if err != nil {
-		return chatExportError(r, errChatExportDenied)
+		return chatExportError(r, err)
 	}
 	req, err := parseChatExportRequest(r)
 	if err != nil {

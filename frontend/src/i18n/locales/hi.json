@@ -429,6 +429,8 @@
     "sendTemplateAction": "टेम्पलेट भेजें"
   },
   "contacts": {
+    "recordedForwardFailed": "{time} पर फ़ॉरवर्ड दर्ज हुआ · विफल",
+    "recordedForwardUnconfirmed": "{time} पर फ़ॉरवर्ड दर्ज हुआ · भेजने की पुष्टि नहीं हुई",
     "title": "संपर्क",
     "subtitle": "अपने संपर्कों और ग्राहक जानकारी का प्रबंधन करें",
     "newContact": "नया संपर्क",

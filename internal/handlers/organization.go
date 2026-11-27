@@ -386,19 +386,19 @@ func (a *App) MaskContactFields(orgID any, profileName, phoneNumber string) (str
 	return profileName, phoneNumber
 }
 
-// ShouldMaskPhoneNumbers checks if phone masking is enabled for the organization
+// ShouldMaskPhoneNumbers keeps numbers masked if the workspace setting cannot be read.
 func (a *App) ShouldMaskPhoneNumbers(orgID any) bool {
-	var org models.Organization
-	if err := a.DB.Where("id = ?", orgID).First(&org).Error; err != nil {
-		return false
-	}
+	mask, err := a.phoneNumberMaskSetting(orgID)
+	return err != nil || mask
+}
 
-	if org.Settings != nil {
-		if v, ok := org.Settings["mask_phone_numbers"].(bool); ok {
-			return v
-		}
+func (a *App) phoneNumberMaskSetting(orgID any) (bool, error) {
+	var org models.Organization
+	if err := a.DB.Select("settings").Where("id = ?", orgID).First(&org).Error; err != nil {
+		return false, err
 	}
-	return false
+	mask, _ := org.Settings["mask_phone_numbers"].(bool)
+	return mask, nil
 }
 
 // OrganizationResponse represents an organization in API responses
