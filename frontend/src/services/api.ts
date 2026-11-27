@@ -2235,6 +2235,7 @@ export const contactsService = {
     page?: number;
     limit?: number;
     tags?: string;
+    include_forward_activity?: boolean;
     // Inbox filters. unread is team-shared read state (incoming messages not
     // yet read, or a manual "Mark as unread"); assigned=me also counts an
     // active transfer to the current user.

@@ -56,7 +56,7 @@ type AgentAnalyticsResponse struct {
 func (a *App) GetAgentAnalytics(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Unauthorized")
 	}
 
 	// Parse date range
@@ -92,7 +92,12 @@ func (a *App) GetAgentAnalytics(r *fastglue.Request) error {
 
 	// Check if filtering by specific agent (requires analytics permission)
 	var filterAgentID *uuid.UUID
-	if a.HasPermission(userID, models.ResourceAnalytics, models.ActionRead, orgID) && agentIDStr != "" {
+	canReadAnalytics, err := a.hasPermissionChecked(userID, models.ResourceAnalytics, models.ActionRead, orgID)
+	// A confirmed missing grant retains the personal-statistics view.
+	if err != nil && !organizationAccessDenied(err) {
+		return sendOrganizationAccessError(r, err, fasthttp.StatusForbidden, "Access denied")
+	}
+	if canReadAnalytics && agentIDStr != "" {
 		parsedID, err := uuid.Parse(agentIDStr)
 		if err == nil {
 			filterAgentID = &parsedID
@@ -106,7 +111,7 @@ func (a *App) GetAgentAnalytics(r *fastglue.Request) error {
 		response.TrendData = a.calculateTrendData(orgID, periodStart, periodEnd, groupBy, filterAgentID)
 		// Calculate summary for this specific agent
 		a.calculateAgentSummaryStats(orgID, *filterAgentID, periodStart, periodEnd, &response.Summary)
-	} else if !a.HasPermission(userID, models.ResourceAnalytics, models.ActionRead, orgID) {
+	} else if !canReadAnalytics {
 		// Users without analytics permission only see their own stats
 		myStats := a.calculateAgentStats(orgID, userID, periodStart, periodEnd)
 		response.MyStats = &myStats
@@ -116,7 +121,10 @@ func (a *App) GetAgentAnalytics(r *fastglue.Request) error {
 		// Users with analytics permission see all agents
 		a.calculateSummaryStats(orgID, periodStart, periodEnd, &response.Summary)
 		response.TrendData = a.calculateTrendData(orgID, periodStart, periodEnd, groupBy, nil)
-		response.AgentStats = a.calculateAllAgentStats(orgID, periodStart, periodEnd)
+		response.AgentStats, err = a.calculateAllAgentStats(orgID, periodStart, periodEnd)
+		if err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Agent membership could not be checked", nil, "")
+		}
 		// Also include current user's stats (for their own break time tracking)
 		myStats := a.calculateAgentStats(orgID, userID, periodStart, periodEnd)
 		response.MyStats = &myStats
@@ -182,11 +190,11 @@ func (a *App) GetAgentDetails(r *fastglue.Request) error {
 func (a *App) GetAgentComparison(r *fastglue.Request) error {
 	orgID, userID, err := a.getOrgAndUserID(r)
 	if err != nil {
-		return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
+		return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Unauthorized")
 	}
 
-	if !a.HasPermission(userID, models.ResourceAnalytics, models.ActionRead, orgID) {
-		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Access denied", nil, "")
+	if err := a.requireOrgPermission(r, userID, orgID, models.ResourceAnalytics, models.ActionRead, "Access denied"); err != nil {
+		return nil
 	}
 
 	// Parse date range
@@ -209,7 +217,10 @@ func (a *App) GetAgentComparison(r *fastglue.Request) error {
 		periodEnd = now
 	}
 
-	agentStats := a.calculateAllAgentStats(orgID, periodStart, periodEnd)
+	agentStats, err := a.calculateAllAgentStats(orgID, periodStart, periodEnd)
+	if err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusServiceUnavailable, "Agent membership could not be checked", nil, "")
+	}
 
 	return r.SendEnvelope(map[string]any{
 		"agents": agentStats,
@@ -335,10 +346,10 @@ func (a *App) calculateAgentStats(orgID, agentID uuid.UUID, start, end time.Time
 		Where("organization_id = ? AND agent_id = ? AND status = ?", orgID, agentID, models.TransferStatusActive).
 		Count(&stats.ActiveTransfers)
 
-	// Messages sent - count outgoing messages to contacts during agent's active transfers
-	// This captures all messages sent while the agent was handling the conversation
+	// Count confirmed sends to contacts associated with this agent's transfers.
 	a.DB.Model(&models.Message{}).
 		Where("organization_id = ? AND direction = ? AND created_at >= ? AND created_at <= ?", orgID, models.DirectionOutgoing, start, end).
+		Where("status IN ?", []models.MessageStatus{models.MessageStatusSent, models.MessageStatusDelivered, models.MessageStatusRead}).
 		Where("contact_id IN (SELECT contact_id FROM agent_transfers WHERE agent_id = ? AND organization_id = ?)", agentID, orgID).
 		Count(&stats.MessagesSent)
 
@@ -370,7 +381,7 @@ func (a *App) calculateAgentStats(orgID, agentID uuid.UUID, start, end time.Time
 	return stats
 }
 
-func (a *App) calculateAllAgentStats(orgID uuid.UUID, start, end time.Time) []AgentPerformanceStats {
+func (a *App) calculateAllAgentStats(orgID uuid.UUID, start, end time.Time) ([]AgentPerformanceStats, error) {
 	// Get every user who is, or was, an agent of one of this organization's
 	// teams. The team must belong to this organization (another org's teams
 	// do not count). Soft-deleted teams and team memberships are deliberately
@@ -389,7 +400,7 @@ func (a *App) calculateAllAgentStats(orgID uuid.UUID, start, end time.Time) []Ag
 		Order("users.id").
 		Find(&agents).Error; err != nil {
 		a.Log.Error("Failed to fetch agents for analytics", "error", err, "org_id", orgID)
-		return []AgentPerformanceStats{}
+		return nil, err
 	}
 
 	// Same membership rule as the auth layer: a removed membership or a
@@ -402,20 +413,25 @@ func (a *App) calculateAllAgentStats(orgID uuid.UUID, start, end time.Time) []Ag
 	memberships, err := loadOrgMembershipRows(a.DB, agentIDs, orgID)
 	if err != nil {
 		a.Log.Error("Failed to fetch agent memberships for analytics", "error", err, "org_id", orgID)
-		return []AgentPerformanceStats{}
+		return nil, err
 	}
 
 	stats := make([]AgentPerformanceStats, 0, len(agents))
 	for i := range agents {
 		agent := &agents[i]
-		if !orgMembershipRowsValid(a.DB, agent, orgID, memberships[agent.ID]) {
+		valid, err := orgMembershipRowsValid(a.DB, agent, orgID, memberships[agent.ID])
+		if err != nil {
+			a.Log.Error("Failed to check agent membership for analytics", "error", err, "org_id", orgID)
+			return nil, err
+		}
+		if !valid {
 			continue
 		}
 		agentStats := a.calculateAgentStats(orgID, agent.ID, start, end)
 		stats = append(stats, agentStats)
 	}
 
-	return stats
+	return stats, nil
 }
 
 // calculateBreakTime calculates total break time and count for an agent within a time period

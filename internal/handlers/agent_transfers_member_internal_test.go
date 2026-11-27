@@ -57,28 +57,26 @@ func TestOrgMemberUserQuery_SQL(t *testing.T) {
 func TestLookupOrgMemberUser_GuardsWithoutQuery(t *testing.T) {
 	id := uuid.New()
 
-	_, ok := lookupOrgMemberUser(nil, id, id, true)
-	assert.False(t, ok, "nil db")
-
+	_, err := lookupOrgMemberUser(nil, id, id, true)
+	require.ErrorIs(t, err, gorm.ErrInvalidDB)
 	db := dryRunPostgres(t)
-	_, ok = lookupOrgMemberUser(db, uuid.Nil, id, true)
-	assert.False(t, ok, "nil user id")
-	_, ok = lookupOrgMemberUser(db, id, uuid.Nil, true)
-	assert.False(t, ok, "nil org id")
+	_, err = lookupOrgMemberUser(db, uuid.Nil, id, true)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	_, err = lookupOrgMemberUser(db, id, uuid.Nil, true)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
 
 func TestOrgMemberMembershipValid_FailsClosed(t *testing.T) {
 	orgID := uuid.New()
 	homeUser := &models.User{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID}
 
-	assert.False(t, orgMemberMembershipValid(dryRunPostgres(t), nil, orgID), "nil user")
-	assert.False(t, orgMemberMembershipValid(nil, homeUser, orgID), "nil db must not accept the home org")
-	assert.False(t, orgMemberMembershipValid(dryRunPostgres(t), homeUser, uuid.Nil), "nil org")
-
+	require.ErrorIs(t, checkOrgMemberMembership(dryRunPostgres(t), nil, orgID), gorm.ErrRecordNotFound)
+	require.ErrorIs(t, checkOrgMemberMembership(nil, homeUser, orgID), gorm.ErrInvalidDB)
+	require.ErrorIs(t, checkOrgMemberMembership(dryRunPostgres(t), homeUser, uuid.Nil), gorm.ErrRecordNotFound)
 	failing := dryRunPostgres(t)
 	failing.Error = errors.New("membership query failed")
-	assert.False(t, orgMemberMembershipValid(failing, homeUser, orgID),
-		"a failed membership query must reject, not fall back to the home org")
+	require.ErrorIs(t, checkOrgMemberMembership(failing, homeUser, orgID), failing.Error)
+
 }
 
 func TestOrgMemberMembershipValid_HomeOrgFallbackWithoutAnyRow(t *testing.T) {
@@ -88,14 +86,14 @@ func TestOrgMemberMembershipValid_HomeOrgFallbackWithoutAnyRow(t *testing.T) {
 	orgID := uuid.New()
 
 	homeUser := &models.User{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: orgID}
-	assert.True(t, orgMemberMembershipValid(db, homeUser, orgID))
+	assert.NoError(t, checkOrgMemberMembership(db, homeUser, orgID))
 
 	otherUser := &models.User{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: uuid.New()}
-	assert.False(t, orgMemberMembershipValid(db, otherUser, orgID))
+	assert.ErrorIs(t, checkOrgMemberMembership(db, otherUser, orgID), gorm.ErrRecordNotFound)
 
 	// No super-admin bypass.
 	superAdmin := &models.User{BaseModel: models.BaseModel{ID: uuid.New()}, OrganizationID: uuid.New(), IsSuperAdmin: true}
-	assert.False(t, orgMemberMembershipValid(db, superAdmin, orgID))
+	assert.ErrorIs(t, checkOrgMemberMembership(db, superAdmin, orgID), gorm.ErrRecordNotFound)
 }
 
 func TestOrgMembershipRowsValid(t *testing.T) {
@@ -138,11 +136,15 @@ func TestOrgMembershipRowsValid(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, orgMembershipRowsValid(db, tc.user, orgID, tc.rows))
+			valid, err := orgMembershipRowsValid(db, tc.user, orgID, tc.rows)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, valid)
 		})
 	}
 
-	assert.False(t, orgMembershipRowsValid(db, nil, orgID, nil), "nil user")
+	valid, err := orgMembershipRowsValid(db, nil, orgID, nil)
+	require.NoError(t, err)
+	assert.False(t, valid, "nil user")
 }
 
 func TestLoadOrgMembershipRows_IncludesSoftDeletedRows(t *testing.T) {
@@ -172,7 +174,7 @@ func TestLoadOrgMembershipRows_IncludesSoftDeletedRows(t *testing.T) {
 func TestFindOrgMemberUser_SendsSameNotFoundEnvelope(t *testing.T) {
 	for _, label := range []string{"Agent", "User"} {
 		req := testutil.NewGETRequest(t)
-		user, err := findOrgMemberUser(nil, req, uuid.New(), uuid.New(), label, true)
+		user, err := findOrgMemberUser(dryRunPostgres(t), req, uuid.Nil, uuid.New(), label, true)
 
 		assert.Nil(t, user)
 		assert.ErrorIs(t, err, errEnvelopeSent)

@@ -11,7 +11,7 @@ import { contactsService, accountsService, type ImportResult } from '@/services/
 import { toast } from 'vue-sonner'
 import { Plus, Users, Pencil, Trash2, MessageSquare, Download } from 'lucide-vue-next'
 import { getErrorMessage } from '@/lib/api-utils'
-import { formatDate } from '@/lib/utils'
+import { formatDate, formatDateTime } from '@/lib/utils'
 import { contactAddressDisplay, contactDisplayName } from '@/lib/contactAddress'
 import { useSearchPagination } from '@/composables/useSearchPagination'
 import { useRouter } from 'vue-router'
@@ -41,6 +41,7 @@ interface Contact {
   assigned_user_id: string | null
   last_message_at: string | null
   last_message_preview: string
+  latest_forward_activity?: { state: 'failed' | 'unconfirmed'; recorded_at: string }
   unread_count: number
   created_at: string
   updated_at: string
@@ -99,7 +100,8 @@ async function fetchContacts() {
     const response = await contactsService.list({
       search: searchQuery.value || undefined,
       page: currentPage.value,
-      limit: pageSize
+      limit: pageSize,
+      include_forward_activity: true,
     })
     const data = response.data as any
     const responseData = data.data || data
@@ -220,6 +222,9 @@ function getDisplayName(contact: Contact): string {
                   <div class="flex flex-col">
                     <RouterLink :to="`/settings/contacts/${contact.id}`" class="font-medium text-inherit no-underline hover:opacity-80">{{ getDisplayName(contact) }}</RouterLink>
                     <span v-if="contact.last_message_preview" class="text-xs text-muted-foreground truncate max-w-[200px]">{{ contact.last_message_preview }}</span>
+                    <span v-if="contact.latest_forward_activity" class="text-xs text-muted-foreground" data-testid="latest-forward-activity">
+                      {{ t(contact.latest_forward_activity.state === 'failed' ? 'contacts.recordedForwardFailed' : 'contacts.recordedForwardUnconfirmed', { time: formatDateTime(contact.latest_forward_activity.recorded_at) }) }}
+                    </span>
                   </div>
                 </template>
                 <template #cell-phone_number="{ item: contact }">

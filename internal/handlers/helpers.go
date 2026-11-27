@@ -136,35 +136,43 @@ func loadOrgMembershipRows(db *gorm.DB, userIDs []uuid.UUID, orgID uuid.UUID) (m
 // organization (users.organization_id), as findByIDAndOrg did before. A user
 // whose membership was removed (row soft-deleted) is rejected even when
 // orgID is their home organization. Super admins get no bypass.
-func orgMembershipRowsValid(db *gorm.DB, user *models.User, orgID uuid.UUID, rows []models.UserOrganization) bool {
+func orgMembershipRowsValid(db *gorm.DB, user *models.User, orgID uuid.UUID, rows []models.UserOrganization) (bool, error) {
 	if user == nil || orgID == uuid.Nil {
-		return false
+		return false, nil
 	}
 	if len(rows) == 0 {
-		return user.OrganizationID == orgID
+		return user.OrganizationID == orgID, nil
 	}
 	for i := range rows {
 		if rows[i].DeletedAt.Valid {
 			continue
 		}
 		// The live row is unique (idx_user_org_unique ... WHERE deleted_at IS NULL).
-		return access.ResellerDerivedMembershipActive(db, &rows[i])
+		return access.ResellerDerivedMembershipActiveChecked(db, &rows[i])
 	}
-	return false
+	return false, nil
 }
 
-// orgMemberMembershipValid reports whether user is a valid member of orgID
-// under orgMembershipRowsValid. It fails closed: a nil database or a failed
-// membership query rejects the user.
-func orgMemberMembershipValid(db *gorm.DB, user *models.User, orgID uuid.UUID) bool {
-	if db == nil || user == nil || user.ID == uuid.Nil || orgID == uuid.Nil {
-		return false
+// checkOrgMemberMembership returns ErrRecordNotFound only for confirmed absence.
+func checkOrgMemberMembership(db *gorm.DB, user *models.User, orgID uuid.UUID) error {
+	if db == nil {
+		return gorm.ErrInvalidDB
+	}
+	if user == nil || user.ID == uuid.Nil || orgID == uuid.Nil {
+		return gorm.ErrRecordNotFound
 	}
 	byUser, err := loadOrgMembershipRows(db, []uuid.UUID{user.ID}, orgID)
 	if err != nil {
-		return false
+		return err
 	}
-	return orgMembershipRowsValid(db, user, orgID, byUser[user.ID])
+	valid, err := orgMembershipRowsValid(db, user, orgID, byUser[user.ID])
+	if err != nil {
+		return err
+	}
+	if !valid {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 // orgMemberUserQuery scopes a users query to one user who belongs to orgID.
@@ -180,29 +188,29 @@ func orgMemberUserQuery(db *gorm.DB, userID, orgID uuid.UUID, activeOnly bool) *
 // lookupOrgMemberUser returns a non-deleted user who is a valid member of
 // orgID (home organization or user_organizations membership). With
 // activeOnly, deactivated users are rejected as well. It writes no response.
-func lookupOrgMemberUser(db *gorm.DB, userID, orgID uuid.UUID, activeOnly bool) (*models.User, bool) {
-	if db == nil || userID == uuid.Nil || orgID == uuid.Nil {
-		return nil, false
+func lookupOrgMemberUser(db *gorm.DB, userID, orgID uuid.UUID, activeOnly bool) (*models.User, error) {
+	if db == nil {
+		return nil, gorm.ErrInvalidDB
+	}
+	if userID == uuid.Nil || orgID == uuid.Nil {
+		return nil, gorm.ErrRecordNotFound
 	}
 	var user models.User
 	if err := orgMemberUserQuery(db, userID, orgID, activeOnly).First(&user).Error; err != nil {
-		return nil, false
+		return nil, err
 	}
-	if !orgMemberMembershipValid(db, &user, orgID) {
-		return nil, false
+	if err := checkOrgMemberMembership(db, &user, orgID); err != nil {
+		return nil, err
 	}
-	return &user, true
+	return &user, nil
 }
 
-// findOrgMemberUser is the membership-aware counterpart of
-// findByIDAndOrg[models.User]. users.organization_id is only a user's home
-// organization; members working in another organization are recorded in
-// user_organizations, so a home-column lookup wrongly 404s them. On failure it
-// sends the same 404 "<label> not found" envelope and returns errEnvelopeSent.
+// findOrgMemberUser keeps the same not-found response for removed or invisible
+// users and surfaces unavailable membership reads before the caller proceeds.
 func findOrgMemberUser(db *gorm.DB, r *fastglue.Request, userID, orgID uuid.UUID, label string, activeOnly bool) (*models.User, error) {
-	user, ok := lookupOrgMemberUser(db, userID, orgID, activeOnly)
-	if !ok {
-		_ = r.SendErrorEnvelope(fasthttp.StatusNotFound, label+" not found", nil, "")
+	user, err := lookupOrgMemberUser(db, userID, orgID, activeOnly)
+	if err != nil {
+		_ = sendOrganizationAccessError(r, err, fasthttp.StatusNotFound, label+" not found")
 		return nil, errEnvelopeSent
 	}
 	return user, nil

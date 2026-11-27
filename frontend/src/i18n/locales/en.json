@@ -663,6 +663,8 @@
     "sendTemplateAction": "Send Template"
   },
   "contacts": {
+    "recordedForwardFailed": "Forward recorded {time} · Failed",
+    "recordedForwardUnconfirmed": "Forward recorded {time} · Send unconfirmed",
     "title": "Contacts",
     "subtitle": "Manage your contacts and customer information",
     "newContact": "New Contact",

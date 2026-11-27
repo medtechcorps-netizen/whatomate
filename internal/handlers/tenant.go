@@ -35,7 +35,10 @@ func (a *App) Tenant(handler TenantRequestHandler) fastglue.FastRequestHandler {
 			)
 		}
 		organizationID, err := a.getOrgID(r)
-		if err != nil || organizationID == uuid.Nil {
+		if err != nil {
+			return sendOrganizationAccessError(r, err, fasthttp.StatusUnauthorized, "Unauthorized")
+		}
+		if organizationID == uuid.Nil {
 			return r.SendErrorEnvelope(fasthttp.StatusUnauthorized, "Unauthorized", nil, "")
 		}
 		if !a.rlsEnabled() {
