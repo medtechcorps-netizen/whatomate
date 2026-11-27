@@ -1188,7 +1188,7 @@ const identityInventoryAggregateSQL = `,
  direct_phones AS MATERIALIZED (SELECT onboarding_cycle,phone,count(DISTINCT direct_primary_bsuid) AS principals FROM classified WHERE sender_kind='direct' AND phone<>'' GROUP BY onboarding_cycle,phone),
  receipt_shapes AS MATERIALIZED (SELECT r.*,
  matched_hold.id IS NOT NULL AS linked,COALESCE(matched_hold.shape_ok,false) AS hold_shape_ok,
- COALESCE(c.id IS NOT NULL AND c.channel='whatsapp' AND c.provider='meta'
+ COALESCE(c.id IS NOT NULL AND c.channel='whatsapp' AND c.provider='meta_legacy'
  AND c.external_account_id='legacy-account:'||$2::text AND c.legacy_account_id=$2::text AND c.deleted_at IS NULL,false) AS exact_account,
  COALESCE(r.protocol='whatsapp_identity_review_v1' AND r.event_type='review_pending',false) AS protocol_ok,
  COALESCE(r.status IN ('pending','processing','processed','ignored','failed'),false) AS status_ok
@@ -1215,8 +1215,8 @@ GROUP BY 1, 2, 3, 4),
  'derived_reasons_overlap',true,'scope_failure_policy','whole_report_refusal',
  'current_decidability','not_observed','recorded_authentication','stored_shape_not_fresh_verification','complete_visibility',true,
  'shadow_state',CASE WHEN NOT EXISTS(SELECT 1 FROM c) THEN 'absent'
- WHEN EXISTS(SELECT 1 FROM c WHERE channel='whatsapp' AND provider='meta' AND external_account_id='legacy-account:'||$2::text AND legacy_account_id=$2::text AND deleted_at IS NULL) THEN 'live_exact'
- WHEN EXISTS(SELECT 1 FROM c WHERE channel='whatsapp' AND provider='meta' AND external_account_id='legacy-account:'||$2::text AND legacy_account_id=$2::text AND deleted_at IS NOT NULL) THEN 'deleted_exact' ELSE 'contradictory' END,
+ WHEN EXISTS(SELECT 1 FROM c WHERE channel='whatsapp' AND provider='meta_legacy' AND external_account_id='legacy-account:'||$2::text AND legacy_account_id=$2::text AND deleted_at IS NULL) THEN 'live_exact'
+ WHEN EXISTS(SELECT 1 FROM c WHERE channel='whatsapp' AND provider='meta_legacy' AND external_account_id='legacy-account:'||$2::text AND legacy_account_id=$2::text AND deleted_at IS NOT NULL) THEN 'deleted_exact' ELSE 'contradictory' END,
  'counts',pg_catalog.jsonb_build_object(
  'holds',(SELECT count(*) FROM h),
  'supported',(SELECT count(*) FROM h WHERE supported IS TRUE),

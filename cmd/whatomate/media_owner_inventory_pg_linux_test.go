@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"net/url"
 	"os"
 	"os/exec"
@@ -142,6 +143,8 @@ func TestMediaInventoryPGExplicitOwnerStdinTLSAndRefusals(t *testing.T) {
 	planPGOK(t, f.admin.QueryRow(ctx, "SELECT id::text FROM public.organizations WHERE deleted_at IS NULL AND reseller_id IS NOT NULL ORDER BY id LIMIT 1").Scan(&org), "select synthetic organization")
 	account := uuid.New()
 	identityInventoryExec(t, f, "INSERT INTO public.whatsapp_accounts(id,created_at,updated_at,organization_id,name,phone_id,business_id,access_token,is_smb,status) VALUES($1,now(),now(),$2::uuid,'owner-input-fixture','synthetic-phone','synthetic-business','DO_NOT_TRANSFER',true,'active')", account, org)
+	shadow := uuid.New()
+	identityInventoryExec(t, f, "INSERT INTO public.channel_accounts(id,created_at,updated_at,organization_id,channel,provider,name,external_account_id,status,metadata) VALUES($1,now(),now(),$2::uuid,'whatsapp',$3,'synthetic-legacy-shadow','legacy-account:'||$4::text,'active',jsonb_build_object('legacy_account_id',$4::text))", shadow, org, channelapi.LegacyMetaProvider, account.String())
 	ownerURL, err := url.Parse(f.cfg.MigrationURL)
 	require.NoError(t, err)
 	runtimeURL, err := url.Parse(f.cfg.URL)
@@ -150,7 +153,7 @@ func TestMediaInventoryPGExplicitOwnerStdinTLSAndRefusals(t *testing.T) {
 	require.True(t, ok)
 	runtimePassword, ok := runtimeURL.User.Password()
 	require.True(t, ok)
-	for _, scenario := range []string{"owner", "runtime-role", "wrong-password", "wrong-ca", "wrong-hostname", "plaintext", "missing-rls", "cancellation", "input-timeout", "owner-after-refusals"} {
+	for _, scenario := range []string{"owner", "runtime-role", "wrong-password", "wrong-ca", "wrong-hostname", "plaintext", "missing-rls", "cancellation", "input-timeout", "nonlegacy-meta-provider", "owner-after-refusals"} {
 		t.Run(scenario, func(t *testing.T) {
 			base := t.TempDir()
 			outDir := filepath.Join(base, "output")
@@ -168,6 +171,12 @@ func TestMediaInventoryPGExplicitOwnerStdinTLSAndRefusals(t *testing.T) {
 			configBytes := []byte(fmt.Sprintf("[app]\nenvironment=\"test\"\n[database]\nurl=%q\nmigration_url=\"postgres://forbidden:unused@other.invalid/unused\"\n", configured.String()))
 			configPath := filepath.Join(base, "config.toml")
 			require.NoError(t, os.WriteFile(configPath, configBytes, 0600))
+			if scenario == "nonlegacy-meta-provider" {
+				identityInventoryExec(t, f, "UPDATE public.channel_accounts SET provider='meta' WHERE id=$1", shadow)
+				t.Cleanup(func() {
+					identityInventoryExec(t, f, "UPDATE public.channel_accounts SET provider=$1 WHERE id=$2", channelapi.LegacyMetaProvider, shadow)
+				})
+			}
 			username, password, trust := f.owner, ownerPassword, string(ca)
 			if scenario == "runtime-role" {
 				username, password = f.runtime, runtimePassword

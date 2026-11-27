@@ -3,6 +3,7 @@ package mediaretirement
 import (
 	"encoding/json"
 	"fmt"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"strings"
 	"testing"
 )
@@ -19,8 +20,8 @@ CREATE TABLE IF NOT EXISTS public.whatsapp_coexistence_states(id uuid PRIMARY KE
 TRUNCATE public.whatsapp_accounts,public.channel_accounts,public.whatsapp_coexistence_states;`)
 	pg(t, fmt.Sprintf(`INSERT INTO public.organizations VALUES('%s','2026-11-03T00:00:00Z',NULL,'{"private":"DO_NOT_TRANSFER"}');
 INSERT INTO public.whatsapp_accounts VALUES('%s','%s','current name','phone-id','connected',true,'2026-11-03T00:00:00Z',NULL,'DO_NOT_TRANSFER');
-INSERT INTO public.channel_accounts VALUES('%s','%s','whatsapp','meta','legacy-account:%s','{"legacy_account_id":"%s","access_token":"DO_NOT_TRANSFER"}','2026-11-03T00:00:00Z',NULL);
-INSERT INTO public.whatsapp_coexistence_states VALUES('80000000-0000-0000-0000-000000000001','%s','%s',1,2,'connected','2026-11-03T00:00:00Z');`, org, scopeAccount, org, scopeChannel, org, scopeAccount, scopeAccount, org, scopeAccount))
+INSERT INTO public.channel_accounts VALUES('%s','%s','whatsapp','%s','legacy-account:%s','{"legacy_account_id":"%s","access_token":"DO_NOT_TRANSFER"}','2026-11-03T00:00:00Z',NULL);
+INSERT INTO public.whatsapp_coexistence_states VALUES('80000000-0000-0000-0000-000000000001','%s','%s',1,2,'connected','2026-11-03T00:00:00Z');`, org, scopeAccount, org, scopeChannel, org, channelapi.LegacyMetaProvider, scopeAccount, scopeAccount, org, scopeAccount))
 }
 
 func scopeRaw(t *testing.T) []byte {
@@ -65,6 +66,7 @@ func TestScopePostgresRefusesAmbiguousOrContradictoryClaims(t *testing.T) {
 		{"channel-missing-selector", "UPDATE public.channel_accounts SET metadata='{}'"},
 		{"channel-object-selector", `UPDATE public.channel_accounts SET metadata='{"legacy_account_id":{"content":"DO_NOT_TRANSFER"}}'`},
 		{"channel-wrong-external", "UPDATE public.channel_accounts SET external_account_id='wrong'"},
+		{"channel-nonlegacy-meta-provider", "UPDATE public.channel_accounts SET provider='meta'"},
 		{"channel-wrong-provider", "UPDATE public.channel_accounts SET provider='other'"},
 		{"channel-wrong-organization", "UPDATE public.channel_accounts SET organization_id='10000000-0000-0000-0000-000000000002'"},
 		{"channel-deleted", "UPDATE public.channel_accounts SET deleted_at=now()"},

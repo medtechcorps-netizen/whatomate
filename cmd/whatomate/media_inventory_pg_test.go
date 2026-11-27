@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	channelapi "github.com/shridarpatil/whatomate/internal/channel"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +24,8 @@ func TestMediaInventoryPGInstalledSchemaPrivateCommand(t *testing.T) {
 	planPGOK(t, f.admin.QueryRow(ctx, "SELECT id::text FROM public.organizations WHERE deleted_at IS NULL AND reseller_id IS NOT NULL ORDER BY id LIMIT 1").Scan(&org), "select synthetic organization")
 	account := uuid.New()
 	identityInventoryExec(t, f, "INSERT INTO public.whatsapp_accounts(id,created_at,updated_at,organization_id,name,phone_id,business_id,access_token,is_smb,status) VALUES($1,now(),now(),$2::uuid,'media-inventory-fixture','synthetic-phone','synthetic-business','DO_NOT_TRANSFER',true,'active')", account, org)
+	shadow := uuid.New()
+	identityInventoryExec(t, f, "INSERT INTO public.channel_accounts(id,created_at,updated_at,organization_id,channel,provider,name,external_account_id,status,metadata) VALUES($1,now(),now(),$2::uuid,'whatsapp',$3,'synthetic-legacy-shadow','legacy-account:'||$4::text,'active',jsonb_build_object('legacy_account_id',$4::text))", shadow, org, channelapi.LegacyMetaProvider, account.String())
 	ownerCfg := f.cfg
 	ownerCfg.URL = f.cfg.MigrationURL
 	ownerCfg.MigrationURL = "must-not-be-used"
