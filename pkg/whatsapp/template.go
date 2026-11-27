@@ -402,23 +402,69 @@ func (c *Client) buildStandardComponents(template *TemplateSubmission) ([]map[st
 	return components, nil
 }
 
-// FetchTemplates fetches all templates from Meta's API
+const (
+	maxTemplatePages       = 100
+	maxTemplateCursorBytes = 4096
+)
+
+// FetchTemplates returns the complete template list for the selected account.
 func (c *Client) FetchTemplates(ctx context.Context, account *Account) ([]MetaTemplate, error) {
-	url := fmt.Sprintf("%s?fields=id,name,language,category,status,components,quality_score,quality_rating&limit=100", c.buildTemplatesURL(account))
-
-	respBody, err := c.doRequest(ctx, http.MethodGet, url, nil, account.AccessToken)
-	if err != nil {
-		c.Log.Error("Failed to fetch templates", "error", err)
-		return nil, err
+	if c == nil || c.HTTPClient == nil {
+		return nil, errors.New("WhatsApp HTTP client is not configured")
+	}
+	// The previous single request used the configured HTTP timeout. Apply the
+	// same budget to the complete list, without extending a caller's deadline.
+	if c.HTTPClient.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.HTTPClient.Timeout)
+		defer cancel()
 	}
 
-	var result TemplateListResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
+	endpoint := c.buildTemplatesURL(account)
+	var after string
+	templates := make([]MetaTemplate, 0)
+	seenCursors := make(map[string]struct{})
+	for pageNumber := 1; pageNumber <= maxTemplatePages; pageNumber++ {
+		body, err := c.doRequest(ctx, http.MethodGet, templateListPageURL(endpoint, after), nil, account.AccessToken)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// HTTP errors can contain the request URL or provider response. Do
+			// not pass an opaque cursor into logs or the handler error.
+			var status *MetaHTTPError
+			if errors.As(err, &status) {
+				return nil, fmt.Errorf("failed to fetch template page %d: HTTP status %d", pageNumber, status.StatusCode)
+			}
+			return nil, fmt.Errorf("failed to fetch template page %d", pageNumber)
+		}
+		var page TemplateListResponse
+		if err := json.Unmarshal(body, &page); err != nil || page.Data == nil {
+			return nil, fmt.Errorf("invalid template page %d from Meta", pageNumber)
+		}
+		templates = append(templates, page.Data...)
+		if page.Paging.Next == "" {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			c.Log.Info("Fetched templates from Meta", "count", len(templates))
+			return templates, nil
+		}
 
-	c.Log.Info("Fetched templates from Meta", "count", len(result.Data))
-	return result.Data, nil
+		// Next is only a continuation signal. Only the after token becomes
+		// query data on the exact same endpoint, including on an empty page.
+		after = page.Paging.Cursors.After
+		if after == "" || len(after) > maxTemplateCursorBytes || strings.ContainsFunc(after, func(r rune) bool {
+			return r <= ' ' || r > '~'
+		}) {
+			return nil, errors.New("Meta template pagination returned an invalid continuation cursor")
+		}
+		if _, repeated := seenCursors[after]; repeated {
+			return nil, errors.New("Meta template pagination repeated a continuation cursor")
+		}
+		seenCursors[after] = struct{}{}
+	}
+	return nil, fmt.Errorf("Meta template pagination exceeded %d pages", maxTemplatePages)
 }
 
 // FetchTemplate fetches one template's current name, language and status from

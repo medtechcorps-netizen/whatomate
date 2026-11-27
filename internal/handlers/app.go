@@ -303,6 +303,28 @@ func (a *App) requireExplicitOrganization(r *fastglue.Request) (uuid.UUID, error
 	return uuid.Nil, errEnvelopeSent
 }
 
+// requireMatchingExplicitOrganization preserves headerless callers while
+// preventing an explicit workspace from falling back to another tenant.
+func (a *App) requireMatchingExplicitOrganization(r *fastglue.Request, orgID uuid.UUID) bool {
+	headers := r.RequestCtx.Request.Header.PeekAll("X-Organization-ID")
+	if len(headers) == 0 {
+		return true
+	}
+	if len(headers) != 1 {
+		_ = r.SendErrorEnvelope(fasthttp.StatusBadRequest, "X-Organization-ID must identify the selected organization", nil, "")
+		return false
+	}
+	selectedOrgID, err := a.requireExplicitOrganization(r)
+	if err != nil {
+		return false
+	}
+	if selectedOrgID != orgID || (a.hasTenantScope() && a.tenantOrgID != orgID) {
+		_ = r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+		return false
+	}
+	return true
+}
+
 // HealthCheck returns server health status
 func (a *App) HealthCheck(r *fastglue.Request) error {
 	return r.SendEnvelope(map[string]string{

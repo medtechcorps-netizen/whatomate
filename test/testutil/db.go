@@ -224,14 +224,26 @@ func OpenIsolatedTestDatabaseOwnedByRole(t *testing.T) (*gorm.DB, *gorm.DB, stri
 }
 
 // OpenIsolatedTestDatabaseAsAdmin creates a disposable database using the
-// TEST_DATABASE_URL login itself. It exists only for negative authority tests
-// that must prove a table-owning superuser is rejected.
+// TEST_DATABASE_URL superuser and a separate, initially NOLOGIN runtime role.
 func OpenIsolatedTestDatabaseAsAdmin(t *testing.T) (*gorm.DB, string) {
 	t.Helper()
-	clusterDB := SetupTestDB(t)
-	baseURL, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set, skipping database test")
+	}
+	baseURL, err := url.Parse(dsn)
 	require.NoError(t, err)
 	require.NotEmpty(t, baseURL.Scheme, "TEST_DATABASE_URL must be a PostgreSQL URL")
+
+	// The allocator only creates and drops fixture resources. SetupTestDB would
+	// also migrate and truncate the database named in TEST_DATABASE_URL.
+	clusterDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	clusterSQLDB, err := clusterDB.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, clusterSQLDB.Close()) })
 
 	var superuser bool
 	require.NoError(t, clusterDB.Raw(`
@@ -240,7 +252,7 @@ func OpenIsolatedTestDatabaseAsAdmin(t *testing.T) (*gorm.DB, string) {
 		WHERE role.rolname = current_user
 	`).Scan(&superuser).Error)
 	if !superuser {
-		t.Skip("negative migration-authority regression requires a disposable superuser test login")
+		t.Skip("isolated administrator fixture requires a disposable superuser test login")
 	}
 
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -275,6 +287,9 @@ func OpenIsolatedTestDatabaseAsAdmin(t *testing.T) (*gorm.DB, string) {
 	baseURL.Path = "/" + databaseName
 	baseURL.RawPath = ""
 	query := baseURL.Query()
+	// pgx gives query parameters precedence over the database in the path.
+	query.Del("dbname")
+	query.Del("database")
 	query.Set("statement_cache_capacity", "0")
 	query.Set("default_query_exec_mode", "describe_exec")
 	baseURL.RawQuery = query.Encode()
@@ -285,6 +300,9 @@ func OpenIsolatedTestDatabaseAsAdmin(t *testing.T) (*gorm.DB, string) {
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	isolatedSQLDB = sqlDB
+	var connectedDatabase string
+	require.NoError(t, db.Raw("SELECT pg_catalog.current_database()").Scan(&connectedDatabase).Error)
+	require.Equal(t, databaseName, connectedDatabase, "refuse migrations outside the generated database")
 	require.NoError(t, runMigrations(db))
 	return db, runtimeRole
 }

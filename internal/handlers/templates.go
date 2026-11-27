@@ -2,16 +2,21 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/shridarpatil/whatomate/internal/access"
+	"github.com/shridarpatil/whatomate/internal/channel"
+	"github.com/shridarpatil/whatomate/internal/database"
 	"github.com/shridarpatil/whatomate/internal/models"
 	"github.com/shridarpatil/whatomate/internal/templateutil"
 	"github.com/shridarpatil/whatomate/pkg/whatsapp"
 	"github.com/valyala/fasthttp"
 	"github.com/zerodha/fastglue"
+	"gorm.io/gorm"
 )
 
 // TemplateRequest represents the request body for creating/updating a template
@@ -62,6 +67,9 @@ type TemplateResponse struct {
 func (a *App) ListTemplates(r *fastglue.Request) error {
 	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionRead)
 	if err != nil {
+		return nil
+	}
+	if !a.requireMatchingExplicitOrganization(r, orgID) {
 		return nil
 	}
 
@@ -460,20 +468,71 @@ func (a *App) submitTemplateToMeta(account *models.WhatsAppAccount, template *mo
 	return a.WhatsApp.SubmitTemplate(ctx, waAccount, submission)
 }
 
-// SyncTemplates syncs templates from Meta API
-func (a *App) SyncTemplates(r *fastglue.Request) error {
-	orgID, _, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
+var (
+	errTemplateSyncAccountChanged = errors.New("template sync account changed")
+	errTemplateSyncForbidden      = errors.New("template sync permission is no longer available")
+)
+
+// ListTemplateSyncAccounts returns the choices needed by a template sync operator.
+func (a *App) ListTemplateSyncAccounts(r *fastglue.Request) error {
+	r.RequestCtx.Response.Header.Set("Cache-Control", "private, no-store")
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
 	if err != nil {
 		return nil
 	}
+	if len(r.RequestCtx.Request.Header.PeekAll("X-Organization-ID")) != 1 {
+		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "X-Organization-ID must identify the selected organization", nil, "")
+	}
+	if !a.requireMatchingExplicitOrganization(r, orgID) {
+		return nil
+	}
+	if err := a.requireCurrentTemplateSyncPermission(orgID, userID); err != nil {
+		if errors.Is(err, errTemplateSyncForbidden) {
+			return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+		}
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load template sync accounts", nil, "")
+	}
 
-	// Get account name from query or body
+	var accounts []models.WhatsAppAccount
+	if err := a.DB.Select("id", "name", "status", "access_token", "access_token_expires_at").
+		Where("organization_id = ?", orgID).Order("created_at DESC, id DESC").Find(&accounts).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to load template sync accounts", nil, "")
+	}
+	type accountChoice struct {
+		ID   uuid.UUID `json:"id"`
+		Name string    `json:"name"`
+	}
+	choices := make([]accountChoice, 0, len(accounts))
+	for _, account := range accounts {
+		if account.Name != "" && a.prepareWhatsAppAccountForOutbound(&account) == nil {
+			choices = append(choices, accountChoice{ID: account.ID, Name: account.Name})
+		}
+	}
+	return r.SendEnvelope(map[string]any{"accounts": choices})
+}
+
+// SyncTemplates syncs templates from Meta API
+func (a *App) SyncTemplates(r *fastglue.Request) error {
+	orgID, userID, err := a.requireAuth(r, models.ResourceTemplates, models.ActionSync)
+	if err != nil {
+		return nil
+	}
+	if !a.requireMatchingExplicitOrganization(r, orgID) {
+		return nil
+	}
+
+	var body struct {
+		WhatsAppAccount   string          `json:"whatsapp_account"`
+		WhatsAppAccountID json.RawMessage `json:"whatsapp_account_id"`
+	}
+	if len(r.RequestCtx.PostBody()) != 0 {
+		if err := r.Decode(&body, "json"); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid template sync request", nil, "")
+		}
+	}
+
 	accountName := string(r.RequestCtx.QueryArgs().Peek("account"))
 	if accountName == "" {
-		var body struct {
-			WhatsAppAccount string `json:"whatsapp_account"`
-		}
-		_ = r.Decode(&body, "json")
 		accountName = body.WhatsAppAccount
 	}
 
@@ -481,93 +540,180 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 		return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "whatsapp_account is required", nil, "")
 	}
 
-	account, err := a.resolveWhatsAppAccount(orgID, accountName)
-	if err != nil {
+	query := a.DB.Where("organization_id = ? AND name = ?", orgID, accountName)
+	if body.WhatsAppAccountID != nil {
+		var rawID string
+		if err := json.Unmarshal(body.WhatsAppAccountID, &rawID); err != nil {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid whatsapp_account_id", nil, "")
+		}
+		accountID, err := uuid.Parse(rawID)
+		if err != nil || accountID == uuid.Nil || accountID.String() != rawID {
+			return r.SendErrorEnvelope(fasthttp.StatusBadRequest, "Invalid whatsapp_account_id", nil, "")
+		}
+		query = query.Where("id = ?", accountID)
+	}
+
+	// Keep the stored binding, including the original token representation.
+	// Only the copy used for the provider request is decrypted.
+	var account models.WhatsAppAccount
+	if err := query.First(&account).Error; err != nil {
+		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "WhatsApp account not found", nil, "")
+	}
+	providerAccount := account
+	if err := a.prepareWhatsAppAccountForOutbound(&providerAccount); err != nil {
 		return r.SendErrorEnvelope(fasthttp.StatusNotFound, "WhatsApp account not found", nil, "")
 	}
 
-	// Fetch templates from Meta API
-	templates, err := a.fetchTemplatesFromMeta(account)
+	templates, err := a.WhatsApp.FetchTemplates(requestContext(r), a.toWhatsAppAccount(&providerAccount))
 	if err != nil {
 		a.Log.Error("Failed to fetch templates from Meta", "error", err)
 		return r.SendErrorEnvelope(fasthttp.StatusBadGateway, "Failed to fetch templates from Meta", nil, "")
 	}
 
-	// Sync to database
 	synced := 0
-	for _, metaTemplate := range templates {
-		// Quality rating: prefer the nested score object (newer field), fall back
-		// to the legacy top-level rating. Empty string means "Meta didn't tell us"
-		// — on INSERT the column default 'UNKNOWN' applies; on UPDATE we skip
-		// the column so we don't clobber a previously-known rating.
-		qualityRating := metaTemplate.QualityRating
-		if metaTemplate.QualityScore != nil && metaTemplate.QualityScore.Score != "" {
-			qualityRating = metaTemplate.QualityScore.Score
+	err = a.DB.Transaction(func(tx *gorm.DB) error {
+		// Fetch the full provider result before acquiring the same locks used by
+		// account edits and deletion. Template rows still use the account name.
+		if err := channel.LockLegacyMetaOrganizationAndWhatsAppAccount(tx, orgID, account.ID); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errExplicitOrganizationUnavailable
+			}
+			return err
 		}
 
-		template := models.Template{
-			OrganizationID:  orgID,
-			WhatsAppAccount: account.Name,
-			MetaTemplateID:  metaTemplate.ID,
-			Name:            metaTemplate.Name,
-			DisplayName:     metaTemplate.Name,
-			Language:        metaTemplate.Language,
-			Category:        metaTemplate.Category,
-			Status:          metaTemplate.Status,
-			QualityRating:   qualityRating,
+		// The lock can find an archived organization row. Check the ordinary
+		// tenant boundary again before using any account or membership data.
+		reader := &App{DB: tx, Log: a.Log}
+		if _, err := reader.requireAuthenticatedTenant(orgID); err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, database.ErrPlatformComplianceTenant) {
+				return errExplicitOrganizationUnavailable
+			}
+			return err
 		}
 
-		// Parse components
-		for _, comp := range metaTemplate.Components {
-			switch comp.Type {
-			case "HEADER":
-				template.HeaderType = comp.Format
-				if comp.Text != "" {
-					template.HeaderContent = comp.Text
+		var current models.WhatsAppAccount
+		if err := tx.Where("organization_id = ? AND id = ?", orgID, account.ID).First(&current).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errTemplateSyncAccountChanged
+			}
+			return err
+		}
+		if current.Name != account.Name || current.PhoneID != account.PhoneID ||
+			current.BusinessID != account.BusinessID || current.AppID != account.AppID ||
+			current.APIVersion != account.APIVersion || current.Status != account.Status ||
+			current.AccessToken != account.AccessToken ||
+			(current.AccessTokenExpiresAt == nil) != (account.AccessTokenExpiresAt == nil) ||
+			(current.AccessTokenExpiresAt != nil && !current.AccessTokenExpiresAt.Equal(*account.AccessTokenExpiresAt)) {
+			return errTemplateSyncAccountChanged
+		}
+		if err := a.prepareWhatsAppAccountForOutbound(&current); err != nil {
+			return errTemplateSyncAccountChanged
+		}
+
+		if err := reader.requireCurrentTemplateSyncPermission(orgID, userID); err != nil {
+			return err
+		}
+
+		for _, metaTemplate := range templates {
+			// Quality rating: prefer the nested score object (newer field), fall back
+			// to the legacy top-level rating. Empty string means "Meta didn't tell us"
+			// — on INSERT the column default 'UNKNOWN' applies; on UPDATE we skip
+			// the column so we don't clobber a previously-known rating.
+			qualityRating := metaTemplate.QualityRating
+			if metaTemplate.QualityScore != nil && metaTemplate.QualityScore.Score != "" {
+				qualityRating = metaTemplate.QualityScore.Score
+			}
+
+			template := models.Template{
+				OrganizationID:  orgID,
+				WhatsAppAccount: account.Name,
+				MetaTemplateID:  metaTemplate.ID,
+				Name:            metaTemplate.Name,
+				DisplayName:     metaTemplate.Name,
+				Language:        metaTemplate.Language,
+				Category:        metaTemplate.Category,
+				Status:          metaTemplate.Status,
+				QualityRating:   qualityRating,
+			}
+
+			// Parse components
+			for _, comp := range metaTemplate.Components {
+				switch comp.Type {
+				case "HEADER":
+					template.HeaderType = comp.Format
+					if comp.Text != "" {
+						template.HeaderContent = comp.Text
+					}
+				case "BODY":
+					template.BodyContent = comp.Text
+				case "FOOTER":
+					template.FooterContent = comp.Text
+				case "BUTTONS":
+					// Convert []TemplateButton to []any
+					buttons := make([]any, len(comp.Buttons))
+					for i, btn := range comp.Buttons {
+						buttons[i] = btn
+					}
+					template.Buttons = convertToJSONBArray(buttons)
 				}
-			case "BODY":
-				template.BodyContent = comp.Text
-			case "FOOTER":
-				template.FooterContent = comp.Text
-			case "BUTTONS":
-				// Convert []TemplateButton to []any
-				buttons := make([]any, len(comp.Buttons))
-				for i, btn := range comp.Buttons {
-					buttons[i] = btn
-				}
-				template.Buttons = convertToJSONBArray(buttons)
 			}
-		}
 
-		// Upsert (including soft-deleted templates to restore them)
-		existing := models.Template{}
-		if err := a.DB.Unscoped().Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ?",
-			orgID, account.Name, template.Name, template.Language).First(&existing).Error; err == nil {
-			// Update existing and restore if soft-deleted (explicitly set deleted_at to NULL)
-			template.ID = existing.ID
-			updates := map[string]any{
-				"meta_template_id": template.MetaTemplateID,
-				"display_name":     template.DisplayName,
-				"category":         template.Category,
-				"status":           template.Status,
-				"header_type":      template.HeaderType,
-				"header_content":   template.HeaderContent,
-				"body_content":     template.BodyContent,
-				"footer_content":   template.FooterContent,
-				"buttons":          template.Buttons,
-				"deleted_at":       nil, // Restore soft-deleted template
+			// Upsert (including soft-deleted templates to restore them)
+			existing := models.Template{}
+			if err := tx.Unscoped().Where("organization_id = ? AND whats_app_account = ? AND name = ? AND language = ?",
+				orgID, account.Name, template.Name, template.Language).First(&existing).Error; err == nil {
+				// Update existing and restore if soft-deleted (explicitly set deleted_at to NULL)
+				template.ID = existing.ID
+				updates := map[string]any{
+					"meta_template_id": template.MetaTemplateID,
+					"display_name":     template.DisplayName,
+					"category":         template.Category,
+					"status":           template.Status,
+					"header_type":      template.HeaderType,
+					"header_content":   template.HeaderContent,
+					"body_content":     template.BodyContent,
+					"footer_content":   template.FooterContent,
+					"buttons":          template.Buttons,
+					"deleted_at":       nil, // Restore soft-deleted template
+				}
+				// Only update quality_rating when Meta returned a value; otherwise
+				// keep whatever we had previously.
+				if template.QualityRating != "" {
+					updates["quality_rating"] = template.QualityRating
+				}
+				result := tx.Unscoped().Model(&template).Updates(updates)
+				if result.Error != nil {
+					return fmt.Errorf("update synced template: %w", result.Error)
+				}
+				if result.RowsAffected != 1 {
+					return fmt.Errorf("update synced template affected %d rows", result.RowsAffected)
+				}
+			} else if errors.Is(err, gorm.ErrRecordNotFound) {
+				// Only a missing row permits creation; other lookup failures abort the batch.
+				result := tx.Create(&template)
+				if result.Error != nil {
+					return fmt.Errorf("create synced template: %w", result.Error)
+				}
+				if result.RowsAffected != 1 {
+					return fmt.Errorf("create synced template affected %d rows", result.RowsAffected)
+				}
+			} else {
+				return fmt.Errorf("look up synced template: %w", err)
 			}
-			// Only update quality_rating when Meta returned a value; otherwise
-			// keep whatever we had previously.
-			if template.QualityRating != "" {
-				updates["quality_rating"] = template.QualityRating
-			}
-			a.DB.Unscoped().Model(&template).Updates(updates)
-		} else {
-			// Create new
-			a.DB.Create(&template)
+			synced++
 		}
-		synced++
+		return nil
+	})
+	switch {
+	case errors.Is(err, errExplicitOrganizationUnavailable):
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Selected organization is not available", nil, "")
+	case errors.Is(err, errTemplateSyncAccountChanged):
+		return r.SendErrorEnvelope(fasthttp.StatusConflict, "WhatsApp account changed while syncing templates. Try again.", nil, "")
+	case errors.Is(err, errTemplateSyncForbidden):
+		return r.SendErrorEnvelope(fasthttp.StatusForbidden, "Insufficient permissions", nil, "")
+	case err != nil:
+		a.Log.Error("Failed to persist templates from Meta", "error", err, "account", accountName)
+		return r.SendErrorEnvelope(fasthttp.StatusInternalServerError, "Failed to save synced templates", nil, "")
 	}
 
 	return r.SendEnvelope(map[string]any{
@@ -576,11 +722,44 @@ func (a *App) SyncTemplates(r *fastglue.Request) error {
 	})
 }
 
-func (a *App) fetchTemplatesFromMeta(account *models.WhatsAppAccount) ([]whatsapp.MetaTemplate, error) {
-	waAccount := a.toWhatsAppAccount(account)
+// requireCurrentTemplateSyncPermission reads the current tenant role without
+// using cached grants and distinguishes a missing grant from a failed read.
+func (a *App) requireCurrentTemplateSyncPermission(orgID, userID uuid.UUID) error {
+	var user models.User
+	if err := a.DB.Select("is_super_admin").Where("id = ? AND is_active = ?", userID, true).Take(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errTemplateSyncForbidden
+		}
+		return err
+	}
+	if user.IsSuperAdmin {
+		return nil
+	}
 
-	ctx := context.Background()
-	return a.WhatsApp.FetchTemplates(ctx, waAccount)
+	membership, active, err := access.OrganizationMembershipChecked(a.DB, userID, orgID)
+	if err != nil {
+		return err
+	}
+	if !active || membership.RoleID == nil {
+		return errTemplateSyncForbidden
+	}
+
+	var role models.CustomRole
+	if err := a.DB.Select("id").Where("organization_id = ? AND id = ?", orgID, *membership.RoleID).Take(&role).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return errTemplateSyncForbidden
+		}
+		return err
+	}
+	if err := a.loadRolePermissions(&role); err != nil {
+		return err
+	}
+	for _, permission := range role.Permissions {
+		if permission.Resource == models.ResourceTemplates && permission.Action == models.ActionSync {
+			return nil
+		}
+	}
+	return errTemplateSyncForbidden
 }
 
 func (a *App) deleteTemplateFromMeta(account *models.WhatsAppAccount, templateName string) {

@@ -4,11 +4,11 @@ import { defineComponent, nextTick, reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import TemplatesView from './TemplatesView.vue'
 
-const mocks = vi.hoisted(() => ({ get: vi.fn(), list: vi.fn(), remove: vi.fn(), success: vi.fn(), error: vi.fn() }))
+const mocks = vi.hoisted(() => ({ get: vi.fn(), list: vi.fn(), remove: vi.fn(), success: vi.fn(), error: vi.fn(), adapter: vi.fn() }))
 const context = reactive({ selectedOrgId: 'org-A', session: 'session-A', live: true, canDelete: true })
 vi.mock('@/services/api', () => ({
   AUTH_SESSION_EVENT: 'auth-session-state',
-  api: { get: mocks.get, delete: mocks.remove, post: vi.fn() },
+  api: { get: mocks.get, delete: mocks.remove, post: vi.fn(), defaults: { adapter: mocks.adapter } },
   templatesService: { list: mocks.list },
 }))
 vi.mock('@/stores/organizations', () => ({ useOrganizationsStore: () => context }))
@@ -68,6 +68,7 @@ describe('template delete feedback ownership', () => {
     context.live = true
     context.canDelete = true
     localStorage.clear()
+    localStorage.setItem('selected_organization_id', 'org-A')
     mocks.get.mockResolvedValue({ data: { data: { accounts: [] } } })
     mocks.list.mockResolvedValue({ data: { data: { templates, total: 2 } } })
     mocks.remove.mockResolvedValue({})
