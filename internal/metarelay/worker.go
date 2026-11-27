@@ -132,12 +132,15 @@ func (w *Worker) ProcessOnce(ctx context.Context) error {
 }
 
 func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
+	// A claimed job retains its bounded settlement window after intake stops.
+	// Cancellation still reaches forwarding, while an observed accepted result
+	// can be committed before the command joins this worker and closes Redis.
 	// Version 0/1 are legacy static jobs, version 2 carries registry/static
 	// routing fields, and version 3 adds an app-bound static Messenger fence.
 	// A future producer version is parked, never destroyed by a worker that does
 	// not understand its routing/fence semantics.
 	if job.SchemaVersion > maxInboundJobSchemaVersion {
-		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 		defer cancel()
 		return w.store.ParkInbound(settleCtx, job.ID, w.now().UTC().Add(time.Minute))
 	}
@@ -147,7 +150,7 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 		strings.TrimSpace(job.ExternalAccountID) != "" && job.RegistryFence == ""
 	if (job.SchemaVersion == staticMessengerInboundJobSchemaVersion && !validStaticMessengerV3) ||
 		(job.SchemaVersion < staticMessengerInboundJobSchemaVersion && job.WebhookApp != "") {
-		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 		defer cancel()
 		return w.store.DeadInbound(settleCtx, job.ID, "invalid_static_messenger_job")
 	}
@@ -165,13 +168,13 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 		} else if resolveErr == nil {
 			deadReason = "registry_binding_version_changed"
 		} else if errors.Is(resolveErr, ErrRegistryStale) {
-			settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+			settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 			defer cancel()
 			return w.store.ParkInbound(
 				settleCtx, job.ID, w.now().UTC().Add(time.Minute),
 			)
 		} else if errors.Is(resolveErr, ErrRegistryUnavailable) {
-			settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+			settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 			defer cancel()
 			_, _, retryErr := w.store.RetryInbound(
 				settleCtx, job.ID, w.now().UTC().Add(retryBackoff(job.Attempts+1)),
@@ -181,7 +184,7 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 		}
 	}
 	if !ok {
-		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 		defer cancel()
 		return w.store.DeadInbound(settleCtx, job.ID, deadReason)
 	}
@@ -191,7 +194,7 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 		appBindingChanged = true
 	}
 	if appBindingChanged {
-		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 		defer cancel()
 		return w.store.DeadInbound(settleCtx, job.ID, "webhook_app_binding_changed")
 	}
@@ -203,7 +206,7 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 		staticAccountBindingChanged = true
 	}
 	if staticAccountBindingChanged {
-		settleCtx, cancel := context.WithTimeout(ctx, queueSettlementTimeout)
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 		defer cancel()
 		return w.store.DeadInbound(settleCtx, job.ID, "static_account_binding_changed")
 	}
@@ -212,7 +215,7 @@ func (w *Worker) processJob(ctx context.Context, job InboundJob) error {
 	outcome := w.forwardToReReply(forwardCtx, account, job.Body)
 	cancelForward()
 
-	settleCtx, cancelSettle := context.WithTimeout(ctx, queueSettlementTimeout)
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), queueSettlementTimeout)
 	defer cancelSettle()
 	if outcome.success {
 		if err := w.store.CompleteInbound(settleCtx, job.ID); err != nil {
