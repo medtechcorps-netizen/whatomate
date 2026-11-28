@@ -1124,3 +1124,22 @@ The exact reader and writer states must meet in a single commit. CI checks
 the first-parent history and both parents of a pull request merge, including
 intermediate topic commits. A change to the measured inputs requires a fresh
 review. The Go registry tests still recompute every closure.
+
+### Contacts and Campaign inventory review
+
+The Contacts and Campaign transition adds three files to the chatbot backfill
+and all four to the migration inventory.
+
+| File | Chatbot backfill | Migrations |
+| --- | --- | --- |
+| `internal/campaignpacing/pacing.go` | Added | Added |
+| `internal/handlers/campaign_contact_audience.go` | Added | Added |
+| `internal/handlers/campaign_pacing.go` | Added | Added |
+| `internal/worker/campaign_continuation.go` | | Added |
+
+The measured backfill grows from 221 to 224 files. The migration inventory
+grows from 245 to 249 files. All other registry entries retain the same
+members and hashes. CI checks the reviewed source and both generated
+documents across the entire transition. The feature commit must include
+the corresponding limits and pass the Go generators, signed compatibility,
+staging checks and production review before release.

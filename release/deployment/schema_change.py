@@ -2805,7 +2805,25 @@ _CI_QUOTE_STATES = (
 )
 
 
-def _ci_quote_source_digest(repo: _Repository, revision: str) -> str:
+_CI_CAMPAIGN_DATA_FILES = (
+    "internal/campaignpacing/pacing.go",
+    "internal/handlers/campaign_contact_audience.go",
+    "internal/handlers/campaign_pacing.go",
+)
+_CI_CAMPAIGN_MIGRATION_FILES = (*_CI_CAMPAIGN_DATA_FILES, "internal/worker/campaign_continuation.go")
+# Digests cover the complete registry, migration manifest and physical source at
+# each end. The four-file transition is published together by the feature PR.
+_CI_CAMPAIGN_STATES = (
+    ("e3ef94beacbcbb1a5c81a5fe53b45b1e2ac9fdc7c943ae96bbd964db67109502",
+     "3bc8937ac37d12c08fea36c30e3df67ec3602e14583cdc965e3fd132f32a59de",
+     "a802c5a1cbf5ccb79cda455805eed4cc94d91bb61fbe25395b66a0c0a8455b50"),
+    ("0e3ebc418abbf445f0d9b7f9b9aadace26ea0851821a8dbbe03b0c773881c85b",
+     "666761550aabcf434894f519e332cbbc5b28a7e3faec55cf91cb1c3222a790f0",
+     "7a0406bd2ed15af61bf1e1f2be2c259a61634575d0f73d7006412d196ee99925"),
+)
+
+
+def _ci_inventory_source_digest(repo: _Repository, revision: str) -> str:
     # Include the other-platform fallback and module graph as well as all
     # production Go files. The raw Git records bind path, mode and blob OID.
     extra = {path.encode() for path in (
@@ -2828,23 +2846,45 @@ def _ci_quote_source_digest(repo: _Repository, revision: str) -> str:
 
 
 def _ci_quote_writer_closure(repo: _Repository, base: str, head: str) -> None:
+    _ci_reviewed_inventory_transition(repo, base, head, _CI_QUOTE_STATES, _CI_QUOTE_FILES)
+
+
+def _ci_campaign_inventory_closure(repo: _Repository, base: str, head: str) -> None:
+    # The continuation worker belongs only to migrations. The existing backfill
+    # gains the pacing package and the two handlers.
+    old = repo.document(base, REGISTRY, _registry)
+    new = repo.document(head, REGISTRY, _registry)
+    _valid([r["id"] for r in old] == [r["id"] for r in new])
+    changed = [(a, b) for a, b in zip(old, new) if a != b]
+    _valid(len(changed) == 1)
+    before, after = changed[0]
+    _valid(before["id"] == after["id"] == _CI_H1_BASELINE_ID
+           and not set(before["closure_files"]).intersection(_CI_CAMPAIGN_MIGRATION_FILES)
+           and sorted([*before["closure_files"], *_CI_CAMPAIGN_DATA_FILES]) == after["closure_files"]
+           and {k: v for k, v in before.items() if k not in ("closure_files", "closure_sha256")}
+           == {k: v for k, v in after.items() if k not in ("closure_files", "closure_sha256")})
+    _ci_reviewed_inventory_transition(repo, base, head, _CI_CAMPAIGN_STATES, _CI_CAMPAIGN_MIGRATION_FILES)
+
+
+def _ci_reviewed_inventory_transition(repo: _Repository, base: str, head: str,
+                                      states: tuple[tuple[str, str, str], ...], added_files: tuple[str, ...]) -> None:
     def state(revision: str) -> int:
         registry = repo.blob(revision, REGISTRY)
         migration = repo.blob(revision, MIGRATION_PATH)
         _valid(registry and migration)
         documents = (hashlib.sha256(registry).hexdigest(), hashlib.sha256(migration).hexdigest())
-        for index, (expected_registry, expected_migration, expected_source) in enumerate(_CI_QUOTE_STATES):
+        for index, (expected_registry, expected_migration, expected_source) in enumerate(states):
             if documents == (expected_registry, expected_migration):
-                _valid(_ci_quote_source_digest(repo, revision) == expected_source)
+                _valid(_ci_inventory_source_digest(repo, revision) == expected_source)
                 return index
         raise _Invalid()
 
     _valid(state(base) == 0 and state(head) == 1)
     old = repo.document(base, MIGRATION_PATH, lambda _: None)
     new = repo.document(head, MIGRATION_PATH, lambda _: None)
-    _valid(not set(_CI_QUOTE_FILES).intersection(old["closure_files"])
-           and sorted(old["closure_files"] + list(_CI_QUOTE_FILES)) == new["closure_files"])
-    for path in _CI_QUOTE_FILES:
+    _valid(not set(added_files).intersection(old["closure_files"])
+           and sorted(old["closure_files"] + list(added_files)) == new["closure_files"])
+    for path in added_files:
         _valid(repo.blob(base, path) is None and bool(repo.blob(head, path)))
     _ci_paired_metadata_history(repo, base, head,
                                 (repo.blob(base, REGISTRY), repo.blob(base, MIGRATION_PATH)),
@@ -2852,7 +2892,7 @@ def _ci_quote_writer_closure(repo: _Repository, base: str, head: str) -> None:
 
     # A synthetic PR merge can conceal edits that were reverted on the topic
     # branch. Inspect both ancestries, allowing only one introduction of the
-    # complete writer. A later clean merge of that change is not a second one.
+    # complete reviewed inventory. A later clean merge of that change is not a second one.
     graph = _git(repo.root, ["rev-list", "--parents", "--topo-order", "--reverse",
                              f"--max-count={MAX_HISTORY_COMMITS + 1}", f"{base}..{head}"])
     _valid(graph.endswith(b"\n") and len(graph) <= MAX_HISTORY_COMMITS * 123)
@@ -3028,6 +3068,18 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
                    and repo.blob(base, REGISTRY) != repo.blob(head, REGISTRY))
     except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
         return tuple(sorted(set(legacy.reasons) | {"quote-writer-closure-incomplete"}))
+    # A partial Campaign introduction must fail even when both old documents
+    # were left in place. Later changes that add no reviewed path use the
+    # existing registry and release rules.
+    try:
+        campaign_added = any(not repo._tree(base, path) and bool(repo._tree(head, path))
+                             for path in _CI_CAMPAIGN_MIGRATION_FILES)
+        if campaign_added:
+            _valid(not quote_writer and legacy.reasons == ("migration-path-changed:closure",)
+                   and legacy.kind == "none" and legacy.dormant is False
+                   and repo.blob(base, REGISTRY) != repo.blob(head, REGISTRY))
+    except (_Invalid, UnicodeError, TypeError, ValueError, KeyError, RecursionError):
+        return tuple(sorted(set(legacy.reasons) | {"campaign-inventory-incomplete"}))
     if legacy.reasons != ("migration-path-changed:closure",):
         return legacy.reasons
     policy = _classify_v2(repo, base, head, legacy)
@@ -3053,6 +3105,8 @@ def check_ci_source(repo_dir: Path, base: str, head: str) -> tuple[str, ...]:
             if path == REGISTRY and before != after:
                 if quote_writer:
                     _ci_quote_writer_closure(repo, base, head)
+                elif campaign_added:
+                    _ci_campaign_inventory_closure(repo, base, head)
                 elif old["closure_files"] == new["closure_files"]:
                     _ci_generated_closure_hash_refresh(repo, base, head, old, new)
                 else:
